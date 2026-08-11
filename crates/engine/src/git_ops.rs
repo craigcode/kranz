@@ -929,6 +929,35 @@ impl GitRepo {
         self.run_os(&args)
     }
 
+    /// Full `git diff <from>..<to> -- <paths>` output, verbatim — the
+    /// affected-path diff a Flight Rules waiver's digest binds (KRZ-344
+    /// D-I): only changes under the named paths alter the bytes, so an
+    /// unrelated-path change can never invalidate (or be covered by) the
+    /// waiver. Refuses flag-shaped refs (the [`GitRepo::changed_paths`]
+    /// guard) and an EMPTY path set — `git diff <range> --` with no
+    /// pathspec silently means the WHOLE diff, which would bind authority
+    /// the caller never scoped.
+    pub fn diff_range_paths(&self, from: &str, to: &str, paths: &[String]) -> Result<String> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing diff_range_paths with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
+        if paths.is_empty() {
+            return Err(EngineError::Git(
+                "refusing diff_range_paths with an empty path set — `--` alone means the \
+                 whole diff, not an empty one"
+                    .to_string(),
+            ));
+        }
+        let range = format!("{from}..{to}");
+        let mut args: Vec<OsString> = vec!["diff".into(), range.into(), "--".into()];
+        args.extend(paths.iter().map(OsString::from));
+        self.run_os(&args)
+    }
+
     /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),
     /// one per line as git reports them.
     ///

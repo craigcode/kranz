@@ -744,11 +744,14 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             });
         }
 
-        EventKind::StandardsResolved { .. } | EventKind::StandardsDrifted { .. } => {
-            // Audit-only (KRZ-342 D-H): the pin itself folds with
-            // plan.approved / plan.revised; these events are the queryable
-            // provenance and refusal evidence. State shape intentionally
-            // does not grow.
+        EventKind::StandardsResolved { .. }
+        | EventKind::StandardsDrifted { .. }
+        | EventKind::StandardsWaiverApproved { .. } => {
+            // Audit-only (KRZ-342 D-H; KRZ-344 D-I): the pin itself folds
+            // with plan.approved; these events are the queryable provenance,
+            // refusal, and waiver evidence. The coverage fold joins waivers
+            // straight from the log — state shape intentionally does not
+            // grow.
         }
     }
 

@@ -24,12 +24,13 @@
 //! `gate.result` pass that named the rule — and no failing join. The same
 //! failing evidence renders `failed` against an effectively ENFORCED rule
 //! and `advisory` against an approved one (D-B: an advisory rule's violation
-//! could not have blocked). `waived` is the KRZ-344 slot: the disposition
-//! vocabulary and the renderers carry it now, but this slice deliberately
-//! wires NO waiver signal — the ordinary orchestrator finding-waiver is
-//! insufficient authority for a standards rule (D-I), so a rule-cited
-//! finding that was waived as prose still renders `failed`/`advisory` here
-//! until `standards.waiver.approved` exists to join.
+//! could not have blocked). `waived` renders when every failing join on the
+//! row is covered by a valid, unexpired, exactly-matching
+//! `standards.waiver.approved` (KRZ-344, D-I) — the structured human
+//! exception event, joined on the full binding (rule id + pinned revision +
+//! manifest digest + approval seq + finding fingerprint + human surface).
+//! The ordinary orchestrator finding-waiver remains insufficient authority:
+//! a rule-cited finding waived as prose still renders `failed`/`advisory`.
 //!
 //! WHY `not-applicable` rows exist: evidence occasionally names a rule the
 //! approved pin does not carry (a hand-authored or stale citation at
@@ -42,9 +43,14 @@
 //! clock, no filesystem, no hash map in output order — rows follow the
 //! pin's stable id order (then not-applicable rows sorted by id/revision/
 //! digest), evidence follows log seq order, and every timestamp is the
-//! log's own data. A mission with no pin folds to `None`, and every
-//! consumer renders NOTHING — pre-Flight-Rules logs stay byte-identical
-//! through report.md, provenance replay, and the evidence bundle.
+//! log's own data. Waiver expiry is judged against the LOG'S OWN FRONTIER
+//! (the latest event instant in the mission's slice), never a wall clock,
+//! so the same log folds byte-identically at any wall time — a replay
+//! renders the world as of the evidence, and an enforcement decision
+//! re-judges expiry against its own clock (KRZ-346). A mission with no pin
+//! folds to `None`, and every consumer renders NOTHING — pre-Flight-Rules
+//! logs stay byte-identical through report.md, provenance replay, and the
+//! evidence bundle.
 
 use crate::events::{Event, EventKind};
 use crate::gate::GateVerdict;
@@ -67,9 +73,11 @@ pub enum RuleDisposition {
     /// Failing evidence joined an effectively APPROVED rule — recorded,
     /// but the advisory lifecycle means it could not block (D-B).
     Advisory,
-    /// The joined failure was excepted by an authorized human waiver. The
-    /// slot renders in this slice; the SIGNAL is KRZ-344's
-    /// (`standards.waiver.approved`) — no waiver flow is wired here (D-I).
+    /// Every joined failure was excepted by a valid, unexpired,
+    /// exactly-matching `standards.waiver.approved` (KRZ-344, D-I) — the
+    /// authorized human exception. One waiver subtracts exactly one
+    /// failure: any failing join left uncovered renders
+    /// `failed`/`advisory` instead.
     Waived,
     /// The rule applied but no evidence names it. The honest zero state:
     /// absence of evidence is never rendered as pass (D-H).
@@ -108,13 +116,35 @@ pub struct CoverageEvidence {
     /// The mechanism that produced it: the gate name for a gate verdict,
     /// the citing run id for a finding.
     pub mechanism: String,
-    /// The verdict bearing (`pass`/`fail`; findings are failures by
-    /// construction). `waived` is KRZ-344's to record.
+    /// The verdict bearing (`pass`/`fail`/`waived`; findings are failures
+    /// by construction). `waived` marks a failing join covered by a valid
+    /// `standards.waiver.approved` (KRZ-344) — the `waiver` field then
+    /// names it.
     pub bearing: String,
     /// The artefact handle (a gate's `artefactRef`, verbatim — its
     /// resolution status stays with the gate ladder's total classifier) or
     /// the finding's subject.
     pub reference: String,
+    /// The waiver that excepts this failure (KRZ-344, D-I), joined through
+    /// the structured event — never parsed from orchestrator prose.
+    /// Present exactly when `bearing` is `waived`; additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver: Option<WaiverJoin>,
+}
+
+/// The waiver join behind a `waived` evidence entry (KRZ-344): everything
+/// the audit needs to name the exception without re-reading the event —
+/// its seq anchor, the approver principal + invocation surface, the
+/// recorded reason, and the expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaiverJoin {
+    /// The waiver event's seq — the join anchor into the log.
+    pub seq: u64,
+    pub approver: String,
+    pub surface: String,
+    pub reason: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// One row of the coverage matrix: a pinned rule (or a citation that
@@ -215,8 +245,17 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
     let mut findings: Vec<(u64, &crate::types::Finding, &str)> = Vec::new();
     let mut gates: Vec<(u64, &str, GateVerdict, &str, &[String])> = Vec::new();
     let mut drift: Vec<DriftRecord> = Vec::new();
+    let mut waivers: Vec<crate::standards_waiver::WaiverRecord> = Vec::new();
+    // The fold's evaluation instant: the log's own frontier (the latest
+    // event instant in the mission's slice), never a wall clock — waiver
+    // expiry is judged as of the evidence, keeping replays byte-identical.
+    let mut frontier: Option<DateTime<Utc>> = None;
 
     for event in events.iter().filter(|e| e.mission_id == mission_id) {
+        frontier = Some(frontier.map_or(event.ts, |seen| seen.max(event.ts)));
+        if let Some(record) = crate::standards_waiver::WaiverRecord::from_event(event) {
+            waivers.push(record);
+        }
         match &event.kind {
             EventKind::PlanApproved { plan, .. } => {
                 // Mirror the reducer's fold EXACTLY: the pin is replaced on
@@ -266,6 +305,13 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
     }
 
     let (approval_seq, pin) = pin?;
+    // A pinned mission has at least its plan.approved event, so the
+    // frontier exists; the expect can never fire.
+    let now = frontier.expect("a pinned mission slice is non-empty");
+    // Waivers consumed by a join: one waiver subtracts EXACTLY ONE failure
+    // (D-I), so a matched waiver can never cover a second entry — even one
+    // with an identical fingerprint.
+    let mut used_waivers: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut rules: Vec<RuleCoverage> = Vec::new();
     for pinned in &pin.rules {
         let mut evidence: Vec<CoverageEvidence> = Vec::new();
@@ -278,13 +324,43 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
                     && citation.revision == pinned.revision
                     && citation.digest == pin.digest
                 {
-                    evidence.push(CoverageEvidence {
+                    let mut entry = CoverageEvidence {
                         seq: *seq,
                         event: "validation.finding".to_string(),
                         mechanism: (*run_id).to_string(),
                         bearing: "fail".to_string(),
                         reference: finding.subject.clone(),
-                    });
+                        waiver: None,
+                    };
+                    // KRZ-344 (D-I): a valid, unexpired, exactly-matching
+                    // human waiver excepts THIS one failure. The join is
+                    // the structured event's full binding — rule id,
+                    // pinned revision, manifest digest, approval seq,
+                    // finding fingerprint, human surface — never a parse
+                    // of orchestrator decision prose.
+                    let fingerprint = crate::standards_waiver::finding_fingerprint(run_id, finding);
+                    if let Some(waiver) = waivers.iter().find(|waiver| {
+                        !used_waivers.contains(&waiver.seq)
+                            && crate::standards_waiver::waiver_covers(
+                                waiver,
+                                pinned,
+                                &pin,
+                                approval_seq,
+                                &fingerprint,
+                                now,
+                            )
+                    }) {
+                        used_waivers.insert(waiver.seq);
+                        entry.bearing = "waived".to_string();
+                        entry.waiver = Some(WaiverJoin {
+                            seq: waiver.seq,
+                            approver: waiver.approver.clone(),
+                            surface: waiver.surface.clone(),
+                            reason: waiver.reason.clone(),
+                            expires_at: waiver.expires_at,
+                        });
+                    }
+                    evidence.push(entry);
                 }
             }
         }
@@ -299,6 +375,11 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
                         GateVerdict::Fail => "fail".to_string(),
                     },
                     reference: (*artefact_ref).to_string(),
+                    // A waiver binds a finding fingerprint; gate-result
+                    // failures join no waiver in this slice — the
+                    // enforced-MUST gate binding (KRZ-346) owns its own
+                    // exception check.
+                    waiver: None,
                 });
             }
         }
@@ -309,6 +390,11 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
             } else {
                 RuleDisposition::Advisory
             }
+        } else if evidence.iter().any(|entry| entry.bearing == "waived") {
+            // Every failing join is covered by a valid waiver (a surviving
+            // "fail" bearing took the branch above); the row names the
+            // exception rather than the block.
+            RuleDisposition::Waived
         } else if evidence.iter().any(|entry| entry.bearing == "pass") {
             RuleDisposition::Passed
         } else {
@@ -351,6 +437,9 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
             mechanism: (*run_id).to_string(),
             bearing: "fail".to_string(),
             reference: finding.subject.clone(),
+            // A not-applicable citation never joins a waiver: the waiver
+            // binds the PINNED rule, and this citation joined none.
+            waiver: None,
         };
         let key = (
             citation.id.clone(),
@@ -463,14 +552,29 @@ pub fn render_coverage_markdown(coverage: &StandardsCoverage) -> String {
                 rule.evidence
                     .iter()
                     .map(|entry| {
-                        format!(
+                        let mut cell = format!(
                             "{} seq {} {} {} `{}`",
                             entry.event,
                             entry.seq,
                             md_cell(&entry.mechanism),
                             entry.bearing,
                             md_cell(&entry.reference)
-                        )
+                        );
+                        // A waived failure names its exception through the
+                        // structured event (KRZ-344, D-I): seq anchor,
+                        // approver + surface, expiry, reason.
+                        if let Some(waiver) = &entry.waiver {
+                            let _ = write!(
+                                cell,
+                                " (waiver seq {} by {} via {}, expires {}: \"{}\")",
+                                waiver.seq,
+                                md_cell(&waiver.approver),
+                                md_cell(&waiver.surface),
+                                waiver.expires_at.to_rfc3339(),
+                                md_cell(&waiver.reason)
+                            );
+                        }
+                        cell
                     })
                     .collect::<Vec<_>>()
                     .join("; ")
@@ -495,7 +599,9 @@ pub fn render_coverage_markdown(coverage: &StandardsCoverage) -> String {
             out,
             "\nAbsence of evidence is never rendered as pass: `not-evaluated` means no gate \
              verdict or finding named the rule, and `not-applicable` marks citations the \
-             approved pin does not carry.\n"
+             approved pin does not carry. `waived` names an authorized human exception \
+             (`standards.waiver.approved`, D-I) — one waiver subtracts exactly one failure, \
+             and any rule, finding, scope, diff, or expiry change restores the block.\n"
         );
     }
     if !coverage.drift.is_empty() {
@@ -1107,6 +1213,377 @@ mod tests {
         assert!(
             md.contains("not-applicable (cited against digest sha256:"),
             "{md}"
+        );
+    }
+
+    // ---- the waiver join (KRZ-344, D-I) -----------------------------------
+
+    /// The waiver fixture: a pin whose enforced ZZ-FAIL-001 (r2) declares
+    /// `waivable: true`, cited by one finding at seq 4 (run v-1, subject
+    /// a-1); ZZ-OTHER-001 passes via a gate verdict, so every test can
+    /// prove the waiver grants no authority beyond its one finding.
+    fn waiver_matrix_events() -> Vec<Event> {
+        let mut fail = pinned_rule("ZZ-FAIL-001", 2, "enforced", "must");
+        fail.waivable = true;
+        vec![
+            ev(
+                1,
+                EventKind::PlanApproved {
+                    plan: plan_with_pin(vec![
+                        fail,
+                        pinned_rule("ZZ-OTHER-001", 1, "enforced", "must"),
+                    ]),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+            ),
+            ev(
+                2,
+                gate_result(
+                    "zz-gate",
+                    GateVerdict::Pass,
+                    "file:runs/gate-zz.jsonl",
+                    vec!["ZZ-OTHER-001".to_string()],
+                ),
+            ),
+            ev(
+                4,
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: "v-1".to_string(),
+                    finding: waiver_finding("a-1"),
+                },
+            ),
+        ]
+    }
+
+    /// The fixture finding the waiver binds (kept in one place so the
+    /// fingerprint the test computes is byte-identical to the fold's).
+    fn waiver_finding(subject: &str) -> crate::types::Finding {
+        finding_with_rule(
+            subject,
+            Some(citation("ZZ-FAIL-001", 2, &"ab".repeat(32), "enforced")),
+        )
+    }
+
+    fn waiver_fingerprint(subject: &str) -> String {
+        crate::standards_waiver::finding_fingerprint("v-1", &waiver_finding(subject))
+    }
+
+    /// A fully valid waiver over the fixture finding; expiry one hour past
+    /// the fixture instant, so the fixed-ts log frontier sees it live.
+    fn valid_waiver(fingerprint: &str) -> EventKind {
+        EventKind::StandardsWaiverApproved {
+            rule_id: "ZZ-FAIL-001".to_string(),
+            rule_revision: 2,
+            manifest_digest: "ab".repeat(32),
+            approval_seq: 1,
+            finding_fingerprint: fingerprint.to_string(),
+            paths: vec!["crates/engine/src/x.rs".to_string()],
+            diff_digest: "cd".repeat(32),
+            reason: "upstream false positive, tracked as zz-123".to_string(),
+            approver: "local-operator".to_string(),
+            surface: "cli".to_string(),
+            expires_at: ts() + chrono::Duration::hours(1),
+        }
+    }
+
+    /// `valid_waiver` with one field mutated — each invalidation clause of
+    /// the D-I binding gets its own exact probe.
+    fn mutated_waiver(fingerprint: &str, mutate: impl FnOnce(&mut EventKind)) -> EventKind {
+        let mut kind = valid_waiver(fingerprint);
+        mutate(&mut kind);
+        kind
+    }
+
+    fn fail_row(coverage: &StandardsCoverage) -> &RuleCoverage {
+        coverage
+            .rules
+            .iter()
+            .find(|row| row.id == "ZZ-FAIL-001")
+            .expect("the fixture row")
+    }
+
+    /// A valid, unexpired, exactly-matching waiver renders `waived`, and
+    /// the row names the exception through the structured event — the seq
+    /// anchor, the approver and surface, the expiry, and the reason — in
+    /// the ONE markdown renderer report.md, provenance replay, and the
+    /// evidence bundle share (D-H/D-I; the ticket's "replay/report/
+    /// evidence name the waiver" hint).
+    #[test]
+    fn flight_rules_waiver_valid_waiver_renders_waived_and_names_the_exception() {
+        let mut events = waiver_matrix_events();
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Waived);
+        assert_eq!(row.evidence.len(), 1);
+        assert_eq!(row.evidence[0].bearing, "waived");
+        let join = row.evidence[0].waiver.as_ref().expect("the waiver joins");
+        assert_eq!(join.seq, 7);
+        assert_eq!(join.approver, "local-operator");
+        assert_eq!(join.surface, "cli");
+        assert_eq!(join.reason, "upstream false positive, tracked as zz-123");
+        assert_eq!(join.expires_at, ts() + chrono::Duration::hours(1));
+
+        // Unrelated rows receive no authority: the passing rule is
+        // untouched by a waiver that never named it.
+        let other = coverage
+            .rules
+            .iter()
+            .find(|row| row.id == "ZZ-OTHER-001")
+            .expect("the passing row");
+        assert_eq!(other.disposition, RuleDisposition::Passed);
+
+        let md = render_coverage_markdown(&coverage);
+        assert!(
+            md.contains("| ZZ-FAIL-001 | r2 | enforced | must | gate:zz-gate | waived |"),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "validation.finding seq 4 v-1 waived `a-1` (waiver seq 7 by local-operator \
+                 via cli, expires "
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("upstream false positive, tracked as zz-123"),
+            "{md}"
+        );
+        // The machine form names it too (camelCase, additive). The
+        // fixture pin's first rule is ZZ-FAIL-001.
+        let json = serde_json::to_value(&coverage).unwrap();
+        let waiver = &json["rules"][0]["evidence"][0]["waiver"];
+        assert_eq!(waiver["seq"], 7);
+        assert_eq!(waiver["approver"], "local-operator");
+        assert_eq!(waiver["surface"], "cli");
+        assert!(waiver["expiresAt"].is_string());
+    }
+
+    /// One waiver subtracts EXACTLY ONE matching failure (D-I): a second
+    /// failing join on the same rule — a distinct finding, or even an
+    /// identical duplicate one waiver could pattern-match twice — keeps
+    /// the row failed, because the fold consumes each waiver once.
+    #[test]
+    fn flight_rules_waiver_subtracts_exactly_one_failure() {
+        // Distinct second finding (subject a-9, same rule/revision/digest).
+        let mut events = waiver_matrix_events();
+        events.push(ev(
+            5,
+            EventKind::ValidationFinding {
+                milestone_id: "ms-1".to_string(),
+                run_id: "v-1".to_string(),
+                finding: waiver_finding("a-9"),
+            },
+        ));
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Failed);
+        assert_eq!(row.evidence.len(), 2);
+        assert_eq!(row.evidence[0].bearing, "waived");
+        assert_eq!(row.evidence[1].bearing, "fail");
+        assert!(row.evidence[1].waiver.is_none());
+
+        // Identical duplicate (same run, same content, later seq): the
+        // fingerprint matches both, but the consumed waiver cannot cover
+        // the second occurrence.
+        let mut events = waiver_matrix_events();
+        events.push(ev(
+            5,
+            EventKind::ValidationFinding {
+                milestone_id: "ms-1".to_string(),
+                run_id: "v-1".to_string(),
+                finding: waiver_finding("a-1"),
+            },
+        ));
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Failed);
+        assert_eq!(row.evidence[0].bearing, "waived");
+        assert_eq!(row.evidence[1].bearing, "fail");
+    }
+
+    /// Expiry restores the block: the fold judges the waiver against the
+    /// log's own frontier, so an event appended after the expiry instant
+    /// flips the row back to failed — deterministically, with no wall
+    /// clock. (An enforcement decision re-judges expiry against its own
+    /// clock; this fold is the audit.)
+    #[test]
+    fn flight_rules_waiver_expiry_restores_the_block() {
+        let mut events = waiver_matrix_events();
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let live = standards_coverage("m-1", &events).expect("a pin folds");
+        assert_eq!(fail_row(&live).disposition, RuleDisposition::Waived);
+
+        let mut later = ev(8, EventKind::MissionPaused {});
+        later.ts = ts() + chrono::Duration::hours(2);
+        events.push(later);
+        let expired = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&expired);
+        assert_eq!(row.disposition, RuleDisposition::Failed);
+        assert_eq!(row.evidence[0].bearing, "fail");
+        assert!(row.evidence[0].waiver.is_none());
+    }
+
+    /// A revision bump, a substituted manifest, or a re-approval
+    /// invalidates the waiver: the recorded revision / manifest digest /
+    /// approval seq must match the standing pin exactly, or the join
+    /// simply does not happen.
+    #[test]
+    fn flight_rules_waiver_mismatched_revision_digest_or_pin_joins_nothing() {
+        let fingerprint = waiver_fingerprint("a-1");
+        let probes = [
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved { rule_revision, .. } = kind {
+                    *rule_revision = 3;
+                }
+            }),
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved {
+                    manifest_digest, ..
+                } = kind
+                {
+                    *manifest_digest = "ff".repeat(32);
+                }
+            }),
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved { approval_seq, .. } = kind {
+                    *approval_seq = 99;
+                }
+            }),
+        ];
+        for (idx, probe) in probes.into_iter().enumerate() {
+            let mut events = waiver_matrix_events();
+            events.push(ev(7, probe));
+            let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+            let row = fail_row(&coverage);
+            assert_eq!(
+                row.disposition,
+                RuleDisposition::Failed,
+                "probe {idx} must not join"
+            );
+            assert!(row.evidence[0].waiver.is_none(), "probe {idx}");
+        }
+    }
+
+    /// A finding-fingerprint change invalidates the waiver: a waiver bound
+    /// to one finding covers no other — the block stays.
+    #[test]
+    fn flight_rules_waiver_fingerprint_mismatch_restores_the_block() {
+        let mut events = waiver_matrix_events();
+        // Bound to a DIFFERENT finding's fingerprint (subject a-9, which
+        // no recorded failure carries).
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-9"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Failed);
+        assert!(row.evidence[0].waiver.is_none());
+    }
+
+    /// The unauthorized-actor clause, consumption-side (D-I): a model may
+    /// request a waiver but can never approve one, so an event claiming a
+    /// model/orchestrator/worker surface — or no accountable approver at
+    /// all — carries no authority and the block stands. No engine code
+    /// path emits this event; this is the second fence against a hand-cut
+    /// log laundering model discretion into human approval.
+    #[test]
+    fn flight_rules_waiver_model_or_anonymous_surface_carries_no_authority() {
+        let fingerprint = waiver_fingerprint("a-1");
+        let probes = [
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved { surface, .. } = kind {
+                    *surface = "model".to_string();
+                }
+            }),
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved { surface, .. } = kind {
+                    *surface = "orchestrator".to_string();
+                }
+            }),
+            mutated_waiver(&fingerprint, |kind| {
+                if let EventKind::StandardsWaiverApproved { approver, .. } = kind {
+                    *approver = "  ".to_string();
+                }
+            }),
+        ];
+        for (idx, probe) in probes.into_iter().enumerate() {
+            let mut events = waiver_matrix_events();
+            events.push(ev(7, probe));
+            let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+            assert_eq!(
+                fail_row(&coverage).disposition,
+                RuleDisposition::Failed,
+                "probe {idx} must carry no authority"
+            );
+        }
+    }
+
+    /// A `waivable: false` rule can never be excepted: the record path
+    /// refuses to write the event, and a hand-cut event joins nothing —
+    /// the fold re-checks the pinned waiver posture rather than trusting
+    /// the log (fail closed).
+    #[test]
+    fn flight_rules_waiver_non_waivable_rule_never_joins() {
+        // full_matrix_events pins ZZ-FAIL-001 r2 with waivable: false,
+        // cited by the seq-4 finding.
+        let mut events = full_matrix_events();
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Failed);
+        assert!(row.evidence[0].waiver.is_none());
+    }
+
+    /// The event is additive (AGENTS.md contract rule): the wire name and
+    /// camelCase payload round-trip, an empty path set omits the key, and
+    /// a log without waiver events folds byte-identically to before — no
+    /// `waiver` key materializes anywhere in the machine form.
+    #[test]
+    fn flight_rules_waiver_event_is_additive_and_old_logs_fold_unchanged() {
+        let kind = valid_waiver(&"ef".repeat(32));
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "standards.waiver.approved");
+        assert_eq!(json["payload"]["ruleId"], "ZZ-FAIL-001");
+        assert_eq!(json["payload"]["ruleRevision"], 2);
+        assert_eq!(json["payload"]["manifestDigest"], "ab".repeat(32));
+        assert_eq!(json["payload"]["approvalSeq"], 1);
+        assert_eq!(json["payload"]["findingFingerprint"], "ef".repeat(32));
+        assert_eq!(
+            json["payload"]["paths"],
+            serde_json::json!(["crates/engine/src/x.rs"])
+        );
+        assert_eq!(json["payload"]["diffDigest"], "cd".repeat(32));
+        assert_eq!(
+            json["payload"]["reason"],
+            "upstream false positive, tracked as zz-123"
+        );
+        assert_eq!(json["payload"]["approver"], "local-operator");
+        assert_eq!(json["payload"]["surface"], "cli");
+        assert!(json["payload"]["expiresAt"].is_string());
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::StandardsWaiverApproved { .. }));
+        assert_eq!(back.type_name(), "standards.waiver.approved");
+
+        let sparse = mutated_waiver(&"ef".repeat(32), |kind| {
+            if let EventKind::StandardsWaiverApproved { paths, .. } = kind {
+                paths.clear();
+            }
+        });
+        let json = serde_json::to_value(&sparse).unwrap();
+        assert!(
+            json["payload"].get("paths").is_none(),
+            "an empty path set carries no key: {json}"
+        );
+
+        // Pre-KRZ-344 logs: no waiver events, so no waiver key anywhere.
+        let coverage = standards_coverage("m-1", &full_matrix_events()).expect("a pin folds");
+        let json = serde_json::to_string(&coverage).unwrap();
+        assert!(
+            !json.contains("\"waiver\""),
+            "old logs fold byte-identically: {json}"
         );
     }
 }

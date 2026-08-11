@@ -985,6 +985,79 @@ pub enum EventKind {
         #[serde(rename = "changedRules")]
         changed_rules: Vec<String>,
     },
+
+    /// The Flight Rules human waiver decision (ticket
+    /// `.kranz/tickets/flight-rules-waiver-decisions.md`, KRZ-344; design
+    /// D-I — "waivers are narrow human decisions"): the ONE authorized
+    /// exception path for a standards failure. Only an authenticated human
+    /// surface records it (`kranz standards waive` in this slice) — a model
+    /// may request a waiver or propose a fix but can NEVER approve one, so
+    /// no engine or backend code path emits this event. The binding is
+    /// deliberately narrow enough that the waiver cannot survive a
+    /// meaningful rule/finding/scope/diff change: it names the pinned rule
+    /// id + revision + manifest digest + approval sequence, the fingerprint
+    /// of the EXACT finding it subtracts, the affected paths, and the
+    /// sha256 over the affected-path diff (the whole diff for an unscoped
+    /// rule), plus the reason, the approver, and the expiry. A change to
+    /// the affected-path diff, the rule revision, the finding fingerprint,
+    /// or the pin — or the expiry passing — invalidates the waiver and
+    /// restores the block; unrelated paths receive no authority. It
+    /// subtracts EXACTLY ONE matching standards failure: it never disables
+    /// a checker, an RFC, a domain, or a class, and engine floor gates have
+    /// no waiver slot at all. Audit-only in the reducer: the coverage fold
+    /// joins it straight from the log.
+    #[serde(rename = "standards.waiver.approved")]
+    StandardsWaiverApproved {
+        /// The pinned rule id the waiver excepts (frontmatter `id:`).
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        /// The pinned rule revision — a waiver naming any other revision
+        /// joins nothing.
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        /// sha256 of the approved manifest the waiver binds to
+        /// ([`StandardsPin::digest`]).
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        /// The seq of the `plan.approved` event whose pin the waiver binds
+        /// — a re-approval supersedes every earlier waiver.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        /// sha256 fingerprint of the ONE finding this waiver subtracts
+        /// ([`crate::standards_waiver::finding_fingerprint`]).
+        #[serde(rename = "findingFingerprint")]
+        finding_fingerprint: String,
+        /// The affected paths the bound diff covers: the rule's
+        /// `when-paths` intersected with the mission diff, or the whole
+        /// changed set for an unscoped rule. Recorded so the audit names
+        /// exactly what the digest covers; empty when a scoped rule
+        /// matched no changed path (the waiver then binds the empty
+        /// scoped diff).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        /// sha256 over the affected-path diff bytes at approval time — a
+        /// later change to any affected path digests differently and
+        /// invalidates the waiver.
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        /// The human's reason, verbatim (scrubbed at write like every
+        /// payload string).
+        reason: String,
+        /// The approver principal: the authenticated identity where the
+        /// local authority model can name one, else honestly
+        /// `local-operator` (D-I — never invent a real-world identity).
+        approver: String,
+        /// The authenticated invocation surface (`cli` in this slice).
+        /// The coverage fold honors only recognized human surfaces — a
+        /// hand-cut event claiming a model surface carries no authority.
+        surface: String,
+        /// The expiry instant. The fold judges it against the log's own
+        /// frontier (the latest event instant — never a wall clock, so
+        /// replays stay byte-identical); an enforcement decision re-judges
+        /// it against its own clock.
+        #[serde(rename = "expiresAt")]
+        expires_at: DateTime<Utc>,
+    },
 }
 
 impl EventKind {
@@ -1042,6 +1115,7 @@ impl EventKind {
             EventKind::WorkspaceProviderPinned { .. } => "workspace.provider.pinned",
             EventKind::StandardsResolved { .. } => "standards.resolved",
             EventKind::StandardsDrifted { .. } => "standards.drifted",
+            EventKind::StandardsWaiverApproved { .. } => "standards.waiver.approved",
         }
     }
 

@@ -429,6 +429,25 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             crate::cli::StandardsCommand::Lint { dir, against } => {
                 cmd_standards_lint(&repo, &dir, against.as_deref())
             }
+            crate::cli::StandardsCommand::Waive {
+                rule,
+                revision,
+                finding,
+                reason,
+                expires,
+            } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_waive(
+                    &repo,
+                    &mission,
+                    &rule,
+                    revision,
+                    finding.as_deref(),
+                    &reason,
+                    &expires,
+                    lock_force,
+                )
+            }
         },
         Command::Otel {
             endpoint,
@@ -1707,6 +1726,105 @@ fn cmd_standards_lint(repo: &Path, dir: &Path, against: Option<&str>) -> Result<
             return Ok(1);
         }
     }
+    Ok(0)
+}
+
+/// `kranz standards waive --rule <id> --reason <text> --expires <rfc3339>`
+/// (KRZ-344, design D-I): the one authorized exception path for a
+/// standards failure. The engine validates every refusal shape and appends
+/// `standards.waiver.approved`; this wrapper displays the evidence the
+/// waiver binds. Refusals print plainly and exit 1 — they are operator
+/// feedback, not crashes. The approver is never a flag: the local
+/// authority model cannot name a person, so the record honestly carries
+/// `local-operator` plus the `cli` surface (D-I — a model can request a
+/// waiver but never approve one, and there is no identity to invent).
+#[allow(clippy::too_many_arguments)]
+fn cmd_standards_waive(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    revision: Option<u64>,
+    finding: Option<&str>,
+    reason: &str,
+    expires: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let expires_at = match chrono::DateTime::parse_from_rfc3339(expires) {
+        Ok(parsed) => parsed.with_timezone(&chrono::Utc),
+        Err(err) => {
+            eprintln!("waiver refused: --expires must be an RFC 3339 instant: {err}");
+            return Ok(1);
+        }
+    };
+    let request = kranz_engine::standards_waiver::WaiverRequest {
+        rule_id: rule.to_string(),
+        revision,
+        finding_subject: finding.map(str::to_string),
+        reason: reason.to_string(),
+        expires_at,
+    };
+    let outcome = match kranz_engine::standards_waiver::approve_standards_waiver(
+        repo, mission_id, &request, "cli", force_lock,
+    ) {
+        Ok(outcome) => outcome,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "waiver refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first (a waiver against a live mission would race the \
+                 runner's own appends).\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("waiver refused: {e}");
+            return Ok(1);
+        }
+    };
+    // Display the evidence the waiver binds — the finding, the rule, the
+    // affected paths, and the diff digest — exactly as recorded.
+    let pinned = &outcome.rule;
+    println!(
+        "recorded standards.waiver.approved (seq {})",
+        outcome.event.seq
+    );
+    println!("mission: {mission_id}");
+    println!(
+        "rule: {} r{} — {}, {}; checker {}; waivable: {}",
+        pinned.id,
+        pinned.revision,
+        pinned.level,
+        pinned.effective_status,
+        pinned.checker.as_deref().unwrap_or("-"),
+        pinned.waivable
+    );
+    println!("  statement: {}", pinned.statement);
+    println!(
+        "finding: {} (run {})\n  evidence: {}",
+        outcome.finding_subject, outcome.run_id, outcome.finding_evidence
+    );
+    println!("  fingerprint: sha256:{}", outcome.finding_fingerprint);
+    if pinned.when_paths.is_empty() {
+        println!(
+            "affected paths: the whole mission diff ({} path(s)) — the rule is unscoped",
+            outcome.affected_paths.len()
+        );
+    } else if outcome.affected_paths.is_empty() {
+        println!(
+            "affected paths: (none — the rule's when-paths match no changed path; the \
+             waiver binds the empty scoped diff)"
+        );
+    } else {
+        println!("affected paths: {}", outcome.affected_paths.join(", "));
+    }
+    println!(
+        "diff digest: sha256:{} (covers the affected-path diff at the mission branch tip)",
+        outcome.diff_digest
+    );
+    println!(
+        "approver: {} via cli\nreason: {reason}\nexpires: {}",
+        kranz_engine::standards_waiver::LOCAL_OPERATOR,
+        expires_at.to_rfc3339()
+    );
     Ok(0)
 }
 

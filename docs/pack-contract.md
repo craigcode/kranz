@@ -185,6 +185,32 @@ refused with exit 1, one line per violation naming the rule or RFC.
 - invalid corpus or refused transitions ⇒ nonzero exit naming the
   file/field or the refused transition
 
+## `kranz standards waive --rule <id> --reason <text> --expires <rfc3339>`
+
+The Flight Rules human exception path (KRZ-344, design D-I): records one
+`standards.waiver.approved` event against the mission (selected with
+`--mission`, as usual), excepting exactly one recorded standards failure.
+The command displays the evidence it binds — the finding, the pinned rule,
+the affected paths, and the sha256 over the affected-path diff (the whole
+mission diff for an unscoped rule) — and records the approver honestly as
+`local-operator` plus the `cli` surface. `--revision` and `--finding`
+narrow the target; both default to the pinned revision and the latest
+citing finding.
+
+- the rule declares `waivable: false`, is absent from the approved pin
+  (an expired/retired rule is never pinned), the revision mismatches, no
+  finding cites the rule, a live waiver already covers that finding, the
+  reason is empty, or the expiry is not in the future ⇒ "waiver refused:
+  …", exit 1, nothing appended
+- a live engine holds the mission lock ⇒ refused; stop the mission first
+- otherwise the event is appended and the binding evidence printed, exit 0
+
+A change to the affected-path diff, the rule revision, the finding
+fingerprint, or the pin — or the expiry passing — invalidates the waiver
+and restores the block. There is no `--ignore-standards`, auto-waive,
+wildcard, or permanent default, and no model-driven approval path: a
+model may request a waiver or propose a fix, never approve one.
+
 ## Configuring a mission to run with a pack
 
 Set `packDir` in `.kranz/config.json` (repo layer) or
