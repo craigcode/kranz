@@ -1632,8 +1632,9 @@ mod tests {
         // The stored secret is the db's real passphrase by construction —
         // one string is both written 0600 and fed to create-keychain — and
         // the witnessed first unlock above consumed exactly it.
-        let secret = std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
-        assert!(!secret.is_empty());
+        let unlock_material =
+            std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
+        assert!(!unlock_material.is_empty());
     }
 
     /// macOS: an existing keychain path is never replaced — the seed must
@@ -1765,11 +1766,17 @@ mod tests {
             .join("Library")
             .join("Keychains")
             .join("login.keychain-db");
-        let secret = std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
+        let unlock_material =
+            std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
         assert!(
             security_output(
                 home.path(),
-                &["unlock-keychain", "-p", &secret, db.to_str().unwrap()]
+                &[
+                    "unlock-keychain",
+                    "-p",
+                    &unlock_material,
+                    db.to_str().unwrap(),
+                ]
             )
             .status
             .success(),
