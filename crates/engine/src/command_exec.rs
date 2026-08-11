@@ -1563,28 +1563,38 @@ mod tests {
             "poisoned ambient vars reached the contract command: {output}"
         );
 
-        // A full env dump shows exactly the contract boundary.
-        let (ok, dump) = run_shell_command(dir.path(), "env", &env).await;
-        assert!(ok, "{dump}");
-        for leaked in [
-            "GH_TOKEN",
-            "SLACK_BOT_TOKEN",
-            "AWS_SECRET_ACCESS_KEY",
-            "hunter2",
-        ] {
+        // Inspect names separately from values. `run_shell_command` retains a
+        // bounded output tail, and launcher-managed PATH values can themselves
+        // exceed that bound; a raw `env` dump could therefore discard the
+        // leading `PATH=` and make this boundary test host-PATH-dependent.
+        let (ok, names) =
+            run_shell_command(dir.path(), "env | sed 's/=.*//' | LC_ALL=C sort", &env).await;
+        assert!(ok, "{names}");
+        for leaked in ["GH_TOKEN", "SLACK_BOT_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
             assert!(
-                !dump.contains(leaked),
-                "contract env leaked {leaked}:\n{dump}"
+                !names.lines().any(|name| name == leaked),
+                "contract env leaked {leaked}:\n{names}"
             );
         }
-        assert!(dump.contains("PATH="), "PATH must cross:\n{dump}");
         assert!(
-            dump.contains(&format!("HOME={}", scratch.path().display())),
-            "HOME must be the per-mission scratch:\n{dump}"
+            names.lines().any(|name| name == "PATH"),
+            "PATH must cross:\n{names}"
+        );
+
+        let (ok, managed) = run_shell_command(
+            dir.path(),
+            "printf 'HOME=%s\nKRANZ_BASE_SHA=%s\nCARGO_HOME=%s\n' \"$HOME\" \"$KRANZ_BASE_SHA\" \"$CARGO_HOME\"",
+            &env,
+        )
+        .await;
+        assert!(ok, "{managed}");
+        assert!(
+            managed.contains(&format!("HOME={}", scratch.path().display())),
+            "HOME must be the per-mission scratch:\n{managed}"
         );
         assert!(
-            dump.contains("KRANZ_BASE_SHA=deadbeef"),
-            "base sha must reach the contract env:\n{dump}"
+            managed.contains("KRANZ_BASE_SHA=deadbeef"),
+            "base sha must reach the contract env:\n{managed}"
         );
         let cargo_home = env.get("CARGO_HOME").expect("CARGO_HOME");
         assert!(
@@ -1592,8 +1602,8 @@ mod tests {
             "contract CARGO_HOME must live under mission scratch: {cargo_home}"
         );
         assert!(
-            dump.contains(&format!("CARGO_HOME={cargo_home}")),
-            "cache-only Cargo home must reach the child:\n{dump}"
+            managed.contains(&format!("CARGO_HOME={cargo_home}")),
+            "cache-only Cargo home must reach the child:\n{managed}"
         );
     }
 
