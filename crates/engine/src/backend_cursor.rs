@@ -178,20 +178,122 @@ fn session_keychain_secret_path(home: &Path) -> PathBuf {
 /// interactive auth (see the invariant above [`SESSION_KEYCHAIN_LOCK_SECS`])
 /// — currently just `lock-keychain` at session teardown; passphrase-carrying
 /// work goes through [`security_script_in_session_home`].
+///
+/// Bounded by [`SECURITY_TIMEOUT`]: a locked keychain makes `security` park
+/// on a GUI approval forever (observed live 2026-08-10, a 20-minute gate
+/// hang), so every spawn goes through the one bounded helper and a timeout
+/// surfaces as `Err(TimedOut)` — unavailable-not-authorized, never a hang.
 #[cfg(target_os = "macos")]
 fn security_in_session_home(home: &Path, args: &[&std::ffi::OsStr]) -> std::io::Result<bool> {
-    let mut cmd = std::process::Command::new("security");
+    let output = security_bounded(home, args, None)?;
+    Ok(output.status.success())
+}
+
+/// Hard ceiling on any `security` invocation: a healthy subcommand answers in
+/// well under a second; anything past the bound is a locked keychain waiting
+/// on a GUI approval that will never come in a headless session.
+#[cfg(target_os = "macos")]
+const SECURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The one bounded `security` spawn (ticket security-cli-invocation-timeout):
+/// every `security` call in the engine goes through here so a locked keychain
+/// can never park a gate or a spawn. Polls `try_wait` against
+/// [`SECURITY_TIMEOUT`], kills the child on expiry, and reports the timeout
+/// as `Err(TimedOut)` naming the bound. `stdin_script`, when present, is fed
+/// to the child on a pipe (the `security -i` batch form).
+#[cfg(target_os = "macos")]
+fn security_bounded(
+    home: &Path,
+    args: &[&std::ffi::OsStr],
+    stdin_script: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    security_bounded_with_timeout(
+        Path::new("security"),
+        home,
+        args,
+        stdin_script,
+        SECURITY_TIMEOUT,
+    )
+}
+
+/// [`security_bounded`] with an explicit binary path and timeout — the unit
+/// under test for the locked-keychain hang regression (a stub `security`
+/// that sleeps forever must fail fast, never hang the caller). The production
+/// wrapper pins the binary to `security` resolved through the pinned
+/// `/usr/bin:/bin` PATH; only tests substitute a stub path.
+#[cfg(target_os = "macos")]
+fn security_bounded_with_timeout(
+    binary: &Path,
+    home: &Path,
+    args: &[&std::ffi::OsStr],
+    stdin_script: Option<&str>,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    let mut cmd = std::process::Command::new(binary);
     cmd.args(args)
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin");
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if stdin_script.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
     if let Ok(user) = std::env::var("USER") {
         cmd.env("USER", user);
     }
     // HOME is pinned to the session home so any preference side effect
     // lands in the scratch tree, never in the operator's real keychain
     // search list.
-    cmd.status().map(|status| status.success())
+    let mut child = cmd.spawn()?;
+    if let Some(script) = stdin_script {
+        if let Some(mut stdin) = child.stdin.take() {
+            // A broken pipe means the process died before reading; the wait
+            // below surfaces the real status.
+            let _ = stdin.write_all(script.as_bytes());
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "security did not exit within {}s (killed; locked keychain?)",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+    };
+    // The process has exited, so both pipes are at EOF and drain immediately.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Run `security -i` with `script` fed on stdin: the one-shot commands have
@@ -199,30 +301,13 @@ fn security_in_session_home(home: &Path, args: &[&std::ffi::OsStr]) -> std::io::
 /// keep secrets out of argv (see the seed's doc above). stdout is dropped
 /// (interactive mode may echo prompts); stderr is captured for the
 /// failure warning — callers must redact any secret before logging it.
+/// Bounded by [`SECURITY_TIMEOUT`] like every `security` spawn.
 #[cfg(target_os = "macos")]
 fn security_script_in_session_home(
     home: &Path,
     script: &str,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = std::process::Command::new("security");
-    cmd.arg("-i")
-        .env_clear()
-        .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    if let Ok(user) = std::env::var("USER") {
-        cmd.env("USER", user);
-    }
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        // A broken pipe means the process died before reading; the wait
-        // below surfaces the real status.
-        let _ = stdin.write_all(script.as_bytes());
-    }
-    child.wait_with_output()
+    security_bounded(home, &[std::ffi::OsStr::new("-i")], Some(script))
 }
 
 /// Write the per-session keychain passphrase 0600 (mode forced even when
@@ -1460,6 +1545,42 @@ mod tests {
         assert!(
             seeded.join("agent-cli-state.json").is_file(),
             "validator-path HOME must carry the seeded agent-cli-state.json"
+        );
+    }
+
+    /// A `security` invocation against a locked keychain parks on a GUI
+    /// approval forever (the 2026-08-10 gate hang). The bounded helper must
+    /// kill the child at the deadline and fail with `TimedOut` naming the
+    /// bound — never hang. Regression: a stub `security` that sleeps 30s is
+    /// killed at the 1s test bound.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_bounded_kills_a_locked_keychain_hang_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-security");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = security_bounded_with_timeout(
+            &stub,
+            home.path(),
+            &[std::ffi::OsStr::new("find-generic-password")],
+            None,
+            std::time::Duration::from_secs(1),
+        );
+
+        let error = result.expect_err("a hung security must be reported as timed out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            error.to_string().contains("did not exit within 1s"),
+            "the error names the bound: {error}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "killed at the deadline, not after the stub's 30s sleep"
         );
     }
 
