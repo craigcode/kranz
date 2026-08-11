@@ -3,6 +3,8 @@ title: Flight Rules resolution, approval pinning, and policy-drift refusal
 priority: 1
 schedule: once
 blocked-by: [flight-rules-pack-contract]
+state: done
+state-note: Implemented — pack/resolution.rs (deterministic resolver, approval_pin, merge_drift), additive standardsManifest contract, standards.resolved/standards.drifted events, final-validation park + merge refusal. 22 flight_rules_pin_* tests; workspace gates green.
 ---
 
 ## Goal
