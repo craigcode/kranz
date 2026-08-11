@@ -13,14 +13,17 @@ boundary made mechanical: **kranz core stays domain-free; domain knowledge
 The contract **extends** the existing pack concept
 (`packaging/gascity/pack.toml`, schema 2, `docs/gascity-citizenship.md`) —
 it is not a second mechanism. The schema-2 base manifest is a valid pack
-that simply registers nothing; schema 3 adds the declaration sections.
+that simply registers nothing; schema 3 adds the declaration sections;
+schema 4 adds the optional `[standards]` root (the Flight Rules corpus,
+KRZ-341 — see below).
 
 ## pack.toml schema
 
 ```toml
 [pack]
 name = "acme-standards"     # required, non-empty
-schema = 3                  # required: 2 (base manifest) or 3 (contract)
+schema = 3                  # required: 2 (base manifest), 3 (contract),
+                            # or 4 (contract + [standards])
 
 # Zero or more DETERMINISTIC gates. They run at the mission's final gate,
 # AFTER the engine floor gates, through the same GatePipeline — advisory,
@@ -62,7 +65,70 @@ items = ["changelog updated", "version bumped"]
 [[artefact_store]]
 name = "evidence"
 kind = "local-dir"
+
+# Schema 4 only (KRZ-341): the optional Flight Rules standards root. A
+# [standards] section at schema 2/3 is a load error naming the field;
+# unknown keys inside it fail closed.
+# [standards]
+# root = "standards"        # pack-relative directory holding the RFC corpus
 ```
+
+## The standards corpus (schema 4, KRZ-341)
+
+Ticket: `.kranz/tickets/flight-rules-pack-contract.md`; design:
+`docs/scoping/flight-rules-engineering-standards.md` (D-A through D-C, D-F,
+D-J). Implementation: `crates/engine/src/pack/standards.rs`.
+
+A schema-4 pack may carry a governed standards corpus — human-readable RFCs
+containing stable machine-readable rules:
+
+```text
+<root>/RFC-014-slug/rfc.md            # one directory per RFC
+<root>/RFC-014-slug/rules/RULE-ID.md  # flat rule files, one rule each
+```
+
+`rfc.md` frontmatter: `id`, `title`, `owner`, `status` (`draft` /
+`approved` / `enforced` / `retired`), optional RFC3339 `effective-at`,
+optional `supersedes` list. Rule frontmatter: `id`, positive `revision`,
+`rfc` (parent id), `level` (`must` / `should`), `status` (`active` /
+`retired`), one-line `statement`, `domains` and `stages` lists
+(`planning` / `implementation` / `validation` / `merge`), optional
+`when-paths` and `task-classes`, optional typed `checker`
+(`gate:<declared-pack-gate>` / `agent-judgement` / `manual-attestation`),
+and `waivable` (default `false` — fail-closed).
+
+The load is strict and bounded (D-J):
+
+- **Frontmatter is a hand-written subset** (no YAML dependency, the same
+  call as the TOML subset): `key: value` scalars, `key: [a, b]` inline
+  lists, double-quoted strings, `#` comments. Anchors, aliases, tags,
+  block scalars, single-quoted strings, nested/block values, tabs, and
+  unknown or duplicate fields are all load errors naming file and field.
+- **Traversal is capability-relative and no-follow**: regular UTF-8 files
+  only; symlinked parents/leaves, FIFOs/devices, and hidden files are
+  refused, never followed. Caps fail promptly: 256 KiB per file, 512
+  files, 256 rules, 1 MiB total normalized bytes
+  (`MAX_STANDARDS_*` constants).
+- **Identity is frontmatter IDs, never paths** (D-C): IDs are pack-wide
+  unique across RFCs and rules; renaming a file preserves the digest. The
+  sha256 digest covers the normalized metadata of every RFC/rule (sorted
+  by id, lists sorted/deduplicated) PLUS the declarations of referenced
+  pack gates — changing a referenced checker changes the digest. Markdown
+  prose bodies are never hashed (rationale, not a second machine
+  authority).
+- **Lifecycle is checked at load and across refs** (D-B/D-C/D-F): draft
+  rules may omit a checker; an approved/enforced rule must bind one.
+  Retirement is a one-way tombstone. `kranz standards lint --against
+  <ref>` reads the base from tracked git blobs (never the worktree) and
+  refuses absent/draft → enforced transitions, semantic rule changes
+  (statement/level/stages/when-paths/task-classes/checker/waivable)
+  without a revision increment, disappeared known rule IDs, and tombstone
+  reactivation.
+- **Trust boundary** (D-A/D-J): a tracked, repo-relative pack may activate
+  enforced rules. An external/untracked pack loads approved advisory rules
+  but enforced content is a load error naming the remedy (vendor the pack
+  into the repo as a tracked, repo-relative `packDir`).
+
 
 The manifest is parsed by a **deliberate TOML subset**
 (`crates/engine/src/pack/toml.rs`): `[table]` / `[[array-of-tables]]`
@@ -96,11 +162,28 @@ offending field** — never a silently-skipped section:
 
 Fully local lint surface: loads and validates a pack directory and prints
 what registered (gates with commands and scoping, prompts with role
-targets and sources, declaration-only checklists and artefact stores).
+targets and sources, declaration-only checklists and artefact stores; for
+a schema-4 pack, the standards registration — RFC/rule counts and the
+content digest).
 
 - valid pack ⇒ the registration report, exit 0
 - no `pack.toml` ⇒ "no pack at \<dir\> — nothing to lint", exit 0
 - invalid pack ⇒ nonzero exit, the error naming the offending field
+
+## `kranz standards lint <dir> [--against <ref>]`
+
+The Flight Rules lint surface (KRZ-341): prints the pack's normalized
+standards manifest — every RFC and rule with its effective lifecycle
+status, checker binding, and scopes, plus the sha256 content digest and
+the trust posture the loader applied. With `--against <ref>`, the base
+pack is read from tracked blobs at that git ref (`git show` / `git
+ls-tree`, never the worktree) and lifecycle transition violations are
+refused with exit 1, one line per violation naming the rule or RFC.
+
+- valid corpus, clean transitions ⇒ the manifest report, exit 0
+- a pack without `[standards]` ⇒ "…declares no [standards] root", exit 0
+- invalid corpus or refused transitions ⇒ nonzero exit naming the
+  file/field or the refused transition
 
 ## Configuring a mission to run with a pack
 
@@ -149,3 +232,8 @@ unaffected.
   means the slices that consume them need no schema rework.
 - **Approval-time pack gates** — pack gates join the final-gate evaluation
   only; the approval surface keeps the engine floor alone.
+- **Standards resolution, approval pinning, and enforcement** — KRZ-341
+  lands the schema-4 corpus contract, loader, digest, and lifecycle lint
+  only. Deterministic applicability resolution, the approved mission
+  manifest, drift refusal, stage projections, and checker execution are
+  the KRZ-342–346 slices (docs/scoping/flight-rules-engineering-standards.md).

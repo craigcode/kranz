@@ -609,6 +609,15 @@ pub enum Command {
         #[command(subcommand)]
         command: PackCommand,
     },
+
+    /// Work with Flight Rules standards (KRZ-341): the schema-4 pack
+    /// standards corpus — RFCs, rules, the normalized manifest + content
+    /// digest, and the lifecycle transition lint
+    /// (docs/scoping/flight-rules-engineering-standards.md)
+    Standards {
+        #[command(subcommand)]
+        command: StandardsCommand,
+    },
 }
 
 /// Subcommands under `kranz pack` — the pack contract surface (ticket
@@ -626,6 +635,32 @@ pub enum PackCommand {
     Lint {
         /// The pack directory containing pack.toml
         dir: PathBuf,
+    },
+}
+
+/// Subcommands under `kranz standards` — the Flight Rules surface (ticket
+/// `.kranz/tickets/flight-rules-pack-contract.md`, KRZ-341).
+#[derive(Subcommand, Debug)]
+pub enum StandardsCommand {
+    /// Load a pack's [standards] corpus and print the normalized manifest:
+    /// every RFC and rule with its effective lifecycle status, checker
+    /// binding, and scopes, plus the sha256 content digest and the trust
+    /// posture (an external/untracked pack is advisory-only — enforced rules
+    /// are refused at load naming the remedy).
+    ///
+    /// With --against <ref>, the base pack is read from TRACKED BLOBS at
+    /// that git ref (never the worktree) and lifecycle transition violations
+    /// are refused: absent/draft → enforced, a semantic rule change without
+    /// a revision increment, a disappeared known rule ID, tombstone
+    /// reactivation. Exit 0 clean, 1 on load errors or refused transitions.
+    Lint {
+        /// The pack directory containing pack.toml
+        dir: PathBuf,
+
+        /// Base git ref (branch or sha) whose tracked pack bytes define the
+        /// approved lifecycle state for the transition check
+        #[arg(long, value_name = "REF")]
+        against: Option<String>,
     },
 }
 
@@ -834,6 +869,38 @@ mod tests {
                 PackCommand::Lint { dir } => assert_eq!(dir, PathBuf::from("some/dir")),
             },
             other => panic!("expected Pack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flight_rules_contract_standards_lint_parses_dir_and_against() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "lint", "some/dir"]).unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against, None);
+                }
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "lint",
+            "some/dir",
+            "--against",
+            "main",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against.as_deref(), Some("main"));
+                }
+            },
+            other => panic!("expected Standards, got {other:?}"),
         }
     }
 

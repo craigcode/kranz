@@ -54,6 +54,11 @@
 
 mod toml;
 
+/// The Flight Rules standards corpus (KRZ-341): the additive schema-4
+/// `[standards]` root, its strict RFC/rule loader, the normalized manifest +
+/// content digest, and the lifecycle transition lint.
+pub mod standards;
+
 use crate::gate::{ArtefactRef, Gate, GateKind, GateOutcome};
 use crate::types::{MissionConfig, Role};
 use std::collections::HashSet;
@@ -70,6 +75,12 @@ pub const SCHEMA_BASE: u32 = 2;
 /// The current contract version: the base manifest plus the `[[gate]]`,
 /// `[[prompt]]`, `[[checklist]]`, and `[[artefact_store]]` sections.
 pub const SCHEMA_CONTRACT: u32 = 3;
+
+/// The Flight Rules standards version (KRZ-341): the contract sections plus
+/// the optional `[standards] root = "..."` key. A `[standards]` section at
+/// schema 2/3 is a load error naming the field — the corpus loads only
+/// where its lifecycle can be reasoned about.
+pub const SCHEMA_STANDARDS: u32 = 4;
 
 /// Engine gate names a pack gate may never claim. The first four are the
 /// contract-defect floor gates ([`crate::contract_gates`]); `merge-gate-suite`
@@ -98,6 +109,12 @@ pub struct Pack {
     pub prompts: Vec<PackPrompt>,
     pub checklists: Vec<PackChecklist>,
     pub artefact_stores: Vec<PackArtefactStore>,
+    /// The loaded Flight Rules standards corpus (KRZ-341) — `Some` exactly
+    /// when a schema-4 manifest declares `[standards] root`. Loaded EAGERLY
+    /// at pack load (same fail-closed posture as every other section): a
+    /// configured pack whose corpus cannot be fully accounted for is a load
+    /// error, never a quiet skip.
+    pub standards: Option<standards::StandardsManifest>,
 }
 
 /// One declared deterministic gate. Runs at the final gate (advisory, like
@@ -151,26 +168,56 @@ impl Pack {
     /// is not a pack (no `pack.toml`) — the lint surface says so plainly;
     /// config-pointed loads ([`load_for_config`]) turn it into an error.
     /// Any contract violation is an `Err` naming the offending field.
+    ///
+    /// Equivalent to [`Self::load_with_trust`] with
+    /// [`standards::StandardsTrust::External`] — the fail-closed default for
+    /// a directory whose repo relationship the caller has not established.
     pub fn load(dir: &Path) -> Result<Option<Pack>, String> {
+        Self::load_with_trust(dir, standards::StandardsTrust::External)
+    }
+
+    /// [`Self::load`] with an explicit Flight Rules trust level (KRZ-341
+    /// D-A/D-J): an external/untracked pack may carry approved advisory
+    /// rules, but an effectively ENFORCED rule fails the load naming the
+    /// trust remedy.
+    pub fn load_with_trust(
+        dir: &Path,
+        trust: standards::StandardsTrust,
+    ) -> Result<Option<Pack>, String> {
         let manifest_path = dir.join(PACK_MANIFEST);
         let source = match std::fs::read_to_string(&manifest_path) {
             Ok(source) => source,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("cannot read {}: {e}", manifest_path.display())),
         };
-        Self::parse(dir, &source).map(Some)
+        Self::parse_with_trust(dir, &source, trust).map(Some)
     }
 
     /// Parse and validate a manifest's text (the load path minus the file
-    /// read, so tests exercise the identical validation).
+    /// read, so tests exercise the identical validation). Trust defaults to
+    /// [`standards::StandardsTrust::External`]; the corpus walk still reads
+    /// `dir` (standards root, prompt textFiles).
     pub fn parse(dir: &Path, source: &str) -> Result<Pack, String> {
+        Self::parse_with_trust(dir, source, standards::StandardsTrust::External)
+    }
+
+    /// [`Self::parse`] with an explicit Flight Rules trust level.
+    pub fn parse_with_trust(
+        dir: &Path,
+        source: &str,
+        trust: standards::StandardsTrust,
+    ) -> Result<Pack, String> {
         let doc = toml::parse(source).map_err(|e| format!("{PACK_MANIFEST}: {e}"))?;
-        Self::from_document(dir, &doc)
+        Self::from_document(dir, &doc, trust)
     }
 
     /// Semantic validation over the parsed document: strict per-section
     /// fields, types, uniqueness, and the engine-name reservation.
-    fn from_document(dir: &Path, doc: &toml::Document) -> Result<Pack, String> {
+    fn from_document(
+        dir: &Path,
+        doc: &toml::Document,
+        trust: standards::StandardsTrust,
+    ) -> Result<Pack, String> {
         // Unknown SECTIONS fail closed too — a mistyped `[[gates]]` must not
         // silently register nothing.
         for section in &doc.sections {
@@ -178,39 +225,24 @@ impl Pack {
                 toml::Section::Single(t) => t.name.as_str(),
                 toml::Section::Array { name, .. } => name.as_str(),
             };
-            if !["pack", "gate", "prompt", "checklist", "artefact_store"].contains(&name) {
+            if ![
+                "pack",
+                "gate",
+                "prompt",
+                "checklist",
+                "artefact_store",
+                "standards",
+            ]
+            .contains(&name)
+            {
                 return Err(format!(
                     "{PACK_MANIFEST}: unknown section `{name}` (declared sections: [pack], \
-                     [[gate]], [[prompt]], [[checklist]], [[artefact_store]])"
+                     [[gate]], [[prompt]], [[checklist]], [[artefact_store]], [standards])"
                 ));
             }
         }
 
-        let header = doc
-            .single("pack")
-            .ok_or_else(|| format!("{PACK_MANIFEST}: missing required table `[pack]`"))?;
-        check_unknown(header, "[pack]", &["name", "schema"])?;
-        let name = required_string(header, "[pack]", "name")?;
-        let schema = match header.get("schema") {
-            Some(toml::Value::Integer(n)) => {
-                let n = *n;
-                if n == i64::from(SCHEMA_BASE) || n == i64::from(SCHEMA_CONTRACT) {
-                    n as u32
-                } else {
-                    return Err(format!(
-                        "[pack] field `schema` is {n}: supported versions are {SCHEMA_BASE} \
-                         (base manifest) and {SCHEMA_CONTRACT} (contract)"
-                    ));
-                }
-            }
-            Some(v) => {
-                return Err(format!(
-                    "[pack] field `schema` must be an integer, got {}",
-                    v.type_name()
-                ))
-            }
-            None => return Err("[pack] is missing required field `schema`".to_string()),
-        };
+        let (name, schema) = manifest_header(doc)?;
 
         let mut gates = Vec::new();
         for (idx, item) in doc.array("gate").iter().enumerate() {
@@ -239,6 +271,14 @@ impl Pack {
             artefact_stores.iter().map(|s| s.name.as_str()),
         )?;
 
+        // Schema 4's additive section: a declared standards root loads its
+        // corpus EAGERLY (checker bindings resolve against this pack's
+        // gates), so every consuming surface sees the fully-accounted pack.
+        let standards = match standards_root_of(doc, schema)? {
+            Some(root) => Some(standards::load_from_pack_dir(dir, &root, &gates, trust)?),
+            None => None,
+        };
+
         Ok(Pack {
             name,
             schema,
@@ -247,6 +287,7 @@ impl Pack {
             prompts,
             checklists,
             artefact_stores,
+            standards,
         })
     }
 
@@ -292,10 +333,21 @@ impl Pack {
             .map(|p| format!("{}→{}", p.name, role_target_name(p.role)))
             .collect::<Vec<_>>()
             .join(", ");
+        // Standards summary only when a schema-4 pack declared a corpus —
+        // schema 2/3 and no-pack output stay byte-identical.
+        let standards = match &self.standards {
+            Some(m) => format!(
+                ", standards: {} RFC(s)/{} rule(s) digest sha256:{}",
+                m.rfcs.len(),
+                m.rules.len(),
+                m.digest
+            ),
+            None => String::new(),
+        };
         format!(
             "pack `{}` (schema {}) at {}: {} gate(s) [{}], {} prompt(s) [{}], \
              {} checklist(s), {} artefact store(s) (checklists/stores are \
-             declaration-only: validated at load, never executed)",
+             declaration-only: validated at load, never executed){standards}",
             self.name,
             self.schema,
             self.dir.display(),
@@ -313,15 +365,23 @@ impl Pack {
 /// not absolute). No key ⇒ `Ok(None)` — the byte-identical pack-less path.
 /// A key pointing at a non-directory or a non-pack is a misconfiguration
 /// and fails closed, exactly like an invalid manifest.
+///
+/// Flight Rules trust (KRZ-341 D-A/D-J): a repo-relative `packDir` is the
+/// tracked, base-ownable shape ([`standards::StandardsTrust::RepoTracked`]);
+/// an ABSOLUTE path points outside the repo's history and is
+/// [`standards::StandardsTrust::External`] — advisory rules load, enforced
+/// ones fail closed naming the remedy. (Reading repo-relative packs from
+/// the pinned base tree rather than the worktree is the next slice,
+/// KRZ-342; [`standards::load_at_ref`] already provides it for the lint.)
 pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<Pack>, String> {
     let Some(configured) = cfg.pack_dir.as_deref() else {
         return Ok(None);
     };
     let raw = Path::new(configured);
-    let dir = if raw.is_absolute() {
-        raw.to_path_buf()
+    let (dir, trust) = if raw.is_absolute() {
+        (raw.to_path_buf(), standards::StandardsTrust::External)
     } else {
-        repo_root.join(raw)
+        (repo_root.join(raw), standards::StandardsTrust::RepoTracked)
     };
     if !dir.is_dir() {
         return Err(format!(
@@ -329,7 +389,7 @@ pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<P
             dir.display()
         ));
     }
-    let Some(pack) = Pack::load(&dir)? else {
+    let Some(pack) = Pack::load_with_trust(&dir, trust)? else {
         return Err(format!(
             "packDir `{configured}` resolves to {}, which has no {PACK_MANIFEST} — \
              it is not a pack",
@@ -396,6 +456,9 @@ pub fn render_lint(pack: &Pack) -> String {
     for store in &pack.artefact_stores {
         out.push_str(&format!("  - {} (kind `{}`)\n", store.name, store.kind));
     }
+    if let Some(manifest) = &pack.standards {
+        out.push_str(&standards::render_registration(manifest));
+    }
     out
 }
 
@@ -455,6 +518,69 @@ impl Gate for PackGate {
 // ---------------------------------------------------------------------------
 // Per-section validation
 // ---------------------------------------------------------------------------
+
+/// The `[pack]` header: name + schema version, with the strict field/type
+/// checks every load path shares. Factored out of `from_document` so the
+/// Flight Rules base-ref loader ([`standards::load_at_ref`]) validates a
+/// tracked pack.toml through the SAME code as a worktree load.
+fn manifest_header(doc: &toml::Document) -> Result<(String, u32), String> {
+    let header = doc
+        .single("pack")
+        .ok_or_else(|| format!("{PACK_MANIFEST}: missing required table `[pack]`"))?;
+    check_unknown(header, "[pack]", &["name", "schema"])?;
+    let name = required_string(header, "[pack]", "name")?;
+    let schema = match header.get("schema") {
+        Some(toml::Value::Integer(n)) => {
+            let n = *n;
+            if n == i64::from(SCHEMA_BASE)
+                || n == i64::from(SCHEMA_CONTRACT)
+                || n == i64::from(SCHEMA_STANDARDS)
+            {
+                n as u32
+            } else {
+                return Err(format!(
+                    "[pack] field `schema` is {n}: supported versions are {SCHEMA_BASE} \
+                     (base manifest), {SCHEMA_CONTRACT} (contract), and {SCHEMA_STANDARDS} \
+                     (standards)"
+                ));
+            }
+        }
+        Some(v) => {
+            return Err(format!(
+                "[pack] field `schema` must be an integer, got {}",
+                v.type_name()
+            ))
+        }
+        None => return Err("[pack] is missing required field `schema`".to_string()),
+    };
+    Ok((name, schema))
+}
+
+/// The normalized `[standards] root` path, when declared (KRZ-341). The
+/// section is valid ONLY at schema 4 — at schema 2/3 it is a load error
+/// naming the field — and unknown keys inside it fail closed. The root is a
+/// pack-relative path without parent components, normalized like every
+/// other pack path.
+fn standards_root_of(doc: &toml::Document, schema: u32) -> Result<Option<String>, String> {
+    let Some(table) = doc.single("standards") else {
+        return Ok(None);
+    };
+    if schema != SCHEMA_STANDARDS {
+        return Err(format!(
+            "[standards] requires [pack] field `schema` = {SCHEMA_STANDARDS} (this pack \
+             declares schema {schema}) — the standards root is additive at schema \
+             {SCHEMA_STANDARDS} only"
+        ));
+    }
+    check_unknown(table, "[standards]", &["root"])?;
+    let raw = required_string(table, "[standards]", "root")?;
+    validate_pack_relative_path(&raw, "[standards]", "root")?;
+    let normalized = crate::merge_gate::normalize_relative_path(&raw, false);
+    if normalized.is_empty() || normalized == "." {
+        return Err("[standards] field `root` must name a pack-relative directory".to_string());
+    }
+    Ok(Some(normalized))
+}
 
 /// A stable label for one `[[section]]` item, carrying its declared name
 /// when readable so errors point at the entry AND the field.
@@ -965,9 +1091,9 @@ kind = "local-dir"
 
     #[test]
     fn pack_contract_unsupported_schema_fails_closed() {
-        let (_tmp, dir) = pack_dir_with("[pack]\nname = \"x\"\nschema = 4\n", &[]);
+        let (_tmp, dir) = pack_dir_with("[pack]\nname = \"x\"\nschema = 5\n", &[]);
         let err = Pack::load(&dir).expect_err("must fail");
-        assert!(err.contains("field `schema` is 4"), "{err}");
+        assert!(err.contains("field `schema` is 5"), "{err}");
     }
 
     #[test]
