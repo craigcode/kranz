@@ -33,6 +33,7 @@ pub mod corpus_export;
 pub mod cost;
 pub mod decompose;
 pub mod deps;
+pub mod disk_preflight;
 pub mod domain_lint;
 pub mod egress_proxy;
 pub mod escalation_metrics;

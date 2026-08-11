@@ -325,6 +325,39 @@ where
                     }
                 }
 
+                // Disk-footprint preflight (ticket mission-build-footprint):
+                // refuse to START a mission whose build ladder won't fit in
+                // the free space under the repo, naming the estimate, rather
+                // than dying mid-feature with os error 28. Unmeasurable free
+                // space degrades to proceed (never a fabricated refusal).
+                if let crate::disk_preflight::DiskPreflight::Insufficient {
+                    free_bytes,
+                    estimate_bytes,
+                } = crate::disk_preflight::check(repo_root)
+                {
+                    let reason = format!(
+                        "insufficient disk for the mission build ladder: {} free < {} estimated \
+                         (free space or raise the estimate)",
+                        crate::disk_preflight::gib(free_bytes),
+                        crate::disk_preflight::gib(estimate_bytes)
+                    );
+                    tracing::warn!(mission = %mission_id, reason = %reason, "parking claimed mission: disk preflight");
+                    queue::finish_claim(claim);
+                    if let Some(slug) = &ticket_slug {
+                        Ticket::write_state(
+                            repo_root,
+                            slug,
+                            TicketState::Parked,
+                            Some(format!("parked (disk): {reason}")),
+                        )?;
+                    }
+                    report.parked.push(mission_id);
+                    if once {
+                        return Ok(report);
+                    }
+                    continue;
+                }
+
                 if let Some(slug) = &ticket_slug {
                     if let Some(blocker) = work_skip_for_failed_blocker(repo_root, slug)? {
                         queue::finish_claim(claim);
