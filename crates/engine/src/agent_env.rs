@@ -289,13 +289,59 @@ fn link_cargo_cache(name: &str, from: &Path, to: &Path) {
     }
 }
 
+/// The operator's home directory from the OS account record (`getpwuid_r`),
+/// NOT the ambient `HOME` env var (ticket contract-toolchain-home-os-account).
+/// In env_clear'd / sandboxed gate contexts `HOME` is absent or points at a
+/// relocated scratch dir, so deriving CARGO_HOME/RUSTUP_HOME from it silently
+/// degrades (the m-eee81f workers each misread this as an in-scope bug). The
+/// passwd entry is the operator's real home regardless of the process env.
+/// `HOME` is consulted only as a fallback when the account record is
+/// unavailable, and the toolchain env vars themselves remain the explicit
+/// override (handled in [`toolchain_var_value`]).
+#[cfg(unix)]
+fn os_account_home() -> Option<PathBuf> {
+    // getpwuid_r (the reentrant form): the engine is a multi-threaded tokio
+    // process, so the static-buffer getpwuid is not sound here. pw_dir points
+    // into `buf`; copy it to an owned PathBuf before returning.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0_u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+    (!home.is_empty()).then(|| PathBuf::from(home))
+}
+
+/// The operator's toolchain home: the OS account record on Unix, falling back
+/// to the ambient `HOME` env var only when the account record is unavailable
+/// (non-Unix, or a passwd-less container). See [`os_account_home`].
+fn operator_home() -> Option<PathBuf> {
+    #[cfg(unix)]
+    if let Some(home) = os_account_home() {
+        return Some(home);
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 /// The value a toolchain var resolves to for a child env: ambient when set,
 /// else `<real home>/<default_subdir>` when that directory exists.
 fn toolchain_var_value(var: &str, default_subdir: &str) -> Option<String> {
     if let Some(value) = std::env::var_os(var) {
         return Some(value.to_string_lossy().into_owned());
     }
-    let real_home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let real_home = operator_home()?;
     let candidate = real_home.join(default_subdir);
     candidate.is_dir().then(|| candidate.display().to_string())
 }
@@ -826,6 +872,66 @@ mod tests {
     /// CARGO_HOME must instead be isolated under scratch. Proven by actually
     /// executing Cargo under the generated env.
     #[cfg(unix)]
+    /// Ticket contract-toolchain-home-os-account: with `HOME` UNSET in the
+    /// engine's own env (the env_clear'd / sandboxed gate shape), the
+    /// toolchain derivation must fall to the OS account record, not silently
+    /// degrade to None. On a normal host the account record equals `$HOME`.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_home_os_account_resolves_when_home_is_unset() {
+        let real_home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let _guard = EnvTestGuard::engage_unsetting(&[], &["HOME", "CARGO_HOME", "RUSTUP_HOME"]);
+
+        // The account record is the source now — HOME is gone, yet the
+        // resolved operator home is still the operator's real home.
+        let account_home = os_account_home().expect("this host has a passwd entry");
+        assert_eq!(account_home, real_home, "account record == $HOME here");
+        assert_eq!(operator_home().as_deref(), Some(real_home.as_path()));
+
+        // And the derivation still resolves the operator's real toolchain
+        // dirs (only asserted when present, so the test is host-independent).
+        if real_home.join(".rustup").is_dir() {
+            assert_eq!(
+                toolchain_var_value("RUSTUP_HOME", ".rustup"),
+                Some(real_home.join(".rustup").display().to_string())
+            );
+        }
+    }
+
+    /// The toolchain env var remains an explicit override: it wins even when
+    /// the OS account record disagrees.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_home_os_account_env_var_is_still_an_explicit_override() {
+        let _guard = EnvTestGuard::engage(&[("RUSTUP_HOME", "/explicit/override")]);
+        assert_eq!(
+            toolchain_var_value("RUSTUP_HOME", ".rustup"),
+            Some("/explicit/override".to_string()),
+            "an explicit toolchain env var always wins"
+        );
+    }
+
+    /// The agent-session env shape is byte-identical (ticket's "do not weaken
+    /// env_clear + scratch HOME" invariant): with HOME set normally, the
+    /// toolchain derivation lands on the same operator home it always did.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_home_os_account_keeps_session_env_shape_unchanged() {
+        let _guard = EnvTestGuard::engage_unsetting(&[], &["CARGO_HOME", "RUSTUP_HOME"]);
+        let real_home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let env = contract_command_env(scratch.path(), None, &[]);
+
+        if real_home.join(".rustup").is_dir() {
+            assert_eq!(
+                env.get("RUSTUP_HOME").map(String::as_str),
+                Some(real_home.join(".rustup").display().to_string().as_str()),
+                "RUSTUP_HOME still derives from the operator's real home"
+            );
+        }
+    }
+
     #[test]
     fn contract_env_derives_toolchain_homes_from_the_real_home_and_cargo_runs() {
         let _guard = EnvTestGuard::engage_unsetting(&[], &["RUSTUP_HOME", "CARGO_HOME"]);
