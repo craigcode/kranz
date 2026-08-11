@@ -3238,6 +3238,9 @@ impl MissionEngine {
             // The seed-time route record rides every worker spawn (ticket
             // routing-rules-config) — folded state, identical on resume.
             let executor_route = self.state.mission.executor_route.clone();
+            // Flight Rules (KRZ-345): the approved standards pin projects
+            // the implementation-stage rules into the worker prompt.
+            let standards_pin = self.state.mission.standards_manifest.clone();
             let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
                 let session_cwd = self.active_root().to_path_buf();
                 runner::run_worker_in(
@@ -3258,6 +3261,7 @@ impl MissionEngine {
                     auth_verdict,
                     &touch_set,
                     executor_route.clone(),
+                    standards_pin.as_ref(),
                 )
                 .await
             } else {
@@ -3278,6 +3282,7 @@ impl MissionEngine {
                     auth_verdict,
                     &touch_set,
                     executor_route.clone(),
+                    standards_pin.as_ref(),
                 )
                 .await
             };
@@ -3727,6 +3732,9 @@ impl MissionEngine {
         let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
         let touch_set = self.state.mission.touch_set.clone();
+        // Flight Rules (KRZ-345): the approved standards pin projects the
+        // implementation-stage rules into each worker prompt.
+        let standards_pin = self.state.mission.standards_manifest.clone();
         let tracker = ConcurrencyTracker::new();
 
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
@@ -3752,6 +3760,7 @@ impl MissionEngine {
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
             let touch_set = touch_set.clone();
+            let standards_pin = standards_pin.clone();
             let executor_route = self.state.mission.executor_route.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
@@ -3771,6 +3780,7 @@ impl MissionEngine {
                     verdict,
                     &touch_set,
                     executor_route,
+                    standards_pin.as_ref(),
                 )
                 .await;
                 (idx, result)
@@ -4416,6 +4426,9 @@ impl MissionEngine {
         let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
         let touch_set = self.state.mission.touch_set.clone();
+        // Flight Rules (KRZ-345): the approved standards pin projects the
+        // implementation-stage rules into each worker prompt.
+        let standards_pin = self.state.mission.standards_manifest.clone();
         let tracker = ConcurrencyTracker::new();
         let selected = self.select_backend(Role::Worker);
         if let Some(reason) = selected.fallback_reason.as_deref() {
@@ -4450,6 +4463,7 @@ impl MissionEngine {
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
             let touch_set = touch_set.clone();
+            let standards_pin = standards_pin.clone();
             let executor_route = self.state.mission.executor_route.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
@@ -4469,6 +4483,7 @@ impl MissionEngine {
                     auth_verdict,
                     &touch_set,
                     executor_route,
+                    standards_pin.as_ref(),
                 )
                 .await;
                 (idx, result)
@@ -5118,6 +5133,9 @@ impl MissionEngine {
             // bare where the platform and backend can contain it.
             let validator_sandbox =
                 self.validator_containment(role, selected_kind, &cfg, &session_cwd)?;
+            // Flight Rules (KRZ-345): the approved standards pin projects the
+            // validation-stage rules into the validator prompt.
+            let standards_pin = self.state.mission.standards_manifest.clone();
             let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
@@ -5136,6 +5154,7 @@ impl MissionEngine {
                 milestone.validator_guidance.as_deref(),
                 contract_results.as_deref(),
                 validator_sandbox,
+                standards_pin.as_ref(),
             )
             .await;
             let caught = self.catch_up();
@@ -5264,6 +5283,7 @@ impl MissionEngine {
                     milestone.validator_guidance.as_deref(),
                     contract_results.as_deref(),
                     retry_validator_sandbox,
+                    standards_pin.as_ref(),
                 )
                 .await;
                 let caught = self.catch_up();
@@ -5566,6 +5586,9 @@ impl MissionEngine {
         // backend that always honors the containment wrap.
         let validator_sandbox =
             self.validator_containment(role, BackendKind::Claude, &confirm_cfg, &session_cwd)?;
+        // Flight Rules (KRZ-345): the confirmation validator receives the
+        // same approved-pin validation-stage projection as the primary.
+        let standards_pin = self.state.mission.standards_manifest.clone();
         let outcome = runner::run_validator_in(
             confirm_backend.as_ref(),
             &mut self.log,
@@ -5584,6 +5607,7 @@ impl MissionEngine {
             milestone.validator_guidance.as_deref(),
             contract_results,
             validator_sandbox,
+            standards_pin.as_ref(),
         )
         .await;
         let caught = self.catch_up();
@@ -6832,10 +6856,21 @@ impl MissionEngine {
         Ok(())
     }
 
-    /// Append knowledge (then lessons) onto a planning seed. Order and
-    /// separate budgets are load-bearing (ticket
-    /// repo-knowledge-ranked-brief-injection).
-    fn append_planning_context(&self, seed: &mut String) {
+    /// Append the Flight Rules planning projection, then knowledge (then
+    /// lessons) onto a planning seed. Order and separate budgets are
+    /// load-bearing (ticket repo-knowledge-ranked-brief-injection): the
+    /// standards projection comes FIRST — the plan itself must account for
+    /// applicable policy (KRZ-345, D-D/D-G) — and, unlike the best-effort
+    /// knowledge/lessons blocks, it fails closed (a malformed or over-budget
+    /// corpus errors the seed, D-J). No standards / no applicable rule ⇒
+    /// nothing is appended and the seed stays byte-identical.
+    fn append_planning_context(&self, seed: &mut String) -> Result<()> {
+        if let Some(projection) = self.planning_standards_projection(None)? {
+            if let Some(section) = projection.seed_section() {
+                seed.push_str("\n\n");
+                seed.push_str(&section);
+            }
+        }
         if let Some(block) = self.render_knowledge_for_planning() {
             seed.push_str("\n\n");
             seed.push_str(&block);
@@ -6844,6 +6879,7 @@ impl MissionEngine {
             seed.push_str("\n\n");
             seed.push_str(&index);
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -6928,7 +6964,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            self.append_planning_context(&mut seed);
+            self.append_planning_context(&mut seed)?;
             format!("{seed}\n\nUSER TURN:\n{message}")
         } else {
             format!("{}\n\n{}", digest::render(&self.state), message)
@@ -7029,7 +7065,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            self.append_planning_context(&mut seed);
+            self.append_planning_context(&mut seed)?;
             (seed, None)
         } else {
             (digest::render_reseed(&self.state, &self.plan_json()?), None)
@@ -7054,7 +7090,7 @@ impl MissionEngine {
                          the plan JSON until asked.",
                         self.state.mission.goal
                     );
-                    self.append_planning_context(&mut seed);
+                    self.append_planning_context(&mut seed)?;
                     seed
                 } else {
                     digest::render_reseed(&self.state, &self.plan_json()?)
@@ -8377,6 +8413,349 @@ pub(crate) mod tests {
             .expect("the decision carries detail");
         assert!(detail.contains("vendor/pack"), "{detail}");
         assert!(detail.contains(&pinned.digest), "{detail}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Flight Rules workflow projections (ticket
+    // flight-rules-workflow-projection, KRZ-345, design D-D/D-G)
+    // -----------------------------------------------------------------------
+
+    /// Vendor a schema-4 pack whose rules exercise the planning projection:
+    /// ZZ-SEED-001 (unscoped — always in the seed's candidate set) plus one
+    /// planning-stage rule per path prefix (crates/, docs/, apps/, src/) so
+    /// successive plans can keep widening the touch set into NEW rules (the
+    /// fixed-point loop's delta).
+    fn flight_rules_projection_vendored_pack(root: &std::path::Path) {
+        let mut files = vec![
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-projection-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz planning policy\nstatus: approved\nowner: \
+                 zz\n---\nprose\n"
+                    .to_string(),
+            ),
+        ];
+        let rule = |id: &str, when_paths: Option<&str>| {
+            let mut body = format!(
+                "---\nid: {id}\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: active\n\
+                 statement: zz statement for {id}.\ndomains: [zz]\nstages: [planning]\n"
+            );
+            if let Some(paths) = when_paths {
+                body.push_str(&format!("when-paths: [{paths}]\n"));
+            }
+            body.push_str("checker: agent-judgement\n---\nprose\n");
+            (
+                format!("vendor/pack/standards/RFC-001-slug/rules/{id}.md"),
+                body,
+            )
+        };
+        files.push(rule("ZZ-SEED-001", None));
+        files.push(rule("ZZ-WIDE-001", Some("crates/")));
+        files.push(rule("ZZ-DOCS-001", Some("docs/")));
+        files.push(rule("ZZ-APPS-001", Some("apps/")));
+        files.push(rule("ZZ-SRC-001", Some("src/")));
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the projection pack"]);
+    }
+
+    /// The streaming orchestrator script: session-start seed turn, then one
+    /// reply per engine turn (the draft_test.rs `orch_script` shape).
+    fn projection_orch_script(replies: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            replies
+                .iter()
+                .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+                .collect(),
+        )
+    }
+
+    /// A parseable plan JSON reply carrying the given touch set; the goal
+    /// doubles as the marker distinguishing which scripted plan came back.
+    fn projection_plan_json(touch_set: &[&str], marker: &str) -> String {
+        serde_json::json!({
+            "goal": marker,
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{"title": "F1", "spec": "s", "validationCriteria": ["c"]}],
+            }],
+            "touchSet": touch_set,
+        })
+        .to_string()
+    }
+
+    fn flight_rules_projection_engine(
+        root: &std::path::Path,
+        mock: Arc<crate::backend_mock::MockBackend>,
+    ) -> MissionEngine {
+        let backend: Arc<dyn AgentBackend> = mock;
+        let cfg = MissionConfig {
+            pack_dir: Some("vendor/pack".to_string()),
+            ..MissionConfig::default()
+        };
+        MissionEngine::create(backend, root, "goal", cfg).expect("create engine")
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_planning_seed_carries_the_projection() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec!["seeded".to_string()]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs[0].prompt else {
+            panic!("the planning session seeds via a streaming prompt");
+        };
+        // The planning-stage projection lands in the seed: the unscoped rule,
+        // its source, the boundary, and the honest advisory label — while the
+        // crates/-scoped rule stays OUT (the seed hints never reach it).
+        assert!(seed.contains("planning projection"), "{seed}");
+        assert!(seed.contains("`ZZ-SEED-001` r1"), "{seed}");
+        assert!(
+            seed.contains("source: pack `zz-projection-pack` root `standards`, RFC `RFC-001`"),
+            "the rule names its source: {seed}"
+        );
+        assert!(seed.contains("candidate resolution at `main`"), "{seed}");
+        assert!(seed.contains("untrusted content boundary"), "{seed}");
+        assert!(seed.contains("advisory — cannot block"), "{seed}");
+        assert!(
+            !seed.contains("ZZ-WIDE-001"),
+            "path-scoped rules wait for the plan's touch set: {seed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_no_pack_seed_is_byte_identical() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // No pack vendored; the default config carries no packDir.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec!["seeded".to_string()]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs[0].prompt else {
+            panic!("the planning session seeds via a streaming prompt");
+        };
+        assert_eq!(
+            seed,
+            "MISSION GOAL:\ngoal\n\nYou are in the planning phase. Interrogate the goal and \
+             the repository (read-only), ask the user sharp questions if anything material is \
+             ambiguous, then propose the validation contract, milestones and features. Do not \
+             emit the plan JSON until asked.",
+            "no standards ⇒ the seed is byte-for-byte the pre-Flight-Rules prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_revision_loop_converges() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+                projection_plan_json(&["crates/**"], "plan-v2"),
+            ]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::Ready(plan) = request else {
+            panic!("the revised plan reaches the fixed point: {request:?}");
+        };
+        assert_eq!(plan.goal, "plan-v2", "the REVISED plan is offered");
+
+        let messages = &mock.injected_messages()[0];
+        assert_eq!(
+            messages.len(),
+            3,
+            "seed turn + plan demand + exactly ONE bounded revision turn: {messages:?}"
+        );
+        let revision = &messages[2];
+        assert!(
+            revision.contains("activates Flight Rules policy you have not seen"),
+            "{revision}"
+        );
+        assert!(
+            revision.contains("`ZZ-WIDE-001` r1"),
+            "the exact delta is delivered: {revision}"
+        );
+        assert!(
+            !revision.contains("ZZ-SEED-001"),
+            "the seed-delivered rule is never re-delivered: {revision}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_parks_after_bounded_revisions() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        // Every reply widens the touch set into another rule: the loop never
+        // converges inside the revision budget and planning parks.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+                projection_plan_json(&["crates/**", "docs/**"], "plan-v2"),
+                projection_plan_json(&["crates/**", "docs/**", "apps/**"], "plan-v3"),
+                projection_plan_json(&["crates/**", "docs/**", "apps/**", "src/**"], "plan-v4"),
+            ]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::NotReady(text) = request else {
+            panic!("a non-converging plan is never offered for approval: {request:?}");
+        };
+        assert!(text.contains("Planning parked"), "{text}");
+        assert!(
+            text.contains("ZZ-SRC-001"),
+            "the park names the rules still unaccounted for: {text}"
+        );
+        assert_eq!(
+            mock.injected_messages()[0].len(),
+            5,
+            "plan demand + three bounded revision turns, then the park"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_no_pack_never_revises() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // No pack: any touch set is offered immediately, byte-identical.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+            ]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::Ready(plan) = request else {
+            panic!("a standards-free mission offers the plan untouched: {request:?}");
+        };
+        assert_eq!(plan.goal, "plan-v1");
+        assert_eq!(
+            mock.injected_messages()[0].len(),
+            2,
+            "no revision turn without standards"
+        );
+    }
+
+    #[test]
+    fn flight_rules_projection_approve_plan_over_budget_fails_closed() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // One rule whose statement alone exceeds the hard byte cap: approval
+        // must fail naming the rule — never truncate policy to fit (D-D/D-J).
+        let fat = "x".repeat(crate::pack::projection::MAX_PROJECTION_STATEMENT_BYTES + 1);
+        let files = [
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-fat-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz fat\nstatus: approved\nowner: zz\n---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rules/ZZ-FAT-001.md".to_string(),
+                format!(
+                    "---\nid: ZZ-FAT-001\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: \
+                     active\nstatement: {fat}\ndomains: [zz]\nstages: [planning, \
+                     implementation, validation, merge]\nchecker: agent-judgement\n---\nprose\n"
+                ),
+            ),
+        ];
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the over-budget pack"]);
+
+        let mut engine = flight_rules_pin_engine(&root);
+        let err = engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect_err("over-budget applicable policy must fail approval");
+        let text = format!("{err}");
+        assert!(text.contains("ZZ-FAT-001"), "names the excess rule: {text}");
+        assert!(text.contains("never truncated"), "{text}");
+
+        // The refusal landed BEFORE any approval side effect: no mission
+        // branch, no events beyond mission.created, no plan.json.
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(!engine.repo.branch_exists(&branch).unwrap());
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "a refused approval emits nothing: {events:?}"
+        );
+        assert!(!engine.paths.plan_file().exists());
     }
 
     // -----------------------------------------------------------------------

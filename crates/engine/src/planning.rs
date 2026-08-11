@@ -34,7 +34,7 @@ impl MissionEngine {
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
             self.pending_research = extract_research(&text);
-            return Ok(PlanRequest::Ready(plan));
+            return self.standards_fixed_point(plan).await;
         }
         if let Some(reason) = parse_wrong_plan(&text) {
             return Ok(PlanRequest::WrongPlan { reason });
@@ -42,7 +42,7 @@ impl MissionEngine {
         let retry = self.orch_turn(JSON_RETRY_MSG).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&retry) {
             self.pending_research = extract_research(&retry);
-            return Ok(PlanRequest::Ready(plan));
+            return self.standards_fixed_point(plan).await;
         }
         if let Some(reason) = parse_wrong_plan(&retry) {
             return Ok(PlanRequest::WrongPlan { reason });
@@ -55,6 +55,138 @@ impl MissionEngine {
         } else {
             retry
         }))
+    }
+
+    /// The Flight Rules planning projection (KRZ-345, design D-D/D-G):
+    /// planning-stage rules resolved from the TRUSTED source — against the
+    /// seed hints (ticket repo-refs + any explicit touch hints) when
+    /// `touch_override` is `None`, or against the plan's own touch set for
+    /// the fixed-point revision loop. `Ok(None)` — no standards-configured
+    /// pack — leaves every planning surface byte-identical.
+    pub(crate) fn planning_standards_projection(
+        &self,
+        touch_override: Option<&[String]>,
+    ) -> Result<Option<crate::pack::projection::PlanningProjection>> {
+        let task_class = crate::ticket::parse_task_class_from_goal(&self.state.mission.goal);
+        let hints = match touch_override {
+            Some(touch) => touch.to_vec(),
+            None => self.planning_touch_hints(),
+        };
+        crate::pack::projection::planning_projection(
+            &self.repo,
+            &self.state.config,
+            &self.state.mission.base_branch,
+            task_class.as_deref(),
+            &hints,
+        )
+        .map_err(EngineError::Config)
+    }
+
+    /// The seed-time selection hints (D-D's "ticket repo refs and explicit
+    /// touch hints"): the mission's explicit touch hints (empty during
+    /// initial planning) plus the linked ticket's repo-refs. The ticket read
+    /// is best-effort — hints shape a conservative candidate set, never
+    /// policy; the pack load is the fail-closed part.
+    fn planning_touch_hints(&self) -> Vec<String> {
+        let mut hints = self.state.mission.touch_set.clone();
+        if let Some(slug) =
+            crate::ticket::Ticket::slug_for_mission(&self.paths.repo_root, &self.state.mission.id)
+        {
+            if let Ok(ticket) = crate::ticket::Ticket::load(&crate::ticket::Ticket::md_path(
+                &self.paths.repo_root,
+                &slug,
+            )) {
+                hints.extend(ticket.repo_refs);
+            }
+        }
+        hints
+    }
+
+    /// The Flight Rules fixed-point revision loop (KRZ-345, design D-D): the
+    /// planner received the planning-stage candidate set with its seed; when
+    /// the RETURNED plan's touch set activates additional planning-stage
+    /// rules the planner never saw, the exact delta goes back in one bounded
+    /// revision turn and resolution repeats against the revised plan, until
+    /// the plan/rule set reaches a fixed point (the plan activates nothing
+    /// the planner did not receive) or the turn budget runs out and planning
+    /// parks. The plan is never offered for approval carrying a rule the
+    /// planner did not receive; approval re-resolves and pins only the fixed
+    /// point (KRZ-342's approval re-resolution stays the authority). No
+    /// standards ⇒ the plan passes through untouched, byte-identical.
+    async fn standards_fixed_point(&mut self, plan: Plan) -> Result<PlanRequest> {
+        let Some(seed_projection) = self.planning_standards_projection(None)? else {
+            return Ok(PlanRequest::Ready(plan));
+        };
+        let mut delivered: std::collections::BTreeSet<(String, u64)> =
+            seed_projection.delivered().into_iter().collect();
+        let mut plan = plan;
+        let mut revisions = 0;
+        loop {
+            let Some(current) = self.planning_standards_projection(Some(&plan.touch_set))? else {
+                // Standards stopped governing between the seed and now (the
+                // configured pack changed mid-planning): nothing the planner
+                // saw can be missing — approval re-resolves the truth.
+                return Ok(PlanRequest::Ready(plan));
+            };
+            let delta: Vec<crate::pack::projection::ProjectedRule> = current
+                .rules
+                .iter()
+                .filter(|rule| !delivered.contains(&rule.identity()))
+                .cloned()
+                .collect();
+            if delta.is_empty() {
+                return Ok(PlanRequest::Ready(plan));
+            }
+            if revisions == MAX_STANDARDS_REVISION_TURNS {
+                // The touch set kept activating unseen policy past the
+                // revision budget: park honestly, naming the rules still
+                // unaccounted for (D-D: "planning parks").
+                return Ok(PlanRequest::NotReady(format!(
+                    "Planning parked: after {MAX_STANDARDS_REVISION_TURNS} bounded revision \
+                     turns the plan's touch set still activates Flight Rules rules the \
+                     planner has not accounted for ({}). Narrow the touch set or address the \
+                     standards delta explicitly, then re-run the draft.",
+                    delta
+                        .iter()
+                        .map(|rule| format!("{} r{}", rule.id, rule.revision))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            revisions += 1;
+            delivered.extend(delta.iter().map(|rule| rule.identity()));
+            let message = format!(
+                "The touch set of the plan you just emitted activates Flight Rules policy you \
+                 have not seen. These additional planning-stage rule(s) apply — the plan must \
+                 account for them before it can be offered for approval:\n\n{}\n\
+                 Revise the plan to account for every rule above (adjust milestones, features, \
+                 criteria, or the touch set itself), then output ONLY the revised plan JSON \
+                 conforming exactly to this JSON Schema — no prose before or after:\n{}",
+                current.render_delta(&delta),
+                plan_schema()
+            );
+            let reply = self.orch_turn(&message).await?;
+            let mut revised = runner::parse_report::<Plan>(&reply);
+            let mut prose = reply;
+            if revised.is_none() {
+                let retry = self.orch_turn(JSON_RETRY_MSG).await?;
+                revised = runner::parse_report::<Plan>(&retry);
+                if !retry.trim().is_empty() {
+                    prose = retry;
+                }
+            }
+            match revised {
+                Some(revised) => {
+                    // Research evidence rides the text that carried the
+                    // ACCEPTED plan, exactly like the initial turn's capture.
+                    self.pending_research = extract_research(&prose);
+                    plan = revised;
+                }
+                // A prose answer parks planning exactly like the initial
+                // turn's NotReady — the operator sees the planner's words.
+                None => return Ok(PlanRequest::NotReady(prose)),
+            }
+        }
     }
 
     /// Propose a REVISED plan for the not-yet-complete work of a running or
@@ -131,6 +263,12 @@ impl MissionEngine {
 const WRONG_PLAN_PROMPT_CHANNEL: &str = "If you can produce a plan but believe it is likely \
      WRONG — the goal is misframed, the premise is broken, the spec is confidently off — \
      respond with ONLY {\"wrongPlan\": \"<one-paragraph reason>\"}.";
+
+/// The bounded revision turns the Flight Rules fixed-point loop may take
+/// before planning parks (KRZ-345, design D-D): each turn delivers the exact
+/// rule delta the plan's touch set newly activates, so a planner that keeps
+/// widening its touch set cannot loop planning forever.
+const MAX_STANDARDS_REVISION_TURNS: usize = 3;
 
 /// Wire shape of the planner-initiated wrong-plan escalation reply.
 #[derive(serde::Deserialize)]
