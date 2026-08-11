@@ -3,6 +3,8 @@ title: Project applicable Flight Rules through planning, work, and validation
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin, flight-rules-finding-provenance]
+state: done
+state-note: Implemented — pack/projection.rs (stage projections with marked untrusted boundary, honest approved-vs-enforced labels, per-rule sources, manifest+projection digests, 64-rule/16-KiB hard budget), approval fails over-budget naming the excess, planning seed projection + bounded fixed-point revision loop (3 turns, then park), worker/scrutiny/functional prompts carry only their stage's rules with the prompt hash covering the exact projection; no pack/no applicable rules byte-identical. 17 flight_rules_projection_* tests; full workspace gates green.
 ---
 
 ## Goal
