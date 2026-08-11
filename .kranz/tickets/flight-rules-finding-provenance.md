@@ -3,6 +3,8 @@ title: Flight Rules finding, event, replay, and evidence provenance
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin]
+state: done
+state-note: Implemented — additive Finding.rule citation + gate.result ruleIds (D-H), the standards_coverage fold (passed/failed/advisory/waived/not-evaluated/not-applicable; absence never pass), and report.md/provenance/evidence-bundle/CLI rendering; pre-Flight-Rules logs render byte-identical. 17 flight_rules_provenance_* tests; full workspace gates green.
 ---
 
 ## Goal
