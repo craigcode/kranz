@@ -3212,6 +3212,35 @@ impl MissionEngine {
             // judgement digest reflects them.
             self.drain_control().await?;
 
+            // Infrastructure failure, not worker quality (ticket
+            // worker-spawn-auth-failure-budget): a spawn that died in seconds
+            // on a backend auth/dead-binary signature never ran, so it must
+            // not burn the respawn budget or fail the feature. Park the
+            // milestone for operator re-auth with a distinct reason; the
+            // feature stays Active and re-runs on unblock.
+            if let Some(reauth) = spawn_auth_death(&outcome, selected_kind) {
+                let milestone_id = self.state.mission.milestones[mi].id.clone();
+                self.emit_decision(
+                    &format!(
+                        "worker spawn for {} died on a {} auth/dead-binary signature; parking \
+                         for operator re-auth instead of consuming the respawn budget",
+                        feature.id,
+                        selected_kind.as_str()
+                    ),
+                    None,
+                )?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason: format!(
+                        "backend {} unauthenticated — {reauth}; feature {} stays active and \
+                         re-runs on unblock",
+                        selected_kind.as_str(),
+                        feature.id
+                    ),
+                })?;
+                return Ok(());
+            }
+
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
             if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
@@ -7133,6 +7162,49 @@ fn session_exit_summary(exit: &SessionExit) -> String {
     }
 }
 
+/// Classify a worker run that died on a backend auth/dead-binary signature as
+/// an INFRASTRUCTURE failure rather than a worker-quality failure (ticket
+/// worker-spawn-auth-failure-budget). Such a run never produced work, so it
+/// must not burn the respawn budget or fail the feature — the operator
+/// re-auths and the feature re-runs.
+///
+/// Deliberately conservative: BOTH halves must hold, so a genuine slow failure
+/// (the CLI ran, emitted a terminal event, and was judged) never matches —
+/// `without emitting a terminal/result event` is present only when the CLI
+/// died before producing any work product. Returns the operator's re-auth
+/// action when this IS an auth death, `None` otherwise. A backend with no
+/// known auth signature never classifies; its failures consume budget
+/// normally.
+pub(crate) fn spawn_auth_death(
+    outcome: &runner::RunOutcome,
+    kind: BackendKind,
+) -> Option<&'static str> {
+    if outcome.result == RunResult::Pass {
+        return None;
+    }
+    let SessionExit::Failed(message) = &outcome.exit else {
+        return None;
+    };
+    let lower = message.to_lowercase();
+    let no_terminal = lower.contains("without emitting a terminal event")
+        || lower.contains("without emitting a result message");
+    if !no_terminal {
+        return None;
+    }
+    match kind {
+        BackendKind::Cursor if lower.contains("authentication required") => {
+            Some("re-authenticate the cursor CLI (refresh CURSOR_API_KEY or `agent` login)")
+        }
+        BackendKind::Codex if lower.contains("401") || lower.contains("unauthorized") => {
+            Some("re-authenticate the codex CLI (refresh OPENAI_API_KEY or `codex login`)")
+        }
+        BackendKind::Claude if lower.contains("not logged in") || lower.contains("oauth") => {
+            Some("re-authenticate the claude CLI (`claude auth` / refresh ANTHROPIC_API_KEY)")
+        }
+        _ => None,
+    }
+}
+
 /// One feature's slot in a parallel batch (roadmap M3): the feature it runs,
 /// its per-feature branch, and the worktree directory that branch is checked
 /// out in. Built up front so the cleanup guard can always find every worktree.
@@ -10298,6 +10370,93 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
         }
+    }
+
+    /// Build a minimal worker outcome with the given result/exit for the
+    /// spawn_auth_death classifier tests.
+    fn auth_death_outcome(result: RunResult, exit: SessionExit) -> runner::RunOutcome {
+        runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: None,
+            validator_report: None,
+            exit,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        }
+    }
+
+    #[test]
+    fn spawn_auth_death_cursor_instant_auth_death_classifies() {
+        // The m-eee81f shape: cursor died in ~1s with an auth error and no
+        // terminal event.
+        let outcome = auth_death_outcome(
+            RunResult::Fail,
+            SessionExit::Failed(
+                "cursor exited with exit status: 1 without emitting a terminal event; \
+                 stderr tail: Error: Authentication required"
+                    .to_string(),
+            ),
+        );
+        let action = spawn_auth_death(&outcome, BackendKind::Cursor)
+            .expect("cursor instant auth death must classify");
+        assert!(action.contains("cursor"), "{action}");
+    }
+
+    #[test]
+    fn spawn_auth_death_genuine_slow_failure_does_not_classify() {
+        // A worker that RAN, emitted a terminal event, and failed its
+        // judgement: the "without emitting" signal is absent, so even an
+        // auth-shaped stderr tail does not classify — this consumes budget.
+        let outcome = auth_death_outcome(
+            RunResult::Fail,
+            SessionExit::Failed(
+                "cursor exited with exit status: 1; stderr tail: authentication required"
+                    .to_string(),
+            ),
+        );
+        assert!(
+            spawn_auth_death(&outcome, BackendKind::Cursor).is_none(),
+            "a run that produced a terminal event is a genuine failure, not an auth death"
+        );
+        // A passing run never classifies.
+        let pass = auth_death_outcome(RunResult::Pass, SessionExit::Completed);
+        assert!(spawn_auth_death(&pass, BackendKind::Cursor).is_none());
+        // A clean abort (interrupt/budget) never classifies.
+        let aborted = auth_death_outcome(RunResult::Partial, SessionExit::Aborted);
+        assert!(spawn_auth_death(&aborted, BackendKind::Cursor).is_none());
+    }
+
+    #[test]
+    fn spawn_auth_death_per_backend_signatures_and_unknown_backends() {
+        let cursor_death = |tail: &str| {
+            auth_death_outcome(
+                RunResult::Fail,
+                SessionExit::Failed(format!(
+                    "agent exited with exit status: 1 without emitting a terminal event; \
+                     stderr tail: {tail}"
+                )),
+            )
+        };
+        // codex: 401.
+        let o = cursor_death("http 401 unauthorized");
+        assert!(spawn_auth_death(&o, BackendKind::Codex).is_some());
+        // claude: not logged in / oauth.
+        let o = cursor_death("Not logged in");
+        assert!(spawn_auth_death(&o, BackendKind::Claude).is_some());
+        let o = cursor_death("OAuth token expired");
+        assert!(spawn_auth_death(&o, BackendKind::Claude).is_some());
+        // An unrecognized signature does not classify.
+        let o = cursor_death("segfault");
+        assert!(spawn_auth_death(&o, BackendKind::Cursor).is_none());
+        // A backend with no known signature (kimi/local/…) never classifies.
+        let o = cursor_death("authentication required");
+        assert!(spawn_auth_death(&o, BackendKind::Kimi).is_none());
     }
 
     #[test]

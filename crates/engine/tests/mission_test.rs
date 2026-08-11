@@ -263,6 +263,23 @@ fn worker_fail() -> MockScript {
     }))
 }
 
+/// Worker script: the backend CLI dies in seconds with an auth error and NO
+/// terminal event (ticket worker-spawn-auth-failure-budget) — no result event
+/// is replayed, and the exit carries the "without emitting a result message"
+/// plus the claude auth signature ("Not logged in"). This is the m-eee81f
+/// cursor auth-death shape, on the claude kind the mock backend maps to.
+fn worker_auth_death() -> MockScript {
+    MockScript {
+        events: vec![mock_init("mock-session")],
+        exit: kranz_engine::backend::SessionExit::Failed(
+            "claude exited with exit status: 1 without emitting a result message; \
+             stderr tail: Error: Not logged in"
+                .to_string(),
+        ),
+        ..Default::default()
+    }
+}
+
 /// Validator script returning the given findings.
 fn validator_with(findings: serde_json::Value) -> MockScript {
     MockScript::single_shot_json(&json!({ "findings": findings, "summary": "validated" }))
@@ -4603,6 +4620,72 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
         EventKind::FeatureFailed { feature_id, reason, .. }
             if feature_id == "f-1-1" && reason.contains("respawn budget exhausted")
     )));
+}
+
+/// Ticket worker-spawn-auth-failure-budget: a worker whose backend CLI dies
+/// in seconds with an auth signature is an INFRASTRUCTURE failure — it must
+/// NOT consume the respawn budget or fail the feature. The milestone blocks
+/// with a `backend unauthenticated` reason naming the re-auth action; the
+/// feature stays Active so it re-runs once the operator re-auths.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_auth_death_blocks_milestone_without_burning_respawn_budget() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_auth_death(), // f-1-1: the backend CLI auth-dies instantly
+    ]));
+    // A generous respawn budget: the point is that NONE of it is consumed.
+    let cfg = MissionConfig {
+        max_respawns: 3,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+
+    // The mission parks for operator action, it does NOT fail the feature.
+    assert_eq!(status, MissionStatus::Blocked);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(
+        ms.features[0].status,
+        FeatureStatus::Active,
+        "the feature stays active (re-runs on re-auth), not failed"
+    );
+    assert_eq!(
+        ms.features[0].respawns, 0,
+        "an auth death must not consume the respawn budget"
+    );
+    assert_eq!(
+        ms.features[0].worker_runs.len(),
+        1,
+        "exactly one worker run — no respawn was spawned"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { reason, .. }
+                if reason.contains("unauthenticated") && reason.contains("claude")
+        )),
+        "a milestone.blocked naming the backend and the re-auth action"
+    );
+    // And the feature was never failed.
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureFailed { feature_id, .. } if feature_id == "f-1-1"
+        )),
+        "an auth death must not fail the feature"
+    );
 }
 
 // ---------------------------------------------------------------------------
