@@ -3052,6 +3052,7 @@ mod tests {
                     artefact_detail: None,
                     score: score.map(|(score, _)| score),
                     threshold: score.map(|(_, threshold)| threshold),
+                    rule_ids: Vec::new(),
                 },
             )
         }

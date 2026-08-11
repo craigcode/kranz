@@ -806,6 +806,19 @@ pub fn render_mission_report(
         let _ = writeln!(md, "\nNo validation rounds were recorded.");
     }
 
+    // Flight Rules coverage (KRZ-343, design D-H): every applicable pinned
+    // rule's disposition with its mechanism and evidence joins, folded from
+    // the same log — absence of evidence is never rendered as pass. `None`
+    // (no approved standards pin) renders nothing, so a pre-Flight-Rules
+    // mission's report stays byte-identical.
+    if let Some(coverage) = crate::standards_coverage::standards_coverage(&mission.id, events) {
+        let _ = writeln!(
+            md,
+            "\n{}",
+            crate::standards_coverage::render_coverage_markdown(&coverage).trim_end_matches('\n')
+        );
+    }
+
     // Contract outcomes — the mission completed, so every assertion passed
     // the final gate (or was explicitly waived; waivers are recorded above).
     let _ = writeln!(md, "\n## Contract outcomes");

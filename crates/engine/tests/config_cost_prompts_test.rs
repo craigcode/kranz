@@ -443,6 +443,7 @@ fn mission_a_events() -> Vec<EventKind> {
                 evidence: "it broke".into(),
                 suggested_fix: "fix it".into(),
                 class: String::new(),
+                rule: None,
             },
         },
         // First fix-feature after milestone.validating: fix cycle #1.

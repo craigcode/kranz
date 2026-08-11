@@ -192,6 +192,7 @@ impl MissionEngine {
                             },
                             suggested_fix: String::new(),
                             class: String::new(),
+                            rule: None,
                         }),
                         None => findings.push(Finding {
                             subject: assertion.id.clone(),
@@ -199,6 +200,7 @@ impl MissionEngine {
                             evidence: "no verdict returned for this assertion".to_string(),
                             suggested_fix: String::new(),
                             class: String::new(),
+                            rule: None,
                         }),
                     }
                 }
@@ -213,6 +215,7 @@ impl MissionEngine {
                             .to_string(),
                         suggested_fix: String::new(),
                         class: String::new(),
+                        rule: None,
                     });
                 }
                 "unparseable verdicts; all judgement assertions failed conservatively".to_string()

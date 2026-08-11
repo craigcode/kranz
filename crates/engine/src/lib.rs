@@ -71,6 +71,7 @@ pub mod routing_rules;
 pub mod sandbox;
 pub mod sandbox_container;
 pub mod scrub;
+pub mod standards_coverage;
 mod stream_bounds;
 pub mod ticket;
 pub mod ticket_notes;

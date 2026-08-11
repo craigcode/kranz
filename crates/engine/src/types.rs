@@ -661,6 +661,56 @@ pub struct Finding {
     /// existing scrutiny/functional/gate findings.
     #[serde(default)]
     pub class: String,
+    /// The Flight Rules standards rule this finding cites (ticket
+    /// `flight-rules-finding-provenance`, KRZ-343; design D-H): the stable
+    /// rule/revision join key plus the pinned source identity, carried as
+    /// structured data so provenance joins never parse `subject` or
+    /// `evidence` prose. Additive: `None` on every pre-KRZ-343 finding and
+    /// on every finding that does not cite a rule, and
+    /// `skip_serializing_if` keeps those findings byte-identical on the
+    /// wire. `subject` stays the human/assertion handle for old consumers;
+    /// rule provenance is never smuggled into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<RuleCitation>,
+}
+
+/// The standards rule a [`Finding`] cites (KRZ-343, design D-H): the join
+/// key that makes a checker verdict answerable to the approved manifest pin
+/// without parsing prose. Every field is the PINNED spelling (the consent
+/// snapshot [`StandardsPin`] carries), so a citation joins the mission's
+/// approved policy even after the live pack moves on.
+///
+/// WHY a group and not loose optional fields: a citation is only joinable
+/// whole — a rule id without its revision names a moving target (revisions
+/// are the semantic-change unit, D-C), and either without the source digest
+/// cannot say WHICH approved manifest it answered to. The group is all-or-
+/// nothing: `Some` carries the full join key, `None` cites nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCitation {
+    /// The stable rule id (frontmatter `id:`), matching
+    /// [`StandardsRuleRef`]'s naming so log-wide joins use one spelling.
+    pub id: String,
+    /// The pinned revision the verdict was rendered against. A citation at
+    /// any other revision does not join the pin — the coverage fold renders
+    /// it `not-applicable` rather than joining stale policy.
+    pub revision: u64,
+    /// The pinned pack identity: pack name + standards root, the display
+    /// spelling [`crate::pack::resolution::render_pin_section`] uses.
+    pub source: String,
+    /// Lowercase hex sha256 of the pinned normalized manifest
+    /// ([`StandardsPin::digest`]) — the content binding of the citation.
+    pub digest: String,
+    /// The rule's pinned EFFECTIVE lifecycle (`approved` or `enforced`):
+    /// whether the cited verdict could block (D-B).
+    pub lifecycle: String,
+    /// The rule's RFC-2119 level (`must` or `should`).
+    pub level: String,
+    /// The rule's pinned checker binding (`gate:<id>`, `agent-judgement`,
+    /// `manual-attestation`) — the mechanism the verdict came from; `None`
+    /// when the pinned rule declared none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1866,6 +1916,7 @@ mod tests {
             evidence: "wrote outside touch-set".to_string(),
             suggested_fix: String::new(),
             class: "out-of-contract-write".to_string(),
+            rule: None,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["class"], "out-of-contract-write");

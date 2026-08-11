@@ -470,6 +470,14 @@ pub enum EventKind {
         /// [`crate::gate::GateScore`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         threshold: Option<f64>,
+        /// The stable Flight Rules standards rule ids this evaluation
+        /// joined (KRZ-343, design D-H): the linkage the coverage matrix
+        /// joins on, from [`crate::gate::GateOutcome::rule_ids`]. Additive
+        /// and evidentiary only — a gate with no standards linkage carries
+        /// an empty list, which never hits the wire, so a boolean-only
+        /// gate's payload stays byte-identical.
+        #[serde(rename = "ruleIds", default, skip_serializing_if = "Vec::is_empty")]
+        rule_ids: Vec<String>,
     },
 
     /// One deterministic gate projected onto a Claude Code lifecycle hook
@@ -913,9 +921,18 @@ pub enum EventKind {
     /// identity + digest, the selection inputs (stage, task class, touch
     /// set), the selected rule revisions, and the `plan.approved` seq the
     /// pin attaches to — the queryable provenance for the consent artifact
-    /// the plan's `standardsManifest` carries in full. `effective-at`
-    /// evaluation is not recorded here: KRZ-341 parses and carries the field
-    /// but deliberately does not evaluate it in this slice.
+    /// the plan's `standardsManifest` carries in full.
+    ///
+    /// D-H's record list, verified for KRZ-343: the source identity/digest,
+    /// selection inputs, stage, rule revisions, and approval sequence all
+    /// ride in this payload; the effective-time evaluation instant is the
+    /// event envelope's own `ts` — resolution runs in the same approve_plan
+    /// call as the emission, so the append stamp IS the instant the
+    /// effective statuses were judged (payloads never duplicate the envelope
+    /// clock anywhere in this schema). The RFC `effective_at` absorption
+    /// window itself stays unevaluated in this slice: KRZ-341 parses and
+    /// carries the field, and the stage-projection slice that evaluates it
+    /// (KRZ-345) records its own surfaces.
     #[serde(rename = "standards.resolved")]
     StandardsResolved {
         /// `repo-tracked` or `external-pinned` ([`StandardsPinSource`]).
@@ -1599,6 +1616,7 @@ mod tests {
                 evidence: "frontier sees a failure the local pass missed".to_string(),
                 suggested_fix: "fix a2".to_string(),
                 class: String::new(),
+                rule: None,
             }],
             judgment_opportunity: false,
         };
@@ -1724,6 +1742,7 @@ mod tests {
             artefact_detail: Some("[a-1] test-runner pipeline's grep anchors no nonzero count: `cargo test | grep ok`".to_string()),
             score: Some(0.42),
             threshold: Some(0.75),
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["type"], "gate.result");
@@ -1751,6 +1770,7 @@ mod tests {
                 artefact_detail,
                 score,
                 threshold,
+                rule_ids,
             } => {
                 assert_eq!(gate, "vacuous-filter");
                 assert_eq!(surface, crate::gate::GateSurface::Approval);
@@ -1761,6 +1781,7 @@ mod tests {
                 assert!(artefact_detail.as_deref().unwrap().contains("[a-1]"));
                 assert_eq!(score, Some(0.42));
                 assert_eq!(threshold, Some(0.75));
+                assert!(rule_ids.is_empty());
             }
             _ => panic!("wrong variant"),
         }
@@ -1771,6 +1792,8 @@ mod tests {
     /// stays OFF the wire (byte-identical to a payload that never had them)
     /// and a line without them parses back to `None` (serde default), so
     /// hand-written or future-trimmed logs fold like engine-written ones.
+    /// KRZ-343's `ruleIds` follows the same rule: a gate with no standards
+    /// linkage carries an empty list, which serializes as NO key.
     #[test]
     fn gate_result_event_optional_fields_are_additive() {
         let sparse = EventKind::GateResult {
@@ -1783,13 +1806,14 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&sparse).unwrap();
         assert_eq!(json["payload"]["surface"], "final-gate");
         assert_eq!(json["payload"]["kind"], "model-judged");
         assert_eq!(json["payload"]["verdict"], "pass");
         let payload = json["payload"].as_object().unwrap();
-        for absent in ["artefactDetail", "score", "threshold"] {
+        for absent in ["artefactDetail", "score", "threshold", "ruleIds"] {
             assert!(
                 !payload.contains_key(absent),
                 "payload must not contain {absent} when None: {json}"

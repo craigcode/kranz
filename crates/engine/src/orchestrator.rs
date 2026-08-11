@@ -6156,6 +6156,7 @@ impl MissionEngine {
                     evidence: "assertion has check=command but no command".to_string(),
                     suggested_fix: String::new(),
                     class: String::new(),
+                    rule: None,
                 });
                 continue;
             };
@@ -6168,6 +6169,7 @@ impl MissionEngine {
                     evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
                     suggested_fix: String::new(),
                     class: "command-assertion".to_string(),
+                    rule: None,
                 });
             }
         }
@@ -6342,6 +6344,7 @@ impl MissionEngine {
                         contract"
                         .to_string(),
                     class: "command-assertion".to_string(),
+                    rule: None,
                 });
             }
         }

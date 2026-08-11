@@ -556,6 +556,7 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         }
     }
 

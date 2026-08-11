@@ -837,6 +837,7 @@ fn fix_cycles_increment_once_per_validation_round() {
                     evidence: "it broke".into(),
                     suggested_fix: "fix it".into(),
                     class: String::new(),
+                    rule: None,
                 },
             },
         ),
@@ -2123,6 +2124,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                         evidence: "e".into(),
                         suggested_fix: String::new(),
                         class: String::new(),
+                        rule: None,
                     },
                 }
             }
@@ -2207,6 +2209,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
             evidence: "command failed".to_string(),
             suggested_fix: String::new(),
             class: String::new(),
+            rule: None,
         },
     };
 
@@ -3982,6 +3985,7 @@ fn gate_result_event_is_record_only_in_the_fold() {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         },
     };
     let without = fold(&[
