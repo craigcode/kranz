@@ -2242,6 +2242,7 @@ fn standards_pin() -> kranz_engine::types::StandardsPin {
         source: kranz_engine::types::StandardsPinSource::RepoTracked,
         task_class: None,
         touch_set: vec!["crates/**".to_string()],
+        gates: Vec::new(),
         rules: vec![
             rule(
                 "ZZ-IMPL-001",

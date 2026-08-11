@@ -384,8 +384,26 @@ pub fn standards_coverage(mission_id: &str, events: &[Event]) -> Option<Standard
             }
         }
         evidence.sort_by_key(|entry| entry.seq);
-        let disposition = if evidence.iter().any(|entry| entry.bearing == "fail") {
-            if pinned.effective_status == "enforced" {
+        let unwaived_finding_failure = evidence
+            .iter()
+            .any(|entry| entry.event == "validation.finding" && entry.bearing == "fail");
+        let gate_failure = evidence
+            .iter()
+            .any(|entry| entry.event == "gate.result" && entry.bearing == "fail");
+        let waived_finding = evidence
+            .iter()
+            .any(|entry| entry.event == "validation.finding" && entry.bearing == "waived");
+        let mode = crate::standards_enforcement::rule_mode(pinned);
+        let disposition = if unwaived_finding_failure
+            || (gate_failure
+                // A standards gate event and its cited finding are two
+                // evidence views of ONE checker failure. An exact D-I waiver
+                // binds the finding, so the companion gate event must not
+                // resurrect the same block in replay.
+                && !(mode == crate::standards_enforcement::RuleMode::Authoritative
+                    && waived_finding))
+        {
+            if mode == crate::standards_enforcement::RuleMode::Authoritative {
                 RuleDisposition::Failed
             } else {
                 RuleDisposition::Advisory
@@ -678,6 +696,7 @@ mod tests {
             source: StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".to_string()],
+            gates: Vec::new(),
             rules,
         }
     }
@@ -884,6 +903,31 @@ mod tests {
                 ("ZZ-FAIL-001", 1),
             ]
         );
+    }
+
+    #[test]
+    fn flight_rules_enforcement_enforced_should_failure_is_advisory() {
+        let rule = pinned_rule("ZZ-SHOULD-001", 1, "enforced", "should");
+        let events = vec![
+            ev(
+                1,
+                EventKind::PlanApproved {
+                    plan: plan_with_pin(vec![rule]),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+            ),
+            ev(
+                2,
+                gate_result(
+                    "zz-gate",
+                    GateVerdict::Fail,
+                    "inline:failed",
+                    vec!["ZZ-SHOULD-001".to_string()],
+                ),
+            ),
+        ];
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        assert_eq!(coverage.rules[0].disposition, RuleDisposition::Advisory);
     }
 
     // ---- additive contract fields (D-H) -----------------------------------
@@ -1359,6 +1403,30 @@ mod tests {
         assert_eq!(waiver["approver"], "local-operator");
         assert_eq!(waiver["surface"], "cli");
         assert!(waiver["expiresAt"].is_string());
+    }
+
+    #[test]
+    fn flight_rules_enforcement_exact_waiver_covers_companion_gate_failure() {
+        let mut events = waiver_matrix_events();
+        events.push(ev(
+            6,
+            gate_result(
+                "zz-gate",
+                GateVerdict::Fail,
+                "inline:failed",
+                vec!["ZZ-FAIL-001".to_string()],
+            ),
+        ));
+        events.push(ev(7, valid_waiver(&waiver_fingerprint("a-1"))));
+        let coverage = standards_coverage("m-1", &events).expect("a pin folds");
+        let row = fail_row(&coverage);
+        assert_eq!(row.disposition, RuleDisposition::Waived);
+        assert_eq!(row.evidence.len(), 2);
+        assert!(row.evidence.iter().any(|entry| entry.bearing == "waived"));
+        assert!(row
+            .evidence
+            .iter()
+            .any(|entry| entry.event == "gate.result"));
     }
 
     /// One waiver subtracts EXACTLY ONE matching failure (D-I): a second

@@ -53,7 +53,7 @@ use super::standards::{
     load_at_ref, Checker, RfcStatus, RuleMeta, RuleStage, StandardsManifest, StandardsTrust,
 };
 use crate::git_ops::GitRepo;
-use crate::types::{MissionConfig, PinnedRule, StandardsPin, StandardsPinSource};
+use crate::types::{MissionConfig, PinnedGate, PinnedRule, StandardsPin, StandardsPinSource};
 use std::path::Path;
 
 /// The resolution surface recorded on `standards.resolved` for the
@@ -269,6 +269,15 @@ pub fn pin_from_manifest(
         source,
         task_class: task_class.map(crate::routing::normalize_task_class),
         touch_set: touch_set.to_vec(),
+        gates: manifest
+            .pack_gates
+            .iter()
+            .map(|gate| PinnedGate {
+                id: gate.name.clone(),
+                command: gate.command.clone(),
+                when_paths: gate.when_paths.clone(),
+            })
+            .collect(),
         rules: resolved
             .iter()
             .map(|rule| pin_rule(manifest, rule))
@@ -599,40 +608,72 @@ pub fn merge_drift(
     if pin.source == StandardsPinSource::ExternalPinned {
         return Ok(None);
     }
-    let approved = enforced_snapshot(&resolve_pin(
+    let approved_rules = resolve_pin(
         pin,
         RuleStage::Merge,
         &TouchInput::Actual(integration_paths),
-    ));
-    let (current, current_digest) = match load_at_ref(repo, live_base_ref, &pin.pack_dir) {
-        Ok(Some(manifest)) => {
-            let resolved = resolve(
-                &manifest,
-                RuleStage::Merge,
-                pin.task_class.as_deref(),
-                &TouchInput::Actual(integration_paths),
-            );
-            let pinned: Vec<PinnedRule> = resolved
-                .iter()
-                .map(|rule| pin_rule(&manifest, rule))
-                .collect();
-            (enforced_snapshot(&pinned), Some(manifest.digest.clone()))
+    );
+    let approved = enforced_snapshot(&approved_rules);
+    let approved_bindings = pinned_enforced_gate_snapshot(&approved_rules, &pin.gates);
+    let (current, current_bindings, current_digest) =
+        match load_at_ref(repo, live_base_ref, &pin.pack_dir) {
+            Ok(Some(manifest)) => {
+                let resolved = resolve(
+                    &manifest,
+                    RuleStage::Merge,
+                    pin.task_class.as_deref(),
+                    &TouchInput::Actual(integration_paths),
+                );
+                let pinned: Vec<PinnedRule> = resolved
+                    .iter()
+                    .map(|rule| pin_rule(&manifest, rule))
+                    .collect();
+                let bindings = manifest_enforced_gate_snapshot(&pinned, &manifest.pack_gates);
+                (
+                    enforced_snapshot(&pinned),
+                    bindings,
+                    Some(manifest.digest.clone()),
+                )
+            }
+            Ok(None) => (
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                None,
+            ),
+            Err(error) => {
+                // A live base whose policy cannot be read must fail closed:
+                // merging under an unknowable enforced set is not an option.
+                return Ok(Some(DriftReport {
+                    approved_digest: pin.digest.clone(),
+                    current_digest: None,
+                    changed_rules: vec![format!(
+                        "live base standards pack `{}` failed to load: {error}",
+                        pin.pack_dir
+                    )],
+                }));
+            }
+        };
+    let mut changed = drift_lines(&approved, &current);
+    for (rule_id, approved_gate) in &approved_bindings {
+        match current_bindings.get(rule_id) {
+            Some(current_gate) if current_gate == approved_gate => {}
+            Some(_) => changed.push(format!(
+                "{rule_id} checker gate declaration changed on the live base since approval"
+            )),
+            None => changed.push(format!(
+                "{rule_id} checker gate declaration is missing on the live base"
+            )),
         }
-        Ok(None) => (std::collections::BTreeMap::new(), None),
-        Err(error) => {
-            // A live base whose policy cannot be read must fail closed:
-            // merging under an unknowable enforced set is not an option.
-            return Ok(Some(DriftReport {
-                approved_digest: pin.digest.clone(),
-                current_digest: None,
-                changed_rules: vec![format!(
-                    "live base standards pack `{}` failed to load: {error}",
-                    pin.pack_dir
-                )],
-            }));
+    }
+    for rule_id in current_bindings.keys() {
+        if !approved_bindings.contains_key(rule_id) {
+            changed.push(format!(
+                "{rule_id} checker gate declaration is newly applicable on the live base"
+            ));
         }
-    };
-    let changed = drift_lines(&approved, &current);
+    }
+    changed.sort();
+    changed.dedup();
     if changed.is_empty() {
         return Ok(None);
     }
@@ -641,6 +682,47 @@ pub fn merge_drift(
         current_digest,
         changed_rules: changed,
     }))
+}
+
+fn pinned_enforced_gate_snapshot(
+    rules: &[PinnedRule],
+    gates: &[crate::types::PinnedGate],
+) -> std::collections::BTreeMap<String, crate::types::PinnedGate> {
+    rules
+        .iter()
+        .filter(|rule| rule.effective_status == RfcStatus::Enforced.as_str())
+        .filter_map(|rule| {
+            let id = rule.checker.as_deref()?.strip_prefix("gate:")?;
+            gates
+                .iter()
+                .find(|gate| gate.id == id)
+                .cloned()
+                .map(|gate| (rule.id.clone(), gate))
+        })
+        .collect()
+}
+
+fn manifest_enforced_gate_snapshot(
+    rules: &[PinnedRule],
+    gates: &[super::PackGateDecl],
+) -> std::collections::BTreeMap<String, crate::types::PinnedGate> {
+    rules
+        .iter()
+        .filter(|rule| rule.effective_status == RfcStatus::Enforced.as_str())
+        .filter_map(|rule| {
+            let id = rule.checker.as_deref()?.strip_prefix("gate:")?;
+            gates.iter().find(|gate| gate.name == id).map(|gate| {
+                (
+                    rule.id.clone(),
+                    crate::types::PinnedGate {
+                        id: gate.name.clone(),
+                        command: gate.command.clone(),
+                        when_paths: gate.when_paths.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 /// The applicable ENFORCED snapshot, keyed by rule id: the drift comparison

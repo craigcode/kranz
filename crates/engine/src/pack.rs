@@ -515,6 +515,14 @@ impl PackGate {
             outcome,
         }
     }
+
+    /// Attach the stable Flight Rules ids whose checker is this gate. The
+    /// command verdict remains untouched; this is only the structured D-H
+    /// evidence join carried onto `gate.result`.
+    pub fn with_rule_ids(mut self, rule_ids: Vec<String>) -> Self {
+        self.outcome = self.outcome.with_rule_ids(rule_ids);
+        self
+    }
 }
 
 impl Gate for PackGate {

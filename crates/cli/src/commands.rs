@@ -448,6 +448,10 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                     lock_force,
                 )
             }
+            crate::cli::StandardsCommand::Attest { rule, reason } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_attest(&repo, &mission, &rule, &reason, lock_force)
+            }
         },
         Command::Otel {
             endpoint,
@@ -1824,6 +1828,52 @@ fn cmd_standards_waive(
         "approver: {} via cli\nreason: {reason}\nexpires: {}",
         kranz_engine::standards_waiver::LOCAL_OPERATOR,
         expires_at.to_rfc3339()
+    );
+    Ok(0)
+}
+
+/// Record the positive human checker verdict for one `manual-attestation`
+/// rule. This is intentionally separate from a waiver: the operator is
+/// attesting that the current diff satisfies the rule, not excepting a
+/// failure. The engine owns all binding and refusal checks.
+fn cmd_standards_attest(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    reason: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let record = match kranz_engine::standards_attestation::approve_attestation(
+        repo, mission_id, rule, reason, "cli", force_lock,
+    ) {
+        Ok(record) => record,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "attestation refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first.\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("attestation refused: {e}");
+            return Ok(1);
+        }
+    };
+    println!(
+        "recorded standards.attestation.approved (seq {})",
+        record.seq
+    );
+    println!("mission: {mission_id}");
+    println!("rule: {} r{}", record.rule_id, record.rule_revision);
+    if record.paths.is_empty() {
+        println!("affected paths: (none)");
+    } else {
+        println!("affected paths: {}", record.paths.join(", "));
+    }
+    println!("diff digest: sha256:{}", record.diff_digest);
+    println!(
+        "approver: {} via {}\nreason: {}",
+        record.approver, record.surface, record.reason
     );
     Ok(0)
 }

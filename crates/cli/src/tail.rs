@@ -650,6 +650,16 @@ impl EventRenderer {
                 ansi::BLUE,
                 format!("waiver approved: {rule_id} r{rule_revision} by {approver}"),
             ),
+            EventKind::StandardsAttestationApproved {
+                rule_id,
+                rule_revision,
+                approver,
+                ..
+            } => (
+                "standards".to_string(),
+                ansi::BLUE,
+                format!("attestation approved: {rule_id} r{rule_revision} by {approver}"),
+            ),
         };
 
         // Budget: "[tag] body" must fit LINE_MAX visible chars.

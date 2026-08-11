@@ -215,6 +215,19 @@ pub struct PinnedRule {
     pub waivable: bool,
 }
 
+/// One pack gate declaration copied into the approval pin. Flight Rules
+/// checker execution consumes this snapshot, never a later mission-worktree
+/// lookup, so changing `pack.toml` on the mission branch cannot rewrite the
+/// command that judges that same mission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedGate {
+    pub id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when_paths: Vec<String>,
+}
+
 /// The approval-pinned standards manifest (KRZ-342, design D-E), carried on
 /// the plan contract as `standardsManifest`: pack identity + content digest,
 /// the selection inputs resolution ran with, and the applicable rule
@@ -243,6 +256,11 @@ pub struct StandardsPin {
     /// The approved touch-set globs resolution ran against (D-D input 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touch_set: Vec<String>,
+    /// Every pack gate declaration from the trusted approval source. Rules
+    /// reference these by stable id; non-rule pack gates also retain their
+    /// pre-Flight-Rules advisory behavior without a live worktree re-read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<PinnedGate>,
     /// The applicable rules (D-D's mission-wide set — the union over the
     /// four workflow stages), stable-sorted by id.
     pub rules: Vec<PinnedRule>,

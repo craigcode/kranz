@@ -1058,6 +1058,30 @@ pub enum EventKind {
         #[serde(rename = "expiresAt")]
         expires_at: DateTime<Utc>,
     },
+
+    /// Positive human verdict for a rule whose typed checker is
+    /// `manual-attestation` (KRZ-346 D-F). Like a waiver, authority is narrow:
+    /// exact mission pin, rule revision, affected paths, and current diff.
+    /// Unlike a waiver it does not except a failing checker; it IS the
+    /// checker and therefore carries no finding fingerprint or expiry.
+    #[serde(rename = "standards.attestation.approved")]
+    StandardsAttestationApproved {
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        reason: String,
+        approver: String,
+        surface: String,
+    },
 }
 
 impl EventKind {
@@ -1116,6 +1140,7 @@ impl EventKind {
             EventKind::StandardsResolved { .. } => "standards.resolved",
             EventKind::StandardsDrifted { .. } => "standards.drifted",
             EventKind::StandardsWaiverApproved { .. } => "standards.waiver.approved",
+            EventKind::StandardsAttestationApproved { .. } => "standards.attestation.approved",
         }
     }
 

@@ -6146,6 +6146,10 @@ impl MissionEngine {
             }
             changed_paths.extend(paths);
         }
+        let mut all_changed_paths: Vec<String> = changed_paths.iter().cloned().collect();
+        all_changed_paths.sort();
+        let mut actual_paths: Vec<String> = deliverable_paths.iter().cloned().collect();
+        actual_paths.sort();
         if non_meta_commit_count == 0 {
             // Same mission-end clear as complete_mission: no open question
             // may outlive the mission in the pending-decision projection.
@@ -6172,7 +6176,6 @@ impl MissionEngine {
         // mission can never false-positive here. Deterministic and cheap —
         // runs before any command/assertion spend below.
         if let Some(pin) = self.state.mission.standards_manifest.clone() {
-            let actual_paths: Vec<String> = deliverable_paths.iter().cloned().collect();
             let pin_base = self
                 .state
                 .mission
@@ -6271,37 +6274,155 @@ impl MissionEngine {
         // records the named verdicts so a vacuously-green contract is
         // visible in the event log instead of silently trusted.
         //
-        // ONE shared pipeline (ticket pack-contract-gates-prompts): the
-        // engine floor gates register FIRST and the configured pack's
-        // deterministic gates register AFTER — registration order is the
-        // evaluation order within the deterministic section (gate.rs), so a
-        // pack can add to the floor but never precede, displace, or replace
-        // it (a pack gate named like a floor gate was already refused at
-        // load). Pack gate commands run FIRST, before the pipeline exists:
-        // Gate::evaluate is synchronous (and the pipeline is not Send, so it
-        // must never be held across an await) while the engine's bounded
-        // shell runner is async — each gate captures its command's outcome
-        // (same cleared contract env and active root as the contract
-        // assertions above) and the pipeline still owns ordering and
-        // reporting — see pack.rs's module docs. Same advisory posture as
-        // the floor: a failing pack gate is recorded, never blocking.
-        let pack = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
-            .map_err(EngineError::Config)?;
-        let mut pack_gates: Vec<crate::pack::PackGate> = Vec::new();
-        if let Some(pack) = &pack {
-            let changed_paths: Vec<String> = changed_paths.into_iter().collect();
-            for decl in pack.gates_for_paths(&changed_paths) {
-                let (ok, output) =
-                    run_shell_command_sandboxed(&gate_root, &decl.command, &env, &gate_sandbox)
-                        .await;
-                pack_gates.push(crate::pack::PackGate::from_run(
-                    &decl.name,
-                    &decl.command,
-                    ok,
-                    output,
-                ));
+        // ONE shared pipeline (pack gates + KRZ-346 Flight Rules): engine
+        // floors register first, then prepared deterministic pack/checker
+        // outcomes, then contextual/manual outcomes in the model-judged
+        // section. Commands/model turns finish before registration because
+        // Gate::evaluate is synchronous and the pipeline is not Send.
+        //
+        // A standards mission consumes approval-pinned gate declarations —
+        // never `load_for_config` from the mission worktree. Schema-2/3 packs
+        // (no standards pin) retain their legacy live advisory gate path.
+        let standards_pin = self.state.mission.standards_manifest.clone();
+        let mut standards_rules = standards_pin
+            .as_ref()
+            .map(|pin| {
+                crate::standards_enforcement::applicable_rules(
+                    pin,
+                    &[
+                        crate::pack::standards::RuleStage::Validation,
+                        crate::pack::standards::RuleStage::Merge,
+                    ],
+                    &actual_paths,
+                )
+            })
+            .unwrap_or_default();
+        standards_rules.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut gate_rule_ids: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut contextual_rules = Vec::new();
+        let mut prepared_standard_reports = Vec::new();
+        let enforcement_events = if standards_pin.is_some() {
+            self.log.flush()?;
+            EventLog::read_events(self.log.events_path())?
+        } else {
+            Vec::new()
+        };
+        if let Some(pin) = standards_pin.as_ref() {
+            for rule in &standards_rules {
+                match crate::standards_enforcement::checker_binding(pin, rule, &actual_paths) {
+                    crate::standards_enforcement::CheckerBinding::Gate(gate) => {
+                        gate_rule_ids
+                            .entry(gate.id.clone())
+                            .or_default()
+                            .push(rule.id.clone());
+                    }
+                    crate::standards_enforcement::CheckerBinding::AgentJudgement => {
+                        contextual_rules.push(rule.clone());
+                    }
+                    crate::standards_enforcement::CheckerBinding::ManualAttestation => {
+                        let attestation = crate::standards_attestation::active_attestation(
+                            self.active_repo(),
+                            &enforcement_events,
+                            &self.state.mission.id,
+                            pin,
+                            rule,
+                            &base,
+                            "HEAD",
+                        )?;
+                        let artefact = crate::gate::ArtefactRef::new(format!(
+                            "manual attestation for {} r{}",
+                            rule.id, rule.revision
+                        ));
+                        let outcome = if let Some(attestation) = attestation {
+                            crate::gate::GateOutcome::pass(artefact.with_detail(format!(
+                                "standards.attestation.approved seq {} by {} via {}: {}",
+                                attestation.seq,
+                                attestation.approver,
+                                attestation.surface,
+                                attestation.reason
+                            )))
+                        } else {
+                            crate::gate::GateOutcome::fail(artefact.with_detail(
+                                "no current authorized manual attestation is recorded for \
+                                 this exact pinned rule and diff",
+                            ))
+                        };
+                        prepared_standard_reports.push(crate::gate::GateReport {
+                            name: format!("standards-manual:{}", rule.id),
+                            kind: crate::gate::GateKind::ModelJudged,
+                            outcome: outcome.with_rule_ids(vec![rule.id.clone()]),
+                        });
+                    }
+                    crate::standards_enforcement::CheckerBinding::Unavailable(reason) => {
+                        prepared_standard_reports.push(crate::gate::GateReport {
+                            name: format!("standards-binding:{}", rule.id),
+                            kind: crate::gate::GateKind::Deterministic,
+                            outcome: crate::gate::GateOutcome::fail(
+                                crate::gate::ArtefactRef::new(format!(
+                                    "checker binding for {} r{}",
+                                    rule.id, rule.revision
+                                ))
+                                .with_detail(reason),
+                            )
+                            .with_rule_ids(vec![rule.id.clone()]),
+                        });
+                    }
+                }
             }
         }
+
+        let (pack_name, pinned_gate_decls) = if let Some(pin) = standards_pin.as_ref() {
+            (Some(pin.pack_name.clone()), pin.gates.clone())
+        } else {
+            let pack = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+                .map_err(EngineError::Config)?;
+            let name = pack.as_ref().map(|pack| pack.name.clone());
+            let gates = pack
+                .as_ref()
+                .map(|pack| {
+                    pack.gates
+                        .iter()
+                        .map(|gate| crate::types::PinnedGate {
+                            id: gate.name.clone(),
+                            command: gate.command.clone(),
+                            when_paths: gate.when_paths.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, gates)
+        };
+        let mut pack_gates: Vec<crate::pack::PackGate> = Vec::new();
+        for decl in &pinned_gate_decls {
+            if !crate::merge_gate::when_paths_match(&decl.when_paths, &all_changed_paths) {
+                continue;
+            }
+            let (ok, output) =
+                run_shell_command_sandboxed(&gate_root, &decl.command, &env, &gate_sandbox).await;
+            let rule_ids = gate_rule_ids.remove(&decl.id).unwrap_or_default();
+            pack_gates.push(
+                crate::pack::PackGate::from_run(&decl.id, &decl.command, ok, output)
+                    .with_rule_ids(rule_ids),
+            );
+        }
+        // A valid pin cannot leave a gate id unresolved (checker_binding
+        // resolved against this same list). Treat any corrupt duplicate or
+        // hand-edited pin conservatively anyway.
+        for (gate, rule_ids) in gate_rule_ids {
+            prepared_standard_reports.push(crate::gate::GateReport {
+                name: format!("standards-binding:{gate}"),
+                kind: crate::gate::GateKind::Deterministic,
+                outcome: crate::gate::GateOutcome::fail(
+                    crate::gate::ArtefactRef::new(format!("approval-pinned gate `{gate}`"))
+                        .with_detail("the pinned checker declaration was unavailable at execution"),
+                )
+                .with_rule_ids(rule_ids),
+            });
+        }
+        prepared_standard_reports.extend(self.judge_standards_rules(&contextual_rules).await?);
+
         // The pipeline is scoped to this block: it is not Send (Box<dyn
         // Gate>), so it must be fully dropped before the next await below.
         let (floor_reports, pack_reports) = {
@@ -6315,6 +6436,11 @@ impl MissionEngine {
             let floor_gate_count = pipeline.len();
             for gate in pack_gates {
                 pipeline.register(Box::new(gate));
+            }
+            for report in prepared_standard_reports {
+                pipeline.register(Box::new(crate::standards_enforcement::PreparedGate::new(
+                    report,
+                )));
             }
             let final_gate_reports = pipeline.evaluate();
             let (floor, pack) = final_gate_reports.split_at(floor_gate_count);
@@ -6347,34 +6473,146 @@ impl MissionEngine {
                 Some(contract_gates::render_gate_verdicts(&floor_reports)),
             )?;
         }
-        // The pack's verdicts are recorded whenever a configured pack had
-        // applicable gates — pass or fail, since a pack's silent green is
-        // exactly as invisible as its failure would be. No pack ⇒ no
-        // decision ⇒ byte-identical behavior.
-        if let Some(pack) = &pack {
-            if !pack_reports.is_empty() {
-                let failed_pack = contract_gates::failed_gate_names(&pack_reports);
+        // Ordinary (unlinked) pack gates remain advisory. Linked Flight
+        // Rules reports are interpreted through D-B below.
+        let ordinary_pack_reports: Vec<_> = pack_reports
+            .iter()
+            .filter(|report| report.outcome.rule_ids.is_empty())
+            .cloned()
+            .collect();
+        if let Some(pack_name) = &pack_name {
+            if !ordinary_pack_reports.is_empty() {
+                let failed_pack = contract_gates::failed_gate_names(&ordinary_pack_reports);
                 let summary = if failed_pack.is_empty() {
                     format!(
                         "pack `{}` gates (final gate): {} deterministic gate(s) passed — advisory only",
-                        pack.name,
-                        pack_reports.len()
+                        pack_name,
+                        ordinary_pack_reports.len()
                     )
                 } else {
                     format!(
                         "pack `{}` gates (final gate): named gate(s) failed: {} — advisory only; \
                          command outcomes and findings above are unchanged",
-                        pack.name,
+                        pack_name,
                         failed_pack.join(", ")
                     )
                 };
                 self.emit_decision(
                     &summary,
                     Some(contract_gates::render_verdict_block(
-                        &format!("pack `{}` gates:", pack.name),
-                        &pack_reports,
+                        &format!("pack `{pack_name}` gates:"),
+                        &ordinary_pack_reports,
                     )),
                 )?;
+            }
+        }
+
+        // Interpret linked checker failures through the exact lifecycle ×
+        // level matrix. Advisory failures are recorded as findings but never
+        // enter the blocking/fix loop. Enforced MUST failures enter it unless
+        // a still-live D-I waiver matches this exact finding AND the current
+        // affected-path diff.
+        let linked_reports: Vec<_> = pack_reports
+            .iter()
+            .filter(|report| !report.outcome.rule_ids.is_empty())
+            .cloned()
+            .collect();
+        let mut advisory_standard_findings = Vec::new();
+        let mut waived_standard_rules = Vec::new();
+        if let Some(pin) = standards_pin.as_ref() {
+            for report in &linked_reports {
+                if report.outcome.passed() {
+                    continue;
+                }
+                for rule_id in &report.outcome.rule_ids {
+                    let Some(rule) = standards_rules.iter().find(|rule| &rule.id == rule_id) else {
+                        continue;
+                    };
+                    let detail = report
+                        .outcome
+                        .artefact
+                        .detail
+                        .as_deref()
+                        .unwrap_or("checker failed without detail");
+                    let finding = crate::standards_enforcement::failure_finding(
+                        pin,
+                        rule,
+                        &scrub::scrub(&format!(
+                            "checker `{}` failed for {} r{}: {detail}",
+                            report.name, rule.id, rule.revision
+                        )),
+                    );
+                    match crate::standards_enforcement::rule_mode(rule) {
+                        crate::standards_enforcement::RuleMode::Absent => {}
+                        crate::standards_enforcement::RuleMode::Advisory => {
+                            advisory_standard_findings.push(finding)
+                        }
+                        crate::standards_enforcement::RuleMode::Authoritative => {
+                            let waiver = crate::standards_waiver::active_waiver_for_finding(
+                                self.active_repo(),
+                                &enforcement_events,
+                                &self.state.mission.id,
+                                pin,
+                                rule,
+                                &finding,
+                                &base,
+                                "HEAD",
+                                chrono::Utc::now(),
+                            )?;
+                            if let Some(waiver) = waiver {
+                                waived_standard_rules.push((rule.id.clone(), waiver.seq));
+                            } else {
+                                findings.push(finding);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (rule_id, waiver_seq) in waived_standard_rules {
+            self.emit_decision(
+                &format!(
+                    "Flight Rules {rule_id}: failing enforced MUST covered by exact human waiver"
+                ),
+                Some(format!(
+                    "standards.waiver.approved seq {waiver_seq} matches the pinned revision, \
+                     checker finding fingerprint, affected paths, current diff digest, approval \
+                     sequence, human authority surface, and expiry"
+                )),
+            )?;
+        }
+        if !linked_reports.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "Flight Rules final enforcement: {} checker verdict(s), {} blocking failure(s), {} advisory failure(s)",
+                    linked_reports.len(),
+                    findings
+                        .iter()
+                        .filter(|finding| finding.class == "standards-authoritative")
+                        .count(),
+                    advisory_standard_findings.len()
+                ),
+                Some(contract_gates::render_verdict_block(
+                    "Flight Rules checkers:",
+                    &linked_reports,
+                )),
+            )?;
+        }
+        if !advisory_standard_findings.is_empty() {
+            let milestone_id = self
+                .state
+                .mission
+                .milestones
+                .last()
+                .expect("a final gate has a milestone")
+                .id
+                .clone();
+            for finding in advisory_standard_findings {
+                self.emit(EventKind::ValidationFinding {
+                    milestone_id: milestone_id.clone(),
+                    run_id: crate::reducer::ENGINE_RUN_ID.to_string(),
+                    finding,
+                })?;
             }
         }
 
@@ -6462,12 +6700,46 @@ impl MissionEngine {
             })?;
         }
 
-        // Command assertions are non-waivable but still fixable: send every
-        // finding through convert_findings, then refuse an all-waive that
-        // covers any command-assertion subject (synthesize fixes instead).
-        let command_subjects: std::collections::HashSet<String> = findings
+        // A missing manual attestation is intentionally human-as-MUST. It
+        // is neither a code defect for a worker to chase nor a judgement a
+        // model may waive. Park immediately with the one authorized command;
+        // resuming after that event is recorded re-runs the exact checker.
+        let manual_attestation_rules: Vec<String> = findings
             .iter()
-            .filter(|f| f.class == "command-assertion")
+            .filter_map(|finding| {
+                finding
+                    .rule
+                    .as_ref()
+                    .filter(|rule| rule.checker.as_deref() == Some("manual-attestation"))
+                    .map(|rule| rule.id.clone())
+            })
+            .collect();
+        if !manual_attestation_rules.is_empty() {
+            let rules = manual_attestation_rules.join(", ");
+            self.emit_decision(
+                &format!("Flight Rules manual attestation required: {rules}"),
+                Some(format!(
+                    "Stop the mission runner, inspect the current diff, then record each positive human verdict with `kranz --mission {} standards attest --rule <id> --reason <reason>` and resume. Any relevant diff change invalidates the attestation.",
+                    self.state.mission.id
+                )),
+            )?;
+            self.emit(EventKind::MilestoneBlocked {
+                milestone_id: last_milestone_id,
+                reason: format!(
+                    "authorized manual attestation required for Flight Rules rule(s): {rules}"
+                ),
+            })?;
+            return Ok(None);
+        }
+
+        // Command assertions and failing enforced Flight Rules MUSTs are not
+        // waivable by model discretion. The latter have exactly one exception
+        // channel: a pre-recorded, live standards.waiver.approved event,
+        // consumed above. Refuse any ordinary conversion-turn waive that
+        // names either class and synthesize fixes instead.
+        let protected_subjects: std::collections::HashSet<String> = findings
+            .iter()
+            .filter(|f| f.class == "command-assertion" || f.class == "standards-authoritative")
             .map(|f| f.subject.clone())
             .collect();
         let all_findings = findings;
@@ -6514,7 +6786,7 @@ impl MissionEngine {
             FindingsConversion::Waive { waived }
                 if waived
                     .iter()
-                    .all(|w| !command_subjects.contains(w.subject.as_str())) =>
+                    .all(|w| !protected_subjects.contains(w.subject.as_str())) =>
             {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
@@ -6523,20 +6795,20 @@ impl MissionEngine {
                 Ok(Some(MissionStatus::Complete))
             }
             FindingsConversion::Waive { waived } => {
-                // Model waived a command assertion — refuse. Fix every
-                // command-classified finding the waive covered (and any
+                // Model waived a protected final-gate finding — refuse. Fix
+                // every protected finding the waive covered (and any
                 // other unwaived remainder is already handled by convert
                 // synthesizing; here the waive emptied the set, so rebuild
                 // from command findings only).
                 let refuse_note = waived
                     .iter()
-                    .filter(|w| command_subjects.contains(w.subject.as_str()))
+                    .filter(|w| protected_subjects.contains(w.subject.as_str()))
                     .map(|w| w.subject.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.emit_decision(
                     &format!(
-                        "refused waive of final-gate command assertion(s): {refuse_note}; synthesizing fix feature(s)"
+                        "refused model waive of non-waivable final-gate finding(s): {refuse_note}; synthesizing fix feature(s)"
                     ),
                     Some(
                         waived
@@ -6546,16 +6818,16 @@ impl MissionEngine {
                             .join("\n"),
                     ),
                 )?;
-                let command_only: Vec<&Finding> = all_findings
+                let protected_only: Vec<&Finding> = all_findings
                     .iter()
-                    .filter(|f| command_subjects.contains(&f.subject))
+                    .filter(|f| protected_subjects.contains(&f.subject))
                     .collect();
-                let specs = synthesize_fix_specs(command_only);
+                let specs = synthesize_fix_specs(protected_only);
                 if self.fix_cycle_exhausted(li) && !self.escalate_or_block(&last_milestone_id)? {
                     self.emit(EventKind::MilestoneBlocked {
                         milestone_id: last_milestone_id,
                         reason: format!(
-                            "{} final-gate command assertion(s) failed but the fix-cycle cap ({}) is reached",
+                            "{} non-waivable final-gate finding(s) failed but the fix-cycle cap ({}) is reached",
                             specs.len(),
                             self.state.config.max_fix_cycles_per_milestone
                         ),
@@ -6568,7 +6840,7 @@ impl MissionEngine {
                 self.emit_fix_features(
                     li,
                     specs,
-                    &format!("fix non-waivable command assertion(s): {refuse_note}"),
+                    &format!("fix non-waivable final-gate finding(s): {refuse_note}"),
                     refuse_note,
                 )?;
                 Ok(None)
@@ -8307,6 +8579,7 @@ pub(crate) mod tests {
             source: crate::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".to_string()],
+            gates: Vec::new(),
             rules: vec![],
         }));
         let err = engine.approve_plan(plan).expect_err("must reject");

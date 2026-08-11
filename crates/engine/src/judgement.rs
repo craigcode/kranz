@@ -7,6 +7,7 @@
 //! also call.
 
 use crate::error::Result;
+use crate::gate::{ArtefactRef, GateKind, GateOutcome, GateReport};
 use crate::git_ops::GitRepo;
 use crate::lessons;
 use crate::orchestrator::{
@@ -225,6 +226,62 @@ impl MissionEngine {
         Ok(findings)
     }
 
+    /// One contextual Flight Rules verdict per pinned rule. The engine owns
+    /// the checker prompt and validates cardinality strictly: a missing OR
+    /// duplicate id is a failing gate outcome, never a pass by omission or
+    /// "first verdict wins". Returned reports are model-judged gate entries
+    /// and carry their exact rule id for the coverage fold.
+    pub(crate) async fn judge_standards_rules(
+        &mut self,
+        rules: &[PinnedRule],
+    ) -> Result<Vec<GateReport>> {
+        if rules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed = rules
+            .iter()
+            .map(|rule| {
+                format!(
+                    "- [{} r{}; {}; {}] {}",
+                    rule.id, rule.revision, rule.effective_status, rule.level, rule.statement
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let base = judge_diff_base(
+            self.state.mission.base_sha.as_deref(),
+            &self.state.mission.base_branch,
+        );
+        let diff_stat = self
+            .active_repo()
+            .diff_stat(&base, "HEAD")
+            .unwrap_or_default();
+        let message = format!(
+            "Flight Rules contextual final checker. Judge EVERY listed rule against the full \
+             repository diff {base}..HEAD and current tree. Return exactly one verdict for each \
+             listed id and no duplicate ids. The verdict is authoritative; do not infer policy \
+             from prose outside these pinned statements.\n\nRULES:\n{listed}\n\nDIFF STAT:\n{diff_stat}\n\n\
+             Respond with ONLY this JSON:\n\
+             {{\"verdicts\":[{{\"id\":\"string\",\"pass\":true,\"evidence\":\"string\"}}],\"summary\":\"string\"}}"
+        );
+        let (decision, text) = self.json_decision::<VerdictsDecision>(&message).await?;
+        let (reports, summary) = match decision {
+            Some(decision) => {
+                let reports = strict_standards_reports(rules, Some(&decision.verdicts));
+                (reports, decision.summary)
+            }
+            None => (
+                strict_standards_reports(rules, None),
+                "unparseable contextual standards verdict; all rules failed closed".to_string(),
+            ),
+        };
+        self.emit_decision(
+            &format!("Flight Rules contextual checker: {summary}"),
+            Some(text),
+        )?;
+        Ok(reports)
+    }
+
     // -----------------------------------------------------------------------
     // Cross-mission lesson capture
     // -----------------------------------------------------------------------
@@ -299,6 +356,58 @@ impl MissionEngine {
             None => Ok((None, retry)),
         }
     }
+}
+
+fn strict_standards_reports(rules: &[PinnedRule], verdicts: Option<&[Verdict]>) -> Vec<GateReport> {
+    rules
+        .iter()
+        .map(|rule| {
+            let matching: Vec<&Verdict> = verdicts
+                .unwrap_or_default()
+                .iter()
+                .filter(|verdict| verdict.id == rule.id)
+                .collect();
+            let (pass, detail) = match matching.as_slice() {
+                [verdict] if verdict.pass => (true, verdict.evidence.clone()),
+                [verdict] => (
+                    false,
+                    if verdict.evidence.is_empty() {
+                        "contextual checker judged the rule failed".to_string()
+                    } else {
+                        verdict.evidence.clone()
+                    },
+                ),
+                [] => (
+                    false,
+                    "contextual checker returned no verdict for this rule".to_string(),
+                ),
+                _ => (
+                    false,
+                    format!(
+                        "contextual checker returned {} duplicate verdicts for this rule",
+                        matching.len()
+                    ),
+                ),
+            };
+            let artefact =
+                ArtefactRef::new(format!("contextual Flight Rules verdict for {}", rule.id));
+            let outcome = if pass {
+                GateOutcome::pass(if detail.is_empty() {
+                    artefact
+                } else {
+                    artefact.with_detail(detail)
+                })
+            } else {
+                GateOutcome::fail(artefact.with_detail(detail))
+            }
+            .with_rule_ids(vec![rule.id.clone()]);
+            GateReport {
+                name: format!("standards-agent:{}", rule.id),
+                kind: GateKind::ModelJudged,
+                outcome,
+            }
+        })
+        .collect()
 }
 
 /// Which base ref the final gate's agent-judgement turn diffs against: the base
@@ -392,6 +501,96 @@ mod tests {
     use crate::backend::AgentBackend;
     use crate::orchestrator::tests::lessons_test_repo;
     use std::sync::Arc;
+
+    fn contextual_rule(id: &str) -> PinnedRule {
+        PinnedRule {
+            id: id.to_string(),
+            revision: 1,
+            rfc: "RFC-001".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: "Review the full change.".to_string(),
+            domains: Vec::new(),
+            stages: vec!["validation".to_string()],
+            when_paths: Vec::new(),
+            task_classes: Vec::new(),
+            checker: Some("agent-judgement".to_string()),
+            waivable: false,
+        }
+    }
+
+    #[test]
+    fn flight_rules_enforcement_contextual_missing_and_duplicate_fail_closed() {
+        let rules = vec![contextual_rule("ZZ-CONTEXT-001")];
+        let missing = strict_standards_reports(&rules, Some(&[]));
+        assert_eq!(missing.len(), 1);
+        assert!(!missing[0].outcome.passed());
+        assert!(missing[0]
+            .outcome
+            .artefact
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no verdict")));
+
+        let duplicates = [
+            Verdict {
+                id: "ZZ-CONTEXT-001".to_string(),
+                pass: true,
+                evidence: "first".to_string(),
+            },
+            Verdict {
+                id: "ZZ-CONTEXT-001".to_string(),
+                pass: true,
+                evidence: "second".to_string(),
+            },
+        ];
+        let duplicate = strict_standards_reports(&rules, Some(&duplicates));
+        assert_eq!(duplicate.len(), 1);
+        assert!(!duplicate[0].outcome.passed());
+        assert!(duplicate[0]
+            .outcome
+            .artefact
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("duplicate")));
+    }
+
+    #[test]
+    fn flight_rules_enforcement_contextual_emits_exactly_one_linked_report_per_rule() {
+        let rules = vec![
+            contextual_rule("ZZ-CONTEXT-001"),
+            contextual_rule("ZZ-CONTEXT-002"),
+        ];
+        let verdicts = [
+            Verdict {
+                id: "ZZ-CONTEXT-002".to_string(),
+                pass: false,
+                evidence: "unsafe behavior remains".to_string(),
+            },
+            Verdict {
+                id: "ZZ-CONTEXT-001".to_string(),
+                pass: true,
+                evidence: "reviewed".to_string(),
+            },
+            Verdict {
+                id: "unrequested".to_string(),
+                pass: true,
+                evidence: String::new(),
+            },
+        ];
+        let reports = strict_standards_reports(&rules, Some(&verdicts));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[0].outcome.rule_ids,
+            vec!["ZZ-CONTEXT-001".to_string()]
+        );
+        assert!(reports[0].outcome.passed());
+        assert_eq!(
+            reports[1].outcome.rule_ids,
+            vec!["ZZ-CONTEXT-002".to_string()]
+        );
+        assert!(!reports[1].outcome.passed());
+    }
 
     #[test]
     fn judge_gate_diff_uses_pinned_base_sha() {

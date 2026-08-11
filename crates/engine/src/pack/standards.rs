@@ -313,6 +313,10 @@ pub struct StandardsManifest {
     /// Declarations of the pack gates referenced by `gate:` checkers —
     /// governing bytes, hashed into the digest (D-F).
     pub gate_bindings: Vec<PackGateDecl>,
+    /// All pack gates from the same trusted source. Only referenced bindings
+    /// participate in the standards digest, but approval pins the full list
+    /// so ordinary advisory pack gates also avoid a mission-worktree re-read.
+    pub pack_gates: Vec<PackGateDecl>,
     /// Lowercase hex sha256 over [`Self::canonical_text`].
     pub digest: String,
     canonical: String,
@@ -1407,6 +1411,7 @@ fn assemble(
         rfcs,
         rules,
         gate_bindings,
+        pack_gates: gates.to_vec(),
         digest,
         canonical,
     })

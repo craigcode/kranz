@@ -214,6 +214,7 @@ pub fn waiver_covers(
     now: DateTime<Utc>,
 ) -> bool {
     rule.waivable
+        && waiver.seq > approval_seq
         && waiver.rule_id == rule.id
         && waiver.rule_revision == rule.revision
         && waiver.manifest_digest == pin.digest
@@ -222,6 +223,62 @@ pub fn waiver_covers(
         && now < waiver.expires_at
         && HUMAN_SURFACES.contains(&waiver.surface.as_str())
         && !waiver.approver.trim().is_empty()
+}
+
+/// Enforcement-time half of D-I: find the live human waiver that covers this
+/// freshly-computed failing checker finding AND the current affected-path
+/// diff. The log-only coverage fold cannot re-read git; final/merge decisions
+/// must call this function before treating a failure as waived.
+#[allow(clippy::too_many_arguments)]
+pub fn active_waiver_for_finding(
+    repo: &crate::git_ops::GitRepo,
+    events: &[Event],
+    mission_id: &str,
+    pin: &StandardsPin,
+    rule: &PinnedRule,
+    finding: &Finding,
+    base_ref: &str,
+    head_ref: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Option<WaiverRecord>> {
+    let approval_seq = events
+        .iter()
+        .filter(|event| event.mission_id == mission_id)
+        .filter_map(|event| match &event.kind {
+            EventKind::PlanApproved { plan, .. }
+                if plan
+                    .standards_manifest
+                    .as_deref()
+                    .is_some_and(|approved| approved == pin) =>
+            {
+                Some(event.seq)
+            }
+            _ => None,
+        })
+        .next_back();
+    let Some(approval_seq) = approval_seq else {
+        return Ok(None);
+    };
+    let changed = repo.changed_paths(base_ref, head_ref)?;
+    let paths = affected_paths(rule, &changed);
+    let diff = if rule.when_paths.is_empty() {
+        repo.diff_full(base_ref, head_ref)?
+    } else if paths.is_empty() {
+        String::new()
+    } else {
+        repo.diff_range_paths(base_ref, head_ref, &paths)?
+    };
+    let diff_digest = sha256_hex(diff.as_bytes());
+    let fingerprint = finding_fingerprint(crate::reducer::ENGINE_RUN_ID, finding);
+    Ok(events
+        .iter()
+        .filter(|event| event.mission_id == mission_id)
+        .filter_map(WaiverRecord::from_event)
+        .rfind(|waiver| {
+            waiver_covers(waiver, rule, pin, approval_seq, &fingerprint, now)
+                && waiver.paths == paths
+                && waiver.diff_digest == diff_digest
+        }))
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +606,7 @@ mod tests {
             source: crate::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".to_string()],
+            gates: Vec::new(),
             rules: vec![pinned(true)],
         }
     }

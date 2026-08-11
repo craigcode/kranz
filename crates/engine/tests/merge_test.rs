@@ -1303,3 +1303,119 @@ fn flight_rules_pin_merge_mission_unchanged_policy_merges_clean() {
         "an unchanged base policy merges clean: {report:?}"
     );
 }
+
+#[test]
+fn flight_rules_enforcement_merge_reruns_pinned_gate_on_integration_tree() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    write_standards_pack(&dir, "enforced");
+    let pack_base = repo
+        .add_all_and_commit("vendor the standards pack")
+        .unwrap();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &pack_base,
+        "crates/engine/src/lib.rs",
+        "pub fn x() {}\n",
+    );
+    let pin = approve_fixture_pin(&repo, dir.path());
+
+    let calls = std::cell::RefCell::new(Vec::new());
+    let report = merge_mission(
+        &repo,
+        "main",
+        &pack_base,
+        "kranz/mission-x",
+        None,
+        Some(&pin),
+        |command, cwd| {
+            calls
+                .borrow_mut()
+                .push((command.to_string(), cwd.to_path_buf()));
+            if command == "cd ." {
+                (false, "integration checker failed".to_string())
+            } else {
+                (true, String::new())
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        report,
+        MergeReport::StandardsFailed {
+            rule_id: "ZZ-MUST-001".to_string(),
+            checker: "gate:zz-gate".to_string(),
+            output: "integration checker failed".to_string(),
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(
+        calls.len(),
+        1,
+        "ordinary merge gates stop after the rule block"
+    );
+    assert_eq!(calls[0].0, "cd .");
+    assert_ne!(
+        calls[0].1,
+        dir.path(),
+        "checker runs in scratch, not primary"
+    );
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        pack_base,
+        "base remains untouched"
+    );
+}
+
+#[test]
+fn flight_rules_enforcement_merge_detects_checker_command_drift() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _seed) = seeded_repo();
+    write_standards_pack(&dir, "enforced");
+    let pack_base = repo
+        .add_all_and_commit("vendor the standards pack")
+        .unwrap();
+    seed_mission_branch(
+        &dir,
+        &repo,
+        &pack_base,
+        "crates/engine/src/lib.rs",
+        "pub fn x() {}\n",
+    );
+    let pin = approve_fixture_pin(&repo, dir.path());
+
+    let manifest = dir.path().join("vendor/pack/pack.toml");
+    let changed = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("command = \"cd .\"", "command = \"false\"");
+    std::fs::write(&manifest, changed).unwrap();
+    let moved_base = repo
+        .add_all_and_commit("change standards checker command")
+        .unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &pack_base,
+        "kranz/mission-x",
+        None,
+        Some(&pin),
+        passing_executor,
+    )
+    .unwrap();
+    match report {
+        MergeReport::StandardsDrifted { changed_rules, .. } => assert!(
+            changed_rules.iter().any(|line| {
+                line.contains("ZZ-MUST-001") && line.contains("gate declaration changed")
+            }),
+            "{changed_rules:?}"
+        ),
+        other => panic!("expected checker binding drift, got {other:?}"),
+    }
+    assert_eq!(repo.head_sha().unwrap(), moved_base);
+}

@@ -41,7 +41,9 @@ use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::git_ops::KranzCommitMetadata;
-use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::merge::{
+    merge_mission_with_standards_evidence, MergeReport, StandardsMergeEvidence,
+};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::queue;
@@ -711,6 +713,14 @@ impl MissionHost {
         // against the exact scratch integration diff and refuse on
         // enforced-set drift; `None` keeps the merge byte-identical.
         let standards_pin = state.mission.standards_manifest.clone();
+        let standards_coverage = kranz_engine::standards_coverage::standards_coverage(id, &events);
+        let standards_evidence = StandardsMergeEvidence::from_mission_events(
+            id,
+            standards_pin.as_ref(),
+            standards_coverage.as_ref(),
+            &events,
+            chrono::Utc::now(),
+        );
         let metadata = KranzCommitMetadata {
             mission_id: state.mission.id.clone(),
             cost_usd: state.total_cost_usd,
@@ -748,13 +758,14 @@ impl MissionHost {
         }
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            let report = merge_mission(
+            let report = merge_mission_with_standards_evidence(
                 &repo,
                 &base_branch,
                 &base_sha,
                 &mission_branch,
                 Some(metadata),
                 standards_pin.as_ref(),
+                &standards_evidence,
                 |cmd, cwd| {
                     if gate_policy.enforces_on_this_host() {
                         kranz_engine::command_exec::run_bounded_gate_command_sandboxed(
@@ -850,6 +861,15 @@ impl MissionHost {
                     changed_rules.join("\n")
                 )))
             }
+            MergeReport::StandardsFailed {
+                rule_id,
+                checker,
+                output,
+            } => Err(ApiError::unprocessable(kranz_engine::scrub::scrub(
+                &format!(
+                    "Flight Rules merge checker refused {rule_id} ({checker}):\n{output}"
+                ),
+            ))),
         }
     }
 

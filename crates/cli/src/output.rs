@@ -1881,6 +1881,7 @@ mod tests {
                 source: kranz_engine::types::StandardsPinSource::RepoTracked,
                 task_class: None,
                 touch_set: vec!["crates/**".to_string()],
+                gates: Vec::new(),
                 rules: vec![rule("ZZ-FAIL-001", 2), rule("ZZ-QUIET-001", 1)],
             }));
             let mut gate = gate_result(

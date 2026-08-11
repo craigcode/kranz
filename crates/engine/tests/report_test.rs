@@ -434,6 +434,7 @@ fn pinned_plan() -> Plan {
             source: kranz_engine::types::StandardsPinSource::RepoTracked,
             task_class: None,
             touch_set: vec!["crates/**".into()],
+            gates: Vec::new(),
             rules: vec![
                 rule("ZZ-FAIL-001", 2, "enforced", "must"),
                 rule("ZZ-QUIET-001", 1, "enforced", "must"),

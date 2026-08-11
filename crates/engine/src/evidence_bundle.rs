@@ -1552,6 +1552,7 @@ mod tests {
                 source: crate::types::StandardsPinSource::RepoTracked,
                 task_class: None,
                 touch_set: vec!["crates/**".to_string()],
+                gates: Vec::new(),
                 rules: vec![
                     rule("ZZ-FAIL-001", 2, "enforced"),
                     rule("ZZ-PASS-001", 1, "enforced"),

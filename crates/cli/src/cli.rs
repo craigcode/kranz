@@ -697,6 +697,20 @@ pub enum StandardsCommand {
         #[arg(long, value_name = "RFC3339")]
         expires: String,
     },
+
+    /// Record the authorized human verdict for one approval-pinned
+    /// `manual-attestation` rule. The attestation binds to the current
+    /// affected paths and diff digest, so any relevant change invalidates
+    /// it. The approver is always the local operator using this CLI surface.
+    Attest {
+        /// The pinned manual-attestation rule id
+        #[arg(long)]
+        rule: String,
+
+        /// Why the operator judges the current change compliant
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1009,6 +1023,34 @@ mod tests {
         // reason-less waiver exists.
         assert!(
             Cli::try_parse_from(["kranz", "standards", "waive", "--rule", "ZZ-FAIL-001"]).is_err()
+        );
+    }
+
+    #[test]
+    fn flight_rules_enforcement_standards_attest_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "attest",
+            "--rule",
+            "ZZ-MANUAL-001",
+            "--reason",
+            "reviewed the deployment evidence",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Attest { rule, reason } => {
+                    assert_eq!(rule, "ZZ-MANUAL-001");
+                    assert_eq!(reason, "reviewed the deployment evidence");
+                }
+                other => panic!("expected Attest, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["kranz", "standards", "attest", "--rule", "ZZ-MANUAL-001"])
+                .is_err()
         );
     }
 
