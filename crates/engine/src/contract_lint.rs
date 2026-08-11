@@ -13,15 +13,10 @@
 //! This module takes plain inputs and does not depend on `MissionEngine`, so
 //! it is unit-testable in isolation (mirrors `contract_sweep.rs`).
 //!
-//! CRITICAL: `approve_plan` is a synchronous `pub fn` called from inside the
-//! process `#[tokio::main]` runtime. Constructing a new `tokio::runtime::Runtime`
-//! and calling `block_on` from there panics unconditionally ("Cannot start a
-//! runtime from within a runtime"). The runner here therefore uses
-//! `std::process::Command` with a poll/try_wait+sleep timeout loop, copying
-//! the proven-safe pattern of `run_with_timeout` in `orchestrator.rs`. It must
-//! NOT call the async `run_shell_command` or `run_bounded_gate_command` (the
-//! latter builds a current-thread runtime and would panic under the ambient
-//! runtime).
+//! Approval is synchronous but normally called inside Tokio. Execution uses
+//! `command_exec`'s scoped-thread bridge into the same bounded, process-tree
+//! killed, sandbox-aware gate runner as validation/final gates; it never
+//! starts a nested runtime on the caller's runtime thread.
 
 use crate::types::{Assertion, AssertionCheck};
 use std::collections::HashMap;
@@ -34,9 +29,6 @@ const PER_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// Overall wall-clock budget for linting an entire contract's command
 /// assertions; once spent, remaining assertions are recorded `NotLinted`.
 const OVERALL_BUDGET: Duration = Duration::from_secs(180);
-
-/// Max characters of combined stdout+stderr kept per lint result.
-const OUTPUT_TAIL_MAX: usize = 1500;
 
 /// Verdict for one `check: command` assertion run once against the
 /// untouched base tree.
@@ -173,95 +165,41 @@ pub fn classify(ran_to_completion: bool, exited_success: bool) -> AssertionLintO
 /// with hooks off. The lint is advisory-only, so a command that depended on
 /// a now-cleared ambient var flips to `FailedOnBase`/`CouldNotVerdict` —
 /// exactly the signal that it needs a `contractEnvPassthrough` entry.
-pub fn lint_env(base_sha: Option<&str>, passthrough: &[String]) -> HashMap<String, String> {
-    let scratch = std::env::temp_dir().join(format!("kranz-contract-lint-{}", std::process::id()));
-    let mut env = crate::agent_env::contract_command_env(&scratch, base_sha, passthrough);
+pub fn lint_env(
+    scratch: &Path,
+    base_sha: Option<&str>,
+    passthrough: &[String],
+) -> HashMap<String, String> {
+    let mut env = crate::agent_env::contract_command_env(scratch, base_sha, passthrough);
     env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
     env.insert("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string());
     env.insert("GIT_CONFIG_VALUE_0".to_string(), "/dev/null".to_string());
     env
 }
 
-/// Run `sh -c command` in `cwd` with `env` as the child's COMPLETE
-/// (cleared) environment, polling with a bounded wall-clock `timeout`
-/// rather than blocking forever (mirrors `orchestrator::run_with_timeout`).
-/// Returns `(ran_to_completion, exited_success, output_tail)`.
-fn run_command_bounded(
-    cwd: &Path,
-    command: &str,
-    env: &HashMap<String, String>,
-    timeout: Duration,
-) -> (bool, bool, String) {
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return (false, false, format!("failed to spawn: {e}")),
-    };
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|_| std::process::Output {
-                        status,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                    });
-                let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
-                combined.push_str(&String::from_utf8_lossy(&output.stderr));
-                let tail = last_chars(&combined, OUTPUT_TAIL_MAX);
-                return (true, status.success(), tail);
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return (false, false, "timed out".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => return (false, false, format!("wait error: {e}")),
-        }
-    }
-}
-
-/// Last `max` characters of `text` (never splits a code point).
-fn last_chars(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let start = chars.len().saturating_sub(max);
-    chars[start..].iter().collect()
-}
-
 /// Lint every `check: command` assertion in `contract` against the
 /// untouched base tree, using the module's default per-command timeout and
 /// overall budget. `passthrough` is the mission config's
 /// `contractEnvPassthrough` (see [`lint_env`]).
-pub fn run_contract_lint(
+pub(crate) fn run_contract_lint(
     cwd: &Path,
+    scratch: &Path,
     base_sha: Option<&str>,
     contract: &[Assertion],
     tree_clean_at_base: bool,
     passthrough: &[String],
+    sandbox: &crate::command_exec::GateSandbox,
 ) -> ContractLintReport {
     run_contract_lint_with_limits(
         cwd,
+        scratch,
         base_sha,
         contract,
         tree_clean_at_base,
         PER_COMMAND_TIMEOUT,
         OVERALL_BUDGET,
         passthrough,
+        sandbox,
     )
 }
 
@@ -269,16 +207,18 @@ pub fn run_contract_lint(
 /// and `overall` budget, so tests can exercise timeout/budget behavior
 /// without waiting on the production defaults.
 #[allow(clippy::too_many_arguments)]
-pub fn run_contract_lint_with_limits(
+pub(crate) fn run_contract_lint_with_limits(
     cwd: &Path,
+    scratch: &Path,
     base_sha: Option<&str>,
     contract: &[Assertion],
     tree_clean_at_base: bool,
     per_command: Duration,
     overall: Duration,
     passthrough: &[String],
+    sandbox: &crate::command_exec::GateSandbox,
 ) -> ContractLintReport {
-    let env = lint_env(base_sha, passthrough);
+    let env = lint_env(scratch, base_sha, passthrough);
     let overall_start = Instant::now();
     let mut results = Vec::new();
 
@@ -300,9 +240,14 @@ pub fn run_contract_lint_with_limits(
             continue;
         }
 
-        let (ran_to_completion, exited_success, output_tail) =
-            run_command_bounded(cwd, command, &env, per_command);
-        let outcome = classify(ran_to_completion, exited_success);
+        let (code, output_tail) = crate::command_exec::run_shell_command_sandboxed_blocking(
+            cwd,
+            command,
+            per_command,
+            &env,
+            sandbox,
+        );
+        let outcome = classify(code.is_some(), code == Some(0));
         results.push(AssertionLint {
             id: assertion.id.clone(),
             command: command.to_string(),
@@ -320,6 +265,19 @@ pub fn run_contract_lint_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_lint(cwd: &Path, base_sha: Option<&str>, contract: &[Assertion]) -> ContractLintReport {
+        let scratch = tempfile::tempdir().unwrap();
+        run_contract_lint(
+            cwd,
+            scratch.path(),
+            base_sha,
+            contract,
+            true,
+            &[],
+            &crate::command_exec::GateSandbox::Disabled,
+        )
+    }
 
     fn command_assertion(id: &str, command: &str) -> Assertion {
         Assertion {
@@ -392,7 +350,8 @@ mod tests {
 
     #[test]
     fn approval_lint_env_has_base_sha_and_disables_hooks() {
-        let with_sha = lint_env(Some("deadbeef"), &[]);
+        let scratch = tempfile::tempdir().unwrap();
+        let with_sha = lint_env(scratch.path(), Some("deadbeef"), &[]);
         assert_eq!(
             with_sha.get("KRANZ_BASE_SHA").map(String::as_str),
             Some("deadbeef")
@@ -410,7 +369,7 @@ mod tests {
             Some("/dev/null")
         );
 
-        let without_sha = lint_env(None, &[]);
+        let without_sha = lint_env(scratch.path(), None, &[]);
         assert!(!without_sha.contains_key("KRANZ_BASE_SHA"));
         assert_eq!(
             without_sha.get("GIT_CONFIG_COUNT").map(String::as_str),
@@ -433,7 +392,7 @@ mod tests {
             command_assertion("a2", "false"),
             judgement_assertion("a3"),
         ];
-        let report = run_contract_lint(&std::env::temp_dir(), None, &contract, true, &[]);
+        let report = run_lint(&std::env::temp_dir(), None, &contract);
 
         assert_eq!(report.results.len(), 2);
 
@@ -451,15 +410,18 @@ mod tests {
     #[test]
     fn approval_lint_runner_times_out_slow_command() {
         let contract = vec![command_assertion("a1", "sleep 5")];
+        let scratch = tempfile::tempdir().unwrap();
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
             &std::env::temp_dir(),
+            scratch.path(),
             None,
             &contract,
             true,
             Duration::from_millis(200),
             Duration::from_secs(600),
             &[],
+            &crate::command_exec::GateSandbox::Disabled,
         );
         let elapsed = start.elapsed();
 
@@ -482,14 +444,17 @@ mod tests {
             command_assertion("a2", "true"),
             command_assertion("a3", "false"),
         ];
+        let scratch = tempfile::tempdir().unwrap();
         let report = run_contract_lint_with_limits(
             &std::env::temp_dir(),
+            scratch.path(),
             None,
             &contract,
             true,
             Duration::from_secs(600),
             Duration::from_millis(50),
             &[],
+            &crate::command_exec::GateSandbox::Disabled,
         );
 
         assert_eq!(report.results.len(), 3);
@@ -531,7 +496,7 @@ mod tests {
             "a6",
             r#"grep -L '^name = "tokio"' Cargo.lock"#,
         )];
-        let report = run_contract_lint(&repo_root, None, &contract, true, &[]);
+        let report = run_lint(&repo_root, None, &contract);
 
         assert_eq!(report.results.len(), 1);
         let a6 = &report.results[0];
@@ -549,7 +514,7 @@ mod tests {
             command_assertion("a1", "true"),
             command_assertion("a2", "false"),
         ];
-        let report = run_contract_lint(&std::env::temp_dir(), None, &contract, true, &[]);
+        let report = run_lint(&std::env::temp_dir(), None, &contract);
         assert_eq!(report.results.len(), 2);
     }
 
@@ -566,7 +531,7 @@ mod tests {
             "a1",
             "test -z \"$GH_TOKEN\" && env | grep -c hunter2-lint | grep -q '^0$'",
         )];
-        let report = run_contract_lint(&std::env::temp_dir(), None, &contract, true, &[]);
+        let report = run_lint(&std::env::temp_dir(), None, &contract);
 
         assert_eq!(report.results.len(), 1);
         assert_eq!(

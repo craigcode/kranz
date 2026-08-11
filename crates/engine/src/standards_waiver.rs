@@ -296,7 +296,24 @@ pub fn approve_standards_waiver(
     surface: &str,
     force: LockForce,
 ) -> crate::error::Result<WaiverOutcome> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return Err(EngineError::InvalidState(format!(
+            "unsafe mission id `{mission_id}` — waiver targets must be one local mission id"
+        )));
+    }
     let paths = MissionPaths::new(repo_root, mission_id);
+    // The initial fold supplies only the configured throttle needed to acquire
+    // the single-writer lock. Re-read and re-fold after acquisition: two
+    // simultaneous human surfaces must not both validate against the same
+    // stale pre-lock log and append duplicate or superseded authority.
+    let initial_events = EventLog::read_events(&paths.events_file())?;
+    let initial_state = reducer::fold(&initial_events)?;
+    let mut log = EventLog::acquire(
+        &paths,
+        mission_id,
+        Duration::from_millis(initial_state.config.event_stream_throttle_ms),
+        force,
+    )?;
     let events = EventLog::read_events(&paths.events_file())?;
     let state = reducer::fold(&events)?;
 
@@ -441,12 +458,6 @@ pub fn approve_standards_waiver(
     };
     let diff_digest = sha256_hex(diff_text.as_bytes());
 
-    let mut log = EventLog::acquire(
-        &paths,
-        mission_id,
-        Duration::from_millis(state.config.event_stream_throttle_ms),
-        force,
-    )?;
     let (event, audits) = log.append_with_redaction_audits(EventKind::StandardsWaiverApproved {
         rule_id: rule.id.clone(),
         rule_revision: rule.revision,
@@ -1005,6 +1016,20 @@ mod tests {
         assert_eq!(events.len(), 4, "refusals append nothing");
         let events2 = EventLog::read_events(&paths2.events_file()).unwrap();
         assert_eq!(events2.len(), 1, "refusals append nothing");
+    }
+
+    #[test]
+    fn flight_rules_waiver_refuses_unsafe_mission_id_before_path_access() {
+        let root = tempfile::tempdir().unwrap();
+        let err = approve_standards_waiver(
+            root.path(),
+            "../m-victim",
+            &record_request(),
+            "cli",
+            LockForce::No,
+        )
+        .expect_err("a waiver cannot escape the local mission namespace");
+        assert!(err.to_string().contains("unsafe mission id"), "{err}");
     }
 
     /// The diff binding (D-I): the recorded digest covers the

@@ -836,13 +836,10 @@ async fn invalid_workspace_contract_refused_at_approve() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{"schemaVersion": 1, "secrets": ["sk-live-value-not-a-name"]}"#,
-    )
-    .unwrap();
+    commit_workspace_contract(
+        &root,
+        r#"{"schemaVersion": 1, "secrets": ["sk-live-value-not-a-name"]}"#,
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -907,11 +904,9 @@ async fn valid_workspace_contract_approves() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{
+    commit_workspace_contract(
+        &root,
+        r#"{
             "schemaVersion": 1,
             "bootstrap": ["cargo fetch"],
             "services": [{"name": "db", "start": "docker compose up db", "port": {"policy": {"fixed": 5432}}}],
@@ -920,8 +915,7 @@ async fn valid_workspace_contract_approves() {
             "secrets": ["DATABASE_URL"],
             "mounts": ["/var/cache/cargo"]
         }"#,
-    )
-    .unwrap();
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -1004,13 +998,10 @@ async fn workspace_provider_pin_with_contract_records_schema_version() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
-    )
-    .unwrap();
+    commit_workspace_contract(
+        &root,
+        r#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -6955,13 +6946,13 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     assert!(detail.contains("[a-2] false"), "{detail}");
 }
 
-/// finding f-1-2: when the working tree is not clean at base (a tracked file
-/// has uncommitted changes when `approve_plan` runs), the lint report must
-/// carry `tree_clean_at_base: false` and its dirty-tree note must show up in
-/// both plan.md and the `orchestrator.decision` detail — while approval
-/// still succeeds, since the lint is advisory only.
+/// Approval-time assertion commands are agent-authored code. They run in a
+/// detached disposable worktree at the pinned base SHA, never in the primary
+/// checkout, even when sandbox enforcement is off. A command that overwrites
+/// a tracked source file therefore cannot alter the operator's tree, and the
+/// disposable registration/directory is gone before approval returns.
 #[tokio::test(flavor = "multi_thread")]
-async fn approval_lint_notes_dirty_tree_at_base() {
+async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
     if !setup() {
         return;
     }
@@ -6969,39 +6960,79 @@ async fn approval_lint_notes_dirty_tree_at_base() {
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
 
-    // Dirty a tracked file (README.md, committed by init_repo) without
-    // staging or committing it, so the tree is unclean when approve_plan
-    // resolves `base` and runs the lint.
-    std::fs::write(root.join("README.md"), "dirty\n").unwrap();
-
     let plan = simple_plan(
         1,
-        vec![assertion("", "not-yet-landed assertion", Some("false"))],
+        vec![assertion(
+            "",
+            "hostile approval assertion",
+            Some("printf 'tampered\\n' > README.md"),
+        )],
     );
     engine.approve_plan(plan).unwrap();
 
     let paths = engine.paths().clone();
+    assert_eq!(
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+        "seed\n",
+        "the approval command must not alter the primary checkout"
+    );
+    assert!(
+        !paths
+            .runs_dir()
+            .join("approval-contract-lint-worktree")
+            .exists(),
+        "the disposable approval worktree is cleaned"
+    );
+    assert!(
+        !raw_git(&root, &["worktree", "list", "--porcelain"])
+            .contains("approval-contract-lint-worktree"),
+        "the disposable worktree registration is pruned"
+    );
     let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
     assert!(
-        md.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
         "{md}"
     );
-
-    drop(engine);
-    let events = read_log(&paths);
-    let decision = events.iter().find_map(|e| match &e.kind {
-        EventKind::OrchestratorDecision { summary, detail }
-            if summary.contains("contract lint") =>
-        {
-            Some((summary.clone(), detail.clone()))
-        }
-        _ => None,
-    });
-    let (_summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
-    let detail = detail.expect("decision carries the full lint summary");
     assert!(
-        detail.contains("note: contract lint ran against a working tree with uncommitted changes"),
-        "{detail}"
+        !md.contains("working tree with uncommitted changes"),
+        "the pinned disposable tree is clean: {md}"
+    );
+}
+
+/// A predictable mission-branch name is not an authority channel. If a
+/// branch already contains commits before approval, those bytes were not
+/// derived from the pinned approval base and must not be smuggled into the
+/// mission deliverable.
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_refuses_preexisting_mission_branch_commits() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    let branch = engine.state().mission.mission_branch.clone();
+
+    raw_git(&root, &["checkout", "-b", &branch]);
+    std::fs::write(root.join("planted.txt"), "not approved\n").unwrap();
+    raw_git(&root, &["add", "planted.txt"]);
+    raw_git(&root, &["commit", "-m", "planted mission commit"]);
+    raw_git(&root, &["checkout", "main"]);
+
+    let error = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("pre-existing mission bytes must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to approve pre-existing commits"),
+        "{error}"
+    );
+    assert!(
+        !read_log(engine.paths())
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::PlanApproved { .. })),
+        "the refusal emits no approval authority"
     );
 }
 
@@ -7032,10 +7063,9 @@ async fn approval_lint_never_blocks() {
 }
 
 /// finding a3 / feature f-1-2: the contract lint runs its command
-/// assertions synchronously (never constructing a nested `tokio::Runtime`),
-/// so driving `approve_plan` from inside a live tokio runtime must not
-/// panic with "Cannot start a runtime from within a runtime" and must
-/// return Ok.
+/// assertions through a scoped OS-thread bridge, so driving `approve_plan`
+/// from inside a live tokio runtime must not panic with "Cannot start a
+/// runtime from within a runtime" and must return Ok.
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_lint_no_nested_runtime_panic() {
     if !setup() {
@@ -7052,8 +7082,8 @@ async fn approval_lint_no_nested_runtime_panic() {
             assertion("", "fails on base", Some("false")),
         ],
     );
-    // No panic (and no Err) proves the lint used the synchronous
-    // std::process::Command path rather than spinning up a nested runtime.
+    // No panic (and no Err) proves the gate runtime lived on the bridge
+    // thread rather than being nested on this Tokio worker.
     engine.approve_plan(plan).unwrap();
     assert_eq!(engine.state().mission.status, MissionStatus::Approved);
 }

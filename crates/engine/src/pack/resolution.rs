@@ -391,6 +391,7 @@ pub fn approval_pin(
             )),
         }
     } else {
+        super::validate_pack_relative_path(configured, "mission config", "packDir")?;
         let pack_rel = crate::merge_gate::normalize_relative_path(configured, false);
         match load_at_ref(repo, base_ref, &pack_rel)? {
             Some(manifest) => {
@@ -413,11 +414,18 @@ pub fn approval_pin(
                 // silently running standards-free. A schema-2/3 pack (or a
                 // missing/unparseable one — run start owns that failure)
                 // stays byte-identical.
-                let worktree_declares_standards =
-                    super::Pack::load_with_trust(&repo_root.join(raw), StandardsTrust::External)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|pack| pack.standards.is_some());
+                let worktree_declares_standards = match super::Pack::load_with_trust(
+                    &repo_root.join(raw),
+                    StandardsTrust::External,
+                ) {
+                    Ok(pack) => pack.is_some_and(|pack| pack.standards.is_some()),
+                    Err(error) => {
+                        return Err(format!(
+                            "packDir `{configured}` is not tracked on base branch `{base_ref}` \
+                             and its worktree pack cannot be accepted as advisory-only: {error}"
+                        ));
+                    }
+                };
                 if worktree_declares_standards {
                     return Err(format!(
                         "packDir `{configured}` declares a standards corpus but is not tracked \
@@ -1404,7 +1412,10 @@ mod tests {
         git(&["rm", "-rq", "vendor/pack"]);
         git(&["commit", "-qm", "drop the pack from the base"]);
         // The worktree still holds a pack (restored, untracked relative to HEAD).
-        for (rel, body) in vendored_pack_files("approved") {
+        // Restore an ENFORCED corpus. External-trust loading rejects it;
+        // approval must propagate that refusal rather than swallowing it as
+        // `None` and silently running standards-free.
+        for (rel, body) in vendored_pack_files("enforced") {
             if rel == "README.md" {
                 continue;
             }

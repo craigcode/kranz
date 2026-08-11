@@ -436,10 +436,17 @@ pub fn planning_projection(
             None => return Ok(None),
         }
     } else {
+        super::validate_pack_relative_path(configured, "mission config", "packDir")?;
         let pack_rel = crate::merge_gate::normalize_relative_path(configured, false);
-        match load_at_ref(repo, base_ref, &pack_rel)? {
+        // Resolve the moving branch name once. The manifest and its display
+        // identity must come from one immutable tree even if the base ref is
+        // advanced concurrently while a planning turn is being prepared.
+        let base_oid = repo
+            .rev_parse(base_ref)
+            .map_err(|e| format!("cannot resolve ref `{base_ref}`: {e}"))?;
+        match load_at_ref(repo, &base_oid, &pack_rel)? {
             Some(manifest) => {
-                let name = super::resolution::pack_name_at_ref(repo, base_ref, &pack_rel)?
+                let name = super::resolution::pack_name_at_ref(repo, &base_oid, &pack_rel)?
                     .unwrap_or_else(|| pack_rel.clone());
                 (name, manifest)
             }

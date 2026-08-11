@@ -940,6 +940,49 @@ async fn run_shell_command_sandboxed_with_code(
     (code, output)
 }
 
+/// Synchronous bridge for gate execution from approval-time code that runs
+/// inside an ambient Tokio runtime. The actual bounded/sandboxed executor is
+/// async; attempting to build and `block_on` a second runtime on the caller's
+/// runtime thread panics. A scoped OS thread owns the short-lived runtime,
+/// while borrowed cwd/env/sandbox inputs remain valid until it joins.
+///
+/// `Some(code)` means the command reached an exit status; `None` covers
+/// spawn/wrap failures, timeout/tree kill, signal termination, or runtime
+/// setup failure. The output always carries the bounded diagnostic tail.
+pub(crate) fn run_shell_command_sandboxed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+) -> (Option<i32>, String) {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return (
+                        None,
+                        format!("failed to create approval gate runtime: {error}"),
+                    )
+                }
+            };
+            runtime.block_on(run_shell_command_sandboxed_with_code(
+                cwd, command, timeout, env, sandbox,
+            ))
+        });
+        worker.join().unwrap_or_else(|_| {
+            (
+                None,
+                "approval gate runner panicked before producing a verdict".to_string(),
+            )
+        })
+    })
+}
+
 /// Child setup shared by every bounded run: piped stdout/stderr (drained
 /// concurrently by [`run_command_bounded`]), stdin null, kill_on_drop, and —
 /// on unix — the child as leader of a NEW process group, so the timeout path

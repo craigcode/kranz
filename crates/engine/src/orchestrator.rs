@@ -232,6 +232,38 @@ struct ParallelDecision {
 // MissionEngine
 // ---------------------------------------------------------------------------
 
+/// Throwaway detached worktree used only by approval-time contract lint.
+/// Agent-authored assertion commands may mutate every writable byte they can
+/// reach, so they never run in the primary checkout. Cleanup is RAII and
+/// forceful because a timed-out or failing command may leave the tree dirty.
+struct ApprovalLintWorktree {
+    repo: GitRepo,
+    path: PathBuf,
+}
+
+impl ApprovalLintWorktree {
+    fn create(repo: &GitRepo, path: &Path, base_sha: &str) -> Result<Self> {
+        let _ = repo.remove_worktree(path);
+        let _ = std::fs::remove_dir_all(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        repo.add_detached_worktree(path, base_sha)?;
+        Ok(Self {
+            repo: repo.clone(),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ApprovalLintWorktree {
+    fn drop(&mut self) {
+        let _ = self.repo.remove_worktree(&self.path);
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = self.repo.prune_worktrees();
+    }
+}
+
 /// The mission engine: composes the event log, reducer state, git repo,
 /// runner, control inbox, and the long-lived orchestrator session into the
 /// §4.5 loop.
@@ -1118,6 +1150,25 @@ impl MissionEngine {
             )));
         }
 
+        // Resolve the moving base branch exactly once, before any base-owned
+        // contract/policy read or mission-branch side effect. Every approval
+        // artefact and the branch itself must derive from this immutable tree;
+        // otherwise a concurrent base advance can pin policy from one commit,
+        // create the mission branch from another, and record a third SHA.
+        let base = self.state.mission.base_branch.clone();
+        let base_sha = self.repo.rev_parse(&base)?;
+        let branch = self.state.mission.mission_branch.clone();
+        if self.repo.branch_exists(&branch)? {
+            let existing_tip = self.repo.rev_parse(&branch)?;
+            if existing_tip != base_sha {
+                return Err(EngineError::InvalidState(format!(
+                    "mission branch `{branch}` already exists at {existing_tip}, not the pinned \
+                     approval base {base_sha}; refusing to approve pre-existing commits into \
+                     this mission"
+                )));
+            }
+        }
+
         // Workspace contract (D-A): validate the base-branch-owned
         // `.kranz/workspace.json` from the repo ROOT — never the mission
         // branch, so a mission cannot weaken the contract that judges it
@@ -1125,7 +1176,7 @@ impl MissionEngine {
         // unchanged; present-but-invalid ⇒ fail closed, owner repo-setup,
         // before any branch/commit side effects below.
         let approval_contract =
-            crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+            crate::workspace_contract::load_workspace_contract_at_ref(&self.repo, &base_sha)?;
 
         // Routing rules (ticket routing-rules-config), same base-branch-owned
         // posture: validate the tracked `.kranz/routing-rules.json` as
@@ -1135,10 +1186,8 @@ impl MissionEngine {
         // this mission's route was already pinned from the base at creation
         // (mission.created's config), so a VALID edit between create and
         // approve does not re-route it.
-        let _routing_rules = crate::routing_rules::load_routing_rules_at_ref(
-            &self.repo,
-            &self.state.mission.base_branch,
-        )?;
+        let _routing_rules =
+            crate::routing_rules::load_routing_rules_at_ref(&self.repo, &base_sha)?;
 
         // Flight Rules (KRZ-342, design D-D/D-E): resolve the applicable
         // standards from the TRUSTED source — tracked base blobs for a
@@ -1154,7 +1203,7 @@ impl MissionEngine {
             &self.repo,
             &self.state.config,
             &self.paths.repo_root,
-            &self.state.mission.base_branch,
+            &base_sha,
             crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
             plan.standards_manifest.as_deref(),
             &plan.touch_set,
@@ -1218,46 +1267,59 @@ impl MissionEngine {
             );
         }
 
+        // Run agent-authored approval probes only in a disposable detached
+        // worktree at the already-pinned base SHA. Even an `enforce: off`
+        // mission cannot modify the primary checkout through this advisory
+        // lint; enforced missions additionally get the same gate sandbox as
+        // validation/final commands. The sandbox scratch matches the cleared
+        // contract env's HOME/TMP/CARGO_HOME roots.
+        let command_assertions_present = plan
+            .validation_contract
+            .iter()
+            .any(|assertion| assertion.check == AssertionCheck::Command);
+        let contract_lint_report = if command_assertions_present {
+            let lint_root = self
+                .paths
+                .runs_dir()
+                .join("approval-contract-lint-worktree");
+            let _lint_worktree = ApprovalLintWorktree::create(&self.repo, &lint_root, &base_sha)?;
+            let scratch = self.paths.runs_dir().join("approval-contract-home");
+            let sandbox = crate::command_exec::resolve_gate_sandbox(
+                &self.state.config.worker.sandbox,
+                &lint_root,
+                &self.paths.mission_dir(),
+                &scratch,
+                &self.paths.runs_dir(),
+            )?
+            .sandbox;
+            contract_lint::run_contract_lint(
+                &lint_root,
+                &scratch,
+                Some(&base_sha),
+                &plan.validation_contract,
+                true,
+                &self.state.config.contract_env_passthrough,
+                &sandbox,
+            )
+        } else {
+            contract_lint::ContractLintReport {
+                results: Vec::new(),
+                tree_clean_at_base: true,
+            }
+        };
+
         // Git first: if anything fails here, no event was emitted and
         // approve_plan can simply be retried.
-        let base = self.state.mission.base_branch.clone();
-        let branch = self.state.mission.mission_branch.clone();
         if !self.repo.branch_exists(&branch)? {
-            self.repo.create_branch(&branch, Some(&base))?;
+            self.repo.create_branch(&branch, Some(&base_sha))?;
         }
         let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
         if !worktree_mode {
             self.repo.checkout(&branch)?;
         }
-        // Committing plan files onto the mission branch below does not move
-        // the base branch ref, so resolving it anywhere in approve_plan pins
-        // the base tip as of approval (plan §f-1-2: never re-resolve later —
-        // that would reintroduce the moving-base-branch race this fixes).
-        // Unaffected by worktree_mode: `base` is resolved against the primary
-        // repo either way, and creating (but not checking out) the mission
-        // branch never moves it.
-        let base_sha = self.repo.rev_parse(&base)?;
-
-        // Lint each `check: command` assertion against the untouched base
-        // tree (M8 tier 1, feature f-1-2): at this point the working tree is
-        // either still on `base` (worktree mode never checks out the mission
-        // branch on the primary) or was just checked out onto a mission
-        // branch freshly created FROM `base` above, with nothing committed
-        // onto it yet — either way this is the pristine base. Never blocks
-        // approval; only informs the operator and plan.md. Deliberately the
-        // stricter `is_clean()` rather than `is_clean_tracked()`: this note
-        // is advisory-only and a false positive (flagging an untracked
-        // scratch file as "dirty") costs nothing, whereas `is_clean_tracked`
-        // would silently ignore untracked-but-not-ignored files that could
-        // still leak into a command assertion's output.
-        let tree_clean_at_base = self.repo.is_clean()?;
-        let contract_lint_report = contract_lint::run_contract_lint(
-            &self.paths.repo_root,
-            Some(&base_sha),
-            &plan.validation_contract,
-            tree_clean_at_base,
-            &self.state.config.contract_env_passthrough,
-        );
+        // `base_sha` was resolved before every base-owned read above and the
+        // mission branch was created from that exact object. Never re-resolve
+        // the moving base name during approval.
 
         // Named, deterministic contract-validation gates (ticket
         // contract-validation-gates.md): the defect classes behind the lint —

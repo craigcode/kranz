@@ -10,6 +10,9 @@
 //! number, instead of dying mid-feature. It is deliberately a drain-time
 //! refusal, not an in-mission guard: the honest failure is up front.
 
+use cap_fs_ext::DirExt as _;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use std::path::Path;
 
 /// The decision a pre-drain disk check reaches.
@@ -38,7 +41,7 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(u64::from(stat.f_bavail) * stat.f_frsize)
+    Some(u64::from(stat.f_bavail).saturating_mul(stat.f_frsize))
 }
 
 /// No statvfs equivalent is wired up on non-Unix targets; report unmeasurable
@@ -74,20 +77,60 @@ pub fn estimate_build_footprint_bytes(repo_root: &Path) -> u64 {
 }
 
 fn dir_size_capped(dir: &Path, cap: u64) -> u64 {
+    // A repository may contain an arbitrarily wide `target/` tree. Bound
+    // both bytes and directory entries so a tree of millions of empty files
+    // cannot turn the preflight itself into an unbounded denial of service.
+    const MAX_WALK_ENTRIES: usize = 250_000;
+    dir_size_capped_with_entry_limit(dir, cap, MAX_WALK_ENTRIES)
+}
+
+fn dir_size_capped_with_entry_limit(dir: &Path, cap: u64, max_entries: usize) -> u64 {
+    let Some(parent) = dir.parent() else {
+        return 0;
+    };
+    let Some(name) = dir.file_name() else {
+        return 0;
+    };
+    // Pin the parent and open the target leaf no-follow. Descendants are then
+    // opened relative to retained directory capabilities, so a repo-authored
+    // symlink is never traversed or priced as its external target.
+    let Ok(parent) = Dir::open_ambient_dir(parent, ambient_authority()) else {
+        return 0;
+    };
+    let Ok(root) = parent.open_dir_nofollow(name) else {
+        return 0;
+    };
+
     let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
+    let mut stack = vec![root];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
+        let Ok(entries) = d.entries() else {
             continue;
         };
         for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    total = total.saturating_add(meta.len());
-                    if total >= cap {
-                        return total;
+            visited = visited.saturating_add(1);
+            if visited > max_entries {
+                return cap;
+            }
+            let name = entry.file_name();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if let Ok(child) = d.open_dir_nofollow(&name) {
+                    stack.push(child);
+                }
+            } else if file_type.is_file() {
+                // Re-check the entry no-follow before using its size. If it
+                // was swapped after `file_type`, a symlink/special entry is
+                // skipped instead of followed.
+                if let Ok(meta) = d.symlink_metadata(&name) {
+                    if meta.file_type().is_file() {
+                        total = total.saturating_add(meta.len());
+                        if total >= cap {
+                            return total;
+                        }
                     }
                 }
             }
@@ -160,6 +203,36 @@ mod tests {
             estimate_build_footprint_bytes(dir.path()),
             FOOTPRINT_FLOOR_BYTES
         );
+    }
+
+    #[test]
+    fn mission_build_footprint_entry_limit_is_conservative() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        for i in 0..3 {
+            std::fs::write(target.join(format!("empty-{i}")), []).unwrap();
+        }
+        assert_eq!(
+            dir_size_capped_with_entry_limit(&target, 123_456, 2),
+            123_456
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_build_footprint_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("real"), [0_u8; 7]).unwrap();
+        std::fs::write(outside.path().join("large"), vec![0_u8; 1024 * 1024]).unwrap();
+        symlink(outside.path(), target.join("outside-link")).unwrap();
+
+        assert_eq!(dir_size_capped(&target, u64::MAX), 7);
     }
 
     #[test]

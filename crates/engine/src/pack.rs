@@ -380,13 +380,12 @@ impl Pack {
 /// A key pointing at a non-directory or a non-pack is a misconfiguration
 /// and fails closed, exactly like an invalid manifest.
 ///
-/// Flight Rules trust (KRZ-341 D-A/D-J): a repo-relative `packDir` is the
-/// tracked, base-ownable shape ([`standards::StandardsTrust::RepoTracked`]);
-/// an ABSOLUTE path points outside the repo's history and is
-/// [`standards::StandardsTrust::External`] — advisory rules load, enforced
-/// ones fail closed naming the remedy. (Reading repo-relative packs from
-/// the pinned base tree rather than the worktree is the next slice,
-/// KRZ-342; [`standards::load_at_ref`] already provides it for the lint.)
+/// Flight Rules trust (KRZ-341 D-A/D-J): a repo-relative `packDir` is only
+/// [`standards::StandardsTrust::RepoTracked`] when its manifest is actually
+/// tracked beneath this repository. Absolute, symlink-escaped, and untracked
+/// paths are [`standards::StandardsTrust::External`] — advisory rules load,
+/// enforced ones fail closed naming the remedy. Approval reads repo-relative
+/// packs from the pinned base tree through [`resolution::approval_pin`].
 pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<Pack>, String> {
     let Some(configured) = cfg.pack_dir.as_deref() else {
         return Ok(None);
@@ -395,7 +394,10 @@ pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<P
     let (dir, trust) = if raw.is_absolute() {
         (raw.to_path_buf(), standards::StandardsTrust::External)
     } else {
-        (repo_root.join(raw), standards::StandardsTrust::RepoTracked)
+        validate_pack_relative_path(configured, "mission config", "packDir")?;
+        let dir = repo_root.join(raw);
+        let trust = standards::trust_for_dir(repo_root, &dir);
+        (dir, trust)
     };
     if !dir.is_dir() {
         return Err(format!(
@@ -1301,6 +1303,16 @@ kind = "local-dir"
         };
         let err = load_for_config(&cfg, repo.path()).expect_err("must fail");
         assert!(err.contains("is not a directory"), "{err}");
+
+        // Relative configuration is containment syntax, not a path cleanup
+        // opportunity: silently dropping `..` could load an external corpus
+        // while labelling it repo-owned.
+        let cfg = MissionConfig {
+            pack_dir: Some("../pack".to_string()),
+            ..MissionConfig::default()
+        };
+        let err = load_for_config(&cfg, repo.path()).expect_err("traversal must fail");
+        assert!(err.contains("without parent components"), "{err}");
     }
 
     // ---- textFile no-follow containment (12th-pass review) --------------
