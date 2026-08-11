@@ -350,6 +350,81 @@ fn duplicate_fixfeature_supersedes_a_failed_commitless_feature() {
     assert_eq!(matches[0].status, FeatureStatus::Pending);
 }
 
+/// The negative pin for the commitless-supersession hole (review of
+/// 30b276e): a feature judged FAILED *after* its worker committed real work
+/// to the mission branch records those commits on the feature.failed event,
+/// so it is NOT "commitless" — a re-proposal reusing its id must REJECT, not
+/// rewrite the payload and reset it to Pending (which would orphan the audit
+/// link to the landed commits).
+#[test]
+fn duplicate_fixfeature_rejects_a_failed_feature_with_commits() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: fix_feature("judged"),
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "judged".into(),
+            },
+        ),
+    )
+    .expect("started");
+    // Judged failed AFTER the worker landed commits on the mission branch.
+    apply(
+        &mut state,
+        &ev(
+            5,
+            EventKind::FeatureFailed {
+                feature_id: "judged".into(),
+                reason: "validation judged the work insufficient".into(),
+                commits: vec!["deadbeef implement the thing".into()],
+            },
+        ),
+    )
+    .expect("failed with commits recorded");
+
+    let mut revised = fix_feature("judged");
+    revised.title = "re-proposed after the judgement".to_string();
+    let err = apply(
+        &mut state,
+        &ev(
+            6,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, EngineError::InvalidState(_)),
+        "failed-with-commits must reject the duplicate, got {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Golden happy path
 // ---------------------------------------------------------------------------
@@ -1002,6 +1077,7 @@ fn every_status_value_is_reachable() {
         EventKind::FeatureFailed {
             feature_id: "f-1-2".into(),
             reason: "r".into(),
+            commits: vec![],
         }, // f Failed
         EventKind::FeatureSkipped {
             feature_id: "f-2-1".into(),
@@ -2022,6 +2098,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
             Action::FeatureFailed(f) => EventKind::FeatureFailed {
                 feature_id: fs(*f),
                 reason: "r".into(),
+                commits: vec![],
             },
             Action::FeatureSkipped(f) => EventKind::FeatureSkipped {
                 feature_id: fs(*f),

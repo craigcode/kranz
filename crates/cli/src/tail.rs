@@ -262,7 +262,9 @@ impl EventRenderer {
                 ansi::BLUE,
                 format!("complete ({} commit(s))", commits.len()),
             ),
-            EventKind::FeatureFailed { feature_id, reason } => (
+            EventKind::FeatureFailed {
+                feature_id, reason, ..
+            } => (
                 format!("feature {feature_id}"),
                 ansi::RED,
                 format!("FAILED: {reason}"),

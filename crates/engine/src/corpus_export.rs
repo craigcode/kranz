@@ -742,6 +742,7 @@ mod tests {
                 EventKind::FeatureFailed {
                     feature_id: "f-1-2".to_string(),
                     reason: "gave up".to_string(),
+                    commits: Vec::new(),
                 },
             ),
             // Engine-owned workspace-gate lift: NOT a human judgement.

@@ -212,6 +212,15 @@ pub enum EventKind {
         #[serde(rename = "featureId")]
         feature_id: String,
         reason: String,
+        /// Commits the failed feature landed on the mission branch before the
+        /// judgement (empty for a run that never committed — the m-eee81f
+        /// auth-death class — and for parallel/dirty-tree paths where nothing
+        /// reached the branch). Recorded so the supersession guard can tell
+        /// "failed with real work" (started; re-proposal rejects) from
+        /// "failed commitless" (re-proposable). Additive; old logs default
+        /// to empty.
+        #[serde(default)]
+        commits: Vec<String>,
     },
 
     #[serde(rename = "feature.skipped")]

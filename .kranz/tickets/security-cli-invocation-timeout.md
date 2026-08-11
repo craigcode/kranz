@@ -2,6 +2,8 @@
 title: Every security(1) invocation needs a hard timeout — locked keychains hang, not fail
 priority: 2
 schedule: once
+state: done
+state-note: Fixed — both security call sites route through one bounded helper (10s kill deadline, Err(TimedOut)); regression test pins the locked-keychain hang.
 ---
 
 ## Goal

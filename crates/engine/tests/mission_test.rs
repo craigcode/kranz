@@ -4600,7 +4600,7 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     let events = read_log(&paths);
     assert!(events.iter().any(|e| matches!(
         &e.kind,
-        EventKind::FeatureFailed { feature_id, reason }
+        EventKind::FeatureFailed { feature_id, reason, .. }
             if feature_id == "f-1-1" && reason.contains("respawn budget exhausted")
     )));
 }

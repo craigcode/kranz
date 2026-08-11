@@ -2,6 +2,8 @@
 title: Codex backend 401s in scratch HOMEs — nothing seeds ~/.codex/auth.json
 priority: 2
 schedule: once
+state: done
+state-note: Fixed — backend_codex now seeds scratch HOME with auth.json/config.toml, mirroring kimi/claude idiom.
 ---
 
 ## Goal

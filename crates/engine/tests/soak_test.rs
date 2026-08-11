@@ -652,7 +652,7 @@ async fn run_conflict_iteration(iter: usize) {
     ctx.ensure(
         events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::FeatureFailed { feature_id, reason }
+            EventKind::FeatureFailed { feature_id, reason, .. }
                 if feature_id == "f-1-2" && reason.contains("conflicted")
         )),
         "no feature.failed(f-1-2) with a conflicted-merge reason — the merge conflict never happened",

@@ -2,6 +2,8 @@
 title: parse_user flags any tool result containing "hook" as denied — validator sessions abort
 priority: 1
 schedule: once
+state: done
+state-note: Fixed in 1a87737 — 'hook' now requires a block/deny/reject phrase; structured refusals require is_error.
 ---
 
 ## Goal

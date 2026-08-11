@@ -285,8 +285,19 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature.commits.extend(commits.iter().cloned());
         }
 
-        EventKind::FeatureFailed { feature_id, .. } => {
-            feature_mut(state, feature_id)?.status = FeatureStatus::Failed;
+        EventKind::FeatureFailed {
+            feature_id,
+            commits,
+            ..
+        } => {
+            let feature = feature_mut(state, feature_id)?;
+            feature.status = FeatureStatus::Failed;
+            // Record any commits the failure landed on the mission branch:
+            // the fix-feature supersession guard reads `commits.is_empty()`
+            // to tell a failed-COMMITLESS feature (re-proposable — the
+            // m-eee81f auth-death wedge) from failed-with-real-work (started;
+            // a duplicate fixfeature.created must reject).
+            feature.commits.extend(commits.iter().cloned());
         }
 
         EventKind::FeatureSkipped { feature_id, .. } => {

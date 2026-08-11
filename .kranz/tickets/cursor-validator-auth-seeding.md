@@ -2,6 +2,8 @@
 title: Cursor validator sessions fail auth — seeding covers only the worker spawn path
 priority: 2
 schedule: once
+state: done
+state-note: Verified the seeding branch in cursor_child_env already covers the no-relocated-HOME (validator) shape; pinned by regression test cursor_child_env_without_relocated_home_seeds_cursor_config.
 ---
 
 ## Goal

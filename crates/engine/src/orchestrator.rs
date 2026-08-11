@@ -3292,6 +3292,10 @@ impl MissionEngine {
                     self.emit(EventKind::FeatureFailed {
                         feature_id: feature.id,
                         reason,
+                        // The worker's commits ARE on the mission branch
+                        // (sequential path) — recording them keeps the
+                        // supersession guard from treating this as commitless.
+                        commits,
                     })?;
                     return Ok(());
                 }
@@ -3308,6 +3312,7 @@ impl MissionEngine {
                     self.emit(EventKind::FeatureFailed {
                         feature_id: feature.id,
                         reason: "respawn budget exhausted".to_string(),
+                        commits,
                     })?;
                     return Ok(());
                 }
@@ -3889,6 +3894,7 @@ impl MissionEngine {
                 } else {
                     note
                 },
+                commits: Vec::new(), // dirty tree: nothing reached the branch
             })?;
             return Ok(false);
         }
@@ -3912,6 +3918,7 @@ impl MissionEngine {
                 self.emit(EventKind::FeatureFailed {
                     feature_id: feature_id.to_string(),
                     reason: format!("dirty-tree checkpoint refused by secret scan: {detail}"),
+                    commits: Vec::new(), // nothing staged or committed
                 })?;
                 // Then BLOCK the milestone: the refused content is still
                 // sitting uncommitted in the SHARED sequential working tree
@@ -4416,6 +4423,7 @@ impl MissionEngine {
                     self.emit(EventKind::FeatureFailed {
                         feature_id,
                         reason: "worker run did not complete in its parallel worktree".to_string(),
+                        commits: Vec::new(), // worktree branch never merged
                     })?;
                     continue;
                 }
@@ -4431,6 +4439,7 @@ impl MissionEngine {
                              are preserved for inspection (see the checkpoint decision record)",
                             ws.branch
                         ),
+                        commits: Vec::new(), // worktree branch never merged
                     })?;
                     continue;
                 }
@@ -4475,6 +4484,7 @@ impl MissionEngine {
                              the merged branch",
                             ws.branch
                         ),
+                        commits: Vec::new(), // conflicting worktree branch discarded
                     })?;
                     // … and ALSO synthesize a conflict-resolution fix-feature
                     // on the SAME (still-Active) milestone so the milestone can
@@ -4532,6 +4542,7 @@ impl MissionEngine {
                              before it started: {detail}",
                             ws.branch
                         ),
+                        commits: Vec::new(), // merge never started
                     })?;
                 }
             }
@@ -13187,7 +13198,7 @@ pub(crate) mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     &e.kind,
-                    EventKind::FeatureFailed { feature_id: fid, reason }
+                    EventKind::FeatureFailed { feature_id: fid, reason, .. }
                         if fid == feature_id
                             && reason.contains("worktree inspection failed")
                             && reason.contains("preserved")
