@@ -3,6 +3,8 @@ title: Reuse Flight Rules for spec and incident review task classes
 priority: 3
 schedule: once
 blocked-by: [flight-rules-workflow-projection, flight-rules-enforcement-binding, flight-rules-dashboard-report]
+state: done
+state-note: Implemented — spec-review and incident-review use one immutable tracked input plus one required nonempty review deliverable, the same pinned resolver/checkers/findings/waivers/evidence path as code missions, and no external tracker or parallel result schema. Source mutation, empty delivery, unsafe paths, and prompt-shadowing fail closed; dedicated flight_rules_review_class_* tests are green.
 ---
 
 ## Goal

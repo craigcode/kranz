@@ -3,6 +3,8 @@ title: Flight Rules plan review, mission coverage, drift, and waiver UI
 priority: 2
 schedule: once
 blocked-by: [flight-rules-workflow-projection, flight-rules-enforcement-binding, flight-rules-waiver-decisions]
+state: done
+state-note: Implemented — plan review renders the approval-pinned RFC/rule consent, mission control and report surfaces render typed coverage/drift/waiver evidence with text labels, exact waiver actions are authority-gated, and old/no-pack missions stay quiet. Dashboard typecheck, tests, build, embedded sync/check, and lint are green.
 ---
 
 ## Goal

@@ -4068,6 +4068,13 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
+    let decision_summaries: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(
         types.contains(&"validation.finding"),
         "gate finding surfaced: {types:?}"
@@ -4088,9 +4095,9 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
         events.iter().any(|e| matches!(
             &e.kind,
             EventKind::OrchestratorDecision { summary, .. }
-                if summary.contains("refused waive") && summary.contains("a-1")
+                if summary.contains("refused model waive") && summary.contains("a-1")
         )),
-        "must surface the refuse-waive decision: {types:?}"
+        "must surface the refuse-waive decision: {types:?}; decisions: {decision_summaries:?}"
     );
 }
 
@@ -10101,10 +10108,10 @@ async fn pack_contract_no_pack_behavior_is_byte_identical() {
     );
 }
 
-/// An invalid pack fails CLOSED at run start — the error names the
-/// offending field and no worker ever spawns.
+/// An invalid untracked pack fails CLOSED before approval — the error names
+/// the offending field, no consent event lands, and no worker ever spawns.
 #[tokio::test(flavor = "multi_thread")]
-async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
+async fn pack_contract_invalid_pack_fails_closed_before_approval() {
     if !setup() {
         return;
     }
@@ -10125,12 +10132,9 @@ async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
         ..test_cfg()
     };
     let mut engine = make_engine(&backend, &root, cfg);
-    engine.approve_plan(simple_plan(1, vec![])).unwrap();
-
-    let err = timeout(TEST_TIMEOUT, engine.run())
-        .await
-        .expect("run must not hang")
-        .expect_err("an invalid pack must fail the run closed");
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("an invalid pack must fail approval closed");
     let msg = err.to_string();
     assert!(
         msg.contains("duplicate [[gate]] name `zz-dup`"),
@@ -10140,9 +10144,10 @@ async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
     drop(engine);
     let events = read_log(&paths);
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
-        "nothing spends when the pack cannot load"
+        !events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::PlanApproved { .. } | EventKind::WorkerSpawned { .. }
+        )),
+        "neither consent nor spend may occur when the pack cannot load"
     );
 }

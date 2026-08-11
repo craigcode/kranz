@@ -502,9 +502,10 @@ pub fn approval_pin_with_context(
                 // WORKTREE pack declares a corpus anyway, the operator is
                 // pointing at an untracked pack — blocking policy needs base
                 // history (D-A), so refuse naming the remedy rather than
-                // silently running standards-free. A schema-2/3 pack (or a
-                // missing/unparseable one — run start owns that failure)
-                // stays byte-identical.
+                // silently running standards-free. A valid schema-2/3 pack
+                // stays byte-identical; a missing or malformed worktree pack
+                // fails approval here because its advisory contract cannot be
+                // established safely.
                 let worktree_declares_standards = match super::Pack::load_with_trust(
                     &repo_root.join(raw),
                     StandardsTrust::External,

@@ -3,6 +3,8 @@ title: Flight Rules effectiveness, calibration, and exception metrics
 priority: 3
 schedule: once
 blocked-by: [flight-rules-dashboard-report]
+state: done
+state-note: Implemented — deterministic cross-mission rule/revision folds expose honest raw denominators, advisory/fail/block/waiver/not-evaluated/false-green outcomes, resolution time and score distributions, minimum-sample suppression, and calibration smells through CLI JSON/text and REST. Dedicated flight_rules_metrics_* tests are green.
 ---
 
 ## Goal

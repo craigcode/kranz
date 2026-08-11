@@ -156,7 +156,7 @@ a new machine goes from nothing to `kranz plan` without cloning the repo.
   docs/scoping/secret-scanning.md (all D-A..D-D decided). Follow-up: verify
   the always-on entropy detector's false-positive rate on real logs.
 
-## M5.5 — Flight Rules engineering standards governance ◑ (accepted 2026-08-07; near-term P1)
+## M5.5 — Flight Rules engineering standards governance ✓ (shipped 2026-08-11)
 
 Turn the shipped pack, gate, provenance, confidence, and evidence primitives
 into one governed engineering-standards workflow. A configured pack owns
@@ -166,7 +166,7 @@ projects it into planning/work/validation, and binds each rule to the right
 deterministic, contextual, or human mechanism. Full accepted design and threat
 model: [`docs/scoping/flight-rules-engineering-standards.md`](scoping/flight-rules-engineering-standards.md).
 
-Near-term P1 order:
+Delivered in dependency order:
 
 1. `flight-rules-pack-contract` — canonical schema, lifecycle lint, bounded
    no-follow loader, normalized manifest/digest.
@@ -178,17 +178,19 @@ Near-term P1 order:
    stage-specific guidance and approved/advisory versus enforced/MUST behavior
    through the existing gate ladder.
 
-P2 is `flight-rules-dashboard-report`. P3 is effectiveness/calibration metrics
-and spec/incident review task classes. Organization-wide hosted policy
-distribution, signing, inheritance, and RBAC remain later control-plane work;
-M5.5 is repo/pack-owned and works with today's local and multi-repo operation.
+The P2 dashboard/report surface and P3 effectiveness/calibration metrics plus
+spec/incident review consumers shipped in the same milestone. Organization-wide
+hosted policy distribution, signing, inheritance, and RBAC remain later
+control-plane work; M5.5 is repo/pack-owned and works with today's local and
+multi-repo operation.
 
-Done when: a synthetic pack's approved rule is visible but nonblocking; its
+Done-when proof: a synthetic pack's approved rule is visible but nonblocking; its
 enforced deterministic and contextual MUSTs block with rule-linked evidence;
 an exact human waiver is replayable and invalidates on diff/rule drift; a
 mission cannot edit the rules judging itself; a live-base policy change before
 merge requires reapproval/revalidation; and old/no-pack missions remain
-unchanged.
+unchanged. The executable evidence matrix and closure record are in
+[`docs/reviews/flight-rules-m55-proof.md`](reviews/flight-rules-m55-proof.md).
 
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; live deploy user-gated)
 

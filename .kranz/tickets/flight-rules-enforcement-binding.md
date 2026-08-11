@@ -3,6 +3,8 @@ title: Bind Flight Rules lifecycle and levels to authoritative gate enforcement
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin, flight-rules-finding-provenance, flight-rules-waiver-decisions]
+state: done
+state-note: Implemented — approval-pinned deterministic, contextual, and manual-attestation checkers run through the existing gate ladder; lifecycle/level policy is exact, enforced MUST failures block final/merge, approved and SHOULD failures remain advisory, waivers subtract only their exact rule failure, and checker/policy drift fails closed. Dedicated flight_rules_enforcement_* tests plus the M5.5 proof matrix are green.
 ---
 
 ## Goal

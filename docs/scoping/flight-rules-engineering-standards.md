@@ -1,6 +1,6 @@
 # Flight Rules — governed engineering standards for humans and agents
 
-Status: **accepted for near-term delivery 2026-08-07**. D-A through D-K are
+Status: **shipped 2026-08-11**. D-A through D-K are
 decided below. Implementation is the KRZ-341–349 ticket series; the P1
 vertical slice is roadmap M5.5.
 

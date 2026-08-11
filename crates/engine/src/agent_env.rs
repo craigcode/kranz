@@ -305,17 +305,17 @@ fn os_account_home() -> Option<PathBuf> {
     // into `buf`; copy it to an owned PathBuf before returning.
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0_u8; 4096];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut entry_ptr = std::ptr::null_mut();
     let rc = unsafe {
         libc::getpwuid_r(
             libc::getuid(),
             &mut pwd,
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
-            &mut result,
+            &mut entry_ptr,
         )
     };
-    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+    if rc != 0 || entry_ptr.is_null() || pwd.pw_dir.is_null() {
         return None;
     }
     let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
