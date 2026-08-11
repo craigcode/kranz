@@ -3,6 +3,8 @@ title: Human-approved, exact, expiring Flight Rules waiver decisions
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin, flight-rules-finding-provenance]
+state: done
+state-note: Implemented — standards.waiver.approved event (rule id+revision, manifest digest, approval seq, finding fingerprint, affected paths, affected-path-diff digest, reason, local-operator + cli surface, expiry), `kranz standards waive` with fail-closed refusals (waivable:false / unpinned rule / revision mismatch / absent finding / already-waived / past expiry), the coverage fold's waived join (exactly-one subtraction, log-frontier expiry, human-surface check) named through the shared matrix renderer. 16 flight_rules_waiver_* tests; full workspace gates green.
 ---
 
 ## Goal
