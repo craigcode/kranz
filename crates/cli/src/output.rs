@@ -167,6 +167,17 @@ pub fn render_plan(plan: &Plan) -> String {
                     assertion.statement
                 ));
             }
+            AssertionCheck::PtyScript => {
+                let command = assertion
+                    .pty_script
+                    .as_ref()
+                    .map(|s| format!(" — `{}`", s.command))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  [{id}] (pty-script) {}{command}\n",
+                    assertion.statement
+                ));
+            }
         }
     }
 
@@ -236,7 +247,9 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
 /// then Grant latency and Escalation ledger sections — unless there is no
 /// history at all (no closed missions, no escalations, no decided grants,
 /// no task-class rows), in which case only the Autonomy section (zeros) plus
-/// a short note is printed, per the spec's empty-history rule.
+/// a short note is printed, per the spec's empty-history rule. The
+/// industry-comparison set (KRZ-333), when folded, renders LAST as a
+/// clearly-separated secondary section after the Escalation ledger.
 pub fn render_outcomes(outcomes: &Outcomes) -> String {
     let ratio = &outcomes.autonomy_ratio;
     let mut out = String::new();
@@ -290,6 +303,70 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
             "  no approved grants yet (flag threshold {})\n",
             format_duration_ms(stamp.threshold_ms)
         )),
+    }
+
+    // Gate score distribution flags (KRZ-316) beside the rubber-stamp
+    // signal — the documented complement, always presented together:
+    // block-to-grant timing catches an inattentive human, these catch a
+    // mis-specified gate whose threshold nothing approaches. Sub-minimum
+    // and unscored gates render ABSENT, never zero-filled.
+    let score_flags = &outcomes.gate_score_flags;
+    out.push('\n');
+    out.push_str("Gate score signals\n");
+    if score_flags.scored_gates == 0 {
+        out.push_str("  no scored gate evaluations recorded yet\n");
+    } else if score_flags.assessed_gates == 0 {
+        out.push_str(&format!(
+            "  {} scored gate{}, none at the minimum sample ({}) — no flags\n",
+            score_flags.scored_gates,
+            if score_flags.scored_gates == 1 {
+                ""
+            } else {
+                "s"
+            },
+            score_flags.min_samples
+        ));
+    } else {
+        // Group each gate's kinds onto one line (the fold emits a gate's
+        // flags adjacently); gates ordered by identity, as folded.
+        let mut flagged: Vec<(
+            &str,
+            Vec<&str>,
+            &kranz_engine::gate_score_flags::ScoreDistribution,
+        )> = Vec::new();
+        for flag in &score_flags.flags {
+            match flagged.last_mut() {
+                Some((gate, kinds, _)) if *gate == flag.gate => {
+                    kinds.push(flag.kind.as_str());
+                }
+                _ => flagged.push((&flag.gate, vec![flag.kind.as_str()], &flag.distribution)),
+            }
+        }
+        out.push_str(&format!(
+            "  {} of {} assessed gate{} flagged ({} scored, min sample {})\n",
+            flagged.len(),
+            score_flags.assessed_gates,
+            if score_flags.assessed_gates == 1 {
+                ""
+            } else {
+                "s"
+            },
+            score_flags.scored_gates,
+            score_flags.min_samples
+        ));
+        for (gate, kinds, d) in flagged {
+            out.push_str(&format!(
+                "  {}: {} — {} samples, scores {:.3}..{:.3} (mean {:.3}), variance {:.2e}, closest approach {:.3}\n",
+                gate,
+                kinds.join(", "),
+                d.samples,
+                d.min_score,
+                d.max_score,
+                d.mean_score,
+                d.variance,
+                d.closest_approach
+            ));
+        }
     }
 
     let cost = &outcomes.cost_per_change;
@@ -396,6 +473,67 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
             latency,
             flag
         ));
+    }
+
+    // The industry-comparison set (KRZ-333): a clearly-separated SECONDARY
+    // section after every native section — the kranz-native metrics stay
+    // primary. Each comparison metric carries its inline definition (the
+    // definition is the whole argument), and a slot whose data the fold
+    // cannot see renders empty naming its dependency, never an
+    // approximation. Absent entirely when the fold pinned no window.
+    if let Some(comparison) = &outcomes.comparison {
+        out.push('\n');
+        out.push_str(&format!(
+            "Industry comparison (secondary to the native metrics above; {}d window)\n",
+            comparison.window_days
+        ));
+
+        let share = &comparison.assisted_change_share;
+        match (share.total_changes, share.share) {
+            (Some(total), Some(s)) => out.push_str(&format!(
+                "  Assisted-change share: {:.0}% — {} of {} landed change{} on {}\n",
+                s * 100.0,
+                share.agent_changes,
+                total,
+                if total == 1 { "" } else { "s" },
+                share.base_branch.as_deref().unwrap_or("?")
+            )),
+            _ => out.push_str(&format!(
+                "  Assisted-change share: — (needs {})\n",
+                share.dependency.as_deref().unwrap_or("unavailable data")
+            )),
+        }
+        out.push_str(&format!("    definition: {}\n", share.definition));
+
+        let density = &comparison.defect_density;
+        match density.defects_per_merged_change {
+            Some(d) => out.push_str(&format!(
+                "  Defect density: {:.2} traced defect{} per merged change ({} defect{}, {} merged change{})\n",
+                d,
+                if density.traced_defects == 1 { "" } else { "s" },
+                density.traced_defects,
+                if density.traced_defects == 1 { "" } else { "s" },
+                density.merged_changes,
+                if density.merged_changes == 1 { "" } else { "s" }
+            )),
+            None => out.push_str(&format!(
+                "  Defect density: — (needs {})\n",
+                density.dependency.as_deref().unwrap_or("unavailable data")
+            )),
+        }
+        out.push_str(&format!("    definition: {}\n", density.definition));
+
+        // Empty-and-named-dependency today (the traced defect records carry
+        // no lifecycle timestamps); the computed arm arrives with the data.
+        let resolution = &comparison.defect_resolution_time;
+        out.push_str(&format!(
+            "  Defect resolution time: — (needs {})\n",
+            resolution
+                .dependency
+                .as_deref()
+                .unwrap_or("unavailable data")
+        ));
+        out.push_str(&format!("    definition: {}\n", resolution.definition));
     }
 
     out
@@ -620,6 +758,84 @@ pub fn render_provenance(chain: &ProvenanceChain) -> String {
             gate.artefact_ref,
             artefact_annotation(gate.artefact),
         ));
+    }
+
+    // Standards coverage (KRZ-343, design D-H): the rule coverage matrix
+    // folded into the chain — each applicable pinned rule's disposition
+    // with its mechanism and evidence joins, and any drift refusals. A
+    // mission with no approved pin (every pre-Flight-Rules log) renders
+    // NOTHING here, so those text views stay byte-identical.
+    if let Some(coverage) = &chain.standards {
+        out.push('\n');
+        out.push_str("Standards coverage\n");
+        out.push_str(&format!(
+            "  pack {} ({}, {}) — root {}, sha256:{}\n",
+            coverage.pack_name,
+            coverage.pack_dir,
+            coverage.source,
+            coverage.standards_root,
+            coverage.digest
+        ));
+        let resolution = match (coverage.resolution_seq, coverage.resolved_at) {
+            (Some(seq), Some(ts)) => {
+                format!(
+                    "standards.resolved seq {seq} (evaluated {})",
+                    ts.to_rfc3339()
+                )
+            }
+            _ => "no standards.resolved event in this log".to_string(),
+        };
+        out.push_str(&format!(
+            "  pinned at plan approval (seq {}); {resolution}\n",
+            coverage.approval_seq
+        ));
+        for rule in &coverage.rules {
+            let checker = rule.checker.as_deref().unwrap_or("-");
+            let evidence = if rule.evidence.is_empty() {
+                "no evidence named this rule (never rendered as pass)".to_string()
+            } else {
+                rule.evidence
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} seq {} {} {} `{}`",
+                            entry.event, entry.seq, entry.mechanism, entry.bearing, entry.reference
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let note = rule
+                .note
+                .as_deref()
+                .map(|note| format!(" — {}", one_line(note, 120)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {} r{}  {} {}  {}  {}{}  — {}\n",
+                rule.id,
+                rule.revision,
+                rule.lifecycle,
+                rule.level,
+                checker,
+                rule.disposition.as_str().to_uppercase(),
+                note,
+                evidence
+            ));
+        }
+        for record in &coverage.drift {
+            let current = record
+                .current_digest
+                .as_deref()
+                .map(|digest| format!("sha256:{digest}"))
+                .unwrap_or_else(|| "(no readable manifest on the live base)".to_string());
+            out.push_str(&format!(
+                "  [seq {}] policy drift refused: approved sha256:{} → current {} — {}\n",
+                record.seq,
+                record.approved_digest,
+                current,
+                one_line(&record.changed_rules.join("; "), 120)
+            ));
+        }
     }
 
     out.push('\n');
@@ -966,6 +1182,7 @@ mod tests {
                         feature_id: None,
                         milestone_id: None,
                         candidate: None,
+                        executor_route: None,
                         sdk_session_id: "s".into(),
                         model: "sonnet".into(),
                         quant: "n/a".into(),
@@ -1012,6 +1229,226 @@ mod tests {
                 .find(|l| l.contains("cargo test") && l.contains("approved"))
                 .expect("grant ledger row present");
             assert!(grant_line.contains("rubber-stamp"), "{grant_line}");
+        }
+
+        /// A scored `gate.result` append (KRZ-316 fixture): the (score,
+        /// threshold) pair rides verbatim, as the gate stated it.
+        fn scored_gate_result(gate: &str, score: f64, threshold: f64) -> EventKind {
+            use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
+            EventKind::GateResult {
+                gate: gate.into(),
+                surface: GateSurface::Approval,
+                kind: GateKind::Deterministic,
+                index: 0,
+                verdict: GateVerdict::Pass,
+                artefact_ref: format!("contract gate {gate}"),
+                artefact_detail: None,
+                score: Some(score),
+                threshold: Some(threshold),
+                rule_ids: Vec::new(),
+            }
+        }
+
+        /// KRZ-316: the distribution flags render beside the rubber-stamp
+        /// signal — the ticket's "complement, not alternative" — naming the
+        /// gate and carrying the distribution that triggered the flag; the
+        /// JSON form carries the same section.
+        #[test]
+        fn score_distribution_flag_cli_text_renders_beside_rubber_stamp() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            // Ten constant far-from-threshold scores + a fast grant park:
+            // the gate smell AND the human smell in one report.
+            let mut kinds = vec![
+                created("goal"),
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+            ];
+            for _ in 0..10 {
+                kinds.push(scored_gate_result("vacuous-filter", 0.5, 1.0));
+            }
+            kinds.push(EventKind::MissionCompleted {});
+            seed_mission(root, "m-1", kinds);
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Rubber-stamp signal"), "{text}");
+            assert!(text.contains("Gate score signals"), "{text}");
+            // Presented together: the gate section directly follows the
+            // rubber-stamp block.
+            let stamp_at = text.find("Rubber-stamp signal").unwrap();
+            let flags_at = text.find("Gate score signals").unwrap();
+            let cost_at = text.find("Cost per change").unwrap();
+            assert!(stamp_at < flags_at && flags_at < cost_at, "{text}");
+            assert!(
+                text.contains("1 of 1 assessed gate flagged (1 scored, min sample 10)"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "vacuous-filter: never-approaches-threshold, near-constant — 10 samples, scores 0.500..0.500 (mean 0.500), variance 0.00e0, closest approach 0.500"
+                ),
+                "{text}"
+            );
+
+            // The JSON form carries the same section (the wire shape the
+            // REST endpoint serves verbatim).
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(json.contains("gateScoreFlags"), "{json}");
+            assert!(json.contains("never-approaches-threshold"), "{json}");
+            assert!(json.contains("near-constant"), "{json}");
+            let round_tripped: Outcomes = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, outcomes);
+        }
+
+        /// KRZ-316 absence: history without a single scored gate evaluation
+        /// states so plainly — no flag rows, no zero-filled distributions.
+        #[test]
+        fn score_distribution_flag_cli_text_no_scored_gates_states_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Gate score signals"), "{text}");
+            assert!(
+                text.contains("no scored gate evaluations recorded yet"),
+                "{text}"
+            );
+            assert!(!text.contains("near-constant"), "{text}");
+            assert!(!text.contains("never-approaches"), "{text}");
+        }
+
+        /// KRZ-333: the industry-comparison set renders as a clearly-separated
+        /// SECONDARY section after every native section, each metric carrying
+        /// its inline definition as CONTENT. The tempdir is no git repo, so
+        /// the git-derived slots degrade naming their dependency — never an
+        /// approximation.
+        #[test]
+        fn comparison_metrics_text_renders_secondary_section_with_inline_definitions() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![
+                    created("goal"),
+                    EventKind::GrantRequested {
+                        milestone_id: "ms-1".into(),
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::GrantApproved {
+                        kind: GrantKind::Command,
+                        command: "cargo test".into(),
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(text.contains("Industry comparison"), "{text}");
+            // Ordered after every native section: the ledger is the last
+            // native one, the comparison set follows it.
+            let ledger_at = text.find("Escalation ledger").unwrap();
+            let comparison_at = text.find("Industry comparison").unwrap();
+            assert!(
+                ledger_at < comparison_at,
+                "comparison renders after the native sections: {text}"
+            );
+            // Inline definitions as content, not just presence.
+            assert!(text.contains("agent-involved by construction"), "{text}");
+            assert!(text.contains("traced-from-mission frontmatter"), "{text}");
+            assert!(text.contains("no lifecycle timestamps"), "{text}");
+            // The empty slots name their dependencies.
+            assert!(
+                text.contains("Assisted-change share: — (needs a git probe"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Defect density: — (needs merged changes in the window"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Defect resolution time: — (needs ticket open/close timestamps"),
+                "{text}"
+            );
+        }
+
+        /// KRZ-333: the JSON form carries the comparison section as a
+        /// separate key ordered after the native keys — the same wire shape
+        /// the REST endpoint serves verbatim.
+        #[test]
+        fn comparison_metrics_json_carries_the_section_after_native_keys() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![created("goal"), EventKind::MissionCompleted {}],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(json.contains("\"comparison\""), "{json}");
+            assert!(
+                json.find("\"escalations\"").unwrap() < json.find("\"comparison\"").unwrap(),
+                "the comparison key follows the native keys: {json}"
+            );
+            assert!(json.contains("agent-involved by construction"), "{json}");
+            assert!(json.contains("\"windowDays\": 30"), "{json}");
+            let round_tripped: Outcomes = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped, outcomes);
+        }
+
+        /// KRZ-333: the hermetic seam — fold options without a comparison
+        /// window attach NO section at all (absent from text and wire, never
+        /// a zeroed report).
+        #[test]
+        fn comparison_metrics_absent_when_options_pin_no_window() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-1",
+                vec![created("goal"), EventKind::MissionCompleted {}],
+            );
+
+            let outcomes = kranz_engine::outcomes::compute_outcomes_with_options(
+                root,
+                &kranz_engine::outcomes::OutcomesOptions::default(),
+            )
+            .unwrap();
+            assert!(outcomes.comparison.is_none());
+            let text = render_outcomes(&outcomes);
+            assert!(!text.contains("Industry comparison"), "{text}");
+            let json = render_outcomes_json(&outcomes).unwrap();
+            assert!(!json.contains("\"comparison\""), "{json}");
         }
     }
 
@@ -1128,6 +1565,7 @@ mod tests {
                 considered_alternatives: None,
                 command_grants: vec![],
                 touch_set: vec![],
+                standards_manifest: None,
             }
         }
 
@@ -1148,6 +1586,7 @@ mod tests {
                 artefact_detail: None,
                 score: None,
                 threshold: None,
+                rule_ids: Vec::new(),
             }
         }
 
@@ -1158,6 +1597,7 @@ mod tests {
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: format!("sess-{run_id}"),
                 model: model.to_string(),
                 quant: "n/a".to_string(),
@@ -1408,6 +1848,129 @@ mod tests {
                 "the empty ledger reads plainly:\n{text}"
             );
         }
+
+        /// KRZ-343 (D-H): the text view renders the standards coverage
+        /// matrix — each applicable rule's disposition with its mechanism
+        /// and evidence joins — while a pin-less mission renders NO section
+        /// (byte-identical pre-Flight-Rules output).
+        #[test]
+        fn flight_rules_provenance_cli_text_renders_standards_coverage() {
+            let tmp = TempDir::new().unwrap();
+            let paths = MissionPaths::new(tmp.path(), "m-1");
+            let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+            let rule = |id: &str, revision: u64| kranz_engine::types::PinnedRule {
+                id: id.to_string(),
+                revision,
+                rfc: "RFC-001".to_string(),
+                level: "must".to_string(),
+                effective_status: "enforced".to_string(),
+                statement: format!("statement for {id}"),
+                domains: Vec::new(),
+                stages: vec!["validation".to_string()],
+                when_paths: Vec::new(),
+                task_classes: Vec::new(),
+                checker: Some("gate:zz-gate".to_string()),
+                waivable: false,
+            };
+            let mut plan = sample_plan();
+            plan.standards_manifest = Some(Box::new(kranz_engine::types::StandardsPin {
+                pack_name: "zz-pack".to_string(),
+                pack_dir: "vendor/pack".to_string(),
+                standards_root: "standards".to_string(),
+                digest: "ab".repeat(32),
+                source: kranz_engine::types::StandardsPinSource::RepoTracked,
+                task_class: None,
+                touch_set: vec!["crates/**".to_string()],
+                context_paths: Vec::new(),
+                gates: Vec::new(),
+                rules: vec![rule("ZZ-FAIL-001", 2), rule("ZZ-QUIET-001", 1)],
+            }));
+            let mut gate = gate_result(
+                "zz-gate",
+                GateSurface::FinalGate,
+                GateKind::Deterministic,
+                0,
+                "file:runs/gate-zz.jsonl",
+            );
+            if let EventKind::GateResult { rule_ids, .. } = &mut gate {
+                *rule_ids = vec!["ZZ-QUIET-001".to_string()];
+            }
+            for kind in [
+                EventKind::MissionCreated {
+                    goal: "ship the thing".into(),
+                    base_branch: "main".into(),
+                    mission_branch: "kranz/mission-x".into(),
+                    config: MissionConfig::default(),
+                },
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::StandardsResolved {
+                    source: "repo-tracked".to_string(),
+                    pack_name: "zz-pack".to_string(),
+                    standards_root: "standards".to_string(),
+                    digest: "ab".repeat(32),
+                    stage: "approval".to_string(),
+                    task_class: None,
+                    touch_set: vec!["crates/**".to_string()],
+                    context_paths: Vec::new(),
+                    rules: Vec::new(),
+                    approval_seq: 2,
+                },
+                gate,
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".into(),
+                    run_id: "v-1".into(),
+                    finding: kranz_engine::types::Finding {
+                        subject: "a-1".into(),
+                        severity: "major".into(),
+                        evidence: "the rule failed".into(),
+                        suggested_fix: String::new(),
+                        class: String::new(),
+                        rule: Some(kranz_engine::types::RuleCitation {
+                            id: "ZZ-FAIL-001".to_string(),
+                            revision: 2,
+                            source: "zz-pack standards".to_string(),
+                            digest: "ab".repeat(32),
+                            lifecycle: "enforced".to_string(),
+                            level: "must".to_string(),
+                            checker: Some("gate:zz-gate".to_string()),
+                        }),
+                    },
+                },
+                EventKind::MissionCompleted {},
+            ] {
+                log.append(kind).unwrap();
+            }
+            drop(log);
+
+            let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            for line in [
+                "Standards coverage",
+                "pack zz-pack (vendor/pack, repo-tracked) — root standards",
+                "pinned at plan approval (seq 2); standards.resolved seq 3 (evaluated ",
+                "ZZ-FAIL-001 r2  enforced must  gate:zz-gate  FAILED  — validation.finding seq 5 v-1 fail `a-1`",
+                "ZZ-QUIET-001 r1  enforced must  gate:zz-gate  PASSED  — gate.result seq 4 zz-gate pass `file:runs/gate-zz.jsonl`",
+            ] {
+                assert!(text.contains(line), "missing line: {line}\n{text}");
+            }
+            // The JSON form carries the same matrix.
+            let json = render_provenance_json(&chain).unwrap();
+            assert!(json.contains("\"standards\""), "{json}");
+            assert!(json.contains("\"disposition\": \"failed\""), "{json}");
+
+            // Pin-less mission (the seed_repo fixture): NO section, and the
+            // JSON has no standards key — pre-Flight-Rules byte-compat.
+            let tmp2 = TempDir::new().unwrap();
+            seed_repo(tmp2.path());
+            let chain = compute_provenance(tmp2.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            assert!(!text.contains("Standards coverage"), "{text}");
+            let json = render_provenance_json(&chain).unwrap();
+            assert!(!json.contains("\"standards\""), "{json}");
+        }
     }
 
     #[test]
@@ -1425,6 +1988,7 @@ mod tests {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "milestone one".to_string(),
@@ -1437,6 +2001,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         };
         let events = vec![
             Event {
@@ -1599,6 +2164,7 @@ mod tests {
                 artefact_detail: None,
                 score: Some(1.0),
                 threshold: Some(1.0),
+                rule_ids: Vec::new(),
             })
             .unwrap();
 
@@ -1610,5 +2176,105 @@ mod tests {
             assert_eq!(round_tripped.evaluations[0].score, Some(1.0));
             assert_eq!(round_tripped.evaluations[0].threshold, Some(1.0));
         }
+    }
+}
+pub fn render_standards_metrics(
+    report: &kranz_engine::standards_metrics::StandardsMetricsReport,
+) -> String {
+    fn rate(value: Option<f64>) -> String {
+        value
+            .map(|value| format!("{:.1}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Flight Rules effectiveness (minimum {} samples for conclusions)",
+        report.minimum_samples
+    );
+    for definition in &report.definitions {
+        let _ = writeln!(out, "  definition: {definition}");
+    }
+    if report.rules.is_empty() {
+        out.push_str("no approval-pinned Flight Rules evidence recorded yet\n");
+        return out;
+    }
+    for rule in &report.rules {
+        let _ = writeln!(
+            out,
+            "{} r{} — applicable {}, evaluated {}, advisory {}, failed {}, blocked {}, waived {}, not-evaluated {}, false-green {}",
+            rule.id,
+            rule.revision,
+            rule.applicable_missions,
+            rule.evaluated_missions,
+            rule.advisory_missions,
+            rule.failed_missions,
+            rule.blocked_missions,
+            rule.waived_missions,
+            rule.not_evaluated_missions,
+            rule.false_green_missions,
+        );
+        let _ = writeln!(
+            out,
+            "  rates: evaluation {}, advisory {}, failure {}, block {}, waiver {}; mean resolution {}",
+            rate(rule.evaluation_rate),
+            rate(rule.advisory_rate),
+            rate(rule.failure_rate),
+            rate(rule.block_rate),
+            rate(rule.waiver_rate),
+            rule.mean_resolution_ms
+                .map(|millis| format!("{millis:.0} ms"))
+                .unwrap_or_else(|| "—".to_string()),
+        );
+        if rule.conclusions_suppressed {
+            let samples = if rule.evaluated_missions == 0 {
+                rule.applicable_missions
+            } else {
+                rule.evaluated_missions
+            };
+            let _ = writeln!(
+                out,
+                "  conclusions suppressed: {samples} relevant sample(s), need {}",
+                report.minimum_samples
+            );
+        }
+        if let Some(scores) = &rule.score_distribution {
+            let _ = writeln!(
+                out,
+                "  scores: n {}, min {:.3}, mean {:.3}, max {:.3}, near threshold {}",
+                scores.samples, scores.minimum, scores.mean, scores.maximum, scores.near_threshold,
+            );
+        }
+        for smell in &rule.smells {
+            let _ = writeln!(
+                out,
+                "  smell {} (n={}): {} — {}",
+                smell.kind, smell.samples, smell.observed, smell.definition
+            );
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod standards_metrics_output_tests {
+    use super::*;
+
+    #[test]
+    fn flight_rules_metrics_cli_empty_report_keeps_denominator_definition_visible() {
+        let report = kranz_engine::standards_metrics::StandardsMetricsReport {
+            minimum_samples: 5,
+            definitions: vec!["applicable = approval-pinned rule/revision".to_string()],
+            rules: Vec::new(),
+        };
+        let text = render_standards_metrics(&report);
+        assert!(text.contains("minimum 5 samples"), "{text}");
+        assert!(text.contains("definition: applicable"), "{text}");
+        assert!(
+            text.contains("no approval-pinned Flight Rules evidence"),
+            "{text}"
+        );
     }
 }

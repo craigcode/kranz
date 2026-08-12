@@ -56,6 +56,50 @@ fn base_spec(prompt: PromptMode) -> SessionSpec {
         max_turns: None,
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
+    }
+}
+
+/// Whether this host can APPLY a sandbox profile, not merely find
+/// `sandbox-exec` on PATH: these tests drive real nested sandbox
+/// application, and under the gate sandbox wrap (a wrapped `cargo test`
+/// dogfooding this repo — ticket gate-sandbox-supervision-dogfood) a nested
+/// apply of any profile but the identical one is kernel-denied (probed
+/// 2026-08-05; no SBPL clause can allow it). The smoke-apply makes each
+/// test skip with a detectable marker instead of failing on the outer
+/// sandbox's presence — the same posture `crate::sandbox`'s own
+/// enforcement tests take.
+#[cfg(target_os = "macos")]
+fn sandbox_exec_can_apply() -> bool {
+    let found = std::process::Command::new("which")
+        .arg("sandbox-exec")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !found {
+        eprintln!("sandbox-exec not found on this host; skipping");
+        return false;
+    }
+    let smoke = std::process::Command::new("sandbox-exec")
+        .arg("-p")
+        .arg("(version 1)\n(allow default)\n")
+        .arg("/usr/bin/true")
+        .output();
+    match smoke {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 sandbox-exec cannot apply a smoke profile here (nested apply is denied \
+                 inside the gate sandbox wrap); skipping: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+            false
+        }
     }
 }
 
@@ -349,6 +393,45 @@ fn tool_result_structured_refusals_are_denials() {
         };
         assert!(!denied, "near-miss must not count as denial: {text:?}");
     }
+}
+
+/// A bare "hook" substring (e.g. a directory listing that happens to contain
+/// `hooks_test.rs`, or prose discussing hooks) must NOT park a deny-by-default
+/// grant: the m-eee81f validator aborts were exactly this false positive.
+#[test]
+fn tool_result_hook_substring_alone_is_not_a_denial() {
+    for (text, is_error) in [
+        // Directory listing of crates/engine/tests/ — the m-eee81f shape.
+        (
+            "backend_claude_test.rs\nbackend_cursor_test.rs\nhooks_test.rs\nmission_test.rs",
+            false,
+        ),
+        ("hooks_test.rs", false),
+        ("The hook status file is missing", true),
+        (
+            "See docs/knowledge/decisions/positioning-governance-evidence-layer.md for hook design",
+            false,
+        ),
+    ] {
+        let events = parse_stream_line(&tool_result_line(text, is_error));
+        let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+            panic!("expected ToolResult for {text:?}");
+        };
+        assert!(
+            !denied,
+            "bare 'hook' mention must not count as denial: {text:?}"
+        );
+    }
+
+    // A genuine hook block still counts.
+    let events = parse_stream_line(&tool_result_line(
+        "operation blocked by PreToolUse hook",
+        false,
+    ));
+    let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+        panic!("expected ToolResult");
+    };
+    assert!(denied, "a real hook block must still count as denial");
 }
 
 #[test]
@@ -1089,13 +1172,7 @@ mod sandbox_wrap {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_wrap_macos_enforced_launch_allows_inside_denies_outside() {
-        if std::process::Command::new("which")
-            .arg("sandbox-exec")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("sandbox-exec not found on this host; skipping");
+        if !sandbox_exec_can_apply() {
             return;
         }
 
@@ -1172,13 +1249,7 @@ mod sandbox_wrap {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_wrap_macos_start_confines_spawned_process() {
-        if std::process::Command::new("which")
-            .arg("sandbox-exec")
-            .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            eprintln!("sandbox-exec not found on this host; skipping");
+        if !sandbox_exec_can_apply() {
             return;
         }
 
@@ -1285,6 +1356,7 @@ async fn real_single_shot() {
         max_turns: None,
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     };
 
     let mut session = backend.start(spec).await.expect("spawn real claude");

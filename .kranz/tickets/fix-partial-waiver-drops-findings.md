@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in f4ba469 (Craig); reviewed + negative-tested + gates green
 title: Partial waiver silently drops unwaived findings (validation gate hole)
 priority: 1
 schedule: once

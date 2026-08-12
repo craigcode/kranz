@@ -1,4 +1,5 @@
 ---
+state: done
 title: Persist estimates; serve plan, report, diff, and merged-state over REST
 priority: 2
 schedule: once

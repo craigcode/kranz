@@ -137,6 +137,14 @@ pub struct GateOutcome {
     /// Optional gate-supplied score (KRZ-315). `None` for boolean-only
     /// gates; never consulted to compute `verdict`.
     pub score: Option<GateScore>,
+    /// The stable Flight Rules standards rule ids this evaluation joined
+    /// (ticket `flight-rules-finding-provenance`, KRZ-343; design D-H): the
+    /// linkage persisted as `ruleIds` on the gate's `gate.result` event so
+    /// the coverage matrix can answer "which approved rules did this
+    /// mechanism evaluate" without parsing prose. Empty for every gate with
+    /// no standards linkage — boolean-only gates are byte-identical on the
+    /// wire (the event omits the empty list).
+    pub rule_ids: Vec<String>,
 }
 
 impl GateOutcome {
@@ -147,6 +155,7 @@ impl GateOutcome {
             verdict: GateVerdict::Pass,
             artefact,
             score: None,
+            rule_ids: Vec::new(),
         }
     }
 
@@ -156,12 +165,21 @@ impl GateOutcome {
             verdict: GateVerdict::Fail,
             artefact,
             score: None,
+            rule_ids: Vec::new(),
         }
     }
 
     /// Attach a confidence score + threshold without touching the verdict.
     pub fn with_score(mut self, score: f64, threshold: f64) -> Self {
         self.score = Some(GateScore { score, threshold });
+        self
+    }
+
+    /// Name the standards rules this evaluation joined (KRZ-343) — stable
+    /// rule ids, never rule prose. Like the score, the linkage is purely
+    /// evidentiary: it never changes the verdict.
+    pub fn with_rule_ids(mut self, rule_ids: Vec<String>) -> Self {
+        self.rule_ids = rule_ids;
         self
     }
 

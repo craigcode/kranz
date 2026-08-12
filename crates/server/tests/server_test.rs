@@ -45,6 +45,7 @@ fn sample_plan() -> Plan {
             statement: "cargo test passes".into(),
             check: AssertionCheck::Command,
             command: Some("cargo test".into()),
+            pty_script: None,
         }],
         milestones: vec![PlanMilestone {
             title: "M1".into(),
@@ -57,6 +58,7 @@ fn sample_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -91,6 +93,7 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
         feature_id: Some("f-1-1".into()),
         milestone_id: Some("ms-1".into()),
         candidate: None,
+        executor_route: None,
         sdk_session_id: "00000000-0000-0000-0000-000000000001".into(),
         model: "sonnet".into(),
         quant: "n/a".into(),
@@ -1003,6 +1006,121 @@ async fn control_post_enqueues_a_drainable_command() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(body["error"].is_string());
+}
+
+/// The question-answer route (ticket structured-human-question-events): an
+/// option-index answer against an OPEN question 202s and lands in the
+/// control inbox as `answer-question`; stale answers (unknown question,
+/// out-of-range or mismatched option) 409 with nothing enqueued — the same
+/// stale-decision discipline as the grant routes.
+#[tokio::test]
+async fn question_events_answer_route_enqueues_and_validates() {
+    let (_tmp, _repo_root, paths, app) = fixture();
+
+    // Open question q-1 (run-1 / f-1-1 / ms-1 all exist in the seeded log).
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::QuestionOpened {
+            question_id: "q-1".into(),
+            role: Role::Worker,
+            text: "Which storage engine should the cache use?".into(),
+            options: vec!["sqlite".into(), "in-memory".into()],
+            run_id: Some("run-1".into()),
+            feature_id: Some("f-1-1".into()),
+            milestone_id: Some("ms-1".into()),
+        })
+        .unwrap();
+    }
+
+    // The projection is part of the folded state payload (no new GET
+    // endpoint): /state carries the open question.
+    let (status, state) = get_json(&app, &format!("/api/missions/{MISSION_ID}/state")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state["pendingQuestions"][0]["questionId"], "q-1",
+        "the pending-decision projection rides the state payload: {state}"
+    );
+
+    // Option-index answer: 202 and queued as the dedicated control kind.
+    let uri = format!("/api/missions/{MISSION_ID}/question/answer");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"questionId":"q-1","answer":"sqlite","option":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let commands = control::drain(&paths).unwrap();
+    assert_eq!(commands.len(), 1);
+    match &commands[0].1 {
+        ControlCommand::AnswerQuestion {
+            question_id,
+            answer,
+            option,
+        } => {
+            assert_eq!(question_id, "q-1");
+            assert_eq!(answer, "sqlite");
+            assert_eq!(*option, Some(0));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    // Acknowledge so later arms see an empty inbox.
+    control::acknowledge(&paths, &commands[0].0).unwrap();
+
+    // A free-text answer (no option) is fine too.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"questionId":"q-1","answer":"use postgres"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let commands = control::drain(&paths).unwrap();
+    assert_eq!(commands.len(), 1);
+    control::acknowledge(&paths, &commands[0].0).unwrap();
+
+    // Stale answers never reach the inbox: unknown question, out-of-range
+    // option, and an option text that doesn't match the parked question all
+    // 409.
+    for body in [
+        r#"{"questionId":"q-nope","answer":"sqlite","option":0}"#,
+        r#"{"questionId":"q-1","answer":"sqlite","option":9}"#,
+        r#"{"questionId":"q-1","answer":"in-memory","option":0}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "body: {body}");
+    }
+    assert!(
+        control::drain(&paths).unwrap().is_empty(),
+        "stale answers must not enqueue"
+    );
 }
 
 #[tokio::test]

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: docs/metrics.md — four metrics defined with reproduce-commands and dogfood numbers (89.8%% autonomy, 0 sub-10s grants, 0 false greens); linked from the-trust-interval.md.
 title: "Publish the trust-metric vocabulary (docs/metrics.md) with dogfood receipts"
 priority: 1
 schedule: once

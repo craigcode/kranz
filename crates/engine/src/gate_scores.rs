@@ -2,8 +2,10 @@
 //! KRZ-315 — the persistence-and-query half of scored gates): the recorded
 //! evaluation series for ONE gate identity, folded from every mission log
 //! in the repo and surfaced as `kranz gate-scores <gate>` (text or
-//! `--json`). The `gate-score-distribution-flags` ticket consumes the same
-//! series next.
+//! `--json`). The `gate-score-distribution-flags` slice
+//! ([`crate::gate_score_flags`], KRZ-316) folds the distribution flags over
+//! the same `gate.result` events, sharing this module's extraction
+//! discipline and verbatim-score contract.
 //!
 //! The ticket's contract rules, and where this module stands on them:
 //!
@@ -216,6 +218,7 @@ mod tests {
             artefact_detail: None,
             score: score.map(|(score, _)| score),
             threshold: score.map(|(_, threshold)| threshold),
+            rule_ids: Vec::new(),
         }
     }
 

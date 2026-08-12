@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: complete across two commits: 445bb12 (3.3a — per-run CONNECT proxy, allowlist enforcement, JSONL denial records, RunOutcome.denied_egress, Seatbelt+container env wiring, bwrap documented out of scope) and c576107 (3.3b — GrantKind::Egress park/approve/deny mirroring the command path, approve extends Mission.egress_grants extend-only, proxy allowlist reads them on re-run, four surfaces render distinctly, contract_health classifies egress-denied blocks as grant denials; worker-path park explicitly … (truncated)
 title: Egress grants — sandbox egress-denial instrumentation (prerequisite)
 priority: 3
 schedule: once

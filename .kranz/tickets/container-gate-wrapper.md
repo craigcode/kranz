@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: container gates execute inside the mission container (run --rm --read-only, mission ro, authority masked, named + teardown); runtime-unavailable and fs+net+egress fail closed; real Cargo root never mounted. Live fixture runtime-gated for CI; 7 unit tests green locally; full gates green.
 title: "Container gate wrapper — engine-run gates inside the mission container"
 priority: 1
 schedule: once

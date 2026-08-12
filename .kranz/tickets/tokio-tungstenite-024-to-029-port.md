@@ -1,4 +1,5 @@
 ---
+state: done
 title: Port tokio-tungstenite 0.24 → 0.29 in the Slack socket client (dependabot PR #10)
 priority: 3
 schedule: once

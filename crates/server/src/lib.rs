@@ -415,8 +415,14 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
         )
         .route("/missions/outcomes", get(rest::mission_outcomes))
         .route("/escalation-metrics", get(rest::escalation_metrics))
+        .route("/standards-metrics", get(rest::standards_metrics))
         .route("/cost-per-merged-change", get(rest::cost_per_merged_change))
         .route("/missions/{id}/state", get(rest::mission_state))
+        .route("/missions/{id}/standards", get(rest::mission_standards))
+        .route(
+            "/missions/{id}/standards/waiver",
+            post(rest::post_standards_waiver),
+        )
         .route("/missions/{id}/workspace", get(rest::mission_workspace))
         .route("/missions/{id}/events", get(rest::mission_events))
         .route("/missions/{id}/plan", get(rest::mission_plan))
@@ -437,6 +443,19 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
             "/missions/{id}/runs/{run_id}/transcript",
             get(rest::run_transcript),
         )
+        // The hook-status lane (ticket agent-hooks-status-signals): the
+        // POST is the lane's ONLY write, authenticated by the per-run
+        // capability token (exempt from the mutation-token gate below, like
+        // the GitHub webhook's HMAC route); the GET is an ordinary
+        // tokenless-loopback read. The body limit is the lane's own
+        // 16 KiB bound — the relay's body is a handful of small fields.
+        .route(
+            "/hook-status",
+            post(rest::post_hook_status).route_layer(axum::extract::DefaultBodyLimit::max(
+                kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES,
+            )),
+        )
+        .route("/missions/{id}/hook-status", get(rest::mission_hook_status))
         .route("/missions/{id}/control", post(rest::post_control))
         .route("/missions/{id}/revise", post(rest::post_revise))
         .route(
@@ -452,6 +471,10 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
             post(rest::post_grant_approve),
         )
         .route("/missions/{id}/grant/deny", post(rest::post_grant_deny))
+        .route(
+            "/missions/{id}/question/answer",
+            post(rest::post_question_answer),
+        )
         .route("/missions/{id}/planning/turn", post(host::planning_turn))
         .route(
             "/missions/{id}/planning/request-plan",
@@ -831,10 +854,18 @@ async fn require_mutation_token(
         // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
         // when unconfigured — GitHub cannot present the mutation token.
         let is_github_hook = path.ends_with("/hooks/github");
+        // The hook-status signal POST authenticates with its own per-RUN
+        // capability token (validated against the registration in the
+        // handler — worker-readable files never carry the serve token).
+        // Scoped to POSTs so a read-gated GET of the projection still
+        // requires the read token.
+        let is_hook_signal_post =
+            request.method() == Method::POST && path.ends_with("/hook-status");
         let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
         let needs_token = path.starts_with("/api/")
             && !is_health
             && !is_github_hook
+            && !is_hook_signal_post
             && (request.method() == Method::POST || (gate.require_read_token && is_read));
         if needs_token {
             // The read-only token authenticates reads ONLY — never a mutation.

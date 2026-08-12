@@ -26,9 +26,12 @@
 //! gate rests on, so its isolation cannot be operator-opt-in.
 //! [`resolve_validator_containment`] resolves the posture: the role's own
 //! enforced sandbox plus the real-checkout read-deny set when enforcement
-//! is configured, the mandatory `fs`-tier wrap when it is not, and a loud
-//! per-round degradation note (never a silent bare run, never fail-closed
-//! validation) where the platform or the selected backend cannot contain.
+//! is configured, the mandatory `fs`-tier wrap when it is not, and — where
+//! the platform or the selected backend cannot contain — a FAIL-CLOSED
+//! refusal by default (ticket `validator-containment-degrade-fail-closed`,
+//! 14th-pass review: the loud degrade reopens the modify→use→restore path,
+//! so it is now the explicit opt-in `validatorAllowUncontainedDegrade`, never
+//! the default).
 //! The read-deny set ([`validator_read_deny_entries`]) closes the broad
 //! read allow over the real checkout's source tree — the snapshot
 //! worktree is the sole writable root and the only tree the validator can
@@ -301,14 +304,17 @@ pub struct ValidatorContainment {
     /// `enforce: off`), `None` only when containment degraded (see `note`).
     pub sandbox: Option<ResolvedSandbox>,
     /// The LOUD operator-facing posture note when containment could not be
-    /// applied — an unsupported platform, a linux without `bwrap`, or a
-    /// backend that does not honor the resolved sandbox. The orchestrator
-    /// surfaces it as a decision per validator spawn (so every validation
-    /// round carries it); `None` when the session is contained. Degradation
-    /// here is deliberately NOT fail-closed: the snapshot's physical
-    /// separation plus the after-fingerprint tripwire still apply, and
-    /// hard-refusing validation on uncontainable platforms is the operator
-    /// decision the ticket names for later.
+    /// applied AND the operator opted into the degrade
+    /// (`validatorAllowUncontainedDegrade`) — an unsupported platform, a
+    /// linux without `bwrap`, or a backend that does not honor the resolved
+    /// sandbox. The orchestrator surfaces it as a decision per validator
+    /// spawn (so every validation round carries it); `None` when the session
+    /// is contained. Without the opt-in the resolution FAILS CLOSED instead
+    /// (ticket `validator-containment-degrade-fail-closed`, 14th-pass
+    /// review): the degrade reopens the modify→use→restore path the
+    /// mandatory-containment work was built to close, so snapshot
+    /// separation plus the after-fingerprint tripwire alone are no longer
+    /// the default posture.
     pub note: Option<String>,
 }
 
@@ -334,14 +340,19 @@ pub struct ValidatorContainment {
 /// `enforce == off` is the case this ticket exists for: the mandatory
 /// `fs`-tier wrap (write containment with the validator's API egress intact;
 /// no operator `extraWrite` widening — the snapshot is the sole writable
-/// root) wherever the platform supports it and the backend can apply it, and
-/// the loud degradation note everywhere else.
+/// root) wherever the platform supports it and the backend can apply it.
+/// Everywhere else the resolution FAILS CLOSED (ticket
+/// `validator-containment-degrade-fail-closed`, 14th-pass review — this
+/// reverses the 224fa73 loud-degrade default) unless
+/// `allow_uncontained_degrade` (the `validatorAllowUncontainedDegrade`
+/// config flag) opts this repo back into the loud degradation note.
 pub fn resolve_validator_containment(
     role_sandbox: &crate::types::SandboxConfig,
     backend: crate::types::BackendKind,
     session_cwd: &Path,
     mission_dir: &Path,
     read_deny_roots: &[PathBuf],
+    allow_uncontained_degrade: bool,
 ) -> crate::error::Result<ValidatorContainment> {
     resolve_validator_containment_target(
         role_sandbox,
@@ -349,6 +360,7 @@ pub fn resolve_validator_containment(
         session_cwd,
         mission_dir,
         read_deny_roots,
+        allow_uncontained_degrade,
         std::env::consts::OS,
         command_available("bwrap"),
         crate::sandbox_container::detect(),
@@ -366,6 +378,7 @@ fn resolve_validator_containment_target(
     session_cwd: &Path,
     mission_dir: &Path,
     read_deny_roots: &[PathBuf],
+    allow_uncontained_degrade: bool,
     target_os: &str,
     bwrap_available: bool,
     container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
@@ -409,31 +422,62 @@ fn resolve_validator_containment_target(
     // enforce: off — MANDATORY containment. The provider is ignored here:
     // `provider: container` with `enforce: off` documents "no sandboxing,
     // same as today", and the mandatory wrap is the process tier.
-    if !backend.supports_sandbox_enforcement() {
-        return Ok(ValidatorContainment {
-            sandbox: None,
-            note: Some(format!(
-                "validator sessions on the {} backend cannot be OS-sandbox-contained (only the \
-                 claude backend applies the resolved sandbox profile); this validator runs with \
-                 snapshot isolation and the after-fingerprint tripwire only — the real checkout \
-                 is reachable from the session. Select a claude validator backend for mandatory \
-                 containment (ticket validator-mandatory-containment)",
-                backend.as_str()
-            )),
-        });
-    }
-    let degraded = |why: String| {
+    //
+    // Where the wrap cannot apply, the default is FAIL CLOSED (ticket
+    // validator-containment-degrade-fail-closed, 14th-pass review — this
+    // REVERSES the 224fa73 loud-degrade-by-default decision: a degraded
+    // validator runs with snapshot separation and the tripwire only, which
+    // reopens the modify→use→restore path the wrap exists to close).
+    // `validatorAllowUncontainedDegrade` opts this repo back into the loud
+    // per-round degradation note.
+    let uncontained = |why: String, note: String| -> crate::error::Result<ValidatorContainment> {
+        if !allow_uncontained_degrade {
+            return Err(crate::error::EngineError::Config(format!(
+                "mandatory validator containment cannot apply ({why}); refusing to run an \
+                 uncontained validator — the degraded posture reopens the modify→use→restore \
+                 path the wrap exists to close (ticket \
+                 validator-containment-degrade-fail-closed). To run validators here anyway, \
+                 set \"validatorAllowUncontainedDegrade\": true in .kranz/config.json (the \
+                 loud per-round degrade returns); otherwise use a containable platform \
+                 (macOS, or linux with `bwrap` on PATH) and the claude validator backend"
+            )));
+        }
         Ok(ValidatorContainment {
             sandbox: None,
-            note: Some(format!(
-                "validator sessions are NOT OS-sandbox-contained ({why}); the validator still \
-                 runs in its throwaway snapshot with the after-fingerprint tripwire on the real \
-                 checkout, but hostile validator code could walk to the real checkout and \
-                 restore bytes before the fingerprint — containment here is the snapshot's \
-                 physical separation only. Fail-closed on uncontainable platforms is the \
-                 operator decision ticket validator-mandatory-containment names for later"
-            )),
+            note: Some(note),
         })
+    };
+    if !backend.supports_sandbox_enforcement() {
+        return uncontained(
+            format!(
+                "the {} backend does not apply the resolved sandbox profile",
+                backend.as_str()
+            ),
+            format!(
+                "validator sessions on the {} backend cannot be OS-sandbox-contained (only the \
+                 claude backend applies the resolved sandbox profile); \
+                 validatorAllowUncontainedDegrade is set, so this validator runs with \
+                 snapshot isolation and the after-fingerprint tripwire only — the real checkout \
+                 is reachable from the session. Select a claude validator backend for mandatory \
+                 containment (ticket validator-mandatory-containment; the degrade is opt-in per \
+                 validator-containment-degrade-fail-closed)",
+                backend.as_str()
+            ),
+        );
+    }
+    let degraded = |why: String| {
+        uncontained(
+            why.clone(),
+            format!(
+                "validator sessions are NOT OS-sandbox-contained ({why}); \
+                 validatorAllowUncontainedDegrade is set, so the validator still runs in its \
+                 throwaway snapshot with the after-fingerprint tripwire on the real checkout, \
+                 but hostile validator code could walk to the real checkout and restore bytes \
+                 before the fingerprint — containment here is the snapshot's physical \
+                 separation only (ticket validator-mandatory-containment; the degrade is \
+                 opt-in per validator-containment-degrade-fail-closed)"
+            ),
+        )
     };
     match platform_support(crate::types::SandboxEnforce::Fs, target_os) {
         // Unreachable (Fs is not Off) — platform_support is the shared
@@ -653,12 +697,16 @@ pub(crate) fn cargo_cache_write_deny_paths() -> Vec<PathBuf> {
 /// Authority files a sandboxed session must never read, even under the broad
 /// read allow: a read of `serve.token` IS mutation authority over `kranz
 /// serve` (loopback is reachable from every sandbox tier), `serve.read.token`
-/// is its GET-side sibling, and `config.json` carries Slack tokens and
-/// remote-workspace credentials. Derived from the mission dir's canonical
-/// `<repo>/.kranz/missions/<id>` layout. Both the raw and the canonical
-/// mission-dir forms are expanded (the dir exists at spawn time even when the
-/// token files do not yet), because Seatbelt matches against canonical paths
-/// — the same `/var` ↔ `/private/var` split the write allowlist handles.
+/// is its GET-side sibling, `config.json` carries Slack tokens and
+/// remote-workspace credentials, and `domain-terms.local` is the plaintext
+/// clean-room lint vocabulary that must never be readable outside the
+/// engine-side lint (14th-pass review: the mandatory validator wrap's
+/// `.kranz` carve-out — kept for the snapshot — otherwise leaks it).
+/// Derived from the mission dir's canonical `<repo>/.kranz/missions/<id>`
+/// layout. Both the raw and the canonical mission-dir forms are expanded (the
+/// dir exists at spawn time even when the token files do not yet), because
+/// Seatbelt matches against canonical paths — the same `/var` ↔
+/// `/private/var` split the write allowlist handles.
 ///
 /// Also denied: `$CARGO_HOME/credentials.toml` AND the legacy extensionless
 /// `$CARGO_HOME/credentials` (or `~/.cargo/...` when CARGO_HOME is unset) —
@@ -670,7 +718,12 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
     let mut paths = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
         if let Some(kranz_dir) = mission_dir.parent().and_then(Path::parent) {
-            for name in ["serve.token", "serve.read.token", "config.json"] {
+            for name in [
+                "serve.token",
+                "serve.read.token",
+                "config.json",
+                "domain-terms.local",
+            ] {
                 paths.push(kranz_dir.join(name));
             }
         }
@@ -682,6 +735,29 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
         }
     }
     paths
+}
+
+/// Authority DIRECTORIES a sandboxed session must never read (14th-pass
+/// review — the directory half of [`authority_read_deny_paths`], denied as
+/// Seatbelt subpaths / bwrap tmpfs shadows):
+///
+/// - `<repo>/.kranz/hook-status/` — the hook-signal projection
+///   (registrations + per-run capability-token hashes). The in-sandbox
+///   `kranz hook-status` relay reads only its session-private spec and POSTs
+///   loopback; the server reads the projection from OUTSIDE the sandbox.
+/// - `<mission_dir>/control/` — the operator→engine control inbox (approve /
+///   pause / config-change commands). The orchestrator polls it from outside
+///   the sandbox; no session ever legitimately reads it. The bwrap write
+///   shadow already hid its contents — this aligns the Seatbelt read posture.
+pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+        dirs.push(mission_dir.join("control"));
+        if let Some(kranz_dir) = mission_dir.parent().and_then(Path::parent) {
+            dirs.push(kranz_dir.join("hook-status"));
+        }
+    }
+    dirs
 }
 
 /// One entry of the validator read-deny set: a top-level path of a real
@@ -787,7 +863,8 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 
 /// Generate an SBPL profile: deny-by-default, broad read (Seatbelt cannot
 /// usefully scope toolchain/dyld reads without breaking `/bin/sh`) with the
-/// [`authority_read_deny_paths`] carve-out, write limited to subpaths of
+/// [`authority_read_deny_paths`]/[`authority_read_deny_dirs`] carve-out,
+/// write limited to subpaths of
 /// `session_cwd`, the session-private scratch `tmpdir`, and each
 /// `extra_write` entry — with the mission metadata of
 /// [`mission_write_denies`] carved back OUT by explicit write denies, so the
@@ -838,16 +915,25 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     // carve-out: the authority material below.
     profile.push_str("(allow file-read*)\n");
     profile.push('\n');
-    // Serve tokens and the repo config must stay unreadable even under the
-    // broad read allow (see authority_read_deny_paths). SBPL denies take
-    // precedence over allows regardless of clause order (verified with
-    // sandbox-exec), so placing the deny after the allow is documentary.
+    // Serve tokens, the repo config, the plaintext lint vocabulary, the
+    // hook-status projection, and the control inbox must stay unreadable even
+    // under the broad read allow (see authority_read_deny_paths /
+    // authority_read_deny_dirs). SBPL denies take precedence over allows
+    // regardless of clause order (verified with sandbox-exec), so placing
+    // the deny after the allow is documentary.
     let mut deny_literals = std::collections::BTreeSet::new();
     for path in authority_read_deny_paths(inputs) {
         deny_literals.insert(escape_sbpl_literal(&path));
     }
-    if !deny_literals.is_empty() {
+    let mut deny_subpaths = std::collections::BTreeSet::new();
+    for dir in authority_read_deny_dirs(inputs) {
+        deny_subpaths.insert(escape_sbpl_literal(&dir));
+    }
+    if !deny_literals.is_empty() || !deny_subpaths.is_empty() {
         profile.push_str("(deny file-read*\n");
+        for lit in &deny_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
         for lit in &deny_literals {
             profile.push_str(&format!("  (literal \"{lit}\")\n"));
         }
@@ -1193,13 +1279,20 @@ pub fn bubblewrap_args(
         out.push("/dev/null".to_string());
         out.push(mask);
     }
-    let control_shadows: std::collections::BTreeSet<String> = write_denies
+    // tmpfs shadows for dirs a session must not read or write: the mission
+    // control inbox (the write-deny idiom — a shadow hides writes AND reads)
+    // plus the authority read-deny dirs (14th-pass review — the hook-status
+    // projection under the validator wrap's `.kranz` carve-out;
+    // authority_read_deny_dirs overlaps control_dirs on the inbox, the set
+    // dedups). Same spawn-time existence filter as the masks.
+    let dir_shadows: std::collections::BTreeSet<String> = write_denies
         .control_dirs
         .iter()
+        .chain(authority_read_deny_dirs(inputs).iter())
         .filter(|path| path.is_dir())
         .map(|path| absolutize(path).display().to_string())
         .collect();
-    for shadow in control_shadows {
+    for shadow in dir_shadows {
         out.push("--tmpfs".to_string());
         out.push(shadow);
     }
@@ -1378,7 +1471,13 @@ mod tests {
         assert!(profile.contains("(allow file-read*)"));
         assert!(profile.contains("(deny file-read*"));
         let kranz_dir = repo.path().join(".kranz");
-        for name in ["serve.token", "serve.read.token", "config.json"] {
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            // The plaintext clean-room lint vocabulary (14th-pass review).
+            "domain-terms.local",
+        ] {
             for base in [kranz_dir.clone(), absolutize(&kranz_dir)] {
                 let expected = format!("(literal \"{}\")", escape_sbpl_literal(&base.join(name)));
                 assert!(
@@ -1394,6 +1493,107 @@ mod tests {
         assert!(
             profile.contains("credentials.toml"),
             "profile missing read deny for cargo credentials:\n{profile}"
+        );
+    }
+
+    /// Composition audit (ticket `config-fail-open-audit`): the effective
+    /// egress list EXTENDS the compiled-in Anthropic floor — a mission's
+    /// configured `egress[]` (and, downstream, its operator-approved egress
+    /// grants) can only add destinations, never drop or narrow the defaults.
+    /// A replace-shaped regression here strands the sandboxed session's own
+    /// API access, or worse, goes unnoticed while the operator believes the
+    /// floor is still composed in.
+    #[test]
+    fn composition_audit_effective_egress_extends_never_replaces_the_default_floor() {
+        let configured = vec![
+            " crates.io:443 ".to_string(),       // trimmed on the way in
+            "api.anthropic.com:443".to_string(), // a duplicate of the floor
+            "registry.npmjs.org:443".to_string(),
+        ];
+        let out = effective_egress(&configured);
+        assert_eq!(
+            out,
+            vec![
+                "api.anthropic.com:443".to_string(),
+                "*.anthropic.com:443".to_string(),
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string(),
+            ]
+        );
+        // An empty configured list still yields the full default floor.
+        assert_eq!(effective_egress(&[]).len(), DEFAULT_EGRESS.len());
+    }
+
+    /// Composition audit: `extraWrite` EXTENDS the writable floor (session
+    /// cwd + session-private scratch) — the floor itself is not configurable
+    /// away, so no config shape can un-write the session's own worktree or
+    /// its private scratch.
+    #[test]
+    fn composition_audit_extra_write_extends_never_replaces_the_writable_floor() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let inputs = inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        );
+        let writable = write_allowlist(&inputs);
+        for floor in [absolutize(session.path()), absolutize(tmp.path())] {
+            assert!(
+                writable.contains(&floor),
+                "the writable floor {floor:?} must survive any extraWrite list"
+            );
+        }
+        assert!(writable.contains(&absolutize(extra.path())));
+    }
+
+    /// Composition audit: the explicit deny sets (mission metadata writes,
+    /// authority reads) survive an `extraWrite` broad enough to COVER them.
+    /// SBPL denies take precedence over every allow regardless of clause
+    /// order, so the deny clauses must still be emitted when the allow side
+    /// is at its widest — this is the deny-wins pin for the sandbox surface.
+    #[test]
+    fn composition_audit_explicit_denies_survive_a_covering_extra_write_allow() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // extraWrite = the repo root: every mission file now sits under an
+        // allowed subpath — the widest realistic allow shape.
+        let profile = generate_profile(&inputs(
+            repo.path(),
+            &mission,
+            tmp.path(),
+            vec![repo.path().to_path_buf()],
+        ));
+        // The covering allow IS emitted...
+        assert!(
+            profile.contains(&format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(repo.path()))
+            )),
+            "the covering extraWrite allow must be present:\n{profile}"
+        );
+        // ...and the metadata write denies still are too: the audit log,
+        // state snapshot, and control inbox stay unwritable through the
+        // allow because SBPL denies win over it.
+        assert!(profile.contains("(deny file-write*"));
+        for name in ["events.jsonl", "state.json"] {
+            assert!(
+                profile.contains(&escape_sbpl_literal(&mission.join(name))),
+                "the write deny for {name} must survive the covering allow:\n{profile}"
+            );
+        }
+        // Authority reads (serve.token) stay denied under the broad read
+        // allow for the same reason.
+        assert!(
+            profile.contains(&escape_sbpl_literal(
+                &repo.path().join(".kranz").join("serve.token")
+            )),
+            "the read deny for serve.token must survive the covering allow:\n{profile}"
         );
     }
 
@@ -2141,7 +2341,12 @@ mod tests {
         std::fs::create_dir_all(&mission).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let kranz_dir = repo.path().join(".kranz");
-        for name in ["serve.token", "serve.read.token", "config.json"] {
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            "domain-terms.local",
+        ] {
             std::fs::write(kranz_dir.join(name), "secret").unwrap();
         }
         let public = repo.path().join("public.txt");
@@ -2151,7 +2356,12 @@ mod tests {
         let profile_dir = tempfile::tempdir().unwrap();
         let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
 
-        for name in ["serve.token", "serve.read.token", "config.json"] {
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            "domain-terms.local",
+        ] {
             let status = Command::new("sandbox-exec")
                 .arg("-f")
                 .arg(&profile_path)
@@ -2512,6 +2722,22 @@ mod tests {
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join("README.md"), "snapshot copy\n").unwrap();
         std::fs::write(root.join(".kranz").join("serve.token"), "secret-token").unwrap();
+        // The sensitive .kranz runtime the 14th-pass over-read finding names
+        // (ticket validator-containment-kranz-overread): the plaintext lint
+        // vocabulary, the hook-status projection, and the mission control
+        // inbox — all reachable through the .kranz carve-out unless the
+        // authority read-deny set covers them.
+        std::fs::write(
+            root.join(".kranz").join("domain-terms.local"),
+            "acme widget\n",
+        )
+        .unwrap();
+        let hook_status = root.join(".kranz").join("hook-status").join("m-x");
+        std::fs::create_dir_all(&hook_status).unwrap();
+        std::fs::write(hook_status.join("run-1.json"), "{\"tokenHash\":\"abc\"}\n").unwrap();
+        let control = mission.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::write(control.join("approve.json"), "{}\n").unwrap();
         (dir, root, snapshot, mission)
     }
 
@@ -2708,6 +2934,64 @@ mod tests {
         );
     }
 
+    /// 14th-pass review (ticket `validator-containment-kranz-overread`): the
+    /// `.kranz` carve-out the snapshot lives under must not reopen the
+    /// sensitive runtime beneath it — the plaintext lint vocabulary
+    /// (`domain-terms.local`), the hook-status projection, and the mission
+    /// control inbox are read-denied (literal for the file, subpaths for the
+    /// dirs) in BOTH raw and canonical forms, exactly like the serve-token
+    /// authority material.
+    #[test]
+    fn validator_containment_profile_denies_sensitive_kranz_runtime_reads() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+
+        let kranz = root.join(".kranz");
+        for base in [kranz.clone(), absolutize(&kranz)] {
+            let terms = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&base.join("domain-terms.local"))
+            );
+            assert!(
+                profile.contains(&terms),
+                "profile missing read deny for domain-terms.local:\n{profile}"
+            );
+            let hook = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&base.join("hook-status"))
+            );
+            assert!(
+                profile.contains(&hook),
+                "profile missing read deny for hook-status/:\n{profile}"
+            );
+        }
+        for base in [mission.clone(), absolutize(&mission)] {
+            let control = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&base.join("control"))
+            );
+            assert!(
+                profile.contains(&control),
+                "profile missing read deny for the control inbox:\n{profile}"
+            );
+        }
+        // …while the carve-out itself stays: no deny names the .kranz DIR
+        // (the closing quote makes this exact).
+        for base in [kranz.clone(), absolutize(&kranz)] {
+            let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base));
+            assert!(
+                !profile.contains(&kranz_rule),
+                ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
+            );
+        }
+    }
+
     /// Non-validator sessions (empty roots) get byte-stable profiles: exactly
     /// the pre-containment shape, i.e. only the authority read-deny block.
     #[test]
@@ -2781,6 +3065,43 @@ mod tests {
         );
     }
 
+    /// The bwrap analogue of the 14th-pass over-read fix (ticket
+    /// `validator-containment-kranz-overread`): the plaintext lint
+    /// vocabulary gets a `/dev/null` mask, and the hook-status projection +
+    /// the control inbox get tmpfs shadows (the control/ shadow was already
+    /// the write-deny idiom; the same mechanism now hides hook-status/).
+    #[test]
+    fn validator_containment_bwrap_masks_sensitive_kranz_runtime() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let args = bubblewrap_args(
+            &validator_containment_inputs(&root, &snapshot, &mission, scratch.path()),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let terms = absolutize(&root.join(".kranz").join("domain-terms.local"))
+            .display()
+            .to_string();
+        assert!(
+            joined.contains(&format!("--ro-bind /dev/null {terms}")),
+            "missing /dev/null mask for domain-terms.local: {args:?}"
+        );
+        for dir in [
+            root.join(".kranz").join("hook-status"),
+            mission.join("control"),
+        ] {
+            let shadow = absolutize(&dir).display().to_string();
+            assert!(
+                args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == shadow),
+                "missing tmpfs shadow for {}: {args:?}",
+                dir.display()
+            );
+        }
+    }
+
     // --- the resolution matrix -----------------------------------------------
 
     fn off_cfg() -> crate::types::SandboxConfig {
@@ -2808,6 +3129,7 @@ mod tests {
             Path::new("/repo/.kranz/missions/m-x/runs/snap"),
             Path::new("/repo/.kranz/missions/m-x"),
             &roots,
+            false,
             "macos",
             false,
             None,
@@ -2833,22 +3155,46 @@ mod tests {
         );
     }
 
-    /// Linux: the mandatory wrap needs `bwrap`; without it the validator
-    /// degrades with the loud note, never silently.
+    /// Linux: the mandatory wrap needs `bwrap`; without it the resolution
+    /// FAILS CLOSED by default (naming the platform limit and the flag), and
+    /// only the explicit `validatorAllowUncontainedDegrade` opt-in restores
+    /// the loud degrade note (ticket
+    /// validator-containment-degrade-fail-closed).
     #[test]
-    fn validator_containment_off_linux_requires_bwrap() {
+    fn validator_containment_off_linux_without_bwrap_fails_closed_unless_opted_in() {
         let roots = vec![PathBuf::from("/repo")];
+        let err = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            false,
+            "linux",
+            false,
+            None,
+        )
+        .expect_err("no bwrap and no opt-in: fail closed");
+        let err = err.to_string();
+        assert!(err.contains("bwrap"), "{err}");
+        assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
+        assert!(
+            err.contains("refusing to run an uncontained validator"),
+            "{err}"
+        );
+
         let containment = resolve_validator_containment_target(
             &off_cfg(),
             crate::types::BackendKind::Claude,
             Path::new("/snap"),
             Path::new("/mission"),
             &roots,
+            true,
             "linux",
             false,
             None,
         )
-        .expect("degradation is a note, not an error");
+        .expect("the opt-in restores the loud degrade");
         assert!(containment.sandbox.is_none());
         let note = containment.note.expect("the loud note");
         assert!(note.contains("bwrap"), "{note}");
@@ -2860,6 +3206,7 @@ mod tests {
             Path::new("/snap"),
             Path::new("/mission"),
             &roots,
+            false,
             "linux",
             true,
             None,
@@ -2872,22 +3219,40 @@ mod tests {
         );
     }
 
-    /// Windows has no process-sandbox tier: degrade with the loud note per
-    /// validation round — deliberately NOT fail-closed in this slice (the
-    /// ticket names that as the later operator decision).
+    /// Windows has no process-sandbox tier: FAIL CLOSED by default — the
+    /// 14th-pass reversal of the 224fa73 loud-degrade default (ticket
+    /// validator-containment-degrade-fail-closed). The error names the
+    /// platform and the opt-in flag; the flag restores the loud note.
     #[test]
-    fn validator_containment_off_windows_degrades_with_loud_note() {
+    fn validator_containment_off_windows_fails_closed_unless_opted_in() {
+        let err = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("C:\\snap"),
+            Path::new("C:\\mission"),
+            &[PathBuf::from("C:\\repo")],
+            false,
+            "windows",
+            false,
+            None,
+        )
+        .expect_err("an uncontainable platform fails closed by default");
+        let err = err.to_string();
+        assert!(err.contains("target_os=windows"), "{err}");
+        assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
+
         let containment = resolve_validator_containment_target(
             &off_cfg(),
             crate::types::BackendKind::Claude,
             Path::new("C:\\snap"),
             Path::new("C:\\mission"),
             &[PathBuf::from("C:\\repo")],
+            true,
             "windows",
             false,
             None,
         )
-        .expect("degradation is a note, not an error");
+        .expect("the opt-in restores the loud degrade");
         assert!(containment.sandbox.is_none());
         let note = containment.note.expect("the loud note");
         assert!(note.contains("target_os=windows"), "{note}");
@@ -2896,27 +3261,47 @@ mod tests {
     }
 
     /// A backend that cannot honor the resolved sandbox must never silently
-    /// run bare: the wrap is skipped and the note names the backend.
+    /// run bare: by default the resolution FAILS CLOSED naming the backend
+    /// and the flag; with the opt-in the wrap is skipped and the note names
+    /// the backend.
     #[test]
-    fn validator_containment_off_non_claude_backend_is_not_silently_weakened() {
+    fn validator_containment_off_non_claude_backend_fails_closed_unless_opted_in() {
         for backend in [
             crate::types::BackendKind::Codex,
             crate::types::BackendKind::Droid,
             crate::types::BackendKind::Kimi,
             crate::types::BackendKind::Local,
             crate::types::BackendKind::Acp,
+            crate::types::BackendKind::Cursor,
         ] {
+            let err = resolve_validator_containment_target(
+                &off_cfg(),
+                backend,
+                Path::new("/snap"),
+                Path::new("/mission"),
+                &[PathBuf::from("/repo")],
+                false,
+                "macos",
+                false,
+                None,
+            )
+            .expect_err("an uncontainable backend fails closed by default");
+            let err = err.to_string();
+            assert!(err.contains(backend.as_str()), "{err}");
+            assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
+
             let containment = resolve_validator_containment_target(
                 &off_cfg(),
                 backend,
                 Path::new("/snap"),
                 Path::new("/mission"),
                 &[PathBuf::from("/repo")],
+                true,
                 "macos",
                 false,
                 None,
             )
-            .expect("degradation is a note, not an error");
+            .expect("the opt-in restores the loud degrade");
             assert!(
                 containment.sandbox.is_none(),
                 "{backend:?} must not get a wrap it cannot honor"
@@ -2941,6 +3326,7 @@ mod tests {
             Path::new("/repo/.kranz/missions/m-x/runs/snap"),
             Path::new("/repo/.kranz/missions/m-x"),
             &roots,
+            false,
             "macos",
             false,
             None,
@@ -2966,6 +3352,7 @@ mod tests {
             Path::new("C:\\snap"),
             Path::new("C:\\mission"),
             &[PathBuf::from("C:\\repo")],
+            false,
             "windows",
             false,
             None,
@@ -2991,6 +3378,7 @@ mod tests {
             Path::new("/snap"),
             Path::new("/mission"),
             &[PathBuf::from("/repo")],
+            false,
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
@@ -3011,6 +3399,7 @@ mod tests {
             Path::new("/snap"),
             Path::new("/mission"),
             &[PathBuf::from("/repo")],
+            false,
             "macos",
             false,
             None,
@@ -3065,6 +3454,24 @@ mod tests {
             assert!(
                 !read(&denied).success(),
                 "read of the real tree must be denied: {}",
+                denied.display()
+            );
+        }
+        // …and so is the sensitive .kranz runtime the carve-out would
+        // otherwise reopen (14th-pass review,
+        // validator-containment-kranz-overread): the plaintext lint
+        // vocabulary, the hook-status projection, and the control inbox.
+        for denied in [
+            root.join(".kranz").join("domain-terms.local"),
+            root.join(".kranz")
+                .join("hook-status")
+                .join("m-x")
+                .join("run-1.json"),
+            mission.join("control").join("approve.json"),
+        ] {
+            assert!(
+                !read(&denied).success(),
+                "read of the sensitive .kranz runtime must be denied: {}",
                 denied.display()
             );
         }

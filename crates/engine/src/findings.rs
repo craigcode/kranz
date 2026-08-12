@@ -333,6 +333,7 @@ mod tests {
             evidence: format!("{subject} evidence"),
             suggested_fix: format!("fix {subject}"),
             class: String::new(),
+            rule: None,
         }
     }
 

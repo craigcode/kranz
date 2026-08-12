@@ -129,6 +129,12 @@ pub struct GateLink {
     pub threshold: Option<f64>,
     /// Resolution of `artefact_ref` against the mission dir.
     pub artefact: ArtefactStatus,
+    /// The standards rule ids the evaluation joined (KRZ-343, design D-H),
+    /// verbatim from the event. Additive: absent (never `[]`) on pre-field
+    /// chains and for gates with no standards linkage, so those chains stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_ids: Vec<String>,
 }
 
 /// One `worker.spawned`, replayed: who ran, with what, under which prompt
@@ -288,6 +294,14 @@ pub struct ProvenanceChain {
     /// (`#[serde(default)]` keeps a pre-field chain.json readable).
     #[serde(default)]
     pub divergences: Vec<DivergenceLink>,
+    /// The Flight Rules rule coverage matrix (KRZ-343, design D-H), folded
+    /// from the same log by [`crate::standards_coverage`]: every applicable
+    /// pinned rule's disposition with its mechanism and evidence joins, the
+    /// resolution provenance, and any drift refusals. `None` — and absent
+    /// from the machine form — on missions with no approved standards pin
+    /// (every pre-Flight-Rules log), so those chains stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standards: Option<crate::standards_coverage::StandardsCoverage>,
     /// The FIRST terminal event (a well-formed log has exactly one); `None`
     /// while the mission is still in flight.
     pub outcome: Option<TerminalLink>,
@@ -319,6 +333,7 @@ pub fn provenance_chain(
         sessions: Vec::new(),
         decisions: Vec::new(),
         divergences: Vec::new(),
+        standards: None,
         outcome: None,
     };
     // The config in force at the current seq (backend derivation); set by
@@ -446,6 +461,7 @@ pub fn provenance_chain(
                 artefact_detail,
                 score,
                 threshold,
+                rule_ids,
             } => chain.gates.push(GateLink {
                 seq: event.seq,
                 gate: gate.clone(),
@@ -458,6 +474,7 @@ pub fn provenance_chain(
                 score: *score,
                 threshold: *threshold,
                 artefact: ArtefactStatus::classify(&resolve_artefact(mission_dir, artefact_ref)),
+                rule_ids: rule_ids.clone(),
             }),
             EventKind::DivergenceNoted {
                 unit,
@@ -527,6 +544,11 @@ pub fn provenance_chain(
             _ => {}
         }
     }
+    // The standards coverage matrix (KRZ-343, D-H): one fold over the same
+    // slice, attached to the chain so the replay and the evidence bundle
+    // render rule dispositions without a second pass. `None` on
+    // pre-Flight-Rules logs — their chains stay byte-identical.
+    chain.standards = crate::standards_coverage::standards_coverage(mission_id, events);
     Ok(chain)
 }
 
@@ -572,6 +594,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -610,6 +633,7 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         }
     }
 
@@ -620,6 +644,7 @@ mod tests {
             feature_id: None,
             milestone_id: None,
             candidate: None,
+            executor_route: None,
             sdk_session_id: format!("sess-{run_id}"),
             model: model.to_string(),
             quant: "n/a".to_string(),
@@ -1125,5 +1150,173 @@ mod tests {
         stripped.as_object_mut().unwrap().remove("divergences");
         let back: ProvenanceChain = serde_json::from_value(stripped).unwrap();
         assert!(back.divergences.is_empty());
+    }
+
+    // ---- KRZ-343: the standards coverage matrix rides the chain -----------
+
+    /// A plan carrying a two-rule standards pin (KRZ-342's consent shape):
+    /// one enforced must, one approved should.
+    fn pinned_plan() -> Plan {
+        let rule = |id: &str, revision: u64, status: &str, level: &str| crate::types::PinnedRule {
+            id: id.to_string(),
+            revision,
+            rfc: "RFC-001".to_string(),
+            level: level.to_string(),
+            effective_status: status.to_string(),
+            statement: format!("statement for {id}"),
+            domains: Vec::new(),
+            stages: vec!["validation".to_string()],
+            when_paths: Vec::new(),
+            task_classes: Vec::new(),
+            checker: Some("gate:zz-gate".to_string()),
+            waivable: false,
+        };
+        Plan {
+            standards_manifest: Some(Box::new(crate::types::StandardsPin {
+                pack_name: "zz-pack".to_string(),
+                pack_dir: "vendor/pack".to_string(),
+                standards_root: "standards".to_string(),
+                digest: "ab".repeat(32),
+                source: crate::types::StandardsPinSource::RepoTracked,
+                task_class: None,
+                touch_set: vec!["crates/**".to_string()],
+                context_paths: Vec::new(),
+                gates: Vec::new(),
+                rules: vec![
+                    rule("ZZ-FAIL-001", 2, "enforced", "must"),
+                    rule("ZZ-QUIET-001", 1, "approved", "should"),
+                ],
+            })),
+            ..sample_plan()
+        }
+    }
+
+    /// KRZ-343 (D-H): the replay folds the coverage matrix from the same
+    /// log — a finding's rule citation joins its pinned row, the untouched
+    /// rule reads not-evaluated, and the machine form carries the section.
+    #[test]
+    fn flight_rules_provenance_replay_folds_the_coverage_matrix() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created(),
+                EventKind::PlanApproved {
+                    plan: pinned_plan(),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::StandardsResolved {
+                    source: "repo-tracked".to_string(),
+                    pack_name: "zz-pack".to_string(),
+                    standards_root: "standards".to_string(),
+                    digest: "ab".repeat(32),
+                    stage: "approval".to_string(),
+                    task_class: None,
+                    touch_set: vec!["crates/**".to_string()],
+                    context_paths: Vec::new(),
+                    rules: vec![
+                        crate::types::StandardsRuleRef {
+                            id: "ZZ-FAIL-001".to_string(),
+                            revision: 2,
+                            effective_status: "enforced".to_string(),
+                        },
+                        crate::types::StandardsRuleRef {
+                            id: "ZZ-QUIET-001".to_string(),
+                            revision: 1,
+                            effective_status: "approved".to_string(),
+                        },
+                    ],
+                    approval_seq: 2,
+                },
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".into(),
+                    run_id: "v-1".into(),
+                    finding: crate::types::Finding {
+                        subject: "a-1".into(),
+                        severity: "major".into(),
+                        evidence: "broke the rule".into(),
+                        suggested_fix: String::new(),
+                        class: String::new(),
+                        rule: Some(crate::types::RuleCitation {
+                            id: "ZZ-FAIL-001".to_string(),
+                            revision: 2,
+                            source: "zz-pack standards".to_string(),
+                            digest: "ab".repeat(32),
+                            lifecycle: "enforced".to_string(),
+                            level: "must".to_string(),
+                            checker: Some("gate:zz-gate".to_string()),
+                        }),
+                    },
+                },
+                EventKind::MissionCompleted {},
+            ],
+        );
+        let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+        let coverage = chain
+            .standards
+            .as_ref()
+            .expect("the matrix rides the chain");
+        assert_eq!(coverage.pack_name, "zz-pack");
+        assert_eq!(coverage.approval_seq, 2);
+        assert_eq!(coverage.resolution_seq, Some(3));
+        assert_eq!(coverage.rules.len(), 2);
+        let failed = &coverage.rules[0];
+        assert_eq!(failed.id, "ZZ-FAIL-001");
+        assert_eq!(
+            failed.disposition,
+            crate::standards_coverage::RuleDisposition::Failed
+        );
+        assert_eq!(failed.evidence.len(), 1);
+        assert_eq!(failed.evidence[0].seq, 4);
+        assert_eq!(failed.evidence[0].mechanism, "v-1");
+        let quiet = &coverage.rules[1];
+        assert_eq!(quiet.id, "ZZ-QUIET-001");
+        assert_eq!(
+            quiet.disposition,
+            crate::standards_coverage::RuleDisposition::NotEvaluated
+        );
+
+        // The machine form carries the section; a chain.json predating the
+        // field still deserializes (serde default).
+        let json = serde_json::to_value(&chain).unwrap();
+        assert_eq!(json["standards"]["digest"], "ab".repeat(32));
+        assert_eq!(json["standards"]["rules"][0]["disposition"], "failed");
+        let mut stripped = json.clone();
+        stripped.as_object_mut().unwrap().remove("standards");
+        let back: ProvenanceChain = serde_json::from_value(stripped).unwrap();
+        assert!(back.standards.is_none());
+        // …and the pinned manifest stays inspectable through the machine
+        // form: id, revision, lifecycle, level, checker, statement all ride
+        // the row.
+        let row = &json["standards"]["rules"][1];
+        assert_eq!(row["id"], "ZZ-QUIET-001");
+        assert_eq!(row["revision"], 1);
+        assert_eq!(row["lifecycle"], "approved");
+        assert_eq!(row["level"], "should");
+        assert_eq!(row["checker"], "gate:zz-gate");
+        assert_eq!(row["statement"], "statement for ZZ-QUIET-001");
+    }
+
+    /// The byte-compat regression contract: a pre-Flight-Rules log (the
+    /// full KRZ-325 fixture — no pin, no standards events) folds with NO
+    /// standards section, so its chain JSON is byte-identical to what the
+    /// replay produced before this field existed.
+    #[test]
+    fn flight_rules_provenance_pre_flight_rules_chain_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        seed_full_mission(tmp.path());
+        let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+        assert!(chain.standards.is_none());
+        let json = serde_json::to_string_pretty(&chain).unwrap();
+        assert!(
+            !json.contains("\"standards\""),
+            "a pre-Flight-Rules chain carries no standards key: {json}"
+        );
+        // A chain.json written before the field existed still deserializes.
+        let mut value = serde_json::to_value(&chain).unwrap();
+        value.as_object_mut().unwrap().remove("divergences");
+        let back: ProvenanceChain = serde_json::from_value(value).unwrap();
+        assert!(back.standards.is_none());
     }
 }

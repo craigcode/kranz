@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: efc4c1a: kranz decompose — planner-driven goal→ticket-DAG (1..=8 nodes), dry-run preview default, --yes writes with rollback-on-any-refusal, deps::detect_cycle authoritative post-write, 26 tests (valid chain, cycle/self-edge/unknown-blocker/duplicate/collision refusals all with zero files written, mock-planner e2e, order-of-execution + failed-blocker-skip proven over the existing drain). Design resolved: one up-front DAG review (the preview), nodes flow the normal draft→approve→queue pipeline pe … (truncated)
 title: Decompose complex goals into a ticket DAG (plan → multiple missions over blocked-by edges)
 priority: 3
 schedule: once

@@ -98,9 +98,9 @@ jobs:
         # The proposed tree contributes CONTENT only. A change cannot un-ban a
         # term or waive its own leak: the denylist and allowlist always come
         # from the trusted side. A policy file absent on the trusted side
-        # means "no such policy" — remove it from the proposed tree too (the
-        # linter then fails loudly on the missing denylist rather than
-        # silently linting with proposed policy).
+        # means "no such policy" — remove it from the proposed tree too; the
+        # lint step then takes the documented bootstrap path below (never the
+        # proposed policy).
         shell: bash
         run: |
           for policy in .kranz/domain-denylist.json .kranz/domain-allowlist; do
@@ -111,7 +111,18 @@ jobs:
             fi
           done
       - name: Lint the proposed tree with trusted policy
-        run: '"${{ github.workspace }}/target/debug/kranz" --repo "$RUNNER_TEMP/kranz-domain-lint-proposed" domain-lint'
+        # Bootstrap posture: a trusted base that predates the policy has
+        # nothing to judge WITH (the landing push of this very workflow, or
+        # the policy's own introduction) — skip with a loud note and success.
+        # The proposed policy is NEVER substituted (that is the self-judgment
+        # hole the trusted-base design exists to close); the gate begins with
+        # the first base that carries the policy.
+        run: |
+          if [ ! -f "$RUNNER_TEMP/kranz-domain-lint-proposed/.kranz/domain-denylist.json" ]; then
+            echo "::notice::trusted base carries no domain denylist (workflow bootstrap or the policy's own introduction) — judging nothing; the gate begins with the first base that has the policy"
+            exit 0
+          fi
+          "${{ github.workspace }}/target/debug/kranz" --repo "$RUNNER_TEMP/kranz-domain-lint-proposed" domain-lint
       - name: Report PR lint result
         if: always() && github.event_name == 'pull_request_target' && github.actor != 'dependabot[bot]'
         env:

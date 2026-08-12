@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: 418d257: checkpoint partitions dirty paths — tracked files scan added lines only (git diff HEAD + scan_unified_diff), new untracked files still full-file; scoping note records the trade (strictness unchanged, target changed). Regression tests: base-region ignored / added-line refused / untracked refused.
 title: Scope the checkpoint secret scan to the dirty diff, not full dirty files
 priority: 3
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at c19c163: cap-std no-follow idiom (symlink_metadata per segment + open_dir_nofollow) guards mission dir resolution, event log acquire/reads, state snapshot reads, control enqueue, REST resolver; catalog ids filtered through is_safe_id at parse time (all four consumers). Symlink tests cfg(unix)-gated per lessons pattern. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: No-follow symlink checks on .kranz and mission paths; validate catalog IDs (P1)
 priority: 1
 schedule: once

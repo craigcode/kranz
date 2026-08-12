@@ -1,4 +1,5 @@
 ---
+state: done
 title: Run the queue from web and Slack: serve-owned drain
 priority: 2
 schedule: once

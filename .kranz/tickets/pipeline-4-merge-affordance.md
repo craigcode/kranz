@@ -1,4 +1,5 @@
 ---
+state: done
 title: Human merge from web and Slack: gated, never pushes
 priority: 2
 schedule: once

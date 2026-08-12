@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: c2e7f3b: POST /api/hooks/github with HMAC-SHA256 verification (refuses closed without a configured secret), event allowlist (CI workflow_run failure + kanz:fix/kanz:fix-and-queue comments), slug-deterministic dedup, provenance-carrying ticket drafts through the EXISTING draft path — plan approval never skipped; the queue label pre-consents only the queue step. No push/merge paths anywhere (source-scan tests assert). 21 engine + 9 server tests, workspace 1743 green. Dashboard UI surfacing of the  … (truncated)
 title: CI failure / PR comment triggers → audited fix missions
 priority: 3
 schedule: once

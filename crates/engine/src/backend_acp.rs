@@ -1430,6 +1430,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         }
     }
 

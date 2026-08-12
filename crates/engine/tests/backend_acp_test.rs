@@ -57,6 +57,7 @@ fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> Se
         max_turns: None,
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -498,6 +499,8 @@ async fn backend_acp_peer_death_mid_run_leaves_a_resumable_event_log() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
+        None,
     )
     .await
     .expect("run_worker returns the recorded outcome even for a failed run");
@@ -706,6 +709,7 @@ async fn backend_acp_acp_stop_reason_truncated_turn_validator_cannot_pass() {
         &[],
         &[],
         &[],
+        None,
         None,
     )
     .await

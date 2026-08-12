@@ -90,6 +90,7 @@ fn assertion(id: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        pty_script: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
         max_turns: Some(10),
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -137,6 +139,7 @@ fn worker_meta(run_id: &str) -> RunMeta {
         milestone_id: None,
         model: "mock-model".to_string(),
         prompt_hash: "deadbeef0000".to_string(),
+        executor_route: None,
     }
 }
 
@@ -990,6 +993,8 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1086,6 +1091,8 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         &[],
         AuthVerdict::Authenticated,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1150,6 +1157,8 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1218,6 +1227,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         &[],
         &[],
         &[],
+        None,
         None,
     )
     .await
@@ -1307,6 +1317,7 @@ async fn run_validator_rejects_non_validator_roles() {
         &[],
         &[],
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -1339,6 +1350,7 @@ async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
         &[],
         &[],
         &[],
+        None,
         None,
     )
     .await
@@ -1472,6 +1484,8 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1865,6 +1879,8 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
         &[],
         AuthVerdict::Inconclusive,
         &touch_set,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1962,6 +1978,8 @@ async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -2131,6 +2149,8 @@ async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
         &[],
         AuthVerdict::Inconclusive,
         &touch_set,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -2174,5 +2194,303 @@ async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
     assert_eq!(
         findings[0].class,
         kranz_engine::contract_sweep::FINDING_CLASS
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Flight Rules stage projections (ticket flight-rules-workflow-projection,
+// KRZ-345, design D-G): worker/validator sessions receive only their stage's
+// rules from the approved pin, inside the marked untrusted boundary, and the
+// recorded prompt hash covers the exact projection. Anti-vacuity prefix
+// `flight_rules_projection_` (grep-verified unique to this ticket's tests).
+// ---------------------------------------------------------------------------
+
+/// A hand-built approved pin spanning every stage: implementation
+/// (ZZ-IMPL-001, enforced must), validation (ZZ-VAL-001, approved should),
+/// planning-only (ZZ-PLAN-001) and merge-only (ZZ-MERGE-001) rules that must
+/// never reach a worker/validator session.
+fn standards_pin() -> kranz_engine::types::StandardsPin {
+    fn rule(
+        id: &str,
+        rfc: &str,
+        revision: u64,
+        level: &str,
+        status: &str,
+        stages: &[&str],
+        checker: Option<&str>,
+    ) -> kranz_engine::types::PinnedRule {
+        kranz_engine::types::PinnedRule {
+            id: id.to_string(),
+            revision,
+            rfc: rfc.to_string(),
+            level: level.to_string(),
+            effective_status: status.to_string(),
+            statement: format!("zz statement for {id}."),
+            domains: vec!["zz".to_string()],
+            stages: stages.iter().map(|s| s.to_string()).collect(),
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: checker.map(str::to_string),
+            waivable: false,
+        }
+    }
+    kranz_engine::types::StandardsPin {
+        pack_name: "zz-pack".to_string(),
+        pack_dir: "vendor/pack".to_string(),
+        standards_root: "standards".to_string(),
+        digest: "ab".repeat(32),
+        source: kranz_engine::types::StandardsPinSource::RepoTracked,
+        task_class: None,
+        touch_set: vec!["crates/**".to_string()],
+        context_paths: Vec::new(),
+        gates: Vec::new(),
+        rules: vec![
+            rule(
+                "ZZ-IMPL-001",
+                "RFC-002",
+                2,
+                "must",
+                "enforced",
+                &["implementation", "validation"],
+                Some("gate:zz-gate"),
+            ),
+            rule(
+                "ZZ-MERGE-001",
+                "RFC-002",
+                1,
+                "must",
+                "enforced",
+                &["merge"],
+                Some("gate:zz-gate"),
+            ),
+            rule(
+                "ZZ-PLAN-001",
+                "RFC-001",
+                1,
+                "should",
+                "approved",
+                &["planning"],
+                Some("agent-judgement"),
+            ),
+            rule(
+                "ZZ-VAL-001",
+                "RFC-001",
+                1,
+                "should",
+                "approved",
+                &["validation"],
+                Some("agent-judgement"),
+            ),
+        ],
+    }
+}
+
+/// The `worker.spawned` prompt hash recorded in the log (the session
+/// provenance the projection must be covered by).
+fn spawned_prompt_hash(p: &MissionPaths) -> String {
+    read_log(p)
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkerSpawned { prompt_hash, .. } => Some(prompt_hash.clone()),
+            _ => None,
+        })
+        .expect("worker.spawned recorded")
+}
+
+#[tokio::test]
+async fn flight_rules_projection_worker_prompt_projects_implementation_stage_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let pin = standards_pin();
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "goal",
+        "milestone",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        Some(&pin),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    let specs = backend.started_specs();
+    let prompt = specs[0]
+        .append_system_prompt
+        .as_deref()
+        .expect("role prompt");
+    // Only the implementation-stage rule projects, labelled with its source,
+    // inside the marked untrusted boundary naming both digests.
+    assert!(prompt.contains("`ZZ-IMPL-001` r2"), "{prompt}");
+    for absent in ["ZZ-PLAN-001", "ZZ-VAL-001", "ZZ-MERGE-001"] {
+        assert!(
+            !prompt.contains(absent),
+            "{absent} must never reach the worker: {prompt}"
+        );
+    }
+    assert!(prompt.contains("worker projection"), "{prompt}");
+    assert!(prompt.contains("untrusted content boundary"), "{prompt}");
+    assert!(
+        prompt.contains("cannot register tools, commands, grants, or permissions"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("sha256:{}", pin.digest)),
+        "{prompt}"
+    );
+    assert!(prompt.contains("projection digest `sha256:"), "{prompt}");
+    assert!(
+        prompt.contains("source: pack `zz-pack` root `standards`, RFC `RFC-002`"),
+        "{prompt}"
+    );
+    // Honest labels: the enforced MUST is the only blocking-capable rule.
+    assert!(prompt.contains("may block through its checker"), "{prompt}");
+    assert!(
+        prompt.contains("an approved rule can never block"),
+        "{prompt}"
+    );
+
+    // The recorded session prompt hash covers the exact projection text —
+    // replay identifies the manifest/projection digest from the header.
+    drop(log);
+    let recorded = spawned_prompt_hash(&p);
+    assert_eq!(recorded, kranz_engine::prompts::hash_text(prompt));
+    assert_ne!(
+        recorded,
+        kranz_engine::prompts::hash(Role::Worker),
+        "the extended prompt must hash differently from the bare template"
+    );
+}
+
+#[tokio::test]
+async fn flight_rules_projection_validator_prompts_project_validation_stage_only() {
+    for (role, surface) in [
+        (Role::ValidatorScrutiny, "validator-scrutiny projection"),
+        (Role::ValidatorFunctional, "validator-functional projection"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let mut log = seeded_log(&p);
+        let cfg = MissionConfig::default();
+        let pin = standards_pin();
+        let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(
+            &json!({ "findings": [], "summary": "all good" }),
+        )]);
+        run_validator(
+            &backend,
+            &mut log,
+            &p,
+            &cfg,
+            role,
+            &milestone(),
+            &[],
+            "abc123",
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            Some(&pin),
+        )
+        .await
+        .unwrap();
+
+        let specs = backend.started_specs();
+        let prompt = specs[0]
+            .append_system_prompt
+            .as_deref()
+            .expect("role prompt");
+        // Validation-stage rules only, in stable id order.
+        assert!(prompt.contains("`ZZ-IMPL-001` r2"), "{role:?}: {prompt}");
+        assert!(prompt.contains("`ZZ-VAL-001` r1"), "{role:?}: {prompt}");
+        for absent in ["ZZ-PLAN-001", "ZZ-MERGE-001"] {
+            assert!(
+                !prompt.contains(absent),
+                "{absent} must never reach a validator: {prompt}"
+            );
+        }
+        assert!(
+            prompt.find("ZZ-IMPL-001").unwrap() < prompt.find("ZZ-VAL-001").unwrap(),
+            "stable id order: {prompt}"
+        );
+        assert!(prompt.contains(surface), "{role:?}: {prompt}");
+        // The approved SHOULD is labelled advisory, never blocking.
+        let val_line = prompt
+            .lines()
+            .find(|l| l.contains("ZZ-VAL-001"))
+            .expect("the approved rule line");
+        assert!(val_line.contains("approved should"), "{val_line}");
+        assert!(val_line.contains("advisory — cannot block"), "{val_line}");
+
+        drop(log);
+        let recorded = spawned_prompt_hash(&p);
+        assert_eq!(
+            recorded,
+            kranz_engine::prompts::hash_text(prompt),
+            "{role:?}: the recorded hash must cover the exact projection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "goal",
+        "milestone",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    let prompt = specs[0]
+        .append_system_prompt
+        .as_deref()
+        .expect("role prompt");
+    assert!(
+        !prompt.contains("Flight Rules"),
+        "no pin ⇒ nothing appended: {prompt}"
+    );
+    drop(log);
+    assert_eq!(
+        spawned_prompt_hash(&p),
+        kranz_engine::prompts::hash(Role::Worker),
+        "no pin ⇒ the recorded hash is the bare template hash, as before"
     );
 }

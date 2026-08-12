@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: 1fc5ae2 (agent-29 implementation, operator-gated): planner's third voice — {"wrongPlan": reason} channel in the plan-request prompt (never inferred from prose), PlanRequest::WrongPlan, DraftOutcome::WrongPlan, TicketState::WrongPlan (kebab 'wrong-plan') parking with WRONG-PLAN: note + body section, re-draftable like NeedsContext, distinct rendering across CLI/REST/dashboard (177/177)/Slack. Additive; NeedsContext unchanged; planner-initiated only. Gates: 47 workspace suites, clippy, fmt, build,  … (truncated)
 title: Draft-stage 'this plan is likely wrong' escalation, distinct from NeedsContext
 priority: 3
 schedule: once

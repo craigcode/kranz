@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped 2026-07-13 as the worker-deny GrantKind with exact per-mission deny exceptions and all operator surfaces
 title: Worker deny-rule grants — lift a WORKER_DENY rule by operator consent
 priority: 2
 schedule: once

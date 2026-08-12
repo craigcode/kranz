@@ -1,4 +1,5 @@
 ---
+state: done
 title: Trace provenance + weight-hash pinning + validated-trace export (flywheel, frontier-first)
 priority: 2
 schedule: once

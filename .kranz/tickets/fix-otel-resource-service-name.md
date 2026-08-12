@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in this polish commit; reviewed + gates green
 title: kranz otel exports spans with service.name=unknown_service
 priority: 3
 schedule: once

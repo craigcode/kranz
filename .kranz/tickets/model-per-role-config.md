@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: codex-built, opus-reviewed, gate-verified, merged
 title: Generalize role -> (backend, model, effort) selection in config
 priority: 3
 schedule: once

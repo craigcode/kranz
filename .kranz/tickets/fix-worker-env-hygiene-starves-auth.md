@@ -1,4 +1,5 @@
 ---
+state: done
 title: Worker env hygiene must not starve the worker of live auth (macOS Keychain)
 priority: 1
 schedule: once

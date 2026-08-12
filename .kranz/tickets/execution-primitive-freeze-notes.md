@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: freeze propagated — AGENTS.md Change-discipline boundary, what-is-kranz will-not-build section, prompts.rs/knowledge.rs module-doc pointers. docs/roadmap.md note deferred (Cursor has the file open in-flight). Doc/comment-only diff; full gates green.
 title: Propagate the execution-primitive freeze into operating docs
 priority: 2
 schedule: once

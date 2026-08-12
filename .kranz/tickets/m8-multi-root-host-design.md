@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: accepted 2026-07-15 in docs/scoping/m8-multi-root-host.md and sequenced in the roadmap
 title: M8 multi-root host design — config, tokens, queues, Slack routing
 priority: 2
 schedule: once

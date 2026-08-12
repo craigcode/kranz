@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 7659358: defer-until frontmatter, kranz ticket ready [--include-deferred], shared approve gate refuses not-yet-ready naming the time (--force overrides), malformed timestamp hard-errors naming the ticket. 8 tests. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: "Ticket defer_until (D-BW-3, adopted from beads)"
 priority: 3
 schedule: once

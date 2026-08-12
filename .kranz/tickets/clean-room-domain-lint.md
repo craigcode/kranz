@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: domain_lint.rs + kranz domain-lint [--seed-config] + trusted-base CI workflow; salted-hash policy (no readable terms), path-scoped waivers, 616 files scanned green. domain_lint filter: 16 green; full gates green. Follow-up: operator seeds private vocabulary.
 title: Clean-room CI lint — core fails on domain vocabulary
 priority: 1
 schedule: once

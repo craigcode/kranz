@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 7ae58be (+fmt b3dd2e9): validators (both roles) carry exactly Bash(printenv KRANZ_*) — bare printenv/env/echo stay denied; both validator prompts document the sanctioned form. Gate test validator_env_reads_allow_kranz_printenv_only green. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: "Validators: read-only KRANZ_* env reads shouldn't park for a grant"
 priority: 2
 schedule: once

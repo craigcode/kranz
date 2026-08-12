@@ -1,3 +1,8 @@
+---
+state: done
+state-note: Done at fc93a23: escalation_metrics.rs aggregator (autonomy ratio, rubber-stamp p50/p90 + under-10s, false greens via traced-from-mission, escalation ledger), GET /api/escalation-metrics, kranz escalation-metrics [--json], FlightSurgeon dashboard panel, kranz draft --from-mission. Zero contract changes; 26 new tests incl. the ticket's exact anti-vacuity numbers. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
+---
+
 # Flight-surgeon console (escalation metrics + ledger)
 
 ## Problem

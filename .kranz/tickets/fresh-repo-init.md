@@ -1,4 +1,5 @@
 ---
+state: done
 title: Fresh-repository onboarding with kranz init
 priority: 3
 schedule: once

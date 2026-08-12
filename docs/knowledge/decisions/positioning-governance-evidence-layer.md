@@ -6,6 +6,7 @@ last_verified: 2026-07-29
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
+  - docs/scoping/flight-rules-engineering-standards.md
   - crates/engine/src/backend.rs
   - crates/engine/src/outcomes.rs
   - crates/engine/src/trace_export.rs
@@ -78,6 +79,11 @@ N-backend fan-out for codegen velocity falls under the freeze.
   adapters. Adapters translate; they do not orchestrate codegen.
 - **Planning and plan approval**: the plan is a consent artifact, not an
   execution feature.
+- **Flight Rules engineering standards** (M5.5): deterministic selection,
+  consent pinning, gate binding, human exception authority, and policy
+  evidence are governance primitives, not context-management work. The generic
+  lifecycle/resolver belongs in core; actual house rules and rationale remain
+  in packs. Design: `docs/scoping/flight-rules-engineering-standards.md`.
 - **Local-inference tier**: a backend behind KRZ-331, kept because routing
   and cost governance need a cheap tier — not because kranz hosts models.
 

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the M6 arc: WorkspaceProvider seam (workspace_provider.rs) with workspace.* events; local default provider.
 title: WorkspaceProvider seam + local-worktree implementation
 priority: 1
 schedule: once

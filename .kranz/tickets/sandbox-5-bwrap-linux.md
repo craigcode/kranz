@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: bubblewrap implementation and tests shipped in 22df707; live runner proof remains a roadmap gate
 title: Linux bubblewrap parity for enforce=fs and fs+net
 priority: 2
 schedule: once

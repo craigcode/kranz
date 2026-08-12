@@ -37,6 +37,21 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
       return { text: `Grant approved: ${truncate(e.payload.command, 80)}`, tone: 'ok' };
     case 'grant.denied':
       return { text: `Grant denied: ${truncate(e.payload.command, 80)}`, tone: 'bad' };
+    case 'question.opened':
+      return {
+        text: `Question ${e.payload.questionId}: ${truncate(e.payload.text, 80)} — awaiting an answer`,
+        tone: 'warn',
+      };
+    case 'question.answered':
+      return {
+        text: `Question ${e.payload.questionId} answered: ${truncate(e.payload.answer, 80)}`,
+        tone: 'ok',
+      };
+    case 'question.cleared':
+      return {
+        text: `Question ${e.payload.questionId} cleared (${e.payload.why})`,
+        tone: 'plain',
+      };
     case 'milestone.started':
       return { text: `Milestone ${e.payload.milestoneId} started`, tone: 'info' };
     case 'feature.started':
@@ -81,6 +96,31 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
       return {
         text: `Finding [${e.payload.finding.severity}]: ${truncate(e.payload.finding.evidence, 80)}`,
         tone: 'warn',
+      };
+    case 'gate.result':
+      return {
+        text: `Gate ${e.payload.gate}: ${e.payload.verdict}${(e.payload.ruleIds ?? []).length > 0 ? ` (${e.payload.ruleIds?.join(', ')})` : ''}`,
+        tone: e.payload.verdict === 'pass' ? 'ok' : 'bad',
+      };
+    case 'standards.resolved':
+      return {
+        text: `Flight Rules resolved: ${e.payload.rules.length} rule(s), ${e.payload.digest.slice(0, 10)}…`,
+        tone: 'info',
+      };
+    case 'standards.drifted':
+      return {
+        text: `Flight Rules drift refused merge: ${truncate(e.payload.changedRules.join('; '), 76)}`,
+        tone: 'bad',
+      };
+    case 'standards.waiver.approved':
+      return {
+        text: `Standards waiver approved: ${e.payload.ruleId} r${e.payload.ruleRevision}`,
+        tone: 'warn',
+      };
+    case 'standards.attestation.approved':
+      return {
+        text: `Standards attestation approved: ${e.payload.ruleId} r${e.payload.ruleRevision}`,
+        tone: 'ok',
       };
     case 'validator.tamper': {
       const p = e.payload;

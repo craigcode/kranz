@@ -273,6 +273,7 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
         BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
+        BackendKind::Cursor => crate::backend_cursor::discover_cursor_binary(None),
         BackendKind::Local | BackendKind::Acp => unreachable!("handled above"),
     };
 
@@ -399,6 +400,13 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
             // documented free read-only probe (docs/scoping/kimi-cli-backend.md
             // §2) that shows the OAuth-managed provider when authenticated.
             BackendKind::Kimi => &["provider", "list"],
+            // `agent models` is the free read-only probe that distinguishes
+            // BOTH failure modes the scoping doc's preflight requires
+            // (docs/scoping/cursor-cli-backend.md): unauthenticated ("Not
+            // logged in") vs. authenticated-but-zero-entitled-models ("No
+            // models available for this account") — the honest
+            // model-availability diagnostic of probe item 5.
+            BackendKind::Cursor => &["models"],
             BackendKind::Local => {
                 return AuthProbe::Unknown("local backend has no CLI to probe".into())
             }
@@ -412,6 +420,15 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
             let lower = out.to_ascii_lowercase();
             if kind == BackendKind::Kimi && lower.contains("no providers configured") {
                 return AuthProbe::Unauthenticated(out);
+            }
+            // An authenticated cursor account with zero entitled models fails
+            // every session deterministically (probe item 5); park with the
+            // real cause named rather than letting a mission discover it.
+            if kind == BackendKind::Cursor && lower.contains("no models available") {
+                return AuthProbe::Unauthenticated(format!(
+                    "cursor account has no entitled models ({out}); provision at least one \
+                     model for the account (docs/scoping/cursor-cli-backend.md item 5)"
+                ));
             }
             if lower.contains("not logged")
                 || lower.contains("not authenticated")

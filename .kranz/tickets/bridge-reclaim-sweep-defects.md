@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 94ad843: spool-atomic release on every reclaim path + queue-shaped three-way pid verdict with lease start-tokens. RECLAIM-SPOOL/RECLAIM-TOKEN round-trip cases (both fail pre-fix); full round-trip + 5 selftests green on live bd 1.0.5.
 title: "Reclaim sweep: stop re-dispatching claimed-and-spooled beads; fix lease pid classification"
 priority: 1
 schedule: once

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Reconcile ticket .status when a mission terminates outside the drain (kranz run / REST start)
 priority: 3
 schedule: once

@@ -117,6 +117,17 @@ impl MissionEngine {
                         });
                     }
                 }
+                BackendKind::Cursor => {
+                    if let Err(err) = crate::backend_cursor::discover_cursor_binary(None) {
+                        issues.push(PreflightIssue {
+                            severity: "warn",
+                            message: format!(
+                                "{role_key}.backend is \"cursor\" but no cursor agent binary was \
+                                 found ({err}); that role will fall back to the claude backend"
+                            ),
+                        });
+                    }
+                }
                 BackendKind::Claude => {}
                 BackendKind::Acp => {
                     // No cheap probe exists for an ACP executable (there is
@@ -143,12 +154,22 @@ impl MissionEngine {
 
         // Contract command programs: probe the leading token of each distinct
         // command, flagging only ones that clearly do not resolve on PATH.
+        // Pty-script assertions (ticket pty-functional-validation) probe the
+        // same way — an interactive target that does not resolve fails its
+        // validation round exactly like a missing command program, so the
+        // warning belongs at the same approve-time surface. (Execution
+        // probes below stay Command-only: an interactive target has no
+        // business running at preflight.)
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for assertion in &self.state.mission.validation_contract {
-            if assertion.check != AssertionCheck::Command {
-                continue;
-            }
-            let Some(command) = assertion.command.as_deref() else {
+            let command = match assertion.check {
+                AssertionCheck::Command => assertion.command.as_deref(),
+                AssertionCheck::PtyScript => {
+                    assertion.pty_script.as_ref().map(|s| s.command.as_str())
+                }
+                AssertionCheck::AgentJudgement => None,
+            };
+            let Some(command) = command else {
                 continue;
             };
             let Some(program) = leading_program(command) else {
@@ -158,15 +179,22 @@ impl MissionEngine {
                 continue; // already reported/checked this program
             }
             if !program_resolves(&program) {
+                let kind = if assertion.check == AssertionCheck::PtyScript {
+                    "pty-script"
+                } else {
+                    "command"
+                };
                 issues.push(PreflightIssue {
                     severity: "warn",
                     message: format!(
-                        "command assertion [{}] uses '{program}', which was not found on PATH",
+                        "{kind} assertion [{}] uses '{program}', which was not found on PATH",
                         assertion.id
                     ),
                 });
             }
-            if !contract_sweep::cargo_test_has_anti_vacuity(command) {
+            if assertion.check == AssertionCheck::Command
+                && !contract_sweep::cargo_test_has_anti_vacuity(command)
+            {
                 issues.push(PreflightIssue {
                     severity: "warn",
                     message: format!(
@@ -849,6 +877,7 @@ mod tests {
             statement: "the check passes".to_string(),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            pty_script: None,
         }
     }
 
@@ -862,13 +891,49 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Whether this host can APPLY a sandbox profile, not merely find
+    /// `sandbox-exec` on PATH: the preflight test drives REAL nested sandbox
+    /// application (the preflight wraps its contract probes in a generated
+    /// profile), and under the gate sandbox wrap (a wrapped `cargo test`
+    /// dogfooding this repo — ticket gate-sandbox-supervision-dogfood) that
+    /// nested apply is kernel-denied regardless of profile content:
+    /// re-applying the IDENTICAL label is a permitted no-op, anything else
+    /// is EPERM (probed 2026-08-05; no SBPL clause can allow it). The
+    /// smoke-apply makes the test skip with a detectable marker instead of
+    /// failing on the outer sandbox's presence — the same posture
+    /// `crate::sandbox`'s own enforcement tests take.
     #[cfg(target_os = "macos")]
     fn sandbox_exec_available() -> bool {
-        std::process::Command::new("which")
+        let found = std::process::Command::new("which")
             .arg("sandbox-exec")
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !found {
+            eprintln!("sandbox-exec not found on this host; skipping");
+            return false;
+        }
+        let smoke = std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1)\n(allow default)\n")
+            .arg("/usr/bin/true")
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                     sandbox-exec cannot apply a smoke profile here (nested apply is denied \
+                     inside the gate sandbox wrap); skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+                false
+            }
+        }
     }
 
     /// The P1 regression test: with `worker.sandbox.enforce = fs`, the
@@ -881,8 +946,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_preflight_probes_disposable_worktree_not_primary() {
+        // The helper prints the precise reason (not found / nested apply
+        // denied under the gate wrap / probe error).
         if !sandbox_exec_available() {
-            eprintln!("sandbox-exec not found on this host; skipping");
             return;
         }
         let (_dir, root, sha) = seeded_git_repo();

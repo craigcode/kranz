@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped in e160ca4: two-path estimate for local-routed plans (local $0 marginal / frontier + one cache-miss, CACHE_MISS_MULT, priced once per escalation at feature/milestone edges) rendered in plan.md cost section; fixture pins miss-once math and frontier-only-None.
 title: Price tier switches as cache-miss events in the cost model
 priority: 3
 schedule: once

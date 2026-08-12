@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: gate_score_flags.rs (distribution fold + never-approaches/near-constant rules at MIN_SAMPLE=10, strict margins, unscored excluded) + Gate score signals section beside rubber-stamp + ledger summary field. score_distribution_flag filter: 13 green; full gates green.
 title: Flag mis-specified gates from their score distributions
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped in 952cbc0
 title: Blast-radius-gated Considered Alternatives section in parked plans
 priority: 3
 schedule: once

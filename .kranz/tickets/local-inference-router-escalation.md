@@ -1,4 +1,5 @@
 ---
+state: done
 title: Deterministic tier routing + executor escalation (validator-local split out)
 priority: 2
 schedule: once

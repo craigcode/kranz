@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: kranz evidence-bundle <id> — manifest/chain/summary/escalations/cost/log/artefacts directory; unresolved entries for missing bytes; fingerprints-only redaction proof; byte-identical re-exports. evidence_bundle filter: 7 green; full gates green.
 title: Evidence bundle export — per-unit portable audit package
 priority: 2
 schedule: once

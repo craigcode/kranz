@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: Claim leaks when the failed-blocker skip errors before run_mission
 priority: 3
 schedule: once

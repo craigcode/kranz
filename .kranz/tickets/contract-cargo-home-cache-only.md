@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Landed at a5a5f23: merge gates substitute a fresh cache-only CARGO_HOME (fail-closed); contract paths already covered via contract_command_env. Stage 2 split into engine-gates-sandbox-wrapped. contract_cargo_home filter: 2 tests green.
 title: "Engine-run gate commands: cache-only CARGO_HOME, then sandbox-wrapped execution"
 priority: 2
 schedule: once

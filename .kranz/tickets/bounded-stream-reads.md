@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 0d59945: stream_bounds.rs (TailWindow/BoundedLines/drain_to_tail); all four CLI backends capped (8MiB line, 64KiB stderr tail at EOF); backend_local 600s timeout + 8MiB body cap; truncation marker survives tailing. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Bound backend stream reads and local backend timeouts (P2)
 priority: 3
 schedule: once

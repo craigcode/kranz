@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: comparison_metrics.rs — assisted-change share (mission landings / all landings, honest under-read named inline) and defect density (landed linkage) RENDERED; defect resolution time EMPTY naming its dependency (no lifecycle timestamps). Inline definitions as content, native primary. comparison_metrics filter: 11 green; full gates green.
 title: Industry-comparison metrics beside the kranz-native outcomes
 priority: 3
 schedule: once

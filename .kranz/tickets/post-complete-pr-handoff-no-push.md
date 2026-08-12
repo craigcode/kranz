@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented
 title: Optional PR handoff for completed missions, without auto-push
 priority: 2
 schedule: once

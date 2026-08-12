@@ -1,4 +1,5 @@
 ---
+state: done
 title: Provide KRANZ_BASE_SHA to the final mission-gate environment
 priority: 2
 schedule: once

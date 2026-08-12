@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: delivered as scoping (docs/scoping/pipeline-view.md); build split into pipeline-1..4 tickets
 title: One pipeline view: the ticket-to-merge journey, visible and driveable
 priority: 1
 schedule: once

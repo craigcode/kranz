@@ -25,9 +25,12 @@ import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
+import { QuestionRequestPanel } from './components/QuestionRequestPanel';
+import { HookStatusPanel } from './components/HookStatusPanel';
 import { RevisionPanel } from './components/RevisionPanel';
 import { FeaturesPanel } from './components/FeaturesPanel';
 import { ProgressLog } from './components/ProgressLog';
+import { StandardsPanel } from './components/StandardsPanel';
 import { TokenPrompt } from './components/TokenPrompt';
 import { TicketDetail } from './components/TicketDetail';
 import { ProjectPicker } from './components/ProjectPicker';
@@ -133,7 +136,10 @@ export default function App() {
             <ModelPanel />
             <WorkspacePanel />
             <GrantRequestPanel />
+            <QuestionRequestPanel />
+            <HookStatusPanel />
             <RevisionPanel />
+            <StandardsPanel />
             <FeaturesPanel />
             <ProgressLog />
           </aside>

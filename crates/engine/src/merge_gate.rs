@@ -321,6 +321,32 @@ mod tests {
         );
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`): the merge-gate
+    /// suite fails CLOSED on every weakening shape — an unparseable file, an
+    /// empty gate list, a suite with no unconditional gate (every gate
+    /// skippable by a narrow diff), a `whenPaths` entry spelling `.` (which
+    /// must be omitted, not spelled), and path escapes. A merge must never
+    /// go green because the config judging it got narrower.
+    #[test]
+    fn composition_audit_merge_gate_suite_fails_closed_on_every_weakening_shape() {
+        assert!(parse_gate_suite(b"not json").is_err());
+        assert!(parse_gate_suite(br#"{"gates":[]}"#).is_err());
+        assert!(
+            parse_gate_suite(br#"{"gates":[{"command":"npm test","whenPaths":["web"]}]}"#).is_err()
+        );
+        assert!(parse_gate_suite(
+            br#"{"gates":[{"command":"a","whenPaths":["."]},{"command":"b"}]}"#
+        )
+        .is_err());
+        assert!(parse_gate_suite(br#"{"gates":[{"command":"a","cwd":"../x"}]}"#).is_err());
+        // The same weakening shapes are refused when the suite is otherwise
+        // well-formed — the fail-closed checks are not order-dependent.
+        assert!(parse_gate_suite(
+            br#"{"gates":[{"command":"ok"},{"command":"npm test","whenPaths":["web"]}]}"#
+        )
+        .is_ok());
+    }
+
     #[test]
     fn parse_rejects_paths_that_escape_the_repo() {
         for text in [

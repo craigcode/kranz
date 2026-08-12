@@ -261,6 +261,7 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
                     change.path
                 ),
                 class: FINDING_CLASS.to_string(),
+                rule: None,
             }),
             Err(e) => findings.push(Finding {
                 subject: change.path.to_string(),
@@ -271,6 +272,7 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
                 ),
                 suggested_fix: "fix the mission's touchSet globs".to_string(),
                 class: FINDING_CLASS.to_string(),
+                rule: None,
             }),
         }
     }
@@ -303,6 +305,7 @@ pub fn primary_checkout_finding(
         suggested_fix: "restore the primary checkout to a clean state on the starting branch"
             .to_string(),
         class: FINDING_CLASS.to_string(),
+        rule: None,
     })
 }
 

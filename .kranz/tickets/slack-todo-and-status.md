@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: codex-built, opus-reviewed, gate-verified, merged
 title: /kranz todo and /kranz status — operator worklist and pipeline snapshot in Slack
 priority: 2
 schedule: once

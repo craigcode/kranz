@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 4dd5d92: writable set = session_cwd + per-session private scratch + declared extraWrite; mission metadata write-denied (Seatbelt literals/regex, bwrap masks, container :ro); sibling temp neighbors default-denied. Deviation: merge worktrees NOT moved under mission-owned parent (narrowing already denies siblings; heavy orchestrator/merge edits avoided). Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Narrow sandbox write scope: read-only mission metadata, per-run private scratch (P1)
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: per-(path,len,mtime) memoization in outcomes.rs cached_mission_outcomes: unchanged logs not re-parsed; append-only logs invalidate deterministically via len; per-entry computes/hits counters prove it in the invalidation test (global counters race across parallel tests). Single-source fold unchanged; skip semantics unchanged.
 title: Outcomes fold scales with total event-log bytes — add caching or projection
 priority: 3
 schedule: once

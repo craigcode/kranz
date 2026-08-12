@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented operator-driven in d0fa348: contract_health fold (engine), amm.rs projection (LADDER v1, ordinal labels), ready --all org view, readiness-axes.md note; dogfooded L2 on this repo, gitignore finding ticketed
 title: AMM-compatible readiness projection over kranz-native signals, plus a contract-health axis and org metric
 priority: 2
 schedule: once

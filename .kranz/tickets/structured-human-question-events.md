@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: additive question.opened/answered/cleared + WorkerReport.questions + AnswerQuestion control; pending_questions projection replaying after restart; dashboard QuestionRequestPanel + Slack QuestionReady in the shared your-move chrome; prose fallback intact. 28 Rust + 5 vitest green; dashboard chain green; full gates green.
 title: Structured human-question events for dashboard and Slack
 priority: 3
 schedule: once
