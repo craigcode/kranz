@@ -1,6 +1,6 @@
 ---
 state: done
-state-note: Fixed on codex/stabilization-proof-sprint; live m-760060 receipt reproduced both aliases, regression tests cover alias equivalence, symlink escape rejection, and scratch-HOME creation under real Seatbelt.
+state-note: Fixed on codex/stabilization-proof-sprint; live m-760060 and m-bb3632 receipts reproduced path-alias, scratch-HOME, and Claude temp-root failures. Regression tests cover alias equivalence, symlink escape rejection, scratch-HOME creation under real Seatbelt, and CLAUDE_CODE_TMPDIR confinement.
 title: Normalize macOS temporary-path aliases in hook and validator containment
 priority: 1
 schedule: once
@@ -13,7 +13,9 @@ Fix the live M8 proof failures caused by macOS exposing one temporary path as
 both `/var/...` and `/private/var/...`: the PreToolUse touch-set guard must
 allow either spelling of an in-contract target while rejecting a real symlink
 escape, and a sandbox-contained validator must be able to create Claude's
-session state under its private scratch HOME.
+session state under its private scratch HOME. Claude's own Bash/session temp
+root must also be redirected from its `/private/tmp/claude-<uid>` fallback into
+that same private, sandbox-writable scratch tree.
 
 ## Context
 
@@ -22,7 +24,9 @@ the canonical `/private/var/...` worktree spelling were falsely blocked, then
 the same targets were allowed through `/var/...`. Both validators subsequently
 received `EPERM` creating `$HOME/.claude/session-env`: the Seatbelt profile was
 generated before the scratch root existed, so it could not canonicalize and
-allow both temp-path spellings.
+allow both temp-path spellings. After that fix, rerun `m-bb3632` showed the
+current Claude CLI separately attempting `/private/tmp/claude-<uid>`; the
+installed CLI exposes `CLAUDE_CODE_TMPDIR` specifically to relocate it.
 
 ## Acceptance hints
 
@@ -31,6 +35,8 @@ allow both temp-path spellings.
 - Claude child-environment seeding occurs before Seatbelt profile generation,
   so a previously absent scratch root contributes both raw and canonical
   write-allow paths.
+- `CLAUDE_CODE_TMPDIR` is pinned to the cleared environment's private
+  `TMPDIR`, never the shared system temp fallback.
 - A live macOS backend-start test creates `$HOME/.claude/session-env` inside
   the sandbox while an outside write remains denied.
 - `cargo test --workspace hook_gate_projection_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
