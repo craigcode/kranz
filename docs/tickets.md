@@ -43,6 +43,35 @@ drafted by the GitHub webhook trigger (`POST /api/hooks/github`, see
 docs/protocol.md §Webhooks) additionally carry `trigger: ci-failure|pr-comment`
 provenance; human-authored tickets omit it.
 
+### Reviewing a spec or incident artifact
+
+`spec-review` and `incident-review` are explicit artifact-consumer task
+classes. They reuse the normal mission plan, Flight Rules resolver, findings,
+waivers, checker results, replay, and evidence bundle. A review ticket names
+one tracked UTF-8 source; the source is read-only and the mission must commit
+a substantive review output:
+
+```markdown
+---
+title: Review the API compatibility proposal
+task-class: spec-review
+review-artifact: docs/proposals/api-v2.md
+review-output: reviews/api-v2.md
+---
+
+## Goal
+Review the proposal against the applicable engineering standards.
+```
+
+`review-output` is optional and defaults to `reviews/<ticket-slug>.md`.
+Drafting refuses a missing, blank, oversized, untracked, symlink, or non-text
+source. Approval requires the plan touch set to include the output and exclude
+the input. The final gate refuses a missing/blank/unchanged output and also
+refuses any deliverable commit that touched the source—even if a later commit
+restored its bytes. Rules scoped by `task-classes` and `when-paths` resolve
+against the immutable input as read-only context; exceptions and attestations
+remain bound to the resulting review diff.
+
 ## Listing the backlog
 
 ```sh

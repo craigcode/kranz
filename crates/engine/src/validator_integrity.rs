@@ -20,9 +20,11 @@
 //!    was physical separation, not containment: a hostile validator could
 //!    walk to the real checkout, modify tests, run them, and restore the
 //!    bytes — modify → use → restore leaves no drift for this module to
-//!    catch. Where the platform or backend cannot contain, the round
-//!    carries the loud degradation decision and the layers below are what
-//!    remains.
+//!    catch. Where the platform or backend cannot contain, the round now
+//!    FAILS CLOSED by default (ticket
+//!    `validator-containment-degrade-fail-closed`); only under the explicit
+//!    `validatorAllowUncontainedDegrade` opt-in does it carry the loud
+//!    degradation decision, with the layers below as what remains.
 //! 2. The copy-on-write immutable snapshot ([`crate::validator_snapshot`]):
 //!    each validator session runs in a THROWAWAY worktree copy of the
 //!    checkout and only its verdict crosses back, so writes are

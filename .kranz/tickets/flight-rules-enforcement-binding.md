@@ -3,6 +3,8 @@ title: Bind Flight Rules lifecycle and levels to authoritative gate enforcement
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin, flight-rules-finding-provenance, flight-rules-waiver-decisions]
+state: done
+state-note: Implemented — approval-pinned deterministic, contextual, and manual-attestation checkers run through the existing gate ladder; lifecycle/level policy is exact, enforced MUST failures block final/merge, approved and SHOULD failures remain advisory, waivers subtract only their exact rule failure, and checker/policy drift fails closed. Dedicated flight_rules_enforcement_* tests plus the M5.5 proof matrix are green.
 ---
 
 ## Goal
@@ -33,3 +35,6 @@ it.
 - An enforced failure prevents COMPLETE/merge; an exact still-valid D-I waiver changes only that rule disposition to waived.
 - No standards pack preserves current gate ordering and behavior.
 - Anti-vacuity: unique filter `flight_rules_enforcement_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-346 is step 6 of 9 in the delivery sequence at docs/scoping/flight-rules-engineering-standards.md:362, and every one of steps 1-5 is unlanded on the base this mission branches from (main @ 90a4bdc, re-verified this turn): `git cat-file -e main:crates/engine/src/pack/standards.rs` fails, `git grep -ci standards main -- crates apps` returns exactly one hit (a doc comment at crates/engine/src/pack.rs:1), and pack.rs:68,72 still define only SCHEMA_BASE=2/SCHEMA_CONTRACT=3 with a live test at pac … (truncated)

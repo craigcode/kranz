@@ -59,6 +59,18 @@
       ]
     },
     {
+      "command": "bash packaging/gascity/test/order-trigger-event.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
+      "command": "bash packaging/gascity/test/kranz-run-bead-events.sh",
+      "whenPaths": [
+        "packaging/gascity"
+      ]
+    },
+    {
       "command": "bash packaging/gascity/test/check-bridge-hygiene.sh",
       "whenPaths": [
         "packaging/gascity"

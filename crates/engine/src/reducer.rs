@@ -82,6 +82,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 .collect();
             state.mission.command_grants = plan.command_grants.clone();
             state.mission.touch_set = plan.touch_set.clone();
+            // The Flight Rules approval pin (KRZ-342 D-E) folds with the plan
+            // it was approved with — the mission's standards authority from
+            // here on.
+            state.mission.standards_manifest = plan.standards_manifest.as_deref().cloned();
             state.mission.status = MissionStatus::Approved;
             state.latest_plan_revision = 0;
             state.pending_revision = None;
@@ -285,8 +289,19 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature.commits.extend(commits.iter().cloned());
         }
 
-        EventKind::FeatureFailed { feature_id, .. } => {
-            feature_mut(state, feature_id)?.status = FeatureStatus::Failed;
+        EventKind::FeatureFailed {
+            feature_id,
+            commits,
+            ..
+        } => {
+            let feature = feature_mut(state, feature_id)?;
+            feature.status = FeatureStatus::Failed;
+            // Record any commits the failure landed on the mission branch:
+            // the fix-feature supersession guard reads `commits.is_empty()`
+            // to tell a failed-COMMITLESS feature (re-proposable — the
+            // m-eee81f auth-death wedge) from failed-with-real-work (started;
+            // a duplicate fixfeature.created must reject).
+            feature.commits.extend(commits.iter().cloned());
         }
 
         EventKind::FeatureSkipped { feature_id, .. } => {
@@ -437,7 +452,13 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     // an unstarted (Pending) or failed-and-commitless feature
                     // can be re-proposed by a re-plan — this is the normal
                     // shape after new findings (m-83d1ed re-proposed the same
-                    // id twice). The successor REPLACES the prior payload in
+                    // id twice). Failed-with-runs-but-no-commits is the same
+                    // class: runs that never committed produced no work (the
+                    // m-eee81f wedge — three infra-failed runs made
+                    // `worker_runs` non-empty and bricked every re-proposal);
+                    // their records stay in the log. A feature whose run is
+                    // in flight is Active, so runs alone are not the "started"
+                    // signal. The successor REPLACES the prior payload in
                     // place and restarts as Pending; the original payload is
                     // not lost — it lives in this same event log (the first
                     // fixfeature.created). Once a feature has started,
@@ -452,8 +473,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     let prior_started = matches!(
                         existing.status,
                         FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
-                    ) || !existing.commits.is_empty()
-                        || !existing.worker_runs.is_empty();
+                    ) || !existing.commits.is_empty();
                     if prior_started {
                         return Err(EngineError::InvalidState(format!(
                         "duplicate fixfeature.created for feature '{}' with a different payload",
@@ -723,6 +743,17 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 version: version.clone(),
             });
         }
+
+        EventKind::StandardsResolved { .. }
+        | EventKind::StandardsDrifted { .. }
+        | EventKind::StandardsWaiverApproved { .. }
+        | EventKind::StandardsAttestationApproved { .. } => {
+            // Audit-only (KRZ-342 D-H; KRZ-344 D-I): the pin itself folds
+            // with plan.approved; these events are the queryable provenance,
+            // refusal, and waiver evidence. The coverage fold joins waivers
+            // straight from the log — state shape intentionally does not
+            // grow.
+        }
     }
 
     state.last_seq = event.seq;
@@ -760,6 +791,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
             egress_grants: Vec::new(),
+            standards_manifest: None,
             // The seed-time route record (ticket routing-rules-config): the
             // folded task class exists only on THIS event's goal, so the
             // decision is derived here, once — deterministically equal to
@@ -892,6 +924,13 @@ fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> R
     state.mission.validation_contract = plan.validation_contract.clone();
     state.mission.command_grants = plan.command_grants.clone();
     state.mission.touch_set = plan.touch_set.clone();
+    // The Flight Rules pin (KRZ-342 D-E) is NEVER re-read from a revision:
+    // the planner never authors policy, and no revision flow re-validates a
+    // carried manifest against the trusted source — folding one would let a
+    // re-plan substitute weakened policy into the consent artifact. The
+    // approval-time pin stands for the mission's life; an envelope escape is
+    // caught by the final-validation check (which re-resolves the pinned
+    // base snapshot against actual paths) and by the merge drift check.
     state.mission.milestones = revised_milestones;
     Ok(())
 }

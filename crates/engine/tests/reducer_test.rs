@@ -66,6 +66,7 @@ fn plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -286,6 +287,143 @@ fn duplicate_fixfeature_with_different_payload_supersedes_an_unstarted_feature()
     assert_eq!(matches.len(), 1, "one registration for the id");
     assert_eq!(matches[0].title, "the revised proposal");
     assert_eq!(matches[0].status, FeatureStatus::Pending);
+}
+
+/// A fixfeature whose runs all failed WITHOUT committing anything produced
+/// no work, so a re-plan re-proposing the same id with a revised payload is
+/// the same implicit supersession as an unstarted feature (mission
+/// m-eee81f: three infra-failed runs left `worker_runs` non-empty and every
+/// re-proposal wedged the log with "duplicate fixfeature.created").
+#[test]
+fn duplicate_fixfeature_supersedes_a_failed_commitless_feature() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    // The prior feature carries failed-run records but no commits and no
+    // started status — runs that never produced work.
+    let mut prior = fix_feature("flaky");
+    prior.status = FeatureStatus::Failed;
+    prior.worker_runs = vec!["r-1".to_string(), "r-2".to_string(), "r-3".to_string()];
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: prior,
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+
+    let mut revised = fix_feature("flaky");
+    revised.title = "re-proposed after the infra failures".to_string();
+    revised.spec = "same finding, tighter spec".to_string();
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .expect("a failed, commitless feature is superseded, not wedged");
+
+    let matches: Vec<_> = state.mission.milestones[0]
+        .features
+        .iter()
+        .filter(|f| f.id == "flaky")
+        .collect();
+    assert_eq!(matches.len(), 1, "one registration for the id");
+    assert_eq!(matches[0].title, "re-proposed after the infra failures");
+    assert_eq!(matches[0].status, FeatureStatus::Pending);
+}
+
+/// The negative pin for the commitless-supersession hole (review of
+/// 30b276e): a feature judged FAILED *after* its worker committed real work
+/// to the mission branch records those commits on the feature.failed event,
+/// so it is NOT "commitless" — a re-proposal reusing its id must REJECT, not
+/// rewrite the payload and reset it to Pending (which would orphan the audit
+/// link to the landed commits).
+#[test]
+fn duplicate_fixfeature_rejects_a_failed_feature_with_commits() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: fix_feature("judged"),
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "judged".into(),
+            },
+        ),
+    )
+    .expect("started");
+    // Judged failed AFTER the worker landed commits on the mission branch.
+    apply(
+        &mut state,
+        &ev(
+            5,
+            EventKind::FeatureFailed {
+                feature_id: "judged".into(),
+                reason: "validation judged the work insufficient".into(),
+                commits: vec!["deadbeef implement the thing".into()],
+            },
+        ),
+    )
+    .expect("failed with commits recorded");
+
+    let mut revised = fix_feature("judged");
+    revised.title = "re-proposed after the judgement".to_string();
+    let err = apply(
+        &mut state,
+        &ev(
+            6,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, EngineError::InvalidState(_)),
+        "failed-with-commits must reject the duplicate, got {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +837,7 @@ fn fix_cycles_increment_once_per_validation_round() {
                     evidence: "it broke".into(),
                     suggested_fix: "fix it".into(),
                     class: String::new(),
+                    rule: None,
                 },
             },
         ),
@@ -940,6 +1079,7 @@ fn every_status_value_is_reachable() {
         EventKind::FeatureFailed {
             feature_id: "f-1-2".into(),
             reason: "r".into(),
+            commits: vec![],
         }, // f Failed
         EventKind::FeatureSkipped {
             feature_id: "f-2-1".into(),
@@ -1877,6 +2017,7 @@ fn prop_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -1960,6 +2101,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
             Action::FeatureFailed(f) => EventKind::FeatureFailed {
                 feature_id: fs(*f),
                 reason: "r".into(),
+                commits: vec![],
             },
             Action::FeatureSkipped(f) => EventKind::FeatureSkipped {
                 feature_id: fs(*f),
@@ -1982,6 +2124,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                         evidence: "e".into(),
                         suggested_fix: String::new(),
                         class: String::new(),
+                        rule: None,
                     },
                 }
             }
@@ -2066,6 +2209,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
             evidence: "command failed".to_string(),
             suggested_fix: String::new(),
             class: String::new(),
+            rule: None,
         },
     };
 
@@ -3280,6 +3424,7 @@ fn plan_three_milestones() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -3840,6 +3985,7 @@ fn gate_result_event_is_record_only_in_the_fold() {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         },
     };
     let without = fold(&[
@@ -4323,4 +4469,72 @@ fn routing_rules_config_mission_created_fold_derives_executor_route() {
         .expect("the seed-time record survives approval");
     assert_eq!(route.tier, ExecutorTier::Frontier);
     assert_eq!(route.rule, None);
+}
+
+/// Flight Rules (ticket flight-rules-resolution-pin, KRZ-342, design D-E):
+/// the approval pin folds from `plan.approved`, but a revision NEVER re-pins
+/// — no revision flow re-validates a carried manifest against the trusted
+/// source, so folding one would let a re-plan substitute weakened policy
+/// into the consent artifact.
+#[test]
+fn flight_rules_pin_revision_never_folds_a_carried_manifest() {
+    let pin = StandardsPin {
+        pack_name: "zz".to_string(),
+        pack_dir: "vendor/pack".to_string(),
+        standards_root: "standards".to_string(),
+        digest: "ab".repeat(32),
+        source: StandardsPinSource::RepoTracked,
+        task_class: None,
+        touch_set: vec![],
+        context_paths: Vec::new(),
+        gates: Vec::new(),
+        rules: vec![PinnedRule {
+            id: "ZZ-MUST-001".to_string(),
+            revision: 1,
+            rfc: "RFC-002".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: "zz".to_string(),
+            domains: vec![],
+            stages: vec!["merge".to_string()],
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: Some("agent-judgement".to_string()),
+            waivable: false,
+        }],
+    };
+    let mut approved_plan = plan();
+    approved_plan.standards_manifest = Some(Box::new(pin.clone()));
+    // The revision carries a FABRICATED pin (emptied rules, different
+    // digest) — and an extend-only touch set so the revision itself is
+    // otherwise valid.
+    let mut revised = plan();
+    revised.touch_set = vec!["src/**".to_string()];
+    revised.standards_manifest = Some(Box::new(StandardsPin {
+        digest: "cd".repeat(32),
+        rules: vec![],
+        ..pin.clone()
+    }));
+
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: approved_plan,
+            base_sha: Some("deadbeef".to_string()),
+        },
+        EventKind::PlanRevised {
+            revision: 1,
+            plan: revised,
+        },
+    ]);
+    assert_eq!(
+        state.mission.standards_manifest,
+        Some(pin),
+        "the approval-time pin stands for the mission's life"
+    );
+    assert_eq!(
+        state.mission.touch_set,
+        vec!["src/**".to_string()],
+        "the revision's other fields still fold"
+    );
 }

@@ -232,6 +232,14 @@ pub fn render_plan_markdown(
             }
         }
     }
+
+    // Flight Rules (KRZ-342, D-G's plan-review projection): the approved
+    // standards pin — source digest, ids, revisions, effective statuses,
+    // statements, scopes, checker bindings — rendered where the operator
+    // reviews the plan. Absent pin ⇒ byte-identical plan.md.
+    if let Some(pin) = &plan.standards_manifest {
+        let _ = writeln!(md, "\n{}", crate::pack::resolution::render_pin_section(pin));
+    }
     while md.ends_with('\n') {
         md.pop();
     }
@@ -796,6 +804,19 @@ pub fn render_mission_report(
     }
     if !rendered_any {
         let _ = writeln!(md, "\nNo validation rounds were recorded.");
+    }
+
+    // Flight Rules coverage (KRZ-343, design D-H): every applicable pinned
+    // rule's disposition with its mechanism and evidence joins, folded from
+    // the same log — absence of evidence is never rendered as pass. `None`
+    // (no approved standards pin) renders nothing, so a pre-Flight-Rules
+    // mission's report stays byte-identical.
+    if let Some(coverage) = crate::standards_coverage::standards_coverage(&mission.id, events) {
+        let _ = writeln!(
+            md,
+            "\n{}",
+            crate::standards_coverage::render_coverage_markdown(&coverage).trim_end_matches('\n')
+        );
     }
 
     // Contract outcomes — the mission completed, so every assertion passed

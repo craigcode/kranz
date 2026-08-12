@@ -1,6 +1,6 @@
 # Flight Rules — governed engineering standards for humans and agents
 
-Status: **accepted for near-term delivery 2026-08-07**. D-A through D-K are
+Status: **shipped 2026-08-11**. D-A through D-K are
 decided below. Implementation is the KRZ-341–349 ticket series; the P1
 vertical slice is roadmap M5.5.
 
@@ -275,7 +275,7 @@ stage-filtered projection:
 - implementation: workers receive only implementation-stage statements;
 - scrutiny/functional validation: validators cite rule IDs in findings;
 - final/merge: registered checkers evaluate the actual diff/integration;
-- later review task classes: spec and incident artifacts use the same
+- review task classes: spec and incident artifacts use the same
   resolver, without a new standards corpus.
 
 Each projection's content hash joins the existing prompt/session provenance.

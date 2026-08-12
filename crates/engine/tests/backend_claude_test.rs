@@ -395,6 +395,45 @@ fn tool_result_structured_refusals_are_denials() {
     }
 }
 
+/// A bare "hook" substring (e.g. a directory listing that happens to contain
+/// `hooks_test.rs`, or prose discussing hooks) must NOT park a deny-by-default
+/// grant: the m-eee81f validator aborts were exactly this false positive.
+#[test]
+fn tool_result_hook_substring_alone_is_not_a_denial() {
+    for (text, is_error) in [
+        // Directory listing of crates/engine/tests/ — the m-eee81f shape.
+        (
+            "backend_claude_test.rs\nbackend_cursor_test.rs\nhooks_test.rs\nmission_test.rs",
+            false,
+        ),
+        ("hooks_test.rs", false),
+        ("The hook status file is missing", true),
+        (
+            "See docs/knowledge/decisions/positioning-governance-evidence-layer.md for hook design",
+            false,
+        ),
+    ] {
+        let events = parse_stream_line(&tool_result_line(text, is_error));
+        let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+            panic!("expected ToolResult for {text:?}");
+        };
+        assert!(
+            !denied,
+            "bare 'hook' mention must not count as denial: {text:?}"
+        );
+    }
+
+    // A genuine hook block still counts.
+    let events = parse_stream_line(&tool_result_line(
+        "operation blocked by PreToolUse hook",
+        false,
+    ));
+    let AgentEvent::ToolResult { denied, .. } = &events[0] else {
+        panic!("expected ToolResult");
+    };
+    assert!(denied, "a real hook block must still count as denial");
+}
+
 #[test]
 fn tool_result_content_array_form_is_flattened() {
     let line = json!({

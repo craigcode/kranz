@@ -656,6 +656,7 @@ pub async fn run_worker(
     auth_verdict: AuthVerdict,
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -676,6 +677,7 @@ pub async fn run_worker(
         auth_verdict,
         touch_set,
         executor_route,
+        standards_pin,
     )
     .await
 }
@@ -707,6 +709,7 @@ pub async fn run_worker_in(
     auth_verdict: AuthVerdict,
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -725,6 +728,7 @@ pub async fn run_worker_in(
         auth_verdict,
         touch_set,
         executor_route,
+        standards_pin,
     )?;
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -765,6 +769,7 @@ pub async fn run_worker_in_buffered(
     auth_verdict: AuthVerdict,
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -783,6 +788,7 @@ pub async fn run_worker_in_buffered(
         auth_verdict,
         touch_set,
         executor_route,
+        standards_pin,
     )?;
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -921,6 +927,7 @@ fn build_worker_spec(
     auth_verdict: AuthVerdict,
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<(SessionSpec, RunMeta)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -951,14 +958,29 @@ fn build_worker_spec(
     // than silently dropping the pack the operator configured). No packDir
     // ⇒ None ⇒ the prompt and its recorded hash are byte-identical.
     let pack = crate::pack::load_for_config(cfg, repo_root).map_err(EngineError::Config)?;
-    let mut pack_prompt_hash = None;
+    let mut extended_prompt_hash = None;
     if let Some(pack) = &pack {
         let section = pack.prompt_section(role);
         if !section.is_empty() {
             role_prompt.push_str(&section);
             // The recorded hash must name the exact text the session ran
             // with — the template hash would no longer be true.
-            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
+
+    // Flight Rules stage projection (KRZ-345, design D-G): the approved
+    // pin's implementation-stage rules append through the same channel,
+    // inside the marked untrusted boundary, and the recorded hash covers the
+    // exact projection text (replay identifies the manifest/projection
+    // digest from the header). No pin / no applicable rule ⇒ None ⇒ the
+    // prompt and its hash stay byte-identical.
+    if let Some(pin) = standards_pin {
+        if let Some(section) =
+            crate::pack::projection::session_section(pin, role).map_err(EngineError::Config)?
+        {
+            role_prompt.push_str(&section);
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
         }
     }
 
@@ -1080,7 +1102,7 @@ fn build_worker_spec(
         feature_id: Some(feature.id.clone()),
         milestone_id: None,
         model: role_cfg.model.clone(),
-        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
+        prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
         executor_route,
     };
     Ok((spec, run_meta))
@@ -1116,6 +1138,7 @@ pub async fn run_validator(
     egress_grants: &[String],
     worker_commands: &[String],
     guidance: Option<&str>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_validator_in(
@@ -1140,6 +1163,7 @@ pub async fn run_validator(
         // pre-resolve the mandatory containment wrap in the orchestrator
         // and pass it through here (ticket validator-mandatory-containment).
         None,
+        standards_pin,
     )
     .await
 }
@@ -1184,6 +1208,7 @@ pub async fn run_validator_in(
     guidance: Option<&str>,
     contract_results: Option<&str>,
     validator_sandbox: Option<crate::sandbox::ResolvedSandbox>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -1257,12 +1282,25 @@ pub async fn run_validator_in(
     // append to the rendered role prompt through the same channel; the load
     // fails closed and no packDir leaves prompt and hash byte-identical.
     let pack = crate::pack::load_for_config(cfg, &paths.repo_root).map_err(EngineError::Config)?;
-    let mut pack_prompt_hash = None;
+    let mut extended_prompt_hash = None;
     if let Some(pack) = &pack {
         let section = pack.prompt_section(kind);
         if !section.is_empty() {
             role_prompt.push_str(&section);
-            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
+
+    // Flight Rules stage projection (KRZ-345, design D-G): the approved
+    // pin's validation-stage rules append through the same channel, inside
+    // the marked untrusted boundary; the recorded hash covers the exact
+    // projection text. No pin / no applicable rule ⇒ byte-identical.
+    if let Some(pin) = standards_pin {
+        if let Some(section) =
+            crate::pack::projection::session_section(pin, kind).map_err(EngineError::Config)?
+        {
+            role_prompt.push_str(&section);
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
         }
     }
 
@@ -1365,7 +1403,7 @@ pub async fn run_validator_in(
         feature_id: None,
         milestone_id: Some(milestone.id.clone()),
         model: role_cfg.model.clone(),
-        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(kind)),
+        prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(kind)),
         // Task-class routing decides the WORKER executor tier only; validator
         // sessions are never routed, so there is no route to record.
         executor_route: None,
