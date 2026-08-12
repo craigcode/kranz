@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: kranz export-corpus [--all] — three provenance-tagged sources (validated traces + gate chain, divergence pairs with resolution, escalation ledger); byte-identical regeneration (380 records live); failed/unvalidated excluded. corpus_export filter: 8 green; full gates green.
 title: Provenance-tagged training-corpus export
 priority: 3
 schedule: once

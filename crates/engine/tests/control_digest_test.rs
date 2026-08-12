@@ -405,12 +405,14 @@ fn plan() -> Plan {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                pty_script: None,
             },
             Assertion {
                 id: "a-2".to_string(),
                 statement: "docs are accurate".to_string(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                pty_script: None,
             },
         ],
         milestones: vec![
@@ -426,6 +428,7 @@ fn plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -462,6 +465,8 @@ fn digest_events() -> Vec<Event> {
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: Some("ms-1".to_string()),
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-r-1".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),

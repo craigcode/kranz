@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the M6 arc: WorkspacePin recorded at approval with workspace.provider.pinned event.
 title: Pin workspace provider identity at mission approval (M6)
 priority: 2
 schedule: once

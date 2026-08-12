@@ -46,6 +46,7 @@ fn sample_plan() -> Plan {
             statement: "tests pass".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![PlanMilestone {
             title: "Milestone One".to_string(),
@@ -65,6 +66,7 @@ fn sample_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -227,6 +229,40 @@ fn parses_export_traces() {
             all: true,
             out: Some(ref path),
         } if path == std::path::Path::new("out.jsonl")
+    ));
+}
+
+#[test]
+fn corpus_export_cli_parses() {
+    let cli = Cli::try_parse_from(["kranz", "export-corpus"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: None,
+            all: false,
+            out: None,
+        }
+    ));
+
+    let cli = Cli::try_parse_from(["kranz", "export-corpus", "m-1"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: Some(ref id),
+            all: false,
+            out: None,
+        } if id == "m-1"
+    ));
+
+    let cli =
+        Cli::try_parse_from(["kranz", "export-corpus", "--all", "--out", "corpus.jsonl"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::ExportCorpus {
+            mission_id: None,
+            all: true,
+            out: Some(ref path),
+        } if path == std::path::Path::new("corpus.jsonl")
     ));
 }
 
@@ -502,6 +538,8 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: None,
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-1".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -603,6 +641,8 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: None,
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-pass".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -625,6 +665,8 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     known_gaps: vec![],
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
+                    escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -639,6 +681,8 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 role: Role::Worker,
                 feature_id: Some("f-1-2".to_string()),
                 milestone_id: None,
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-fail".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -661,11 +705,14 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                     known_gaps: vec![],
                     commits: vec![],
                     commands_run: vec![],
+                    escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureFailed {
                 feature_id: "f-1-2".to_string(),
                 reason: "gave up".to_string(),
+                commits: Vec::new(),
             },
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
@@ -737,6 +784,8 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
                 milestone_id: None,
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-a".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -759,6 +808,8 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                     known_gaps: vec![],
                     commits: vec!["abc feature one".to_string()],
                     commands_run: vec![],
+                    escalation: None,
+                    questions: None,
                 }),
             },
             EventKind::FeatureCompleted {
@@ -787,6 +838,185 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
     assert_eq!(value["missionId"], "m-a");
 }
 
+/// Seed a mission exercising all three corpus sources: a validation-PASSED
+/// worker run, a divergence noted+resolved (its second candidate stream
+/// spawned but never completed — an unvalidated session), and an approved
+/// grant park.
+fn write_corpus_mission(repo: &Path, mission_id: &str) {
+    write_events(
+        repo,
+        mission_id,
+        vec![
+            created_kind("ship it", mission_id),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "abc123".to_string(),
+            },
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-pass".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "sess-pass".to_string(),
+                model: "sonnet".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-pass.jsonl".to_string(),
+            },
+            EventKind::WorkerCompleted {
+                run_id: "w-pass".to_string(),
+                result: RunResult::Pass,
+                tokens: TokenUsage::default(),
+                cost_usd: None,
+                report: Some(WorkerReport {
+                    result: RunResult::Pass,
+                    summary: "built feature one".to_string(),
+                    files_touched: vec![],
+                    tests_added: vec![],
+                    test_evidence: "cargo test: ok".to_string(),
+                    dependencies_added: vec![],
+                    known_gaps: vec![],
+                    commits: vec!["abc feature one".to_string()],
+                    commands_run: vec![],
+                    escalation: None,
+                    questions: None,
+                }),
+            },
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".to_string(),
+                commits: vec!["abc feature one".to_string()],
+            },
+            EventKind::WorkerSpawned {
+                run_id: "w-cand".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "sess-cand".to_string(),
+                model: "gpt-5".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "hash".to_string(),
+                transcript_path: "runs/w-cand.jsonl".to_string(),
+            },
+            EventKind::DivergenceNoted {
+                unit: "f-1-1".to_string(),
+                candidates: vec![
+                    DivergenceCandidate {
+                        run_id: "w-pass".to_string(),
+                        branch: format!("kranz/pool/{mission_id}/f-1-1-c0"),
+                        backend: "claude".to_string(),
+                        tree: "aaa".to_string(),
+                    },
+                    DivergenceCandidate {
+                        run_id: "w-cand".to_string(),
+                        branch: format!("kranz/pool/{mission_id}/f-1-1-c1"),
+                        backend: "codex".to_string(),
+                        tree: "bbb".to_string(),
+                    },
+                ],
+                diverged: true,
+            },
+            EventKind::DivergenceResolved {
+                unit: "f-1-1".to_string(),
+                selected: Some(0),
+                reason: "kept the first candidate".to_string(),
+                decided_by: "operator".to_string(),
+            },
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".to_string(),
+                kind: GrantKind::Command,
+                command: "cargo test".to_string(),
+            },
+            EventKind::GrantApproved {
+                kind: GrantKind::Command,
+                command: "cargo test".to_string(),
+            },
+            EventKind::MilestoneCompleted {
+                milestone_id: "ms-1".to_string(),
+                tag: None,
+            },
+        ],
+    );
+}
+
+#[test]
+fn corpus_export_cli_is_regenerable_and_covers_all_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_corpus_mission(repo, "m-corpus");
+
+    let first = commands::cmd_export_corpus(repo, "m-corpus").unwrap();
+    let second = commands::cmd_export_corpus(repo, "m-corpus").unwrap();
+    assert_eq!(
+        first, second,
+        "export-corpus must be byte-identical across consecutive invocations"
+    );
+
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(lines.len(), 3, "one record per source: {first}");
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // worker-trace: provenance-tagged (backend derived, gate chain present
+    // though empty on this gateless fixture); the unvalidated w-cand stream
+    // never enters the corpus as a trace.
+    assert_eq!(records[0]["source"], "worker-trace");
+    assert_eq!(records[0]["runId"], "w-pass");
+    assert_eq!(records[0]["missionId"], "m-corpus");
+    assert_eq!(records[0]["backend"], "claude");
+    assert!(records[0]["gateChain"].is_array());
+    // divergence: both candidates and the resolution.
+    assert_eq!(records[1]["source"], "divergence");
+    assert_eq!(records[1]["candidates"][0]["runId"], "w-pass");
+    assert_eq!(records[1]["candidates"][1]["runId"], "w-cand");
+    assert_eq!(records[1]["resolution"]["selected"], 0);
+    assert_eq!(records[1]["resolution"]["decidedBy"], "operator");
+    // escalation: the approved grant park as a labeled judgment.
+    assert_eq!(records[2]["source"], "escalation");
+    assert_eq!(records[2]["kind"], "grant");
+    assert_eq!(records[2]["ask"], "command: cargo test");
+    assert_eq!(records[2]["decision"], "approved");
+    assert!(records[2]["askSeq"].is_number());
+}
+
+#[test]
+fn corpus_export_all_aggregates_and_skips_unreadable_missions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    write_corpus_mission(repo, "m-a");
+    // A second mission directory whose event log is missing entirely — must
+    // be skipped, not fatal, for --all.
+    fs::create_dir_all(repo.join(".kranz/missions/m-broken")).unwrap();
+
+    let jsonl = commands::cmd_export_corpus_all(repo);
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "m-a's three records, m-broken skipped: {jsonl}"
+    );
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["missionId"], "m-a");
+    }
+    // Aggregation is deterministic too: same tree in, same bytes out.
+    assert_eq!(jsonl, commands::cmd_export_corpus_all(repo));
+}
+
 #[test]
 fn status_icons_cover_terminal_states() {
     // Blocked milestone ✖, failed feature ✗, skipped feature ⊘.
@@ -808,6 +1038,7 @@ fn status_icons_cover_terminal_states() {
             EventKind::FeatureFailed {
                 feature_id: "f-1-1".to_string(),
                 reason: "no good".to_string(),
+                commits: Vec::new(),
             },
             EventKind::FeatureSkipped {
                 feature_id: "f-1-2".to_string(),
@@ -1219,6 +1450,127 @@ fn grant_commands_reject_bad_state() {
     assert!(commands::cmd_approve_grant(repo, "m-none", "gc audit").is_err());
 }
 
+/// Seed an open structured question q-1 (options sqlite/in-memory) on an
+/// active mission (ticket structured-human-question-events).
+fn seed_open_question(repo: &Path, mission: &str) {
+    write_events(
+        repo,
+        mission,
+        vec![
+            created_kind("goal", mission),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "abc1234".into(),
+            },
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "sess".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "hash".into(),
+                transcript_path: "runs/r-1.jsonl".into(),
+            },
+            EventKind::QuestionOpened {
+                question_id: "q-1".into(),
+                role: Role::Worker,
+                text: "Which storage engine?".into(),
+                options: vec!["sqlite".into(), "in-memory".into()],
+                run_id: Some("r-1".into()),
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+            },
+        ],
+    );
+}
+
+#[test]
+fn question_events_commands_list_and_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    seed_open_question(repo, "m-q");
+
+    // The projection lists: id, ask, indexed options.
+    let listing = commands::cmd_list_questions(repo, "m-q").unwrap();
+    assert!(listing.contains("q-1"), "id listed: {listing}");
+    assert!(
+        listing.contains("Which storage engine?"),
+        "ask listed: {listing}"
+    );
+    assert!(
+        listing.contains("[0] sqlite") && listing.contains("[1] in-memory"),
+        "options indexed: {listing}"
+    );
+
+    // An option answer enqueues the dedicated control kind, camelCase id.
+    commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(0)).unwrap();
+    let files = queued_json_files(repo, "m-q");
+    assert_eq!(files.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "kind": "answer-question",
+            "questionId": "q-1",
+            "answer": "sqlite",
+            "option": 0
+        })
+    );
+}
+
+#[test]
+fn question_events_commands_reject_stale_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    seed_open_question(repo, "m-q");
+
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-nope", "sqlite", None).is_err(),
+        "unknown question"
+    );
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(9)).is_err(),
+        "option index out of range"
+    );
+    assert!(
+        commands::cmd_answer_question(repo, "m-q", "q-1", "in-memory", Some(0)).is_err(),
+        "option text must match the parked question"
+    );
+
+    // The rejections above enqueued nothing: the first valid answer is the
+    // only file in the inbox.
+    commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(0)).unwrap();
+    assert_eq!(
+        queued_json_files(repo, "m-q").len(),
+        1,
+        "stale answers never enqueue"
+    );
+
+    // A mission with no open questions rejects the answer.
+    write_events(
+        repo,
+        "m-1",
+        vec![
+            created_kind("goal", "m-1"),
+            EventKind::PlanApproved {
+                plan: sample_plan(),
+                base_sha: None,
+            },
+        ],
+    );
+    assert!(commands::cmd_answer_question(repo, "m-1", "q-1", "x", None).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Control-command targeting (pause/resume/msg refuse terminal missions —
 // their inbox is never drained, so "success" there would be a silent no-op)
@@ -1446,6 +1798,79 @@ fn corrupt_log_stays_error() {
 // Live-printer event rendering
 // ---------------------------------------------------------------------------
 
+/// The question events render one line each (ticket
+/// structured-human-question-events): opened names the ask and the option
+/// count (or the free-text expectation), answered names the answer, cleared
+/// names why.
+#[test]
+fn question_events_renderer_renders_question_lines() {
+    let mut renderer = EventRenderer::new(false);
+
+    let opened = event(
+        1,
+        "m-1",
+        EventKind::QuestionOpened {
+            question_id: "q-1".to_string(),
+            role: Role::Worker,
+            text: "Which storage engine?".to_string(),
+            options: vec!["sqlite".to_string(), "in-memory".to_string()],
+            run_id: Some("r-1".to_string()),
+            feature_id: Some("f-1-1".to_string()),
+            milestone_id: Some("ms-1".to_string()),
+        },
+    );
+    assert_eq!(
+        renderer.render(&opened),
+        "[mission] question q-1 opened: Which storage engine? (2 option(s)); awaiting an answer"
+    );
+
+    let free_text = event(
+        2,
+        "m-1",
+        EventKind::QuestionOpened {
+            question_id: "q-2".to_string(),
+            role: Role::Worker,
+            text: "What should the flag be called?".to_string(),
+            options: vec![],
+            run_id: Some("r-1".to_string()),
+            feature_id: Some("f-1-1".to_string()),
+            milestone_id: Some("ms-1".to_string()),
+        },
+    );
+    assert_eq!(
+        renderer.render(&free_text),
+        "[mission] question q-2 opened: What should the flag be called? (free-text answer)"
+    );
+
+    let answered = event(
+        3,
+        "m-1",
+        EventKind::QuestionAnswered {
+            question_id: "q-1".to_string(),
+            answer: "sqlite".to_string(),
+            via: "answer-question".to_string(),
+            option: Some(0),
+        },
+    );
+    assert_eq!(
+        renderer.render(&answered),
+        "[mission] question q-1 answered: sqlite"
+    );
+
+    let cleared = event(
+        4,
+        "m-1",
+        EventKind::QuestionCleared {
+            question_id: "q-2".to_string(),
+            why: "milestone completed".to_string(),
+        },
+    );
+    assert_eq!(
+        renderer.render(&cleared),
+        "[mission] question q-2 cleared (milestone completed)"
+    );
+}
+
 #[test]
 fn renderer_tags_worker_lines_and_truncates() {
     let mut renderer = EventRenderer::new(false);
@@ -1458,6 +1883,8 @@ fn renderer_tags_worker_lines_and_truncates() {
             role: Role::Worker,
             feature_id: Some("f-1-2".to_string()),
             milestone_id: None,
+            candidate: None,
+            executor_route: None,
             sdk_session_id: "sess".to_string(),
             model: "sonnet".to_string(),
             quant: "n/a".to_string(),

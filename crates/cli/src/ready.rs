@@ -738,7 +738,7 @@ fn backend_lanes_for_config(cfg: &kranz_engine::types::MissionConfig) -> ReadyDi
     // still execs a real binary, so an unrelated broken (or hung) CLI on
     // PATH must not slow down or fail readiness for a repo that never
     // dispatches to it. `None` marks a lane that was skipped, not probed.
-    let probes: Vec<(&str, Option<bool>)> = ["claude", "codex", "droid", "kimi"]
+    let probes: Vec<(&str, Option<bool>)> = ["claude", "codex", "droid", "kimi", "cursor"]
         .iter()
         .map(|&backend| {
             if !required.contains(&backend) {
@@ -751,7 +751,8 @@ fn backend_lanes_for_config(cfg: &kranz_engine::types::MissionConfig) -> ReadyDi
                 .is_ok(),
                 "codex" => kranz_engine::backend_codex::discover_codex_binary(None).is_ok(),
                 "droid" => kranz_engine::backend_droid::discover_droid_binary(None).is_ok(),
-                _ => kranz_engine::backend_kimi::discover_kimi_binary(None).is_ok(),
+                "kimi" => kranz_engine::backend_kimi::discover_kimi_binary(None).is_ok(),
+                _ => kranz_engine::backend_cursor::discover_cursor_binary(None).is_ok(),
             };
             (backend, Some(available))
         })

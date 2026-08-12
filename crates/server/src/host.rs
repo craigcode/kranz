@@ -41,7 +41,9 @@ use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::git_ops::KranzCommitMetadata;
-use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::merge::{
+    merge_mission_with_standards_evidence, MergeReport, StandardsMergeEvidence,
+};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::queue;
@@ -706,6 +708,19 @@ impl MissionHost {
             ))
         })?;
         let mission_branch = state.mission.mission_branch.clone();
+        // The approved Flight Rules pin (KRZ-342, D-E) rides into the merge:
+        // a repo-tracked pin makes merge re-resolve the live base policy
+        // against the exact scratch integration diff and refuse on
+        // enforced-set drift; `None` keeps the merge byte-identical.
+        let standards_pin = state.mission.standards_manifest.clone();
+        let standards_coverage = kranz_engine::standards_coverage::standards_coverage(id, &events);
+        let standards_evidence = StandardsMergeEvidence::from_mission_events(
+            id,
+            standards_pin.as_ref(),
+            standards_coverage.as_ref(),
+            &events,
+            chrono::Utc::now(),
+        );
         let metadata = KranzCommitMetadata {
             mission_id: state.mission.id.clone(),
             cost_usd: state.total_cost_usd,
@@ -714,15 +729,54 @@ impl MissionHost {
 
         let repo_root = self.repo_root.clone();
         let gate_executor = Arc::clone(&self.gate_executor);
+        // engine-gates-sandbox-wrapped: the merged mission's own
+        // `worker.sandbox` posture decides whether the gate suite (which
+        // executes that mission's worker-authored test/build code) runs
+        // inside the resolved sandbox profile. `enforce == off` falls
+        // through to the injected `gate_executor` — byte-identical pre-wrap
+        // behavior, and the test seam (`with_gate_executor`) stays
+        // authoritative there. Every enforced posture routes INTO the
+        // sandboxed runner: the process provider wraps in the resolved
+        // profile; `provider: container` wraps the gates in the mission
+        // container when a runtime is detected (ticket
+        // container-gate-wrapper); and the fail-closed postures (an
+        // unsupported platform, linux without `bwrap`, container without a
+        // runtime) error loudly at resolve rather than running unsandboxed
+        // (13th-pass review, P1).
+        let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
+            sandbox: state.config.worker.sandbox.clone(),
+            mission_dir: paths.mission_dir(),
+        };
+        // A container-provider mission whose host has NO container runtime
+        // cannot wrap its merge gates (ticket container-gate-wrapper): they
+        // fail closed at resolve instead of running unsandboxed. This merge
+        // path has no event log, so the SAME note the resolve error carries
+        // goes to the operator-visible server log first — the refusal then
+        // reads as the config problem it is, never a flaky gate.
+        if let Some(note) = gate_policy.degradation_note() {
+            tracing::warn!(mission = %id, note = %note, "merge gate sandbox cannot wrap; gates fail closed");
+        }
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            let report = merge_mission(
+            let report = merge_mission_with_standards_evidence(
                 &repo,
                 &base_branch,
                 &base_sha,
                 &mission_branch,
                 Some(metadata),
-                |cmd, cwd| gate_executor(cmd, cwd),
+                standards_pin.as_ref(),
+                &standards_evidence,
+                |cmd, cwd| {
+                    if gate_policy.enforces_on_this_host() {
+                        kranz_engine::command_exec::run_bounded_gate_command_sandboxed(
+                            cwd,
+                            cmd,
+                            &gate_policy,
+                        )
+                    } else {
+                        gate_executor(cmd, cwd)
+                    }
+                },
             );
             // Explicit: the repo-busy hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.
@@ -768,6 +822,53 @@ impl MissionHost {
             ))),
             MergeReport::RefusedPreMerge { detail } => Err(ApiError::conflict(format!(
                 "merge refused before it started: {detail}"
+            ))),
+            MergeReport::StandardsDrifted {
+                approved_digest,
+                current_digest,
+                changed_rules,
+            } => {
+                // KRZ-342 (D-E/D-H): the refusal is the merge's answer; the
+                // `standards.drifted` event is its evidence. Append it to the
+                // mission log best-effort — the mission is Complete, so no
+                // engine should hold the log lock; a held lock downgrades to
+                // a server-log warning, never to a silent 4xx.
+                if let Err(error) = EventLog::acquire(
+                    &paths,
+                    id,
+                    std::time::Duration::ZERO,
+                    LockForce::No,
+                )
+                .and_then(|mut log| {
+                    log.append(kranz_engine::events::EventKind::StandardsDrifted {
+                        approved_digest: approved_digest.clone(),
+                        current_digest: current_digest.clone(),
+                        surface: "merge".to_string(),
+                        changed_rules: changed_rules.clone(),
+                    })
+                    .map(|_| ())
+                }) {
+                    tracing::warn!(mission = %id, %error, "standards.drifted event could not be appended; the merge refusal stands");
+                }
+                Err(ApiError::unprocessable(format!(
+                    "refusing to merge: the live base Flight Rules policy drifted from the \
+                     approved pin (approved sha256:{approved_digest}, current {}) — the \
+                     applicable enforced set changed; revalidate and re-approve the mission:\n{}",
+                    current_digest
+                        .as_deref()
+                        .map(|d| format!("sha256:{d}"))
+                        .unwrap_or_else(|| "<unreadable>".to_string()),
+                    changed_rules.join("\n")
+                )))
+            }
+            MergeReport::StandardsFailed {
+                rule_id,
+                checker,
+                output,
+            } => Err(ApiError::unprocessable(kranz_engine::scrub::scrub(
+                &format!(
+                    "Flight Rules merge checker refused {rule_id} ({checker}):\n{output}"
+                ),
             ))),
         }
     }
@@ -820,6 +921,7 @@ impl MissionHost {
             max_turns: role.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         let outcome = run_ask_session(backend, spec).await?;
         Ok(json!({

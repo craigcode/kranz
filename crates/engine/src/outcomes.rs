@@ -1,7 +1,15 @@
 //! Flight-surgeon outcomes fold: autonomy ratio, grant-latency distribution,
-//! and an escalation ledger — all computed per-request from the existing
-//! event log. Pure-fold style, mirroring [`crate::trace_export`]: there is no
-//! second persisted source of truth, only a function over `&[Event]`.
+//! an escalation ledger, cost and cycle time — plus the KRZ-321/323/329
+//! extensions (per-task-class rows, the context-reuse split, the rubber-stamp
+//! flag, and cost per merged change), the KRZ-316 gate score distribution
+//! flags beside the rubber-stamp signal, and the KRZ-333 industry-comparison
+//! set ([`crate::comparison_metrics`]) attached as a clearly-separated
+//! secondary section when the fold options pin its window — all computed
+//! per-request from the
+//! existing event log. Pure-fold style, mirroring [`crate::trace_export`]:
+//! there is no second persisted source of truth, only a function over
+//! `&[Event]` (the merged-change denominator adds the live ancestry probe at
+//! fold time — derived, never stored).
 
 use crate::events::{Event, EventKind};
 use chrono::{DateTime, Utc};
@@ -59,6 +67,43 @@ pub struct EscalationRow {
     pub summary: String,
     pub decision: String,
     pub latency_ms: Option<u64>,
+    /// Rubber-stamp marker (ticket `rubber-stamp-grant-flag`), stamped at
+    /// aggregate time against the configured threshold: `Some(true)` when
+    /// this is a grant APPROVED in under the threshold, `Some(false)` for an
+    /// approved grant at/over it, `None` when the marker does not apply
+    /// (denied or pending grants — a fast DENY is not a rubber stamp — and
+    /// non-grant rows). A flag, never an enforcement.
+    #[serde(default)]
+    pub rubber_stamp: Option<bool>,
+}
+
+/// The divergence ledger of one mission (ticket
+/// `divergence-first-class-event`, KRZ-304), folded from its
+/// `divergence.noted` / `divergence.resolved` events. A ledger exists only
+/// for missions that recorded pool activity — a mission without pools has
+/// NO row (absent, never zeroed).
+///
+/// The counts are records, not verdicts: agreement between models is a
+/// signal to log, never a criterion to trust, so `agreed` feeds the
+/// escalation ledger and the training corpus but gates nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DivergenceOutcomes {
+    /// Units whose sibling candidate streams were compared
+    /// (`divergence.noted` events).
+    pub noted: u64,
+    /// Of those, units whose candidate branch trees differed.
+    pub diverged: u64,
+    /// Of those, units with identical candidate trees — the agreement
+    /// records (logged, never trusted).
+    pub agreed: u64,
+    /// Resolutions that chose a candidate (first-wins per unit, the
+    /// engine's own emission posture — a duplicated hand-written resolution
+    /// counts once).
+    pub resolved_selected: u64,
+    /// Resolutions that chose NONE — the unit was judged and abandoned;
+    /// itself a recorded judgement, distinct from "not yet judged".
+    pub resolved_none: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +116,140 @@ pub struct Outcomes {
     pub cost_per_change: CostPerChange,
     /// mission.created → terminal, minus paused spans (dashboard rule).
     pub cycle_time: CycleTime,
+    /// The same fold grouped by task class (ticket
+    /// `outcomes-report-task-class`): one row per class recovered from
+    /// `mission.created` goals, plus an explicit "unclassified" row for
+    /// missions whose goal carries none. Sorted by class name with
+    /// "unclassified" last.
+    #[serde(default)]
+    pub task_classes: Vec<TaskClassRow>,
+    /// Context-reuse split per backend (fresh vs cache-read vs cache-write
+    /// input tokens) — only for backends whose wire reports cache fields at
+    /// all; a backend that reports none yields NO row (absent, never a
+    /// fabricated 0%).
+    #[serde(default)]
+    pub context_reuse: Vec<ContextReuseRow>,
+    /// Rubber-stamp flag summary (ticket `rubber-stamp-grant-flag`), shown
+    /// alongside the latency distribution.
+    #[serde(default)]
+    pub rubber_stamp: RubberStampReport,
+    /// Gate score distribution flags (ticket
+    /// `gate-score-distribution-flags`, KRZ-316): per-gate smells folded
+    /// from the scored `gate.result` series across the same mission logs —
+    /// the rubber-stamp signal's documented COMPLEMENT, presented together:
+    /// block-to-grant timing catches an inattentive human, these catch a
+    /// mis-specified gate whose threshold nothing approaches. Carried into
+    /// the escalation ledger fold as this SUMMARY FIELD, never a per-row
+    /// marker: a flag indicts the GATE's specification across all missions,
+    /// so pinning it on one mission's grant/block/revision row would
+    /// misattribute a cross-mission smell to one escalation.
+    #[serde(default)]
+    pub gate_score_flags: crate::gate_score_flags::GateScoreFlagsReport,
+    /// Fleet divergence ledger (KRZ-304), summed over the missions that
+    /// have one — `None` when NO mission recorded a divergence event
+    /// (absent means "no pools", never a fabricated zero report), and
+    /// omitted from the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergences: Option<DivergenceOutcomes>,
+    /// The industry-comparison set (ticket `outcomes-comparison-metrics`,
+    /// KRZ-333): assisted-change share, defect density per merged change,
+    /// and defect resolution time — a clearly-separated SECONDARY section
+    /// beside the kranz-native metrics above, each metric carrying its
+    /// inline definition (the definition is the whole argument). `None` —
+    /// and omitted from the wire — when the fold options pin no comparison
+    /// window (the hermetic test seam); production resolve() pins one, so
+    /// every served/printed report carries the section LAST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<crate::comparison_metrics::ComparisonReport>,
+}
+
+/// One task class's row in the outcomes report (KRZ-321).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClassRow {
+    /// The class as written in ticket frontmatter / the mission goal, or
+    /// [`UNCLASSIFIED_TASK_CLASS`] when the mission carried none.
+    pub task_class: String,
+    pub missions: u64,
+    pub closed_missions: u64,
+    /// Σ worker cost across the class's missions (same rule as
+    /// [`CostPerChange::total_cost_usd`]).
+    pub total_cost_usd: f64,
+    pub non_meta_commits: u64,
+    /// total_cost_usd / non_meta_commits — None when the class has no
+    /// non-meta commits (the ratio is meaningless, not zero).
+    pub usd_per_commit: Option<f64>,
+    /// Grant + block + revision rows raised by the class's missions.
+    pub escalations: u64,
+    /// Of those, the grant parks — the advisor invocations.
+    pub advisor_invocations: u64,
+    /// escalations / missions (every row has at least one mission).
+    pub escalations_per_mission: f64,
+    /// Mean created→terminal (paused spans excluded) over the class's
+    /// missions with a computable cycle — None when none closed.
+    pub cycle_mean_ms: Option<f64>,
+}
+
+/// The task-class label missions without a `task-class` group under
+/// (KRZ-321: an explicit row, never silently dropped).
+pub const UNCLASSIFIED_TASK_CLASS: &str = "unclassified";
+
+/// One backend's context-reuse split (KRZ-321). Emitted ONLY for backends
+/// whose wire reports cache token fields
+/// ([`crate::types::BackendKind::reports_cache_read_tokens`]); reuse shares
+/// above ~95% are the cost pattern per-mission totals hide — a signal to
+/// investigate carried context, not a target to optimize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextReuseRow {
+    /// [`crate::types::BackendKind::as_str`] of the backend the mission's
+    /// config routed these runs to.
+    pub backend: String,
+    /// Missions contributing at least one completed run on this backend.
+    pub missions: u64,
+    /// Completed runs folded.
+    pub runs: u64,
+    /// Σ non-cache input tokens.
+    pub fresh_input: u64,
+    /// Σ cache-read input tokens.
+    pub cache_read: u64,
+    /// Σ cache-write (creation) input tokens — None for backends whose wire
+    /// has no such field (codex), never zero-filled.
+    pub cache_write: Option<u64>,
+    /// (cache_read + cache_write) / (fresh + cache_read + cache_write) over
+    /// reported fields — None when no input tokens were recorded at all.
+    pub reuse_share: Option<f64>,
+}
+
+/// The rubber-stamp flag summary (KRZ-323): approved grants decided under
+/// the configured threshold, counted against all approved decisions with a
+/// computable latency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RubberStampReport {
+    /// The threshold in effect (config `rubberStampThresholdMs`; default
+    /// [`crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS`]).
+    pub threshold_ms: u64,
+    /// Approved grant decisions with a computable latency (the population).
+    pub approved_decisions: u64,
+    /// Approved decisions under `threshold_ms` (strictly under; at/over is
+    /// not flagged).
+    pub flagged: u64,
+    /// flagged / approved_decisions — None when nothing was approved.
+    pub share: Option<f64>,
+}
+
+impl Default for RubberStampReport {
+    /// The serde-backfill / empty-history default carries the DOCUMENTED
+    /// threshold, never a zero that would flag everything.
+    fn default() -> Self {
+        Self {
+            threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+            approved_decisions: 0,
+            flagged: 0,
+            share: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,8 +275,9 @@ pub struct CycleTime {
     pub mean_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Per-mission fold intermediate (never serialized — the report structs are
+/// the wire surface; this lives in the memo cache and the aggregator).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MissionOutcomes {
     pub interventions: u64,
     pub is_closed: bool,
@@ -109,6 +289,74 @@ pub struct MissionOutcomes {
     pub non_meta_commits: u64,
     /// created → terminal minus paused spans; None while no terminal event.
     pub cycle_time_ms: Option<u64>,
+    /// The `task-class` recovered from the mission.created goal via
+    /// [`crate::ticket::parse_task_class_from_goal`]; None when the goal
+    /// carries no class heading (the "unclassified" row).
+    pub task_class: Option<String>,
+    /// Token usage summed per backend (as routed by the mission.created
+    /// config for each run's role) — the context-reuse split's input.
+    pub token_sums: Vec<BackendTokenSum>,
+    /// The mission's divergence ledger (KRZ-304) — `None` when the mission
+    /// recorded no divergence events at all (missions without pools:
+    /// absent, never a zeroed ledger).
+    pub divergences: Option<DivergenceOutcomes>,
+    /// The mission's scored gate evaluations (KRZ-316): every `gate.result`
+    /// carrying a score pair, folded to (gate, score, threshold) samples —
+    /// the distribution flag fold's per-mission input, memoized with the
+    /// rest of this struct so repeated requests never re-walk the log.
+    pub gate_score_samples: Vec<crate::gate_score_flags::GateScoreSample>,
+    /// The KRZ-333 comparison fold's log-derived inputs, folded in the SAME
+    /// scan as every other field and memoized alongside them (14th-pass
+    /// review: the comparison path used to re-read every events.jsonl the
+    /// native fold had just parsed — two scans per log per request). Only
+    /// the git probes stay outside this struct: branch tips move
+    /// independently of the log, so a merged bit can never ride the memo
+    /// entry — it is probed live at report time.
+    pub comparison: ComparisonInputs,
+}
+
+/// The log-derived per-mission inputs the KRZ-333 comparison fold needs
+/// ([`MissionOutcomes::comparison`]) — every field a pure function of the
+/// log bytes, so the whole bundle memoizes with the native fold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonInputs {
+    /// The first terminal event's timestamp — the comparison window's key;
+    /// `None` while the mission is open (an open mission is in no closed
+    /// window).
+    pub terminal_ts: Option<DateTime<Utc>>,
+    /// The `mission.created` base branch, recovered DIRECTLY from the
+    /// event: the landed-changes denominator's anchor even when the strict
+    /// reducer rejects the log (the standalone fold's recovery rule,
+    /// unchanged).
+    pub base_branch: Option<String>,
+    /// The strict reducer's reading of the log — the merged-change
+    /// derivation's inputs. `None` when the reducer rejects the log
+    /// (hand-edited, non-contiguous, dangling refs): a corrupt log yields
+    /// no merged change — an under-read, never an inflation. Folded over
+    /// the event slice as passed; production callers pass one mission's
+    /// log.
+    pub folded: Option<FoldedMissionRefs>,
+}
+
+/// The strict-reducer mission facts the merged-change probe needs
+/// ([`ComparisonInputs::folded`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldedMissionRefs {
+    pub status: crate::types::MissionStatus,
+    pub base_branch: String,
+    pub mission_branch: String,
+}
+
+/// One mission's token usage on one backend, summed over its completed runs
+/// (KRZ-321 context-reuse split).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackendTokenSum {
+    pub backend: crate::types::BackendKind,
+    pub runs: u64,
+    /// Non-cache input tokens.
+    pub fresh_input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 /// The four fixed grant-latency bucket labels, in display order.
@@ -152,7 +400,10 @@ fn cache_entry_stats(events_path: &std::path::Path) -> Option<(u64, u64)> {
 /// Fold one mission with per-(path, len, mtime) memoization. Returns None
 /// when the log is missing or unreadable — the caller degrades per-row
 /// exactly as before; the cache never changes the skip semantics.
-fn cached_mission_outcomes(
+/// Crate-internal: the KRZ-333 comparison fold ([`crate::comparison_metrics`])
+/// rides the same memoized scan instead of re-reading every log the native
+/// fold just parsed (14th-pass review).
+pub(crate) fn cached_mission_outcomes(
     mission_id: &str,
     events_path: &std::path::Path,
 ) -> Option<MissionOutcomes> {
@@ -311,6 +562,8 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: command.clone(),
             decision,
             latency_ms,
+            // Stamped at aggregate time against the configured threshold.
+            rubber_stamp: None,
         });
     }
 
@@ -361,6 +614,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: reason.clone(),
             decision,
             latency_ms: None,
+            rubber_stamp: None,
         });
     }
 
@@ -399,6 +653,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             summary: instructions.clone(),
             decision,
             latency_ms: None,
+            rubber_stamp: None,
         });
     }
 
@@ -424,6 +679,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         EventKind::MissionCreated { config, .. } => Some(config),
         _ => None,
     });
+    // The task class travels in the goal (ticket.rs folds it in under a
+    // fixed heading; create() only ever sees the folded goal).
+    let task_class = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionCreated { goal, .. } => crate::ticket::parse_task_class_from_goal(goal),
+        _ => None,
+    });
     let mut run_models: std::collections::HashMap<&str, (&str, crate::types::Role)> =
         std::collections::HashMap::new();
     for e in &mission_events {
@@ -438,6 +699,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         }
     }
     let mut cost_usd = 0.0;
+    // Token usage summed per backend (keyed by its as_str for deterministic
+    // output) — the context-reuse split's per-mission input. The backend is
+    // the one the mission.created config routes the run's role to, the same
+    // rule the cost fallback prices with.
+    let mut token_sums: std::collections::BTreeMap<&'static str, BackendTokenSum> =
+        std::collections::BTreeMap::new();
     for e in &mission_events {
         if let EventKind::WorkerCompleted {
             run_id,
@@ -446,16 +713,28 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             ..
         } = &e.kind
         {
-            cost_usd += recorded.unwrap_or_else(|| {
-                let (model, role) = run_models
-                    .get(run_id.as_str())
-                    .copied()
-                    .unwrap_or(("", crate::types::Role::Worker));
-                let backend = config
-                    .map(|c| c.backend_kind(role))
-                    .unwrap_or(crate::types::BackendKind::Claude);
-                crate::cost::usage_cost_usd_for_backend(tokens, model, backend)
-            });
+            let (model, role) = run_models
+                .get(run_id.as_str())
+                .copied()
+                .unwrap_or(("", crate::types::Role::Worker));
+            let backend = config
+                .map(|c| c.backend_kind(role))
+                .unwrap_or(crate::types::BackendKind::Claude);
+            cost_usd += recorded
+                .unwrap_or_else(|| crate::cost::usage_cost_usd_for_backend(tokens, model, backend));
+            let sum = token_sums
+                .entry(backend.as_str())
+                .or_insert(BackendTokenSum {
+                    backend,
+                    runs: 0,
+                    fresh_input: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+            sum.runs += 1;
+            sum.fresh_input += tokens.input;
+            sum.cache_read += tokens.cache_read;
+            sum.cache_write += tokens.cache_write;
         }
     }
 
@@ -497,6 +776,73 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         _ => None,
     };
 
+    // --- divergence ledger (KRZ-304) --------------------------------------
+    // The pool's judgement trail per mission: units compared, the diverged/
+    // agreed split, and the resolution KINDS (a candidate chosen vs judged-
+    // and-abandoned). Resolutions count first-wins per unit — the engine
+    // emits at most one, and the fold dedupes a hand-written duplicate the
+    // same way so a crafted log cannot inflate the ledger.
+    let mut noted: u64 = 0;
+    let mut diverged: u64 = 0;
+    let mut resolved_units: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut resolved_selected: u64 = 0;
+    let mut resolved_none: u64 = 0;
+    for e in &mission_events {
+        match &e.kind {
+            EventKind::DivergenceNoted { diverged: d, .. } => {
+                noted += 1;
+                if *d {
+                    diverged += 1;
+                }
+            }
+            EventKind::DivergenceResolved { unit, selected, .. } => {
+                let first_for_unit = resolved_units.insert(unit.as_str());
+                match (first_for_unit, selected) {
+                    (true, Some(_)) => resolved_selected += 1,
+                    (true, None) => resolved_none += 1,
+                    (false, _) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let divergences = (noted > 0 || !resolved_units.is_empty()).then(|| DivergenceOutcomes {
+        noted,
+        diverged,
+        agreed: noted - diverged,
+        resolved_selected,
+        resolved_none,
+    });
+
+    // --- gate score samples (KRZ-316) --------------------------------------
+    // Every scored `gate.result` in this mission's slice, as (gate, score,
+    // threshold) samples — the distribution flag fold's input. Unscored
+    // (boolean-only) gates yield no sample: excluded, never zeroed.
+    let gate_score_samples = crate::gate_score_flags::collect_scored_samples(&mission_events);
+
+    // --- comparison-fold inputs (KRZ-333; 14th-pass review) ----------------
+    // Everything the industry-comparison fold needs from the log, derived in
+    // this same scan so a pinned comparison window never re-reads a log the
+    // native fold just parsed. The base-branch anchor comes from
+    // `mission.created` DIRECTLY (a log the strict reducer rejects still
+    // anchors the denominator); the merged-change derivation reads the
+    // strict reducer's status + branch refs (a rejected log yields no merged
+    // change — the degrade rule the standalone fold documented).
+    let comparison = ComparisonInputs {
+        terminal_ts,
+        base_branch: mission_events.iter().find_map(|e| match &e.kind {
+            EventKind::MissionCreated { base_branch, .. } => Some(base_branch.clone()),
+            _ => None,
+        }),
+        folded: crate::reducer::fold(events)
+            .ok()
+            .map(|state| FoldedMissionRefs {
+                status: state.mission.status,
+                base_branch: state.mission.base_branch,
+                mission_branch: state.mission.mission_branch,
+            }),
+    };
+
     MissionOutcomes {
         interventions,
         is_closed,
@@ -505,6 +851,86 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         cost_usd,
         non_meta_commits,
         cycle_time_ms,
+        task_class,
+        token_sums: token_sums.into_values().collect(),
+        divergences,
+        gate_score_samples,
+        comparison,
+    }
+}
+
+/// Per-task-class accumulator for the KRZ-321 grouping (fold-internal).
+#[derive(Default)]
+struct TaskClassAcc {
+    missions: u64,
+    closed_missions: u64,
+    total_cost_usd: f64,
+    non_meta_commits: u64,
+    escalations: u64,
+    advisor_invocations: u64,
+    cycle_count: u64,
+    cycle_total_ms: u64,
+}
+
+/// Per-backend context-reuse accumulator (fold-internal).
+struct ReuseAcc {
+    backend: crate::types::BackendKind,
+    missions: u64,
+    runs: u64,
+    fresh_input: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+/// Fold-time options for the outcomes report (ticket
+/// `rubber-stamp-grant-flag`). Pure-fold idiom preserved: the same log plus
+/// the same options always yields byte-identical report data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutcomesOptions {
+    /// Grants APPROVED in under this many ms are flagged as rubber-stamp
+    /// signals (strictly under; at/over is not flagged).
+    pub rubber_stamp_threshold_ms: u64,
+    /// When `Some((days, now))`, the industry-comparison set (KRZ-333) is
+    /// folded over that window and attached to the report
+    /// ([`Outcomes::comparison`]). `None` keeps the fold hermetic — no git
+    /// probe, no clock — which is exactly the test seam: production
+    /// [`OutcomesOptions::resolve`] pins the documented default window and
+    /// the request time, so the purity rule above holds with the window as
+    /// an explicit input.
+    pub comparison_window: Option<(u64, DateTime<Utc>)>,
+}
+
+impl Default for OutcomesOptions {
+    fn default() -> Self {
+        Self {
+            rubber_stamp_threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
+            comparison_window: None,
+        }
+    }
+}
+
+impl OutcomesOptions {
+    /// Resolve from the repo's layered config (`rubberStampThresholdMs`).
+    /// A missing key falls back to the documented default; a broken config
+    /// degrades to the default too — the report fold never fails on config
+    /// (the engine proper rejects bad config at run start).
+    pub fn resolve(repo_root: &std::path::Path) -> Self {
+        match crate::config::load(repo_root) {
+            Ok(cfg) => Self {
+                rubber_stamp_threshold_ms: cfg.rubber_stamp_threshold_ms,
+                ..Self::default()
+            },
+            Err(_) => Self::default(),
+        }
+        .with_comparison_window()
+    }
+
+    /// Pin the industry-comparison window to the documented default
+    /// ([`DEFAULT_MERGED_CHANGE_WINDOW_DAYS`], the same window the
+    /// merged-change fold publishes) ending at the request time.
+    fn with_comparison_window(mut self) -> Self {
+        self.comparison_window = Some((DEFAULT_MERGED_CHANGE_WINDOW_DAYS, Utc::now()));
+        self
     }
 }
 
@@ -515,6 +941,15 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
 /// A mission with no `events.jsonl` or an unreadable/corrupt log is skipped
 /// (degrade per-row); this never panics or fails the whole aggregate.
 pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes> {
+    compute_outcomes_with_options(repo_root, &OutcomesOptions::resolve(repo_root))
+}
+
+/// [`compute_outcomes`] with explicit fold options (the hermetic test seam:
+/// no config file is consulted).
+pub fn compute_outcomes_with_options(
+    repo_root: &std::path::Path,
+    options: &OutcomesOptions,
+) -> anyhow::Result<Outcomes> {
     let index_contents = std::fs::read_to_string(
         crate::paths::MissionPaths::new(repo_root, "_")
             .missions_dir()
@@ -539,6 +974,23 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
     let mut total_non_meta_commits: u64 = 0;
     let mut cycle_closed: u64 = 0;
     let mut cycle_total_ms: u64 = 0;
+    // Per-task-class accumulators, keyed by class name (BTreeMap: the fold's
+    // output order must be a function of the log, never of hash iteration).
+    let mut class_accs: std::collections::BTreeMap<String, TaskClassAcc> =
+        std::collections::BTreeMap::new();
+    // Per-backend context-reuse accumulators, keyed by the backend's as_str.
+    let mut reuse_accs: std::collections::BTreeMap<&'static str, ReuseAcc> =
+        std::collections::BTreeMap::new();
+    // Fleet divergence ledger (KRZ-304): summed over missions that have one;
+    // stays None when no mission recorded a divergence event.
+    let mut divergence_acc: Option<DivergenceOutcomes> = None;
+    // Scored gate evaluation samples (KRZ-316): concatenated across
+    // missions into the distribution flag fold's input.
+    let mut all_score_samples: Vec<crate::gate_score_flags::GateScoreSample> = Vec::new();
+    // The comparison fold's per-mission inputs (KRZ-333), collected in this
+    // same pass so the comparison section never re-reads a log this loop
+    // just folded (14th-pass review — the double scan).
+    let mut comparison_inputs: Vec<(String, ComparisonInputs)> = Vec::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -557,6 +1009,7 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
         let Some(out) = cached_mission_outcomes(&id, &events_path) else {
             continue;
         };
+        comparison_inputs.push((id.clone(), out.comparison.clone()));
         if out.is_closed {
             closed_missions += 1;
             total_interventions += out.interventions;
@@ -565,13 +1018,68 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
             }
         }
         all_latencies_ms.extend(out.latencies_ms);
-        escalations.extend(out.escalations);
         total_cost_usd += out.cost_usd;
         total_non_meta_commits += out.non_meta_commits;
         if let Some(ms) = out.cycle_time_ms {
             cycle_closed += 1;
             cycle_total_ms += ms;
         }
+
+        // Same fold, grouped by task class (KRZ-321).
+        let class_key = out
+            .task_class
+            .clone()
+            .unwrap_or_else(|| UNCLASSIFIED_TASK_CLASS.to_string());
+        let acc = class_accs.entry(class_key).or_default();
+        acc.missions += 1;
+        if out.is_closed {
+            acc.closed_missions += 1;
+        }
+        acc.total_cost_usd += out.cost_usd;
+        acc.non_meta_commits += out.non_meta_commits;
+        if let Some(ms) = out.cycle_time_ms {
+            acc.cycle_count += 1;
+            acc.cycle_total_ms += ms;
+        }
+        acc.escalations += out.escalations.len() as u64;
+        acc.advisor_invocations += out
+            .escalations
+            .iter()
+            .filter(|r| r.kind == EscalationKind::Grant)
+            .count() as u64;
+
+        // Same fold, grouped by backend (KRZ-321 context-reuse split).
+        for sum in &out.token_sums {
+            let acc = reuse_accs
+                .entry(sum.backend.as_str())
+                .or_insert_with(|| ReuseAcc {
+                    backend: sum.backend,
+                    missions: 0,
+                    runs: 0,
+                    fresh_input: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+            acc.missions += 1;
+            acc.runs += sum.runs;
+            acc.fresh_input += sum.fresh_input;
+            acc.cache_read += sum.cache_read;
+            acc.cache_write += sum.cache_write;
+        }
+
+        // The fleet divergence ledger sums only missions that HAVE one.
+        if let Some(d) = &out.divergences {
+            let acc = divergence_acc.get_or_insert_with(DivergenceOutcomes::default);
+            acc.noted += d.noted;
+            acc.diverged += d.diverged;
+            acc.agreed += d.agreed;
+            acc.resolved_selected += d.resolved_selected;
+            acc.resolved_none += d.resolved_none;
+        }
+
+        all_score_samples.extend(out.gate_score_samples);
+
+        escalations.extend(out.escalations);
     }
 
     let interventions_per_closed_mission = if closed_missions > 0 {
@@ -586,6 +1094,97 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
     };
 
     escalations.sort_by_key(|e| std::cmp::Reverse(e.ts));
+
+    // Rubber-stamp flag (KRZ-323): stamp each approved grant row against the
+    // configured threshold and count the share. Strictly under flags; at or
+    // over does not. Denied/pending grants and non-grant rows keep `None` —
+    // a fast deny is not a rubber stamp.
+    let mut approved_decisions: u64 = 0;
+    let mut flagged: u64 = 0;
+    for row in &mut escalations {
+        if row.kind != EscalationKind::Grant || row.decision != "approved" {
+            continue;
+        }
+        let Some(latency) = row.latency_ms else {
+            continue;
+        };
+        approved_decisions += 1;
+        let is_flagged = latency < options.rubber_stamp_threshold_ms;
+        if is_flagged {
+            flagged += 1;
+        }
+        row.rubber_stamp = Some(is_flagged);
+    }
+
+    // Rows sorted by class name (BTreeMap order) with "unclassified" moved
+    // last — documented and deterministic.
+    let mut task_classes: Vec<TaskClassRow> = class_accs
+        .into_iter()
+        .map(|(task_class, acc)| TaskClassRow {
+            escalations_per_mission: acc.escalations as f64 / acc.missions as f64,
+            usd_per_commit: (acc.non_meta_commits > 0)
+                .then(|| acc.total_cost_usd / acc.non_meta_commits as f64),
+            cycle_mean_ms: (acc.cycle_count > 0)
+                .then(|| acc.cycle_total_ms as f64 / acc.cycle_count as f64),
+            task_class,
+            missions: acc.missions,
+            closed_missions: acc.closed_missions,
+            total_cost_usd: acc.total_cost_usd,
+            non_meta_commits: acc.non_meta_commits,
+            escalations: acc.escalations,
+            advisor_invocations: acc.advisor_invocations,
+        })
+        .collect();
+    task_classes.sort_by_key(|row| {
+        (
+            row.task_class == UNCLASSIFIED_TASK_CLASS,
+            row.task_class.clone(),
+        )
+    });
+
+    // Context-reuse rows: ONLY backends whose wire reports cache fields —
+    // a backend reporting none yields no row (absent, never a fabricated
+    // 0% split).
+    let context_reuse: Vec<ContextReuseRow> = reuse_accs
+        .into_values()
+        .filter(|acc| acc.backend.reports_cache_read_tokens())
+        .map(|acc| {
+            let cache_write = acc
+                .backend
+                .reports_cache_write_tokens()
+                .then_some(acc.cache_write);
+            let cached = acc.cache_read + cache_write.unwrap_or(0);
+            let total = acc.fresh_input + cached;
+            ContextReuseRow {
+                backend: acc.backend.as_str().to_string(),
+                missions: acc.missions,
+                runs: acc.runs,
+                fresh_input: acc.fresh_input,
+                cache_read: acc.cache_read,
+                cache_write,
+                reuse_share: (total > 0).then(|| cached as f64 / total as f64),
+            }
+        })
+        .collect();
+
+    // Industry-comparison set (KRZ-333): folded and attached only when the
+    // options pin a window (production resolve() does; the hermetic seam
+    // leaves it off and the section is simply absent). Folded over the
+    // per-mission inputs the native loop above already derived and memoized
+    // — the log scan is shared, never repeated; only the git probes run
+    // live (branch tips move independently of the logs). Derived, never
+    // stored.
+    let comparison = options
+        .comparison_window
+        .map(|(window_days, now)| {
+            crate::comparison_metrics::comparison_report_from_inputs(
+                repo_root,
+                &comparison_inputs,
+                window_days,
+                now,
+            )
+        })
+        .transpose()?;
 
     Ok(Outcomes {
         autonomy_ratio: AutonomyRatio {
@@ -608,6 +1207,179 @@ pub fn compute_outcomes(repo_root: &std::path::Path) -> anyhow::Result<Outcomes>
             total_ms: cycle_total_ms,
             mean_ms: (cycle_closed > 0).then(|| cycle_total_ms as f64 / cycle_closed as f64),
         },
+        task_classes,
+        context_reuse,
+        rubber_stamp: RubberStampReport {
+            threshold_ms: options.rubber_stamp_threshold_ms,
+            approved_decisions,
+            flagged,
+            share: (approved_decisions > 0).then(|| flagged as f64 / approved_decisions as f64),
+        },
+        gate_score_flags: crate::gate_score_flags::score_distribution_report(&all_score_samples),
+        divergences: divergence_acc,
+        comparison,
+    })
+}
+
+/// Default time window for [`compute_cost_per_merged_change`] (KRZ-329):
+/// 30 days. The window selects missions by their terminal-event timestamp
+/// and is inclusive at both ends (`cutoff <= terminal_ts <= now`).
+pub const DEFAULT_MERGED_CHANGE_WINDOW_DAYS: u64 = 30;
+
+/// Largest window [`compute_cost_per_merged_change`] accepts: 36,525 days
+/// (100 years) — far past any real audit window. The bound exists so the
+/// `u64 → i64` conversion and the chrono subtraction can never wrap, panic,
+/// or push the cutoff out of representable range (12th-pass review): the
+/// REST layer rejects over-bound values with 400, and the engine errors
+/// here so ANY caller is safe.
+pub const MAX_MERGED_CHANGE_WINDOW_DAYS: u64 = 36_525;
+
+/// Cost per merged change for one repo (KRZ-329), beside the autonomy
+/// ratio. The numerator is the existing cost fold over missions closed in
+/// the window; the denominator is merged changes — missions that COMPLETED
+/// in the window AND whose branch tip is an ancestor of the live base tip
+/// ([`crate::merged::merged_bit`]), derived at fold time, never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostPerMergedChange {
+    /// The window in effect (days).
+    pub window_days: u64,
+    /// Missions with a terminal event inside the window (any terminal kind —
+    /// the same closed set as [`AutonomyRatio`]).
+    pub closed_in_window: u64,
+    /// Σ worker cost over the windowed missions (same rule as
+    /// [`CostPerChange::total_cost_usd`]).
+    pub total_cost_usd: f64,
+    /// Windowed missions that closed COMPLETE with their branch landed.
+    pub merged_changes: u64,
+    /// total_cost_usd / merged_changes — None when nothing merged in the
+    /// window (absent, never zero: no fabricated numbers).
+    pub usd_per_merged_change: Option<f64>,
+    /// zero-intervention closed / closed over the same window — None when
+    /// nothing closed in it.
+    pub zero_intervention_share: Option<f64>,
+}
+
+/// Fold one repo's cost per merged change. Pure over (event logs, live git
+/// refs, `now`): the same inputs always yield byte-identical data, and no
+/// merge state is ever persisted — the ancestry probe runs at fold time.
+/// A mission with an unreadable/corrupt log is skipped (degrade per-row);
+/// a repo git fails to open simply yields no merged changes (the ratio
+/// reads absent, never zero). A `window_days` over
+/// [`MAX_MERGED_CHANGE_WINDOW_DAYS`] is an honest error — never a wrapped
+/// or panicked computation.
+pub fn compute_cost_per_merged_change(
+    repo_root: &std::path::Path,
+    window_days: u64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<CostPerMergedChange> {
+    let index_contents = std::fs::read_to_string(
+        crate::paths::MissionPaths::new(repo_root, "_")
+            .missions_dir()
+            .join("index.md"),
+    )
+    .unwrap_or_default();
+
+    let mut ids = crate::paths::MissionPaths::list_missions(repo_root);
+    for id in crate::mission_catalog::mission_index_ids(&index_contents) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+
+    // Bound the window BEFORE any arithmetic (12th-pass review): an
+    // unbounded `window_days` wraps the `as i64` cast negative (a cutoff in
+    // the future, silently windowing the wrong missions) or panics the
+    // chrono arithmetic — a read-authorized request could crash its own
+    // handler. The conversions stay checked so the failure mode is always
+    // an honest error, for this and every other caller.
+    if window_days > MAX_MERGED_CHANGE_WINDOW_DAYS {
+        return Err(crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} exceeds the maximum {MAX_MERGED_CHANGE_WINDOW_DAYS} days"
+        ))
+        .into());
+    }
+    let days = i64::try_from(window_days).map_err(|_| {
+        crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} is out of range"
+        ))
+    })?;
+    let window = chrono::Duration::try_days(days).ok_or_else(|| {
+        crate::error::EngineError::InvalidState(format!(
+            "window_days {window_days} is out of range"
+        ))
+    })?;
+    let cutoff = now - window;
+    let repo = crate::git_ops::GitRepo::open(repo_root).ok();
+
+    let mut closed_in_window: u64 = 0;
+    let mut zero_intervention: u64 = 0;
+    let mut total_cost_usd = 0.0;
+    let mut merged_changes: u64 = 0;
+
+    for id in ids {
+        let paths = crate::paths::MissionPaths::new(repo_root, &id);
+        let events_path = paths.events_file();
+        if !events_path.is_file() {
+            continue;
+        }
+        if paths.require_no_follow().is_err() {
+            continue;
+        }
+        let events = match crate::event_log::EventLog::read_events(&events_path) {
+            Ok(events) => events,
+            Err(_) => continue, // corrupt log degrades per-mission, never fails
+        };
+        // The window keys on the terminal event's own timestamp (the same
+        // "first terminal in seq order" the cycle-time fold uses).
+        let Some(terminal_ts) = events.iter().find_map(|e| {
+            matches!(
+                e.kind,
+                EventKind::MissionCompleted {}
+                    | EventKind::MissionFailed { .. }
+                    | EventKind::MissionAbandoned { .. }
+            )
+            .then_some(e.ts)
+        }) else {
+            continue; // still open — not in any closed window
+        };
+        if terminal_ts < cutoff || terminal_ts > now {
+            continue;
+        }
+        let out = mission_outcomes(&id, &events);
+        closed_in_window += 1;
+        if out.interventions == 0 {
+            zero_intervention += 1;
+        }
+        total_cost_usd += out.cost_usd;
+
+        // Merged change: closed COMPLETE and the mission branch landed on the
+        // live base (merged.rs's probe — the same derivation the mission rows
+        // and ticket projection use, run at fold time). The strict-reducer
+        // refs ride `mission_outcomes`' own fold — a log the reducer rejects
+        // yields no merged change (degrade per-mission, never fail the fold).
+        if let (Some(repo), Some(folded)) = (repo.as_ref(), out.comparison.folded.as_ref()) {
+            if folded.status == crate::types::MissionStatus::Complete
+                && crate::merged::merged_bit_for_branches(
+                    repo,
+                    &folded.mission_branch,
+                    &folded.base_branch,
+                ) == Some(true)
+            {
+                merged_changes += 1;
+            }
+        }
+    }
+
+    Ok(CostPerMergedChange {
+        window_days,
+        closed_in_window,
+        total_cost_usd,
+        merged_changes,
+        usd_per_merged_change: (merged_changes > 0).then(|| total_cost_usd / merged_changes as f64),
+        zero_intervention_share: (closed_in_window > 0)
+            .then(|| zero_intervention as f64 / closed_in_window as f64),
     })
 }
 
@@ -1011,7 +1783,82 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
+    }
+
+    /// Acceptance hint 2: the per-mission fold surfaces the divergence count
+    /// and the resolution KINDS (a candidate chosen vs judged-and-abandoned),
+    /// first-wins per unit — and a mission without pool activity has NO
+    /// ledger at all (absent, never a zeroed row).
+    #[test]
+    fn divergence_event_outcomes_fold_surfaces_count_and_resolution_kind() {
+        let candidate = |run_id: &str, tree: &str| crate::types::DivergenceCandidate {
+            run_id: run_id.into(),
+            branch: format!("kranz/pool/m-1/f-1-1-{run_id}"),
+            backend: "claude".into(),
+            tree: tree.into(),
+        };
+        let noted = |seq: u64, unit: &str, diverged: bool| {
+            ev(
+                seq,
+                "m-1",
+                seq as i64,
+                EventKind::DivergenceNoted {
+                    unit: unit.into(),
+                    candidates: vec![candidate("r-c0", "aaa"), candidate("r-c1", "bbb")],
+                    diverged,
+                },
+            )
+        };
+        let resolved = |seq: u64, unit: &str, selected: Option<u32>| {
+            ev(
+                seq,
+                "m-1",
+                seq as i64,
+                EventKind::DivergenceResolved {
+                    unit: unit.into(),
+                    selected,
+                    reason: "r".into(),
+                    decided_by: "operator".into(),
+                },
+            )
+        };
+        let events = vec![
+            noted(1, "f-1-1", true),       // diverged
+            noted(2, "f-1-2", false),      // agreement record
+            resolved(3, "f-1-1", Some(1)), // chose a candidate
+            resolved(4, "f-1-2", None),    // judged, none chosen
+            resolved(5, "f-1-1", Some(0)), // duplicate: first-wins
+        ];
+        let out = mission_outcomes("m-1", &events);
+        let ledger = out.divergences.expect("a pool mission has a ledger");
+        assert_eq!(ledger.noted, 2, "two units compared");
+        assert_eq!(ledger.diverged, 1);
+        assert_eq!(
+            ledger.agreed, 1,
+            "the agreement record counts — logged, never trusted"
+        );
+        assert_eq!(ledger.resolved_selected, 1, "first-wins dedupes the repeat");
+        assert_eq!(ledger.resolved_none, 1);
+
+        // A mission with NO divergence events has no ledger at all.
+        let quiet = mission_outcomes(
+            "m-1",
+            &[ev(
+                1,
+                "m-1",
+                1,
+                EventKind::UserMessage {
+                    text: "hi".into(),
+                    interrupt: false,
+                },
+            )],
+        );
+        assert_eq!(
+            quiet.divergences, None,
+            "absent for missions without pools — never a zeroed row"
+        );
     }
 
     mod compute_outcomes_tests {
@@ -1079,6 +1926,8 @@ mod tests {
                             role: Role::Worker,
                             feature_id: Some("f-1-1".into()),
                             milestone_id: Some("ms-1".into()),
+                            candidate: None,
+                            executor_route: None,
                             sdk_session_id: "s".into(),
                             model: "sonnet".into(),
                             quant: "n/a".into(),
@@ -1172,6 +2021,8 @@ mod tests {
                             role: Role::Worker,
                             feature_id: None,
                             milestone_id: Some("ms-1".into()),
+                            candidate: None,
+                            executor_route: None,
                             sdk_session_id: "s".into(),
                             model: "my-local-model".into(),
                             quant: "n/a".into(),
@@ -1259,6 +2110,64 @@ mod tests {
                 "appended events invalidate the memo entry"
             );
             assert_ne!(third, second);
+        }
+
+        /// 14th-pass review: the KRZ-333 comparison fold rides the memoized
+        /// native fold — one scan per log, not two per request. The cache
+        /// stats are the observable: a standalone comparison-report call
+        /// after a full outcomes fold must be a cache HIT (before the fix
+        /// the comparison path re-read every events.jsonl from disk,
+        /// invisible to the cache).
+        #[test]
+        fn comparison_fold_reuses_the_memoized_native_fold_scan() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let events_path = MissionPaths::new(root, "m-cmp").events_file();
+            seed_mission(
+                root,
+                "m-cmp",
+                vec![
+                    created("g"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionCompleted {},
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 0)),
+                "the native fold computes once"
+            );
+            // The comparison section attached to the SAME fold (a tempdir is
+            // no git repo, so the denominator reads absent; the base anchor
+            // from mission.created still records).
+            let attached = outcomes
+                .comparison
+                .as_ref()
+                .expect("resolve() pins the comparison window");
+            assert_eq!(
+                attached.assisted_change_share.base_branch.as_deref(),
+                Some("main")
+            );
+            assert_eq!(attached.window_days, DEFAULT_MERGED_CHANGE_WINDOW_DAYS);
+
+            // The standalone entry point reuses the memoized scan too.
+            let report = crate::comparison_metrics::compute_comparison_report(
+                root,
+                DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            assert_eq!(
+                cache_entry_stats(&events_path),
+                Some((1, 1)),
+                "the comparison fold must ride the memoized scan, not re-read the log"
+            );
+            assert_eq!(&report, attached, "same inputs, same report");
         }
 
         fn created(goal: &str) -> EventKind {
@@ -1438,6 +2347,29 @@ mod tests {
             assert!(outcomes.escalations.is_empty());
         }
 
+        /// 12th-pass review: an unbounded `window_days` once wrapped the
+        /// `as i64` cast negative or panicked the chrono arithmetic — a
+        /// read-authorized request could crash its handler. Over the
+        /// documented maximum is now an honest error for ANY caller;
+        /// the maximum itself still computes.
+        #[test]
+        fn window_days_bound_over_max_errors_instead_of_panicking() {
+            let tmp = TempDir::new().unwrap();
+            let now = Utc::now();
+            let err = compute_cost_per_merged_change(tmp.path(), u64::MAX, now)
+                .expect_err("u64::MAX must error, never wrap or panic");
+            assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+            let err =
+                compute_cost_per_merged_change(tmp.path(), MAX_MERGED_CHANGE_WINDOW_DAYS + 1, now)
+                    .expect_err("just over the bound errors");
+            assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+            let report =
+                compute_cost_per_merged_change(tmp.path(), MAX_MERGED_CHANGE_WINDOW_DAYS, now)
+                    .expect("the documented maximum computes");
+            assert_eq!(report.window_days, MAX_MERGED_CHANGE_WINDOW_DAYS);
+            assert_eq!(report.closed_in_window, 0);
+        }
+
         #[test]
         fn outcomes_skips_mission_with_corrupt_event_log() {
             let tmp = TempDir::new().unwrap();
@@ -1463,6 +2395,802 @@ mod tests {
 
             let outcomes = compute_outcomes(root).unwrap();
             assert_eq!(outcomes.autonomy_ratio.closed_missions, 1);
+        }
+
+        /// The fleet ledger sums only missions that HAVE one; a repo with no
+        /// pool activity reports None (absent — never a fabricated zero).
+        #[test]
+        fn divergence_event_fleet_ledger_sums_only_pool_missions() {
+            let candidate = |run_id: &str| crate::types::DivergenceCandidate {
+                run_id: run_id.into(),
+                branch: format!("kranz/pool/m-pool/f-1-1-{run_id}"),
+                backend: "claude".into(),
+                tree: "aaa".into(),
+            };
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-pool",
+                vec![
+                    created("pool"),
+                    EventKind::DivergenceNoted {
+                        unit: "f-1-1".into(),
+                        candidates: vec![candidate("r-c0"), candidate("r-c1")],
+                        diverged: true,
+                    },
+                    EventKind::DivergenceResolved {
+                        unit: "f-1-1".into(),
+                        selected: Some(0),
+                        reason: "kept".into(),
+                        decided_by: "operator".into(),
+                    },
+                ],
+            );
+            seed_mission(root, "m-quiet", vec![created("quiet")]);
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let ledger = outcomes
+                .divergences
+                .expect("a repo with a pool mission reports a fleet ledger");
+            assert_eq!(ledger.noted, 1);
+            assert_eq!(ledger.diverged, 1);
+            assert_eq!(ledger.agreed, 0);
+            assert_eq!(ledger.resolved_selected, 1);
+            assert_eq!(ledger.resolved_none, 0);
+
+            // No pool activity anywhere → the fleet ledger is absent, and
+            // stays off the wire (additive: pool-less reports are unchanged).
+            let tmp2 = TempDir::new().unwrap();
+            seed_mission(tmp2.path(), "m-quiet", vec![created("quiet")]);
+            let outcomes = compute_outcomes(tmp2.path()).unwrap();
+            assert_eq!(outcomes.divergences, None);
+            let value = serde_json::to_value(&outcomes).unwrap();
+            assert!(
+                !value.as_object().unwrap().contains_key("divergences"),
+                "no divergences key on the wire without pools: {value}"
+            );
+        }
+    }
+
+    /// KRZ-321/323 fold extensions: per-task-class rows, the context-reuse
+    /// split, and the rubber-stamp flag — all derived from the same event
+    /// log at fold time.
+    mod outcomes_report_tests {
+        use super::*;
+        use crate::paths::MissionPaths;
+        use crate::types::{GrantKind, MissionConfig, Role, RunResult, TokenUsage};
+        use tempfile::TempDir;
+
+        fn ev_ms(seq: u64, mission_id: &str, ts_ms: i64, kind: EventKind) -> Event {
+            Event {
+                seq,
+                ts: DateTime::from_timestamp_millis(ts_ms).unwrap(),
+                mission_id: mission_id.to_string(),
+                kind,
+            }
+        }
+
+        fn write_log(repo_root: &std::path::Path, id: &str, events: Vec<Event>) {
+            let paths = MissionPaths::new(repo_root, id);
+            std::fs::create_dir_all(paths.mission_dir()).unwrap();
+            let lines: Vec<String> = events
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect();
+            std::fs::write(paths.events_file(), lines.join("\n") + "\n").unwrap();
+        }
+
+        fn sample_plan() -> crate::types::Plan {
+            crate::types::Plan {
+                goal: "g".into(),
+                validation_contract: vec![],
+                milestones: vec![],
+                considered_alternatives: None,
+                command_grants: vec![],
+                touch_set: vec![],
+                standards_manifest: None,
+            }
+        }
+
+        /// A mission.created whose goal carries a `task-class` heading in the
+        /// exact layout [`crate::ticket::Ticket::mission_goal`] folds it in.
+        fn created_with_class(mission_branch: &str, task_class: Option<&str>) -> EventKind {
+            let goal = match task_class {
+                Some(class) => format!("do the thing\n\n## Task class\n{class}\n"),
+                None => "do the thing".to_string(),
+            };
+            created_with_config(mission_branch, goal, MissionConfig::default())
+        }
+
+        fn created_with_config(
+            mission_branch: &str,
+            goal: String,
+            config: MissionConfig,
+        ) -> EventKind {
+            EventKind::MissionCreated {
+                goal,
+                base_branch: "main".into(),
+                mission_branch: mission_branch.into(),
+                config,
+            }
+        }
+
+        fn worker_spawned(run_id: &str) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: run_id.into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "s".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "t".into(),
+            }
+        }
+
+        fn worker_completed(run_id: &str, tokens: TokenUsage, cost_usd: f64) -> EventKind {
+            EventKind::WorkerCompleted {
+                run_id: run_id.into(),
+                result: RunResult::Pass,
+                tokens,
+                cost_usd: Some(cost_usd),
+                report: None,
+            }
+        }
+
+        fn grant_req(seq: u64, mission_id: &str, ts_ms: i64, command: &str) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind: GrantKind::Command,
+                    command: command.into(),
+                },
+            )
+        }
+
+        fn grant_yes(seq: u64, mission_id: &str, ts_ms: i64, command: &str) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: command.into(),
+                },
+            )
+        }
+
+        #[test]
+        fn outcomes_report_task_class_rows_group_and_unclassified_last() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-a: execution-class, closed, $10 spend, one non-meta commit,
+            // one approved grant park, a 100s cycle.
+            write_log(
+                root,
+                "m-a",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-a",
+                        0,
+                        created_with_class("kranz/m-a", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-a", 1_000, worker_spawned("r-a")),
+                    ev_ms(
+                        3,
+                        "m-a",
+                        2_000,
+                        worker_completed(
+                            "r-a",
+                            TokenUsage {
+                                input: 1,
+                                output: 1,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            10.0,
+                        ),
+                    ),
+                    ev_ms(
+                        4,
+                        "m-a",
+                        3_000,
+                        EventKind::FeatureCompleted {
+                            feature_id: "f-1-1".into(),
+                            commits: vec!["aaa [f-1-1] add the thing".to_string()],
+                        },
+                    ),
+                    grant_req(5, "m-a", 4_000, "cargo test"),
+                    grant_yes(6, "m-a", 64_000, "cargo test"),
+                    ev_ms(7, "m-a", 100_000, EventKind::MissionCompleted {}),
+                ],
+            );
+            // m-b: same class, still open (no terminal), $5 spend, one
+            // pending grant park.
+            write_log(
+                root,
+                "m-b",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-b",
+                        0,
+                        created_with_class("kranz/m-b", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-b", 1_000, worker_spawned("r-b")),
+                    ev_ms(
+                        3,
+                        "m-b",
+                        2_000,
+                        worker_completed(
+                            "r-b",
+                            TokenUsage {
+                                input: 1,
+                                output: 1,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            5.0,
+                        ),
+                    ),
+                    grant_req(4, "m-b", 3_000, "cargo clippy"),
+                ],
+            );
+            // m-c: no task class in its goal, closed with a 50s cycle, no
+            // escalations and no spend.
+            write_log(
+                root,
+                "m-c",
+                vec![
+                    ev_ms(1, "m-c", 0, created_with_class("kranz/m-c", None)),
+                    ev_ms(2, "m-c", 50_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.task_classes.len(), 2);
+            let exec = &outcomes.task_classes[0];
+            assert_eq!(exec.task_class, "execution-class");
+            assert_eq!(exec.missions, 2);
+            assert_eq!(exec.closed_missions, 1);
+            assert_eq!(exec.total_cost_usd, 15.0);
+            assert_eq!(exec.non_meta_commits, 1);
+            assert_eq!(exec.usd_per_commit, Some(15.0));
+            assert_eq!(exec.escalations, 2);
+            assert_eq!(exec.advisor_invocations, 2);
+            assert_eq!(exec.escalations_per_mission, 1.0);
+            assert_eq!(exec.cycle_mean_ms, Some(100_000.0));
+
+            let unclassified = &outcomes.task_classes[1];
+            assert_eq!(unclassified.task_class, UNCLASSIFIED_TASK_CLASS);
+            assert_eq!(unclassified.missions, 1);
+            assert_eq!(unclassified.closed_missions, 1);
+            assert_eq!(unclassified.non_meta_commits, 0);
+            // Missing data is absent, never zero-filled.
+            assert_eq!(unclassified.usd_per_commit, None);
+            assert_eq!(unclassified.escalations, 0);
+            assert_eq!(unclassified.advisor_invocations, 0);
+            assert_eq!(unclassified.escalations_per_mission, 0.0);
+            assert_eq!(unclassified.cycle_mean_ms, Some(50_000.0));
+        }
+
+        #[test]
+        fn outcomes_report_context_reuse_split_absent_for_unreporting_backends() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Claude run with cache fields reported.
+            write_log(
+                root,
+                "m-claude",
+                vec![
+                    ev_ms(1, "m-claude", 0, created_with_class("kranz/m-c", None)),
+                    ev_ms(2, "m-claude", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-claude",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 500,
+                                output: 10,
+                                cache_read: 800,
+                                cache_write: 200,
+                            },
+                            1.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-claude", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+            // Local-tier mission: the local backend's wire carries no cache
+            // fields at all, so it must yield NO reuse row (absent — never a
+            // fabricated 0% split).
+            let mut local_cfg = MissionConfig::default();
+            local_cfg.worker.backend = Some("local".into());
+            write_log(
+                root,
+                "m-local",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-local",
+                        0,
+                        created_with_config("kranz/m-l", "g".into(), local_cfg),
+                    ),
+                    ev_ms(2, "m-local", 1_000, worker_spawned("r-2")),
+                    ev_ms(
+                        3,
+                        "m-local",
+                        2_000,
+                        worker_completed(
+                            "r-2",
+                            TokenUsage {
+                                input: 100,
+                                output: 10,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                            0.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-local", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.context_reuse.len(), 1);
+            let row = &outcomes.context_reuse[0];
+            assert_eq!(row.backend, "claude");
+            assert_eq!(row.missions, 1);
+            assert_eq!(row.runs, 1);
+            assert_eq!(row.fresh_input, 500);
+            assert_eq!(row.cache_read, 800);
+            assert_eq!(row.cache_write, Some(200));
+            assert_eq!(row.reuse_share, Some(1_000.0 / 1_500.0));
+        }
+
+        #[test]
+        fn outcomes_report_context_reuse_codex_cache_write_is_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Codex reports cached input tokens but has no cache-write field
+            // on its wire: cache_read is real, cache_write must be absent
+            // (None), never zero-filled.
+            let mut codex_cfg = MissionConfig::default();
+            codex_cfg.worker.backend = Some("codex".into());
+            write_log(
+                root,
+                "m-codex",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-codex",
+                        0,
+                        created_with_config("kranz/m-x", "g".into(), codex_cfg),
+                    ),
+                    ev_ms(2, "m-codex", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-codex",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 900,
+                                output: 10,
+                                cache_read: 100,
+                                cache_write: 0,
+                            },
+                            1.0,
+                        ),
+                    ),
+                    ev_ms(4, "m-codex", 3_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.context_reuse.len(), 1);
+            let row = &outcomes.context_reuse[0];
+            assert_eq!(row.backend, "codex");
+            assert_eq!(row.cache_read, 100);
+            assert_eq!(row.cache_write, None);
+            assert_eq!(row.reuse_share, Some(100.0 / 1_000.0));
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_boundary_at_threshold() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // Five parks against the default 10s threshold:
+            // - 9_999ms approval → flagged (strictly under);
+            // - 10_000ms approval → NOT flagged (at the threshold);
+            // - 15_000ms approval → NOT flagged (over);
+            // - 5_000ms DENIAL → marker does not apply (a fast deny is not a
+            //   rubber stamp) and is not in the population;
+            // - pending → no marker, not in the population.
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "under"),
+                    grant_yes(4, "m-1", 11_999, "under"),
+                    grant_req(5, "m-1", 20_000, "at"),
+                    grant_yes(6, "m-1", 30_000, "at"),
+                    grant_req(7, "m-1", 40_000, "over"),
+                    grant_yes(8, "m-1", 55_000, "over"),
+                    grant_req(9, "m-1", 60_000, "denied-fast"),
+                    ev_ms(
+                        10,
+                        "m-1",
+                        65_000,
+                        EventKind::GrantDenied {
+                            kind: GrantKind::Command,
+                            command: "denied-fast".into(),
+                            reason: "no".into(),
+                        },
+                    ),
+                    grant_req(11, "m-1", 70_000, "pending"),
+                    ev_ms(12, "m-1", 80_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            let stamp = &outcomes.rubber_stamp;
+            assert_eq!(
+                stamp.threshold_ms,
+                crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS
+            );
+            assert_eq!(stamp.approved_decisions, 3);
+            assert_eq!(stamp.flagged, 1);
+            assert_eq!(stamp.share, Some(1.0 / 3.0));
+
+            let marker = |summary: &str| {
+                outcomes
+                    .escalations
+                    .iter()
+                    .find(|r| r.summary == summary)
+                    .unwrap()
+                    .rubber_stamp
+            };
+            assert_eq!(marker("under"), Some(true));
+            assert_eq!(
+                marker("at"),
+                Some(false),
+                "at the threshold is not under it"
+            );
+            assert_eq!(marker("over"), Some(false));
+            assert_eq!(marker("denied-fast"), None);
+            assert_eq!(marker("pending"), None);
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_threshold_resolves_from_config() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // The threshold is a config key (rubberStampThresholdMs); the
+            // project layer sets 60s here, so a 15s approval flags.
+            std::fs::create_dir_all(root.join(".kranz")).unwrap();
+            std::fs::write(
+                root.join(".kranz").join("config.json"),
+                "{\"rubberStampThresholdMs\": 60000}",
+            )
+            .unwrap();
+            assert_eq!(
+                OutcomesOptions::resolve(root).rubber_stamp_threshold_ms,
+                60_000
+            );
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "fifteen seconds"),
+                    grant_yes(4, "m-1", 17_000, "fifteen seconds"),
+                    ev_ms(5, "m-1", 20_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            // compute_outcomes is the config-reading entry point the CLI and
+            // REST surfaces call.
+            let outcomes = compute_outcomes(root).unwrap();
+            assert_eq!(outcomes.rubber_stamp.threshold_ms, 60_000);
+            assert_eq!(outcomes.rubber_stamp.flagged, 1);
+            assert_eq!(outcomes.rubber_stamp.share, Some(1.0));
+            assert_eq!(outcomes.escalations[0].rubber_stamp, Some(true));
+        }
+
+        #[test]
+        fn outcomes_report_rubber_stamp_absent_without_approvals() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                    ev_ms(
+                        2,
+                        "m-1",
+                        1_000,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    grant_req(3, "m-1", 2_000, "only-denied"),
+                    ev_ms(
+                        4,
+                        "m-1",
+                        3_000,
+                        EventKind::GrantDenied {
+                            kind: GrantKind::Command,
+                            command: "only-denied".into(),
+                            reason: "no".into(),
+                        },
+                    ),
+                    ev_ms(5, "m-1", 4_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            assert_eq!(outcomes.rubber_stamp.approved_decisions, 0);
+            assert_eq!(outcomes.rubber_stamp.flagged, 0);
+            assert_eq!(outcomes.rubber_stamp.share, None);
+            assert_eq!(outcomes.escalations[0].rubber_stamp, None);
+        }
+
+        #[test]
+        fn outcomes_report_fold_is_byte_identical_across_repeated_computes() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            write_log(
+                root,
+                "m-1",
+                vec![
+                    ev_ms(
+                        1,
+                        "m-1",
+                        0,
+                        created_with_class("kranz/m-1", Some("execution-class")),
+                    ),
+                    ev_ms(2, "m-1", 1_000, worker_spawned("r-1")),
+                    ev_ms(
+                        3,
+                        "m-1",
+                        2_000,
+                        worker_completed(
+                            "r-1",
+                            TokenUsage {
+                                input: 500,
+                                output: 10,
+                                cache_read: 800,
+                                cache_write: 200,
+                            },
+                            3.0,
+                        ),
+                    ),
+                    grant_req(4, "m-1", 3_000, "cargo test"),
+                    grant_yes(5, "m-1", 6_000, "cargo test"),
+                    ev_ms(6, "m-1", 10_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let options = OutcomesOptions::default();
+            let first = compute_outcomes_with_options(root, &options).unwrap();
+            let second = compute_outcomes_with_options(root, &options).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap(),
+                "the same log plus the same options yields byte-identical data"
+            );
+        }
+
+        /// A `gate.result` event; `score` is the (score, threshold) pair a
+        /// scored gate reports, `None` for a boolean-only gate (the
+        /// gate_scores.rs fixture idiom).
+        fn gate_scored(
+            seq: u64,
+            mission_id: &str,
+            ts_ms: i64,
+            gate: &str,
+            score: Option<(f64, f64)>,
+        ) -> Event {
+            ev_ms(
+                seq,
+                mission_id,
+                ts_ms,
+                EventKind::GateResult {
+                    gate: gate.into(),
+                    surface: crate::gate::GateSurface::Approval,
+                    kind: crate::gate::GateKind::Deterministic,
+                    index: 0,
+                    verdict: crate::gate::GateVerdict::Pass,
+                    artefact_ref: format!("contract gate {gate}"),
+                    artefact_detail: None,
+                    score: score.map(|(score, _)| score),
+                    threshold: score.map(|(_, threshold)| threshold),
+                    rule_ids: Vec::new(),
+                },
+            )
+        }
+
+        /// KRZ-316: the distribution flags fold beside the rubber-stamp
+        /// signal in ONE report — the documented complement. Ten constant
+        /// far-from-threshold scores across two missions flag the gate
+        /// (never-approaches AND near-constant) while a sub-10s grant
+        /// approval flags the human side; the ledger rows stay untouched
+        /// (the gate smell is the summary field, never a row marker).
+        #[test]
+        fn score_distribution_flag_outcomes_fold_flags_beside_rubber_stamp() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            let mut m1 = vec![
+                ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None)),
+                ev_ms(
+                    2,
+                    "m-1",
+                    1_000,
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                ),
+                grant_req(3, "m-1", 2_000, "cargo test"),
+                grant_yes(4, "m-1", 4_000, "cargo test"),
+            ];
+            for i in 0..5 {
+                m1.push(gate_scored(
+                    5 + i,
+                    "m-1",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m1.push(ev_ms(10, "m-1", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-1", m1);
+
+            let mut m2 = vec![ev_ms(1, "m-2", 0, created_with_class("kranz/m-2", None))];
+            for i in 0..5 {
+                m2.push(gate_scored(
+                    2 + i,
+                    "m-2",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m2.push(ev_ms(7, "m-2", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-2", m2);
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+
+            // The human-side signal, as before.
+            assert_eq!(outcomes.rubber_stamp.flagged, 1);
+            assert_eq!(outcomes.escalations[0].rubber_stamp, Some(true));
+
+            // The gate-side complement beside it.
+            let report = &outcomes.gate_score_flags;
+            assert_eq!(report.scored_gates, 1);
+            assert_eq!(report.assessed_gates, 1);
+            assert_eq!(report.flags.len(), 2);
+            assert!(
+                report.flags.iter().all(|f| f.gate == "vacuous-filter"),
+                "the flag names the gate: {report:?}"
+            );
+            let kinds: Vec<_> = report.flags.iter().map(|f| f.kind).collect();
+            assert_eq!(
+                kinds,
+                [
+                    crate::gate_score_flags::GateScoreFlagKind::NeverApproachesThreshold,
+                    crate::gate_score_flags::GateScoreFlagKind::NearConstant,
+                ]
+            );
+            // The flag carries the distribution that triggered it: ten
+            // samples over BOTH missions, closest approach 0.5, variance 0.
+            let d = &report.flags[0].distribution;
+            assert_eq!(d.samples, 10);
+            assert_eq!(d.closest_approach, 0.5);
+            assert_eq!(d.variance, 0.0);
+            // The rule constants ride the wire (the rubber-stamp idiom).
+            assert_eq!(
+                report.min_samples,
+                crate::gate_score_flags::MIN_SAMPLE_COUNT
+            );
+        }
+
+        /// KRZ-316 absence rules in the outcomes fold: a scored gate below
+        /// the minimum sample is counted but NEVER assessed (no flags, no
+        /// zero-filled distribution), and a boolean-only gate produces no
+        /// population at all — it appears nowhere in the report.
+        #[test]
+        fn score_distribution_flag_outcomes_fold_sub_minimum_and_unscored_absent() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-1: three scored evaluations — under the 10-sample minimum.
+            let mut m1 = vec![ev_ms(1, "m-1", 0, created_with_class("kranz/m-1", None))];
+            for i in 0..3 {
+                m1.push(gate_scored(
+                    2 + i,
+                    "m-1",
+                    5_000 + i as i64,
+                    "vacuous-filter",
+                    Some((0.5, 1.0)),
+                ));
+            }
+            m1.push(ev_ms(5, "m-1", 10_000, EventKind::MissionCompleted {}));
+            write_log(root, "m-1", m1);
+
+            // m-2: only boolean-only gate events — no score pair at all.
+            write_log(
+                root,
+                "m-2",
+                vec![
+                    ev_ms(1, "m-2", 0, created_with_class("kranz/m-2", None)),
+                    gate_scored(2, "m-2", 5_000, "env-sensitive", None),
+                    gate_scored(3, "m-2", 6_000, "env-sensitive", None),
+                    ev_ms(4, "m-2", 10_000, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            let outcomes =
+                compute_outcomes_with_options(root, &OutcomesOptions::default()).unwrap();
+            let report = &outcomes.gate_score_flags;
+            assert_eq!(
+                report.scored_gates, 1,
+                "the unscored gate adds no population: {report:?}"
+            );
+            assert_eq!(report.assessed_gates, 0, "under the minimum: unassessed");
+            assert!(
+                report.flags.is_empty(),
+                "absent, never a zero-filled row: {report:?}"
+            );
         }
     }
 }

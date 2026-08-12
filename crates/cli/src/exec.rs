@@ -329,6 +329,25 @@ mod tests {
         assert_eq!(exit_code_for(MissionStatus::Abandoned), 1);
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`):
+    /// `--allow-unvalidated` lifts EXACTLY the unattended scrutiny floor —
+    /// its blast radius is one refuse-to-run gate, never a validator's deny
+    /// list or the validators themselves (`skipScrutiny` stays an operator
+    /// config decision; the flag only acknowledges it for a headless run,
+    /// and changes nothing when no floor was tripped).
+    #[test]
+    fn composition_audit_allow_unvalidated_lifts_only_the_unattended_scrutiny_floor() {
+        // The floor holds without the flag, and the refusal names it.
+        let err = scrutiny_gate(true, false).unwrap_err();
+        assert!(err.contains("--allow-unvalidated"), "{err}");
+        // The flag acknowledges the floor.
+        assert!(scrutiny_gate(true, true).is_ok());
+        // With validators enabled, the flag is inert — identical outcomes
+        // with and without it.
+        assert!(scrutiny_gate(false, false).is_ok());
+        assert!(scrutiny_gate(false, true).is_ok());
+    }
+
     #[test]
     fn push_failure_exit_code_is_distinct() {
         // Mission COMPLETE → 0; push failure must not reuse that (or 1/2/3).

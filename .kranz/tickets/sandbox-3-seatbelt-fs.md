@@ -1,4 +1,5 @@
 ---
+state: done
 title: macOS Seatbelt profiles: enforce=fs for worker sessions
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: d7c8330: 'context over credentials' dimension in ready.rs — vault present / scan gate committed / no tracked .env (index-read) / worker docs; evidence names failing signals + offending env files; fixtures for all three acceptance cases; dogfood on this repo 10/10. Contributes to score + --json; AMM ladder unchanged (MAPPING_VERSION still 1).
 title: kranz ready dimension — context-rich without credential-rich
 priority: 3
 schedule: once

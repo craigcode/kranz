@@ -179,8 +179,9 @@ pub struct MissionEscalation {
 }
 
 /// Kebab-case wire name of a [`crate::types::GrantKind`] (mirrors its serde
-/// rename) for the ledger's `ask` text.
-fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
+/// rename) for the ledger's `ask` text. `pub(crate)` so the provenance
+/// replay's grant-decision summaries spell the kind identically.
+pub(crate) fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
     match kind {
         crate::types::GrantKind::Command => "command",
         crate::types::GrantKind::TouchPath => "touch-path",
@@ -190,9 +191,71 @@ fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
 }
 
 /// True when a `milestone.unblocked` reason is the engine-owned workspace-gate
-/// lift rather than an operator decision.
-fn is_engine_lift(reason: &str) -> bool {
+/// lift rather than an operator decision. `pub(crate)` so the provenance
+/// replay excludes the same lift from its human-decision chain — one
+/// classification rule, no drift between the two folds.
+pub(crate) fn is_engine_lift(reason: &str) -> bool {
     reason == crate::workspace_gate::GATE_LIFT_REASON
+}
+
+/// Pair each `grant.requested` (in seq order) with the `grant.approved` /
+/// `grant.denied` that answered it, returning `(request_index,
+/// Option<decision_index>)` pairs indexing `mission_events`: the earliest
+/// LATER decision for the same command, falling back to the next unconsumed
+/// decision in seq order (partial/hand-edited logs), each decision consumed
+/// at most once. `None` means the park was never answered (pending).
+///
+/// Extracted for the training-corpus export ([`crate::corpus_export`]) — the
+/// THIRD user of this rule (outcomes.rs carries the first, the ledger fold
+/// below the second) — so the ledger and the corpus pair identical logs
+/// identically and can never drift. `mission_events` must be in ascending
+/// `seq` order or "earliest later" is meaningless.
+pub(crate) fn pair_grant_decisions(mission_events: &[&Event]) -> Vec<(usize, Option<usize>)> {
+    let mut used_decisions = vec![false; mission_events.len()];
+    let mut pairs = Vec::new();
+    for (req_idx, req) in mission_events.iter().enumerate() {
+        let EventKind::GrantRequested { command, .. } = &req.kind else {
+            continue;
+        };
+
+        let mut matched: Option<usize> = None;
+        for (i, cand) in mission_events.iter().enumerate() {
+            if i <= req_idx || used_decisions[i] {
+                continue;
+            }
+            let cand_command = match &cand.kind {
+                EventKind::GrantApproved { command, .. }
+                | EventKind::GrantDenied { command, .. } => command,
+                _ => continue,
+            };
+            if cand_command == command {
+                matched = Some(i);
+                break;
+            }
+        }
+        if matched.is_none() {
+            // Fallback for partial/hand-edited logs (mirrors outcomes.rs):
+            // take the next unconsumed decision in seq order even when it
+            // answers a different command.
+            for (i, cand) in mission_events.iter().enumerate() {
+                if i <= req_idx || used_decisions[i] {
+                    continue;
+                }
+                if matches!(
+                    cand.kind,
+                    EventKind::GrantApproved { .. } | EventKind::GrantDenied { .. }
+                ) {
+                    matched = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(i) = matched {
+            used_decisions[i] = true;
+        }
+        pairs.push((req_idx, matched));
+    }
+    pairs
 }
 
 /// Fold one mission's escalation data from its event slice. `events` may
@@ -256,58 +319,23 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
         }
     }
 
-    // Grant parks: match each request to the earliest later decision with the
-    // same command (falling back to the next decision in seq order), consuming
-    // each decision at most once — the same matching rule as outcomes.rs, so
-    // both folds pair identical logs identically.
+    // Grant parks: pair each request with its decision via the shared rule
+    // ([`pair_grant_decisions`]) so this fold, outcomes.rs, and the
+    // training-corpus export pair identical logs identically.
     let mut latencies_ms = Vec::new();
-    let mut used_decisions = vec![false; mission_events.len()];
-    for (req_idx, req) in mission_events.iter().enumerate() {
+    for (req_idx, matched) in pair_grant_decisions(&mission_events) {
+        let req = mission_events[req_idx];
         let EventKind::GrantRequested {
             milestone_id,
             kind,
             command,
         } = &req.kind
         else {
-            continue;
+            unreachable!("pair_grant_decisions only returns grant.requested indices")
         };
-
-        let mut matched: Option<usize> = None;
-        for (i, cand) in mission_events.iter().enumerate() {
-            if i <= req_idx || used_decisions[i] {
-                continue;
-            }
-            let cand_command = match &cand.kind {
-                EventKind::GrantApproved { command, .. }
-                | EventKind::GrantDenied { command, .. } => command,
-                _ => continue,
-            };
-            if cand_command == command {
-                matched = Some(i);
-                break;
-            }
-        }
-        if matched.is_none() {
-            // Fallback for partial/hand-edited logs (mirrors outcomes.rs):
-            // take the next unconsumed decision in seq order even when it
-            // answers a different command.
-            for (i, cand) in mission_events.iter().enumerate() {
-                if i <= req_idx || used_decisions[i] {
-                    continue;
-                }
-                if matches!(
-                    cand.kind,
-                    EventKind::GrantApproved { .. } | EventKind::GrantDenied { .. }
-                ) {
-                    matched = Some(i);
-                    break;
-                }
-            }
-        }
 
         let (decision, latency_ms) = match matched {
             Some(i) => {
-                used_decisions[i] = true;
                 let decided = mission_events[i];
                 let latency = (decided.ts - req.ts).num_milliseconds();
                 let latency_ms = if latency >= 0 {
@@ -503,7 +531,10 @@ pub fn aggregate(
 /// Read every ticket's `traced-from-mission` frontmatter into defect→mission
 /// links. Absent field = not a traced defect (no false positives); tickets
 /// that fail to parse are already skipped by [`crate::ticket::Ticket::list`].
-fn traced_defects_from_tickets(repo_root: &std::path::Path) -> Vec<TracedDefect> {
+/// `pub(crate)` so the industry-comparison fold
+/// ([`crate::comparison_metrics`]) joins the SAME recorded links for its
+/// defect density — one linkage source, no drift between the two folds.
+pub(crate) fn traced_defects_from_tickets(repo_root: &std::path::Path) -> Vec<TracedDefect> {
     let mut out: Vec<TracedDefect> = crate::ticket::Ticket::list(repo_root)
         .into_iter()
         .filter_map(|ticket| {
@@ -597,6 +628,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 

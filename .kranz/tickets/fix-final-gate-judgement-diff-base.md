@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: code fix landed by hand (09bebcb); deferred regression test landed in b287651 (judge_gate_diff_uses_pinned_base_sha). m-e96644, approved to deliver exactly that test, verified superseded on main 2026-07-23 and abandoned unrun; branch deleted.
 title: Final-gate judgement diff must use pinned base_sha, not the moving base branch
 priority: 3
 schedule: once

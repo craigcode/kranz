@@ -17,6 +17,18 @@ use std::path::Path;
 /// mission branch beside plan.json for later review and reference. Pure and
 /// deterministic given its inputs (no wall-clock reads; the estimate is
 /// computed by the caller and passed in).
+///
+/// `gate_reports` carries the named contract-validation gate verdicts
+/// ([`crate::contract_gates`], ticket contract-validation-gates.md) rendered
+/// into the Contract lint section; callers that do not run the gates
+/// (re-plan previews — see the orchestrator's no-lint note) pass `&[]`.
+///
+/// `pool` is the mission's configured dispatch pool
+/// ([`crate::types::MissionConfig::worker_candidates`], KRZ-303): empty for
+/// the ordinary single-backend shape (no pool section rendered); the
+/// approval-time spend-consent surface otherwise — it must name N and say
+/// what the multiplied estimate pays for.
+#[allow(clippy::too_many_arguments)]
 pub fn render_plan_markdown(
     plan: &Plan,
     mission: &Mission,
@@ -25,6 +37,8 @@ pub fn render_plan_markdown(
     fit_note: Option<&str>,
     missions_used: usize,
     contract_lint: &contract_lint::ContractLintReport,
+    gate_reports: &[crate::gate::GateReport],
+    pool: &[CandidateSpec],
 ) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
@@ -85,6 +99,46 @@ pub fn render_plan_markdown(
         let _ = writeln!(md, "{note}\n");
     }
 
+    // Dispatch-pool spend consent (KRZ-303; the positioning ADR's 2026-07-31
+    // boundary gloss). The approval surface must name N and say what the
+    // multiplied estimate pays for — the operator is consenting to N paid
+    // worker sessions per unit of work, and the per-mission budget applies
+    // to the SUM. The two negative claims are the ticket's other two freeze
+    // properties, stated where consent is given: outputs are candidates for
+    // judgement (never auto-merged into a winner), and the claimed value is
+    // divergence for scrutiny (never throughput).
+    if !pool.is_empty() {
+        let n = pool.len();
+        let _ = writeln!(md, "## Dispatch pool — {n} candidates per unit of work\n");
+        let _ = writeln!(
+            md,
+            "Every worker feature is dispatched to **{n} backends concurrently** \
+             (heterogeneous dispatch, KRZ-303), one git worktree per stream:"
+        );
+        for (i, candidate) in pool.iter().enumerate() {
+            let _ = writeln!(
+                md,
+                "{}. `{}` / `{}`",
+                i + 1,
+                candidate.backend,
+                candidate.model
+            );
+        }
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "Each stream's output is recorded as a sibling **candidate for judgement** tied to \
+             the same unit of work. The engine never selects, ranks, or merges a candidate into \
+             a winner — selection is a later human judgement act — and the pool's claimed value \
+             is **divergence for scrutiny, not throughput**.\n"
+        );
+        let _ = writeln!(
+            md,
+            "**Cost multiplies by {n}:** the estimate above already prices all {n} candidates \
+             for every worker unit, and the per-mission budget applies to that SUM.\n"
+        );
+    }
+
     if let Some(alternatives) = &plan.considered_alternatives {
         let _ = writeln!(md, "## Considered alternatives\n");
         let _ = writeln!(md, "**Chosen approach:** {}\n", alternatives.chosen.trim());
@@ -118,6 +172,19 @@ pub fn render_plan_markdown(
                     cmd.trim()
                 );
             }
+            (AssertionCheck::PtyScript, _) => {
+                let command = a
+                    .pty_script
+                    .as_ref()
+                    .map(|s| s.command.trim())
+                    .unwrap_or("MISSING");
+                let _ = writeln!(
+                    md,
+                    "- **[{}]** {}\n  pty script: `{command}`",
+                    a.id.trim(),
+                    a.statement.trim()
+                );
+            }
             _ => {
                 let _ = writeln!(
                     md,
@@ -139,6 +206,16 @@ pub fn render_plan_markdown(
              in the assertion itself. This never blocks approval.\n"
         );
         let _ = writeln!(md, "{}\n", contract_lint.summary());
+        // Named contract-validation gates (contract-validation-gates): the
+        // defect classes behind the lint, each verdict carrying its class
+        // name. Same advisory posture as the lint.
+        if !gate_reports.is_empty() {
+            let _ = writeln!(
+                md,
+                "{}\n",
+                crate::contract_gates::render_gate_verdicts(gate_reports)
+            );
+        }
     }
 
     for (mi, m) in plan.milestones.iter().enumerate() {
@@ -154,6 +231,14 @@ pub fn render_plan_markdown(
                 let _ = writeln!(md);
             }
         }
+    }
+
+    // Flight Rules (KRZ-342, D-G's plan-review projection): the approved
+    // standards pin — source digest, ids, revisions, effective statuses,
+    // statements, scopes, checker bindings — rendered where the operator
+    // reviews the plan. Absent pin ⇒ byte-identical plan.md.
+    if let Some(pin) = &plan.standards_manifest {
+        let _ = writeln!(md, "\n{}", crate::pack::resolution::render_pin_section(pin));
     }
     while md.ends_with('\n') {
         md.pop();
@@ -588,6 +673,55 @@ pub fn render_mission_report(
             for commit in &f.commits {
                 let _ = writeln!(md, "  - {}", short_commit(commit));
             }
+            // Dispatch-pool candidates (KRZ-303): the unit's sibling outputs,
+            // labelled candidates-for-judgement — the engine never selected,
+            // ranked, or merged a winner; selection is the pending human
+            // judgement act. Each candidate names its backend, its recorded
+            // terminal state, and its (kept) branch so a judge can diff it.
+            let mut candidates: Vec<&WorkerRun> = f
+                .worker_runs
+                .iter()
+                .filter_map(|id| state.runs.get(id))
+                .filter(|r| r.candidate.is_some())
+                .collect();
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|r| r.candidate.as_ref().map(|c| c.index).unwrap_or(0));
+                let n = candidates
+                    .first()
+                    .and_then(|r| r.candidate.as_ref())
+                    .map(|c| c.count)
+                    .unwrap_or(candidates.len() as u32);
+                let _ = writeln!(
+                    md,
+                    "  **{} candidates for judgement** (no winner selected; selection is a \
+                     later human judgement act):",
+                    candidates.len()
+                );
+                for r in candidates {
+                    let c = r
+                        .candidate
+                        .as_ref()
+                        .expect("filtered to candidate-linked runs");
+                    let result = match r.result {
+                        Some(RunResult::Pass) => "pass",
+                        Some(RunResult::Fail) => "fail",
+                        Some(RunResult::Partial) => "partial",
+                        None => "no terminal state recorded",
+                    };
+                    let _ = writeln!(
+                        md,
+                        "  - candidate {}/{}: `{}` / `{}` — {} — branch `kranz/pool/{}/{}-c{}`",
+                        c.index,
+                        n.saturating_sub(1),
+                        c.backend,
+                        r.model,
+                        result,
+                        mission.id,
+                        f.id,
+                        c.index
+                    );
+                }
+            }
             if f.status == FeatureStatus::Complete {
                 for criterion in &f.validation_criteria {
                     let _ = writeln!(md, "  - ✓ {criterion}");
@@ -672,6 +806,19 @@ pub fn render_mission_report(
         let _ = writeln!(md, "\nNo validation rounds were recorded.");
     }
 
+    // Flight Rules coverage (KRZ-343, design D-H): every applicable pinned
+    // rule's disposition with its mechanism and evidence joins, folded from
+    // the same log — absence of evidence is never rendered as pass. `None`
+    // (no approved standards pin) renders nothing, so a pre-Flight-Rules
+    // mission's report stays byte-identical.
+    if let Some(coverage) = crate::standards_coverage::standards_coverage(&mission.id, events) {
+        let _ = writeln!(
+            md,
+            "\n{}",
+            crate::standards_coverage::render_coverage_markdown(&coverage).trim_end_matches('\n')
+        );
+    }
+
     // Contract outcomes — the mission completed, so every assertion passed
     // the final gate (or was explicitly waived; waivers are recorded above).
     let _ = writeln!(md, "\n## Contract outcomes");
@@ -683,6 +830,7 @@ pub fn render_mission_report(
             let check = match (&a.check, &a.command) {
                 (AssertionCheck::Command, Some(cmd)) => format!("command: `{cmd}`"),
                 (AssertionCheck::Command, None) => "command".to_string(),
+                (AssertionCheck::PtyScript, _) => "pty script".to_string(),
                 _ => "agent judgement".to_string(),
             };
             let _ = writeln!(md, "- ✅ **[{}]** {} *({check})*", a.id, a.statement);

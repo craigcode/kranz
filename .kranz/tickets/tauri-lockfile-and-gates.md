@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 5d6e9f6: src-tauri Cargo.lock committed (507 pkgs), macos tauri CI job (cargo check --locked, npm dist first for generate_context!), Dependabot cargo entry, port race fixed (listener kept through handoff). Left to CI: tauri job first run. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Commit the Tauri lockfile and bring the desktop shell into gates (P2)
 priority: 3
 schedule: once

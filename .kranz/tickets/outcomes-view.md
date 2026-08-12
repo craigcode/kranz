@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: complete: autonomy ratio + grant latency + escalation ledger shipped earlier via m-d1e3c3 (flight surgeon); f5fe09d adds the remaining two lagging metrics — cost per change (Σ costUsd / non-meta commits, meta classified by subject from events only, local tier $0) and cycle time (created→terminal minus paused spans) — folded single-source into outcomes.rs and projected to CLI, Slack card, dashboard panel, and REST. Byte-identical regeneration holds (pure fold + memoization). Per-mission --mission … (truncated)
 title: Outcomes view — autonomy ratio, cost per change, and cycle time computed from event logs
 priority: 3
 schedule: once

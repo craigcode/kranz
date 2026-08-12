@@ -11,7 +11,9 @@
 //! field (e.g. only `worker.model`) without restating the rest. Unknown keys
 //! are ignored on deserialization.
 
-use crate::cost::{DEFAULT_CODEX_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL};
+use crate::cost::{
+    DEFAULT_CODEX_MODEL, DEFAULT_CURSOR_MODEL, DEFAULT_DROID_MODEL, DEFAULT_KIMI_MODEL,
+};
 use crate::error::{EngineError, Result};
 use crate::paths;
 use crate::types::{BackendKind, ExecutorTier, MissionConfig, Role, SandboxEnforce};
@@ -19,6 +21,11 @@ use std::path::{Path, PathBuf};
 
 /// Reasoning-effort values accepted by `claude --effort`.
 const VALID_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Maximum dispatch-pool size (`workerCandidates`, KRZ-303). Each candidate
+/// is a full paid worker session per unit of work, so the same 8-wide bound
+/// as `maxParallelWorkers` applies — well past any useful fan-out.
+pub const MAX_WORKER_CANDIDATES: usize = 8;
 
 /// Coarse model capability tiers used by config safety floors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +43,8 @@ pub fn parse_backend(raw: Option<&str>) -> std::result::Result<BackendKind, Stri
         Some("droid") => Ok(BackendKind::Droid),
         Some("kimi") => Ok(BackendKind::Kimi),
         Some("local") => Ok(BackendKind::Local),
+        Some("acp") => Ok(BackendKind::Acp),
+        Some("cursor") => Ok(BackendKind::Cursor),
         Some(other) => Err(other.to_string()),
     }
 }
@@ -68,12 +77,19 @@ pub struct LocalEndpoint {
 /// Returns the APPLIED tier, which may differ from the requested `tier`: a
 /// `Local` request with no configured endpoint fails safe to `Frontier`
 /// (leaving the Worker on its frontier default) rather than routing to an
-/// endpoint that doesn't exist.
+/// endpoint that doesn't exist. A configured dispatch pool
+/// (`worker_candidates`) also pins `Frontier`: the pool is an explicit
+/// per-candidate backend declaration, and local routing's rewrite of
+/// `worker.backend` would sit next to it as a dead, misleading key (pool
+/// candidates are never local-backed — validation rejects `local` entries).
 pub fn apply_executor_routing(
     config: &mut MissionConfig,
     tier: ExecutorTier,
     local_endpoint: Option<&LocalEndpoint>,
 ) -> ExecutorTier {
+    if !config.worker_candidates.is_empty() {
+        return ExecutorTier::Frontier;
+    }
     match (tier, local_endpoint) {
         (ExecutorTier::Frontier, _) => ExecutorTier::Frontier,
         (ExecutorTier::Local, None) => ExecutorTier::Frontier,
@@ -107,11 +123,22 @@ pub fn route_ticket_executor(
 /// [`crate::ticket::parse_task_class_from_goal`] — `create` only ever sees a
 /// folded goal string, never the originating [`crate::ticket::Ticket`], so
 /// the class has to travel through that one channel.
+///
+/// The routing table (KRZ-331): when `cfg.routing` declares rules, they are
+/// the floor — resolved deterministically by [`crate::routing::table_tier`]
+/// (first match wins, no match stays Frontier). An EMPTY table keeps the
+/// hardcoded literal floor ([`task_class_to_tier`]) byte-for-byte, so a
+/// config that never heard of the table routes exactly as before.
 pub fn route_task_class_executor(
     cfg: &mut MissionConfig,
     task_class: Option<&str>,
 ) -> (ExecutorTier, &'static str) {
-    let requested = task_class_to_tier(task_class);
+    let table_configured = !cfg.routing.is_empty();
+    let requested = if table_configured {
+        crate::routing::table_tier(&cfg.routing, task_class)
+    } else {
+        task_class_to_tier(task_class)
+    };
     let local_endpoint = match (&cfg.worker.base_url, cfg.worker.context_budget) {
         (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
             base_url: base_url.clone(),
@@ -121,9 +148,17 @@ pub fn route_task_class_executor(
         _ => None,
     };
     let applied = apply_executor_routing(cfg, requested, local_endpoint.as_ref());
-    let summary = match (requested, applied) {
-        (ExecutorTier::Local, ExecutorTier::Local) => "executor routed local (execution-class)",
-        (ExecutorTier::Local, ExecutorTier::Frontier) => {
+    let summary = match (requested, applied, table_configured) {
+        (ExecutorTier::Local, ExecutorTier::Local, true) => {
+            "executor routed local (routing-table rule)"
+        }
+        (ExecutorTier::Local, ExecutorTier::Local, false) => {
+            "executor routed local (execution-class)"
+        }
+        (ExecutorTier::Local, ExecutorTier::Frontier, true) => {
+            "routing-table rule routes local but no local endpoint configured; executor stays frontier"
+        }
+        (ExecutorTier::Local, ExecutorTier::Frontier, false) => {
             "execution-class ticket but no local endpoint configured; executor stays frontier"
         }
         _ => "executor stays frontier",
@@ -142,6 +177,11 @@ fn backend_default_model(kind: BackendKind) -> Option<&'static str> {
         BackendKind::Droid => Some(DEFAULT_DROID_MODEL),
         BackendKind::Kimi => Some(DEFAULT_KIMI_MODEL),
         BackendKind::Local => None,
+        // ACP has no standard model-selection parameter in v1: the peer's
+        // model is its own concern (encoded in acpCommand/acpArgs), so there
+        // is no backend default to rewrite to.
+        BackendKind::Acp => None,
+        BackendKind::Cursor => Some(DEFAULT_CURSOR_MODEL),
     }
 }
 
@@ -217,6 +257,19 @@ pub fn model_tier(kind: BackendKind, model: &str) -> Option<ModelTier> {
         // the allowBelowDefaultWorkerModel opt-in, and a local orchestrator
         // always fails the frontier floor.
         BackendKind::Local => Some(ModelTier::BelowDefault),
+        // ACP model ids are equally free-form (the string is recorded for
+        // attribution only; ACP v1 has no model-selection parameter), so the
+        // same uniform below-default classification applies.
+        BackendKind::Acp => Some(ModelTier::BelowDefault),
+        // Cursor model ids are drawn from an account-specific catalog
+        // (~190 entries on the probe account; `--list-models` output varies
+        // by entitlement), so no client-side allowlist is possible and every
+        // non-empty id classifies uniformly below-default: a cursor worker
+        // needs the allowBelowDefaultWorkerModel opt-in (a deliberate gate
+        // for a validator-first backend), and the orchestrator stays on its
+        // frontier floor. Model-availability failures themselves are
+        // diagnosed deterministically at session start (probe item 5).
+        BackendKind::Cursor => Some(ModelTier::BelowDefault),
     }
 }
 
@@ -379,6 +432,122 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         )));
     }
 
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+    // KRZ-303): `workerCandidates` is the COMPLETE backend list the worker
+    // role fans out to (worker.backend applies only when the list is empty).
+    // Every entry is checked by the same rules as the worker role itself —
+    // known backend, supported backend/model pair, the worker model floor,
+    // and the sandbox fail-closed pairs — because each one WILL drive real
+    // worker sessions.
+    if cfg.worker_candidates.len() == 1 {
+        return Err(EngineError::Config(
+            "workerCandidates with exactly one entry is a roundabout worker.backend; \
+             use worker.backend (the pool exists for N >= 2 heterogeneous candidates)"
+                .into(),
+        ));
+    }
+    if cfg.worker_candidates.len() > MAX_WORKER_CANDIDATES {
+        return Err(EngineError::Config(format!(
+            "workerCandidates supports at most {MAX_WORKER_CANDIDATES} candidates, got {}",
+            cfg.worker_candidates.len()
+        )));
+    }
+    // The pool and M3 parallel features are two different fan-out models
+    // (same unit to N backends vs N units to one backend each). Combining
+    // them has no defined semantics in this pass — reject rather than pick
+    // one silently.
+    if !cfg.worker_candidates.is_empty() && cfg.max_parallel_workers > 1 {
+        return Err(EngineError::Config(
+            "workerCandidates (dispatch pool: one unit to N backends) and \
+             maxParallelWorkers > 1 (M3: N independent units concurrently) are mutually \
+             exclusive in this pass; configure one fan-out model"
+                .into(),
+        ));
+    }
+    for (i, candidate) in cfg.worker_candidates.iter().enumerate() {
+        let kind = parse_backend(Some(&candidate.backend)).map_err(|other| {
+            EngineError::Config(format!(
+                "workerCandidates[{i}].backend must be one of \"claude\", \"codex\", \"droid\", \"kimi\", \"cursor\", got {other:?}"
+            ))
+        })?;
+        // local/acp need per-role endpoint/command config (baseUrl /
+        // contextBudget / acpCommand) that has no per-candidate home in this
+        // pass; refuse rather than silently share the worker role's.
+        if matches!(kind, BackendKind::Local | BackendKind::Acp) {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}].backend {:?} is not supported in this pass: local/acp \
+                 need per-candidate endpoint/command config (a deliberate widening); use \
+                 claude, codex, droid, kimi, or cursor candidates",
+                candidate.backend
+            )));
+        }
+        // Same fail-closed sandbox pair as the worker role: a candidate that
+        // cannot honor the requested enforcement must never run with the
+        // operator believing it contained.
+        if cfg.worker.sandbox.enforce != SandboxEnforce::Off && !kind.supports_sandbox_enforcement()
+        {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}].backend {:?} cannot honor sandbox.enforce={:?}: only the \
+                 claude backend applies the resolved OS sandbox; run with sandbox.enforce=off, \
+                 or drop the non-claude candidate",
+                candidate.backend,
+                cfg.worker.sandbox.enforce.as_str()
+            )));
+        }
+        let effective = effective_model(Role::Worker, kind, &candidate.model);
+        let tier = model_tier(kind, &effective).ok_or_else(|| {
+            EngineError::Config(format!(
+                "workerCandidates[{i}] effective model {effective:?} (configured as {:?}) is not supported by backend {:?}",
+                candidate.model,
+                candidate.backend
+            ))
+        })?;
+        // The worker model floor applies per candidate — a below-default
+        // stream is exactly as much a worker session as the role's own.
+        if tier < ModelTier::Default && !cfg.allow_below_default_worker_model {
+            return Err(EngineError::Config(format!(
+                "workerCandidates[{i}] effective model {effective:?} (configured as {:?}) on backend {:?} is below the default worker tier; set \
+                 allowBelowDefaultWorkerModel=true on this mission to opt in",
+                candidate.model,
+                candidate.backend
+            )));
+        }
+    }
+
+    // Backend routing table (ticket `backend-routing-abstraction`, KRZ-331):
+    // shape-only checks (blank/duplicate task classes) live in
+    // `routing::validate_table` and fail closed naming the offending rule. A
+    // rule routing `local` with no endpoint configured is NOT an error here:
+    // `apply_executor_routing` already fails safe to Frontier for exactly
+    // that case, with the decision recorded against the mission.
+    if let Err(err) = crate::routing::validate_table(&cfg.routing) {
+        return Err(EngineError::Config(err));
+    }
+
+    // Hook-status lane (ticket `agent-hooks-status-signals`): when enabled,
+    // the endpoint is REQUIRED and must be a loopback HTTP(S) URL — the
+    // per-run capability token rides it, so pointing it at a remote host
+    // would leak signal authority off-machine. A disabled lane ignores the
+    // endpoint entirely (byte-identical pre-lane behavior).
+    if let Some(hook_status) = &cfg.hook_status {
+        if hook_status.enabled {
+            if hook_status.endpoint.trim().is_empty() {
+                return Err(EngineError::Config(
+                    "hookStatus.enabled requires hookStatus.endpoint (the loopback signal \
+                     POST URL, e.g. http://127.0.0.1:4560/api/hook-status)"
+                        .to_string(),
+                ));
+            }
+            if !crate::hook_status::endpoint_is_loopback_http(&hook_status.endpoint) {
+                return Err(EngineError::Config(format!(
+                    "hookStatus.endpoint must be a loopback http(s) URL (the per-run \
+                     capability token rides it), got {:?}",
+                    hook_status.endpoint
+                )));
+            }
+        }
+    }
+
     for (role, name) in [
         (Role::Orchestrator, "orchestrator"),
         (Role::Worker, "worker"),
@@ -388,7 +557,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         let role_cfg = cfg.role(role);
         let kind = parse_backend(role_cfg.backend.as_deref()).map_err(|other| {
             EngineError::Config(format!(
-                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", got {other:?}"
+                "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", \"acp\", \"cursor\", got {other:?}"
             ))
         })?;
         // Fail closed on a silently-unenforced sandbox: only the claude
@@ -440,6 +609,30 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
         })?;
 
         if kind == BackendKind::Local {
+            // Guarded validator role split (ticket
+            // `local-inference-validator-guarded`, KRZ-206b; review addendum
+            // §4 of docs/scoping/local-inference-executor-tier.md): the local
+            // validator tier exists for DETERMINISTIC mechanical checks only
+            // — compile/test/lint exit codes and contract-command pass/fail,
+            // where the engine runs the command itself and the model only
+            // reads verbatim PASS/FAIL evidence. Scrutiny is judgment (diff
+            // review against criteria), and routing judgment local is exactly
+            // the "silent green" attack the split exists to prevent: a weak
+            // local validator that wrongly PASSES bad work never looks like a
+            // failure, so no escalation valve ever fires on it. Only the
+            // functional role may pair with the local backend — and every
+            // local functional PASS is frontier-confirmed before it greens a
+            // gate (confirm-on-pass in the validation round); the scrutiny
+            // role is rejected outright here. Checked FIRST, before the
+            // endpoint fields, so the error names the real problem.
+            if role == Role::ValidatorScrutiny {
+                return Err(EngineError::Config(format!(
+                    "{name}.backend \"local\" is rejected: scrutiny is judgment, not a \
+                     deterministic mechanical check, and the local validator tier is the \
+                     functional role only (KRZ-206b) — a local judgment PASS is the \
+                     silent-green failure mode the guarded role split exists to prevent"
+                )));
+            }
             match role_cfg.base_url.as_deref() {
                 Some(url) if !url.trim().is_empty() => {
                     let rest = url
@@ -485,6 +678,29 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
                     return Err(EngineError::Config(format!(
                         "{name}.temperature must be finite and in 0.0..=2.0, got {temperature}"
+                    )));
+                }
+            }
+        }
+
+        if kind == BackendKind::Acp {
+            // KRZ-301 lands worker-first: the orchestrator needs
+            // streaming-input + resume semantics this backend deliberately
+            // rejects at the seam, and the validator roles wait for live
+            // soak — refuse those pairings here rather than degrading
+            // mid-mission.
+            if role != Role::Worker {
+                return Err(EngineError::Config(format!(
+                    "{name}.backend \"acp\" is supported for the worker role only in this pass \
+                     (KRZ-301); validators and the orchestrator stay on their existing backends"
+                )));
+            }
+            match role_cfg.acp_command.as_deref() {
+                Some(command) if !command.trim().is_empty() => {}
+                _ => {
+                    return Err(EngineError::Config(format!(
+                        "{name}.acpCommand is required when {name}.backend is \"acp\" \
+                         (the ACP agent executable; extra argv goes in {name}.acpArgs)"
                     )));
                 }
             }
@@ -618,6 +834,31 @@ mod tests {
         assert!(cfg.auto_work);
     }
 
+    /// The uncontained-validator degrade opt-in (ticket
+    /// `validator-containment-degrade-fail-closed`): additive — absent (every
+    /// pre-existing config and old `mission.created` payload) deserializes to
+    /// the FAIL-CLOSED default; the explicit `true` opts back into the loud
+    /// degrade.
+    #[test]
+    fn validator_allow_uncontained_degrade_defaults_off_and_parses_opt_in() {
+        assert!(!MissionConfig::default().validator_allow_uncontained_degrade);
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["validatorAllowUncontainedDegrade"], false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(&layer_path, r#"{"validatorAllowUncontainedDegrade": true}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.validator_allow_uncontained_degrade);
+
+        // A layer naming unrelated keys only (the old-config shape) keeps the
+        // fail-closed default.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(!cfg.validator_allow_uncontained_degrade);
+    }
+
     #[test]
     fn contract_env_passthrough_defaults_empty_and_parses_camel_case() {
         // Additive contract change: absent key (every pre-existing config and
@@ -654,6 +895,52 @@ mod tests {
 
         let cfg = load_layers(&[layer_path]).unwrap();
         assert!(!cfg.auto_work);
+    }
+
+    /// Composition audit (ticket `config-fail-open-audit`): layered config
+    /// arrays REPLACE wholesale (deep_merge semantics — a project layer
+    /// overrides a global layer's list). That replace is safe ONLY because
+    /// the deny floor is compiled in: `denyPatterns` from any layer can
+    /// replace another layer's entries but can never strip the built-in
+    /// worker deny list, which `permissions::for_role` appends to. This pins
+    /// both halves of the contract: the documented replace semantics, and
+    /// the floor's unreachability by replacement.
+    #[test]
+    fn composition_audit_layered_deny_patterns_replace_but_never_strip_the_builtin_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        std::fs::write(&global, r#"{"denyPatterns": ["git push --force"]}"#).unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(&project, r#"{"denyPatterns": ["rm -rf *"]}"#).unwrap();
+
+        let cfg = load_layers(&[global, project]).unwrap();
+        // Replace semantics across layers: the later list wins wholesale.
+        assert_eq!(cfg.deny_patterns, vec!["rm -rf *".to_string()]);
+
+        // The built-in §4.7 floor is compiled in, so no layer shape can
+        // remove it: the worker profile carries every built-in rule plus
+        // (only) the winning layer's custom entry.
+        let profile = crate::permissions::for_role(Role::Worker, &cfg, &[], &[], &[]);
+        for builtin in [
+            "Bash(git push*)",
+            "Bash(sudo*)",
+            "Bash(curl*)",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(
+                profile.disallowed_tools.iter().any(|r| r == builtin),
+                "the built-in deny {builtin} must survive layered replacement"
+            );
+        }
+        assert!(profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(rm -rf *)"));
+        assert!(!profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git push --force*)"));
     }
 
     #[test]
@@ -847,6 +1134,57 @@ mod tests {
     }
 
     #[test]
+    fn guarded_local_validator_scrutiny_cannot_be_configured_local() {
+        // KRZ-206b: scrutiny is judgment; the local validator tier is the
+        // functional role only. The rejection names the role, and fires
+        // whether or not the endpoint fields are present (the role guard is
+        // the real problem, never the missing baseUrl).
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("local".into());
+        cfg.validator_scrutiny.base_url = Some("http://127.0.0.1:8080".into());
+        cfg.validator_scrutiny.context_budget = Some(8192);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorScrutiny.backend \"local\" is rejected"),
+            "the rejection must name the role: {err}"
+        );
+
+        let mut cfg = MissionConfig::default();
+        cfg.validator_scrutiny.backend = Some("local".into());
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorScrutiny.backend \"local\" is rejected"),
+            "the role guard must fire before the endpoint checks: {err}"
+        );
+    }
+
+    #[test]
+    fn guarded_local_validator_functional_may_be_configured_local() {
+        // KRZ-206b: the functional role may select the local backend for
+        // deterministic mechanical checks (contract-command pass/fail); the
+        // same endpoint requirements as any local-backed role apply, and
+        // every local PASS is frontier-confirmed at the validation round.
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("local".into());
+        cfg.validator_functional.base_url = Some("http://127.0.0.1:8080".into());
+        cfg.validator_functional.context_budget = Some(8192);
+        assert!(
+            validate(&cfg).is_ok(),
+            "functional + local with a valid endpoint must be accepted"
+        );
+
+        // The endpoint fields stay required — a local functional validator
+        // with nowhere to point is a config error, exactly as before.
+        let mut cfg = MissionConfig::default();
+        cfg.validator_functional.backend = Some("local".into());
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("validatorFunctional.baseUrl is required"),
+            "endpoint requirements must still apply to the functional role: {err}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_kimi_k3_for_unsupported_efforts() {
         for effort in ["medium", "xhigh"] {
             let mut cfg = MissionConfig::default();
@@ -967,6 +1305,7 @@ mod tests {
             BackendKind::Droid,
             BackendKind::Kimi,
             BackendKind::Local,
+            BackendKind::Cursor,
         ] {
             assert!(
                 !kind.supports_sandbox_enforcement(),
@@ -977,7 +1316,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_enforced_sandbox_on_non_claude_backends() {
-        for backend in ["codex", "droid", "kimi"] {
+        for backend in ["codex", "droid", "kimi", "cursor"] {
             for enforce in [
                 crate::types::SandboxEnforce::Fs,
                 crate::types::SandboxEnforce::FsNet,
@@ -1119,7 +1458,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_sandbox_off_on_every_backend() {
-        for backend in ["codex", "droid", "kimi"] {
+        for backend in ["codex", "droid", "kimi", "cursor"] {
             let mut cfg = MissionConfig::default();
             cfg.validator_scrutiny.backend = Some(backend.into());
             assert_eq!(
@@ -1153,6 +1492,78 @@ mod tests {
             allow_below_default_worker_model: true,
             ..MissionConfig::default()
         }
+    }
+
+    /// ACP (KRZ-301): the worker-role-only backend wiring — parse, role
+    /// restriction, required command, model-tier opt-in.
+    fn acp_worker_cfg() -> MissionConfig {
+        let mut cfg = MissionConfig {
+            allow_below_default_worker_model: true,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("acp".into());
+        cfg.worker.acp_command = Some("/opt/bin/my-acp-agent".into());
+        cfg.worker.acp_args = vec!["--serve".into()];
+        cfg
+    }
+
+    #[test]
+    fn backend_acp_config_round_trips_and_parses() {
+        assert_eq!(parse_backend(Some("acp")), Ok(BackendKind::Acp));
+        let cfg = acp_worker_cfg();
+        assert_eq!(cfg.backend_kind(Role::Worker), BackendKind::Acp);
+        assert_eq!(BackendKind::Acp.as_str(), "acp");
+        assert!(!BackendKind::Acp.supports_sandbox_enforcement());
+        assert!(!BackendKind::Acp.reports_cache_read_tokens());
+        assert!(!BackendKind::Acp.reports_cache_write_tokens());
+        assert!(
+            validate(&cfg).is_ok(),
+            "worker + acpCommand + the below-default opt-in must validate"
+        );
+    }
+
+    #[test]
+    fn backend_acp_config_requires_worker_role_and_command() {
+        // Validators and the orchestrator are refused (KRZ-301 lands
+        // worker-first).
+        for role in [
+            Role::Orchestrator,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            let mut cfg = acp_worker_cfg();
+            let role_cfg = match role {
+                Role::Orchestrator => &mut cfg.orchestrator,
+                Role::ValidatorScrutiny => &mut cfg.validator_scrutiny,
+                Role::ValidatorFunctional => &mut cfg.validator_functional,
+                Role::Worker => unreachable!("loop excludes the worker"),
+            };
+            role_cfg.backend = Some("acp".into());
+            role_cfg.acp_command = Some("/opt/bin/my-acp-agent".into());
+            let err = validate(&cfg).expect_err("non-worker acp must be refused");
+            assert!(
+                err.to_string().contains("worker role only"),
+                "refusal must name the role restriction: {err}"
+            );
+        }
+
+        // The command is required (and a blank one is as good as absent).
+        let mut cfg = acp_worker_cfg();
+        cfg.worker.acp_command = None;
+        let err = validate(&cfg).expect_err("missing acpCommand must be refused");
+        assert!(err.to_string().contains("acpCommand"), "{err}");
+        cfg.worker.acp_command = Some("   ".into());
+        assert!(validate(&cfg).is_err(), "blank acpCommand must be refused");
+
+        // ACP model ids are free-form → uniformly below-default → the
+        // worker needs the explicit opt-in, same as local.
+        let mut cfg = acp_worker_cfg();
+        cfg.allow_below_default_worker_model = false;
+        let err = validate(&cfg).expect_err("below-default acp worker needs the opt-in");
+        assert!(
+            err.to_string().contains("allowBelowDefaultWorkerModel"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1426,6 +1837,394 @@ mod tests {
 
         assert_ne!(cfg.validator_scrutiny.backend.as_deref(), Some("local"));
         assert_ne!(cfg.validator_functional.backend.as_deref(), Some("local"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend routing table (ticket backend-routing-abstraction, KRZ-331)
+    // -----------------------------------------------------------------------
+
+    use crate::types::TaskClassRoute;
+
+    fn routing_table(rules: &[(&str, ExecutorTier)]) -> Vec<TaskClassRoute> {
+        rules
+            .iter()
+            .map(|(task_class, tier)| TaskClassRoute {
+                task_class: task_class.to_string(),
+                tier: *tier,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_abstraction_table_defaults_empty_and_parses_camel_case() {
+        // Additive contract change: an absent key (every pre-existing config
+        // and every old mission.created event payload) deserializes to the
+        // EMPTY table — the byte-identical literal floor.
+        assert!(MissionConfig::default().routing.task_class_rules.is_empty());
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["routing"]["taskClassRules"], serde_json::json!([]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{"routing": {"taskClassRules": [{"taskClass": "execution-class", "tier": "local"}, {"taskClass": "docs-class", "tier": "frontier"}]}}"#,
+        )
+        .unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.routing.task_class_rules.len(), 2);
+        assert_eq!(
+            cfg.routing.task_class_rules[0].task_class,
+            "execution-class"
+        );
+        assert_eq!(cfg.routing.task_class_rules[0].tier, ExecutorTier::Local);
+        assert_eq!(cfg.routing.task_class_rules[1].tier, ExecutorTier::Frontier);
+
+        // A layer naming unrelated keys only (the old-config shape) leaves
+        // the table empty.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.routing.task_class_rules.is_empty());
+    }
+
+    #[test]
+    fn routing_abstraction_unconfigured_table_keeps_byte_identical_floor() {
+        // The regression pin: with NO table configured, routing a task class
+        // must produce exactly the pre-table behavior — the literal floor
+        // (`task_class_to_tier`) fed through `apply_executor_routing` —
+        // including the applied config edits, for every input shape.
+        for task_class in [
+            None,
+            Some("execution-class"),
+            Some("  Execution-Class "),
+            Some("planning-class"),
+            Some("some-arbitrary-value"),
+        ] {
+            for endpoint_configured in [false, true] {
+                let wire = |cfg: &mut MissionConfig| {
+                    if endpoint_configured {
+                        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+                        cfg.worker.context_budget = Some(16_384);
+                    }
+                };
+                let mut cfg = MissionConfig::default();
+                wire(&mut cfg);
+                assert!(cfg.routing.task_class_rules.is_empty());
+                let (applied, _) = route_task_class_executor(&mut cfg, task_class);
+
+                // The pre-table reference computation.
+                let mut reference = MissionConfig::default();
+                wire(&mut reference);
+                let endpoint = match (&reference.worker.base_url, reference.worker.context_budget) {
+                    (Some(base_url), Some(context_budget)) => Some(LocalEndpoint {
+                        base_url: base_url.clone(),
+                        context_budget,
+                        temperature: reference.worker.temperature,
+                    }),
+                    _ => None,
+                };
+                let expected = apply_executor_routing(
+                    &mut reference,
+                    task_class_to_tier(task_class),
+                    endpoint.as_ref(),
+                );
+
+                assert_eq!(applied, expected, "task class {task_class:?}");
+                assert_eq!(
+                    cfg, reference,
+                    "an empty table must apply byte-identical config changes for {task_class:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routing_abstraction_table_routes_configured_class_to_local() {
+        // A configured table is the complete floor: it routes the classes it
+        // names — beyond the literal floor's single hardcoded class...
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("docs-class", ExecutorTier::Local)]);
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("docs-class"));
+
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+        assert_eq!(summary, "executor routed local (routing-table rule)");
+
+        // ...and the literal floor's own class stays frontier when the table
+        // does not name it (the table replaces the literal map, it does not
+        // amend it).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("docs-class", ExecutorTier::Local)]);
+        cfg.worker.base_url = Some("http://127.0.0.1:8080".to_string());
+        cfg.worker.context_budget = Some(16_384);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert_eq!(summary, "executor stays frontier");
+    }
+
+    #[test]
+    fn routing_abstraction_table_local_route_fails_safe_without_endpoint() {
+        // The pre-table fail-safe is unchanged under a table: a local route
+        // with no configured endpoint stays frontier rather than routing to
+        // an endpoint that doesn't exist.
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("execution-class", ExecutorTier::Local)]);
+
+        let (applied, summary) = route_task_class_executor(&mut cfg, Some("execution-class"));
+
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert_eq!(cfg.worker.backend, None);
+        assert!(
+            summary.contains("no local endpoint configured"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn routing_abstraction_validate_fails_closed_on_malformed_table() {
+        // Duplicate after normalization: refused, naming the rule (a
+        // shadowed rule is dead config under first-match-wins).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[
+            ("execution-class", ExecutorTier::Local),
+            (" Execution-Class", ExecutorTier::Frontier),
+        ]);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("routing.taskClassRules[1].taskClass"), "{err}");
+        assert!(err.contains("duplicates rule 0"), "{err}");
+
+        // Blank class: refused (it could never match honestly).
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[("   ", ExecutorTier::Local)]);
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("routing.taskClassRules[0].taskClass"), "{err}");
+
+        // A clean table validates.
+        let mut cfg = MissionConfig::default();
+        cfg.routing.task_class_rules = routing_table(&[
+            ("execution-class", ExecutorTier::Local),
+            ("docs-class", ExecutorTier::Frontier),
+        ]);
+        assert!(validate(&cfg).is_ok(), "a clean table must validate");
+    }
+
+    #[test]
+    fn routing_abstraction_hosted_fine_tune_is_plain_local_endpoint_config() {
+        // KRZ-331: a hosted fine-tune is configuration of the
+        // OpenAI-compatible local backend (baseUrl + model), NOT a new
+        // backend kind — an https endpoint carrying a free-form
+        // fine-tune-shaped model id validates exactly like a localhost one,
+        // and a table can route a task class to it by capability class.
+        let mut cfg = local_worker_cfg();
+        cfg.worker.base_url = Some("https://models.internal.example/v1".into());
+        cfg.worker.model = "ft:some-model:some-org:some-id".into();
+        assert!(
+            validate(&cfg).is_ok(),
+            "a hosted fine-tune endpoint is ordinary local-backend config"
+        );
+
+        cfg.routing.task_class_rules = routing_table(&[("execution-class", ExecutorTier::Local)]);
+        let (applied, _) = route_task_class_executor(&mut cfg, Some("execution-class"));
+        assert_eq!(applied, ExecutorTier::Local);
+        assert_eq!(cfg.worker.backend.as_deref(), Some("local"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool, KRZ-303)
+    // -----------------------------------------------------------------------
+
+    use crate::types::CandidateSpec;
+
+    fn dispatch_pool_pair() -> Vec<CandidateSpec> {
+        vec![
+            CandidateSpec {
+                backend: "claude".into(),
+                model: "sonnet".into(),
+            },
+            CandidateSpec {
+                backend: "codex".into(),
+                model: DEFAULT_CODEX_MODEL.into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn dispatch_pool_defaults_empty_and_parses_camel_case() {
+        // Additive contract change: absent key (every pre-existing config and
+        // every old mission.created event payload) deserializes to empty —
+        // today's single-backend behavior exactly.
+        assert!(MissionConfig::default().worker_candidates.is_empty());
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert_eq!(value["workerCandidates"], serde_json::json!([]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("config.json");
+        std::fs::write(
+            &layer_path,
+            r#"{"workerCandidates": [{"backend": "claude", "model": "sonnet"}, {"backend": "codex", "model": "gpt-5-codex"}]}"#,
+        )
+        .unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert_eq!(cfg.worker_candidates, dispatch_pool_pair());
+
+        // A layer naming unrelated keys only (the old-config shape) leaves
+        // the pool empty.
+        let layer_path = dir.path().join("config-old.json");
+        std::fs::write(&layer_path, r#"{"maxRespawns": 3}"#).unwrap();
+        let cfg = load_layers(&[layer_path]).unwrap();
+        assert!(cfg.worker_candidates.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pool_validate_accepts_heterogeneous_pair() {
+        let cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_single_entry() {
+        let cfg = MissionConfig {
+            worker_candidates: vec![CandidateSpec {
+                backend: "claude".into(),
+                model: "sonnet".into(),
+            }],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("workerCandidates with exactly one entry"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_local_and_acp_candidates() {
+        for backend in ["local", "acp"] {
+            let cfg = MissionConfig {
+                worker_candidates: vec![
+                    CandidateSpec {
+                        backend: "claude".into(),
+                        model: "sonnet".into(),
+                    },
+                    CandidateSpec {
+                        backend: backend.into(),
+                        model: "anything".into(),
+                    },
+                ],
+                ..MissionConfig::default()
+            };
+            let err = validate(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("not supported in this pass"),
+                "{backend}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_parallel_workers_combination() {
+        let cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            max_parallel_workers: 2,
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_unknown_backend_and_model() {
+        let cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "gemini".into(),
+                    model: "sonnet".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("workerCandidates[1].backend"), "{err}");
+
+        let cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "codex".into(),
+                    model: "kranz-test-model".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("not supported by backend"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_validate_enforces_worker_floor_per_candidate() {
+        // droid's default GLM is below the default worker tier — rejected
+        // without the opt-in, accepted with it, exactly like the role check.
+        let mut cfg = MissionConfig {
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "droid".into(),
+                    model: DEFAULT_DROID_MODEL.into(),
+                },
+            ],
+            ..MissionConfig::default()
+        };
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("below the default worker tier"), "{err}");
+        cfg.allow_below_default_worker_model = true;
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn dispatch_pool_validate_rejects_sandboxed_non_claude_candidate() {
+        let mut cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::Fs;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("cannot honor sandbox.enforce"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_pool_executor_routing_never_goes_local() {
+        // An execution-class ticket with a configured pool must NOT get
+        // worker.backend rewritten to local: the pool is the explicit
+        // per-candidate backend declaration, and the local key would sit
+        // next to it dead and misleading.
+        let mut cfg = MissionConfig {
+            worker_candidates: dispatch_pool_pair(),
+            ..MissionConfig::default()
+        };
+        let endpoint = test_local_endpoint();
+        let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
+        assert_eq!(applied, ExecutorTier::Frontier);
+        assert!(cfg.worker.backend.is_none());
     }
 
     trait RoleConfigTestExt {

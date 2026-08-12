@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in f4ba469 (Craig); reviewed + negative-tested + gates green
 title: WS + tokenless GETs lack Origin/Host checks (cross-site read exfiltration)
 priority: 1
 schedule: once

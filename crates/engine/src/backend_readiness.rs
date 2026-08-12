@@ -238,12 +238,43 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
         };
     }
 
+    // The ACP backend has no binary-discovery or login-status convention:
+    // its readiness probe only confirms the configured command exists (the
+    // initialize handshake at session start is the real probe). Never
+    // panics; a missing/relative command downgrades to an honest Unknown.
+    if kind == BackendKind::Acp {
+        let configured = cfg.role(role).acp_command.clone();
+        let (status, detail, next_action) = match configured.as_deref() {
+            Some(command) if !command.trim().is_empty() => (
+                ReadinessStatus::Unknown,
+                format!(
+                    "acp agent {command:?} configured; no cheap probe — the initialize \
+                     handshake at session start is the real probe"
+                ),
+                "none".into(),
+            ),
+            _ => (
+                ReadinessStatus::Unknown,
+                "acp backend has no acpCommand configured".into(),
+                "set the role's acpCommand and re-queue".into(),
+            ),
+        };
+        return RoleReadiness {
+            role: role_key.into(),
+            backend,
+            status,
+            detail,
+            next_action,
+        };
+    }
+
     let discover = match kind {
         BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
         BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
-        BackendKind::Local => unreachable!("handled above"),
+        BackendKind::Cursor => crate::backend_cursor::discover_cursor_binary(None),
+        BackendKind::Local | BackendKind::Acp => unreachable!("handled above"),
     };
 
     match discover {
@@ -360,23 +391,44 @@ enum AuthProbe {
 /// Bounded login probe (≤3s). Prefer an explicit auth-status subcommand when
 /// the CLI supports it; never treat a missing subcommand as unauthenticated.
 fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
-    let args: &[&str] = match kind {
-        BackendKind::Claude => &["auth", "status"],
-        BackendKind::Codex => &["login", "status"],
-        BackendKind::Droid => return AuthProbe::Unknown("no auth-status subcommand".into()),
-        // No scriptable auth-status subcommand; `provider list` is the
-        // documented free read-only probe (docs/scoping/kimi-cli-backend.md
-        // §2) that shows the OAuth-managed provider when authenticated.
-        BackendKind::Kimi => &["provider", "list"],
-        BackendKind::Local => {
-            return AuthProbe::Unknown("local backend has no CLI to probe".into())
-        }
-    };
+    let args: &[&str] =
+        match kind {
+            BackendKind::Claude => &["auth", "status"],
+            BackendKind::Codex => &["login", "status"],
+            BackendKind::Droid => return AuthProbe::Unknown("no auth-status subcommand".into()),
+            // No scriptable auth-status subcommand; `provider list` is the
+            // documented free read-only probe (docs/scoping/kimi-cli-backend.md
+            // §2) that shows the OAuth-managed provider when authenticated.
+            BackendKind::Kimi => &["provider", "list"],
+            // `agent models` is the free read-only probe that distinguishes
+            // BOTH failure modes the scoping doc's preflight requires
+            // (docs/scoping/cursor-cli-backend.md): unauthenticated ("Not
+            // logged in") vs. authenticated-but-zero-entitled-models ("No
+            // models available for this account") — the honest
+            // model-availability diagnostic of probe item 5.
+            BackendKind::Cursor => &["models"],
+            BackendKind::Local => {
+                return AuthProbe::Unknown("local backend has no CLI to probe".into())
+            }
+            BackendKind::Acp => return AuthProbe::Unknown(
+                "acp backend has no auth-status convention; the initialize handshake is the probe"
+                    .into(),
+            ),
+        };
     match run_bounded(binary, args, Duration::from_secs(3)) {
         Ok((code, out)) => {
             let lower = out.to_ascii_lowercase();
             if kind == BackendKind::Kimi && lower.contains("no providers configured") {
                 return AuthProbe::Unauthenticated(out);
+            }
+            // An authenticated cursor account with zero entitled models fails
+            // every session deterministically (probe item 5); park with the
+            // real cause named rather than letting a mission discover it.
+            if kind == BackendKind::Cursor && lower.contains("no models available") {
+                return AuthProbe::Unauthenticated(format!(
+                    "cursor account has no entitled models ({out}); provision at least one \
+                     model for the account (docs/scoping/cursor-cli-backend.md item 5)"
+                ));
             }
             if lower.contains("not logged")
                 || lower.contains("not authenticated")

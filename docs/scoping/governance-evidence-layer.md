@@ -1,11 +1,12 @@
-# Governance and evidence layer — KRZ-300/310/320/330 backlog
+# Governance and evidence layer — KRZ-300/310/320/330/340 backlog
 
 Status: positioning accepted 2026-07-29, recorded as an ADR
 (`docs/knowledge/decisions/positioning-governance-evidence-layer.md`).
-Tickets created the same day; sequencing and reconciliations below. This doc
-is the series map — the KRZ-numbered planning ids live here (precedent:
-`local-inference-executor-tier.md` for KRZ-201–209); the on-disk backlog is
-slug tickets in `.kranz/tickets/`.
+The initial KRZ-300/310/320/330 tickets were created the same day; the accepted
+Flight Rules extension added KRZ-341–349 on 2026-08-07. Sequencing and
+reconciliations follow. This doc is the series map — the KRZ-numbered planning
+ids live here (precedent: `local-inference-executor-tier.md` for KRZ-201–209);
+the on-disk backlog is slug tickets in `.kranz/tickets/`.
 
 ## The decision, one line
 
@@ -46,6 +47,15 @@ frozen/retained boundary: the ADR.
 | 331 | `backend-routing-abstraction` | 2 | — | extension — AgentBackend seam + local-inference slices |
 | 332 | `training-corpus-export` | 3 | divergence-first-class-event, escalation-ledger-export | extension — trace_export.rs |
 | 333 | `outcomes-comparison-metrics` | 3 | — | extension — outcomes report presentation; scored-gates addendum (evidence series continues past the 330–332 inference block) |
+| 341 | `flight-rules-pack-contract` | 1 | — | extension — pack contract gains governed structured standards |
+| 342 | `flight-rules-resolution-pin` | 1 | flight-rules-pack-contract | new policy-resolution + approval-pin seam; merge/routing ownership idiom |
+| 343 | `flight-rules-finding-provenance` | 1 | flight-rules-resolution-pin | extension — gate events, findings, replay and evidence bundle |
+| 344 | `flight-rules-waiver-decisions` | 1 | flight-rules-resolution-pin, flight-rules-finding-provenance | new explicit-human exception event; no model waiver of enforced MUST |
+| 345 | `flight-rules-workflow-projection` | 1 | flight-rules-resolution-pin, flight-rules-finding-provenance | extension — stage-filtered planning/worker/validator projection |
+| 346 | `flight-rules-enforcement-binding` | 1 | flight-rules-resolution-pin, flight-rules-finding-provenance, flight-rules-waiver-decisions | extension — GatePipeline + pack/agent/manual checker bindings |
+| 347 | `flight-rules-dashboard-report` | 2 | flight-rules-workflow-projection, flight-rules-enforcement-binding, flight-rules-waiver-decisions | extension — plan consent + coverage/drift/waiver surfaces |
+| 348 | `flight-rules-effectiveness-metrics` | 3 | flight-rules-dashboard-report | extension — outcomes/gate-score/false-green folds by rule revision |
+| 349 | `flight-rules-review-task-classes` | 3 | flight-rules-workflow-projection, flight-rules-enforcement-binding, flight-rules-dashboard-report | later spec/incident artifact consumer; no parallel policy system |
 
 ## Sequencing
 
@@ -59,6 +69,12 @@ frozen/retained boundary: the ADR.
 
 Shippable unit: steps 1–3 — a governance layer that dispatches to an agent
 CLI and produces a provenance trail.
+
+Near-term next shippable unit (roadmap M5.5): **341 → 342 → 343/344 →
+345/346**. Flight Rules is the first product feature built on the now-shipped
+pack/gate/evidence spine. Blocking enforcement does not ship until both typed
+provenance and the authorized-human waiver path exist. 347 is the P2 operator
+surface; 348/349 are P3 follow-through.
 
 ## Reconciliations against the source plan (recorded, not silent)
 
@@ -118,6 +134,38 @@ map and was reassigned. Reconciliations:
 - Out of scope, reaffirmed: knowledge grounding arrives as a pack, never
   core (positioning ADR) — an existing consumer-side knowledge base covers
   that need on the pack side of the boundary.
+
+## Addendum 2026-08-04 — Warp Agent CLI scan
+
+Source: the Warp Agent CLI launch review (roadmap pattern notes,
+2026-08-04). Three tickets added outside the KRZ numbering:
+`config-fail-open-audit` (governance hardening — Warp shipped
+auto-approve-bypasses-denylist and replace-not-extend denylists as live
+counterexamples), `routing-rules-config` (the KRZ-331 config-surface
+slice; Warp's complexity-tier and ordered-rule router forms are the
+reference), and `pty-functional-validation` (extends M5 functional QA to
+terminal-interactive targets; validation-side only). Reference mechanics
+recorded on `heterogeneous-dispatch-pool` (harness-agnostic addressing,
+unified lifecycle vocabulary) and `backend-routing-abstraction`. Warp is
+not a backend candidate until a headless/JSON mode exists.
+
+## Addendum 2026-08-07 — Cloudflare engineering standards enforcement
+
+Source: Cloudflare's 2026-08-04 engineering-standards write-up. The relevant
+product pattern is not another knowledge base: one governed RFC corpus moves
+from approved/advisory to enforced, each SHOULD/MUST has a stable structured
+identity, the applicable subset reaches code/spec/incident review, and
+mechanical rules use linters while contextual rules use AI review.
+
+Accepted Kranz adaptation:
+`docs/scoping/flight-rules-engineering-standards.md` (D-A…D-K) and the
+KRZ-341–349 series above. It stays on the retained side of the positioning
+boundary: standards content lives in packs; core owns generic lifecycle,
+deterministic resolution, consent pinning, gate binding, exception authority,
+and evidence. Kranz strengthens the source pattern with base-branch ownership,
+approval-pinned manifests, merge-time policy-drift refusal, sandboxed gate
+execution, and exact replayable waivers. User-facing name: **Flight Rules**;
+`Codex` is rejected because it collides with OpenAI Codex.
 
 ## Standing rule for every ticket in this series
 

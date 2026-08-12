@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped in 952cbc0
 title: /kranz ask — conversational status and commentary in Slack (LLM-backed)
 priority: 3
 schedule: once

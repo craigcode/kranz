@@ -1,4 +1,5 @@
 ---
+state: done
 title: Add a macOS CI job covering the Seatbelt and process-group code paths
 priority: 3
 schedule: once

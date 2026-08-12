@@ -2,6 +2,8 @@
 title: "Beads bridge: translator correctness (D-BW-2 brief 1)"
 priority: 2
 schedule: once
+state: done
+state-note: "Delivered via the m-83d1ed salvage arc (94ad843, 4420006, 4d4f604, ac29bf2); verified 2026-08-07 — set-state grep clean, live round-trip suite 14/14 on bd 1.0.5. See notes."
 ---
 
 # Beads bridge: translator correctness

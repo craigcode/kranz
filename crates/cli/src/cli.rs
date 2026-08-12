@@ -113,11 +113,22 @@ pub enum Command {
     },
 
     /// Show the flight-surgeon outcomes fold: autonomy ratio, grant-latency
-    /// distribution, and escalation ledger (read-only, no lock)
+    /// distribution, per-task-class rows, context reuse, the rubber-stamp
+    /// flag, and the escalation ledger (read-only, no lock)
     Outcomes {
         /// Dump the full Outcomes struct as JSON instead of the text report
         #[arg(long)]
         json: bool,
+
+        /// Cost per merged change grouped by repo across the host catalog
+        /// (~/.kranz/config.json), beside the autonomy ratio (KRZ-329)
+        #[arg(long)]
+        all: bool,
+
+        /// Window in days for the merged-change denominator (only with
+        /// --all; default 30, inclusive at both ends)
+        #[arg(long, default_value_t = kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS)]
+        window_days: u64,
     },
 
     /// Show the flight-surgeon console: autonomy ratio split by outcome,
@@ -127,6 +138,40 @@ pub enum Command {
     EscalationMetrics {
         /// Dump the full EscalationMetrics struct as JSON instead of the text
         /// report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replay why a mission's unit passed from its event log alone: the gate
+    /// ladder in order (verdicts + artefact resolution against the mission
+    /// dir), each session's backend/model and prompt identity, every human
+    /// decision with its event seq, and the terminal outcome (read-only, no
+    /// lock). A cleaned runs/ degrades artefact refs to "unresolved", never
+    /// to an error.
+    Provenance {
+        /// The mission id (defaults to the global --mission / auto-selection)
+        mission_id: Option<String>,
+
+        /// Dump the full ProvenanceChain struct as JSON instead of the text
+        /// report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the recorded evaluation series for one gate identity across all
+    /// missions: every gate.result with that gate name, in log order —
+    /// verdict, and the gate-supplied score + threshold where the gate
+    /// reported them (read-only, no lock). kranz records what gates report,
+    /// never normalizes it, and never derives the verdict from the score;
+    /// a boolean-only gate's series shows verdicts with no score column
+    /// (absence is the normal case, never a zero).
+    GateScores {
+        /// The gate identity (the `gate` field on gate.result events — a
+        /// defect-class name like `vacuous-filter`, a pack gate name,
+        /// `merge-gate-suite`)
+        gate: String,
+
+        /// Dump the GateScoreSeries struct as JSON instead of the text table
         #[arg(long)]
         json: bool,
     },
@@ -169,6 +214,13 @@ pub enum Command {
     Grant {
         #[command(subcommand)]
         command: GrantCommand,
+    },
+
+    /// Answer an open structured human question (the pending-decision
+    /// projection the dashboard and Slack also render)
+    Question {
+        #[command(subcommand)]
+        command: QuestionCommand,
     },
 
     /// List this repo's missions
@@ -309,6 +361,50 @@ pub enum Command {
         range: Option<String>,
     },
 
+    /// Lint the scoped tree for banned domain vocabulary (the KRZ-314
+    /// clean-room boundary: kranz core stays domain-free, domain knowledge
+    /// ships in private packs). Policy is the committed hashed denylist
+    /// (.kranz/domain-denylist.json) plus reviewed waivers
+    /// (.kranz/domain-allowlist); see docs/domain-lint.md. Exit 0 clean, 1
+    /// on unwaived hits — each named by fingerprint + file:line, never
+    /// quoting the matched term.
+    DomainLint {
+        /// Regenerate the hashed denylist from a plaintext terms file (one
+        /// term per line, `#` comments) instead of linting. The terms file
+        /// IS the protected vocabulary: keep it out of the repo —
+        /// .kranz/domain-terms.local is gitignored for exactly this.
+        #[arg(long, value_name = "TERMS_FILE")]
+        seed_config: Option<PathBuf>,
+
+        /// Print the report as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// INTERNAL: the Claude Code lifecycle-hook command the engine installs
+    /// into worker sessions (KRZ-302). Never invoked by operators — the
+    /// session's CLI pipes a PreToolUse hook payload to stdin; the guard
+    /// judges it against the engine-written spec file, records the outcome,
+    /// and exits 0 (allow) / 2 (block, stderr fed to the model) / 1 (guard
+    /// error, failing open — the engine-side sweep remains authoritative).
+    HookGuard {
+        /// The per-session hook-gate spec file the engine wrote
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+
+    /// INTERNAL: the cursor CLI lifecycle-hook relay the backend installs
+    /// into agent sessions (ticket `agent-hooks-status-signals`). Never
+    /// invoked by operators — the session's CLI pipes a lifecycle hook
+    /// payload to stdin; the relay maps it to a coarse signal and POSTs it
+    /// to the loopback endpoint in the engine-written spec file. Purely
+    /// observational: every failure exits 0.
+    HookStatus {
+        /// The per-session hook-status spec file the engine wrote
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+
     /// Score how ready this repo is for autonomous kranz missions.
     Ready {
         /// Print the serializable scorecard JSON.
@@ -428,6 +524,23 @@ pub enum Command {
         from_start: bool,
     },
 
+    /// Export a mission's portable audit bundle (KRZ-326): a self-contained
+    /// directory an auditor can open without repo access — manifest.json
+    /// (every entry with its sha256 + source ref), a human summary.md, the
+    /// provenance chain.json, the escalation ledger and cost fold, the raw
+    /// scrubbed event log, and every resolvable artefact's bytes under
+    /// artefacts/. Missing artefact bytes are listed as unresolved manifest
+    /// entries, never omitted. The same log always yields the same bundle.
+    EvidenceBundle {
+        /// The mission id (defaults to the global --mission / auto-selection)
+        mission_id: Option<String>,
+
+        /// Directory to write the bundle into (created; must be empty).
+        /// Defaults to ./evidence-bundle-<mission-id>
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+    },
+
     /// Export validation-PASSED worker traces as fine-tuning-ready JSONL.
     ///
     /// Derived and regenerable: loads and folds the target mission's event
@@ -451,6 +564,31 @@ pub enum Command {
         out: Option<PathBuf>,
     },
 
+    /// Export the provenance-tagged training corpus as JSONL (KRZ-332).
+    ///
+    /// One tagged record per line (`source`: worker-trace / divergence /
+    /// escalation): validation-PASSED worker traces, divergence
+    /// comparison+resolution pairs, and escalation-ledger human judgments —
+    /// every record carrying the provenance refs (mission, backend/model,
+    /// run id, gate-chain seqs) that resolve it through `kranz provenance`.
+    /// Derived and regenerable like export-traces (which stays a
+    /// traces-only contract): same logs in, byte-identical JSONL out.
+    ExportCorpus {
+        /// The mission id (defaults to the global --mission / auto-selection;
+        /// ignored with --all)
+        mission_id: Option<String>,
+
+        /// Aggregate the corpus across every mission under .kranz/missions
+        /// (ids sorted). A mission whose event log is missing, unreadable,
+        /// or corrupt is skipped, not fatal.
+        #[arg(long)]
+        all: bool,
+
+        /// Write the JSONL output to this path instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults
@@ -463,6 +601,124 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         command: crate::config_cmd::ConfigCommand,
+    },
+
+    /// Work with kranz packs (the pack contract: deterministic gates, role
+    /// prompts, checklists, artefact stores — docs/pack-contract.md)
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
+
+    /// Work with Flight Rules standards (KRZ-341): the schema-4 pack
+    /// standards corpus — RFCs, rules, the normalized manifest + content
+    /// digest, and the lifecycle transition lint
+    /// (docs/scoping/flight-rules-engineering-standards.md)
+    Standards {
+        #[command(subcommand)]
+        command: StandardsCommand,
+    },
+}
+
+/// Subcommands under `kranz pack` — the pack contract surface (ticket
+/// `.kranz/tickets/pack-contract-gates-prompts.md`).
+#[derive(Subcommand, Debug)]
+pub enum PackCommand {
+    /// Load and validate a pack directory fully locally, printing what it
+    /// registers (gates, prompts, checklists, artefact stores).
+    ///
+    /// A directory without a pack.toml is not a pack — the command says so
+    /// plainly and exits 0. An invalid pack fails closed: nonzero exit
+    /// naming the offending field (unknown field, wrong type, missing
+    /// required key, empty gate command, duplicate name, model-judged gate
+    /// kind, engine-reserved gate name).
+    Lint {
+        /// The pack directory containing pack.toml
+        dir: PathBuf,
+    },
+}
+
+/// Subcommands under `kranz standards` — the Flight Rules surface (ticket
+/// `.kranz/tickets/flight-rules-pack-contract.md`, KRZ-341).
+#[derive(Subcommand, Debug)]
+pub enum StandardsCommand {
+    /// Fold Flight Rules effectiveness across mission event logs and traced
+    /// defect tickets. Raw denominators are always shown; interpretive smells
+    /// remain suppressed below the documented minimum sample count.
+    Metrics {
+        /// Emit the deterministic machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Load a pack's [standards] corpus and print the normalized manifest:
+    /// every RFC and rule with its effective lifecycle status, checker
+    /// binding, and scopes, plus the sha256 content digest and the trust
+    /// posture (an external/untracked pack is advisory-only — enforced rules
+    /// are refused at load naming the remedy).
+    ///
+    /// With --against <ref>, the base pack is read from TRACKED BLOBS at
+    /// that git ref (never the worktree) and lifecycle transition violations
+    /// are refused: absent/draft → enforced, a semantic rule change without
+    /// a revision increment, a disappeared known rule ID, tombstone
+    /// reactivation. Exit 0 clean, 1 on load errors or refused transitions.
+    Lint {
+        /// The pack directory containing pack.toml
+        dir: PathBuf,
+
+        /// Base git ref (branch or sha) whose tracked pack bytes define the
+        /// approved lifecycle state for the transition check
+        #[arg(long, value_name = "REF")]
+        against: Option<String>,
+    },
+
+    /// Record an authorized human waiver for ONE standards failure (ticket
+    /// flight-rules-waiver-decisions, KRZ-344; design D-I) — the only
+    /// approval surface. Displays the finding, the pinned rule, the
+    /// affected paths, and the diff digest the waiver binds, then appends
+    /// `standards.waiver.approved` to the mission log. Refuses: a rule with
+    /// `waivable: false`, a rule absent from the approved pin (an expired/
+    /// retired rule or RFC is never pinned), a mismatched revision, an
+    /// absent finding, an already-waived finding, or a past expiry. The
+    /// approver is recorded honestly as `local-operator` plus this surface
+    /// — a model may request a waiver but can never approve one.
+    Waive {
+        /// The pinned rule id to except (e.g. ENG-RUST-014)
+        #[arg(long)]
+        rule: String,
+
+        /// The revision you believe you are waiving (defaults to the pinned
+        /// revision; a mismatch refuses rather than silently rebinding)
+        #[arg(long)]
+        revision: Option<u64>,
+
+        /// Waive only the latest finding with this subject (disambiguates
+        /// when several findings cite the rule)
+        #[arg(long)]
+        finding: Option<String>,
+
+        /// Why the exception is granted (recorded verbatim)
+        #[arg(long)]
+        reason: String,
+
+        /// Expiry instant, RFC 3339 (e.g. 2026-09-01T00:00:00Z) — must be
+        /// in the future; waivers are never permanent
+        #[arg(long, value_name = "RFC3339")]
+        expires: String,
+    },
+
+    /// Record the authorized human verdict for one approval-pinned
+    /// `manual-attestation` rule. The attestation binds to the current
+    /// affected paths and diff digest, so any relevant change invalidates
+    /// it. The approver is always the local operator using this CLI surface.
+    Attest {
+        /// The pinned manual-attestation rule id
+        #[arg(long)]
+        rule: String,
+
+        /// Why the operator judges the current change compliant
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -509,6 +765,34 @@ pub enum GrantCommand {
         /// Reason recorded on the denial
         #[arg(long, default_value = "denied by operator")]
         reason: String,
+    },
+}
+
+/// Subcommands under `kranz question` — the structured human-question
+/// pending-decision projection (ticket structured-human-question-events).
+#[derive(Subcommand, Debug)]
+pub enum QuestionCommand {
+    /// List the mission's open questions (id, text, options)
+    List {
+        /// Mission id whose open questions should be listed
+        id: String,
+    },
+
+    /// Answer an open question (lands as question.answered; the answer
+    /// reaches the running mission via the user-message consult)
+    Answer {
+        /// Mission id whose open question should be answered
+        id: String,
+
+        /// The engine-minted question id (`q-<n>`, from `kranz question list`)
+        question_id: String,
+
+        /// The answer: an offered option's text verbatim, or free text
+        answer: String,
+
+        /// 0-based index of the offered option picked (omit for free text)
+        #[arg(long)]
+        option: Option<u32>,
     },
 }
 
@@ -598,6 +882,17 @@ pub enum TicketCommand {
         #[arg(long)]
         force: bool,
     },
+
+    /// Fold terminal `.status` sidecar states into committed frontmatter
+    /// `state:` keys — the one-time migration from the ticket-state-
+    /// frontmatter design, so done verdicts survive a fresh clone. Dry-run
+    /// by default; tickets with uncommitted .md edits are skipped by name
+    /// (never rewrite a file an in-flight editor or agent has open)
+    MigrateState {
+        /// Apply the fold (without this flag it only reports what it would do)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]
@@ -625,6 +920,185 @@ mod tests {
     }
 
     #[test]
+    fn pack_contract_pack_lint_parses_dir() {
+        let cli = Cli::try_parse_from(["kranz", "pack", "lint", "some/dir"]).unwrap();
+        match cli.command {
+            Command::Pack { command } => match command {
+                PackCommand::Lint { dir } => assert_eq!(dir, PathBuf::from("some/dir")),
+            },
+            other => panic!("expected Pack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flight_rules_contract_standards_lint_parses_dir_and_against() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "lint", "some/dir"]).unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against, None);
+                }
+                other => panic!("expected Lint, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "lint",
+            "some/dir",
+            "--against",
+            "main",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against.as_deref(), Some("main"));
+                }
+                other => panic!("expected Lint, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+    }
+
+    /// KRZ-344 (D-I): the waiver surface parses its full flag set; the
+    /// approver is never a flag — the record honestly names
+    /// `local-operator` plus the `cli` surface.
+    #[test]
+    fn flight_rules_waiver_standards_waive_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "waive",
+            "--rule",
+            "ZZ-FAIL-001",
+            "--reason",
+            "accepted risk",
+            "--expires",
+            "2026-09-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Waive {
+                    rule,
+                    revision,
+                    finding,
+                    reason,
+                    expires,
+                } => {
+                    assert_eq!(rule, "ZZ-FAIL-001");
+                    assert_eq!(revision, None);
+                    assert_eq!(finding, None);
+                    assert_eq!(reason, "accepted risk");
+                    assert_eq!(expires, "2026-09-01T00:00:00Z");
+                }
+                other => panic!("expected Waive, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "waive",
+            "--rule",
+            "ZZ-FAIL-001",
+            "--revision",
+            "2",
+            "--finding",
+            "a-1",
+            "--reason",
+            "accepted risk",
+            "--expires",
+            "2026-09-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Waive {
+                    revision, finding, ..
+                } => {
+                    assert_eq!(revision, Some(2));
+                    assert_eq!(finding.as_deref(), Some("a-1"));
+                }
+                other => panic!("expected Waive, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        // --reason and --expires are required: no silent permanent or
+        // reason-less waiver exists.
+        assert!(
+            Cli::try_parse_from(["kranz", "standards", "waive", "--rule", "ZZ-FAIL-001"]).is_err()
+        );
+    }
+
+    #[test]
+    fn flight_rules_enforcement_standards_attest_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "attest",
+            "--rule",
+            "ZZ-MANUAL-001",
+            "--reason",
+            "reviewed the deployment evidence",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Attest { rule, reason } => {
+                    assert_eq!(rule, "ZZ-MANUAL-001");
+                    assert_eq!(reason, "reviewed the deployment evidence");
+                }
+                other => panic!("expected Attest, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["kranz", "standards", "attest", "--rule", "ZZ-MANUAL-001"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flight_rules_metrics_standards_metrics_parses_json() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "metrics", "--json"]).unwrap();
+        match cli.command {
+            Command::Standards {
+                command: StandardsCommand::Metrics { json },
+            } => assert!(json),
+            other => panic!("expected standards metrics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_bundle_parses_mission_and_out() {
+        let cli =
+            Cli::try_parse_from(["kranz", "evidence-bundle", "m-1", "--out", "some/dir"]).unwrap();
+        match cli.command {
+            Command::EvidenceBundle { mission_id, out } => {
+                assert_eq!(mission_id.as_deref(), Some("m-1"));
+                assert_eq!(out.as_deref(), Some(PathBuf::from("some/dir").as_path()));
+            }
+            other => panic!("expected EvidenceBundle, got {other:?}"),
+        }
+
+        // Both optional: the mission falls back to auto-selection, the output
+        // dir to ./evidence-bundle-<mission-id>.
+        let cli = Cli::try_parse_from(["kranz", "evidence-bundle"]).unwrap();
+        match cli.command {
+            Command::EvidenceBundle { mission_id, out } => {
+                assert_eq!(mission_id, None);
+                assert_eq!(out, None);
+            }
+            other => panic!("expected EvidenceBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn decompose_parses_goal_and_yes_flag() {
         let cli = Cli::try_parse_from(["kranz", "decompose", "build the thing", "--yes"]).unwrap();
         match cli.command {
@@ -647,5 +1121,100 @@ mod tests {
             Command::Decompose { yes, .. } => assert!(!yes),
             other => panic!("expected Decompose, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn domain_lint_command_parses_seed_config_and_json_flags() {
+        // Bare form: lint mode, text output.
+        let cli = Cli::try_parse_from(["kranz", "domain-lint"]).unwrap();
+        match cli.command {
+            Command::DomainLint { seed_config, json } => {
+                assert_eq!(seed_config, None);
+                assert!(!json);
+            }
+            other => panic!("expected DomainLint, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["kranz", "domain-lint", "--seed-config", "terms", "--json"])
+            .unwrap();
+        match cli.command {
+            Command::DomainLint { seed_config, json } => {
+                assert_eq!(seed_config, Some(PathBuf::from("terms")));
+                assert!(json);
+            }
+            other => panic!("expected DomainLint, got {other:?}"),
+        }
+    }
+
+    /// Composition audit (ticket `config-fail-open-audit`): every CLI flag
+    /// whose name signals a guard-weakening override must either carry the
+    /// `dangerously-` prefix or be one of the enumerated, justified
+    /// exceptions. A future flag that short-circuits a guard without the
+    /// prefix trips this test until its justification is recorded — the
+    /// naming rule's tripwire. The per-flag rationales live in
+    /// docs/config-composition.md.
+    #[test]
+    fn composition_audit_guard_weakening_flags_are_dangerously_prefixed_or_enumerated() {
+        use clap::CommandFactory;
+
+        fn collect_long_flags(cmd: &clap::Command, out: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    out.push(long.to_string());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect_long_flags(sub, out);
+            }
+        }
+
+        let mut flags = Vec::new();
+        collect_long_flags(&Cli::command(), &mut flags);
+        // The heuristic: names that read like they weaken a guard. Wide on
+        // purpose — a false positive only costs a recorded justification.
+        let suspicious = [
+            "force",
+            "steal",
+            "bypass",
+            "unvalidated",
+            "insecure",
+            "skip",
+            "unsafe",
+            "dangerous",
+            "override",
+        ];
+        let mut hits: Vec<String> = flags
+            .into_iter()
+            .filter(|flag| suspicious.iter().any(|s| flag.contains(s)))
+            .collect();
+        hits.sort();
+        hits.dedup();
+
+        // The documented set. `dangerously-*` members are the naming rule's
+        // escape valve; the rest are the accepted exceptions of
+        // docs/config-composition.md:
+        // - force-lock: steals only from a holder PROVABLY dead (the
+        //   liveness probe is fail-closed); the live-holder bypass is the
+        //   dangerously-named flag.
+        // - allow-unvalidated (exec): lifts only the unattended scrutiny
+        //   FLOOR — a refuse-to-run gate, not a deny list; self-describing.
+        // - insecure-lan (serve): an acknowledgment that ADDS token
+        //   requirements on non-loopback binds; it removes nothing.
+        // - force (ticket queue/approve): skips blocked-by READINESS only;
+        //   dependency cycles are never overridable.
+        let expected = [
+            "allow-unvalidated",
+            "dangerously-allow-all",
+            "dangerously-steal-live-lock",
+            "force",
+            "force-lock",
+            "insecure-lan",
+        ];
+        assert_eq!(
+            hits,
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "a guard-weakening flag changed: every bypass of a deny list must carry \
+             the dangerously- prefix or a recorded exception (docs/config-composition.md)"
+        );
     }
 }

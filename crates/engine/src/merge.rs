@@ -5,8 +5,9 @@
 //!
 //! `merge_mission` ties together three primitives that each already carry
 //! their own safety contract: [`GitRepo::is_clean_tracked`] (refuse dirty),
-//! [`crate::merge_gate::run_gate_suite`] (refuse on a failing gate, base
-//! untouched), and [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
+//! [`crate::merge_gate::MergeSuiteGate`] (refuse on a failing gate, base
+//! untouched — the suite runs through the [`crate::gate`] interface), and
+//! [`GitRepo::merge_no_ff`] (clean-abort on conflict). The
 //! merge and gates run in a detached scratch worktree; the primary base only
 //! fast-forwards to that exact tested commit. Every git command on this path
 //! runs via [`GitRepo::with_hooks_disabled`], so mission-planted
@@ -14,8 +15,9 @@
 //! never calls [`GitRepo::push_mission_branch`] or any other push.
 
 use crate::error::Result;
+use crate::gate::{Gate, GateVerdict};
 use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
-use crate::merge_gate::{parse_gate_suite, run_gate_suite, GateSuiteResult, MERGE_GATES_PATH};
+use crate::merge_gate::{parse_gate_suite, MergeSuiteGate, MERGE_GATES_PATH};
 use crate::scrub::{self, SecretFinding};
 use std::path::Path;
 
@@ -55,6 +57,30 @@ pub enum MergeReport {
         /// Git's verbatim refusal text.
         detail: String,
     },
+    /// The live base's applicable ENFORCED Flight Rules set differs from the
+    /// mission's approved pin (KRZ-342, design D-E): policy moved under the
+    /// mission. The merge is refused before the gate suite runs — neither
+    /// grandfather-skipping current policy nor silently applying new policy
+    /// to an old consent artifact — and the caller records
+    /// `standards.drifted`. Base is untouched.
+    StandardsDrifted {
+        /// The digest pinned at approval.
+        approved_digest: String,
+        /// The digest resolved from the live base (`None`: the live base no
+        /// longer yields a readable standards manifest at all).
+        current_digest: Option<String>,
+        /// Id-level change lines for the applicable enforced set.
+        changed_rules: Vec<String>,
+    },
+    /// An applicable enforced MUST could not produce a current authoritative
+    /// merge verdict. Deterministic checkers run against the exact scratch
+    /// integration tree; contextual/manual checkers must carry positive or
+    /// exactly-waived final evidence from the completed mission.
+    StandardsFailed {
+        rule_id: String,
+        checker: String,
+        output: String,
+    },
     /// The mission branch merged cleanly into base with a `--no-ff` commit.
     Merged {
         /// The new merge commit sha, now the tip of `base_branch`.
@@ -73,19 +99,208 @@ pub struct StaleBaseWarning {
     pub merge_commits_since_base: usize,
 }
 
+/// Positive final evidence that may be consumed by merge-only checker forms.
+/// Deterministic gates are always re-run against the scratch integration;
+/// only an exact human waiver may permit one of those current failures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StandardsMergeEvidence {
+    pub passed: std::collections::BTreeSet<String>,
+    waived_final: std::collections::BTreeSet<String>,
+    approval_seq: Option<u64>,
+    waivers: Vec<crate::standards_waiver::WaiverRecord>,
+    attestations: Vec<crate::standards_attestation::AttestationRecord>,
+    evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl StandardsMergeEvidence {
+    pub fn from_mission_events(
+        mission_id: &str,
+        pin: Option<&crate::types::StandardsPin>,
+        coverage: Option<&crate::standards_coverage::StandardsCoverage>,
+        events: &[crate::events::Event],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let mut evidence = Self::default();
+        if let Some(coverage) = coverage {
+            for rule in &coverage.rules {
+                match rule.disposition {
+                    crate::standards_coverage::RuleDisposition::Passed => {
+                        evidence.passed.insert(rule.id.clone());
+                    }
+                    crate::standards_coverage::RuleDisposition::Waived => {
+                        evidence.waived_final.insert(rule.id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(pin) = pin {
+            evidence.approval_seq = events
+                .iter()
+                .filter(|event| event.mission_id == mission_id)
+                .filter_map(|event| match &event.kind {
+                    crate::events::EventKind::PlanApproved { plan, .. }
+                        if plan.standards_manifest.as_deref() == Some(pin) =>
+                    {
+                        Some(event.seq)
+                    }
+                    _ => None,
+                })
+                .next_back();
+            evidence.waivers = events
+                .iter()
+                .filter(|event| event.mission_id == mission_id)
+                .filter_map(crate::standards_waiver::WaiverRecord::from_event)
+                .collect();
+            evidence.attestations = events
+                .iter()
+                .filter(|event| event.mission_id == mission_id)
+                .filter_map(crate::standards_attestation::AttestationRecord::from_event)
+                .collect();
+            evidence.evaluated_at = Some(now);
+        }
+        evidence
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn current_waiver(
+        &self,
+        repo: &GitRepo,
+        live_base_sha: &str,
+        tested_commit: &str,
+        integration_paths: &[String],
+        pin: &crate::types::StandardsPin,
+        rule: &crate::types::PinnedRule,
+        finding: Option<&crate::types::Finding>,
+    ) -> Result<bool> {
+        if !self.waived_final.contains(&rule.id) {
+            return Ok(false);
+        }
+        let (Some(approval_seq), Some(now)) = (self.approval_seq, self.evaluated_at) else {
+            return Ok(false);
+        };
+        let paths = crate::standards_waiver::affected_paths_with_context(
+            rule,
+            integration_paths,
+            &pin.context_paths,
+        );
+        let diff = if rule.when_paths.is_empty() {
+            repo.diff_full(live_base_sha, tested_commit)?
+        } else if paths.is_empty() {
+            String::new()
+        } else {
+            repo.diff_range_paths(live_base_sha, tested_commit, &paths)?
+        };
+        let diff_digest = crate::standards_waiver::sha256_hex(diff.as_bytes());
+        let fingerprint = finding.map(|finding| {
+            crate::standards_waiver::finding_fingerprint(crate::reducer::ENGINE_RUN_ID, finding)
+        });
+        Ok(self.waivers.iter().any(|waiver| {
+            fingerprint
+                .as_ref()
+                .is_none_or(|fingerprint| waiver.finding_fingerprint == *fingerprint)
+                && crate::standards_waiver::waiver_covers(
+                    waiver,
+                    rule,
+                    pin,
+                    approval_seq,
+                    &waiver.finding_fingerprint,
+                    now,
+                )
+                && waiver.paths == paths
+                && waiver.diff_digest == diff_digest
+        }))
+    }
+
+    fn current_attestation(
+        &self,
+        repo: &GitRepo,
+        live_base_sha: &str,
+        tested_commit: &str,
+        integration_paths: &[String],
+        pin: &crate::types::StandardsPin,
+        rule: &crate::types::PinnedRule,
+    ) -> Result<bool> {
+        let Some(approval_seq) = self.approval_seq else {
+            return Ok(false);
+        };
+        let paths = crate::standards_waiver::affected_paths_with_context(
+            rule,
+            integration_paths,
+            &pin.context_paths,
+        );
+        let diff = if rule.when_paths.is_empty() {
+            repo.diff_full(live_base_sha, tested_commit)?
+        } else if paths.is_empty() {
+            String::new()
+        } else {
+            repo.diff_range_paths(live_base_sha, tested_commit, &paths)?
+        };
+        let diff_digest = crate::standards_waiver::sha256_hex(diff.as_bytes());
+        Ok(self.attestations.iter().rev().any(|record| {
+            record.seq > approval_seq
+                && record.rule_id == rule.id
+                && record.rule_revision == rule.revision
+                && record.manifest_digest == pin.digest
+                && record.approval_seq == approval_seq
+                && record.paths == paths
+                && record.diff_digest == diff_digest
+                && crate::standards_waiver::HUMAN_SURFACES.contains(&record.surface.as_str())
+                && !record.approver.trim().is_empty()
+        }))
+    }
+}
+
 /// Runs the gated merge: refuse-if-dirty, then gates, then `--no-ff` merge.
 ///
-/// `executor` is forwarded to [`crate::merge_gate::run_gate_suite`] as-is
-/// (production callers wrap the orchestrator's shell runner, tests inject a
-/// scripted fake). This function never calls
+/// `executor` is forwarded to the [`crate::merge_gate::MergeSuiteGate`]
+/// adapter as-is (production callers wrap the orchestrator's shell runner,
+/// tests inject a scripted fake). This function never calls
 /// [`GitRepo::push_mission_branch`] or any push — the base branch is only
 /// ever advanced locally.
+///
+/// `standards_pin` is the mission's approved Flight Rules manifest pin
+/// (KRZ-342, design D-E), folded from its event log: `None` keeps the merge
+/// byte-identical. With a repo-tracked pin, the LIVE base policy is
+/// re-resolved against the exact scratch integration diff once the
+/// integration commit exists and BEFORE the gate suite runs — an applicable
+/// enforced-set difference refuses with [`MergeReport::StandardsDrifted`].
 pub fn merge_mission<F>(
     repo: &GitRepo,
     base_branch: &str,
     base_sha: &str,
     mission_branch: &str,
     metadata: Option<KranzCommitMetadata>,
+    standards_pin: Option<&crate::types::StandardsPin>,
+    executor: F,
+) -> Result<MergeReport>
+where
+    F: Fn(&str, &Path) -> (bool, String),
+{
+    merge_mission_with_standards_evidence(
+        repo,
+        base_branch,
+        base_sha,
+        mission_branch,
+        metadata,
+        standards_pin,
+        &StandardsMergeEvidence::default(),
+        executor,
+    )
+}
+
+/// The production merge path, including the completed mission's replayed
+/// standards evidence. Kept separate from [`merge_mission`] so existing
+/// embedders with no Flight Rules pin retain their source-compatible call.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mission_with_standards_evidence<F>(
+    repo: &GitRepo,
+    base_branch: &str,
+    base_sha: &str,
+    mission_branch: &str,
+    metadata: Option<KranzCommitMetadata>,
+    standards_pin: Option<&crate::types::StandardsPin>,
+    standards_evidence: &StandardsMergeEvidence,
     executor: F,
 ) -> Result<MergeReport>
 where
@@ -97,7 +312,7 @@ where
     // `.git/hooks/*` and have the merge's own checkout/merge/worktree
     // commands execute it with the server's full environment (exactly what
     // the sanitized gate executor withholds). Worker-side git is untouched.
-    let repo = &repo.with_hooks_disabled();
+    let repo = &repo.with_hooks_disabled()?;
 
     if !repo.is_clean_tracked_strict()? {
         return Ok(MergeReport::RefusedDirtyTree);
@@ -160,7 +375,7 @@ where
         path: scratch_path.clone(),
     };
 
-    let scratch = GitRepo::open(&scratch_path)?.with_hooks_disabled();
+    let scratch = GitRepo::open(&scratch_path)?.with_hooks_disabled()?;
     match scratch.merge_no_ff_with_message(&mission_tip_sha, merge_message.as_deref())? {
         MergeOutcome::Conflict { files } => return Ok(MergeReport::Conflict { files }),
         MergeOutcome::RefusedPreMerge { detail } => {
@@ -170,11 +385,160 @@ where
     }
     let tested_commit = scratch.head_sha()?;
 
-    match run_gate_suite(scratch.root(), &changed_paths, &gate_suite, executor) {
-        GateSuiteResult::Failed { gate, output } => {
-            return Ok(MergeReport::GateFailed { gate, output });
+    // Flight Rules policy-drift check (KRZ-342, design D-E): re-resolve the
+    // LIVE base standards policy against the exact scratch integration diff
+    // (live_base..tested_commit — what this merge would add to the base) and
+    // compare the applicable ENFORCED set against the approved pin's. A
+    // difference refuses BEFORE the gate suite: the mission needs explicit
+    // revalidation/reapproval, not a green gate run under policy the
+    // operator never consented to. `None` pin ⇒ skip, byte-identical.
+    if let Some(pin) = standards_pin {
+        let integration_paths = repo.changed_paths(&live_base_sha, &tested_commit)?;
+        if let Some(drift) =
+            crate::pack::resolution::merge_drift(repo, &live_base_sha, pin, &integration_paths)
+                .map_err(crate::error::EngineError::Git)?
+        {
+            return Ok(MergeReport::StandardsDrifted {
+                approved_digest: drift.approved_digest,
+                current_digest: drift.current_digest,
+                changed_rules: drift.changed_rules,
+            });
         }
-        GateSuiteResult::Passed => {}
+
+        // KRZ-346 (D-F): checker bindings and commands come only from the
+        // approval pin. Deterministic merge rules execute once per stable
+        // gate id against the exact scratch integration tree. Approved rules
+        // and enforced SHOULDs still execute but remain advisory; only an
+        // enforced MUST can refuse the merge.
+        let rules = crate::standards_enforcement::applicable_rules(
+            pin,
+            &[crate::pack::standards::RuleStage::Merge],
+            &integration_paths,
+        );
+        let mut gate_rules: std::collections::BTreeMap<
+            String,
+            (&crate::types::PinnedGate, Vec<&crate::types::PinnedRule>),
+        > = std::collections::BTreeMap::new();
+        for rule in &rules {
+            match crate::standards_enforcement::checker_binding(pin, rule, &integration_paths) {
+                crate::standards_enforcement::CheckerBinding::Gate(gate) => {
+                    gate_rules
+                        .entry(gate.id.clone())
+                        .or_insert_with(|| (gate, Vec::new()))
+                        .1
+                        .push(rule);
+                }
+                crate::standards_enforcement::CheckerBinding::AgentJudgement => {
+                    if crate::standards_enforcement::rule_mode(rule)
+                        == crate::standards_enforcement::RuleMode::Authoritative
+                        && !standards_evidence.passed.contains(&rule.id)
+                        && !standards_evidence.current_waiver(
+                            repo,
+                            &live_base_sha,
+                            &tested_commit,
+                            &integration_paths,
+                            pin,
+                            rule,
+                            None,
+                        )?
+                    {
+                        return Ok(MergeReport::StandardsFailed {
+                            rule_id: rule.id.clone(),
+                            checker: rule.checker.clone().unwrap_or_default(),
+                            output: "no positive or exact-waived final checker evidence is present for this completed mission".to_string(),
+                        });
+                    }
+                }
+                crate::standards_enforcement::CheckerBinding::ManualAttestation => {
+                    if crate::standards_enforcement::rule_mode(rule)
+                        == crate::standards_enforcement::RuleMode::Authoritative
+                        && !standards_evidence.current_attestation(
+                            repo,
+                            &live_base_sha,
+                            &tested_commit,
+                            &integration_paths,
+                            pin,
+                            rule,
+                        )?
+                        && !standards_evidence.current_waiver(
+                            repo,
+                            &live_base_sha,
+                            &tested_commit,
+                            &integration_paths,
+                            pin,
+                            rule,
+                            None,
+                        )?
+                    {
+                        return Ok(MergeReport::StandardsFailed {
+                            rule_id: rule.id.clone(),
+                            checker: "manual-attestation".to_string(),
+                            output: "no authorized attestation or exact waiver matches the scratch integration diff".to_string(),
+                        });
+                    }
+                }
+                crate::standards_enforcement::CheckerBinding::Unavailable(detail) => {
+                    if crate::standards_enforcement::rule_mode(rule)
+                        == crate::standards_enforcement::RuleMode::Authoritative
+                    {
+                        return Ok(MergeReport::StandardsFailed {
+                            rule_id: rule.id.clone(),
+                            checker: rule
+                                .checker
+                                .clone()
+                                .unwrap_or_else(|| "<missing>".to_string()),
+                            output: detail,
+                        });
+                    }
+                }
+            }
+        }
+        for (_gate_id, (gate, bound_rules)) in gate_rules {
+            let (passed, output) = executor(&gate.command, scratch.root());
+            if passed {
+                continue;
+            }
+            for rule in bound_rules.into_iter().filter(|rule| {
+                crate::standards_enforcement::rule_mode(rule)
+                    == crate::standards_enforcement::RuleMode::Authoritative
+            }) {
+                let finding = crate::standards_enforcement::failure_finding(
+                    pin,
+                    rule,
+                    &scrub::scrub(&format!(
+                        "checker `{}` failed for {} r{}: {}",
+                        gate.id, rule.id, rule.revision, output
+                    )),
+                );
+                if !standards_evidence.current_waiver(
+                    repo,
+                    &live_base_sha,
+                    &tested_commit,
+                    &integration_paths,
+                    pin,
+                    rule,
+                    Some(&finding),
+                )? {
+                    return Ok(MergeReport::StandardsFailed {
+                        rule_id: rule.id.clone(),
+                        checker: format!("gate:{}", gate.id),
+                        output,
+                    });
+                }
+            }
+        }
+    }
+
+    // The suite runs through the first-class gate interface (gate.rs) —
+    // behavior is unchanged: same commands, same declared order, stop at
+    // first failure, suite bytes read from the live base branch above.
+    let outcome =
+        MergeSuiteGate::new(scratch.root(), &changed_paths, gate_suite, executor).evaluate();
+    if outcome.verdict == GateVerdict::Fail {
+        return Ok(MergeReport::GateFailed {
+            gate: outcome.artefact.reference,
+            output: outcome.artefact.detail.unwrap_or_default(),
+        });
     }
 
     let post_gate_head = scratch.head_sha()?;

@@ -3,6 +3,12 @@
 //! Separate from the lessons budget ([`crate::lessons::LESSONS_INJECT_MAX_BYTES`]).
 //! Missing vault → inject nothing. Stale notes and notes without
 //! `verified_against` are excluded from automatic injection.
+//!
+//! Boundary note (positioning ADR, frozen surface): context-MANAGEMENT
+//! features — retrieval pipelines, memory systems, dynamic context
+//! optimization — are frozen; this is a capped, ranked, auditable
+//! injection, deliberately not a context engine
+//! (docs/knowledge/decisions/positioning-governance-evidence-layer.md).
 
 use std::path::{Path, PathBuf};
 

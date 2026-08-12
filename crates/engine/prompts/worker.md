@@ -34,13 +34,15 @@ Your very last message must be **ONLY** the WorkerReport JSON — no prose befor
   "dependenciesAdded": ["every dependency you added, with version"],
   "knownGaps": ["anything the spec asked for that is not done or not verified"],
   "commits": ["sha and subject of each commit you made"],
-  "commandsRun": ["exact shell commands you ran to verify your work, e.g. cargo test -p kranz-engine foo, gc lint"]
+  "commandsRun": ["exact shell commands you ran to verify your work, e.g. cargo test -p kranz-engine foo, gc lint"],
+  "escalation": "OPTIONAL — omit normally; a single sentence asking for the frontier advisor, with the reason"
 }
 ```
 
 - `result` is `"pass"` only when every validation criterion has a passing test and lint/build are clean. Otherwise `"partial"` (progress committed, gaps listed) or `"fail"` (approach unworkable — explain in `summary`).
 - `testEvidence` is the load-bearing field. The orchestrator distrusts claims without it.
 - `commandsRun` must list the exact verification commands you executed (test/build/lint invocations) so a validator can re-run them independently to confirm your claim.
+- `escalation` is the self-escalation channel: set it when you judge the task needs frontier-model advice the route you ran on cannot give — an ambiguous spec, an approach call beyond your confidence. The orchestrator (a frontier model) reads it at judgement and the request is recorded. It is never a way to skip work or validation: report honestly (`partial`/`fail` when that is the truth) whether or not you escalate.
 
 ---
 

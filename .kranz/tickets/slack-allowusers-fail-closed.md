@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at e2eb3c6: empty allowUsers now fails closed for all 18 gated call sites unless slack.allowAllUsers: true is set deliberately; refusal names both remedies; read-only actions unchanged. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Slack privileged actions fail closed without an explicit allowAllUsers (P2)
 priority: 3
 schedule: once

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Ticket state must distinguish Delivered (unmerged) from Landed (merged)
 priority: 2
 schedule: once

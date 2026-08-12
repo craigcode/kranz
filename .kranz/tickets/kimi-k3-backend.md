@@ -1,4 +1,5 @@
 ---
+state: done
 title: Add Kimi K3 as an optional AgentBackend (backend_kimi, validator-first)
 priority: 3
 schedule: once

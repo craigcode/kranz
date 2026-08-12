@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: additive gate.result events (gate/surface/kind/index/verdict/artefactRef[+detail/score/threshold]), gate_results.rs resolver (Resolved/Unresolved/Inline), emission at approval + final gate. gate_result_event filter: 14 green; full gates green. Unblocks provenance-replay.
 title: Gate results as first-class events with log-resolvable artefacts
 priority: 2
 schedule: once

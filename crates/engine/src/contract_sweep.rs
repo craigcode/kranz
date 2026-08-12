@@ -89,6 +89,14 @@ pub fn parallel_checkpoint_commit_message(feature_id: &str) -> String {
     format!("[{feature_id}] parallel worktree checkpoint (engine commit)")
 }
 
+/// Message used when a dispatch-pool candidate worktree checkpoints a dirty
+/// stream tree (KRZ-303). Deliberately NOT meta (the checkpoint carries real
+/// worker file changes — the candidate's deliverable), the same posture as
+/// the other checkpoint templates.
+pub fn pool_checkpoint_commit_message(feature_id: &str, index: usize) -> String {
+    format!("[{feature_id}] dispatch pool candidate {index} checkpoint (engine commit)")
+}
+
 /// Whether `subject` matches a known engine/meta commit template.
 ///
 /// Subject templates are SPOOFABLE by a worker's own `git commit`, so this
@@ -253,6 +261,7 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
                     change.path
                 ),
                 class: FINDING_CLASS.to_string(),
+                rule: None,
             }),
             Err(e) => findings.push(Finding {
                 subject: change.path.to_string(),
@@ -263,6 +272,7 @@ pub fn path_findings(touch_set: &[String], changes: &[AttributedChange<'_>]) -> 
                 ),
                 suggested_fix: "fix the mission's touchSet globs".to_string(),
                 class: FINDING_CLASS.to_string(),
+                rule: None,
             }),
         }
     }
@@ -295,6 +305,7 @@ pub fn primary_checkout_finding(
         suggested_fix: "restore the primary checkout to a clean state on the starting branch"
             .to_string(),
         class: FINDING_CLASS.to_string(),
+        rule: None,
     })
 }
 

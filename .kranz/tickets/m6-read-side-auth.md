@@ -1,4 +1,5 @@
 ---
+state: done
 title: Design and ship read-side authentication for kranz serve (M6 read-auth)
 priority: 2
 schedule: once

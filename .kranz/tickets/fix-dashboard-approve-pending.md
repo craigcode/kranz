@@ -1,4 +1,5 @@
 ---
+state: done
 title: Dashboard approves via the host-parked pending plan
 priority: 2
 schedule: once

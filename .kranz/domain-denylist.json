@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "salt": "08263aafff554c08827421b3accf8877a81ee77a00134705a0526479c4dccbc4",
+  "hash": "sha256(salt || NUL || normalized-term)",
+  "terms": [
+    "253752dc168f648cd0472ab47fe7f810eeb5f4e91420662b62e0da6ec8730c8b",
+    "b2468100b9449074f95b2f74548f10cb70a9fbad6a5f261b4b8363cbb6f918c3",
+    "f37870fce9f70297254435e7608eafdbc3c08bc8f108d5203ba69313a1c65e89"
+  ]
+}

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the M6 arc: readiness gate at block lift (workspace_gate.rs), relative-cd checks (eb12f61).
 title: Run workspace bootstrap + readiness before first agent turn
 priority: 1
 schedule: once

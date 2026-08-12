@@ -21,7 +21,27 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap mold
+      # mold as the linker: the a3 plan-contract regression runs a nested
+      # `cargo test -p kranz-engine` inside the suite, which feature-plan
+      # thrashes against the outer --workspace build and RELINKS the big
+      # test binaries — GNU ld then died SIGBUS under the runner's memory
+      # envelope (run 31064030885, `collect2: ld terminated with signal 7
+      # [Bus error]`). mold links at a fraction of GNU ld's memory, which
+      # closes the class for the whole job, not just that test.
+      - name: Link with mold
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      # The same thrash also needs disk: the nested plan's rebuild
+      # duplicates the engine rlib + test binaries under different
+      # fingerprints (~5 GB), which filled the runner right after the
+      # linker stopped dying (run 31065552031, ENOSPC). The stock
+      # toolchains are ~10 GB the suite never touches.
+      - name: Free runner disk (nested plan-contract rebuild headroom)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          df -h /
       - name: Configure git identity (git_ops tests)
         run: |
           git config --global user.name kranz-ci
@@ -46,6 +66,53 @@ jobs:
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
       - run: cargo test --workspace --no-fail-fast
+
+  # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
+  # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A
+  # WRAPPED CONTRACT COMMAND through the gate sandbox wrap, proving a kranz
+  # mission with process enforcement can satisfy this repo's own gate. The
+  # fixture itself drives the wrapped suite and asserts a green exit; the
+  # suite's no-sandbox-can-host tests (setuid /bin/ps exec, nested
+  # sandbox_apply) skip inside the wrap with the detectable
+  # `SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood)` marker — the job
+  # surfaces that count so a silently widening skip set is visible in the
+  # log. macOS-only: the supervision policy being proven is the Seatbelt
+  # clause. The filter substring `dogfood_supervision` matches exactly the
+  # two fixtures of that name (grep-verified collision-free).
+  rust-macos-wrapped-suite:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      # Prebuild the outer harness AND the full workspace dep set. The
+      # wrapped suite still compiles the workspace UNDER the wrap — the
+      # gate's cache-only CARGO_HOME moves the registry source paths, so
+      # target/ fingerprints miss and a full rebuild happens inside the
+      # sandbox. That is the same cost a production wrapped gate pays
+      # (documented in command_exec.rs), and this job is where it is
+      # exercised — the 75-minute budget is for it. The workspace-wide
+      # prebuild is load-bearing, not a shortcut: the wrapped profile
+      # write-denies the operator's real cargo cache (13th-pass), so a
+      # wrapped cargo that needs to DOWNLOAD anything fails EPERM writing
+      # the .crate (run 30977994630 — the engine-only prebuild left cli/
+      # server/slack deps unfetched). With every crate already cached the
+      # wrapped run writes nothing there.
+      - run: cargo test --workspace --no-run
+      - name: Run the wrapped workspace suite (dogfood fixture)
+        # The override appends `-- --nocapture` to the ticket's gate: the
+        # exit code the fixture asserts is unchanged, but libtest then
+        # streams the suite's SKIP-UNDER-WRAP markers into the job log
+        # (captured test output would hide them), keeping the skip set
+        # auditable run over run.
+        env:
+          KRANZ_DOGFOOD_SUITE_CMD: cargo test --workspace -- --nocapture
+        run: cargo test -p kranz-engine dogfood_supervision -- --ignored --nocapture
 
   msrv:
     runs-on: ubuntu-latest

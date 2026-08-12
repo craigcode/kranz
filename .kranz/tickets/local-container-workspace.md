@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 50bbf03: local-container WorkspaceProvider with per-mission compose projects.
 title: Local container workspace provider (ports, network, compose)
 priority: 2
 schedule: once

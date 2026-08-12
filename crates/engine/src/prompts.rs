@@ -4,6 +4,12 @@
 //! opinionated heart of the product. Each spawned session records
 //! [`hash`] of its role prompt (on `worker.spawned`) so transcripts stay
 //! traceable to the exact prompt text that produced them.
+//!
+//! Boundary note (positioning ADR, frozen surface): prompt ROUTING
+//! sophistication — dynamic assembly, per-task prompt optimization, model-
+//! driven prompt selection — is frozen; these sources are static,
+//! versioned, and hashed, on purpose
+//! (docs/knowledge/decisions/positioning-governance-evidence-layer.md).
 
 use crate::types::Role;
 use sha2::{Digest, Sha256};
@@ -28,7 +34,15 @@ pub fn text(role: Role) -> &'static str {
 /// First 12 hex chars of the SHA-256 of the role's prompt text. Recorded on
 /// `worker.spawned` for traceability.
 pub fn hash(role: Role) -> String {
-    let digest = Sha256::digest(text(role).as_bytes());
+    hash_text(text(role))
+}
+
+/// [`hash`] of an arbitrary prompt text — for prompts extended past the
+/// embedded template (a configured pack's appended guidance, ticket
+/// `pack-contract-gates-prompts`), so the recorded hash still names the
+/// exact text the session ran with.
+pub fn hash_text(prompt: &str) -> String {
+    let digest = Sha256::digest(prompt.as_bytes());
     digest[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 

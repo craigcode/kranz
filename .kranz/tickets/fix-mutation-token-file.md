@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: mission m-84e7ea complete, merged 2026-07-05 — sidecar restored after tracked-on-branch/ignored-on-main checkout crossfire deleted it
 title: Persist the serve mutation token to a 0600 file
 priority: 2
 schedule: once

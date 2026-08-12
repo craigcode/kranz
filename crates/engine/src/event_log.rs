@@ -13,8 +13,11 @@ use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
 use crate::paths::MissionPaths;
 use crate::scrub::SecretFinding;
+use cap_std::fs::Dir;
 use chrono::Utc;
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::ffi::OsString;
+use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -87,6 +90,9 @@ pub struct EventLog {
     /// on-disk generation (and token, when present) still match — so a
     /// stolen-from teardown cannot wipe the stealer's lock.
     lock_token: Option<String>,
+    /// Pinned mission directory capability retained from acquisition through
+    /// every lock read/removal. Absolute paths below are display-only.
+    mission_dir: Dir,
     file: File,
     /// Seq to assign to the next appended event.
     next_seq: u64,
@@ -109,6 +115,64 @@ fn drain_lines<W: std::io::Write>(
         buffer.remove(0);
     }
     Ok(())
+}
+
+fn ensure_absent_or_regular_at(dir: &Dir, name: &str, display: &Path) -> Result<()> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(EngineError::InvalidState(format!(
+            "refusing non-regular mission runtime path {}",
+            display.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_create_new_at(dir: &Dir, name: &str) -> std::io::Result<File> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    dir.open_with(name, &options).map(|file| file.into_std())
+}
+
+fn open_write_at(dir: &Dir, name: &str, create: bool) -> std::io::Result<File> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(create)
+        .follow(FollowSymlinks::No);
+    dir.open_with(name, &options).map(|file| file.into_std())
+}
+
+fn open_append_at(dir: &Dir, name: &str, create: bool) -> std::io::Result<File> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .append(true)
+        .create(create)
+        .follow(FollowSymlinks::No);
+    dir.open_with(name, &options).map(|file| file.into_std())
+}
+
+fn open_read_at(dir: &Dir, name: &str) -> std::io::Result<File> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    dir.open_with(name, &options).map(|file| file.into_std())
 }
 
 impl EventLog {
@@ -148,22 +212,20 @@ impl EventLog {
         let mission_dir = paths.open_mission_dir_nofollow(true)?;
         crate::paths::create_real_subdir(&mission_dir, "runs", &paths.runs_dir())?;
         crate::paths::create_real_subdir(&mission_dir, "control", &paths.control_dir())?;
-        crate::paths::ensure_absent_or_regular_file(&paths.lock_file())?;
-        crate::paths::ensure_absent_or_regular_file(&paths.events_file())?;
+        ensure_absent_or_regular_at(&mission_dir, "events.jsonl.lock", &paths.lock_file())?;
+        ensure_absent_or_regular_at(&mission_dir, "events.jsonl", &paths.events_file())?;
 
         let lock_path = paths.lock_file();
-        let (mut lock_file, lock_generation) = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(f) => (f, 0u64),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let (f, prev_gen) = steal_lock(&lock_path, force)?;
-                (f, prev_gen.saturating_add(1))
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let (mut lock_file, lock_generation) =
+            match open_create_new_at(&mission_dir, "events.jsonl.lock") {
+                Ok(f) => (f, 0u64),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let (f, prev_gen) =
+                        steal_lock(&mission_dir, "events.jsonl.lock", &lock_path, force)?;
+                    (f, prev_gen.saturating_add(1))
+                }
+                Err(e) => return Err(e.into()),
+            };
 
         // From here on we hold the lock; release it if the rest of the
         // acquisition fails so a failed open doesn't strand the mission.
@@ -180,8 +242,14 @@ impl EventLog {
             lock_file.flush()?;
 
             let events_path = paths.events_file();
-            let last_seq = if events_path.exists() {
-                let parsed = Self::parse_log(&events_path)?;
+            let last_seq = if mission_dir
+                .symlink_metadata("events.jsonl")
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                let parsed = Self::parse_log_file(
+                    open_read_at(&mission_dir, "events.jsonl")?,
+                    &events_path,
+                )?;
                 if let Some(first) = parsed.events.first() {
                     if first.mission_id != mission_id {
                         return Err(EngineError::InvalidState(format!(
@@ -197,16 +265,16 @@ impl EventLog {
                 // but if left in place the next append glues onto it; once a
                 // further event lands the spliced garbage is no longer final
                 // and every read fails with LogCorruption forever.
-                let file_len = std::fs::metadata(&events_path)?.len();
+                let file_len = mission_dir.metadata("events.jsonl")?.len();
                 if parsed.valid_len < file_len {
                     // Unparseable garbage past the last good line: cut it off.
-                    let repair = OpenOptions::new().write(true).open(&events_path)?;
+                    let repair = open_write_at(&mission_dir, "events.jsonl", false)?;
                     repair.set_len(parsed.valid_len)?;
                     repair.sync_data()?;
                 } else if !parsed.terminated {
                     // The final line parsed but the tear ate its trailing
                     // newline; terminate it so the next append starts fresh.
-                    let mut repair = OpenOptions::new().append(true).open(&events_path)?;
+                    let mut repair = open_append_at(&mission_dir, "events.jsonl", false)?;
                     repair.write_all(b"\n")?;
                     repair.sync_data()?;
                 }
@@ -215,16 +283,14 @@ impl EventLog {
                 0
             };
 
-            let file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&events_path)?;
+            let file = open_append_at(&mission_dir, "events.jsonl", true)?;
             Ok(EventLog {
                 mission_id: mission_id.to_string(),
                 events_path,
                 lock_path: lock_path.clone(),
                 lock_generation,
                 lock_token: process_identity_token(std::process::id() as i32),
+                mission_dir: mission_dir.try_clone()?,
                 file,
                 next_seq: last_seq + 1,
                 throttle,
@@ -235,7 +301,7 @@ impl EventLog {
         match open() {
             Ok(log) => Ok(log),
             Err(e) => {
-                let _ = std::fs::remove_file(&lock_path);
+                let _ = mission_dir.remove_file("events.jsonl.lock");
                 Err(e)
             }
         }
@@ -293,7 +359,9 @@ impl EventLog {
     pub fn append_redacting(&mut self, kind: EventKind) -> Result<(Event, Vec<SecretFinding>)> {
         // Fail closed if another process stole the lock out from under us —
         // otherwise two engines dual-write one log (seq gaps / corruption).
-        let current_gen = read_lock_info(&self.lock_path).generation.unwrap_or(0);
+        let current_gen = read_lock_info_at(&self.mission_dir, "events.jsonl.lock")
+            .generation
+            .unwrap_or(0);
         if current_gen != self.lock_generation {
             return Err(EngineError::LockHeld(format!(
                 "event log lock for '{}' was stolen (generation {} → {}); refusing append",
@@ -381,6 +449,28 @@ impl EventLog {
         Ok(Self::parse_log(path)?.events)
     }
 
+    /// Read the log at `path` ONCE and return the validated events together
+    /// with the exact byte prefix they were parsed from (12th-pass review):
+    /// the evidence bundle must ship `events.jsonl` bytes that reproduce the
+    /// chain/cost/escalations it derived, so parsing one snapshot and then
+    /// rereading the file for the raw copy is not allowed — a concurrent
+    /// append between the two opens would ship bytes the folds never saw.
+    ///
+    /// Torn-tail rule (the honest one): an unparseable FINAL line is
+    /// dropped from the events AND excluded from the returned bytes — the
+    /// shipped prefix is exactly what parsed, so the bundle's log always
+    /// re-folds to the bundle's derived files. bytes-shipped == bytes-parsed.
+    pub fn read_events_and_log_bytes(path: &Path) -> Result<(Vec<Event>, Vec<u8>)> {
+        use std::io::Read;
+        // Same no-follow refusal as `parse_log`: never read through a
+        // symlink, `O_NOFOLLOW` on unix so there is no check-then-open window.
+        let mut bytes = Vec::new();
+        crate::paths::open_read_nofollow(path)?.read_to_end(&mut bytes)?;
+        let parsed = Self::parse_log_bytes(&bytes, path)?;
+        bytes.truncate(parsed.valid_len as usize);
+        Ok((parsed.events, bytes))
+    }
+
     /// Parse and validate the log at `path`, tracking how many leading bytes
     /// form the valid prefix so [`EventLog::acquire`] can truncate torn tails.
     ///
@@ -391,10 +481,24 @@ impl EventLog {
         // A symlinked log file is refused (never read through into another
         // tree); an absent one errors NotFound from the read below, as
         // before. `O_NOFOLLOW` on unix — no check-then-open window.
+        Self::parse_log_file(crate::paths::open_read_nofollow(path)?, path)
+    }
+
+    /// Parse from an already-open file. Acquisition uses this form so log
+    /// recovery reads through the same retained mission capability later
+    /// used for truncation, append, and lock removal.
+    fn parse_log_file(mut file: File, path: &Path) -> Result<ParsedLog> {
         use std::io::Read;
         let mut bytes = Vec::new();
-        crate::paths::open_read_nofollow(path)?.read_to_end(&mut bytes)?;
+        file.read_to_end(&mut bytes)?;
+        Self::parse_log_bytes(&bytes, path)
+    }
 
+    /// Parse one in-memory buffer — the single entry point every reader
+    /// funnels into, so the validation rules (seq contiguity, one mission
+    /// id, torn-final-line drop) can never drift between the file-reading
+    /// forms and the single-snapshot form.
+    fn parse_log_bytes(bytes: &[u8], path: &Path) -> Result<ParsedLog> {
         let mut events = Vec::new();
         let mut valid_len: usize = 0;
         let mut terminated = true;
@@ -522,7 +626,7 @@ impl Drop for EventLog {
         // stealer's lock file; the stealer would then see generation 0 and
         // fail closed on its next append (MutationLock in queue.rs uses the
         // same still-ours check).
-        let info = read_lock_info(&self.lock_path);
+        let info = read_lock_info_at(&self.mission_dir, "events.jsonl.lock");
         let generation_matches = info.generation.unwrap_or(0) == self.lock_generation;
         let token_matches = match (&self.lock_token, &info.token) {
             (Some(ours), Some(theirs)) => ours == theirs,
@@ -531,7 +635,7 @@ impl Drop for EventLog {
             _ => true,
         };
         if generation_matches && token_matches {
-            if let Err(e) = std::fs::remove_file(&self.lock_path) {
+            if let Err(e) = self.mission_dir.remove_file("events.jsonl.lock") {
                 if e.kind() != ErrorKind::NotFound {
                     tracing::warn!(
                         path = %self.lock_path.display(),
@@ -561,40 +665,38 @@ impl Drop for EventLog {
 /// auto-steal path cannot trigger; steals happen only under explicit operator
 /// force flags, which are deliberate one-off actions rather than the
 /// concurrent-by-accident crash-recovery restarts the guard defends against.
-fn steal_lock(lock_path: &Path, force: LockForce) -> Result<(File, u64)> {
+fn steal_lock(
+    mission_dir: &Dir,
+    lock_name: &str,
+    lock_path: &Path,
+    force: LockForce,
+) -> Result<(File, u64)> {
     #[cfg(unix)]
-    let _guard = StealGuard::acquire(lock_path)?;
+    let _guard = StealGuard::acquire(mission_dir, lock_name)?;
 
     loop {
         // The lock may have been RELEASED while we waited for the guard:
         // retry the clean create before probing anything.
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
+        match open_create_new_at(mission_dir, lock_name) {
             Ok(f) => return Ok((f, 0)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
 
-        authorize_steal(lock_path, force)?;
-        let prev_gen = read_lock_info(lock_path).generation.unwrap_or(0);
+        let info = read_lock_info_at(mission_dir, lock_name);
+        authorize_steal(lock_path, &info, force)?;
+        let prev_gen = info.generation.unwrap_or(0);
 
         // Guarded steals never interleave here, but a rival acquire's FIRST
         // (unguarded) create attempt can still slip into the remove→create
         // window and win the freed slot. If it does, loop back and judge
         // THAT holder like any other — never surface the raw io collision.
-        match std::fs::remove_file(lock_path) {
+        match mission_dir.remove_file(lock_name) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         }
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
+        match open_create_new_at(mission_dir, lock_name) {
             Ok(f) => return Ok((f, prev_gen)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
@@ -605,9 +707,8 @@ fn steal_lock(lock_path: &Path, force: LockForce) -> Result<(File, u64)> {
 /// Probe the CURRENT holder recorded at `lock_path` and decide, against the
 /// [`LockForce`] matrix, whether stealing is permitted: `Ok(())` authorizes
 /// the steal, `Err(LockHeld)` refuses with operator guidance.
-fn authorize_steal(lock_path: &Path, force: LockForce) -> Result<()> {
-    let info = read_lock_info(lock_path);
-    match (probe_liveness(&info), force) {
+fn authorize_steal(lock_path: &Path, info: &LockInfo, force: LockForce) -> Result<()> {
+    match (probe_liveness(info), force) {
         // A provably-dead holder is stale (e.g. the engine was Ctrl-C'd —
         // SIGINT skips destructors — or its pid was provably reused): steal
         // it at every tier without demanding --force-lock.
@@ -684,25 +785,51 @@ fn authorize_steal(lock_path: &Path, force: LockForce) -> Result<()> {
 struct StealGuard {
     /// Held only for the flock; dropping (closing) it releases the lock.
     _file: File,
-    path: PathBuf,
+    dir: Dir,
+    name: OsString,
 }
 
 #[cfg(unix)]
 impl StealGuard {
-    fn acquire(lock_path: &Path) -> Result<StealGuard> {
-        use std::os::unix::fs::MetadataExt;
+    fn acquire(dir: &Dir, lock_name: &str) -> Result<StealGuard> {
         use std::os::unix::io::AsRawFd;
-        let mut name = lock_path.file_name().unwrap_or_default().to_os_string();
+        let mut name = OsString::from(lock_name);
         name.push(".steal");
-        let path = lock_path.with_file_name(name);
         loop {
             // Contents are irrelevant (the file exists only to be flock'd),
             // but be explicit that nothing is truncated.
-            let file = OpenOptions::new()
+            use cap_fs_ext::OpenOptionsExt as _;
+            use cap_fs_ext::OpenOptionsFollowExt as _;
+            use cap_primitives::fs::FollowSymlinks;
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
                 .write(true)
-                .create(true)
                 .truncate(false)
-                .open(&path)?;
+                .follow(FollowSymlinks::No);
+            options.custom_flags(libc::O_NONBLOCK);
+            let file = match dir.open_with(&name, &options) {
+                Ok(file) => file.into_std(),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    let mut create = cap_std::fs::OpenOptions::new();
+                    create
+                        .write(true)
+                        .create_new(true)
+                        .follow(FollowSymlinks::No);
+                    create.custom_flags(libc::O_NONBLOCK);
+                    match dir.open_with(&name, &create) {
+                        Ok(file) => file.into_std(),
+                        Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !file.metadata()?.is_file() {
+                return Err(EngineError::InvalidState(format!(
+                    "event-log steal guard {} is not a regular file",
+                    name.to_string_lossy()
+                )));
+            }
             loop {
                 if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
                     break;
@@ -713,9 +840,18 @@ impl StealGuard {
                 }
             }
             let held = file.metadata()?;
-            match std::fs::metadata(&path) {
-                Ok(m) if m.dev() == held.dev() && m.ino() == held.ino() => {
-                    return Ok(StealGuard { _file: file, path });
+            match dir.symlink_metadata(&name) {
+                Ok(m)
+                    if cap_fs_ext::MetadataExt::dev(&m)
+                        == std::os::unix::fs::MetadataExt::dev(&held)
+                        && cap_fs_ext::MetadataExt::ino(&m)
+                            == std::os::unix::fs::MetadataExt::ino(&held) =>
+                {
+                    return Ok(StealGuard {
+                        _file: file,
+                        dir: dir.try_clone()?,
+                        name,
+                    });
                 }
                 // The guard file was unlinked (and possibly recreated) while
                 // we waited: this flock guards a dead inode and serializes
@@ -731,7 +867,7 @@ impl Drop for StealGuard {
     fn drop(&mut self) {
         // Best-effort cleanup; the identity re-check in acquire() keeps this
         // safe against waiters still blocked on the removed inode.
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.dir.remove_file(&self.name);
     }
 }
 
@@ -748,7 +884,7 @@ impl Drop for StealGuard {
 /// spares a directory from cleaning, while a false "dead" runs two engines
 /// on one working tree.
 pub fn lock_holder_is_alive(lock_path: &Path) -> bool {
-    if !lock_path.exists() {
+    if !std::fs::symlink_metadata(lock_path).is_ok_and(|m| m.file_type().is_file()) {
         return false;
     }
     let info = read_lock_info(lock_path);
@@ -829,7 +965,27 @@ struct LockInfo {
 /// `<pid>\n<acquired_unix_epoch_secs>\n<identity_token>\n<generation>`,
 /// tolerating the legacy one-/two-/three-line formats and arbitrary garbage.
 fn read_lock_info(lock_path: &Path) -> LockInfo {
-    let contents = std::fs::read_to_string(lock_path).unwrap_or_default();
+    use std::io::Read;
+    let mut contents = String::new();
+    if let Ok(file) = crate::paths::open_read_nofollow(lock_path) {
+        let _ = file.take(8 * 1024).read_to_string(&mut contents);
+    }
+    parse_lock_info(&contents)
+}
+
+/// Capability-relative lock read used after [`EventLog::acquire`] pins the
+/// mission directory. The small bound prevents a hostile stale lock from
+/// turning liveness checks into unbounded allocation.
+fn read_lock_info_at(dir: &Dir, name: &str) -> LockInfo {
+    use std::io::Read;
+    let mut contents = String::new();
+    if let Ok(file) = open_read_at(dir, name) {
+        let _ = file.take(8 * 1024).read_to_string(&mut contents);
+    }
+    parse_lock_info(&contents)
+}
+
+fn parse_lock_info(contents: &str) -> LockInfo {
     let mut lines = contents.lines();
     let first = lines.next().unwrap_or("").trim();
     let holder = if first.is_empty() {
@@ -1039,7 +1195,73 @@ type IdentityTokenCache =
 #[cfg(target_os = "macos")]
 static IDENTITY_TOKEN_CACHE: std::sync::OnceLock<IdentityTokenCache> = std::sync::OnceLock::new();
 
-/// Cache layer in front of [`ps_identity_token`]: the real `ps` spawn seam.
+/// macOS identity token WITHOUT the `ps` spawn: `proc_pidinfo(
+/// PROC_PIDTBSDINFO)` reads the kernel's stored `p_starttime` directly — the
+/// same immutable value `ps -o lstart=` renders — and this renders it
+/// byte-identically (ctime shape, UTC: probed 2026-08-05 against
+/// `LC_ALL=C TZ=UTC ps -p <pid> -o lstart=`, e.g. `Wed Aug  5 00:34:16 2026`
+/// from both paths for the same process). Byte-identity is load-bearing:
+/// tokens are compared for raw equality against lock-file recordings that
+/// may predate this path (recorded via `ps`), so the rendering must not
+/// drift.
+///
+/// Why this path exists (ticket gate-sandbox-supervision-dogfood): `/bin/ps`
+/// is setuid root, and setuid exec is kernel-denied inside ANY Seatbelt
+/// sandbox — probed: EPERM even under `(allow default)`, not expressible in
+/// SBPL, and a copied binary is AMFI-killed on exec. A process inside the
+/// gate sandbox wrap (a wrapped `cargo test --workspace` dogfooding this
+/// repo, or any wrapped contract command that probes a kranz lock) could
+/// therefore NEVER obtain a token via `ps`. `proc_pidinfo` is not
+/// sandbox-gated for same-uid targets (probed under the session-profile
+/// posture: self, children, and unrelated same-uid host processes all
+/// answer) and needs no spawn at all.
+///
+/// The limit: OTHER-UID pids. Unprivileged `proc_pidinfo` on pid 1 is EPERM
+/// (probed, unsandboxed included) — which is exactly why `/bin/ps` carries
+/// the setuid bit. Those pids fall back to the [`ps_identity_token`] spawn
+/// seam, which keeps answering them wherever setuid exec is permitted.
+#[cfg(target_os = "macos")]
+fn proc_pidinfo_identity_token(pid: i32) -> Option<String> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+        )
+    };
+    if rc <= 0 {
+        return None;
+    }
+    let secs = i64::try_from(info.pbi_start_tvsec).ok()?;
+    let rendered = chrono::DateTime::from_timestamp(secs, 0)?
+        .format("%a %b %e %H:%M:%S %Y")
+        .to_string();
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+/// The uncached token lookup [`process_identity_token`] memoizes:
+/// [`proc_pidinfo_identity_token`] first (no spawn, works inside the gate
+/// sandbox wrap), the `ps` spawn seam only for the pids the unprivileged
+/// syscall cannot read (other-uid — see its doc). [`PS_SPAWN_COUNTS`] still
+/// counts REAL spawns only, so the cache test's pid-1 probe stays the sole
+/// contributor to its own count.
+#[cfg(target_os = "macos")]
+fn uncached_identity_token(pid: i32) -> Option<String> {
+    if let Some(token) = proc_pidinfo_identity_token(pid) {
+        return Some(token);
+    }
+    ps_identity_token(pid)
+}
+
+/// Cache layer in front of [`uncached_identity_token`]: the raw token lookup
+/// (proc_pidinfo first, the real `ps` spawn seam behind it).
 /// The VERDICT (Alive/Dead) is never cached or short-circuited here — only
 /// the raw token lookup is memoized; [`alive_or_reused`] still compares
 /// `recorded == current` on every call, using whatever token this returns.
@@ -1053,9 +1275,9 @@ pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
             return token.clone();
         }
     }
-    let token = ps_identity_token(pid);
-    cache.lock().unwrap().insert(pid, (token.clone(), now));
-    token
+    let identity = uncached_identity_token(pid);
+    cache.lock().unwrap().insert(pid, (identity.clone(), now));
+    identity
 }
 
 /// Everywhere else (windows, exotic unix): no identity token, so pid reuse
@@ -1143,6 +1365,44 @@ mod tests {
         let err = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap_err();
         assert!(err.to_string().contains("refusing"), "{err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquired_log_retains_mission_capability_across_parent_swap() {
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(repo.path(), "m-1");
+        let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+        let original = paths.missions_dir().join("m-original");
+        std::fs::rename(paths.mission_dir(), &original).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("events.jsonl.lock"), "outside-lock").unwrap();
+        std::fs::write(outside.path().join("events.jsonl"), "outside-events").unwrap();
+        symlink(outside.path(), paths.mission_dir()).unwrap();
+
+        log.append(EventKind::MissionPaused {}).unwrap();
+        drop(log);
+
+        assert!(
+            std::fs::read_to_string(original.join("events.jsonl"))
+                .unwrap()
+                .contains("mission.paused"),
+            "the retained append handle must stay on the originally pinned mission"
+        );
+        assert!(
+            !original.join("events.jsonl.lock").exists(),
+            "drop must remove the lock relative to the retained capability"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("events.jsonl")).unwrap(),
+            "outside-events"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("events.jsonl.lock")).unwrap(),
+            "outside-lock"
+        );
     }
 
     #[test]
@@ -1246,10 +1506,27 @@ mod tests {
     /// so this test's spawn-count delta is not polluted by other tests in
     /// this file that concurrently probe `process_identity_token` for the
     /// test process's own pid.
+    ///
+    /// Premise-gated (ticket gate-sandbox-supervision-dogfood): reading
+    /// launchd's token needs the setuid `/bin/ps` (unprivileged
+    /// `proc_pidinfo` on pid 1 is EPERM — see
+    /// [`proc_pidinfo_identity_token`]), and setuid exec is kernel-denied
+    /// inside the gate sandbox wrap. Under a wrapped `cargo test` the raw
+    /// `ps` seam cannot answer for pid 1, so the test skips with a
+    /// detectable marker rather than failing on the sandbox's presence.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_identity_token_caches_one_ps_per_pid() {
         let pid = 1;
+        if ps_identity_token(pid).is_none() {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 macos_identity_token_caches_one_ps_per_pid — the setuid /bin/ps cannot \
+                 execute inside the gate sandbox wrap, so pid 1's token is unreadable here; \
+                 skipping"
+            );
+            return;
+        }
         let count_for_pid = |p: i32| {
             *PS_SPAWN_COUNTS
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))

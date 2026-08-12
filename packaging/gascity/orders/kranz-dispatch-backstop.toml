@@ -1,0 +1,28 @@
+# Slow backstop for the event-driven kranz-dispatch order (review 2026-08-11).
+#
+# The primary order (kranz-dispatch.toml) fires instantly on bead.created.
+# That leaves two gaps this backstop closes on a 15-minute cooldown:
+#
+#   - Quiet-city dead claim: a worker that dies mid-mission leaves a claimed
+#     bead; the reclaim sweep only runs when kranz-dispatch is invoked, and a
+#     city with no new beads never invokes it. Every invocation of
+#     kranz-dispatch runs reclaim_sweep first, so this periodic drain is the
+#     dead-claim recovery path.
+#   - Re-readied bead: a bead reopened (exit 3 underspecified / exit 1 failed)
+#     and later refined by a human fires bead.updated, not bead.created (gc
+#     has no bead.ready event — the lifecycle set is created/updated/closed).
+#     The cooldown drain picks it up on the next tick.
+#
+# A full drain (not --reclaim) is deliberate: it both reclaims dead claims
+# and spools any ready-but-undispatched bead. The 15m interval doubles as
+# retry backoff — a just-reopened bead is NOT re-dispatched instantly, so a
+# human has a window to refine an underspecified brief (exit 3) before the
+# next attempt, and a transient failure (exit 1) retries on a slow cadence
+# rather than a hot loop. Claiming is atomic first-wins and the drain skips
+# non-ready beads, so overlapping fires of this order and the event order
+# never double-spool one bead.
+[order]
+description = "Backstop reclaim + re-ready drain for kranz-dispatch"
+trigger = "cooldown"
+interval = "15m"
+exec = "kranz-dispatch"

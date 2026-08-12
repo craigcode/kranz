@@ -1,4 +1,5 @@
 ---
+state: done
 title: Hosted drain must restore the primary checkout at drain exit
 priority: 3
 schedule: once

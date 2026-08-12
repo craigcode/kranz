@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 4dd5d92: Seatbelt read-deny for serve.token/serve.read.token/config.json (raw+canonical, deny precedence verified); bwrap /dev/null ro-bind masks; container /dev/null:ro mounts. kranz serve mints a read-only token (gated GETs/WS only, never mutations). Flagged gaps: operator-global ~/.kranz tokens uncovered; bwrap/container masks existence-guarded at spawn. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Deny sandbox reads of serve.token + split mutation authority (P1)
 priority: 1
 schedule: once

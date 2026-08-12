@@ -51,6 +51,7 @@ fn plan() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![
             PlanMilestone {
@@ -65,6 +66,7 @@ fn plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -78,6 +80,8 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
         },
         feature_id: feature_id.map(str::to_string),
         milestone_id: milestone_id.map(str::to_string),
+        candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -177,6 +181,12 @@ fn duplicate_fixfeature_with_identical_payload_is_idempotent() {
             milestone_id: "ms-1".into(),
             feature: fix_feature("ms-1-fix-1-1"),
         },
+        // One event AFTER the duplicate: proves the no-op still advanced
+        // last_seq (the m-83d1ed wedge form — without the advance, this
+        // event fails contiguity).
+        EventKind::MilestoneValidating {
+            milestone_id: "ms-1".into(),
+        },
     ];
     let state = fold_kinds(kinds);
     let ms = state
@@ -198,6 +208,12 @@ fn duplicate_fixfeature_with_identical_payload_is_idempotent() {
 
 #[test]
 fn duplicate_fixfeature_with_different_payload_is_invalid() {
+    // Supersession is rejected once the prior feature has WORK attached:
+    // a started feature (Active) with a commit cannot be shadowed by a
+    // re-proposal — the audit trail of work done must not be rewritten.
+    let mut started = fix_feature("ms-1-fix-1-1");
+    started.status = FeatureStatus::Active;
+    started.commits = vec!["deadbeef".to_string()];
     let mut changed = fix_feature("ms-1-fix-1-1");
     changed.title = "a different proposal".to_string();
     let mut state = fold_kinds(vec![
@@ -212,7 +228,7 @@ fn duplicate_fixfeature_with_different_payload_is_invalid() {
         },
         EventKind::FixFeatureCreated {
             milestone_id: "ms-1".into(),
-            feature: fix_feature("ms-1-fix-1-1"),
+            feature: started,
         },
     ]);
     let err = apply(
@@ -227,6 +243,187 @@ fn duplicate_fixfeature_with_different_payload_is_invalid() {
     )
     .unwrap_err();
     assert!(matches!(err, EngineError::InvalidState(_)), "{err}");
+}
+
+/// Implicit supersession (m-83d1ed): re-proposing an UNSTARTED fixfeature
+/// with a revised payload replaces it in place (status back to Pending,
+/// original payload preserved in the event log) rather than erroring.
+#[test]
+fn duplicate_fixfeature_with_different_payload_supersedes_an_unstarted_feature() {
+    let mut changed = fix_feature("ms-1-fix-1-1");
+    changed.title = "the revised proposal".to_string();
+    changed.spec = "tighter spec after findings".to_string();
+    let kinds = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".into(),
+            start_sha: "a".into(),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: fix_feature("ms-1-fix-1-1"),
+        },
+        EventKind::FixFeatureCreated {
+            milestone_id: "ms-1".into(),
+            feature: changed,
+        },
+    ];
+    let state = fold_kinds(kinds);
+    let ms = state
+        .mission
+        .milestones
+        .iter()
+        .find(|m| m.id == "ms-1")
+        .unwrap();
+    let matches: Vec<_> = ms
+        .features
+        .iter()
+        .filter(|f| f.id == "ms-1-fix-1-1")
+        .collect();
+    assert_eq!(matches.len(), 1, "one registration for the id");
+    assert_eq!(matches[0].title, "the revised proposal");
+    assert_eq!(matches[0].status, FeatureStatus::Pending);
+}
+
+/// A fixfeature whose runs all failed WITHOUT committing anything produced
+/// no work, so a re-plan re-proposing the same id with a revised payload is
+/// the same implicit supersession as an unstarted feature (mission
+/// m-eee81f: three infra-failed runs left `worker_runs` non-empty and every
+/// re-proposal wedged the log with "duplicate fixfeature.created").
+#[test]
+fn duplicate_fixfeature_supersedes_a_failed_commitless_feature() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    // The prior feature carries failed-run records but no commits and no
+    // started status — runs that never produced work.
+    let mut prior = fix_feature("flaky");
+    prior.status = FeatureStatus::Failed;
+    prior.worker_runs = vec!["r-1".to_string(), "r-2".to_string(), "r-3".to_string()];
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: prior,
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+
+    let mut revised = fix_feature("flaky");
+    revised.title = "re-proposed after the infra failures".to_string();
+    revised.spec = "same finding, tighter spec".to_string();
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .expect("a failed, commitless feature is superseded, not wedged");
+
+    let matches: Vec<_> = state.mission.milestones[0]
+        .features
+        .iter()
+        .filter(|f| f.id == "flaky")
+        .collect();
+    assert_eq!(matches.len(), 1, "one registration for the id");
+    assert_eq!(matches[0].title, "re-proposed after the infra failures");
+    assert_eq!(matches[0].status, FeatureStatus::Pending);
+}
+
+/// The negative pin for the commitless-supersession hole (review of
+/// 30b276e): a feature judged FAILED *after* its worker committed real work
+/// to the mission branch records those commits on the feature.failed event,
+/// so it is NOT "commitless" — a re-proposal reusing its id must REJECT, not
+/// rewrite the payload and reset it to Pending (which would orphan the audit
+/// link to the landed commits).
+#[test]
+fn duplicate_fixfeature_rejects_a_failed_feature_with_commits() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .expect("fold base");
+    let ms = state.mission.milestones[0].id.clone();
+
+    apply(
+        &mut state,
+        &ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms.clone(),
+                feature: fix_feature("judged"),
+            },
+        ),
+    )
+    .expect("first fixfeature accepted");
+    apply(
+        &mut state,
+        &ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "judged".into(),
+            },
+        ),
+    )
+    .expect("started");
+    // Judged failed AFTER the worker landed commits on the mission branch.
+    apply(
+        &mut state,
+        &ev(
+            5,
+            EventKind::FeatureFailed {
+                feature_id: "judged".into(),
+                reason: "validation judged the work insufficient".into(),
+                commits: vec!["deadbeef implement the thing".into()],
+            },
+        ),
+    )
+    .expect("failed with commits recorded");
+
+    let mut revised = fix_feature("judged");
+    revised.title = "re-proposed after the judgement".to_string();
+    let err = apply(
+        &mut state,
+        &ev(
+            6,
+            EventKind::FixFeatureCreated {
+                milestone_id: ms,
+                feature: revised,
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, EngineError::InvalidState(_)),
+        "failed-with-commits must reject the duplicate, got {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +837,7 @@ fn fix_cycles_increment_once_per_validation_round() {
                     evidence: "it broke".into(),
                     suggested_fix: "fix it".into(),
                     class: String::new(),
+                    rule: None,
                 },
             },
         ),
@@ -881,6 +1079,7 @@ fn every_status_value_is_reachable() {
         EventKind::FeatureFailed {
             feature_id: "f-1-2".into(),
             reason: "r".into(),
+            commits: vec![],
         }, // f Failed
         EventKind::FeatureSkipped {
             feature_id: "f-2-1".into(),
@@ -1452,6 +1651,8 @@ fn approved_status_guard_never_overwrites_terminal_status() {
                 role: Role::ValidatorScrutiny,
                 feature_id: None,
                 milestone_id: None,
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sess-r-after-failure".to_string(),
                 model: "sonnet".to_string(),
                 quant: "n/a".to_string(),
@@ -1630,6 +1831,35 @@ fn snapshot_round_trips_atomically() {
     assert_eq!(read_snapshot(&path).unwrap().last_seq, state.last_seq);
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshot_write_refuses_symlinked_mission_parent_without_touching_target() {
+    use kranz_engine::paths::MissionPaths;
+    use std::os::unix::fs::symlink;
+
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let missions = repo.path().join(".kranz").join("missions");
+    std::fs::create_dir_all(&missions).unwrap();
+    std::fs::write(outside.path().join("state.json"), "outside").unwrap();
+    symlink(outside.path(), missions.join("m-hostile")).unwrap();
+    let paths = MissionPaths::new(repo.path(), "m-hostile");
+    let state = fold_kinds(vec![created()]);
+
+    let error = write_snapshot(&state, &paths.state_file())
+        .expect_err("snapshot writes must not follow a symlinked mission directory");
+
+    assert!(error.to_string().contains("refusing"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("state.json")).unwrap(),
+        "outside"
+    );
+    assert!(
+        !outside.path().join("state.json.tmp").exists(),
+        "capability-relative temp creation must not reach the symlink target"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wire format (§4.3 envelope): exact JSON shape, including key order
 // ---------------------------------------------------------------------------
@@ -1787,6 +2017,7 @@ fn prop_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -1870,6 +2101,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
             Action::FeatureFailed(f) => EventKind::FeatureFailed {
                 feature_id: fs(*f),
                 reason: "r".into(),
+                commits: vec![],
             },
             Action::FeatureSkipped(f) => EventKind::FeatureSkipped {
                 feature_id: fs(*f),
@@ -1892,6 +2124,7 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                         evidence: "e".into(),
                         suggested_fix: String::new(),
                         class: String::new(),
+                        rule: None,
                     },
                 }
             }
@@ -1976,6 +2209,7 @@ fn validation_finding_accepts_reserved_engine_run_id() {
             evidence: "command failed".to_string(),
             suggested_fix: String::new(),
             class: String::new(),
+            rule: None,
         },
     };
 
@@ -2023,22 +2257,30 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
     .expect("fold base");
     let ms = state.mission.milestones[0].id.clone();
 
-    // First fixfeature with id "dup" — accepted.
+    // First fixfeature with id "dup" — accepted (and given WORK attached:
+    // a run + a commit, so a later re-proposal is shadowing, not
+    // supersession).
+    let mut prior = fix_feature("dup");
+    prior.status = FeatureStatus::Active;
+    prior.worker_runs = vec!["r-1".to_string()];
+    prior.commits = vec!["deadbeef".to_string()];
     apply(
         &mut state,
         &ev(
             3,
             EventKind::FixFeatureCreated {
                 milestone_id: ms.clone(),
-                feature: fix_feature("dup"),
+                feature: prior,
             },
         ),
     )
     .expect("first fixfeature accepted");
 
-    // Second fixfeature reusing the same id with a DIFFERENT payload — must
-    // error, not shadow. (An identical re-emission is an idempotent no-op
-    // since m-83d1ed; shadowing stays invalid.)
+    // Second fixfeature reusing the same id with a DIFFERENT payload —
+    // rejected because the prior has work attached (an identical
+    // re-emission is an idempotent no-op, and a revision of an UNSTARTED
+    // feature is an implicit supersession; only shadowing real work stays
+    // invalid).
     let mut shadowed = fix_feature("dup");
     shadowed.spec = "a different proposal under the same id".to_string();
     let err = apply(
@@ -2051,7 +2293,7 @@ fn fixfeature_created_rejects_a_duplicate_feature_id() {
             },
         ),
     )
-    .expect_err("duplicate feature id with a different payload must be rejected");
+    .expect_err("shadowing a started feature must be rejected");
     assert!(
         matches!(err, EngineError::InvalidState(_)),
         "expected InvalidState, got {err:?}"
@@ -2259,6 +2501,341 @@ fn grant_requested_with_empty_command_is_rejected() {
     )
     .expect_err("empty grant command must be rejected");
     assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Structured human questions (ticket structured-human-question-events)
+// ---------------------------------------------------------------------------
+
+/// State folded up to ms-1 Active with worker run r-1 spawned on f-1-1 — the
+/// context refs a `question.opened` can name.
+fn state_with_worker_run() -> MissionState {
+    fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".to_string(),
+            start_sha: "sha-1".to_string(),
+        },
+        spawn("r-1", Some("f-1-1"), None),
+    ])
+}
+
+fn question_opened(id: &str) -> EventKind {
+    EventKind::QuestionOpened {
+        question_id: id.to_string(),
+        role: Role::Worker,
+        text: "Which storage engine should the cache use?".to_string(),
+        options: vec!["sqlite".to_string(), "in-memory".to_string()],
+        run_id: Some("r-1".to_string()),
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: Some("ms-1".to_string()),
+    }
+}
+
+#[test]
+fn question_events_opened_folds_into_pending_projection() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    // Pre-field posture: no questions, id counter at zero.
+    assert!(state.pending_questions.is_empty());
+    assert_eq!(state.question_count, 0);
+
+    apply(&mut state, &ev(next, question_opened("q-1"))).expect("question.opened accepted");
+    assert_eq!(state.question_count, 1, "id counter bumped once");
+    let pending = state
+        .pending_questions
+        .first()
+        .expect("question parked in the projection");
+    assert_eq!(pending.question_id, "q-1");
+    assert_eq!(pending.role, Role::Worker);
+    assert_eq!(pending.text, "Which storage engine should the cache use?");
+    assert_eq!(pending.options, vec!["sqlite", "in-memory"]);
+    assert_eq!(pending.run_id.as_deref(), Some("r-1"));
+    assert_eq!(pending.feature_id.as_deref(), Some("f-1-1"));
+    assert_eq!(pending.milestone_id.as_deref(), Some("ms-1"));
+    // Opening a question parks NOTHING — the run loop never gates on it.
+    assert_eq!(state.mission.status, MissionStatus::Running);
+}
+
+#[test]
+fn question_events_answered_routes_answer_to_user_consult() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(0),
+            },
+        ),
+    )
+    .expect("question.answered accepted");
+    assert!(
+        state.pending_questions.is_empty(),
+        "answered question leaves the projection"
+    );
+    // The answer rides the EXISTING user-message consult path (D-X): the
+    // orchestrator's next consult consumes it from here.
+    assert_eq!(state.pending_user_messages.len(), 1);
+    let line = &state.pending_user_messages[0];
+    assert!(
+        line.contains("q-1") && line.contains("sqlite"),
+        "the consult line names the question and the answer: {line}"
+    );
+    assert!(
+        line.contains("Which storage engine"),
+        "the consult line carries the question text for context: {line}"
+    );
+    assert_eq!(
+        state.question_count, 1,
+        "answers never reset the id counter (ids stay unique across restarts)"
+    );
+}
+
+#[test]
+fn question_events_cleared_removes_open_question() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionCleared {
+                question_id: "q-1".to_string(),
+                why: "milestone completed".to_string(),
+            },
+        ),
+    )
+    .expect("question.cleared accepted");
+    assert!(state.pending_questions.is_empty());
+    assert!(
+        state.pending_user_messages.is_empty(),
+        "a clear is not an answer — nothing reaches the consult path"
+    );
+}
+
+#[test]
+fn question_events_answer_for_not_open_question_is_rejected() {
+    // A forged or stale answer for a question that was never opened must
+    // fail the fold (mirrors grant.approved with nothing parked)…
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::QuestionAnswered {
+                question_id: "q-nope".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: None,
+            },
+        ),
+    )
+    .expect_err("answer for a question that is not open must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert!(state.pending_user_messages.is_empty());
+
+    // …and a REPLAYED answer (already answered) is rejected the same way —
+    // the consult line never double-lands.
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(
+        &mut state,
+        &ev(
+            next + 1,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(0),
+            },
+        ),
+    )
+    .unwrap();
+    let err = apply(
+        &mut state,
+        &ev(
+            next + 2,
+            EventKind::QuestionAnswered {
+                question_id: "q-1".to_string(),
+                answer: "in-memory".to_string(),
+                via: "answer-question".to_string(),
+                option: Some(1),
+            },
+        ),
+    )
+    .expect_err("a duplicate answer must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+    assert_eq!(state.pending_user_messages.len(), 1, "answer landed once");
+}
+
+#[test]
+fn question_events_clear_for_not_open_question_is_rejected() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::QuestionCleared {
+                question_id: "q-nope".to_string(),
+                why: "milestone completed".to_string(),
+            },
+        ),
+    )
+    .expect_err("clear for a question that is not open must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn question_events_opened_duplicate_is_idempotent_or_rejected() {
+    // A duplicated open with an IDENTICAL payload is an idempotent replay
+    // (the fixfeature.created precedent): seq advances, state unchanged, and
+    // the id counter does NOT bump a second time.
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    apply(&mut state, &ev(next + 1, question_opened("q-1")))
+        .expect("identical duplicate open is an idempotent replay");
+    assert_eq!(state.pending_questions.len(), 1);
+    assert_eq!(state.question_count, 1);
+
+    // The SAME id with a DIFFERENT payload is shadowing — loudly invalid.
+    let mut shadowed = question_opened("q-1");
+    let EventKind::QuestionOpened { text, .. } = &mut shadowed else {
+        unreachable!()
+    };
+    *text = "a different question wearing q-1's id".to_string();
+    let err = apply(&mut state, &ev(next + 2, shadowed))
+        .expect_err("same id with a different payload must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
+
+#[test]
+fn question_events_opened_validates_refs_and_text() {
+    let mut state = state_with_worker_run();
+    let next = state.last_seq + 1;
+    for (label, kind) in [
+        ("empty id", question_opened("  ")),
+        ("empty text", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { text, .. } = &mut k else {
+                unreachable!()
+            };
+            *text = "   ".to_string();
+            k
+        }),
+        ("unknown run", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { run_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *run_id = Some("r-nope".to_string());
+            k
+        }),
+        ("unknown feature", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { feature_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *feature_id = Some("f-nope".to_string());
+            k
+        }),
+        ("unknown milestone", {
+            let mut k = question_opened("q-1");
+            let EventKind::QuestionOpened { milestone_id, .. } = &mut k else {
+                unreachable!()
+            };
+            *milestone_id = Some("ms-nope".to_string());
+            k
+        }),
+    ] {
+        let err =
+            apply(&mut state, &ev(next, kind)).expect_err(&format!("{label} must be rejected"));
+        assert!(
+            matches!(err, EngineError::InvalidState(_)),
+            "{label}: got {err:?}"
+        );
+    }
+    // Each rejected open above consumed no seq; a valid open still folds at
+    // the same seq.
+    apply(&mut state, &ev(next, question_opened("q-1"))).unwrap();
+    assert_eq!(state.pending_questions.len(), 1);
+}
+
+/// The restart-replay contract (ticket structured-human-question-events):
+/// folding the LOG from scratch — exactly what a process restart does —
+/// reproduces the projection and the routed answer, with no side state.
+#[test]
+fn question_events_fold_from_log_replays_answer_after_restart() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+        EventKind::MilestoneStarted {
+            milestone_id: "ms-1".to_string(),
+            start_sha: "sha-1".to_string(),
+        },
+        spawn("r-1", Some("f-1-1"), None),
+        question_opened("q-1"),
+        EventKind::QuestionAnswered {
+            question_id: "q-1".to_string(),
+            answer: "sqlite".to_string(),
+            via: "answer-question".to_string(),
+            option: Some(0),
+        },
+    ]);
+    assert!(
+        state.pending_questions.is_empty(),
+        "answered stays answered"
+    );
+    assert_eq!(state.question_count, 1);
+    assert_eq!(state.pending_user_messages.len(), 1);
+    assert!(state.pending_user_messages[0].contains("sqlite"));
+}
+
+/// Pre-field snapshots: a state.json written before the projection existed
+/// has no `pendingQuestions`/`questionCount` keys at all — it must still
+/// deserialize (additive `#[serde(default)]` fields), and the new binary
+/// omits both keys while they are empty/zero, so pre-field snapshots stay
+/// byte-identical until the first question opens.
+#[test]
+fn question_events_state_fields_backcompat_with_pre_field_snapshots() {
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ]);
+    assert!(state.pending_questions.is_empty());
+    assert_eq!(state.question_count, 0);
+
+    let value = serde_json::to_value(&state).unwrap();
+    let object = value.as_object().unwrap();
+    assert!(
+        !object.contains_key("pendingQuestions"),
+        "absent while empty: {value}"
+    );
+    assert!(
+        !object.contains_key("questionCount"),
+        "absent while zero: {value}"
+    );
+    let parsed: MissionState = serde_json::from_value(value).unwrap();
+    assert!(parsed.pending_questions.is_empty());
+    assert_eq!(parsed.question_count, 0);
 }
 
 #[test]
@@ -2592,6 +3169,8 @@ fn weight_hash_round_trips_through_serde_and_reducer_fold() {
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
+        candidate: None,
+        executor_route: None,
         sdk_session_id: "sess-r-1".to_string(),
         model: "sonnet".to_string(),
         quant: "q4_k_m".to_string(),
@@ -2658,6 +3237,8 @@ fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (S
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
         milestone_id: None,
+        candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "local-llama-3-8b".to_string(),
         quant: "q4_k_m".to_string(),
@@ -2824,6 +3405,7 @@ fn plan_three_milestones() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            pty_script: None,
         }],
         milestones: vec![
             PlanMilestone {
@@ -2842,6 +3424,7 @@ fn plan_three_milestones() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -3208,5 +3791,750 @@ fn workspace_provider_pin_backcompat_with_pre_pin_logs_and_snapshots() {
         value["workspacePin"],
         json!({"provider": "local-worktree", "template": "checkout", "version": "none"}),
         "{value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// gate.result events (ticket gate-results-first-class-events, KRZ-312)
+// ---------------------------------------------------------------------------
+
+/// The ladder a replay reconstructs from gate.result events alone:
+/// (surface, section index, gate id, verdict, artefact ref) per evaluation.
+type ReplayedLadder = Vec<(String, u32, String, String, String)>;
+
+/// Reconstruct the full gate ladder from events — the provenance-replay
+/// consumer shape: nothing read but the log. Sorted by (surface, kind,
+/// index) the events reproduce pipeline order exactly (registration order
+/// is evaluation order within a section, gate.rs).
+fn replay_gate_ladder(events: &[Event]) -> ReplayedLadder {
+    let mut ladder: ReplayedLadder = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::GateResult {
+                gate,
+                surface,
+                index,
+                verdict,
+                artefact_ref,
+                ..
+            } => Some((
+                serde_json::to_value(surface)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                *index,
+                gate.clone(),
+                serde_json::to_value(verdict)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                artefact_ref.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    ladder.sort();
+    ladder
+}
+
+/// Acceptance: replaying the committed fixture log (a mission whose
+/// approval ran the four-gate floor and whose final gate re-ran the static
+/// three) reconstructs the full gate ladder — ids, order, verdicts,
+/// artefact refs — with no reads outside the log. The fold itself runs the
+/// distance to mission.completed, proving the record-only apply arm.
+#[test]
+fn gate_result_event_fixture_log_replays_the_full_ladder() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gate-results-ladder.events.jsonl");
+    let events = kranz_engine::event_log::EventLog::read_events(&fixture).unwrap();
+    assert_eq!(events.len(), 16, "fixture log changed; update the ladder");
+
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+
+    let ladder = replay_gate_ladder(&events);
+    let expected: ReplayedLadder = vec![
+        // The approval ladder: the full four-gate floor in ticket order.
+        (
+            "approval".to_string(),
+            0,
+            "vacuous-filter".to_string(),
+            "pass".to_string(),
+            "contract gate vacuous-filter".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            1,
+            "wrong-polarity".to_string(),
+            "fail".to_string(),
+            "contract gate wrong-polarity".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            2,
+            "passes-on-base".to_string(),
+            "fail".to_string(),
+            "contract gate passes-on-base".to_string(),
+        ),
+        (
+            "approval".to_string(),
+            3,
+            "env-sensitive".to_string(),
+            "pass".to_string(),
+            "contract gate env-sensitive".to_string(),
+        ),
+        // The final-gate ladder: the static floor (passes-on-base is absent
+        // by design — the work has landed).
+        (
+            "final-gate".to_string(),
+            0,
+            "vacuous-filter".to_string(),
+            "pass".to_string(),
+            "contract gate vacuous-filter".to_string(),
+        ),
+        (
+            "final-gate".to_string(),
+            1,
+            "wrong-polarity".to_string(),
+            "fail".to_string(),
+            "contract gate wrong-polarity".to_string(),
+        ),
+        (
+            "final-gate".to_string(),
+            2,
+            "env-sensitive".to_string(),
+            "pass".to_string(),
+            "contract gate env-sensitive".to_string(),
+        ),
+    ];
+    assert_eq!(ladder, expected);
+
+    // The failing gates' captured evidence replays verbatim from the log.
+    let wrong_polarity = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::GateResult {
+                gate,
+                artefact_detail,
+                ..
+            } if gate == "wrong-polarity" => artefact_detail.clone(),
+            _ => None,
+        })
+        .expect("wrong-polarity gate.result present");
+    assert!(
+        wrong_polarity.contains("negated grep targets missing path"),
+        "{wrong_polarity}"
+    );
+
+    // Determinism: the same log folds to byte-identical machine output
+    // across two replays (state JSON and the reconstructed ladder alike).
+    let first = serde_json::to_string(&fold(&events).unwrap()).unwrap();
+    let second = serde_json::to_string(&fold(&events).unwrap()).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(replay_gate_ladder(&events), ladder);
+}
+
+/// Backcompat: a log written by an engine predating gate.result — same
+/// mission, not one gate event — still folds cleanly to the same terminal
+/// state. Old logs are the rule, not the exception: the variant is purely
+/// additive, and its absence changes nothing.
+#[test]
+fn gate_result_event_absent_from_pre_gate_logs_folds_clean() {
+    let old_log = r#"{"seq":1,"ts":"2026-01-02T03:04:05Z","missionId":"m-gateladder","type":"mission.created","payload":{"goal":"prove gate ladder replay","baseBranch":"main","missionBranch":"kranz/mission-m-gateladder","config":{}}}
+{"seq":2,"ts":"2026-01-02T03:04:06Z","missionId":"m-gateladder","type":"workspace.provider.pinned","payload":{"provider":"local-worktree","template":"worktree","version":"1"}}
+{"seq":3,"ts":"2026-01-02T03:04:07Z","missionId":"m-gateladder","type":"plan.approved","payload":{"plan":{"goal":"prove gate ladder replay","validationContract":[{"id":"a-1","statement":"tests gate on the landed marker","check":"command","command":"grep -q landed-marker marker.txt"}],"milestones":[{"title":"the work","features":[{"title":"add marker","spec":"write marker.txt","validationCriteria":["marker present"]}]}]},"baseSha":"0123456789abcdef0123456789abcdef01234567"}}
+{"seq":4,"ts":"2026-01-02T03:04:08Z","missionId":"m-gateladder","type":"milestone.started","payload":{"milestoneId":"ms-1","startSha":"0123456789abcdef0123456789abcdef01234567"}}
+{"seq":5,"ts":"2026-01-02T03:04:09Z","missionId":"m-gateladder","type":"feature.started","payload":{"featureId":"f-1-1"}}
+{"seq":6,"ts":"2026-01-02T03:04:10Z","missionId":"m-gateladder","type":"feature.completed","payload":{"featureId":"f-1-1","commits":["fedcba9876543210fedcba9876543210fedcba98"]}}
+{"seq":7,"ts":"2026-01-02T03:04:11Z","missionId":"m-gateladder","type":"milestone.completed","payload":{"milestoneId":"ms-1","tag":"ms-1"}}
+{"seq":8,"ts":"2026-01-02T03:04:12Z","missionId":"m-gateladder","type":"mission.validating","payload":{}}
+{"seq":9,"ts":"2026-01-02T03:04:13Z","missionId":"m-gateladder","type":"mission.completed","payload":{}}
+"#;
+    let events: Vec<Event> = old_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+    assert_eq!(state.mission.milestones.len(), 1);
+    assert!(
+        replay_gate_ladder(&events).is_empty(),
+        "a pre-gate log reconstructs an empty ladder, never an error"
+    );
+}
+
+/// Record-only means record-only: folding a gate.result changes no state —
+/// the fold with the event interleaved is byte-identical to the fold
+/// without it (modulo last_seq), so verdicts can never masquerade as gates
+/// on state transitions.
+#[test]
+fn gate_result_event_is_record_only_in_the_fold() {
+    let gate_event = |seq: u64| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::GateResult {
+            gate: "vacuous-filter".to_string(),
+            surface: kranz_engine::gate::GateSurface::Approval,
+            kind: kranz_engine::gate::GateKind::Deterministic,
+            index: 0,
+            verdict: kranz_engine::gate::GateVerdict::Pass,
+            artefact_ref: "contract gate vacuous-filter".to_string(),
+            artefact_detail: None,
+            score: None,
+            threshold: None,
+            rule_ids: Vec::new(),
+        },
+    };
+    let without = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+    ])
+    .unwrap();
+    let with = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        gate_event(3),
+    ])
+    .unwrap();
+    let mut without_shifted = without;
+    without_shifted.last_seq = with.last_seq;
+    assert_eq!(
+        serde_json::to_string(&with).unwrap(),
+        serde_json::to_string(&without_shifted).unwrap(),
+        "a gate.result must not perturb state beyond last_seq"
+    );
+}
+
+/// Dispatch-pool sibling linkage (ticket heterogeneous-dispatch-pool,
+/// KRZ-303): candidate-linked spawns fold into run records carrying the link,
+/// and the N siblings of ONE unit are one logical dispatch — they must not
+/// deplete the feature's respawn budget; a later ordinary re-run still
+/// counts.
+#[test]
+fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
+    let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: backend.to_string(),
+        }),
+        executor_route: None,
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, candidate_spawn("r-c0", 0, "claude")),
+        ev(5, candidate_spawn("r-c1", 1, "codex")),
+        // An ordinary (non-pool) re-run of the same feature afterwards.
+        ev(6, spawn("r-plain", Some("f-1-1"), None)),
+    ])
+    .unwrap();
+
+    let c0 = state.runs.get("r-c0").expect("candidate 0 recorded");
+    let c1 = state.runs.get("r-c1").expect("candidate 1 recorded");
+    assert_eq!(
+        c0.candidate,
+        Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index: 0,
+            count: 2,
+            backend: "claude".to_string(),
+        })
+    );
+    assert_eq!(
+        c1.candidate,
+        Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index: 1,
+            count: 2,
+            backend: "codex".to_string(),
+        })
+    );
+    // The sibling set: both runs tied to the one unit id.
+    let feature = &state.mission.milestones[0].features[0];
+    assert_eq!(
+        feature.worker_runs,
+        vec![
+            "r-c0".to_string(),
+            "r-c1".to_string(),
+            "r-plain".to_string()
+        ]
+    );
+    // Siblings are one logical dispatch, not retries: only the ordinary
+    // third run charges the respawn budget.
+    assert_eq!(feature.respawns, 1);
+    assert!(state
+        .runs
+        .get("r-plain")
+        .expect("plain run recorded")
+        .candidate
+        .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// divergence.noted / divergence.resolved (ticket divergence-first-class-event,
+// KRZ-304)
+// ---------------------------------------------------------------------------
+
+/// A pool-shaped log written BEFORE the divergence events existed — the
+/// KRZ-303 record: candidate-linked spawns/completions, then the
+/// judgement-pending milestone.blocked — folds unchanged: no resolution set
+/// (and it stays off the state wire), the block still drives the park.
+/// Old logs are the rule, not the exception: the two kinds are additive.
+#[test]
+fn divergence_event_old_logs_fold_cleanly() {
+    let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: backend.to_string(),
+        }),
+        executor_route: None,
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+    let events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, candidate_spawn("r-c0", 0, "claude")),
+        ev(5, candidate_spawn("r-c1", 1, "codex")),
+        ev(6, completed("r-c0", tokens(10, 1), None)),
+        ev(7, completed("r-c1", tokens(10, 1), None)),
+        ev(
+            8,
+            EventKind::MilestoneBlocked {
+                milestone_id: "ms-1".to_string(),
+                reason: "dispatch pool: 2/2 candidate stream(s) recorded for unit f-1-1; …"
+                    .to_string(),
+            },
+        ),
+    ];
+
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Blocked);
+    assert!(
+        state.resolved_divergence_units.is_empty(),
+        "a pre-divergence log folds with no resolutions"
+    );
+    // The empty set is omitted from the state wire (additive: a reader
+    // comparing against a pre-field state.json sees no new key).
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        !value
+            .as_object()
+            .unwrap()
+            .contains_key("resolvedDivergenceUnits"),
+        "an empty resolution set must not hit the wire: {value}"
+    );
+}
+
+/// The new events fold in: `divergence.noted` is record-only (state
+/// unchanged modulo last_seq — the agreement-not-trust rule made
+/// mechanical), `divergence.resolved` lands the unit in the folded
+/// resolution set exactly once even when a hand-written log repeats it.
+#[test]
+fn divergence_event_records_fold_and_resolution_is_idempotent() {
+    let spawn = |run_id: &str, index: u32| EventKind::WorkerSpawned {
+        run_id: run_id.to_string(),
+        role: Role::Worker,
+        feature_id: Some("f-1-1".to_string()),
+        milestone_id: None,
+        candidate: Some(CandidateLink {
+            unit: "f-1-1".to_string(),
+            index,
+            count: 2,
+            backend: "claude".to_string(),
+        }),
+        executor_route: None,
+        sdk_session_id: format!("sess-{run_id}"),
+        model: "sonnet".to_string(),
+        quant: "n/a".to_string(),
+        weight_hash: None,
+        prompt_hash: "deadbeef".to_string(),
+        transcript_path: format!("runs/{run_id}.jsonl"),
+    };
+    let noted = |seq: u64, diverged: bool| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceNoted {
+            unit: "f-1-1".to_string(),
+            candidates: vec![
+                DivergenceCandidate {
+                    run_id: "r-c0".to_string(),
+                    branch: "kranz/pool/m-1/f-1-1-c0".to_string(),
+                    backend: "claude".to_string(),
+                    tree: "aaa".to_string(),
+                },
+                DivergenceCandidate {
+                    run_id: "r-c1".to_string(),
+                    branch: "kranz/pool/m-1/f-1-1-c1".to_string(),
+                    backend: "codex".to_string(),
+                    tree: "bbb".to_string(),
+                },
+            ],
+            diverged,
+        },
+    };
+    let resolved = |seq: u64| Event {
+        seq,
+        ts: base_ts() + chrono::Duration::seconds(seq as i64),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceResolved {
+            unit: "f-1-1".to_string(),
+            selected: Some(1),
+            reason: "codex kept it total".to_string(),
+            decided_by: "operator".to_string(),
+        },
+    };
+
+    let without_noted = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+    ])
+    .unwrap();
+    let with_noted = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+        noted(6, true),
+    ])
+    .unwrap();
+    // Record-only: the noted event perturbs NOTHING but last_seq — the
+    // diverged verdict folds into no state a decision could key on.
+    let mut shifted = without_noted;
+    shifted.last_seq = with_noted.last_seq;
+    assert_eq!(
+        serde_json::to_string(&with_noted).unwrap(),
+        serde_json::to_string(&shifted).unwrap(),
+        "divergence.noted must be record-only in the fold"
+    );
+
+    // The resolution lands the unit once; a duplicated hand-written
+    // resolution folds benignly (set insert is idempotent).
+    let mut events = vec![
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".to_string(),
+            },
+        ),
+        ev(4, spawn("r-c0", 0)),
+        ev(5, spawn("r-c1", 1)),
+        noted(6, true),
+        resolved(7),
+        resolved(8),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.resolved_divergence_units.len(),
+        1,
+        "one unit resolved, duplicated event folded once"
+    );
+    assert!(state.resolved_divergence_units.contains("f-1-1"));
+    let value = serde_json::to_value(&state).unwrap();
+    assert_eq!(value["resolvedDivergenceUnits"], json!(["f-1-1"]));
+
+    // Corruption guards: a noted naming an unknown run, or a resolution
+    // naming an unknown unit, fails the fold instead of folding a dangling
+    // reference.
+    events.push(noted(9, true));
+    let mut bad = events.clone();
+    if let EventKind::DivergenceNoted { candidates, .. } = &mut bad[8].kind {
+        candidates[0].run_id = "r-ghost".to_string();
+    }
+    assert!(
+        fold(&bad).is_err(),
+        "a noted referencing an unknown run must fail the fold"
+    );
+    let mut bad_unit = events;
+    bad_unit.push(Event {
+        seq: 10,
+        ts: base_ts() + chrono::Duration::seconds(10),
+        mission_id: MISSION.to_string(),
+        kind: EventKind::DivergenceResolved {
+            unit: "f-9-9".to_string(),
+            selected: None,
+            reason: "phantom".to_string(),
+            decided_by: "operator".to_string(),
+        },
+    });
+    assert!(
+        fold(&bad_unit).is_err(),
+        "a resolution naming an unknown unit must fail the fold"
+    );
+}
+
+/// The seed-time route record (ticket routing-rules-config): the reducer
+/// derives `mission.executor_route` from `mission.created`'s original folded
+/// goal + routed config — the ONLY event whose goal still carries the task
+/// class (`plan.approved` overwrites `state.mission.goal` with the plan's
+/// own goal, so deriving it later would find nothing).
+#[test]
+fn routing_rules_config_mission_created_fold_derives_executor_route() {
+    let folded_goal = "Bump the dependency.\n## Task class\nexecution-class\n";
+
+    // A routed mission's config (rules-file table applied at create, worker
+    // rewritten to the local backend).
+    let routed_config = || {
+        let mut config = MissionConfig {
+            routing: RoutingConfig {
+                task_class_rules: vec![TaskClassRoute {
+                    task_class: "execution-class".to_string(),
+                    tier: ExecutorTier::Local,
+                }],
+                pattern_rules: vec![],
+            },
+            ..MissionConfig::default()
+        };
+        config.worker.backend = Some("local".to_string());
+        config
+    };
+
+    // The fold names the deciding rule and the effective local tier.
+    let state = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: folded_goal.to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: routed_config(),
+        },
+    )])
+    .unwrap();
+    let route = state
+        .mission
+        .executor_route
+        .clone()
+        .expect("a task-class seed folds a route record");
+    assert_eq!(route.tier, ExecutorTier::Local);
+    assert_eq!(route.rule.as_deref(), Some("taskClassRules[0]"));
+
+    // The same fold is deterministic across replay (the resume path folds
+    // the same log to the same record).
+    let replayed = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: folded_goal.to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: routed_config(),
+        },
+    )])
+    .unwrap();
+    assert_eq!(
+        state.mission.executor_route,
+        replayed.mission.executor_route
+    );
+
+    // No task class on the seed goal ⇒ no record (the pre-provenance shape),
+    // even with a table configured.
+    let state = fold(&[ev(
+        1,
+        EventKind::MissionCreated {
+            goal: "ship the demo feature".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{MISSION}"),
+            config: MissionConfig::default(),
+        },
+    )])
+    .unwrap();
+    assert_eq!(state.mission.executor_route, None);
+
+    // A legacy-floor mission (execution-class goal, no table): the record
+    // carries the effective tier and NO rule — there is no table rule to
+    // name. And the record SURVIVES plan.approved overwriting the goal.
+    let events = vec![
+        ev(
+            1,
+            EventKind::MissionCreated {
+                goal: folded_goal.to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: format!("kranz/mission-{MISSION}"),
+                config: MissionConfig::default(),
+            },
+        ),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: Some("deadbeef".to_string()),
+            },
+        ),
+    ];
+    let state = fold(&events).unwrap();
+    assert_eq!(
+        state.mission.goal,
+        plan().goal,
+        "fixture: plan.approved must overwrite the goal"
+    );
+    let route = state
+        .mission
+        .executor_route
+        .expect("the seed-time record survives approval");
+    assert_eq!(route.tier, ExecutorTier::Frontier);
+    assert_eq!(route.rule, None);
+}
+
+/// Flight Rules (ticket flight-rules-resolution-pin, KRZ-342, design D-E):
+/// the approval pin folds from `plan.approved`, but a revision NEVER re-pins
+/// — no revision flow re-validates a carried manifest against the trusted
+/// source, so folding one would let a re-plan substitute weakened policy
+/// into the consent artifact.
+#[test]
+fn flight_rules_pin_revision_never_folds_a_carried_manifest() {
+    let pin = StandardsPin {
+        pack_name: "zz".to_string(),
+        pack_dir: "vendor/pack".to_string(),
+        standards_root: "standards".to_string(),
+        digest: "ab".repeat(32),
+        source: StandardsPinSource::RepoTracked,
+        task_class: None,
+        touch_set: vec![],
+        context_paths: Vec::new(),
+        gates: Vec::new(),
+        rules: vec![PinnedRule {
+            id: "ZZ-MUST-001".to_string(),
+            revision: 1,
+            rfc: "RFC-002".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: "zz".to_string(),
+            domains: vec![],
+            stages: vec!["merge".to_string()],
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: Some("agent-judgement".to_string()),
+            waivable: false,
+        }],
+    };
+    let mut approved_plan = plan();
+    approved_plan.standards_manifest = Some(Box::new(pin.clone()));
+    // The revision carries a FABRICATED pin (emptied rules, different
+    // digest) — and an extend-only touch set so the revision itself is
+    // otherwise valid.
+    let mut revised = plan();
+    revised.touch_set = vec!["src/**".to_string()];
+    revised.standards_manifest = Some(Box::new(StandardsPin {
+        digest: "cd".repeat(32),
+        rules: vec![],
+        ..pin.clone()
+    }));
+
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: approved_plan,
+            base_sha: Some("deadbeef".to_string()),
+        },
+        EventKind::PlanRevised {
+            revision: 1,
+            plan: revised,
+        },
+    ]);
+    assert_eq!(
+        state.mission.standards_manifest,
+        Some(pin),
+        "the approval-time pin stands for the mission's life"
+    );
+    assert_eq!(
+        state.mission.touch_set,
+        vec!["src/**".to_string()],
+        "the revision's other fields still fold"
     );
 }

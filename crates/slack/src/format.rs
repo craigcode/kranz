@@ -47,6 +47,13 @@ pub const APPROVE_GRANT_ACTION_ID: &str = "kranz_approve_grant";
 /// is `<mission-id>:<command>`.
 pub const DENY_GRANT_ACTION_ID: &str = "kranz_deny_grant";
 
+/// `action_id` of an option button on a question card (ticket
+/// `structured-human-question-events`). The button value is
+/// `<mission-id>:<question-id>:<option-index>` — mission ids and the
+/// engine-minted question ids (`q-<n>`) never contain `:`, so the two colons
+/// split cleanly.
+pub const ANSWER_QUESTION_ACTION_ID: &str = "kranz_answer_question";
+
 /// `action_id` of the "Queue" button on a `/kranz todo` Reviewable-ticket row.
 /// The button value carries the ticket slug and routes through the same
 /// allowlist-gated [`crate::inbound::Action::QueueTicket`] path as
@@ -117,6 +124,25 @@ pub struct GrantReady {
     /// The granted target: a command string, a path glob, a deny rule, or a
     /// `host:port` egress destination, per `kind`.
     pub command: String,
+}
+
+/// An open structured human question (ticket
+/// `structured-human-question-events`) awaiting an operator answer — the
+/// second kind of the ONE pending-decision projection, rendered with the
+/// grant card's chrome (shared "your move" area, never a competing inbox).
+#[derive(Debug, Clone)]
+pub struct QuestionReady {
+    pub mission_id: String,
+    /// Engine-minted id (`q-<n>`) — the handle the answer buttons carry.
+    pub question_id: String,
+    /// The question text (scrubbed + capped at event write).
+    pub text: String,
+    /// The structured choices offered (empty = free-text answer expected;
+    /// capped at event write, so at most a handful of buttons).
+    pub options: Vec<String>,
+    /// Context refs for the card's context line.
+    pub feature_id: Option<String>,
+    pub milestone_id: Option<String>,
 }
 
 /// A ticket that bounced back needing more context, with the orchestrator's
@@ -714,6 +740,66 @@ pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Val
         }),
     ];
     push_dashboard_button(&mut blocks, dashboard_url, &g.mission_id);
+    blocks
+}
+
+/// Open-question announcement (ticket `structured-human-question-events`):
+/// the pending-decision projection's second kind, rendered with the SAME
+/// chrome as the grant card above (header → blurb → subject → context →
+/// actions → dashboard link) so grants and questions read as one "your
+/// move" area — distinct kinds, never competing inboxes. With options, each
+/// becomes a button carrying `<mission-id>:<question-id>:<index>` (the
+/// engine-side cap bounds the row); a free-text ask gets no buttons and the
+/// context line routes the operator to the surfaces that accept free text.
+pub fn build_question_ready(q: &QuestionReady, dashboard_url: Option<&str>) -> Vec<Value> {
+    let mut blocks = vec![
+        header(&format!("Question from worker — {}", q.mission_id)),
+        section("A run asked the human a structured question. Answering lands it in the mission's user-message consult."),
+        // The ask is model-authored (scrubbed + capped at event write);
+        // escape Slack control sequences defensively before rendering.
+        section(&format!("*{}*\n{}", q.question_id, clip(&escape_mrkdwn(q.text.trim())))),
+    ];
+    let context_bits = match (&q.feature_id, &q.milestone_id) {
+        (Some(feature), Some(milestone)) => format!(
+            "feature `{feature}` · milestone `{milestone}` · mission `{}`",
+            q.mission_id
+        ),
+        _ => format!("mission `{}`", q.mission_id),
+    };
+    if q.options.is_empty() {
+        blocks.push(context(&format!(
+            "{context_bits} · free-text answer — reply via the dashboard or `kranz question answer`"
+        )));
+    } else {
+        let option_lines = q
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{i}. {}", escape_mrkdwn(o.trim())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        blocks.push(section(&format!("*Options*\n{}", clip(&option_lines))));
+        blocks.push(context(&context_bits));
+        let elements: Vec<Value> = q
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                json!({
+                    "type": "button",
+                    "style": "primary",
+                    // Button text is capped (Slack 75 chars) and escaped like
+                    // the options list above (model-authored label); the full
+                    // label rides in the list.
+                    "text": { "type": "plain_text", "text": clip_to(&format!("{i}: {}", escape_mrkdwn(o.trim())), 75) },
+                    "action_id": ANSWER_QUESTION_ACTION_ID,
+                    "value": format!("{}:{}:{i}", q.mission_id, q.question_id),
+                })
+            })
+            .collect();
+        blocks.push(json!({ "type": "actions", "elements": elements }));
+    }
+    push_dashboard_button(&mut blocks, dashboard_url, &q.mission_id);
     blocks
 }
 
@@ -1933,6 +2019,100 @@ mod tests {
             .collect();
         assert!(ids.contains(&APPROVE_GRANT_ACTION_ID));
         assert!(ids.contains(&DENY_GRANT_ACTION_ID));
+    }
+
+    /// The question card (ticket structured-human-question-events): same
+    /// chrome as the grant card (header/subject/context/actions), one button
+    /// per option carrying `<mission>:<question>:<index>`; a free-text ask
+    /// gets no buttons and routes the operator to the free-text surfaces.
+    #[test]
+    fn question_events_card_renders_options_as_buttons() {
+        let blocks = build_question_ready(
+            &QuestionReady {
+                mission_id: "m-42".into(),
+                question_id: "q-1".into(),
+                text: "Which storage engine?".into(),
+                options: vec!["sqlite".into(), "in-memory".into()],
+                feature_id: Some("f-1-1".into()),
+                milestone_id: Some("ms-1".into()),
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(text.contains("m-42"), "mission id present");
+        assert!(text.contains("q-1"), "question id present");
+        assert!(text.contains("Which storage engine?"), "the ask is named");
+        assert!(
+            text.contains("f-1-1") && text.contains("ms-1"),
+            "context refs"
+        );
+        assert!(
+            text.contains("Question from worker"),
+            "distinct kind in the shared your-move chrome: {text}"
+        );
+
+        let buttons = all_buttons(&blocks);
+        let values: Vec<&str> = buttons.iter().filter_map(|b| b["value"].as_str()).collect();
+        assert!(
+            values.contains(&"m-42:q-1:0") && values.contains(&"m-42:q-1:1"),
+            "one button per option, value round-trips: {values:?}"
+        );
+        let ids: Vec<&str> = buttons
+            .iter()
+            .filter_map(|b| b["action_id"].as_str())
+            .collect();
+        assert!(
+            ids.iter().all(|id| *id == ANSWER_QUESTION_ACTION_ID),
+            "only answer buttons on the card: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn question_events_card_free_text_ask_has_no_buttons() {
+        let blocks = build_question_ready(
+            &QuestionReady {
+                mission_id: "m-42".into(),
+                question_id: "q-2".into(),
+                text: "What should the flag be called?".into(),
+                options: vec![],
+                feature_id: None,
+                milestone_id: None,
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(text.contains("q-2"));
+        assert!(
+            text.contains("free-text"),
+            "the card says a free-text answer is expected: {text}"
+        );
+        assert!(
+            all_buttons(&blocks).is_empty(),
+            "no buttons on a free-text ask"
+        );
+    }
+
+    /// Model-authored asks must never inject Slack control sequences into
+    /// the card (the grant card's defensive-escape discipline).
+    #[test]
+    fn question_events_card_escapes_mrkdwn() {
+        let blocks = build_question_ready(
+            &QuestionReady {
+                mission_id: "m-42".into(),
+                question_id: "q-1".into(),
+                text: "deploy to <!channel> or <@U123>?".into(),
+                options: vec!["yes <@U123>".into()],
+                feature_id: None,
+                milestone_id: None,
+            },
+            None,
+        );
+        let text = all_text(&blocks);
+        assert!(
+            !text.contains("<!channel>"),
+            "broadcast ping escaped: {text}"
+        );
+        assert!(!text.contains("<@U123>"), "user ping escaped: {text}");
     }
 
     #[test]

@@ -1,0 +1,32 @@
+---
+title: Flight Rules finding, event, replay, and evidence provenance
+priority: 1
+schedule: once
+blocked-by: [flight-rules-resolution-pin]
+state: done
+state-note: Implemented — additive Finding.rule citation + gate.result ruleIds (D-H), the standards_coverage fold (passed/failed/advisory/waived/not-evaluated/not-applicable; absence never pass), and report.md/provenance/evidence-bundle/CLI rendering; pre-Flight-Rules logs render byte-identical. 17 flight_rules_provenance_* tests; full workspace gates green.
+---
+
+## Goal
+Make every standards selection, finding, checker verdict, drift refusal, and
+disposition joinable by stable rule/revision through the append-only log,
+provenance replay, report.md, and evidence bundle.
+
+## Context
+KRZ-343; design D-H. Extend the shipped evidence spine rather than parse
+orchestrator prose. `events.rs` and `types.rs` are contract files: all fields
+are additive/defaulted and old plans/logs must fold byte-compatibly. Existing
+`Finding.subject` remains valid for old consumers; structured rule provenance
+must not be smuggled into that string.
+
+## Acceptance hints
+- Add optional rule ID, revision, source, lifecycle/level, checker ID, and digest fields; gate results admit stable `ruleIds` without changing boolean-only gates.
+- `standards.resolved` records selection inputs, revisions, source digest, effective-time evaluation and approval sequence; `standards.drifted` records both digests and changed applicable rules.
+- Report/provenance/evidence render `passed`, `failed`, `advisory`, `waived`, `not-evaluated`, and `not-applicable`; missing evidence is never pass.
+- Removed run artefacts stay `unresolved`, preserving the existing replay contract; the pinned normalized manifest remains inspectable.
+- Fixture logs from before Flight Rules fold and render unchanged.
+- Same log/manifest produces byte-identical JSON, replay, and bundle output.
+- Anti-vacuity: unique filter `flight_rules_provenance_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-343's entire join target is absent from the base this mission branches from (main @ 90a4bdc): `git grep -i standards HEAD -- crates apps` returns exactly one hit, a doc comment at crates/engine/src/pack.rs:7 — there is no standards module, no StandardsManifest, no rule/revision/lifecycle/checker type, no normalized digest, and no `standards.resolved` or `standards.drifted` event anywhere in the tracked tree. The left half of the join is genuinely shipped and healthy (types.rs:520 `Finding`,  … (truncated)

@@ -36,6 +36,87 @@ const SUMMARY_MAX_CHARS: usize = 200;
 /// Max characters of captured stderr included in failure messages.
 const STDERR_TAIL_CHARS: usize = 500;
 
+/// The ambient var a codex session may authenticate with (injected
+/// explicitly, never via ambient inheritance).
+const CODEX_AUTH_ENV: &str = "OPENAI_API_KEY";
+
+/// The minimal `.codex` state seeded into a session's scratch HOME so file-
+/// based auth survives `agent-env-clear`: the CLI reads `auth.json` for
+/// credentials and `config.toml` for the operator's model/provider defaults.
+/// An unseeded scratch HOME 401s on the first request (observed live on
+/// m-eee81f orch-13). `sessions/` and other per-session state are deliberately
+/// excluded.
+const CODEX_SEED_ENTRIES: &[&str] = &["auth.json", "config.toml"];
+
+/// The cleared environment one `codex` session spawns with (ticket
+/// `agent-env-clear`), mirroring [`crate::backend_claude`]'s seeding
+/// contract: a spec carrying a relocated scratch `HOME` (worker relocation)
+/// is used verbatim; otherwise a fresh per-session scratch HOME is seeded
+/// with [`CODEX_SEED_ENTRIES`] so file-based auth and model/provider config
+/// survive. Seeding failure degrades to an empty scratch home — the session
+/// then fails auth loudly rather than silently inheriting the operator's real
+/// HOME. `OPENAI_API_KEY` is injected explicitly when set (logged name-only).
+fn codex_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, String> {
+    if spec.env.contains_key("HOME") {
+        return crate::agent_env::agent_session_env(
+            &spec.env,
+            &spec.session_id,
+            Some(CODEX_AUTH_ENV),
+        );
+    }
+    let real_home = std::env::var_os("HOME").map(PathBuf::from);
+    let scratch_root = crate::backend_claude::scratch_home_root(&spec.session_id);
+    match seed_codex_scratch_home(&scratch_root, real_home.as_deref()) {
+        Ok(home) => {
+            tracing::info!(
+                session_id = %spec.session_id,
+                decision = "scratch-seeded",
+                "session spec carried no relocated HOME; spawning into a seeded scratch \
+                 HOME (.codex minimal auth/config set)"
+            );
+            crate::agent_env::session_env_with_home(
+                &spec.env,
+                &spec.session_id,
+                Some(CODEX_AUTH_ENV),
+                &home,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %spec.session_id,
+                error = %e,
+                "codex scratch HOME seeding failed; session spawns into an empty scratch \
+                 HOME and will fail auth loudly if OPENAI_API_KEY is not injected"
+            );
+            crate::agent_env::agent_session_env(&spec.env, &spec.session_id, Some(CODEX_AUTH_ENV))
+        }
+    }
+}
+
+/// Seed `<scratch_root>/home/.codex` with [`CODEX_SEED_ENTRIES`], copied
+/// opaquely (bytes only, no parsing/logging of contents) from the real home's
+/// `.codex` when present; a missing source yields an empty-but-present
+/// `.codex`. Returns the home dir the child should get as `HOME`.
+fn seed_codex_scratch_home(
+    scratch_root: &Path,
+    real_home: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let home = scratch_root.join("home");
+    let codex_dir = home.join(".codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    if let Some(real_home) = real_home {
+        let source = real_home.join(".codex");
+        for entry in CODEX_SEED_ENTRIES {
+            let src = source.join(entry);
+            let dst = codex_dir.join(entry);
+            if src.is_file() {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+    }
+    Ok(home)
+}
+
 // ---------------------------------------------------------------------------
 // Binary discovery
 // ---------------------------------------------------------------------------
@@ -483,11 +564,7 @@ impl AgentBackend for CodexBackend {
             // one ambient var a codex session may authenticate with is
             // injected explicitly, never the whole ambient set.
             .env_clear()
-            .envs(crate::agent_env::agent_session_env(
-                &spec.env,
-                &spec.session_id,
-                Some("OPENAI_API_KEY"),
-            ))
+            .envs(codex_child_env(&spec))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -904,6 +981,41 @@ mod tests {
     }
 
     #[test]
+    fn seed_codex_scratch_home_copies_the_minimal_auth_config_set() {
+        let real_home = tempfile::tempdir().unwrap();
+        let codex = real_home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("auth.json"), "{}").unwrap();
+        std::fs::write(codex.join("config.toml"), "model = \"gpt-5\"").unwrap();
+        // Per-session state is never seeded.
+        std::fs::create_dir_all(codex.join("sessions")).unwrap();
+        std::fs::write(codex.join("sessions").join("s1.jsonl"), "{}").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let home = seed_codex_scratch_home(scratch.path(), Some(real_home.path())).unwrap();
+
+        let seeded = home.join(".codex");
+        assert!(seeded.join("auth.json").is_file());
+        assert!(seeded.join("config.toml").is_file());
+        assert!(
+            !seeded.join("sessions").exists(),
+            "per-session transcripts are never seeded"
+        );
+    }
+
+    #[test]
+    fn seed_codex_scratch_home_without_a_source_yields_an_empty_seed() {
+        let real_home = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let home = seed_codex_scratch_home(scratch.path(), Some(real_home.path())).unwrap();
+
+        let seeded = home.join(".codex");
+        assert!(seeded.is_dir());
+        assert_eq!(std::fs::read_dir(&seeded).unwrap().count(), 0);
+    }
+
+    #[test]
     fn build_args_ignores_claude_only_fields() {
         let spec = SessionSpec {
             cwd: PathBuf::from("."),
@@ -924,6 +1036,7 @@ mod tests {
             max_turns: Some(10),
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(
@@ -961,6 +1074,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(

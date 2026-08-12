@@ -18,6 +18,7 @@ use crate::error::{EngineError, Result};
 use crate::paths::MissionPaths;
 use crate::types::{ControlCommand, MissionStatus};
 use chrono::Utc;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -40,7 +41,7 @@ const RAND_LEN: usize = 8;
 pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
     let mission_dir = paths.open_mission_dir_nofollow(true)?;
     let dir = paths.control_dir();
-    crate::paths::create_real_subdir(&mission_dir, "control", &dir)?;
+    let control_dir = crate::paths::open_real_subdir(&mission_dir, "control", &dir, true)?;
 
     let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -51,15 +52,22 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
     );
 
     let final_path = dir.join(&name);
-    let tmp_path = dir.join(format!("{name}.tmp"));
+    let tmp_name = format!("{name}.tmp");
 
     let json = serde_json::to_string(cmd)?;
     {
-        let mut file = std::fs::File::create(&tmp_path)?;
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = control_dir.open_with(&tmp_name, &options)?.into_std();
         file.write_all(json.as_bytes())?;
         file.sync_data()?;
     }
-    std::fs::rename(&tmp_path, &final_path)?;
+    control_dir.rename(&tmp_name, &control_dir, &name)?;
     Ok(final_path)
 }
 
@@ -79,8 +87,12 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
 /// filename (== chronological) order.
 pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
     let mut commands = Vec::new();
-    for path in queued_files(&paths.control_dir())? {
-        let content = match std::fs::read_to_string(&path) {
+    let Some(control_dir) = control_dir(paths, false)? else {
+        return Ok(commands);
+    };
+    for name in queued_files(&control_dir)? {
+        let path = paths.control_dir().join(&name);
+        let content = match read_control_file(&control_dir, &name) {
             Ok(c) => c,
             Err(e) => {
                 // Transient (e.g. racing another drain); skip, never block.
@@ -90,7 +102,7 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
         };
         match serde_json::from_str::<ControlCommand>(&content) {
             Ok(cmd) => commands.push((path, cmd)),
-            Err(e) => quarantine(&path, &e),
+            Err(e) => quarantine(&control_dir, &name, &path, &e),
         }
     }
     Ok(commands)
@@ -102,8 +114,11 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
 /// run-watcher polls this cheaply while a later [`drain`] still returns the
 /// message itself.
 pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
-    for path in queued_files(&paths.control_dir())? {
-        let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(control_dir) = control_dir(paths, false)? else {
+        return Ok(false);
+    };
+    for name in queued_files(&control_dir)? {
+        let Ok(content) = read_control_file(&control_dir, &name) else {
             continue;
         };
         if let Ok(ControlCommand::Msg {
@@ -114,6 +129,28 @@ pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Remove a command returned by [`drain`] after its event has been durably
+/// applied. The delete stays relative to the same no-follow mission/control
+/// chain as enqueue and drain, so a swapped parent symlink cannot redirect
+/// acknowledgement outside the mission.
+pub fn acknowledge(paths: &MissionPaths, path: &Path) -> Result<()> {
+    if path.parent() != Some(paths.control_dir().as_path()) {
+        return Err(EngineError::InvalidState(format!(
+            "refusing control acknowledgement outside {}: {}",
+            paths.control_dir().display(),
+            path.display()
+        )));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        EngineError::InvalidState(format!("control path {} has no file name", path.display()))
+    })?;
+    let Some(control_dir) = control_dir(paths, false)? else {
+        return Err(std::io::Error::from(ErrorKind::NotFound).into());
+    };
+    control_dir.remove_file(name)?;
+    Ok(())
 }
 
 /// Fold one mission's status; `None` when its log is unreadable or absent.
@@ -174,40 +211,62 @@ pub fn resolve_active_mission(repo_root: &Path, explicit: Option<&str>) -> Resul
     }
 }
 
-/// Queued `.json` command files in filename (== chronological) order.
-/// A missing control dir is an empty queue, not an error.
-fn queued_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+/// Open the control directory through the pinned mission capability. A
+/// missing mission/control directory is an empty inbox when `create` is
+/// false.
+fn control_dir(paths: &MissionPaths, create: bool) -> Result<Option<cap_std::fs::Dir>> {
+    let mission_dir = match paths.open_mission_dir_nofollow(create) {
+        Ok(dir) => dir,
+        Err(EngineError::Io(error)) if error.kind() == ErrorKind::NotFound && !create => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
     };
+    match crate::paths::open_real_subdir(&mission_dir, "control", &paths.control_dir(), create) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(EngineError::Io(error)) if error.kind() == ErrorKind::NotFound && !create => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Queued `.json` command names in filename (== chronological) order.
+fn queued_files(dir: &cap_std::fs::Dir) -> Result<Vec<OsString>> {
+    let entries = dir.entries()?;
     let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
-        if is_file && path.extension().and_then(|e| e.to_str()) == Some("json") {
-            files.push(path);
+        if is_file && Path::new(&name).extension().and_then(|e| e.to_str()) == Some("json") {
+            files.push(name);
         }
     }
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    files.sort();
     Ok(files)
+}
+
+fn read_control_file(dir: &cap_std::fs::Dir, name: &OsStr) -> Result<String> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    use std::io::Read;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = dir.open_with(name, &options)?.into_std();
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// Rename an unparseable command file to `<name>.bad` so it stops blocking
 /// the queue but stays on disk for diagnosis.
-fn quarantine(path: &Path, err: &serde_json::Error) {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let bad = path.with_file_name(format!("{file_name}.bad"));
+fn quarantine(dir: &cap_std::fs::Dir, name: &OsStr, path: &Path, err: &serde_json::Error) {
+    let bad_name = format!("{}.bad", name.to_string_lossy());
     tracing::warn!(
         path = %path.display(),
         error = %err,
         "unparseable control command, quarantining as .bad"
     );
-    if let Err(e) = std::fs::rename(path, &bad) {
+    if let Err(e) = dir.rename(name, dir, &bad_name) {
         tracing::warn!(path = %path.display(), error = %e, "failed to quarantine control file");
     }
 }

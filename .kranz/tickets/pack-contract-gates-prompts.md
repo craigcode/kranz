@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: pack.rs + toml-subset parser, packDir config (additive), final-gate pipeline floor-then-pack, prompt injection with honest hash, kranz pack lint, zz- fixture pack + 4 mission fixtures, docs/pack-contract.md. pack_contract filter: 31 green; full gates green.
 title: Pack contract extension — packs register gates, prompts, checklists
 priority: 1
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 89f05a1: new agent_env.rs (empty base + PATH/HOME=scratch/TERM/TMPDIR/toolchain caches/contractEnvPassthrough), all 4 backends env-cleared, contract commands clear_env with per-mission scratch HOME, per-backend auth injection (name-only logged). Follow-ons flagged: merge gates still on old sanitized_gate_env (documented duplicate); workspace-gate/data-hook ambient env BY DESIGN. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Clear ambient environment for agent + contract subprocesses (P1 trust boundary)
 priority: 1
 schedule: once

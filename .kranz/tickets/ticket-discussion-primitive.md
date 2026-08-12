@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 7659358: append-only .notes.jsonl sidecars (atomic append), kranz ticket note/notes (KRANZ_NOTE_AUTHOR else operator), draft includes latest 50 notes in seed only (goal unforked), valid_slug validation, committed artifact class in AGENTS.md. 12 tests. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: "Ticket discussion primitive (D-BW-3, adopted from beads)"
 priority: 3
 schedule: once

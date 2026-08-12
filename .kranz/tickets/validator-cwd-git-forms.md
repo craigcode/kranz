@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented operator-driven (validator path was self-referential for missions): 2a9035a denial detection, 982358c scrutiny/mechanical split, ab17654 guidance persist+inject, 3cdfb7d unblock-add-fix, bfac7e6 engine-run contract commands
 title: Repair the validator execution path (guidance injection, scrutiny/mechanical split, engine-run commands, denial detection, blocked-state repair)
 priority: 2
 schedule: once

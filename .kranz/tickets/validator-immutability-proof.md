@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at c19c163: validator_integrity.rs CheckoutFingerprint (HEAD + porcelain v1) around every validator session; drift emits validator.tamper + blocks milestone, no retry, no waivable finding; Bash allows narrowed to verbatim + exact segments; dashboard/CLI render arms. CoW immutable-snapshot validator is the named follow-up. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Prove validators cannot write: before/after assertions + drop wildcard Bash (P1)
 priority: 2
 schedule: once

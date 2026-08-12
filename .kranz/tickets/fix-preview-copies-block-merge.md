@@ -1,4 +1,5 @@
 ---
+state: done
 title: Worktree-mode deliverable preview copies block the gated merge of their canonical files
 priority: 2
 schedule: once

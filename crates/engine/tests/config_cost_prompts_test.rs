@@ -263,6 +263,7 @@ fn plan_with(features_per_milestone: &[usize]) -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -345,6 +346,8 @@ fn spawned(
         role,
         feature_id: feature_id.map(str::to_string),
         milestone_id: milestone_id.map(str::to_string),
+        candidate: None,
+        executor_route: None,
         sdk_session_id: format!("sess-{run_id}"),
         model: "sonnet".to_string(),
         quant: "n/a".to_string(),
@@ -440,6 +443,7 @@ fn mission_a_events() -> Vec<EventKind> {
                 evidence: "it broke".into(),
                 suggested_fix: "fix it".into(),
                 class: String::new(),
+                rule: None,
             },
         },
         // First fix-feature after milestone.validating: fix cycle #1.
@@ -833,6 +837,7 @@ fn judgement_assertion(id: &str) -> Assertion {
         statement: "orchestrator judges the full diff".into(),
         check: AssertionCheck::AgentJudgement,
         command: None,
+        pty_script: None,
     }
 }
 
@@ -842,6 +847,7 @@ fn command_assertion(id: &str, command: &str) -> Assertion {
         statement: "a command gate".into(),
         check: AssertionCheck::Command,
         command: Some(command.into()),
+        pty_script: None,
     }
 }
 

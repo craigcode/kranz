@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: gate_scores.rs series fold + kranz gate-scores [--json]; vacuous-filter is the honest scored demo (determination coverage, threshold 1.0, absent when no graded surface). gate_score_series filter: 14 green; full gates green. Unblocks gate-score-distribution-flags.
 title: Gate results carry an optional confidence score and threshold
 priority: 1
 schedule: once

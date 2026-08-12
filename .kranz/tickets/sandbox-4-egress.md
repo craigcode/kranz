@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: Egress allowlist: enforce=fs+net (macOS)
 priority: 2
 schedule: once

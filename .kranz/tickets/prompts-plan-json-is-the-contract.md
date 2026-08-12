@@ -1,4 +1,5 @@
 ---
+state: done
 title: Make plan.json-not-plan.md authoritative in worker/orchestrator prompts
 priority: 3
 schedule: once

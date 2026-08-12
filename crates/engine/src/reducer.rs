@@ -8,7 +8,7 @@
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
 use crate::types::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Reserved `run_id` for `validation.finding` events produced by the engine
@@ -82,6 +82,10 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 .collect();
             state.mission.command_grants = plan.command_grants.clone();
             state.mission.touch_set = plan.touch_set.clone();
+            // The Flight Rules approval pin (KRZ-342 D-E) folds with the plan
+            // it was approved with — the mission's standards authority from
+            // here on.
+            state.mission.standards_manifest = plan.standards_manifest.as_deref().cloned();
             state.mission.status = MissionStatus::Approved;
             state.latest_plan_revision = 0;
             state.pending_revision = None;
@@ -199,6 +203,8 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             role,
             feature_id,
             milestone_id,
+            candidate,
+            executor_route: _,
             sdk_session_id,
             model,
             quant,
@@ -217,8 +223,12 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             if let Some(fid) = feature_id {
                 let feature = feature_mut(state, fid)?;
                 feature.worker_runs.push(run_id.clone());
-                // A 2nd+ run on the same feature is a respawn.
-                if feature.worker_runs.len() > 1 {
+                // A 2nd+ run on the same feature is a respawn — EXCEPT a
+                // dispatch-pool candidate (KRZ-303): the N sibling streams
+                // are ONE logical dispatch of the unit, not N-1 retries, and
+                // the pool path has no judgement-driven respawn loop at all,
+                // so counting them would silently deplete `max_respawns`.
+                if feature.worker_runs.len() > 1 && candidate.is_none() {
                     feature.respawns += 1;
                 }
             }
@@ -229,6 +239,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     role: *role,
                     feature_id: feature_id.clone(),
                     milestone_id: milestone_id.clone(),
+                    candidate: candidate.clone(),
                     sdk_session_id: sdk_session_id.clone(),
                     model: model.clone(),
                     quant: quant.clone(),
@@ -278,8 +289,19 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature.commits.extend(commits.iter().cloned());
         }
 
-        EventKind::FeatureFailed { feature_id, .. } => {
-            feature_mut(state, feature_id)?.status = FeatureStatus::Failed;
+        EventKind::FeatureFailed {
+            feature_id,
+            commits,
+            ..
+        } => {
+            let feature = feature_mut(state, feature_id)?;
+            feature.status = FeatureStatus::Failed;
+            // Record any commits the failure landed on the mission branch:
+            // the fix-feature supersession guard reads `commits.is_empty()`
+            // to tell a failed-COMMITLESS feature (re-proposable — the
+            // m-eee81f auth-death wedge) from failed-with-real-work (started;
+            // a duplicate fixfeature.created must reject).
+            feature.commits.extend(commits.iter().cloned());
         }
 
         EventKind::FeatureSkipped { feature_id, .. } => {
@@ -327,6 +349,86 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::ValidationConfirm {
+            milestone_id,
+            local_run_id,
+            confirm_run_id,
+            ..
+        } => {
+            // Audit-only record (KRZ-206b, the gate.result additive
+            // template): the local-vs-frontier comparison drives no state
+            // transition — a disagreement's finding already flows through
+            // validation.finding, and the miss rate reads this event back
+            // off the log, so state shape does not grow. Validate all
+            // references as a corruption guard (mirrors validation.finding):
+            // both run ids name real sessions (the local primary and the
+            // frontier confirmation), so a hand-edited confirm cannot cite
+            // a run the log never recorded.
+            milestone_mut(state, milestone_id)?;
+            run_mut(state, local_run_id)?;
+            run_mut(state, confirm_run_id)?;
+        }
+
+        EventKind::ValidationPtyTranscript { milestone_id, .. } => {
+            // Audit-only record (ticket pty-functional-validation): the
+            // verdict reaches the round through the functional validator's
+            // evidence block, not through this event, so it drives no state
+            // transition (mirrors validation.snapshot). No run id exists at
+            // emit time — the evidence pass is engine-run — so only the
+            // milestone reference is validated as a corruption guard.
+            milestone_mut(state, milestone_id)?;
+        }
+
+        EventKind::GateResult { .. } => {
+            // Audit-only record (KRZ-312): one gate evaluation — id, ladder
+            // position, verdict, artefact handle. Gate results drive no
+            // state transition (the advisory posture of contract gates is
+            // unchanged: verdicts inform, they never block), and the ladder
+            // a replay reconstructs is read from the events themselves, so
+            // state shape intentionally does not grow. And unlike
+            // validation.finding there is no milestone/run reference on the
+            // payload to validate as a corruption guard — the arm is a pure
+            // no-op, exactly like secret.redacted below.
+        }
+
+        EventKind::HookGateFired { run_id, .. } => {
+            // Record-only (KRZ-302, the gate.result additive template): the
+            // in-process hook verdict already happened inside the session,
+            // and the engine-side sweep remains the authoritative layer —
+            // so this drives no state transition and state shape does not
+            // grow. Validate the run reference as a corruption guard
+            // (mirrors validation.finding); the run id is engine-stamped at
+            // fold time, so this cannot be aimed at a run the log never
+            // recorded.
+            run_mut(state, run_id)?;
+        }
+
+        EventKind::DivergenceNoted {
+            unit, candidates, ..
+        } => {
+            // Audit record of the candidate comparison (KRZ-304); the
+            // accompanying milestone.blocked drives the park, and the
+            // `diverged` verdict is deliberately NEVER folded into any
+            // state a decision could key on — agreement between models is a
+            // signal to log, never a criterion to trust. Validate
+            // references as a corruption guard (mirrors validation.finding):
+            // the unit names a feature, every candidate a recorded run.
+            feature_mut(state, unit)?;
+            for candidate in candidates {
+                run_mut(state, &candidate.run_id)?;
+            }
+        }
+
+        EventKind::DivergenceResolved { unit, .. } => {
+            // The judgement record (KRZ-304). The unit joins the folded
+            // resolution set — the engine's restart-safe memory for "this
+            // unit was already judged" (at most one resolution per unit;
+            // the set insert keeps a duplicated hand-written event benign).
+            // Reference validation as a corruption guard, as above.
+            feature_mut(state, unit)?;
+            state.resolved_divergence_units.insert(unit.clone());
+        }
+
         EventKind::FixFeatureCreated {
             milestone_id,
             feature,
@@ -335,19 +437,60 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             if let Some(existing) = ms.features.iter().find(|f| f.id == feature.id) {
                 // A duplicate with an IDENTICAL proposal is an idempotent
                 // replay — a retried emission after a crash between emit
-                // and fold (mission m-83d1ed: a duplicate emit wedged every
-                // subsequent run with "invalid state"). Event-sourced
-                // recovery must no-op it, not brick. A duplicate with a
-                // DIFFERENT payload is still the loud shadowing the guard
-                // exists for.
-                if existing.title != feature.title
-                    || existing.spec != feature.spec
-                    || existing.validation_criteria != feature.validation_criteria
+                // and fold (mission m-83d1ed). Event-sourced recovery must
+                // no-op it, not brick — and it must NOT skip the last_seq
+                // advance at the tail, or the next event fails contiguity
+                // (the m-83d1ed wedge's second form).
+                if existing.title == feature.title
+                    && existing.spec == feature.spec
+                    && existing.validation_criteria == feature.validation_criteria
                 {
-                    return Err(EngineError::InvalidState(format!(
+                    // fall through to the tail: seq advances, state unchanged
+                } else {
+                    // A duplicate with a DIFFERENT payload is an implicit
+                    // SUPERSESSION when the prior feature never produced work:
+                    // an unstarted (Pending) or failed-and-commitless feature
+                    // can be re-proposed by a re-plan — this is the normal
+                    // shape after new findings (m-83d1ed re-proposed the same
+                    // id twice). Failed-with-runs-but-no-commits is the same
+                    // class: runs that never committed produced no work (the
+                    // m-eee81f wedge — three infra-failed runs made
+                    // `worker_runs` non-empty and bricked every re-proposal);
+                    // their records stay in the log. A feature whose run is
+                    // in flight is Active, so runs alone are not the "started"
+                    // signal. The successor REPLACES the prior payload in
+                    // place and restarts as Pending; the original payload is
+                    // not lost — it lives in this same event log (the first
+                    // fixfeature.created). Once a feature has started,
+                    // committed, or completed, a revision is genuinely
+                    // shadowing and stays loudly invalid.
+                    let idx = ms
+                        .features
+                        .iter()
+                        .position(|f| f.id == feature.id)
+                        .expect("found above");
+                    let existing = &ms.features[idx];
+                    let prior_started = matches!(
+                        existing.status,
+                        FeatureStatus::Active | FeatureStatus::Complete | FeatureStatus::Skipped
+                    ) || !existing.commits.is_empty();
+                    if prior_started {
+                        return Err(EngineError::InvalidState(format!(
                         "duplicate fixfeature.created for feature '{}' with a different payload",
                         feature.id
                     )));
+                    }
+                    tracing::info!(
+                        feature_id = %feature.id,
+                        "fixfeature re-proposed before any work: folding as implicit supersession"
+                    );
+                    if ms.status == MilestoneStatus::Validating {
+                        ms.fix_cycles += 1;
+                        ms.status = MilestoneStatus::Active;
+                    }
+                    let mut successor = feature.clone();
+                    successor.status = FeatureStatus::Pending;
+                    ms.features[idx] = successor;
                 }
             } else {
                 // One fix-cycle increment per validation round: the first
@@ -371,6 +514,118 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             let ms = milestone_mut(state, milestone_id)?;
             ms.status = MilestoneStatus::Active;
             ms.fix_cycles = 0;
+        }
+
+        EventKind::WorkerEscalated { run_id, .. } => {
+            // Record-only (KRZ-331, the gate.result additive template): the
+            // worker's escalation request is provenance — the judgement turn
+            // (the frontier advisor) acts on the report, and nothing a
+            // decision could key on changes here: the validator route, the
+            // executor tier, the respawn budget, and every milestone status
+            // are deliberately untouched, so a worker escalation can never
+            // bypass the floor's validator requirements (contrast
+            // tier.escalated above, the orchestrator-initiated tier flip,
+            // which DOES rewrite worker config). Validate the run reference
+            // as a corruption guard (mirrors hook.gate.fired): the run id is
+            // engine-stamped at emit time, so this cannot be aimed at a run
+            // the log never recorded.
+            run_mut(state, run_id)?;
+        }
+
+        EventKind::QuestionOpened {
+            question_id,
+            role,
+            text,
+            options,
+            run_id,
+            feature_id,
+            milestone_id,
+        } => {
+            // The pending-decision projection's open edge (ticket
+            // structured-human-question-events). NOT record-only: the open
+            // question IS state a surface renders and an answer cross-checks
+            // against, so it folds onto `pending_questions` — but it gates
+            // NOTHING in the run loop (contrast grant.requested's park).
+            // Validate references as a corruption guard (mirrors
+            // validation.finding), then dedupe like fixfeature.created: a
+            // duplicated open with an IDENTICAL payload is an idempotent
+            // replay (no double-push, no id-counter bump); the same id with
+            // a DIFFERENT payload is shadowing and stays loudly invalid.
+            if question_id.trim().is_empty() {
+                return Err(EngineError::InvalidState(
+                    "question.opened question id must not be empty".to_string(),
+                ));
+            }
+            if text.trim().is_empty() {
+                return Err(EngineError::InvalidState(format!(
+                    "question.opened {question_id} text must not be empty"
+                )));
+            }
+            if let Some(run_id) = run_id {
+                run_mut(state, run_id)?;
+            }
+            if let Some(feature_id) = feature_id {
+                feature_mut(state, feature_id)?;
+            }
+            if let Some(milestone_id) = milestone_id {
+                milestone_mut(state, milestone_id)?;
+            }
+            if let Some(existing) = state
+                .pending_questions
+                .iter()
+                .find(|q| q.question_id == *question_id)
+            {
+                let identical = existing.role == *role
+                    && existing.text == *text
+                    && existing.options == *options
+                    && existing.run_id == *run_id
+                    && existing.feature_id == *feature_id
+                    && existing.milestone_id == *milestone_id;
+                if !identical {
+                    return Err(EngineError::InvalidState(format!(
+                        "duplicate question.opened for '{question_id}' with a different payload"
+                    )));
+                }
+                // fall through to the tail: seq advances, state unchanged
+            } else {
+                state.question_count += 1;
+                state.pending_questions.push(PendingQuestion {
+                    question_id: question_id.clone(),
+                    role: *role,
+                    text: text.clone(),
+                    options: options.clone(),
+                    run_id: run_id.clone(),
+                    feature_id: feature_id.clone(),
+                    milestone_id: milestone_id.clone(),
+                });
+            }
+        }
+
+        EventKind::QuestionAnswered {
+            question_id,
+            answer,
+            ..
+        } => {
+            // The projection's answer edge: cross-check against the parked
+            // question (mirrors expect_pending_grant — a stale or forged
+            // answer for a question that is not open fails the fold), remove
+            // it, then route the answer onto `pending_user_messages` — the
+            // EXISTING consult path (D-X: answers ride the msg machinery,
+            // never a new delivery mechanism), so the orchestrator's next
+            // user-message consult consumes the answer and a restart replays
+            // it from the log alone.
+            let question = take_pending_question(state, question_id, "question.answered")?;
+            state.pending_user_messages.push(format!(
+                "answer to question {} (\"{}\"): {}",
+                question.question_id, question.text, answer
+            ));
+        }
+
+        EventKind::QuestionCleared { question_id, .. } => {
+            // The projection's clear edge: same parked-question cross-check
+            // as the answer (a clear for a question that is not open is
+            // corruption, never a silent no-op).
+            take_pending_question(state, question_id, "question.cleared")?;
         }
 
         EventKind::MilestoneBlocked { milestone_id, .. } => {
@@ -488,6 +743,17 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 version: version.clone(),
             });
         }
+
+        EventKind::StandardsResolved { .. }
+        | EventKind::StandardsDrifted { .. }
+        | EventKind::StandardsWaiverApproved { .. }
+        | EventKind::StandardsAttestationApproved { .. } => {
+            // Audit-only (KRZ-342 D-H; KRZ-344 D-I): the pin itself folds
+            // with plan.approved; these events are the queryable provenance,
+            // refusal, and waiver evidence. The coverage fold joins waivers
+            // straight from the log — state shape intentionally does not
+            // grow.
+        }
     }
 
     state.last_seq = event.seq;
@@ -525,6 +791,12 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             touch_set: Vec::new(),
             deny_exceptions: Vec::new(),
             egress_grants: Vec::new(),
+            standards_manifest: None,
+            // The seed-time route record (ticket routing-rules-config): the
+            // folded task class exists only on THIS event's goal, so the
+            // decision is derived here, once — deterministically equal to
+            // what create applied (routing::seed_executor_route).
+            executor_route: crate::routing::seed_executor_route(config, goal),
         },
         runs: BTreeMap::new(),
         totals: TokenUsage::default(),
@@ -535,12 +807,15 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         latest_plan_revision: 0,
         pending_revision: None,
         pending_grant_request: None,
+        pending_questions: Vec::new(),
+        question_count: 0,
         last_seq: event.seq,
         escalated_milestones: 0,
         local_executor_milestones: 0,
         workspace_provider: None,
         workspace_pin: None,
         workspace_lifecycle: None,
+        resolved_divergence_units: BTreeSet::new(),
     })
 }
 
@@ -566,6 +841,28 @@ fn expect_pending_grant(
             "{event} with no pending grant request"
         ))),
     }
+}
+
+/// Remove and return the parked question `question_id` names, or fail the
+/// fold. Both `question.answered` and `question.cleared` gate on this
+/// (mirrors [`expect_pending_grant`]): a stale, replayed, or forged
+/// resolution for a question that is not open — never asked, already
+/// answered, already cleared — is corruption, not a silent no-op.
+fn take_pending_question(
+    state: &mut MissionState,
+    question_id: &str,
+    event: &str,
+) -> Result<PendingQuestion> {
+    let Some(index) = state
+        .pending_questions
+        .iter()
+        .position(|q| q.question_id == question_id)
+    else {
+        return Err(EngineError::InvalidState(format!(
+            "{event} for question '{question_id}' that is not open"
+        )));
+    };
+    Ok(state.pending_questions.remove(index))
 }
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
@@ -627,6 +924,13 @@ fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> R
     state.mission.validation_contract = plan.validation_contract.clone();
     state.mission.command_grants = plan.command_grants.clone();
     state.mission.touch_set = plan.touch_set.clone();
+    // The Flight Rules pin (KRZ-342 D-E) is NEVER re-read from a revision:
+    // the planner never authors policy, and no revision flow re-validates a
+    // carried manifest against the trusted source — folding one would let a
+    // re-plan substitute weakened policy into the consent artifact. The
+    // approval-time pin stands for the mission's life; an envelope escape is
+    // caught by the final-validation check (which re-resolves the pinned
+    // base snapshot against actual paths) and by the merge drift check.
     state.mission.milestones = revised_milestones;
     Ok(())
 }
@@ -823,8 +1127,10 @@ fn run_mut<'a>(state: &'a mut MissionState, id: &str) -> Result<&'a mut WorkerRu
 }
 
 /// Recursive JSON merge: objects merge key-by-key, anything else in the patch
-/// replaces the base value wholesale.
-fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+/// replaces the base value wholesale. `pub(crate)` so the provenance replay
+/// (provenance.rs) evolves its tracked config by the SAME merge — a second
+/// spelling of "how a config.changed patch applies" could drift from this one.
+pub(crate) fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
     use serde_json::Value;
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
@@ -849,15 +1155,47 @@ pub fn write_snapshot(state: &MissionState, path: &Path) -> Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
         EngineError::InvalidState(format!("snapshot path {} has no file name", path.display()))
     })?;
-    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+    let tmp_name = format!("{}.tmp", file_name.to_string_lossy());
+    let (parent, pinned_name) = crate::paths::open_parent_nofollow(path)?;
+
+    // Refuse hostile leaves before opening. The no-follow open below is the
+    // authoritative race-safe check; this metadata pass gives a useful error
+    // for directories, fifos, devices, and pre-existing symlinks.
+    for (name, display) in [
+        (pinned_name.as_os_str(), path.to_path_buf()),
+        (
+            std::ffi::OsStr::new(&tmp_name),
+            path.with_file_name(&tmp_name),
+        ),
+    ] {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(EngineError::InvalidState(format!(
+                    "refusing snapshot write through non-regular path {}",
+                    display.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
 
     let json = serde_json::to_string_pretty(state)?;
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&tmp_name, &options)?.into_std();
         std::io::Write::write_all(&mut file, json.as_bytes())?;
         file.sync_data()?;
     }
-    std::fs::rename(&tmp, path)?;
+    parent.rename(&tmp_name, &parent, &pinned_name)?;
     Ok(())
 }
 
@@ -928,5 +1266,238 @@ mod executor_tier_tests {
             state.config.backend_kind(Role::ValidatorFunctional),
             BackendKind::Claude
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_gate_projection_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind,
+        }
+    }
+
+    fn spawned(seq: u64, run_id: &str) -> Event {
+        event(
+            seq,
+            EventKind::WorkerSpawned {
+                run_id: run_id.to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            },
+        )
+    }
+
+    /// The hook.gate.fired fold arm is record-only (KRZ-302): the run
+    /// reference is validated as a corruption guard, and state shape does
+    /// not grow — the mission's course is unchanged by the in-process
+    /// verdict (the engine-side sweep remains the authoritative layer).
+    #[test]
+    fn hook_gate_projection_event_folds_record_only() {
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config: MissionConfig::default(),
+            },
+        );
+        let fired = event(
+            3,
+            EventKind::HookGateFired {
+                run_id: "r-1".to_string(),
+                gate: "out-of-contract-write".to_string(),
+                hook_event: "PreToolUse".to_string(),
+                tool: "Write".to_string(),
+                subject: "docs/oops.md".to_string(),
+                verdict: "blocked".to_string(),
+                detail: Some("outside the touch set".to_string()),
+            },
+        );
+
+        let with_hook = fold(&[created.clone(), spawned(2, "r-1"), fired]).unwrap();
+        let without_hook = fold(&[created, spawned(2, "r-1")]).unwrap();
+
+        // No state transition: identical mission status, run set, and run
+        // outcome with and without the hook event.
+        assert_eq!(with_hook.mission.status, without_hook.mission.status);
+        assert_eq!(with_hook.runs.len(), 1);
+        assert!(with_hook.runs["r-1"].result.is_none());
+        assert_eq!(
+            with_hook.mission.milestones.len(),
+            without_hook.mission.milestones.len()
+        );
+    }
+
+    /// The run reference is a corruption guard: a hook.gate.fired naming a
+    /// run the log never recorded refuses the fold (the run id is
+    /// engine-stamped at fold time, so this can only be log corruption).
+    #[test]
+    fn hook_gate_projection_event_with_unknown_run_is_refused() {
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config: MissionConfig::default(),
+            },
+        );
+        let bogus = event(
+            2,
+            EventKind::HookGateFired {
+                run_id: "no-such-run".to_string(),
+                gate: "out-of-contract-write".to_string(),
+                hook_event: "PreToolUse".to_string(),
+                tool: "Write".to_string(),
+                subject: "docs/oops.md".to_string(),
+                verdict: "blocked".to_string(),
+                detail: None,
+            },
+        );
+        assert!(fold(&[created, bogus]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod routing_abstraction_tests {
+    use super::*;
+    use crate::events::EventKind;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-test".to_string(),
+            kind,
+        }
+    }
+
+    fn created_with_local_worker() -> Event {
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+        event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
+            },
+        )
+    }
+
+    fn spawned(seq: u64, run_id: &str) -> Event {
+        event(
+            seq,
+            EventKind::WorkerSpawned {
+                run_id: run_id.to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            },
+        )
+    }
+
+    /// The worker.escalated fold arm is record-only (KRZ-331, the gate.result
+    /// template): a worker escalation NEVER bypasses the floor's validator
+    /// requirements — the validator route, the executor tier, and every
+    /// decision-keyed counter fold exactly as if the event were absent
+    /// (contrast tier.escalated, the orchestrator-initiated valve, which
+    /// deliberately rewrites worker config). Only the run reference is
+    /// validated, as a corruption guard (mirrors hook.gate.fired).
+    #[test]
+    fn routing_abstraction_escalation_folds_record_only_leaving_validators_untouched() {
+        let escalated = event(
+            3,
+            EventKind::WorkerEscalated {
+                run_id: "r-1".to_string(),
+                feature_id: "f-1-1".to_string(),
+                from: ExecutorTier::Local,
+                to: ExecutorTier::Frontier,
+                reason: "spec ambiguity beyond my confidence".to_string(),
+            },
+        );
+
+        let with = fold(&[created_with_local_worker(), spawned(2, "r-1"), escalated]).unwrap();
+        let without = fold(&[created_with_local_worker(), spawned(2, "r-1")]).unwrap();
+
+        // The WHOLE config is identical with and without the escalation —
+        // validator backends are inside it, so this pins "validator route
+        // unaffected" exactly, not by a sampled field.
+        assert_eq!(with.config, without.config);
+        assert_eq!(
+            with.config.backend_kind(Role::ValidatorScrutiny),
+            BackendKind::Claude
+        );
+        assert_eq!(
+            with.config.backend_kind(Role::ValidatorFunctional),
+            BackendKind::Claude
+        );
+        // The worker escalation never flips the executor tier (that flip is
+        // tier.escalated's job, and it is orchestrator-initiated only).
+        assert_eq!(with.executor_tier(), ExecutorTier::Local);
+        // No state transition of any kind: same mission status, same run
+        // set, same escalation counters.
+        assert_eq!(with.mission.status, without.mission.status);
+        assert_eq!(with.runs.len(), without.runs.len());
+        assert_eq!(with.escalated_milestones, without.escalated_milestones);
+        assert_eq!(
+            with.local_executor_milestones,
+            without.local_executor_milestones
+        );
+    }
+
+    /// The run reference is a corruption guard: a worker.escalated naming a
+    /// run the log never recorded refuses the fold (the run id is
+    /// engine-stamped at emit time, so this can only be log corruption).
+    #[test]
+    fn routing_abstraction_escalation_with_unknown_run_is_refused() {
+        let bogus = event(
+            2,
+            EventKind::WorkerEscalated {
+                run_id: "no-such-run".to_string(),
+                feature_id: "f-1-1".to_string(),
+                from: ExecutorTier::Local,
+                to: ExecutorTier::Frontier,
+                reason: "r".to_string(),
+            },
+        );
+        let mut config = MissionConfig::default();
+        config.worker.backend = Some("local".to_string());
+        let created = event(
+            1,
+            EventKind::MissionCreated {
+                goal: "g".to_string(),
+                base_branch: "main".to_string(),
+                mission_branch: "kranz/mission-m-test".to_string(),
+                config,
+            },
+        );
+        assert!(fold(&[created, bogus]).is_err());
     }
 }

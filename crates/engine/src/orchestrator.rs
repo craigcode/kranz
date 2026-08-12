@@ -40,8 +40,9 @@ use crate::auth_verify::AuthVerdict;
 use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
-use crate::command_exec::{run_shell_command, tail_chars};
+use crate::command_exec::{run_shell_command_sandboxed, tail_chars};
 use crate::config;
+use crate::contract_gates;
 use crate::contract_lint;
 use crate::contract_sweep;
 use crate::control;
@@ -51,6 +52,7 @@ use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::{Event, EventKind};
 use crate::findings::{synthesize_fix_specs, FindingsConversion, FixFeatureSpec};
+use crate::gate_results;
 use crate::git_ops::{with_kranz_trailers, CommitInfo, GitRepo, KranzCommitMetadata};
 use crate::judgement::{lesson_provenance_clean, JudgementOutcome};
 use crate::knowledge::{self, KnowledgeQuery};
@@ -89,6 +91,27 @@ const DECISION_SUMMARY_MAX: usize = 200;
 
 /// Max chars of `worker.message` content (mirrors the runner's cap).
 const MESSAGE_CONTENT_MAX: usize = 2000;
+
+/// Caps for the structured human-question payloads (ticket
+/// `structured-human-question-events`) — the Mission Control AskUserQuestion
+/// UX contract reference (caps, options, free text) made engine-side:
+/// bounded so a model-authored ask can never bloat the append-only log, and
+/// scrubbed at write like every other model-authored string the engine
+/// persists.
+/// Max questions taken from one worker report; the rest is dropped with an
+/// operator-visible decision note (never silently).
+const QUESTIONS_PER_REPORT_CAP: usize = 4;
+/// Max chars of one question's text on `question.opened`.
+const QUESTION_TEXT_MAX: usize = 500;
+/// Max structured choices kept per question (the Slack card renders one
+/// button per option, so this also bounds the chrome).
+const QUESTION_OPTIONS_CAP: usize = 4;
+/// Max chars of one option's label.
+const QUESTION_OPTION_MAX: usize = 100;
+/// Max chars of an operator's answer on `question.answered` (operator-typed
+/// text still gets scrubbed — a pasted token must never reach the
+/// corpus-exported log).
+const ANSWER_TEXT_MAX: usize = 500;
 
 /// Sleep between loop iterations while paused (§4.5 step b).
 const PAUSE_POLL: Duration = Duration::from_millis(300);
@@ -136,6 +159,13 @@ struct UnblockDecision {
     action: String,
     #[serde(default)]
     note: String,
+    /// For a milestone parked on a dispatch-pool judgement (KRZ-303/304):
+    /// the zero-based index of the candidate the operator chose (the
+    /// `-c<i>` suffix of the `kranz/pool/*` branches), or null when no
+    /// candidate was selected. Purely the resolution RECORD's payload —
+    /// the engine never merges a candidate.
+    #[serde(default)]
+    candidate: Option<u32>,
     /// Optional operator guidance injected verbatim into the next validator
     /// task (and its retry) — the only channel by which unblock text can
     /// reach a fresh validator session.
@@ -202,6 +232,38 @@ struct ParallelDecision {
 // MissionEngine
 // ---------------------------------------------------------------------------
 
+/// Throwaway detached worktree used only by approval-time contract lint.
+/// Agent-authored assertion commands may mutate every writable byte they can
+/// reach, so they never run in the primary checkout. Cleanup is RAII and
+/// forceful because a timed-out or failing command may leave the tree dirty.
+struct ApprovalLintWorktree {
+    repo: GitRepo,
+    path: PathBuf,
+}
+
+impl ApprovalLintWorktree {
+    fn create(repo: &GitRepo, path: &Path, base_sha: &str) -> Result<Self> {
+        let _ = repo.remove_worktree(path);
+        let _ = std::fs::remove_dir_all(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        repo.add_detached_worktree(path, base_sha)?;
+        Ok(Self {
+            repo: repo.clone(),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ApprovalLintWorktree {
+    fn drop(&mut self) {
+        let _ = self.repo.remove_worktree(&self.path);
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = self.repo.prune_worktrees();
+    }
+}
+
 /// The mission engine: composes the event log, reducer state, git repo,
 /// runner, control inbox, and the long-lived orchestrator session into the
 /// §4.5 loop.
@@ -246,6 +308,10 @@ pub struct MissionEngine {
     /// whose `backend = "kimi"`. Mirrors `codex_backend`: `None` until the
     /// first successful probe; a failed probe is never cached.
     kimi_backend: Option<Arc<dyn AgentBackend>>,
+    /// Lazily-built [`crate::backend_cursor::CursorBackend`] cache for roles
+    /// whose `backend = "cursor"`. Mirrors `codex_backend`: `None` until the
+    /// first successful probe; a failed probe is never cached.
+    cursor_backend: Option<Arc<dyn AgentBackend>>,
     /// The tree mission-branch work runs in for the current `run()` call
     /// (M7 tier 1). `None` in checkout mode (and before the first `run()`),
     /// where [`Self::active_root`]/[`Self::active_repo`] fall back to
@@ -315,7 +381,11 @@ impl MissionEngine {
     /// tier before the config is stored on `mission.created` and records the
     /// routing decision — every seed path (`kranz draft`/`exec`, REST, Slack)
     /// creates missions from that folded goal string, so this is the single
-    /// place ticket→routing wiring needs to live.
+    /// place ticket→routing wiring needs to live. The routing table itself
+    /// may come from the tracked, base-branch-owned rules file
+    /// ([`crate::routing_rules`], ticket `routing-rules-config`), read here
+    /// from the live base ref — the merge-gates ownership idiom, so a
+    /// mission can never edit the rules that route it.
     pub fn create(
         backend: Arc<dyn AgentBackend>,
         repo_root: impl Into<PathBuf>,
@@ -324,9 +394,6 @@ impl MissionEngine {
     ) -> Result<Self> {
         config::validate(&cfg)?;
         let task_class = crate::ticket::parse_task_class_from_goal(goal);
-        let routing_summary = task_class
-            .as_deref()
-            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
         let repo_root = canonical_root(repo_root.into());
         let repo = GitRepo::open(&repo_root)?;
         repo.ensure_identity()?;
@@ -342,6 +409,48 @@ impl MissionEngine {
                  check out the intended base (e.g. main) first"
             )));
         }
+        let review_contract = crate::review_artifact::parse_from_goal(goal)?;
+        if let Some(contract) = &review_contract {
+            crate::review_artifact::validate_source(&repo, &base_branch, contract)?;
+        }
+
+        // Tracked routing rules (ticket routing-rules-config): when the live
+        // BASE branch carries `.kranz/routing-rules.json`, its validated
+        // table IS this mission's routing table — committed bytes only
+        // (merge.rs's live-base idiom), so an uncommitted working-tree edit
+        // or a later mission-branch edit can never re-route the mission.
+        // Present-but-invalid fails the draft closed BEFORE any mission
+        // side effects below (event log, mission dir). Missing ⇒ the
+        // layered-config/legacy floor, byte-identical. A valid file
+        // supersedes any layered-config `routing` key wholesale; the
+        // supersession rides the load note so it is never silent.
+        let rules_note = match crate::routing_rules::load_routing_rules_at_ref(&repo, &base_branch)?
+        {
+            Some(rules) => {
+                let superseded = if cfg.routing.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; supersedes the layered-config routing table ({} task-class rule(s), {} pattern rule(s))",
+                        cfg.routing.task_class_rules.len(),
+                        cfg.routing.pattern_rules.len()
+                    )
+                };
+                let note = format!(
+                    "routing rules loaded from {} (base branch {:?}): {} task-class rule(s), {} pattern rule(s){superseded}",
+                    crate::routing_rules::ROUTING_RULES_PATH,
+                    base_branch,
+                    rules.task_class_rules.len(),
+                    rules.pattern_rules.len(),
+                );
+                cfg.routing = rules;
+                Some(note)
+            }
+            None => None,
+        };
+        let routing_summary = task_class
+            .as_deref()
+            .map(|task_class| config::route_task_class_executor(&mut cfg, Some(task_class)).1);
 
         let mission_id = format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let paths = MissionPaths::new(&repo_root, &mission_id);
@@ -385,6 +494,7 @@ impl MissionEngine {
             codex_backend: None,
             droid_backend: None,
             kimi_backend: None,
+            cursor_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -396,6 +506,9 @@ impl MissionEngine {
             workspace_handle: None,
             workspace_provider: None,
         };
+        if let Some(note) = rules_note {
+            engine.emit_decision(&note, None)?;
+        }
         if let Some(summary) = routing_summary {
             engine.emit_decision(summary, None)?;
         }
@@ -465,6 +578,18 @@ impl MissionEngine {
                         let _ = repo.remove_worktree(&path);
                     }
                 }
+                // Dispatch-pool candidate worktree DIRS (KRZ-303) are crash
+                // leaks under the same lifetime rule (they exist only while a
+                // lock-holding engine is mid-dispatch). Pool BRANCHES are
+                // deliberately NOT deleted here: they are the recorded
+                // candidate deliverables — deleting them would destroy the
+                // evidence the mission parked to preserve.
+                for index in 0..crate::config::MAX_WORKER_CANDIDATES {
+                    let path = pool_worktree_path(&repo_root, mission_id, &feature.id, index);
+                    if path.exists() {
+                        let _ = repo.remove_worktree(&path);
+                    }
+                }
             }
         }
         // A leaked mission integration worktree (M7 tier 1) is the same story:
@@ -505,6 +630,7 @@ impl MissionEngine {
             codex_backend: None,
             droid_backend: None,
             kimi_backend: None,
+            cursor_backend: None,
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
@@ -604,7 +730,35 @@ impl MissionEngine {
     ///
     /// The snapshot write is mandatory for lifecycle events and best-effort
     /// for `worker.message` stream deltas (recoverable by refolding the log).
+    ///
+    /// Fold-validate BEFORE append (ticket `emit-never-poisons-log`; source
+    /// m-83d1ed, where a re-proposed fixfeature payload appended fine and then
+    /// failed the fold — the append-only log was left holding an event no
+    /// replay can ever fold, and recovery meant surgery on the audit log).
+    /// The fold is computed against a CLONE of the current state; on failure
+    /// nothing is appended, the error surfaces to the caller, and log and
+    /// state stay exactly as they were. On success the real path below folds
+    /// the same event a second time — the honest price of the invariant,
+    /// trivial next to an agent turn. Stream deltas are exempt: their apply
+    /// arm is infallible by construction and they are the hot path, so
+    /// cloning state per delta would tax the one caller that emits thousands.
+    ///
+    /// One named gap: the probe validates the UNscrubbed kind while the real
+    /// fold applies the redaction-scrubbed event. Scrubbing only rewrites
+    /// secret-shaped substrings inside string payloads, which no
+    /// fold-validity rule keys on — a payload id literally shaped like an API
+    /// key is the pathological exception, accepted and documented.
     pub(crate) fn emit(&mut self, kind: EventKind) -> Result<Event> {
+        if !kind.is_stream_delta() {
+            let mut probe = self.state.clone();
+            let probe_event = Event {
+                seq: self.state.last_seq + 1,
+                ts: chrono::Utc::now(),
+                mission_id: self.paths.mission_id.clone(),
+                kind: kind.clone(),
+            };
+            reducer::apply(&mut probe, &probe_event)?;
+        }
         let (event, audits) = self.log.append_with_redaction_audits(kind)?;
         let stream_delta = event.kind.is_stream_delta();
         reducer::apply(&mut self.state, &event)?;
@@ -665,25 +819,37 @@ impl MissionEngine {
         };
 
         match requested {
-            BackendKind::Codex => {
-                if let Some(cached) = &self.codex_backend {
-                    set_effective_model(&mut cfg, BackendKind::Codex);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Codex,
-                        cfg,
-                        fallback_reason: None,
-                    };
+            BackendKind::Claude => {
+                set_effective_model(&mut cfg, BackendKind::Claude);
+                SelectedBackend {
+                    backend: Arc::clone(&self.backend),
+                    kind: BackendKind::Claude,
+                    cfg,
+                    fallback_reason: None,
                 }
-                match crate::backend_codex::discover_codex_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_codex::CodexBackend::new(binary));
-                        self.codex_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Codex);
+            }
+            BackendKind::Local | BackendKind::Acp => {
+                // No-fallback kinds: `config::validate` has already guaranteed
+                // the role's endpoint/command config, and there is no binary
+                // to probe — construction cannot fail.
+                set_effective_model(&mut cfg, requested);
+                let backend = self
+                    .resolve_kind_backend(requested, role)
+                    .expect("validate guarantees local/acp role config");
+                SelectedBackend {
+                    backend,
+                    kind: requested,
+                    cfg,
+                    fallback_reason: None,
+                }
+            }
+            BackendKind::Codex | BackendKind::Droid | BackendKind::Kimi | BackendKind::Cursor => {
+                match self.resolve_kind_backend(requested, role) {
+                    Ok(backend) => {
+                        set_effective_model(&mut cfg, requested);
                         SelectedBackend {
                             backend,
-                            kind: BackendKind::Codex,
+                            kind: requested,
                             cfg,
                             fallback_reason: None,
                         }
@@ -695,94 +861,70 @@ impl MissionEngine {
                             kind: BackendKind::Claude,
                             cfg,
                             fallback_reason: Some(format!(
-                                "codex backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
+                                "{} backend requested for the {role_name} but not available \
+                                 ({err}); falling back to the claude {role_name}",
+                                requested.as_str()
                             )),
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Construct (or reuse the cached) backend for `kind`, WITHOUT any claude
+    /// fallback. Shared by [`Self::select_backend`] — which layers the
+    /// per-kind fallback policy on top — and [`Self::select_pool_candidate`],
+    /// which must never fall back (see there).
+    fn resolve_kind_backend(
+        &mut self,
+        kind: BackendKind,
+        role: Role,
+    ) -> Result<Arc<dyn AgentBackend>> {
+        match kind {
+            BackendKind::Claude => Ok(Arc::clone(&self.backend)),
+            BackendKind::Codex => {
+                if let Some(cached) = &self.codex_backend {
+                    return Ok(Arc::clone(cached));
+                }
+                let binary = crate::backend_codex::discover_codex_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_codex::CodexBackend::new(binary));
+                self.codex_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Droid => {
                 if let Some(cached) = &self.droid_backend {
-                    set_effective_model(&mut cfg, BackendKind::Droid);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Droid,
-                        cfg,
-                        fallback_reason: None,
-                    };
+                    return Ok(Arc::clone(cached));
                 }
-                match crate::backend_droid::discover_droid_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_droid::DroidBackend::new(binary));
-                        self.droid_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Droid);
-                        SelectedBackend {
-                            backend,
-                            kind: BackendKind::Droid,
-                            cfg,
-                            fallback_reason: None,
-                        }
-                    }
-                    Err(err) => {
-                        set_effective_model(&mut cfg, BackendKind::Claude);
-                        SelectedBackend {
-                            backend: Arc::clone(&self.backend),
-                            kind: BackendKind::Claude,
-                            cfg,
-                            fallback_reason: Some(format!(
-                                "droid backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
-                            )),
-                        }
-                    }
-                }
+                let binary = crate::backend_droid::discover_droid_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_droid::DroidBackend::new(binary));
+                self.droid_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Kimi => {
                 if let Some(cached) = &self.kimi_backend {
-                    set_effective_model(&mut cfg, BackendKind::Kimi);
-                    return SelectedBackend {
-                        backend: Arc::clone(cached),
-                        kind: BackendKind::Kimi,
-                        cfg,
-                        fallback_reason: None,
-                    };
+                    return Ok(Arc::clone(cached));
                 }
-                match crate::backend_kimi::discover_kimi_binary(None) {
-                    Ok(binary) => {
-                        let backend: Arc<dyn AgentBackend> =
-                            Arc::new(crate::backend_kimi::KimiBackend::new(binary));
-                        self.kimi_backend = Some(Arc::clone(&backend));
-                        set_effective_model(&mut cfg, BackendKind::Kimi);
-                        SelectedBackend {
-                            backend,
-                            kind: BackendKind::Kimi,
-                            cfg,
-                            fallback_reason: None,
-                        }
-                    }
-                    Err(err) => {
-                        set_effective_model(&mut cfg, BackendKind::Claude);
-                        SelectedBackend {
-                            backend: Arc::clone(&self.backend),
-                            kind: BackendKind::Claude,
-                            cfg,
-                            fallback_reason: Some(format!(
-                                "kimi backend requested for the {role_name} but not available \
-                                 ({err}); falling back to the claude {role_name}"
-                            )),
-                        }
-                    }
+                let binary = crate::backend_kimi::discover_kimi_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_kimi::KimiBackend::new(binary));
+                self.kimi_backend = Some(Arc::clone(&backend));
+                Ok(backend)
+            }
+            BackendKind::Cursor => {
+                if let Some(cached) = &self.cursor_backend {
+                    return Ok(Arc::clone(cached));
                 }
+                let binary = crate::backend_cursor::discover_cursor_binary(None)?;
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_cursor::CursorBackend::new(binary));
+                self.cursor_backend = Some(Arc::clone(&backend));
+                Ok(backend)
             }
             BackendKind::Local => {
-                let role_cfg = match role {
-                    Role::Orchestrator => &cfg.orchestrator,
-                    Role::Worker => &cfg.worker,
-                    Role::ValidatorScrutiny => &cfg.validator_scrutiny,
-                    Role::ValidatorFunctional => &cfg.validator_functional,
-                };
+                let role_cfg = self.state.config.role(role);
                 // `config::validate` has already guaranteed base_url and
                 // context_budget are present for a local-backed role; there
                 // is no binary to probe and therefore no claude fallback.
@@ -797,24 +939,63 @@ impl MissionEngine {
                 let backend: Arc<dyn AgentBackend> = Arc::new(
                     crate::backend_local::LocalBackend::new(base_url, temperature, context_budget),
                 );
-                set_effective_model(&mut cfg, BackendKind::Local);
-                SelectedBackend {
-                    backend,
-                    kind: BackendKind::Local,
-                    cfg,
-                    fallback_reason: None,
-                }
+                Ok(backend)
             }
-            BackendKind::Claude => {
-                set_effective_model(&mut cfg, BackendKind::Claude);
-                SelectedBackend {
-                    backend: Arc::clone(&self.backend),
-                    kind: BackendKind::Claude,
-                    cfg,
-                    fallback_reason: None,
-                }
+            BackendKind::Acp => {
+                let role_cfg = self.state.config.role(role);
+                // `config::validate` has already guaranteed acp_command is
+                // present for an acp-backed role (worker only). Like local,
+                // there is no binary discovery: ACP defines no `--version`
+                // convention, so the initialize handshake at session start
+                // IS the probe — a non-ACP executable fails there, loudly,
+                // and there is no claude fallback to hide that behind.
+                let acp_command = role_cfg
+                    .acp_command
+                    .clone()
+                    .expect("validate guarantees acp_command for backend = acp");
+                let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_acp::AcpBackend::new(
+                    acp_command,
+                    role_cfg.acp_args.clone(),
+                ));
+                Ok(backend)
             }
         }
+    }
+
+    /// Select the backend for ONE dispatch-pool candidate (KRZ-303). Unlike
+    /// [`Self::select_backend`] there is deliberately NO claude fallback: a
+    /// pool whose unavailable candidate silently reran on claude would record
+    /// two same-backend "candidates" — fake diversity, the exact opposite of
+    /// the ticket's point (cross-harness divergence for scrutiny). An
+    /// unavailable candidate backend errors here; the caller records that
+    /// stream's terminal state and its siblings run unaffected.
+    ///
+    /// The returned cfg pins the WORKER role to the candidate's backend and
+    /// (backend-normalized) model; everything else is the mission config.
+    fn select_pool_candidate(&mut self, spec: &CandidateSpec) -> Result<SelectedBackend> {
+        let kind = config::parse_backend(Some(&spec.backend)).map_err(|other| {
+            EngineError::Config(format!(
+                "workerCandidates entry names unknown backend {other:?} (config::validate \
+                 should have rejected it at mission boundaries)"
+            ))
+        })?;
+        if matches!(kind, BackendKind::Local | BackendKind::Acp) {
+            return Err(EngineError::Config(format!(
+                "workerCandidates entry backend {:?} is not supported in this pass \
+                 (config::validate should have rejected it at mission boundaries)",
+                spec.backend
+            )));
+        }
+        let mut cfg = self.state.config.clone();
+        cfg.worker.backend = Some(spec.backend.clone());
+        cfg.worker.model = config::effective_model(Role::Worker, kind, &spec.model);
+        let backend = self.resolve_kind_backend(kind, Role::Worker)?;
+        Ok(SelectedBackend {
+            backend,
+            kind,
+            cfg,
+            fallback_reason: None,
+        })
     }
 
     fn claude_fallback_cfg_for_role(&self, role: Role) -> MissionConfig {
@@ -889,6 +1070,29 @@ impl MissionEngine {
         self.worker_auth_verdict = Some(verdict);
     }
 
+    /// Test hook: pre-seed a lazily-constructed per-kind backend cache so
+    /// dispatch-pool tests can drive non-claude candidates with scripted
+    /// [`crate::backend_mock::MockBackend`]s instead of real agent CLIs (the
+    /// discovery probes read the host, which has no codex/droid/kimi binary
+    /// under test). Never call this outside tests: it bypasses the real
+    /// backend discovery the probe exists to perform.
+    #[doc(hidden)]
+    pub fn seed_kind_backend_for_test(
+        &mut self,
+        kind: BackendKind,
+        backend: Arc<dyn AgentBackend>,
+    ) {
+        match kind {
+            BackendKind::Codex => self.codex_backend = Some(backend),
+            BackendKind::Droid => self.droid_backend = Some(backend),
+            BackendKind::Kimi => self.kimi_backend = Some(backend),
+            BackendKind::Cursor => self.cursor_backend = Some(backend),
+            // claude is the engine's primary backend (injected at create);
+            // local/acp have no probe cache to seed.
+            BackendKind::Claude | BackendKind::Local | BackendKind::Acp => {}
+        }
+    }
+
     /// Fold events appended by `runner::run_*` (which writes to the log
     /// directly) into engine state. Must be called immediately after every
     /// runner invocation, before any further `emit`.
@@ -950,6 +1154,49 @@ impl MissionEngine {
             )));
         }
 
+        // Resolve the moving base branch exactly once, before any base-owned
+        // contract/policy read or mission-branch side effect. Every approval
+        // artefact and the branch itself must derive from this immutable tree;
+        // otherwise a concurrent base advance can pin policy from one commit,
+        // create the mission branch from another, and record a third SHA.
+        let base = self.state.mission.base_branch.clone();
+        let base_sha = self.repo.rev_parse(&base)?;
+        let review_contract = crate::review_artifact::parse_from_goal(&self.state.mission.goal)?;
+        if let Some(contract) = &review_contract {
+            crate::review_artifact::validate_source(&self.repo, &base_sha, contract)?;
+            let output_allowed =
+                contract_sweep::touch_set_includes(&plan.touch_set, &contract.output_path)
+                    .map_err(|error| {
+                        EngineError::Config(format!(
+                            "review output touch-set validation failed: {error}"
+                        ))
+                    })?;
+            let input_allowed = contract_sweep::touch_set_includes(
+                &plan.touch_set,
+                &contract.input_path,
+            )
+            .map_err(|error| {
+                EngineError::Config(format!("review input touch-set validation failed: {error}"))
+            })?;
+            if !output_allowed || input_allowed {
+                return Err(EngineError::Config(format!(
+                    "review-artifact plan must authorize output `{}` and exclude immutable input `{}` from its touchSet",
+                    contract.output_path, contract.input_path
+                )));
+            }
+        }
+        let branch = self.state.mission.mission_branch.clone();
+        if self.repo.branch_exists(&branch)? {
+            let existing_tip = self.repo.rev_parse(&branch)?;
+            if existing_tip != base_sha {
+                return Err(EngineError::InvalidState(format!(
+                    "mission branch `{branch}` already exists at {existing_tip}, not the pinned \
+                     approval base {base_sha}; refusing to approve pre-existing commits into \
+                     this mission"
+                )));
+            }
+        }
+
         // Workspace contract (D-A): validate the base-branch-owned
         // `.kranz/workspace.json` from the repo ROOT — never the mission
         // branch, so a mission cannot weaken the contract that judges it
@@ -957,7 +1204,47 @@ impl MissionEngine {
         // unchanged; present-but-invalid ⇒ fail closed, owner repo-setup,
         // before any branch/commit side effects below.
         let approval_contract =
-            crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)?;
+            crate::workspace_contract::load_workspace_contract_at_ref(&self.repo, &base_sha)?;
+
+        // Routing rules (ticket routing-rules-config), same base-branch-owned
+        // posture: validate the tracked `.kranz/routing-rules.json` as
+        // COMMITTED on the live base branch — present-but-invalid fails
+        // approval closed (owner: repo-setup) before any branch/commit side
+        // effects below, exactly like the contract above. Validation only:
+        // this mission's route was already pinned from the base at creation
+        // (mission.created's config), so a VALID edit between create and
+        // approve does not re-route it.
+        let _routing_rules =
+            crate::routing_rules::load_routing_rules_at_ref(&self.repo, &base_sha)?;
+
+        // Flight Rules (KRZ-342, design D-D/D-E): resolve the applicable
+        // standards from the TRUSTED source — tracked base blobs for a
+        // repo-relative packDir, one capability read for an external one —
+        // and pin the manifest into the plan BEFORE any branch/commit side
+        // effects below (the same ownership posture as the contract and
+        // routing rules above). A malformed base corpus, an external pack
+        // carrying enforced rules, an untracked repo-relative corpus, or a
+        // plan-carried manifest that is stale or substituted fails approval
+        // HERE, before the mission branch exists. No standards-configured
+        // pack ⇒ None ⇒ the approval stays byte-identical.
+        let context_paths: Vec<String> = review_contract
+            .iter()
+            .map(|contract| contract.input_path.clone())
+            .collect();
+        let standards_pin = crate::pack::resolution::approval_pin_with_context(
+            &self.repo,
+            &self.state.config,
+            &self.paths.repo_root,
+            &base_sha,
+            crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
+            plan.standards_manifest.as_deref(),
+            &plan.touch_set,
+            &context_paths,
+        )
+        .map_err(EngineError::Config)?;
+        // The engine authors the pin (D-D): a carried manifest was verified
+        // equal above; anything else would have been rejected.
+        plan.standards_manifest = standards_pin.map(Box::new);
 
         // Provider pin (D-B, ticket workspace-provider-pin-at-approval):
         // resolve the EFFECTIVE provider now — an unknown `workspace.provider`
@@ -1013,45 +1300,73 @@ impl MissionEngine {
             );
         }
 
+        // Run agent-authored approval probes only in a disposable detached
+        // worktree at the already-pinned base SHA. Even an `enforce: off`
+        // mission cannot modify the primary checkout through this advisory
+        // lint; enforced missions additionally get the same gate sandbox as
+        // validation/final commands. The sandbox scratch matches the cleared
+        // contract env's HOME/TMP/CARGO_HOME roots.
+        let command_assertions_present = plan
+            .validation_contract
+            .iter()
+            .any(|assertion| assertion.check == AssertionCheck::Command);
+        let contract_lint_report = if command_assertions_present {
+            let lint_root = self
+                .paths
+                .runs_dir()
+                .join("approval-contract-lint-worktree");
+            let _lint_worktree = ApprovalLintWorktree::create(&self.repo, &lint_root, &base_sha)?;
+            let scratch = self.paths.runs_dir().join("approval-contract-home");
+            let sandbox = crate::command_exec::resolve_gate_sandbox(
+                &self.state.config.worker.sandbox,
+                &lint_root,
+                &self.paths.mission_dir(),
+                &scratch,
+                &self.paths.runs_dir(),
+            )?
+            .sandbox;
+            contract_lint::run_contract_lint(
+                &lint_root,
+                &scratch,
+                Some(&base_sha),
+                &plan.validation_contract,
+                true,
+                &self.state.config.contract_env_passthrough,
+                &sandbox,
+            )
+        } else {
+            contract_lint::ContractLintReport {
+                results: Vec::new(),
+                tree_clean_at_base: true,
+            }
+        };
+
         // Git first: if anything fails here, no event was emitted and
         // approve_plan can simply be retried.
-        let base = self.state.mission.base_branch.clone();
-        let branch = self.state.mission.mission_branch.clone();
         if !self.repo.branch_exists(&branch)? {
-            self.repo.create_branch(&branch, Some(&base))?;
+            self.repo.create_branch(&branch, Some(&base_sha))?;
         }
         let worktree_mode = self.state.config.isolation() == WorkerIsolation::Worktree;
         if !worktree_mode {
             self.repo.checkout(&branch)?;
         }
-        // Committing plan files onto the mission branch below does not move
-        // the base branch ref, so resolving it anywhere in approve_plan pins
-        // the base tip as of approval (plan §f-1-2: never re-resolve later —
-        // that would reintroduce the moving-base-branch race this fixes).
-        // Unaffected by worktree_mode: `base` is resolved against the primary
-        // repo either way, and creating (but not checking out) the mission
-        // branch never moves it.
-        let base_sha = self.repo.rev_parse(&base)?;
+        // `base_sha` was resolved before every base-owned read above and the
+        // mission branch was created from that exact object. Never re-resolve
+        // the moving base name during approval.
 
-        // Lint each `check: command` assertion against the untouched base
-        // tree (M8 tier 1, feature f-1-2): at this point the working tree is
-        // either still on `base` (worktree mode never checks out the mission
-        // branch on the primary) or was just checked out onto a mission
-        // branch freshly created FROM `base` above, with nothing committed
-        // onto it yet — either way this is the pristine base. Never blocks
-        // approval; only informs the operator and plan.md. Deliberately the
-        // stricter `is_clean()` rather than `is_clean_tracked()`: this note
-        // is advisory-only and a false positive (flagging an untracked
-        // scratch file as "dirty") costs nothing, whereas `is_clean_tracked`
-        // would silently ignore untracked-but-not-ignored files that could
-        // still leak into a command assertion's output.
-        let tree_clean_at_base = self.repo.is_clean()?;
-        let contract_lint_report = contract_lint::run_contract_lint(
-            &self.paths.repo_root,
-            Some(&base_sha),
+        // Named, deterministic contract-validation gates (ticket
+        // contract-validation-gates.md): the defect classes behind the lint —
+        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
+        // evaluated through the gate plugin interface (gate.rs) so each
+        // verdict carries its class name into the approval decision and
+        // plan.md below. Static gates inspect the command text against the
+        // (still pristine) repo root; passes-on-base graduates the lint
+        // report. Advisory only, exactly like the lint: approval never
+        // blocks on these.
+        let gate_reports = contract_gates::contract_gate_reports(
             &plan.validation_contract,
-            tree_clean_at_base,
-            &self.state.config.contract_env_passthrough,
+            Some(&contract_lint_report),
+            &self.paths.repo_root,
         );
 
         // Human-readable twin, committed alongside: reviewable in any git UI
@@ -1068,6 +1383,8 @@ impl MissionEngine {
             fit_note.as_deref(),
             calibration.missions_used,
             &contract_lint_report,
+            &gate_reports,
+            &self.state.config.worker_candidates,
         );
         // research.md (repo-knowledge-store slice 1): the evidence the
         // orchestrator emitted with the plan, committed beside plan.md.
@@ -1177,18 +1494,64 @@ impl MissionEngine {
             version: workspace_pin.version,
         })?;
 
-        self.emit(EventKind::PlanApproved {
+        let approved_event = self.emit(EventKind::PlanApproved {
             plan,
             base_sha: Some(base_sha),
         })?;
+
+        // The Flight Rules resolution record (KRZ-342, D-H): emitted AFTER
+        // plan.approved (the "Git first" invariant above — approval can no
+        // longer fail, so a retried approve_plan never double-records), with
+        // the approval seq the pin attaches to. The full snapshots ride in
+        // the plan itself; this event is the queryable selection provenance.
+        if let Some(pin) = self.state.mission.standards_manifest.clone() {
+            self.emit(EventKind::StandardsResolved {
+                source: pin.source.as_str().to_string(),
+                pack_name: pin.pack_name.clone(),
+                standards_root: pin.standards_root.clone(),
+                digest: pin.digest.clone(),
+                stage: crate::pack::resolution::APPROVAL_SURFACE.to_string(),
+                task_class: pin.task_class.clone(),
+                touch_set: pin.touch_set.clone(),
+                context_paths: pin.context_paths.clone(),
+                rules: pin
+                    .rules
+                    .iter()
+                    .map(|rule| crate::types::StandardsRuleRef {
+                        id: rule.id.clone(),
+                        revision: rule.revision,
+                        effective_status: rule.effective_status.clone(),
+                    })
+                    .collect(),
+                approval_seq: approved_event.seq,
+            })?;
+        }
+
+        // First-class gate results (ticket gate-results-first-class-events,
+        // KRZ-312): one gate.result event per evaluated approval gate, in
+        // pipeline order. Emitted AFTER plan.approved, preserving the "Git
+        // first" invariant above (no event lands until approval can no
+        // longer fail) — a retried approve_plan therefore never double-
+        // records a ladder. Record-only: the advisory posture is unchanged,
+        // these events gate nothing.
+        for kind in
+            gate_results::gate_result_events(crate::gate::GateSurface::Approval, &gate_reports)
+        {
+            self.emit(kind)?;
+        }
 
         // Fold the contract lint into an operator-facing decision (M8 tier 1,
         // feature f-1-2): suspects (already pass on the untouched base) get a
         // headline distinct from the benign base-expected-to-fail case, but
         // either way this only informs — approval above already succeeded.
+        // The named gate verdicts (contract-validation-gates) ride the same
+        // decision: failed defect classes are named in the headline, and the
+        // full per-gate verdict block appends to the lint summary in the
+        // detail. The existing headline text is preserved verbatim so
+        // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
-            let headline = if suspect_count > 0 {
+            let mut headline = if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
@@ -1197,7 +1560,19 @@ impl MissionEngine {
                 "contract lint: all command assertions correctly fail on the untouched base"
                     .to_string()
             };
-            self.emit_decision(&headline, Some(contract_lint_report.summary()))?;
+            let failed_gates = contract_gates::failed_gate_names(&gate_reports);
+            if !failed_gates.is_empty() {
+                headline.push_str(&format!(
+                    "; named contract gate(s) failed: {}",
+                    failed_gates.join(", ")
+                ));
+            }
+            let detail = format!(
+                "{}\n\n{}",
+                contract_lint_report.summary(),
+                contract_gates::render_gate_verdicts(&gate_reports)
+            );
+            self.emit_decision(&headline, Some(detail))?;
         }
 
         Ok(())
@@ -1503,6 +1878,107 @@ impl MissionEngine {
         Ok(())
     }
 
+    /// Answer an open structured question (ticket
+    /// `structured-human-question-events`): append `question.answered`, which
+    /// the reducer cross-checks against the parked projection, removes from
+    /// it, and routes onto `pending_user_messages` — the answer reaches the
+    /// running mission through the EXISTING user-message consult (and the
+    /// blocked-milestone consult when blocked), never a new delivery
+    /// mechanism.
+    ///
+    /// The cross-checks mirror the grant approve/deny discipline, so a
+    /// stale, replayed, or mistyped answer can never land on a different
+    /// question than the operator saw:
+    /// - the id must name an OPEN question (a duplicate control file — the
+    ///   crash-between-emit-and-acknowledge window — errors here, is
+    ///   warn-logged, and is acknowledged away; unlike a duplicate grant
+    ///   decision it is narrated WITHOUT an orchestrator.decision, whose
+    ///   fold would wipe the just-queued answer off pending_user_messages);
+    /// - an option INDEX answer must be in range and its text must match the
+    ///   parked option verbatim (the surface resolved the index against the
+    ///   same projection);
+    /// - the answer text must be non-empty.
+    ///
+    /// The answer is scrubbed + capped at this write boundary: operator-typed
+    /// text can still carry a pasted token, and the log is corpus-exported.
+    fn answer_pending_question(
+        &mut self,
+        question_id: &str,
+        answer: &str,
+        option: Option<u32>,
+    ) -> Result<()> {
+        let pending = self
+            .state
+            .pending_questions
+            .iter()
+            .find(|q| q.question_id == question_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::InvalidState(format!("no open question '{question_id}' to answer"))
+            })?;
+        if answer.trim().is_empty() {
+            return Err(EngineError::InvalidState(
+                "question answer must not be empty".to_string(),
+            ));
+        }
+        if let Some(index) = option {
+            let expected = pending.options.get(index as usize).ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "question '{question_id}' has no option {index} (it offered {})",
+                    pending.options.len()
+                ))
+            })?;
+            if expected != answer {
+                return Err(EngineError::InvalidState(format!(
+                    "answer {answer:?} does not match option {index} ({expected:?}) of question '{question_id}'"
+                )));
+            }
+        }
+        self.emit(EventKind::QuestionAnswered {
+            question_id: question_id.to_string(),
+            answer: scrub::scrub_and_truncate(answer, ANSWER_TEXT_MAX),
+            via: "answer-question".to_string(),
+            option,
+        })?;
+        // NO success decision here (contrast the grant approve/deny paths):
+        // an `orchestrator.decision` fold CONSUMES `pending_user_messages`,
+        // which is exactly where the reducer just routed this answer — a
+        // decision emitted now would eat the answer (and any other queued
+        // operator message) before the consult can read it. The
+        // `question.answered` event itself is the audit record; the tail and
+        // both surfaces render it.
+        Ok(())
+    }
+
+    /// Clear every open question matching `scope` (emit `question.cleared`)
+    /// because it stopped being actionable — its milestone completed, or the
+    /// mission ended with the ask still open. Keeps the pending-decision
+    /// projection honest: a question whose decision is moot never lingers as
+    /// a "your move" the operator can no longer act on. (An abandoned mission
+    /// is the deliberate exception — the abandon path emits no events of its
+    /// own, mirroring how a parked grant request also outlives it in state;
+    /// every surface gates on an active mission.)
+    fn clear_open_questions(
+        &mut self,
+        why: &str,
+        scope: impl Fn(&PendingQuestion) -> bool,
+    ) -> Result<()> {
+        let ids: Vec<String> = self
+            .state
+            .pending_questions
+            .iter()
+            .filter(|q| scope(q))
+            .map(|q| q.question_id.clone())
+            .collect();
+        for question_id in ids {
+            self.emit(EventKind::QuestionCleared {
+                question_id,
+                why: why.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Park a `kind` grant for `target` (emit `GrantRequested`), returning
     /// `true`. Bounded by `grant_request_cap` per milestone: over the cap it
     /// emits an informational decision and returns `false` so the caller falls
@@ -1697,6 +2173,8 @@ impl MissionEngine {
             fit_note.as_deref(),
             calibration.missions_used,
             &no_lint,
+            &[],
+            &self.state.config.worker_candidates,
         );
         let revised_md_body = render_revised_plan_markdown(plan, &self.state.mission, &[], &[]);
         let research_md = self
@@ -1882,6 +2360,31 @@ impl MissionEngine {
             .cloned()
             .collect();
 
+        // Flight Rules (KRZ-342, D-E): a revision never re-pins — the
+        // approval-time pin stands for the mission's life (the reducer never
+        // folds a revision-carried manifest: no revision flow re-validates
+        // one against the trusted source, and the planner never authors
+        // policy). What THIS validation does is reject a stale or
+        // substituted carried manifest — resolved against the mission's
+        // pinned base — before any commit side effects below. No
+        // standards-configured pack ⇒ byte-identical.
+        let revision_base = self
+            .state
+            .mission
+            .base_sha
+            .clone()
+            .unwrap_or_else(|| self.state.mission.base_branch.clone());
+        let _standards_pin = crate::pack::resolution::approval_pin(
+            &self.repo,
+            &self.state.config,
+            &self.paths.repo_root,
+            &revision_base,
+            crate::ticket::parse_task_class_from_goal(&self.state.mission.goal).as_deref(),
+            plan.standards_manifest.as_deref(),
+            &plan.touch_set,
+        )
+        .map_err(EngineError::Config)?;
+
         // (4) Write + commit the human-reviewable revised plan (the engine
         // writes and commits — the orchestrator never touches files, like
         // approve_plan). Git first: a failure here leaves no event emitted, so
@@ -2047,6 +2550,32 @@ impl MissionEngine {
         let teardown_mode = crate::workspace_provider::teardown_mode(&self.state.config.workspace)?;
         self.workspace_provider = Some(Arc::clone(&provider));
 
+        // Pack contract (ticket pack-contract-gates-prompts): validate the
+        // configured pack BEFORE any side effects — an invalid pack fails
+        // closed here, at run start, the same backstop as provider
+        // resolution above, rather than silently degrading to pack-less
+        // behavior at the surfaces that consume it (the final gate, the
+        // role-prompt builders). No packDir ⇒ None ⇒ byte-identical run.
+        // The summary stays short (decision summaries are length-capped);
+        // the full registration list rides in the detail.
+        if let Some(pack) = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+            .map_err(EngineError::Config)?
+        {
+            self.emit_decision(
+                &format!(
+                    "pack contract: pack `{}` (schema {}) registered: {} gate(s), \
+                     {} prompt(s), {} checklist(s), {} artefact store(s)",
+                    pack.name,
+                    pack.schema,
+                    pack.gates.len(),
+                    pack.prompts.len(),
+                    pack.checklists.len(),
+                    pack.artefact_stores.len(),
+                ),
+                Some(pack.describe()),
+            )?;
+        }
+
         // Branch isolation: workers commit on the mission branch, never on
         // whatever branch the operator (or a previous mission/draft) left
         // checked out. Approval created and checked out the branch, but
@@ -2154,6 +2683,16 @@ impl MissionEngine {
             )
         };
         self.emit_decision(&summary, None)?;
+
+        // Routing rules ownership surface (ticket routing-rules-config): the
+        // rules are read from the live base branch at mission creation, so a
+        // mission-branch edit can never re-route THIS mission. Surface the
+        // attempt anyway — advisory, once per run, never a block.
+        self.surface_routing_rules_branch_edit()?;
+        // Flight Rules ownership surface (KRZ-342 D-E), same idiom: the
+        // approved pin governs this mission; a mission-branch or external
+        // pack edit is surfaced, never honored.
+        self.surface_standards_branch_edit()?;
 
         // WorkspaceProvider seam drive (design D-B/D-C; ticket
         // workspace-provider-seam): provider.provision → provider.readiness
@@ -2358,8 +2897,27 @@ impl MissionEngine {
                         })?;
                     }
                 }
+                ControlCommand::AnswerQuestion {
+                    question_id,
+                    answer,
+                    option,
+                } => {
+                    if let Err(e) = self.answer_pending_question(&question_id, &answer, option) {
+                        // Warn-log only — NEVER an orchestrator.decision on
+                        // this path (ticket answer-replay-wipes-queued-answer):
+                        // the decision fold consumes pending_user_messages,
+                        // and the common failure here IS the crash-replayed
+                        // duplicate of an answer whose question.answered just
+                        // routed onto that queue — narrating it with a
+                        // decision would wipe the queued answer before the
+                        // consult reads it. The success path skips the
+                        // decision for the same reason (see
+                        // answer_pending_question).
+                        tracing::warn!(error = %e, question_id, "question answer ignored");
+                    }
+                }
             }
-            std::fs::remove_file(&path)?;
+            control::acknowledge(&self.paths, &path)?;
         }
         Ok(())
     }
@@ -2402,7 +2960,7 @@ impl MissionEngine {
         let message = format!(
             "Milestone {milestone_id} is BLOCKED. The user sent:\n- {messages}\n\n\
              Decide how to proceed. Respond with ONLY this JSON:\n\
-             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"unblock-add-fix\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"validatorGuidance\":\"string (optional)\",\"fix\":{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}} (optional)}}\n\
+             {{\"action\":\"unblock-raise-cap\"|\"unblock-skip-findings\"|\"unblock-add-fix\"|\"skip-milestone\"|\"stay-blocked\",\"note\":\"string\",\"candidate\":null,\"validatorGuidance\":\"string (optional)\",\"fix\":{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}} (optional)}}\n\
              Use \"unblock-add-fix\" when validation fails for a mechanical reason a repair \
              worker should fix BEFORE re-validating (run cargo fmt, fix a doc/test lint) — \
              resuming validation unchanged would just fail again; include the fix object \
@@ -2410,14 +2968,19 @@ impl MissionEngine {
              verbatim instructions for the next validator session (e.g. \"run cargo fmt \
              before the gate\", \"the a3 grep pattern is the problem\") — it is folded into \
              mission state and injected into the next validator task and its retry, even \
-             across a process restart."
+             across a process restart. When the milestone is parked on a dispatch-pool \
+             judgement (the block reason names kranz/pool/* candidate branches) and the \
+             user names a winning candidate, set \"candidate\" to its zero-based stream \
+             index (the -c<i> branch suffix); leave it null when no candidate was chosen. \
+             This only RECORDS the judgement — the engine never merges a candidate."
         );
         let (decision, text) = self.json_decision::<UnblockDecision>(&message).await?;
         // Conservative default (documented): stay blocked.
-        let (action, note, validator_guidance, fix) = match decision {
+        let (action, note, candidate, validator_guidance, fix) = match decision {
             Some(d) => (
                 d.action.trim().to_ascii_lowercase(),
                 d.note,
+                d.candidate,
                 d.validator_guidance,
                 d.fix,
             ),
@@ -2426,12 +2989,18 @@ impl MissionEngine {
                 "unparseable unblock decision".to_string(),
                 None,
                 None,
+                None,
             ),
         };
         self.emit_decision(
             &format!("unblock decision for {milestone_id}: {action}"),
             Some(text.clone()),
         )?;
+
+        // Dispatch-pool resolution RECORD (KRZ-304): the judgement the pool
+        // parked for lands here, BEFORE the unblock it rides on, so the log
+        // reads record-then-move. Record-only — the match below is untouched.
+        self.record_pool_resolutions(mi, &action, &note, candidate)?;
 
         match action.as_str() {
             "unblock-raise-cap" | "unblock-skip-findings" => {
@@ -2491,6 +3060,14 @@ impl MissionEngine {
                         reason: "milestone skipped".to_string(),
                     })?;
                 }
+                // Structured human questions (ticket
+                // structured-human-question-events): asks scoped to this
+                // milestone are moot once it is skipped — clear them so the
+                // pending-decision projection never shows an unanswerable
+                // "your move".
+                self.clear_open_questions("milestone skipped", |q| {
+                    q.milestone_id.as_deref() == Some(milestone_id.as_str())
+                })?;
                 self.emit(EventKind::MilestoneCompleted {
                     milestone_id,
                     tag: None,
@@ -2501,14 +3078,212 @@ impl MissionEngine {
         }
     }
 
+    /// Dispatch-pool resolution RECORD (ticket `divergence-first-class-event`,
+    /// KRZ-304): the pool parks its unit's milestone for a human judgement
+    /// act (KRZ-303); this is where that judgement lands in the log. An
+    /// operator steer that NAMES a candidate (`candidate` on the unblock
+    /// decision) or that DISPOSES of the unit (skip-milestone) resolves it:
+    /// append one `divergence.resolved` per unresolved pool unit of this
+    /// milestone — which candidate (or none), why, decided by whom.
+    ///
+    /// RECORD ONLY: the resolution changes nothing about the mission's
+    /// course. The engine never merges a candidate (the KRZ-303 freeze),
+    /// an unblock-* action on a pool park simply re-parks via the
+    /// re-dispatch guard, and agreement between models is a signal to log,
+    /// never a criterion to trust — a unit is done when gates are green and
+    /// no escalation is open, not when its streams stopped disagreeing.
+    ///
+    /// FIRST JUDGEMENT WINS: at most one resolution per unit — the
+    /// reducer-folded `resolved_divergence_units` set is the durable memory
+    /// (restart-safe), so a re-blocked-then-re-steered unit never accrues a
+    /// second record; a changed mind after the record is a conversation
+    /// (user.message), not a resolution amendment. A bare unblock that
+    /// names no candidate and does not dispose of the unit records NOTHING
+    /// — the judgement has not arrived, and the park continues honestly.
+    fn record_pool_resolutions(
+        &mut self,
+        mi: usize,
+        action: &str,
+        note: &str,
+        candidate: Option<u32>,
+    ) -> Result<()> {
+        let disposes = action == "skip-milestone";
+        if candidate.is_none() && !disposes {
+            return Ok(());
+        }
+        let units: Vec<String> = self.state.mission.milestones[mi]
+            .features
+            .iter()
+            .map(|f| f.id.clone())
+            .filter(|id| !self.state.resolved_divergence_units.contains(id))
+            .filter(|id| {
+                self.state
+                    .runs
+                    .values()
+                    .any(|r| r.candidate.as_ref().is_some_and(|c| &c.unit == id))
+            })
+            .collect();
+        for unit in units {
+            let recorded: Vec<u32> = self
+                .state
+                .runs
+                .values()
+                .filter_map(|r| {
+                    r.candidate
+                        .as_ref()
+                        .filter(|c| c.unit == unit)
+                        .map(|c| c.index)
+                })
+                .collect();
+            let base_reason = if note.is_empty() { action } else { note };
+            // `selected` must name a stream that was actually recorded: an
+            // out-of-range index folds to None with the discrepancy named in
+            // the reason — the record never points at a candidate that does
+            // not exist (a resolution of "none" is honest; a phantom is not).
+            let (selected, reason) = match candidate {
+                Some(i) if recorded.contains(&i) => (Some(i), base_reason.to_string()),
+                Some(i) => (
+                    None,
+                    format!("{base_reason} (named candidate c{i} has no recorded stream)"),
+                ),
+                None => (None, base_reason.to_string()),
+            };
+            self.emit(EventKind::DivergenceResolved {
+                unit,
+                selected,
+                reason,
+                decided_by: "operator".to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Feature execution (f)
     // -----------------------------------------------------------------------
+
+    /// Worker self-escalation (ticket `backend-routing-abstraction`, KRZ-331):
+    /// when the finished worker's report carries an `escalation` reason,
+    /// record the request as a `worker.escalated` event naming the SOURCE
+    /// route (the executor capability class this session ran on, derived
+    /// from the routed config exactly like every other tier read) and the
+    /// TARGET route (the frontier advisor — `frontier`, the orchestrator
+    /// role's frontier-floor-enforced model/endpoint).
+    ///
+    /// Deliberately RECORD-ONLY: the event changes no state (the reducer
+    /// fold validates the run reference and nothing else), so the escalation
+    /// can never bypass the floor's validator requirements, flip the
+    /// executor tier, or spend the respawn budget. The advisor ACT already
+    /// exists — the judgement turn that every caller invokes immediately
+    /// after this helper reads the same report, escalation request included
+    /// — so the request is layered on top of the deterministic floor, never
+    /// a replacement for it, and no new session kind is invented here.
+    fn emit_worker_escalation(
+        &mut self,
+        feature_id: &str,
+        outcome: &runner::RunOutcome,
+    ) -> Result<()> {
+        let Some(report) = &outcome.report else {
+            return Ok(());
+        };
+        let Some(reason) = &report.escalation else {
+            return Ok(());
+        };
+        self.emit(EventKind::WorkerEscalated {
+            run_id: outcome.run_id.clone(),
+            feature_id: feature_id.to_string(),
+            from: self.state.executor_tier(),
+            to: ExecutorTier::Frontier,
+            reason: reason.clone(),
+        })?;
+        Ok(())
+    }
+
+    /// Structured human questions (ticket `structured-human-question-events`):
+    /// when the finished worker's report carries `questions` (the "ask the
+    /// human" tool payload — text plus structured choices), open each as a
+    /// `question.opened` event feeding the ONE pending-decision projection
+    /// the dashboard and Slack render beside grants (the D-X channel
+    /// unification: permission prompts stay on the grant flow, ticket
+    /// underspecification stays on NeedsContext, blocked prose stays valid —
+    /// this is never a parallel inbox for any of them).
+    ///
+    /// Deliberately NOT a park: opening a question gates nothing (contrast
+    /// `park_for_grant`). The worker's own `result` drives the mission's
+    /// course exactly as before — a worker that needs a human choice reports
+    /// partial/fail and the normal judgement/blocked flow carries on, with
+    /// the question riding alongside as structured context the operator can
+    /// answer through the existing control path (the answer then reaches the
+    /// mission via the user-message consult fold). A prose-only report (no
+    /// `questions` key) emits nothing, so backends without a structured ask
+    /// keep working byte-for-byte.
+    ///
+    /// Write discipline: the report text was credential-scrubbed at capture
+    /// (runner.rs `final_text`); each field is scrubbed + truncated AGAIN at
+    /// this write boundary (defense-in-depth, and the truncation cap only
+    /// applies here), question/options counts are capped, and the question
+    /// id is engine-minted from the folded `question_count` — never
+    /// model-supplied, so one report's id can never shadow another's.
+    fn emit_worker_questions(
+        &mut self,
+        milestone_id: &str,
+        feature_id: &str,
+        outcome: &runner::RunOutcome,
+    ) -> Result<()> {
+        let Some(report) = &outcome.report else {
+            return Ok(());
+        };
+        let Some(questions) = &report.questions else {
+            return Ok(());
+        };
+        for question in questions.iter().take(QUESTIONS_PER_REPORT_CAP) {
+            if question.text.trim().is_empty() {
+                continue;
+            }
+            // Minted from the CURRENT folded count; each emit below folds
+            // immediately and bumps it, so the next iteration's id is fresh.
+            let question_id = format!("q-{}", self.state.question_count + 1);
+            self.emit(EventKind::QuestionOpened {
+                question_id,
+                role: Role::Worker,
+                text: scrub::scrub_and_truncate(&question.text, QUESTION_TEXT_MAX),
+                options: question
+                    .options
+                    .iter()
+                    .take(QUESTION_OPTIONS_CAP)
+                    .map(|o| scrub::scrub_and_truncate(o, QUESTION_OPTION_MAX))
+                    .filter(|o| !o.trim().is_empty())
+                    .collect(),
+                run_id: Some(outcome.run_id.clone()),
+                feature_id: Some(feature_id.to_string()),
+                milestone_id: Some(milestone_id.to_string()),
+            })?;
+        }
+        let dropped = questions.len().saturating_sub(QUESTIONS_PER_REPORT_CAP);
+        if dropped > 0 {
+            self.emit_decision(
+                &format!(
+                    "worker report carried {dropped} question(s) beyond the {QUESTIONS_PER_REPORT_CAP}-question cap; only the first {QUESTIONS_PER_REPORT_CAP} were opened",
+                ),
+                None,
+            )?;
+        }
+        Ok(())
+    }
 
     /// Run one feature to a terminal state: worker run(s) with interrupt
     /// wiring, the §4.4 dirty-tree discipline, an orchestrator judgement turn,
     /// and the bounded respawn loop.
     async fn run_feature(&mut self, mi: usize, fi: usize) -> Result<()> {
+        // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+        // KRZ-303): with >= 2 configured `workerCandidates` the unit fans out
+        // to ALL of them concurrently and the mission parks for the human
+        // judgement act — a strictly opt-in fork of this method. An empty
+        // pool (or the validated-away 1-entry list) keeps the byte-for-byte
+        // sequential path below.
+        if self.state.config.worker_candidates.len() >= 2 {
+            return self.run_feature_dispatch_pool(mi, fi).await;
+        }
         if self.state.mission.milestones[mi].features[fi].status == FeatureStatus::Pending {
             let feature_id = self.state.mission.milestones[mi].features[fi].id.clone();
             self.emit(EventKind::FeatureStarted { feature_id })?;
@@ -2525,6 +3300,7 @@ impl MissionEngine {
             let grants = self.state.mission.command_grants.clone();
             let egress_grants = self.state.mission.egress_grants.clone();
             let deny_exceptions = self.state.mission.deny_exceptions.clone();
+            let touch_set = self.state.mission.touch_set.clone();
             let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
@@ -2555,6 +3331,12 @@ impl MissionEngine {
             // Worktree mode (M7 tier 1): the worker session's cwd is the
             // mission integration worktree, never the primary repo root.
             // Checkout mode keeps the exact `run_worker` call it always had.
+            // The seed-time route record rides every worker spawn (ticket
+            // routing-rules-config) — folded state, identical on resume.
+            let executor_route = self.state.mission.executor_route.clone();
+            // Flight Rules (KRZ-345): the approved standards pin projects
+            // the implementation-stage rules into the worker prompt.
+            let standards_pin = self.state.mission.standards_manifest.clone();
             let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
                 let session_cwd = self.active_root().to_path_buf();
                 runner::run_worker_in(
@@ -2573,6 +3355,9 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
+                    executor_route.clone(),
+                    standards_pin.as_ref(),
                 )
                 .await
             } else {
@@ -2591,6 +3376,9 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
+                    executor_route.clone(),
+                    standards_pin.as_ref(),
                 )
                 .await
             };
@@ -2604,6 +3392,35 @@ impl MissionEngine {
             // Interrupt (or any queued command) → events now, so the
             // judgement digest reflects them.
             self.drain_control().await?;
+
+            // Infrastructure failure, not worker quality (ticket
+            // worker-spawn-auth-failure-budget): a spawn that died in seconds
+            // on a backend auth/dead-binary signature never ran, so it must
+            // not burn the respawn budget or fail the feature. Park the
+            // milestone for operator re-auth with a distinct reason; the
+            // feature stays Active and re-runs on unblock.
+            if let Some(reauth) = spawn_auth_death(&outcome, selected_kind) {
+                let milestone_id = self.state.mission.milestones[mi].id.clone();
+                self.emit_decision(
+                    &format!(
+                        "worker spawn for {} died on a {} auth/dead-binary signature; parking \
+                         for operator re-auth instead of consuming the respawn budget",
+                        feature.id,
+                        selected_kind.as_str()
+                    ),
+                    None,
+                )?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason: format!(
+                        "backend {} unauthenticated — {reauth}; feature {} stays active and \
+                         re-runs on unblock",
+                        selected_kind.as_str(),
+                        feature.id
+                    ),
+                })?;
+                return Ok(());
+            }
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
             if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
@@ -2658,6 +3475,18 @@ impl MissionEngine {
                 }
             }
 
+            // Worker self-escalation (KRZ-331): record the worker's request
+            // for the frontier advisor BEFORE the judgement turn — the
+            // advisor act — consumes it from the same report.
+            self.emit_worker_escalation(&feature.id, &outcome)?;
+            // Structured human questions (ticket
+            // structured-human-question-events): open the report's "ask the
+            // human" payload into the pending-decision projection — also
+            // BEFORE the judgement turn, which reads the same report. Never
+            // a park: the outcome drives the flow below unchanged.
+            let milestone_id = self.state.mission.milestones[mi].id.clone();
+            self.emit_worker_questions(&milestone_id, &feature.id, &outcome)?;
+
             match self
                 .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
                 .await?
@@ -2673,6 +3502,10 @@ impl MissionEngine {
                     self.emit(EventKind::FeatureFailed {
                         feature_id: feature.id,
                         reason,
+                        // The worker's commits ARE on the mission branch
+                        // (sequential path) — recording them keeps the
+                        // supersession guard from treating this as commitless.
+                        commits,
                     })?;
                     return Ok(());
                 }
@@ -2689,11 +3522,556 @@ impl MissionEngine {
                     self.emit(EventKind::FeatureFailed {
                         feature_id: feature.id,
                         reason: "respawn budget exhausted".to_string(),
+                        commits,
                     })?;
                     return Ok(());
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (KRZ-303)
+    // -----------------------------------------------------------------------
+
+    /// Heterogeneous dispatch pool (ticket `heterogeneous-dispatch-pool`,
+    /// KRZ-303; the positioning ADR's 2026-07-31 boundary gloss): run ONE
+    /// unit of work (this feature) on all N configured `workerCandidates`
+    /// backends concurrently — one git worktree per stream, reusing the M3
+    /// wall-clock idiom — record every output as a SIBLING CANDIDATE tied to
+    /// the unit, then park the milestone for the human judgement act.
+    ///
+    /// The ticket's three freeze properties, enforced HERE (not just
+    /// documented):
+    ///
+    /// 1. CANDIDATES FOR JUDGEMENT, NEVER A WINNER. This path calls
+    ///    `judge_worker_run` NOWHERE and emits no `feature.completed`: there
+    ///    is no code path that selects, ranks, or merges a candidate. Every
+    ///    stream gets its own run record ([`CandidateLink`]ed to the unit and
+    ///    its sibling set) and its own branch
+    ///    (`kranz/pool/<mission>/<feature>-c<i>`, KEPT — the branches ARE the
+    ///    candidate deliverables the later judgement act inspects). The
+    ///    unit's milestone is then BLOCKED: without a judgement surface (the
+    ///    divergence follow-up ticket) the only honest terminal posture is to
+    ///    park for a human.
+    /// 2. DIVERGENCE FOR SCRUTINY, NEVER THROUGHPUT. The N streams all run
+    ///    the SAME unit; nothing here fans out distinct work to go faster,
+    ///    and a candidate whose backend is unavailable fails its own stream
+    ///    loudly ([`Self::select_pool_candidate`] has no claude fallback)
+    ///    rather than silently duplicating a sibling's backend.
+    /// 3. COST MULTIPLIER IN CONSENT. `cost::estimate` multiplies worker runs
+    ///    by N and plan.md's dispatch-pool section names N; each stream keeps
+    ///    the per-run `maxBudgetUsd` cap, so worst-case spend is N × cap and
+    ///    the approved estimate prices exactly that sum.
+    ///
+    /// Single-writer discipline mirrors the M3 batch: Phase A (serial,
+    /// engine-owned writer) emits `feature.started` and forks the worktrees;
+    /// Phase B (concurrent, no log access) runs the N sessions via a JoinSet,
+    /// each BUFFERING its event kinds; Phase C (serial, candidate order)
+    /// replays each stream's kinds through `emit`, stamping the
+    /// [`CandidateLink`] onto its `worker.spawned`.
+    ///
+    /// FAILURE ISOLATION: one stream failing (backend-unavailable selection
+    /// error, session spawn/run error, task panic) does NOT abort its
+    /// siblings — every stream's terminal state is recorded in the pool
+    /// decision's detail, and a run record exists for every stream that
+    /// started. A stream that never started gets NO synthetic run record
+    /// (fabricating one would be dishonest — no session, no transcript); its
+    /// terminal state lives in the decision detail.
+    ///
+    /// NO respawn loop and no dirty-tree orchestrator turn: the sequential
+    /// path's judgement-driven machinery is exactly the winner-selection the
+    /// freeze forbids here. Per-worktree dirty trees are checkpoint-committed
+    /// onto the candidate branch (M3 idiom) so every candidate's deliverable
+    /// is its branch HEAD; a secret-scan refusal is recorded in the decision
+    /// detail and that candidate's leftovers are discarded with its worktree.
+    ///
+    /// RE-DISPATCH GUARD: a feature that already has candidate-linked runs is
+    /// NEVER fanned out again silently (each dispatch is N paid sessions) —
+    /// the guard re-blocks the milestone with the same judgement-pending
+    /// reason, which is also the crash-resume posture (a half-recorded
+    /// candidate set parks instead of silently completing or re-running).
+    async fn run_feature_dispatch_pool(&mut self, mi: usize, fi: usize) -> Result<()> {
+        let feature = self.state.mission.milestones[mi].features[fi].clone();
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+
+        if feature.status == FeatureStatus::Pending {
+            self.emit(EventKind::FeatureStarted {
+                feature_id: feature.id.clone(),
+            })?;
+        }
+
+        // The re-dispatch guard. Checked against the DURABLE record (any run
+        // candidate-linked to this unit), so it holds across restarts.
+        let already_dispatched = self
+            .state
+            .runs
+            .values()
+            .any(|r| r.candidate.as_ref().is_some_and(|c| c.unit == feature.id));
+        if already_dispatched {
+            // Re-block only when the milestone is not already parked —
+            // re-emitting an identical milestone.blocked would just spam the
+            // log on every resume poll.
+            if self.state.mission.milestones[mi].status != MilestoneStatus::Blocked {
+                let reason = self.pool_judgement_block_reason(&feature.id);
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id,
+                    reason,
+                })?;
+            }
+            return Ok(());
+        }
+
+        let specs = self.state.config.worker_candidates.clone();
+        let mission_id = self.state.mission.id.clone();
+        let pre_run_sha = self.active_repo().head_sha()?;
+
+        // Per-candidate worktree layout, built up front so the cleanup guard
+        // sees every path even if a fork fails midway (M3 idiom).
+        let workspaces: Vec<PoolWorkspace> = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| PoolWorkspace {
+                branch: format!("kranz/pool/{mission_id}/{}-c{index}", feature.id),
+                path: pool_worktree_path(&self.paths.repo_root, &mission_id, &feature.id, index),
+                spec,
+            })
+            .collect();
+
+        // The fallible body is wrapped so the worktree-DIR cleanup runs on
+        // every exit — mirroring run_parallel_batch's cleanup guard, with one
+        // deliberate difference: candidate BRANCHES are never deleted by the
+        // engine. They ARE the recorded deliverables a judging human inspects
+        // (and a future judgement act consumes); resume()'s leak sweep
+        // deletes only the dirs for the same reason.
+        //
+        // `preserve` comes back from the inner body with the indices of
+        // candidates whose worktree could not even be INSPECTED (12th-pass
+        // review, P2): an inspection error must never be read as a clean
+        // tree and reaped with a possibly dirty deliverable inside, so the
+        // guard skips those dirs. (Their branches were never deletable
+        // anyway; resume()'s operator-initiated leak sweep still reaps by
+        // path shape — the failure record names the path while it survives.)
+        let mut preserve: Vec<usize> = Vec::new();
+        let pool_result = self
+            .run_dispatch_pool_inner(mi, &feature, &pre_run_sha, &workspaces, &mut preserve)
+            .await;
+
+        for (idx, ws) in workspaces.iter().enumerate() {
+            if preserve.contains(&idx) {
+                continue;
+            }
+            if let Err(e) = self.repo.remove_worktree(&ws.path) {
+                tracing::warn!(path = %ws.path.display(), error = %e, "pool worktree cleanup failed");
+            }
+        }
+        if let Err(e) = self.repo.prune_worktrees() {
+            tracing::warn!(error = %e, "pool worktree prune failed");
+        }
+
+        pool_result
+    }
+
+    /// The `milestone.blocked` reason a dispatch-pool unit parks with
+    /// (KRZ-303): names the unit, the recorded candidate count against N, and
+    /// WHY the mission stops here — selection is a human judgement act (the
+    /// divergence follow-up surfaces it); the engine never picks a winner.
+    fn pool_judgement_block_reason(&self, feature_id: &str) -> String {
+        let recorded = self
+            .state
+            .runs
+            .values()
+            .filter(|r| r.candidate.as_ref().is_some_and(|c| c.unit == feature_id))
+            .count();
+        let n = self.state.config.worker_candidates.len();
+        format!(
+            "dispatch pool: {recorded}/{n} candidate stream(s) recorded for unit {feature_id}; \
+             every output is a candidate for judgement — the engine never selects or merges a \
+             winner (KRZ-303), and the judgement surface lands with the divergence follow-up \
+             ticket. Inspect the candidate branches (kranz/pool/*); to proceed without \
+             judging, skip the milestone."
+        )
+    }
+
+    /// Append the unit's divergence/agreement record (ticket
+    /// `divergence-first-class-event`, KRZ-304): compare every RECORDED
+    /// candidate stream's branch tree and emit one `divergence.noted`
+    /// naming the unit and the candidates (run id + branch + backend +
+    /// tree hash) with the verdict. Called from the pool dispatch after
+    /// every stream's checkpoint commit, so each branch HEAD IS the
+    /// candidate deliverable the hash pins.
+    ///
+    /// **Agreement between models is a signal to log, never a criterion to
+    /// trust.** Identical trees emit the same kind with `diverged: false`
+    /// and change NOTHING about the mission's course — the milestone parks
+    /// for judgement either way, no gate is consulted or skipped on the
+    /// verdict, and a unit is done when gates are green and no escalation
+    /// is open, not when streams stop disagreeing.
+    ///
+    /// Only candidates with a run record AND a successful Phase C
+    /// inspection (`inspected`) are compared: a stream that never started
+    /// has no candidate diff, and a candidate whose worktree inspection
+    /// FAILED (the failed-and-preserved posture) still has a run record but
+    /// its branch carries rejected/untouched bytes — counting either would
+    /// fabricate agreement (or divergence) out of a failure (13th-pass
+    /// review, P2: eligibility was previously inferred from the run record
+    /// alone). The pool decision's detail names failed streams verbatim
+    /// instead. With fewer than two eligible candidates there is nothing to
+    /// compare and NO event is appended (a one-stream "agreement" would be
+    /// vacuous). The crash-resume re-dispatch guard never calls here: a
+    /// half-recorded candidate set parks without a comparison rather than
+    /// fabricating one from incomplete streams.
+    fn emit_pool_divergence_record(
+        &mut self,
+        feature: &Feature,
+        workspaces: &[PoolWorkspace],
+        inspected: &[usize],
+    ) -> Result<()> {
+        let mut candidates: Vec<DivergenceCandidate> = Vec::new();
+        for (index, ws) in workspaces.iter().enumerate() {
+            if !inspected.contains(&index) {
+                continue;
+            }
+            let run = self.state.runs.values().find(|r| {
+                r.candidate
+                    .as_ref()
+                    .is_some_and(|c| c.unit == feature.id && c.index == index as u32)
+            });
+            let Some(run) = run else { continue };
+            // Read-only probe on the shared refs (worktree isolation
+            // untouched): the tree hash anchors the verdict to exact bytes.
+            let tree = self.repo.rev_parse(&format!("{}^{{tree}}", ws.branch))?;
+            candidates.push(DivergenceCandidate {
+                run_id: run.id.clone(),
+                branch: ws.branch.clone(),
+                backend: ws.spec.backend.clone(),
+                tree,
+            });
+        }
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+        let diverged = candidates.iter().any(|c| c.tree != candidates[0].tree);
+        self.emit(EventKind::DivergenceNoted {
+            unit: feature.id.clone(),
+            candidates,
+            diverged,
+        })?;
+        Ok(())
+    }
+
+    /// Fallible body of [`Self::run_feature_dispatch_pool`] (the caller's
+    /// worktree-dir cleanup guard runs regardless of how this returns).
+    ///
+    /// `preserve` collects the indices of candidates whose worktree inspection
+    /// failed at the Phase C checkpoint (12th-pass review, P2): the caller's
+    /// cleanup guard skips reaping those dirs so the unverified bytes survive
+    /// for human inspection. Populated as the failures happen, so even a
+    /// later `?` return cannot lose a preservation decision already made.
+    async fn run_dispatch_pool_inner(
+        &mut self,
+        mi: usize,
+        feature: &Feature,
+        pre_run_sha: &str,
+        workspaces: &[PoolWorkspace],
+        preserve: &mut Vec<usize>,
+    ) -> Result<()> {
+        let milestone_id = self.state.mission.milestones[mi].id.clone();
+        let n = workspaces.len();
+
+        // --- Phase A (serial, single-writer): fork every candidate worktree
+        // off the mission branch tip. `feature.started` was already emitted by
+        // the caller before the re-dispatch guard.
+        for ws in workspaces {
+            self.repo.add_worktree(&ws.path, &ws.branch, pre_run_sha)?;
+        }
+
+        // Resolve every candidate's backend BEFORE spawning: a candidate
+        // whose backend cannot be constructed becomes a recorded stream
+        // failure — never a batch abort, and NEVER a silent claude fallback
+        // (a same-backend duplicate would fake the diversity that is the
+        // pool's entire point).
+        let mut selected: Vec<Option<SelectedBackend>> = Vec::with_capacity(n);
+        let mut stream_errors: Vec<Option<String>> = (0..n).map(|_| None).collect();
+        for (idx, ws) in workspaces.iter().enumerate() {
+            match self.select_pool_candidate(&ws.spec) {
+                Ok(selection) => selected.push(Some(selection)),
+                Err(e) => {
+                    stream_errors[idx] = Some(e.to_string());
+                    selected.push(None);
+                }
+            }
+        }
+
+        // The claude auth probe is once-per-mission and meaningful only for
+        // the claude backend; compute it BEFORE any concurrent task spawns
+        // when ANY selected candidate is claude-backed (mirrors the M3
+        // batch's pre-spawn probe), then hand it to claude streams only.
+        let any_claude = selected
+            .iter()
+            .flatten()
+            .any(|s| s.kind == BackendKind::Claude);
+        let auth_verdict = if any_claude {
+            self.worker_auth_verdict().await
+        } else {
+            AuthVerdict::Inconclusive
+        };
+
+        // --- Phase B (CONCURRENT, no log access): run every stream at once.
+        // Mirrors the M3 batch: each task buffers its kinds and returns them
+        // with its RunOutcome; nothing touches the shared log. The tracker
+        // records the wall-clock overlap for the pool decision (and tests).
+        let goal = self.state.mission.goal.clone();
+        let milestone_title = self.state.mission.milestones[mi].title.clone();
+        let base_sha = self.state.mission.base_sha.clone();
+        let grants = self.state.mission.command_grants.clone();
+        let egress_grants = self.state.mission.egress_grants.clone();
+        let deny_exceptions = self.state.mission.deny_exceptions.clone();
+        let touch_set = self.state.mission.touch_set.clone();
+        // Flight Rules (KRZ-345): the approved standards pin projects the
+        // implementation-stage rules into each worker prompt.
+        let standards_pin = self.state.mission.standards_manifest.clone();
+        let tracker = ConcurrencyTracker::new();
+
+        let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
+        for (idx, ws) in workspaces.iter().enumerate() {
+            let Some(selection) = selected[idx].take() else {
+                continue; // selection error already recorded for this stream
+            };
+            let verdict = if selection.kind == BackendKind::Claude {
+                auth_verdict
+            } else {
+                AuthVerdict::Inconclusive
+            };
+            let backend = selection.backend;
+            let cfg = selection.cfg;
+            let paths = self.paths.clone();
+            let feature = feature.clone();
+            let goal = goal.clone();
+            let milestone_title = milestone_title.clone();
+            let ws_path = ws.path.clone();
+            let guard = tracker.clone();
+            let base_sha = base_sha.clone();
+            let grants = grants.clone();
+            let egress_grants = egress_grants.clone();
+            let deny_exceptions = deny_exceptions.clone();
+            let touch_set = touch_set.clone();
+            let standards_pin = standards_pin.clone();
+            let executor_route = self.state.mission.executor_route.clone();
+            set.spawn(async move {
+                let _live = guard.enter(); // count this session as live
+                let result = runner::run_worker_in_buffered(
+                    backend.as_ref(),
+                    &paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    None,
+                    &ws_path,
+                    base_sha.as_deref(),
+                    &grants,
+                    &egress_grants,
+                    &deny_exceptions,
+                    verdict,
+                    &touch_set,
+                    executor_route,
+                    standards_pin.as_ref(),
+                )
+                .await;
+                (idx, result)
+            });
+        }
+
+        // Collect per-stream results keyed by candidate index. UNLIKE the M3
+        // batch there is no batch-level error: one stream's failure is
+        // recorded against that stream and the survivors still replay — a
+        // failed candidate must never abort its siblings (KRZ-303).
+        let mut buffered: Vec<Option<(Vec<EventKind>, runner::RunOutcome)>> =
+            (0..n).map(|_| None).collect();
+        let mut panic_note: Option<String> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((idx, Ok(result))) => buffered[idx] = Some(result),
+                Ok((idx, Err(e))) => stream_errors[idx] = Some(e.to_string()),
+                Err(e) => {
+                    panic_note = panic_note.or(Some(format!("pool worker task panicked: {e}")));
+                }
+            }
+        }
+        // A panicked task carries no index; any stream that produced neither
+        // a result nor an error was spawned but never returned (selection
+        // errors already populated `stream_errors`), so the panic becomes
+        // its recorded terminal state.
+        for (idx, slot) in stream_errors.iter_mut().enumerate() {
+            if buffered[idx].is_none() && slot.is_none() {
+                *slot = Some(
+                    panic_note
+                        .clone()
+                        .unwrap_or_else(|| "stream ended without a result".to_string()),
+                );
+            }
+        }
+        let peak = tracker.peak();
+
+        // --- Phase C (serial, single-writer, candidate order): replay each
+        // stream's buffered kinds — stamping the sibling linkage onto its
+        // worker.spawned — then checkpoint-commit its worktree so the
+        // candidate branch HEAD is the deliverable.
+        let mut lines: Vec<String> = Vec::with_capacity(n);
+        // The indices whose Phase C inspection SUCCEEDED (13th-pass review,
+        // P2): the divergence comparison below must compare only VERIFIED
+        // candidate bytes — a failed-and-preserved candidate still has a run
+        // record, but its branch carries rejected/untouched bytes, and
+        // comparing those would fabricate an agreement (or divergence) out
+        // of an inspection failure.
+        let mut inspected: Vec<usize> = Vec::with_capacity(n);
+        for (idx, ws) in workspaces.iter().enumerate() {
+            match buffered[idx].take() {
+                Some((events, outcome)) => {
+                    let link = CandidateLink {
+                        unit: feature.id.clone(),
+                        index: idx as u32,
+                        count: n as u32,
+                        backend: ws.spec.backend.clone(),
+                    };
+                    for mut kind in events {
+                        if let EventKind::WorkerSpawned { candidate, .. } = &mut kind {
+                            *candidate = Some(link.clone());
+                        }
+                        self.emit(kind)?;
+                    }
+                    self.log.flush()?;
+
+                    // Checkpoint any stream output on the candidate branch (in
+                    // its worktree), exactly the M3 worktree idiom: a dirty
+                    // deliverable is committed here rather than run through
+                    // the sequential dirty-tree turn; a secret-scan refusal is
+                    // recorded (never silently dropped) and the leftovers go
+                    // away with the worktree dir.
+                    //
+                    // The worktree is HOSTILE (12th-pass review, P1): the
+                    // stream that just ran in it could plant `core.fsmonitor`,
+                    // `core.hooksPath`, or a hook in its git metadata, which
+                    // the checkpoint's own status/commit would then EXECUTE
+                    // with the engine's ambient privileges. The handle runs
+                    // hooks/fsmonitor-disabled — the same countermeasure the
+                    // validator-fingerprint and gated-merge paths use
+                    // (`GitRepo::with_hooks_disabled`).
+                    //
+                    // And inspection is LOAD-BEARING (12th-pass, P2): an
+                    // inspection ERROR must never be read as "clean" or "0
+                    // commits" — that reaped the worktree with a possibly
+                    // dirty deliverable inside. Any failure to open, inspect,
+                    // or query the worktree fails the candidate honestly —
+                    // recorded exactly where stream failures are recorded —
+                    // and PRESERVES its worktree dir + branch (the cleanup
+                    // guard skips the index), so the bytes survive for a
+                    // human. Only a COMMIT-time failure stays a dispatch
+                    // error (`?`): the tree was inspectable by then, so that
+                    // is a real git failure, not hostile metadata.
+                    let inspection: Result<(GitRepo, bool)> = (|| {
+                        let wt_repo = GitRepo::open(&ws.path)?.with_hooks_disabled()?;
+                        wt_repo.ensure_identity()?;
+                        let clean = wt_repo.is_clean()?;
+                        Ok((wt_repo, clean))
+                    })();
+                    let (wt_repo, clean) = match inspection {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            preserve.push(idx);
+                            lines.push(pool_inspection_failure_line(idx, n, ws, &error));
+                            continue;
+                        }
+                    };
+                    let mut note = String::new();
+                    if !clean {
+                        match wt_repo.commit_dirty_paths(
+                            &contract_sweep::pool_checkpoint_commit_message(&feature.id, idx),
+                        )? {
+                            crate::git_ops::CheckpointOutcome::Committed(_) => {}
+                            crate::git_ops::CheckpointOutcome::RefusedBySecretScan { detail } => {
+                                note = format!(
+                                    "; dirty-tree checkpoint refused by secret scan ({detail})"
+                                );
+                            }
+                        }
+                    }
+                    let commits = match wt_repo.commits_between(pre_run_sha, "HEAD") {
+                        Ok(commits) => commits.len(),
+                        Err(error) => {
+                            preserve.push(idx);
+                            lines.push(pool_inspection_failure_line(idx, n, ws, &error));
+                            continue;
+                        }
+                    };
+                    lines.push(format!(
+                        "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — run {:?}, {} commit(s){}",
+                        n - 1,
+                        ws.spec.backend,
+                        ws.spec.model,
+                        ws.branch,
+                        outcome.result,
+                        commits,
+                        note
+                    ));
+                    // Inspection succeeded end to end (open, identify,
+                    // status, commit query): this candidate's bytes are
+                    // verified and it MAY join the divergence comparison.
+                    inspected.push(idx);
+                }
+                None => {
+                    let err = stream_errors[idx]
+                        .clone()
+                        .unwrap_or_else(|| "stream produced no run record".to_string());
+                    lines.push(format!(
+                        "- candidate {idx}/{}: `{}` / `{}` — stream failed, no run record: {err}",
+                        n - 1,
+                        ws.spec.backend,
+                        ws.spec.model
+                    ));
+                }
+            }
+        }
+
+        // The divergence/agreement record (KRZ-304): emitted while every
+        // inspected candidate branch HEAD is final (checkpoints committed
+        // above) and BEFORE the park, so the judgement the milestone waits
+        // on has a first-class handle. Only successfully inspected
+        // candidates participate (13th-pass, P2). Record-only — the park
+        // below is unchanged whether the streams diverged or agreed.
+        self.emit_pool_divergence_record(feature, workspaces, &inspected)?;
+
+        // One first-class decision record for the dispatch: the candidate
+        // table AND the freeze statements, so the replayed history shows what
+        // was produced and why nothing was picked. The N and peak numbers in
+        // the summary let tests assert the fan-out and the overlap.
+        self.emit_decision(
+            &format!(
+                "dispatch pool: unit {} fanned out to {n} candidates (peak {peak} concurrent) \
+                 — candidates for judgement, no winner selected",
+                feature.id
+            ),
+            Some(format!(
+                "Heterogeneous dispatch (KRZ-303): unit `{}` ran on {n} backends concurrently, \
+                 one worktree per stream. Every output below is a CANDIDATE FOR JUDGEMENT tied \
+                 to the unit — the engine never selects, ranks, or merges a winner; selection \
+                 is the human judgement act the divergence follow-up surfaces. The claimed \
+                 value is divergence for scrutiny, not throughput. Cost: the approved estimate \
+                 priced all {n} streams (the per-mission budget applies to the sum).\n\n{}",
+                feature.id,
+                lines.join("\n")
+            )),
+        )?;
+
+        // Park the milestone for the human judgement act (freeze property 1:
+        // no code path completes the unit from a candidate).
+        let reason = self.pool_judgement_block_reason(&feature.id);
+        self.emit(EventKind::MilestoneBlocked {
+            milestone_id,
+            reason,
+        })?;
+        Ok(())
     }
 
     /// Dirty tree after a worker run: ask the orchestrator (JSON), defaulting
@@ -2731,6 +4109,7 @@ impl MissionEngine {
                 } else {
                     note
                 },
+                commits: Vec::new(), // dirty tree: nothing reached the branch
             })?;
             return Ok(false);
         }
@@ -2754,6 +4133,7 @@ impl MissionEngine {
                 self.emit(EventKind::FeatureFailed {
                     feature_id: feature_id.to_string(),
                     reason: format!("dirty-tree checkpoint refused by secret scan: {detail}"),
+                    commits: Vec::new(), // nothing staged or committed
                 })?;
                 // Then BLOCK the milestone: the refused content is still
                 // sitting uncommitted in the SHARED sequential working tree
@@ -2984,14 +4364,28 @@ impl MissionEngine {
         // The whole batch is wrapped so we can ALWAYS clean up worktrees, even
         // on an error return. `batch_result` carries the fallible body's error
         // to re-raise after cleanup.
+        //
+        // `preserve` comes back from the inner body with the indices of
+        // features whose worktree could not even be INSPECTED at the Phase C
+        // checkpoint (12th-pass review, P2): an inspection error must never
+        // be read as a clean tree and reaped with a possibly dirty
+        // deliverable inside, so the guard skips BOTH the worktree dir and
+        // its branch for those. (resume()'s operator-initiated crash sweep
+        // still reaps by path shape — the failure record names the path
+        // while it survives.)
+        let mut preserve: Vec<usize> = Vec::new();
         let batch_result = self
-            .run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces)
+            .run_parallel_batch_inner(mi, &start_sha, &mission_branch, &workspaces, &mut preserve)
             .await;
 
-        // Cleanup guard: remove every worktree + branch we created. Best-effort
+        // Cleanup guard: remove every worktree + branch we created, except
+        // the preserved inspection failures. Best-effort
         // and idempotent (remove_worktree/delete_branch_force tolerate absence);
         // a cleanup failure is logged, never allowed to mask the batch outcome.
-        for ws in &workspaces {
+        for (idx, ws) in workspaces.iter().enumerate() {
+            if preserve.contains(&idx) {
+                continue;
+            }
             if let Err(e) = self.repo.remove_worktree(&ws.path) {
                 tracing::warn!(path = %ws.path.display(), error = %e, "worktree cleanup failed");
             }
@@ -3081,12 +4475,18 @@ impl MissionEngine {
     /// path recovers from (any half-emitted feature is re-forked, its stale
     /// worktree/branch swept). This is gated behind `max_parallel_workers > 1`;
     /// the sequential path never reaches here.
+    ///
+    /// `preserve` collects the indices of workspaces whose Phase C checkpoint
+    /// found the worktree UNINSPECTABLE (12th-pass review, P2): the caller's
+    /// cleanup guard skips reaping those worktree dirs and branches so the
+    /// unverified bytes survive for human inspection.
     async fn run_parallel_batch_inner(
         &mut self,
         mi: usize,
         start_sha: &str,
         mission_branch: &str,
         workspaces: &[ParallelWorkspace],
+        preserve: &mut Vec<usize>,
     ) -> Result<()> {
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         let mut merged_ok: usize = 0;
@@ -3121,6 +4521,10 @@ impl MissionEngine {
         let grants = self.state.mission.command_grants.clone();
         let egress_grants = self.state.mission.egress_grants.clone();
         let deny_exceptions = self.state.mission.deny_exceptions.clone();
+        let touch_set = self.state.mission.touch_set.clone();
+        // Flight Rules (KRZ-345): the approved standards pin projects the
+        // implementation-stage rules into each worker prompt.
+        let standards_pin = self.state.mission.standards_manifest.clone();
         let tracker = ConcurrencyTracker::new();
         let selected = self.select_backend(Role::Worker);
         if let Some(reason) = selected.fallback_reason.as_deref() {
@@ -3154,6 +4558,9 @@ impl MissionEngine {
             let grants = grants.clone();
             let egress_grants = egress_grants.clone();
             let deny_exceptions = deny_exceptions.clone();
+            let touch_set = touch_set.clone();
+            let standards_pin = standards_pin.clone();
+            let executor_route = self.state.mission.executor_route.clone();
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
                 let result = runner::run_worker_in_buffered(
@@ -3170,6 +4577,9 @@ impl MissionEngine {
                     &egress_grants,
                     &deny_exceptions,
                     auth_verdict,
+                    &touch_set,
+                    executor_route,
+                    standards_pin.as_ref(),
                 )
                 .await;
                 (idx, result)
@@ -3204,15 +4614,20 @@ impl MissionEngine {
         // --- Phase C (serial, single-writer, DECLARED merge order) -----------
         // Replay each worker's buffered kinds through the engine's own writer,
         // then judge + commit + merge exactly as the sequential-merge code did.
-        let mut worker_ok: Vec<bool> = Vec::with_capacity(workspaces.len());
+        let mut worker_ok: Vec<WorktreeDisposition> = Vec::with_capacity(workspaces.len());
         for (idx, ws) in workspaces.iter().enumerate() {
             let (events, outcome) = buffered[idx]
                 .take()
                 .expect("every non-errored workspace has a buffered result");
-            let ok = self
-                .append_and_judge_worktree(ws, start_sha, events, &outcome)
+            let disposition = self
+                .append_and_judge_worktree(ws, &milestone_id, start_sha, events, &outcome)
                 .await?;
-            worker_ok.push(ok);
+            // An uninspectable worktree keeps its bytes (12th-pass review,
+            // P2): the caller's cleanup guard skips its dir AND branch.
+            if matches!(disposition, WorktreeDisposition::InspectionFailed) {
+                preserve.push(idx);
+            }
+            worker_ok.push(disposition);
         }
 
         // (2) Merge the per-feature branches into the mission branch in the
@@ -3220,14 +4635,34 @@ impl MissionEngine {
         // conflict (aborted, clean tree) → feature.failed PLUS a resolution
         // fix-feature (below); a worker that failed in its worktree →
         // feature.failed without attempting a merge.
-        for (ws, ok) in workspaces.iter().zip(&worker_ok) {
+        for (ws, disposition) in workspaces.iter().zip(&worker_ok) {
             let feature_id = ws.feature_id.clone();
-            if !ok {
-                self.emit(EventKind::FeatureFailed {
-                    feature_id,
-                    reason: "worker run did not complete in its parallel worktree".to_string(),
-                })?;
-                continue;
+            match disposition {
+                WorktreeDisposition::Ready => {}
+                WorktreeDisposition::NotReady => {
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: "worker run did not complete in its parallel worktree".to_string(),
+                        commits: Vec::new(), // worktree branch never merged
+                    })?;
+                    continue;
+                }
+                WorktreeDisposition::InspectionFailed => {
+                    // Named separately from a plain worker failure: the bytes
+                    // were never verified, and they SURVIVE (the cleanup
+                    // guard skips this worktree + branch) so a human can
+                    // inspect what the engine could not (12th-pass review).
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: format!(
+                            "worktree inspection failed after the run; worktree and branch {} \
+                             are preserved for inspection (see the checkpoint decision record)",
+                            ws.branch
+                        ),
+                        commits: Vec::new(), // worktree branch never merged
+                    })?;
+                    continue;
+                }
             }
             let pre_merge_sha = self.active_repo().head_sha()?;
             match self.active_repo().merge_no_ff(&ws.branch)? {
@@ -3269,6 +4704,7 @@ impl MissionEngine {
                              the merged branch",
                             ws.branch
                         ),
+                        commits: Vec::new(), // conflicting worktree branch discarded
                     })?;
                     // … and ALSO synthesize a conflict-resolution fix-feature
                     // on the SAME (still-Active) milestone so the milestone can
@@ -3326,6 +4762,7 @@ impl MissionEngine {
                              before it started: {detail}",
                             ws.branch
                         ),
+                        commits: Vec::new(), // merge never started
                     })?;
                 }
             }
@@ -3353,15 +4790,17 @@ impl MissionEngine {
 
     /// Phase C for one feature (roadmap M3): append the worker's BUFFERED event
     /// kinds through the engine's single-writer `emit`, checkpoint-commit its
-    /// worktree, and judge the run. Returns `true` when the work is ready to
-    /// merge, `false` when it should be failed.
+    /// worktree, and judge the run. Returns [`WorktreeDisposition::Ready`] when
+    /// the work is ready to merge; any other variant fails the feature (and
+    /// `InspectionFailed` additionally preserves the worktree + branch).
     ///
     /// `buffered` is exactly the `worker.spawned` / `worker.message` /
     /// `worker.completed` kinds `run_worker_in_buffered` collected while the
-    /// session ran concurrently in Phase B — replaying them here, serially,
-    /// through `emit` is what keeps events.jsonl single-writer with contiguous
-    /// seq even though the sessions overlapped. `feature.started` was already
-    /// emitted in Phase A.
+    /// session ran concurrently in Phase B (plus any `hook.gate.fired`
+    /// records folded at session end, KRZ-302) — replaying them here,
+    /// serially, through `emit` is what keeps events.jsonl single-writer
+    /// with contiguous seq even though the sessions overlapped.
+    /// `feature.started` was already emitted in Phase A.
     ///
     /// Deliberately does NOT respawn: the parallel batch is best-effort per the
     /// honest subset. A non-complete judgement fails the feature (its branch is
@@ -3370,10 +4809,11 @@ impl MissionEngine {
     async fn append_and_judge_worktree(
         &mut self,
         ws: &ParallelWorkspace,
+        milestone_id: &str,
         start_sha: &str,
         buffered: Vec<EventKind>,
         outcome: &runner::RunOutcome,
-    ) -> Result<bool> {
+    ) -> Result<WorktreeDisposition> {
         // Replay the buffered run kinds through the engine's own single writer,
         // in the order the session produced them. `emit` folds each into state
         // (worker.spawned → the run is registered on the feature, etc.), so no
@@ -3385,8 +4825,29 @@ impl MissionEngine {
         self.log.flush()?;
 
         // A GitRepo rooted at the worktree, for its own dirty-tree/commit ops.
-        let wt_repo = GitRepo::open(&ws.path)?;
-        wt_repo.ensure_identity()?;
+        // The worktree is HOSTILE (12th-pass review, P1): the worker that ran
+        // in it could plant `core.fsmonitor`, `core.hooksPath`, or a hook in
+        // its git metadata, which the checkpoint's own status/commit would
+        // then EXECUTE with the engine's ambient privileges. The handle runs
+        // hooks/fsmonitor-disabled — the same countermeasure the
+        // validator-fingerprint and gated-merge paths use
+        // (`GitRepo::with_hooks_disabled`).
+        //
+        // Inspection is LOAD-BEARING (12th-pass, P2): an inspection ERROR
+        // must never be read as "clean" (the old `unwrap_or(true)`) or "0
+        // commits" (`unwrap_or_default()`) — the cleanup guard would then
+        // reap the worktree with a possibly dirty deliverable inside. Any
+        // failure to open, identify, inspect, or query the worktree fails the
+        // feature honestly and PRESERVES its bytes. Only a COMMIT-time
+        // failure stays a batch error (`?`): the tree was inspectable by
+        // then, so that is a real git failure, not hostile metadata.
+        let wt_repo = match GitRepo::open(&ws.path).and_then(|repo| repo.with_hooks_disabled()) {
+            Ok(repo) => repo,
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
+        if let Err(error) = wt_repo.ensure_identity() {
+            return self.record_uninspectable_worktree(ws, &error);
+        }
 
         // Commit any worker output on the per-feature branch (in the worktree)
         // so the merge carries it. The worker session's own commits (if any)
@@ -3394,9 +4855,14 @@ impl MissionEngine {
         // here rather than run through the sequential dirty-tree turn — the
         // parallel subset keeps its worktree self-contained. A real git
         // failure `?`-aborts the batch (the caller's cleanup guard still
-        // reaps every worktree); a secret-scan refusal is recorded below, so
-        // dirty deliverables are never silently dropped before judgement.
-        if !wt_repo.is_clean().unwrap_or(true) {
+        // reaps every non-preserved worktree); a secret-scan refusal is
+        // recorded below, so dirty deliverables are never silently dropped
+        // before judgement.
+        let clean = match wt_repo.is_clean() {
+            Ok(clean) => clean,
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
+        if !clean {
             match wt_repo.commit_dirty_paths(
                 &contract_sweep::parallel_checkpoint_commit_message(&ws.feature_id),
             )? {
@@ -3414,29 +4880,63 @@ impl MissionEngine {
                         ),
                         Some(detail),
                     )?;
-                    return Ok(false);
+                    return Ok(WorktreeDisposition::NotReady);
                 }
             }
         }
 
         // Judge the run against the worktree's own commit range (start_sha..HEAD
         // in the worktree — the branch was forked at start_sha).
-        let commits: Vec<String> = wt_repo
-            .commits_between(start_sha, "HEAD")
-            .unwrap_or_default()
-            .iter()
-            .map(|c| format!("{} {}", c.sha, c.subject))
-            .collect();
+        let commits: Vec<String> = match wt_repo.commits_between(start_sha, "HEAD") {
+            Ok(commits) => commits
+                .iter()
+                .map(|c| format!("{} {}", c.sha, c.subject))
+                .collect(),
+            Err(error) => return self.record_uninspectable_worktree(ws, &error),
+        };
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
+        // Worker self-escalation (KRZ-331): same record-only emission as the
+        // sequential path, before the judgement turn consumes the report.
+        self.emit_worker_escalation(&ws.feature_id, outcome)?;
+        // Structured human questions (ticket
+        // structured-human-question-events): same projection open as the
+        // sequential path — never a park.
+        self.emit_worker_questions(milestone_id, &ws.feature_id, outcome)?;
         match self
             .judge_worker_run(&ws.feature_id, outcome, &commits, &diff_stat)
             .await?
         {
-            JudgementOutcome::Complete => Ok(true),
+            JudgementOutcome::Complete => Ok(WorktreeDisposition::Ready),
             // Respawn/Failed both mean "not ready to merge" in the parallel
             // subset (no respawn here); the feature is failed by the caller.
-            JudgementOutcome::Failed(_) | JudgementOutcome::Respawn(_) => Ok(false),
+            JudgementOutcome::Failed(_) | JudgementOutcome::Respawn(_) => {
+                Ok(WorktreeDisposition::NotReady)
+            }
         }
+    }
+
+    /// Record an uninspectable parallel worktree (12th-pass review, P2): the
+    /// failure lands in a decision record — where the batch's other
+    /// checkpoint failures (e.g. a secret-scan refusal) are recorded — and
+    /// the caller marks the feature failed AND preserves the worktree dir +
+    /// branch. An inspection error must never be read as a clean tree whose
+    /// bytes the cleanup guard may reap.
+    fn record_uninspectable_worktree(
+        &mut self,
+        ws: &ParallelWorkspace,
+        error: &EngineError,
+    ) -> Result<WorktreeDisposition> {
+        self.emit_decision(
+            &format!(
+                "parallel checkpoint for {}: worktree inspection failed",
+                ws.feature_id
+            ),
+            Some(format!(
+                "{error} — the feature is failed honestly and its worktree dir + branch are \
+                 PRESERVED for inspection (an inspection error is never a clean, reapable tree)"
+            )),
+        )?;
+        Ok(WorktreeDisposition::InspectionFailed)
     }
 
     /// Locate a feature by id, returning `(milestone_index, feature_index)`.
@@ -3482,6 +4982,49 @@ impl MissionEngine {
         ))
     }
 
+    /// The sandbox posture engine-run gate commands execute under (ticket
+    /// engine-gates-sandbox-wrapped): the worker role's resolved wrap —
+    /// process profile or, with `provider: container`, the mission container
+    /// (ticket container-gate-wrapper) — with the gate's cwd (`root`, the
+    /// active tree) as the writable root and the mission's
+    /// `runs/contract-home` as the private scratch — the same shape the
+    /// contract env already points HOME/TMPDIR/CARGO_HOME at, so no env
+    /// change is needed on this path. `enforce: off` resolves to
+    /// [`crate::command_exec::GateSandbox::Disabled`], today's exact
+    /// behavior; an enforced posture is recorded as a decision so the wrap
+    /// is audible in the event log. Resolution failures (linux without
+    /// `bwrap`, an unsupported platform, `provider: container` with no
+    /// runtime on PATH) fail closed, mirroring session resolution.
+    fn gate_sandbox(&mut self, root: &std::path::Path) -> Result<crate::command_exec::GateSandbox> {
+        let resolution = crate::command_exec::resolve_gate_sandbox(
+            &self.state.config.worker.sandbox,
+            root,
+            &self.paths.mission_dir(),
+            &self.paths.runs_dir().join("contract-home"),
+            &self.paths.runs_dir(),
+        )?;
+        match &resolution.note {
+            Some(note) => {
+                self.emit_decision("engine-run gates NOT sandbox-wrapped", Some(note.clone()))?
+            }
+            None if resolution.sandbox.enforce() != crate::types::SandboxEnforce::Off => self
+                .emit_decision(
+                    "engine-run gates sandbox-wrapped",
+                    Some(format!(
+                        "validation/final-gate commands execute inside the resolved worker \
+                         sandbox wrap (provider:{}, enforce:{}): writes limited to the gate \
+                         tree plus the contract scratch; mission metadata write-denies and \
+                         authority read-denies apply as they do to agent sessions",
+                        self.state.config.worker.sandbox.provider.as_str(),
+                        self.state.config.worker.sandbox.enforce.as_str()
+                    )),
+                )?,
+            // enforce: off — today's posture exactly; no new event noise.
+            None => {}
+        }
+        Ok(resolution.sandbox)
+    }
+
     /// Run the contract's command assertions engine-side and render the
     /// captured results for the functional validator's task (validator
     /// repair 3/5): the validator judges verbatim PASS/FAIL evidence instead
@@ -3490,7 +5033,9 @@ impl MissionEngine {
     /// None when the contract has no command assertions.
     ///
     /// `env` is the commands' COMPLETE (cleared) environment, built by the
-    /// caller via [`Self::contract_command_env`].
+    /// caller via [`Self::contract_command_env`]; `sandbox` is the resolved
+    /// gate wrap from [`Self::gate_sandbox`] ([`crate::command_exec::GateSandbox::Disabled`]
+    /// reproduces the pre-wrap behavior exactly).
     ///
     /// Deliberately an associated function WITHOUT a self receiver: a `&self`
     /// receiver is captured by the async future for its whole lifetime, and
@@ -3500,6 +5045,7 @@ impl MissionEngine {
         contract: &[Assertion],
         root: &std::path::Path,
         env: &HashMap<String, String>,
+        sandbox: &crate::command_exec::GateSandbox,
     ) -> Option<String> {
         let command_assertions: Vec<(String, Option<String>)> = contract
             .iter()
@@ -3513,7 +5059,8 @@ impl MissionEngine {
         for (id, command) in command_assertions {
             match command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = run_shell_command(root, command, env).await;
+                    let (ok, output) =
+                        run_shell_command_sandboxed(root, command, env, sandbox).await;
                     let verdict = if ok { "PASS" } else { "FAIL" };
                     let tail = scrub::scrub(&output);
                     rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}\n"));
@@ -3573,7 +5120,77 @@ impl MissionEngine {
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
-            Self::run_contract_commands_for_validation(&contract, &root, &env).await
+            let gate_sandbox = self.gate_sandbox(&root)?;
+            let rendered =
+                Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox)
+                    .await;
+            // Pty-script assertions (ticket pty-functional-validation): the
+            // M5 functional-QA lane extended to terminal-interactive targets.
+            // Driven engine-side in THIS evidence pass — same root, same
+            // cleared contract env, same gate-sandbox wrap the bounded
+            // contract commands get — with each session's bounded transcript
+            // landing as a `runs/pty-transcripts/` artifact referenced from
+            // an audit-only `validation.pty.transcript` event.
+            let pty_run = crate::pty_harness::run_pty_assertions(
+                &contract,
+                &root,
+                &env,
+                &gate_sandbox,
+                &self.paths.runs_dir(),
+            )
+            .await;
+            for artifact in &pty_run.artifacts {
+                self.emit(EventKind::ValidationPtyTranscript {
+                    milestone_id: milestone_id.clone(),
+                    assertion_id: artifact.assertion_id.clone(),
+                    verdict: if artifact.pass {
+                        crate::gate::GateVerdict::Pass
+                    } else {
+                        crate::gate::GateVerdict::Fail
+                    },
+                    artefact_ref: crate::gate_results::file_artefact_ref(&artifact.transcript_rel),
+                    detail: Some(artifact.detail.clone()),
+                })?;
+            }
+            // A DECLARED pty-script that SKIPPED never executed (ticket
+            // pty-script-skip-vacuous-green): the FAIL evidence line above
+            // goes to the functional validator, but validator discretion is
+            // exactly the vacuous-green hole — surface the skip as a loud
+            // per-round decision too, and let the final gate's
+            // unexecuted-assertion backstop carry the consequence.
+            if !pty_run.skipped.is_empty() {
+                let ids: Vec<&str> = pty_run
+                    .skipped
+                    .iter()
+                    .map(|s| s.assertion_id.as_str())
+                    .collect();
+                let detail = pty_run
+                    .skipped
+                    .iter()
+                    .map(|s| format!("- [{}]: {}", s.assertion_id, s.note))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.emit_decision(
+                    &format!(
+                        "declared pty-script assertion(s) {} did not execute (harness skip) — \
+                         rendered as FAIL evidence",
+                        ids.join(", ")
+                    ),
+                    Some(format!(
+                        "{detail}\nA declared pty-script that never executes cannot green the \
+                         mission: the final gate fails any declared pty assertion with no \
+                         validation.pty.transcript verdict."
+                    )),
+                )?;
+            }
+            match (rendered, pty_run.rendered) {
+                (Some(mut base), Some(pty)) => {
+                    base.push_str(&pty);
+                    Some(base)
+                }
+                (base, None) => base,
+                (None, pty) => pty,
+            }
         } else {
             None
         };
@@ -3606,6 +5223,15 @@ impl MissionEngine {
                 return Ok(());
             };
             let session_cwd = snapshot.path().to_path_buf();
+            // Mandatory containment (ticket validator-mandatory-containment):
+            // resolved per spawn so the posture decision lands next to the
+            // session it covers; `enforce: off` no longer runs the validator
+            // bare where the platform and backend can contain it.
+            let validator_sandbox =
+                self.validator_containment(role, selected_kind, &cfg, &session_cwd)?;
+            // Flight Rules (KRZ-345): the approved standards pin projects the
+            // validation-stage rules into the validator prompt.
+            let standards_pin = self.state.mission.standards_manifest.clone();
             let outcome = runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
@@ -3623,6 +5249,8 @@ impl MissionEngine {
                 &worker_commands,
                 milestone.validator_guidance.as_deref(),
                 contract_results.as_deref(),
+                validator_sandbox,
+                standards_pin.as_ref(),
             )
             .await;
             let caught = self.catch_up();
@@ -3651,9 +5279,23 @@ impl MissionEngine {
             drop(snapshot);
 
             // Bounded (exactly one retry) runtime fallback: a validator run
-            // that did not produce a trusted pass is retried once with the
-            // injected Claude backend. A crashed/aborted validator must never
-            // collapse into "no findings" and green-light validation.
+            // that did not produce a trusted pass is retried once. A crashed/
+            // aborted validator must never collapse into "no findings" and
+            // green-light validation. The retry backend mirrors the primary:
+            // a claude primary retries on the injected claude backend with
+            // the opus/sonnet model swap (the one backend that always honors
+            // the containment wrap); any other primary retries on its OWN
+            // backend with the same config — claude is not a universal
+            // fallback (it may be unauthenticated or absent on the host),
+            // and the retry's containment posture resolves exactly like the
+            // primary's did.
+            //
+            // `retried_on_frontier` records whether THIS verdict came from a
+            // frontier retry: confirm-on-pass (below) keys on the verdict
+            // being the LOCAL primary's own — a retried frontier verdict is
+            // already frontier, so confirming it would judge frontier by
+            // frontier; a retried LOCAL verdict still must be confirmed.
+            let mut retried_on_frontier = false;
             if !validator_outcome_trusted(&outcome) {
                 // Capability-boundary check (grant-request-decision-flow),
                 // gated on the UNTRUSTED outcome: a validator stopped by a
@@ -3679,19 +5321,31 @@ impl MissionEngine {
                 if self.maybe_park_for_egress_grant(&milestone_id, role, &outcome)? {
                     return Ok(());
                 }
+                let retry_kind = if matches!(selected_kind, BackendKind::Claude) {
+                    BackendKind::Claude
+                } else {
+                    selected_kind
+                };
                 self.emit_decision(
                     &format!(
                         "{} {} run did not produce a trusted validator report ({}); retrying once with \
-                         the claude {}",
+                         the {} {}",
                         selected_kind.as_str(),
                         role_label(role),
                         run_outcome_summary(&outcome),
+                        retry_kind.as_str(),
                         role_label(role)
                     ),
                     None,
                 )?;
-                let retry_cfg = self.claude_fallback_cfg_for_role(role);
-                let retry_backend = Arc::clone(&self.backend);
+                let (retry_cfg, retry_backend) = if matches!(retry_kind, BackendKind::Claude) {
+                    (
+                        self.claude_fallback_cfg_for_role(role),
+                        Arc::clone(&self.backend),
+                    )
+                } else {
+                    (cfg.clone(), Arc::clone(&backend))
+                };
                 // The retry is a fresh validator session: its own throwaway
                 // snapshot (the real checkout provably untouched by the
                 // primary — the isolation guarantees it, the tripwire
@@ -3702,6 +5356,11 @@ impl MissionEngine {
                     return Ok(());
                 };
                 let retry_session_cwd = retry_snapshot.path().to_path_buf();
+                // Containment resolves for the retry's actual backend: claude
+                // honors the wrap; anything else follows the same degrade
+                // rules the primary session resolved.
+                let retry_validator_sandbox =
+                    self.validator_containment(role, retry_kind, &retry_cfg, &retry_session_cwd)?;
                 let retry_outcome = runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
@@ -3719,11 +5378,14 @@ impl MissionEngine {
                     &worker_commands,
                     milestone.validator_guidance.as_deref(),
                     contract_results.as_deref(),
+                    retry_validator_sandbox,
+                    standards_pin.as_ref(),
                 )
                 .await;
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
                 caught?;
+                retried_on_frontier = !matches!(retry_kind, BackendKind::Local);
 
                 if self.fail_on_validator_tamper(
                     &milestone_id,
@@ -3744,7 +5406,7 @@ impl MissionEngine {
                 }
                 drop(retry_snapshot);
 
-                // A denial the runner could only read on the Claude retry (a
+                // A denial the runner could only read on the retry (a
                 // Codex/Droid primary whose events don't map to a command, or a
                 // primary that failed some other way) surfaces its grant here,
                 // so those backends aren't silently un-grantable.
@@ -3777,6 +5439,72 @@ impl MissionEngine {
             let report = outcome
                 .validator_report
                 .expect("trusted validator outcome must carry a report");
+
+            // Confirm-on-pass (ticket local-inference-validator-guarded,
+            // KRZ-206b; review addendum §4): a LOCAL functional verdict never
+            // greens a gate alone. The executor-escalation valve catches
+            // executor FAILURES but not validator MISSES — a weak local
+            // validator that wrongly PASSES bad work is not a failure, so
+            // without this confirmation the "no silent green" promise rests
+            // on an unmeasured model. Every local PASS on a contract-command
+            // assertion (and any all-clean local report, which would green
+            // judgment too) is re-judged by a frontier functional session
+            // BEFORE the round may complete, regardless of any spot-check
+            // sampling rate; a local FAIL is trusted without confirmation —
+            // failures are visible (they cost a fix cycle), misses are the
+            // danger, and the asymmetry is deliberate. The confirmations
+            // land in the event store as `validation.confirm`, which IS the
+            // local-vs-frontier miss-rate ground truth (the ticket's start
+            // precondition: the mechanism is the measurement).
+            if role == Role::ValidatorFunctional
+                && selected_kind == BackendKind::Local
+                && !retried_on_frontier
+            {
+                let local_subjects: std::collections::HashSet<&str> =
+                    report.findings.iter().map(|f| f.subject.as_str()).collect();
+                let has_command_assertions =
+                    contract.iter().any(|a| a.check == AssertionCheck::Command);
+                let passed_command_ids: Vec<String> = contract
+                    .iter()
+                    .filter(|a| a.check == AssertionCheck::Command)
+                    .map(|a| a.id.clone())
+                    .filter(|id| !local_subjects.contains(id.as_str()))
+                    .collect();
+                let needs_confirm = !passed_command_ids.is_empty()
+                    // A contract with no command assertions hands the local
+                    // session pure judgment; an all-clean report there would
+                    // green the gate on local judgment alone, which the
+                    // guarded role split forbids — confirm it exactly like a
+                    // command-assertion PASS.
+                    || (!has_command_assertions && report.findings.is_empty());
+                if needs_confirm {
+                    match self
+                        .confirm_local_functional_pass(
+                            &milestone_id,
+                            role,
+                            &milestone,
+                            &contract,
+                            &start_sha,
+                            base_sha.as_deref(),
+                            &grants,
+                            &egress_grants,
+                            &worker_commands,
+                            contract_results.as_deref(),
+                            &outcome.run_id,
+                            &report,
+                            &passed_command_ids,
+                        )
+                        .await?
+                    {
+                        Some(disagreements) => findings.extend(disagreements),
+                        // The round blocked honestly (an untrusted
+                        // confirmation or a tripwire) — never green on an
+                        // unconfirmed local PASS.
+                        None => return Ok(()),
+                    }
+                }
+            }
+
             for finding in report.findings {
                 findings.push((outcome.run_id.clone(), finding));
             }
@@ -3810,6 +5538,13 @@ impl MissionEngine {
 
         if findings.is_empty() {
             let tag = self.tag_milestone(&milestone_id);
+            // Structured human questions (ticket
+            // structured-human-question-events): asks scoped to this
+            // milestone are moot once it completes — clear them out of the
+            // pending-decision projection.
+            self.clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some(milestone_id.as_str())
+            })?;
             self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
             return Ok(());
         }
@@ -3841,6 +5576,11 @@ impl MissionEngine {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 let tag = self.tag_milestone(&milestone_id);
+                // Structured human questions: same clear-on-complete as the
+                // findings-empty path above.
+                self.clear_open_questions("milestone completed", |q| {
+                    q.milestone_id.as_deref() == Some(milestone_id.as_str())
+                })?;
                 self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
             }
             FindingsConversion::Fix {
@@ -3874,6 +5614,260 @@ impl MissionEngine {
             }
         }
         Ok(())
+    }
+
+    /// Confirm-on-pass for a LOCAL functional verdict (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b): re-run the functional
+    /// validator on the FRONTIER tier — the injected claude backend with the
+    /// same fallback config the untrusted-retry path uses — against the same
+    /// milestone, contract, and engine-captured command evidence, in its own
+    /// throwaway snapshot with the same before/after tripwires as any
+    /// validator session.
+    ///
+    /// The comparison fails CLOSED: every frontier finding on a subject the
+    /// local report passed is a recorded miss (the `validation.confirm`
+    /// event — the local-vs-frontier miss-rate ground truth) and is returned
+    /// for the round's findings, so the frontier verdict stands. A frontier
+    /// finding on a subject the local report already failed is NOT a miss
+    /// (both tiers fail it; the local FAIL was already trusted — failures
+    /// are visible, misses are the danger).
+    ///
+    /// Returns `Ok(Some(disagreements))` when a trusted confirmation ran
+    /// (an empty vec means the frontier tier agreed with every local PASS),
+    /// `Ok(None)` when the round BLOCKED honestly: an untrusted confirmation
+    /// never greens the gate — the local PASS simply has no verdict until a
+    /// frontier session can judge it (mirroring the untrusted-after-retry
+    /// block). Deliberately no grant-park or second retry here: the operator
+    /// unblocks with a grant or guidance, and the re-validation re-runs both
+    /// the local verdict and its confirmation.
+    #[allow(clippy::too_many_arguments)]
+    async fn confirm_local_functional_pass(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        milestone: &Milestone,
+        contract: &[Assertion],
+        start_sha: &str,
+        base_sha: Option<&str>,
+        grants: &[String],
+        egress_grants: &[String],
+        worker_commands: &[String],
+        contract_results: Option<&str>,
+        local_run_id: &str,
+        local_report: &ValidatorReport,
+        passed_command_ids: &[String],
+    ) -> Result<Option<Vec<(String, Finding)>>> {
+        self.emit_decision(
+            &format!(
+                "local {} passed {} contract command assertion(s); running the frontier \
+                 confirmation before any green (confirm-on-pass, KRZ-206b — a local PASS \
+                 never greens the gate alone)",
+                role_label(role),
+                passed_command_ids.len()
+            ),
+            None,
+        )?;
+        let confirm_cfg = self.claude_fallback_cfg_for_role(role);
+        let confirm_backend = Arc::clone(&self.backend);
+        // The confirmation is a fresh validator session: its own throwaway
+        // snapshot (the real checkout provably untouched by the local
+        // primary — the isolation guarantees it, the tripwire verifies it)
+        // and its own before/after tripwire pair.
+        let fingerprint = validator_integrity::CheckoutFingerprint::capture(self.active_repo())?;
+        let Some(snapshot) = self.validator_snapshot(milestone_id, role)? else {
+            return Ok(None);
+        };
+        let session_cwd = snapshot.path().to_path_buf();
+        // The confirmation runs on the injected claude backend — the one
+        // backend that always honors the containment wrap.
+        let validator_sandbox =
+            self.validator_containment(role, BackendKind::Claude, &confirm_cfg, &session_cwd)?;
+        // Flight Rules (KRZ-345): the confirmation validator receives the
+        // same approved-pin validation-stage projection as the primary.
+        let standards_pin = self.state.mission.standards_manifest.clone();
+        let outcome = runner::run_validator_in(
+            confirm_backend.as_ref(),
+            &mut self.log,
+            &self.paths,
+            &confirm_cfg,
+            role,
+            milestone,
+            contract,
+            start_sha,
+            None,
+            &session_cwd,
+            base_sha,
+            grants,
+            egress_grants,
+            worker_commands,
+            milestone.validator_guidance.as_deref(),
+            contract_results,
+            validator_sandbox,
+            standards_pin.as_ref(),
+        )
+        .await;
+        let caught = self.catch_up();
+        let outcome = outcome?;
+        caught?;
+
+        // Same tripwires as the primary: any drift across the confirmation
+        // session means the isolation itself failed — fail the round
+        // honestly, before the verdict comparison.
+        if self.fail_on_validator_tamper(milestone_id, role, &outcome.run_id, &fingerprint)? {
+            return Ok(None);
+        }
+        if self.fail_on_snapshot_index_flags(
+            milestone_id,
+            role,
+            &outcome.run_id,
+            &snapshot,
+            &fingerprint.head,
+        )? {
+            return Ok(None);
+        }
+        drop(snapshot);
+
+        if !validator_outcome_trusted(&outcome) {
+            let reason = format!(
+                "frontier confirmation of the local {} PASS did not produce a trusted \
+                 report ({}); the local verdict cannot green the gate unconfirmed",
+                role_label(role),
+                run_outcome_summary(&outcome)
+            );
+            self.emit_decision(&reason, None)?;
+            self.emit(EventKind::MilestoneBlocked {
+                milestone_id: milestone_id.to_string(),
+                reason,
+            })?;
+            return Ok(None);
+        }
+
+        let confirm_report = outcome
+            .validator_report
+            .expect("trusted validator outcome must carry a report");
+        let local_subjects: std::collections::HashSet<&str> = local_report
+            .findings
+            .iter()
+            .map(|f| f.subject.as_str())
+            .collect();
+        // A miss is a frontier finding on a subject the local report did NOT
+        // fail — the local tier passed it and the frontier tier caught it.
+        let disagreements: Vec<Finding> = confirm_report
+            .findings
+            .into_iter()
+            .filter(|f| !local_subjects.contains(f.subject.as_str()))
+            .collect();
+        let disagreement_subjects: std::collections::HashSet<&str> =
+            disagreements.iter().map(|f| f.subject.as_str()).collect();
+        let confirmed: Vec<String> = passed_command_ids
+            .iter()
+            .filter(|id| !disagreement_subjects.contains(id.as_str()))
+            .cloned()
+            .collect();
+        // A contract with no command assertions handed the local session
+        // pure judgment: this confirmation covered ONE miss-rate opportunity
+        // the lists cannot name (there are no command-assertion ids), so the
+        // event carries it explicitly — otherwise a clean judgment-only
+        // confirmation records {confirmed: [], disagreements: []} and the
+        // miss-rate denominator undercounts (14th-pass review).
+        let judgment_opportunity = !contract.iter().any(|a| a.check == AssertionCheck::Command);
+        if !disagreements.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "local validator MISS: the frontier confirmation overturned {} local \
+                     PASS verdict(s) ({}) — failing closed to the frontier verdict; the \
+                     miss is recorded on validation.confirm (the local-vs-frontier \
+                     miss-rate ground truth)",
+                    disagreements.len(),
+                    disagreements
+                        .iter()
+                        .map(|f| f.subject.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            )?;
+        }
+        self.emit(EventKind::ValidationConfirm {
+            milestone_id: milestone_id.to_string(),
+            local_run_id: local_run_id.to_string(),
+            confirm_run_id: outcome.run_id.clone(),
+            confirmed,
+            disagreements: disagreements.clone(),
+            judgment_opportunity,
+        })?;
+        Ok(Some(
+            disagreements
+                .into_iter()
+                .map(|f| (outcome.run_id.clone(), f))
+                .collect(),
+        ))
+    }
+
+    /// Mandatory validator containment resolution (ticket
+    /// `validator-mandatory-containment`): the wrap every validator session
+    /// gets regardless of the role's `sandbox.enforce` — the decision matrix
+    /// lives in [`crate::sandbox::resolve_validator_containment`]. Surfaces
+    /// the posture as an orchestrator decision per spawn: the LOUD
+    /// degradation note when the platform or the selected backend cannot
+    /// contain AND the operator opted in via `validatorAllowUncontainedDegrade`
+    /// (without the opt-in the resolution is an Err — fail closed, ticket
+    /// `validator-containment-degrade-fail-closed`; snapshot isolation plus
+    /// the after-fingerprint tripwire alone no longer suffice by default),
+    /// and the positive note when the mandatory wrap contains a session
+    /// whose `enforce: off` would previously have run bare. A resolution Err
+    /// is the role's own fail-closed posture (enforcement requested but
+    /// unhonorable here) or the uncontained fail-closed default — unchanged
+    /// in shape.
+    fn validator_containment(
+        &mut self,
+        role: Role,
+        kind: BackendKind,
+        cfg: &MissionConfig,
+        session_cwd: &std::path::Path,
+    ) -> Result<Option<crate::sandbox::ResolvedSandbox>> {
+        // The real checkout roots the validator must not read: the tree the
+        // snapshot was taken from (the active tree — the integration
+        // worktree in worktree mode), plus the primary checkout when they
+        // differ (the snapshot lives under the primary's `.kranz`, so the
+        // read-deny carve-outs keep it — and the shared git dir —
+        // reachable).
+        let mut deny_roots = vec![self.active_root().to_path_buf()];
+        if !deny_roots.contains(&self.paths.repo_root) {
+            deny_roots.push(self.paths.repo_root.clone());
+        }
+        let containment = crate::sandbox::resolve_validator_containment(
+            &cfg.role(role).sandbox,
+            kind,
+            session_cwd,
+            &self.paths.mission_dir(),
+            &deny_roots,
+            cfg.validator_allow_uncontained_degrade,
+        )?;
+        match &containment.note {
+            Some(note) => self.emit_decision(
+                "validator session NOT sandbox-contained",
+                Some(note.clone()),
+            )?,
+            None if containment.sandbox.is_some()
+                && cfg.role(role).sandbox.enforce == crate::types::SandboxEnforce::Off =>
+            {
+                self.emit_decision(
+                    "validator session sandbox-contained (mandatory)",
+                    Some(format!(
+                        "enforce:off no longer leaves the {} unwrapped: writes are limited to \
+                         the throwaway snapshot plus the session-private scratch, the real \
+                         checkout's source tree is read-denied (the shared git objects/refs \
+                         the inspection needs stay readable), and mission metadata \
+                         write-denies plus authority read-denies apply as they do to any \
+                         session (ticket validator-mandatory-containment)",
+                        role_label(role)
+                    )),
+                )?
+            }
+            None => {}
+        }
+        Ok(containment.sandbox)
     }
 
     /// Build the per-session validator snapshot (module
@@ -4165,14 +6159,35 @@ impl MissionEngine {
         let commits = self.active_repo().commits_between(&base, "HEAD")?;
         let gate_mission_id = self.state.mission.id.clone();
         let mut non_meta_commit_count = 0usize;
+        // The union of paths the mission diff touches — the `whenPaths`
+        // scoping input for pack gates below (merge-gate idiom: a scoped
+        // gate runs when at least one changed path sits under a prefix).
+        let mut changed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // The DELIVERABLE subset (worker-authored commits only — engine meta
+        // commits like plan.json/report.md are excluded): the Flight Rules
+        // envelope check's "actual changed paths" (D-E). Approval resolved
+        // against the deliverable-describing touch set, so the comparison
+        // basis must match — an enforced rule scoped at `.kranz/` must not
+        // newly "apply" merely because the engine committed mission records.
+        let mut deliverable_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for commit in &commits {
             let paths = commit_changed_paths(self.active_repo(), &commit.sha)?;
             if !contract_sweep::is_meta_commit_with_paths(&commit.subject, &gate_mission_id, &paths)
             {
                 non_meta_commit_count += 1;
+                deliverable_paths.extend(paths.iter().cloned());
             }
+            changed_paths.extend(paths);
         }
+        let mut all_changed_paths: Vec<String> = changed_paths.iter().cloned().collect();
+        all_changed_paths.sort();
+        let mut actual_paths: Vec<String> = deliverable_paths.iter().cloned().collect();
+        actual_paths.sort();
         if non_meta_commit_count == 0 {
+            // Same mission-end clear as complete_mission: no open question
+            // may outlive the mission in the pending-decision projection.
+            self.clear_open_questions("mission failed", |_| true)?;
             self.emit(EventKind::MissionFailed {
                 reason: format!(
                     "no deliverable commits landed on the mission branch: \
@@ -4183,13 +6198,83 @@ impl MissionEngine {
             return Ok(Some(MissionStatus::Failed));
         }
 
+        // Flight Rules envelope check (KRZ-342, design D-E): re-resolve the
+        // approval-pinned source snapshot (the mission's pinned base sha —
+        // immutable, so exactly the bytes approval read) against the ACTUAL
+        // changed paths. A newly applicable ENFORCED rule means the mission
+        // escaped its approved policy envelope (a touch-set grant widened
+        // scope, or an out-of-contract write slipped the sweep): park for
+        // revision/reapproval rather than judge against a moving set. The
+        // declared-touch-set overlap makes approval's selection a superset of
+        // anything an in-envelope diff can activate, so an in-envelope
+        // mission can never false-positive here. Deterministic and cheap —
+        // runs before any command/assertion spend below.
+        if let Some(pin) = self.state.mission.standards_manifest.clone() {
+            let pin_base = self
+                .state
+                .mission
+                .base_sha
+                .clone()
+                .unwrap_or_else(|| self.state.mission.base_branch.clone());
+            let envelope = crate::pack::resolution::newly_applicable_enforced(
+                &self.repo,
+                &pin_base,
+                &pin,
+                &actual_paths,
+            );
+            let park_reason = match envelope {
+                Ok(newly) if newly.is_empty() => None,
+                Ok(newly) => Some(format!(
+                    "newly applicable enforced Flight Rules rule(s) outside the approved \
+                     manifest pin: {} — the mission escaped its approved policy envelope; \
+                     revise the plan and re-approve (D-E)",
+                    newly
+                        .iter()
+                        .map(|rule| format!("{} r{}", rule.id, rule.revision))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                // The approval snapshot itself is unreadable — fail closed:
+                // never judge against a policy that cannot be read.
+                Err(error) => Some(error),
+            };
+            if let Some(reason) = park_reason {
+                let li = self.state.mission.milestones.len() - 1;
+                let last_milestone_id = self.state.mission.milestones[li].id.clone();
+                self.emit_decision(
+                    "standards envelope escaped — parked for revision/reapproval",
+                    Some(reason.clone()),
+                )?;
+                self.emit(EventKind::MilestoneBlocked {
+                    milestone_id: last_milestone_id,
+                    reason,
+                })?;
+                return Ok(None);
+            }
+        }
+
         let contract = self.state.mission.validation_contract.clone();
         let mut findings: Vec<Finding> = Vec::new();
+        if let Some(review) = crate::review_artifact::parse_from_goal(&self.state.mission.goal)? {
+            findings.extend(crate::review_artifact::deliverable_findings(
+                self.active_repo(),
+                &base,
+                "HEAD",
+                &actual_paths,
+                &review,
+            )?);
+        }
         // agent-env-clear: command assertions run with a CLEARED environment
         // (minimal allowlist + scratch HOME + toolchain caches + any
         // contractEnvPassthrough names) — ambient secrets never reach them.
         let gate_base_sha = self.state.mission.base_sha.clone();
         let env = self.contract_command_env(gate_base_sha.as_deref())?;
+        // engine-gates-sandbox-wrapped: the same commands then run under the
+        // resolved worker sandbox profile (a no-op Disabled wrap when
+        // enforce == off). Resolved ONCE for the whole final gate — every
+        // assertion below shares the gate tree + contract scratch shape.
+        let gate_root = self.active_root().to_path_buf();
+        let gate_sandbox = self.gate_sandbox(&gate_root)?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -4203,10 +6288,12 @@ impl MissionEngine {
                     evidence: "assertion has check=command but no command".to_string(),
                     suggested_fix: String::new(),
                     class: String::new(),
+                    rule: None,
                 });
                 continue;
             };
-            let (ok, output) = run_shell_command(self.active_root(), command, &env).await;
+            let (ok, output) =
+                run_shell_command_sandboxed(&gate_root, command, &env, &gate_sandbox).await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
@@ -4214,6 +6301,427 @@ impl MissionEngine {
                     evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
                     suggested_fix: String::new(),
                     class: "command-assertion".to_string(),
+                    rule: None,
+                });
+            }
+        }
+
+        // Named contract gates at the final-gate surface (ticket
+        // contract-validation-gates.md): the static, deterministic classes
+        // (vacuous-filter, wrong-polarity, env-sensitive) re-checked against
+        // the ACTIVE tree — e.g. a negated grep whose target is still absent
+        // here passed vacuously, and its green contributes nothing. The
+        // passes-on-base gate is absent: the work has landed, so passing on
+        // base is now expected. Advisory only, same posture as at approval:
+        // the command outcomes and findings above are unchanged — this
+        // records the named verdicts so a vacuously-green contract is
+        // visible in the event log instead of silently trusted.
+        //
+        // ONE shared pipeline (pack gates + KRZ-346 Flight Rules): engine
+        // floors register first, then prepared deterministic pack/checker
+        // outcomes, then contextual/manual outcomes in the model-judged
+        // section. Commands/model turns finish before registration because
+        // Gate::evaluate is synchronous and the pipeline is not Send.
+        //
+        // A standards mission consumes approval-pinned gate declarations —
+        // never `load_for_config` from the mission worktree. Schema-2/3 packs
+        // (no standards pin) retain their legacy live advisory gate path.
+        let standards_pin = self.state.mission.standards_manifest.clone();
+        let gate_applicability_paths = standards_pin
+            .as_ref()
+            .map(|pin| crate::pack::resolution::evaluation_paths(pin, &all_changed_paths))
+            .unwrap_or_else(|| all_changed_paths.clone());
+        let mut standards_rules = standards_pin
+            .as_ref()
+            .map(|pin| {
+                crate::standards_enforcement::applicable_rules(
+                    pin,
+                    &[
+                        crate::pack::standards::RuleStage::Validation,
+                        crate::pack::standards::RuleStage::Merge,
+                    ],
+                    &actual_paths,
+                )
+            })
+            .unwrap_or_default();
+        standards_rules.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut gate_rule_ids: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut contextual_rules = Vec::new();
+        let mut prepared_standard_reports = Vec::new();
+        let enforcement_events = if standards_pin.is_some() {
+            self.log.flush()?;
+            EventLog::read_events(self.log.events_path())?
+        } else {
+            Vec::new()
+        };
+        if let Some(pin) = standards_pin.as_ref() {
+            for rule in &standards_rules {
+                match crate::standards_enforcement::checker_binding(pin, rule, &actual_paths) {
+                    crate::standards_enforcement::CheckerBinding::Gate(gate) => {
+                        gate_rule_ids
+                            .entry(gate.id.clone())
+                            .or_default()
+                            .push(rule.id.clone());
+                    }
+                    crate::standards_enforcement::CheckerBinding::AgentJudgement => {
+                        contextual_rules.push(rule.clone());
+                    }
+                    crate::standards_enforcement::CheckerBinding::ManualAttestation => {
+                        let attestation = crate::standards_attestation::active_attestation(
+                            self.active_repo(),
+                            &enforcement_events,
+                            &self.state.mission.id,
+                            pin,
+                            rule,
+                            &base,
+                            "HEAD",
+                        )?;
+                        let artefact = crate::gate::ArtefactRef::new(format!(
+                            "manual attestation for {} r{}",
+                            rule.id, rule.revision
+                        ));
+                        let outcome = if let Some(attestation) = attestation {
+                            crate::gate::GateOutcome::pass(artefact.with_detail(format!(
+                                "standards.attestation.approved seq {} by {} via {}: {}",
+                                attestation.seq,
+                                attestation.approver,
+                                attestation.surface,
+                                attestation.reason
+                            )))
+                        } else {
+                            crate::gate::GateOutcome::fail(artefact.with_detail(
+                                "no current authorized manual attestation is recorded for \
+                                 this exact pinned rule and diff",
+                            ))
+                        };
+                        prepared_standard_reports.push(crate::gate::GateReport {
+                            name: format!("standards-manual:{}", rule.id),
+                            kind: crate::gate::GateKind::ModelJudged,
+                            outcome: outcome.with_rule_ids(vec![rule.id.clone()]),
+                        });
+                    }
+                    crate::standards_enforcement::CheckerBinding::Unavailable(reason) => {
+                        prepared_standard_reports.push(crate::gate::GateReport {
+                            name: format!("standards-binding:{}", rule.id),
+                            kind: crate::gate::GateKind::Deterministic,
+                            outcome: crate::gate::GateOutcome::fail(
+                                crate::gate::ArtefactRef::new(format!(
+                                    "checker binding for {} r{}",
+                                    rule.id, rule.revision
+                                ))
+                                .with_detail(reason),
+                            )
+                            .with_rule_ids(vec![rule.id.clone()]),
+                        });
+                    }
+                }
+            }
+        }
+
+        let (pack_name, pinned_gate_decls) = if let Some(pin) = standards_pin.as_ref() {
+            (Some(pin.pack_name.clone()), pin.gates.clone())
+        } else {
+            let pack = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+                .map_err(EngineError::Config)?;
+            let name = pack.as_ref().map(|pack| pack.name.clone());
+            let gates = pack
+                .as_ref()
+                .map(|pack| {
+                    pack.gates
+                        .iter()
+                        .map(|gate| crate::types::PinnedGate {
+                            id: gate.name.clone(),
+                            command: gate.command.clone(),
+                            when_paths: gate.when_paths.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, gates)
+        };
+        let mut pack_gates: Vec<crate::pack::PackGate> = Vec::new();
+        for decl in &pinned_gate_decls {
+            let linked = gate_rule_ids.contains_key(&decl.id);
+            let applicability_paths = if linked {
+                &gate_applicability_paths
+            } else {
+                &all_changed_paths
+            };
+            if !crate::merge_gate::when_paths_match(&decl.when_paths, applicability_paths) {
+                continue;
+            }
+            let (ok, output) =
+                run_shell_command_sandboxed(&gate_root, &decl.command, &env, &gate_sandbox).await;
+            let rule_ids = gate_rule_ids.remove(&decl.id).unwrap_or_default();
+            pack_gates.push(
+                crate::pack::PackGate::from_run(&decl.id, &decl.command, ok, output)
+                    .with_rule_ids(rule_ids),
+            );
+        }
+        // A valid pin cannot leave a gate id unresolved (checker_binding
+        // resolved against this same list). Treat any corrupt duplicate or
+        // hand-edited pin conservatively anyway.
+        for (gate, rule_ids) in gate_rule_ids {
+            prepared_standard_reports.push(crate::gate::GateReport {
+                name: format!("standards-binding:{gate}"),
+                kind: crate::gate::GateKind::Deterministic,
+                outcome: crate::gate::GateOutcome::fail(
+                    crate::gate::ArtefactRef::new(format!("approval-pinned gate `{gate}`"))
+                        .with_detail("the pinned checker declaration was unavailable at execution"),
+                )
+                .with_rule_ids(rule_ids),
+            });
+        }
+        prepared_standard_reports.extend(self.judge_standards_rules(&contextual_rules).await?);
+
+        // The pipeline is scoped to this block: it is not Send (Box<dyn
+        // Gate>), so it must be fully dropped before the next await below.
+        let (floor_reports, pack_reports) = {
+            let mut pipeline = crate::gate::GatePipeline::new();
+            contract_gates::register_contract_gates(
+                &mut pipeline,
+                &contract,
+                None,
+                self.active_root(),
+            );
+            let floor_gate_count = pipeline.len();
+            for gate in pack_gates {
+                pipeline.register(Box::new(gate));
+            }
+            for report in prepared_standard_reports {
+                pipeline.register(Box::new(crate::standards_enforcement::PreparedGate::new(
+                    report,
+                )));
+            }
+            let final_gate_reports = pipeline.evaluate();
+            let (floor, pack) = final_gate_reports.split_at(floor_gate_count);
+            (floor.to_vec(), pack.to_vec())
+        };
+        // First-class gate results (ticket gate-results-first-class-events,
+        // KRZ-312): one gate.result event per evaluation, recorded for the
+        // WHOLE ladder — floor then pack, concatenated back into pipeline
+        // (registration) order so the per-section indices the helper assigns
+        // run continuously across both. Unconditional, pass or fail: a
+        // gate's silent green is exactly as invisible as its failure, and
+        // replay reconstructs the ladder from these events alone. Record-
+        // only; the advisory posture of both floors is unchanged.
+        let ladder: Vec<crate::gate::GateReport> = floor_reports
+            .iter()
+            .chain(pack_reports.iter())
+            .cloned()
+            .collect();
+        for kind in gate_results::gate_result_events(crate::gate::GateSurface::FinalGate, &ladder) {
+            self.emit(kind)?;
+        }
+        let failed_gates = contract_gates::failed_gate_names(&floor_reports);
+        if !failed_gates.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "contract gates (final gate): named gate(s) failed: {} — advisory only; \
+                     command outcomes and findings above are unchanged",
+                    failed_gates.join(", ")
+                ),
+                Some(contract_gates::render_gate_verdicts(&floor_reports)),
+            )?;
+        }
+        // Ordinary (unlinked) pack gates remain advisory. Linked Flight
+        // Rules reports are interpreted through D-B below.
+        let ordinary_pack_reports: Vec<_> = pack_reports
+            .iter()
+            .filter(|report| report.outcome.rule_ids.is_empty())
+            .cloned()
+            .collect();
+        if let Some(pack_name) = &pack_name {
+            if !ordinary_pack_reports.is_empty() {
+                let failed_pack = contract_gates::failed_gate_names(&ordinary_pack_reports);
+                let summary = if failed_pack.is_empty() {
+                    format!(
+                        "pack `{}` gates (final gate): {} deterministic gate(s) passed — advisory only",
+                        pack_name,
+                        ordinary_pack_reports.len()
+                    )
+                } else {
+                    format!(
+                        "pack `{}` gates (final gate): named gate(s) failed: {} — advisory only; \
+                         command outcomes and findings above are unchanged",
+                        pack_name,
+                        failed_pack.join(", ")
+                    )
+                };
+                self.emit_decision(
+                    &summary,
+                    Some(contract_gates::render_verdict_block(
+                        &format!("pack `{pack_name}` gates:"),
+                        &ordinary_pack_reports,
+                    )),
+                )?;
+            }
+        }
+
+        // Interpret linked checker failures through the exact lifecycle ×
+        // level matrix. Advisory failures are recorded as findings but never
+        // enter the blocking/fix loop. Enforced MUST failures enter it unless
+        // a still-live D-I waiver matches this exact finding AND the current
+        // affected-path diff.
+        let linked_reports: Vec<_> = pack_reports
+            .iter()
+            .filter(|report| !report.outcome.rule_ids.is_empty())
+            .cloned()
+            .collect();
+        let mut advisory_standard_findings = Vec::new();
+        let mut waived_standard_rules = Vec::new();
+        if let Some(pin) = standards_pin.as_ref() {
+            for report in &linked_reports {
+                if report.outcome.passed() {
+                    continue;
+                }
+                for rule_id in &report.outcome.rule_ids {
+                    let Some(rule) = standards_rules.iter().find(|rule| &rule.id == rule_id) else {
+                        continue;
+                    };
+                    let detail = report
+                        .outcome
+                        .artefact
+                        .detail
+                        .as_deref()
+                        .unwrap_or("checker failed without detail");
+                    let finding = crate::standards_enforcement::failure_finding(
+                        pin,
+                        rule,
+                        &scrub::scrub(&format!(
+                            "checker `{}` failed for {} r{}: {detail}",
+                            report.name, rule.id, rule.revision
+                        )),
+                    );
+                    match crate::standards_enforcement::rule_mode(rule) {
+                        crate::standards_enforcement::RuleMode::Absent => {}
+                        crate::standards_enforcement::RuleMode::Advisory => {
+                            advisory_standard_findings.push(finding)
+                        }
+                        crate::standards_enforcement::RuleMode::Authoritative => {
+                            let waiver = crate::standards_waiver::active_waiver_for_finding(
+                                self.active_repo(),
+                                &enforcement_events,
+                                &self.state.mission.id,
+                                pin,
+                                rule,
+                                &finding,
+                                &base,
+                                "HEAD",
+                                chrono::Utc::now(),
+                            )?;
+                            if let Some(waiver) = waiver {
+                                waived_standard_rules.push((rule.id.clone(), waiver.seq));
+                            } else {
+                                findings.push(finding);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (rule_id, waiver_seq) in waived_standard_rules {
+            self.emit_decision(
+                &format!(
+                    "Flight Rules {rule_id}: failing enforced MUST covered by exact human waiver"
+                ),
+                Some(format!(
+                    "standards.waiver.approved seq {waiver_seq} matches the pinned revision, \
+                     checker finding fingerprint, affected paths, current diff digest, approval \
+                     sequence, human authority surface, and expiry"
+                )),
+            )?;
+        }
+        if !linked_reports.is_empty() {
+            self.emit_decision(
+                &format!(
+                    "Flight Rules final enforcement: {} checker verdict(s), {} blocking failure(s), {} advisory failure(s)",
+                    linked_reports.len(),
+                    findings
+                        .iter()
+                        .filter(|finding| finding.class == "standards-authoritative")
+                        .count(),
+                    advisory_standard_findings.len()
+                ),
+                Some(contract_gates::render_verdict_block(
+                    "Flight Rules checkers:",
+                    &linked_reports,
+                )),
+            )?;
+        }
+        if !advisory_standard_findings.is_empty() {
+            let milestone_id = self
+                .state
+                .mission
+                .milestones
+                .last()
+                .expect("a final gate has a milestone")
+                .id
+                .clone();
+            for finding in advisory_standard_findings {
+                self.emit(EventKind::ValidationFinding {
+                    milestone_id: milestone_id.clone(),
+                    run_id: crate::reducer::ENGINE_RUN_ID.to_string(),
+                    finding,
+                })?;
+            }
+        }
+
+        // Pty-script assertions (ticket pty-functional-validation) are NOT
+        // re-run at the final gate: their verdicts are validation-round
+        // evidence (the functional validator judges them there, and every
+        // milestone — the last included — passes through a round before the
+        // gate). Surface the posture LOUDLY rather than letting the hard
+        // gate's silence read as a re-check.
+        let pty_assertion_ids: Vec<&str> = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::PtyScript)
+            .map(|a| a.id.as_str())
+            .collect();
+        if !pty_assertion_ids.is_empty() {
+            self.emit_decision(
+                "pty-script assertions not re-run at the final gate",
+                Some(format!(
+                    "assertion(s) {} are terminal-interactive validations executed at each \
+                     milestone's validation round (transcripts referenced from \
+                     validation.pty.transcript events); the final gate re-runs only command \
+                     assertions, so their last round verdict stands",
+                    pty_assertion_ids.join(", ")
+                )),
+            )?;
+            // Vacuous-green backstop (ticket pty-script-skip-vacuous-green):
+            // "their last round verdict stands" is only honest when a
+            // verdict EXISTS. A declared pty-script whose session SKIPPED
+            // every round (this host cannot drive a pty) has no
+            // validation.pty.transcript event in the log — the declared
+            // functional validation never executed, so the gate must not
+            // green on that silence. The finding carries the
+            // command-assertion class: non-waivable, escalatable to the
+            // operator as author-broken, exactly like a failed command
+            // assertion.
+            self.log.flush()?;
+            let events = EventLog::read_events(self.log.events_path())?;
+            for assertion in unexecuted_pty_assertions(&contract, &events) {
+                findings.push(Finding {
+                    subject: assertion.id.clone(),
+                    severity: "critical".to_string(),
+                    evidence: format!(
+                        "declared pty-script assertion `{}` has no validation.pty.transcript \
+                         verdict in the mission log: it never executed in any validation \
+                         round (this host cannot drive a pty session — the round's evidence \
+                         block carries the SKIP as a FAIL line naming the reason — or its \
+                         transcript artifact could not be written), so the declared \
+                         functional validation never ran",
+                        assertion.id
+                    ),
+                    suggested_fix: "run the mission on a unix host that can drive pty \
+                        sessions, or drop the pty-script assertion from the validation \
+                        contract"
+                        .to_string(),
+                    class: "command-assertion".to_string(),
+                    rule: None,
                 });
             }
         }
@@ -4245,12 +6753,46 @@ impl MissionEngine {
             })?;
         }
 
-        // Command assertions are non-waivable but still fixable: send every
-        // finding through convert_findings, then refuse an all-waive that
-        // covers any command-assertion subject (synthesize fixes instead).
-        let command_subjects: std::collections::HashSet<String> = findings
+        // A missing manual attestation is intentionally human-as-MUST. It
+        // is neither a code defect for a worker to chase nor a judgement a
+        // model may waive. Park immediately with the one authorized command;
+        // resuming after that event is recorded re-runs the exact checker.
+        let manual_attestation_rules: Vec<String> = findings
             .iter()
-            .filter(|f| f.class == "command-assertion")
+            .filter_map(|finding| {
+                finding
+                    .rule
+                    .as_ref()
+                    .filter(|rule| rule.checker.as_deref() == Some("manual-attestation"))
+                    .map(|rule| rule.id.clone())
+            })
+            .collect();
+        if !manual_attestation_rules.is_empty() {
+            let rules = manual_attestation_rules.join(", ");
+            self.emit_decision(
+                &format!("Flight Rules manual attestation required: {rules}"),
+                Some(format!(
+                    "Stop the mission runner, inspect the current diff, then record each positive human verdict with `kranz --mission {} standards attest --rule <id> --reason <reason>` and resume. Any relevant diff change invalidates the attestation.",
+                    self.state.mission.id
+                )),
+            )?;
+            self.emit(EventKind::MilestoneBlocked {
+                milestone_id: last_milestone_id,
+                reason: format!(
+                    "authorized manual attestation required for Flight Rules rule(s): {rules}"
+                ),
+            })?;
+            return Ok(None);
+        }
+
+        // Command assertions and failing enforced Flight Rules MUSTs are not
+        // waivable by model discretion. The latter have exactly one exception
+        // channel: a pre-recorded, live standards.waiver.approved event,
+        // consumed above. Refuse any ordinary conversion-turn waive that
+        // names either class and synthesize fixes instead.
+        let protected_subjects: std::collections::HashSet<String> = findings
+            .iter()
+            .filter(|f| f.class == "command-assertion" || f.class == "standards-authoritative")
             .map(|f| f.subject.clone())
             .collect();
         let all_findings = findings;
@@ -4297,7 +6839,7 @@ impl MissionEngine {
             FindingsConversion::Waive { waived }
                 if waived
                     .iter()
-                    .all(|w| !command_subjects.contains(w.subject.as_str())) =>
+                    .all(|w| !protected_subjects.contains(w.subject.as_str())) =>
             {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
@@ -4306,20 +6848,20 @@ impl MissionEngine {
                 Ok(Some(MissionStatus::Complete))
             }
             FindingsConversion::Waive { waived } => {
-                // Model waived a command assertion — refuse. Fix every
-                // command-classified finding the waive covered (and any
+                // Model waived a protected final-gate finding — refuse. Fix
+                // every protected finding the waive covered (and any
                 // other unwaived remainder is already handled by convert
                 // synthesizing; here the waive emptied the set, so rebuild
                 // from command findings only).
                 let refuse_note = waived
                     .iter()
-                    .filter(|w| command_subjects.contains(w.subject.as_str()))
+                    .filter(|w| protected_subjects.contains(w.subject.as_str()))
                     .map(|w| w.subject.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.emit_decision(
                     &format!(
-                        "refused waive of final-gate command assertion(s): {refuse_note}; synthesizing fix feature(s)"
+                        "refused model waive of non-waivable final-gate finding(s): {refuse_note}; synthesizing fix feature(s)"
                     ),
                     Some(
                         waived
@@ -4329,16 +6871,16 @@ impl MissionEngine {
                             .join("\n"),
                     ),
                 )?;
-                let command_only: Vec<&Finding> = all_findings
+                let protected_only: Vec<&Finding> = all_findings
                     .iter()
-                    .filter(|f| command_subjects.contains(&f.subject))
+                    .filter(|f| protected_subjects.contains(&f.subject))
                     .collect();
-                let specs = synthesize_fix_specs(command_only);
+                let specs = synthesize_fix_specs(protected_only);
                 if self.fix_cycle_exhausted(li) && !self.escalate_or_block(&last_milestone_id)? {
                     self.emit(EventKind::MilestoneBlocked {
                         milestone_id: last_milestone_id,
                         reason: format!(
-                            "{} final-gate command assertion(s) failed but the fix-cycle cap ({}) is reached",
+                            "{} non-waivable final-gate finding(s) failed but the fix-cycle cap ({}) is reached",
                             specs.len(),
                             self.state.config.max_fix_cycles_per_milestone
                         ),
@@ -4351,7 +6893,7 @@ impl MissionEngine {
                 self.emit_fix_features(
                     li,
                     specs,
-                    &format!("fix non-waivable command assertion(s): {refuse_note}"),
+                    &format!("fix non-waivable final-gate finding(s): {refuse_note}"),
                     refuse_note,
                 )?;
                 Ok(None)
@@ -4416,6 +6958,12 @@ impl MissionEngine {
             None => self.emit_decision("no cross-mission lesson captured", None)?,
         }
         self.write_mission_report(lesson_paths);
+        // Structured human questions (ticket
+        // structured-human-question-events): questions do not park the run
+        // loop, so an ask can still be open here — a completed mission makes
+        // every one moot. Clear them so the projection never shows a
+        // "your move" on a mission that can no longer act on it.
+        self.clear_open_questions("mission completed", |_| true)?;
         self.emit(EventKind::MissionCompleted {})?;
         Ok(())
     }
@@ -4585,10 +7133,131 @@ impl MissionEngine {
         self.repo.changed_paths(base, &head).unwrap_or_default()
     }
 
-    /// Append knowledge (then lessons) onto a planning seed. Order and
-    /// separate budgets are load-bearing (ticket
-    /// repo-knowledge-ranked-brief-injection).
-    fn append_planning_context(&self, seed: &mut String) {
+    /// Routing rules ownership surface (ticket `routing-rules-config`): the
+    /// rules are read from the live base branch at mission creation
+    /// ([`crate::routing_rules`]), so a mission-branch edit of
+    /// `.kranz/routing-rules.json` can never re-route THIS mission — the
+    /// effective route is pinned in `mission.created`'s config. The edit is
+    /// still surfaced, once per `run()`, on the same advisory decision
+    /// channel as the preflight note: inert, never a block — the
+    /// merge-gates ownership idiom (a mission cannot edit the rules that
+    /// route it), made operator-visible. Ref-based reads keep this true in
+    /// BOTH isolation modes (the integration worktree shares the primary
+    /// refs). Best-effort: a git read failure (e.g. a deleted base ref)
+    /// skips the note rather than failing the run.
+    fn surface_routing_rules_branch_edit(&mut self) -> Result<()> {
+        let path = crate::routing_rules::ROUTING_RULES_PATH;
+        let base = self.repo.show_file(&self.state.mission.base_branch, path);
+        let mission = self
+            .repo
+            .show_file(&self.state.mission.mission_branch, path);
+        let (Ok(base), Ok(mission)) = (base, mission) else {
+            tracing::warn!("routing-rules branch-edit surface: ref read failed; skipping the note");
+            return Ok(());
+        };
+        if base != mission {
+            let base_branch = self.state.mission.base_branch.clone();
+            let mission_branch = self.state.mission.mission_branch.clone();
+            self.emit_decision(
+                &format!(
+                    "{mission_branch} edits {path} — ignored: routing rules are base-branch-owned \
+                     (read from base branch {base_branch:?} at mission creation); land the change \
+                     on {base_branch:?} to route future missions"
+                ),
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Flight Rules ownership surface (ticket `flight-rules-resolution-pin`,
+    /// KRZ-342, design D-E/D-J's "mission edits its own rules" row): the
+    /// approved pin is the mission's standards authority, so a mission-branch
+    /// pack edit can never re-judge THIS mission — and an external pack edit
+    /// after approval cannot change the run (the pinned bytes are the only
+    /// authority). Either edit is still SURFACED, once per `run()`, on the
+    /// same advisory decision channel as the routing-rules note beside it.
+    /// Ref-based reads keep this true in both isolation modes; best-effort:
+    /// a git read failure skips the note rather than failing the run.
+    fn surface_standards_branch_edit(&mut self) -> Result<()> {
+        let Some(pin) = self.state.mission.standards_manifest.clone() else {
+            return Ok(());
+        };
+        let note: Option<String> = match pin.source {
+            crate::types::StandardsPinSource::RepoTracked => {
+                let mission_branch = self.state.mission.mission_branch.clone();
+                match crate::pack::standards::load_at_ref(
+                    &self.repo,
+                    &mission_branch,
+                    &pin.pack_dir,
+                ) {
+                    Ok(Some(branch_manifest)) if branch_manifest.digest == pin.digest => None,
+                    Ok(Some(branch_manifest)) => Some(format!(
+                        "{mission_branch} edits the standards pack `{}` (digest sha256:{} \
+                         vs the approved pin sha256:{}) — ignored: the pin governs this \
+                         mission; the edit can govern only future missions once landed (D-E)",
+                        pin.pack_dir, branch_manifest.digest, pin.digest
+                    )),
+                    Ok(None) => Some(format!(
+                        "{mission_branch} removes the standards pack `{}` — ignored: the \
+                         approved pin sha256:{} governs this mission (D-E)",
+                        pin.pack_dir, pin.digest
+                    )),
+                    Err(error) => Some(format!(
+                        "{mission_branch} edits the standards pack `{}` (its branch copy fails \
+                         to load: {error}) — ignored: the approved pin sha256:{} governs this \
+                         mission (D-E)",
+                        pin.pack_dir, pin.digest
+                    )),
+                }
+            }
+            crate::types::StandardsPinSource::ExternalPinned => {
+                // The external pack is pinned at approval; nothing in the run
+                // re-reads it. Surface a digest mismatch when it still loads
+                // (an unreadable external pack needs no note — nothing
+                // consumes it).
+                let path = std::path::Path::new(&pin.pack_dir);
+                match crate::pack::Pack::load_with_trust(
+                    path,
+                    crate::pack::standards::StandardsTrust::External,
+                ) {
+                    Ok(Some(pack)) => match pack.standards {
+                        Some(manifest) if manifest.digest != pin.digest => Some(format!(
+                            "the external standards pack `{}` was edited after approval \
+                             (digest sha256:{} vs the approved pin sha256:{}) — ignored: the \
+                             pinned snapshot governs this mission (D-E)",
+                            pin.pack_dir, manifest.digest, pin.digest
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        };
+        if let Some(note) = note {
+            self.emit_decision(
+                "standards pack edited outside the approved pin — the pin governs",
+                Some(note),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Append the Flight Rules planning projection, then knowledge (then
+    /// lessons) onto a planning seed. Order and separate budgets are
+    /// load-bearing (ticket repo-knowledge-ranked-brief-injection): the
+    /// standards projection comes FIRST — the plan itself must account for
+    /// applicable policy (KRZ-345, D-D/D-G) — and, unlike the best-effort
+    /// knowledge/lessons blocks, it fails closed (a malformed or over-budget
+    /// corpus errors the seed, D-J). No standards / no applicable rule ⇒
+    /// nothing is appended and the seed stays byte-identical.
+    fn append_planning_context(&self, seed: &mut String) -> Result<()> {
+        if let Some(projection) = self.planning_standards_projection(None)? {
+            if let Some(section) = projection.seed_section() {
+                seed.push_str("\n\n");
+                seed.push_str(&section);
+            }
+        }
         if let Some(block) = self.render_knowledge_for_planning() {
             seed.push_str("\n\n");
             seed.push_str(&block);
@@ -4597,6 +7266,7 @@ impl MissionEngine {
             seed.push_str("\n\n");
             seed.push_str(&index);
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -4681,7 +7351,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            self.append_planning_context(&mut seed);
+            self.append_planning_context(&mut seed)?;
             format!("{seed}\n\nUSER TURN:\n{message}")
         } else {
             format!("{}\n\n{}", digest::render(&self.state), message)
@@ -4706,6 +7376,7 @@ impl MissionEngine {
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
@@ -4726,6 +7397,9 @@ impl MissionEngine {
             milestone_id: None,
             model: role_cfg.model,
             prompt_hash: prompts::hash(Role::Orchestrator),
+            // Task-class routing decides the WORKER executor tier only; the
+            // orchestrator is never routed, so there is no route to record.
+            executor_route: None,
         };
         let outcome = runner::run_session(
             backend.as_ref(),
@@ -4778,7 +7452,7 @@ impl MissionEngine {
                  milestones and features. Do not emit the plan JSON until asked.",
                 self.state.mission.goal
             );
-            self.append_planning_context(&mut seed);
+            self.append_planning_context(&mut seed)?;
             (seed, None)
         } else {
             (digest::render_reseed(&self.state, &self.plan_json()?), None)
@@ -4803,7 +7477,7 @@ impl MissionEngine {
                          the plan JSON until asked.",
                         self.state.mission.goal
                     );
-                    self.append_planning_context(&mut seed);
+                    self.append_planning_context(&mut seed)?;
                     seed
                 } else {
                     digest::render_reseed(&self.state, &self.plan_json()?)
@@ -4863,6 +7537,7 @@ impl MissionEngine {
             max_turns: role_cfg.max_turns,
             env: HashMap::new(),
             sandbox: None,
+            hook_status: None,
         };
         permissions::apply(
             permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
@@ -4893,6 +7568,8 @@ impl MissionEngine {
             role: Role::Orchestrator,
             feature_id: None,
             milestone_id: None,
+            candidate: None,
+            executor_route: None,
             sdk_session_id: sdk_session_id.clone(),
             model: role_cfg.model,
             quant: "n/a".to_string(),
@@ -5101,6 +7778,10 @@ impl MissionEngine {
                     considered_alternatives: None,
                     command_grants: mission.command_grants.clone(),
                     touch_set: mission.touch_set.clone(),
+                    // The Flight Rules pin (KRZ-342) must survive this
+                    // re-serialization — dropping it would silently rewrite
+                    // the approved consent artifact.
+                    standards_manifest: mission.standards_manifest.clone().map(Box::new),
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -5129,6 +7810,49 @@ fn session_exit_summary(exit: &SessionExit) -> String {
     }
 }
 
+/// Classify a worker run that died on a backend auth/dead-binary signature as
+/// an INFRASTRUCTURE failure rather than a worker-quality failure (ticket
+/// worker-spawn-auth-failure-budget). Such a run never produced work, so it
+/// must not burn the respawn budget or fail the feature — the operator
+/// re-auths and the feature re-runs.
+///
+/// Deliberately conservative: BOTH halves must hold, so a genuine slow failure
+/// (the CLI ran, emitted a terminal event, and was judged) never matches —
+/// `without emitting a terminal/result event` is present only when the CLI
+/// died before producing any work product. Returns the operator's re-auth
+/// action when this IS an auth death, `None` otherwise. A backend with no
+/// known auth signature never classifies; its failures consume budget
+/// normally.
+pub(crate) fn spawn_auth_death(
+    outcome: &runner::RunOutcome,
+    kind: BackendKind,
+) -> Option<&'static str> {
+    if outcome.result == RunResult::Pass {
+        return None;
+    }
+    let SessionExit::Failed(message) = &outcome.exit else {
+        return None;
+    };
+    let lower = message.to_lowercase();
+    let no_terminal = lower.contains("without emitting a terminal event")
+        || lower.contains("without emitting a result message");
+    if !no_terminal {
+        return None;
+    }
+    match kind {
+        BackendKind::Cursor if lower.contains("authentication required") => {
+            Some("re-authenticate the cursor CLI (refresh CURSOR_API_KEY or `agent` login)")
+        }
+        BackendKind::Codex if lower.contains("401") || lower.contains("unauthorized") => {
+            Some("re-authenticate the codex CLI (refresh OPENAI_API_KEY or `codex login`)")
+        }
+        BackendKind::Claude if lower.contains("not logged in") || lower.contains("oauth") => {
+            Some("re-authenticate the claude CLI (`claude auth` / refresh ANTHROPIC_API_KEY)")
+        }
+        _ => None,
+    }
+}
+
 /// One feature's slot in a parallel batch (roadmap M3): the feature it runs,
 /// its per-feature branch, and the worktree directory that branch is checked
 /// out in. Built up front so the cleanup guard can always find every worktree.
@@ -5141,10 +7865,43 @@ struct ParallelWorkspace {
     path: PathBuf,
 }
 
+/// How one parallel worktree's Phase C ended (12th-pass review). The merge
+/// loop treats every non-`Ready` variant as "fail the feature", but an
+/// inspection failure additionally PRESERVES the worktree + branch — the
+/// cleanup guard must not reap bytes the checkpoint never verified.
+enum WorktreeDisposition {
+    /// Judged complete: merge the branch.
+    Ready,
+    /// Not ready to merge (a secret-scan policy refusal or a non-complete
+    /// judgement): the feature fails and the cleanup guard reaps as before.
+    NotReady,
+    /// The worktree could not be opened, inspected, or queried: the feature
+    /// fails AND its index lands in the batch's `preserve` set, so the
+    /// cleanup guard keeps the worktree dir and branch for human inspection.
+    InspectionFailed,
+}
+
 /// Result of one buffered parallel worker session (roadmap M3): the event
 /// kinds it collected (to be replayed by the engine's single writer) plus its
 /// [`runner::RunOutcome`], or the error that aborted the session.
 type BufferedRunResult = Result<(Vec<EventKind>, runner::RunOutcome)>;
+
+/// One candidate stream's slot in a dispatch pool (KRZ-303): the configured
+/// backend/model pairing, its branch, and the worktree directory that branch
+/// is checked out in. Mirrors [`ParallelWorkspace`] with one deliberate
+/// difference: pool branches (`kranz/pool/<mission>/<feature>-c<index>`) are
+/// NEVER deleted by the engine — they are the candidate deliverables a
+/// judging human inspects; only the worktree dirs are reaped. The candidate
+/// index is the slot's position in the `workspaces` vec itself (built in
+/// `workerCandidates` order), so it is not duplicated here.
+struct PoolWorkspace {
+    /// Per-candidate branch, off the mission branch tip at dispatch.
+    branch: String,
+    /// Absolute worktree directory the branch is checked out in.
+    path: PathBuf,
+    /// The configured candidate this stream runs.
+    spec: CandidateSpec,
+}
 
 /// Tracks how many parallel worker sessions were live at once (roadmap M3),
 /// so the batch can prove real wall-clock overlap. Cheap and lock-free: each
@@ -5303,6 +8060,59 @@ pub fn mission_worktree_path(repo_root: &std::path::Path, mission_id: &str) -> P
     ))
 }
 
+/// Absolute worktree directory for one dispatch-pool candidate stream
+/// (KRZ-303). Same temp-dir base and repo namespacing as
+/// [`parallel_worktree_path`], with a distinct `kranz-pool-` prefix so
+/// candidate worktrees are mechanically and visually distinct from M3
+/// per-feature worktrees (resume()'s sweeps key off each path shape: M3
+/// branches die with their worktrees; pool BRANCHES are kept — only pool
+/// dirs are reaped).
+fn pool_worktree_path(
+    repo_root: &std::path::Path,
+    mission_id: &str,
+    feature_id: &str,
+    index: usize,
+) -> PathBuf {
+    // Same defensive sanitization as parallel_worktree_path.
+    let safe: String = feature_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!(
+        "kranz-pool-{}-{mission_id}-{safe}-c{index}",
+        repo_worktree_namespace(repo_root)
+    ))
+}
+
+/// The dispatch-pool decision line for a candidate whose worktree could not
+/// even be INSPECTED at the checkpoint (12th-pass review, P2). Recorded
+/// exactly where stream failures are recorded in the pool decision detail,
+/// and the caller additionally pushes the candidate's index into `preserve`
+/// so the cleanup guard skips reaping its worktree dir (its branch is never
+/// deleted regardless) — an inspection error must never destroy deliverable
+/// bytes the engine never got to verify.
+fn pool_inspection_failure_line(
+    idx: usize,
+    n: usize,
+    ws: &PoolWorkspace,
+    error: &EngineError,
+) -> String {
+    format!(
+        "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — worktree inspection failed: {error} \
+         (candidate FAILED; worktree dir and branch preserved for inspection)",
+        n - 1,
+        ws.spec.backend,
+        ws.spec.model,
+        ws.branch
+    )
+}
+
 /// Stable, non-secret repository namespace for process-global temporary
 /// worktree paths. Mission ids are repository-local, so the repository root
 /// must participate in every worktree identity at the host boundary.
@@ -5390,6 +8200,32 @@ fn commit_changed_paths(repo: &GitRepo, sha: &str) -> Result<Vec<String>> {
         Ok(paths) => Ok(paths),
         Err(_) => repo.changed_paths(EMPTY_TREE_SHA, sha),
     }
+}
+
+/// Vacuous-green backstop for declared pty-script assertions (ticket
+/// `pty-script-skip-vacuous-green`): the harness emits a
+/// `validation.pty.transcript` event for every session it DROVE — pass or
+/// fail, the round's verdict is evidence either way — so a declared
+/// assertion with NO such event in the log never executed (every round
+/// skipped it, or its transcript artifact could not be written). The final
+/// gate re-runs only command assertions; without this check a declared
+/// pty-script that skipped on every round would green the mission without
+/// its declared functional validation ever executing.
+fn unexecuted_pty_assertions<'a>(
+    contract: &'a [Assertion],
+    events: &[Event],
+) -> Vec<&'a Assertion> {
+    let executed: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ValidationPtyTranscript { assertion_id, .. } => Some(assertion_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    contract
+        .iter()
+        .filter(|a| a.check == AssertionCheck::PtyScript && !executed.contains(a.id.as_str()))
+        .collect()
 }
 
 /// De-duplicated, first-seen-order commands run by this milestone's workers,
@@ -5533,6 +8369,782 @@ pub(crate) mod tests {
             "integration worktree still listed after teardown: {after:?}"
         );
         assert!(!path.exists(), "integration worktree dir must be gone");
+    }
+
+    // -----------------------------------------------------------------------
+    // emit-never-poisons-log: fold-validate before append
+    // -----------------------------------------------------------------------
+
+    /// Build an engine on a throwaway repo and return it with its events path.
+    fn emit_test_engine(root: &std::path::Path) -> (MissionEngine, std::path::PathBuf) {
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, root, "goal", MissionConfig::default()).unwrap();
+        let events_path = engine.paths.events_file();
+        (engine, events_path)
+    }
+
+    /// An emit whose fold would fail must append NOTHING: the log stays
+    /// byte-identical, the state is untouched, and the error surfaces to the
+    /// caller. This is the m-83d1ed wedge class — appended-then-unfoldable —
+    /// closed at emit time.
+    #[test]
+    fn emit_never_appends_an_unfoldable_event() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (mut engine, events_path) = emit_test_engine(&root);
+        let log_before = std::fs::read(&events_path).unwrap();
+        let state_before = serde_json::to_string(&engine.state).unwrap();
+
+        // mission.created is fold-valid ONLY as the log's first event — and
+        // this log already has one (create() wrote it). Re-emitting the REAL
+        // first event's own kind is the simplest guaranteed unfoldable emit.
+        let first_line = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let first_event: Event = serde_json::from_str(&first_line).unwrap();
+        let result = engine.emit(first_event.kind);
+
+        let err = result.expect_err("a fold-invalid emit must be rejected");
+        assert!(
+            err.to_string().contains("only valid as the first event"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&events_path).unwrap(),
+            log_before,
+            "a rejected emit must leave the log byte-identical"
+        );
+        assert_eq!(
+            serde_json::to_string(&engine.state).unwrap(),
+            state_before,
+            "a rejected emit must leave the state untouched"
+        );
+    }
+
+    /// The happy path keeps its exact-once shape under the new pre-fold: one
+    /// valid emit appends exactly one event, folds it (last_seq +1), and
+    /// refreshes the snapshot to match.
+    #[test]
+    fn emit_never_appends_valid_emit_lands_exactly_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (mut engine, events_path) = emit_test_engine(&root);
+        let lines_before = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .count();
+        let seq_before = engine.state.last_seq;
+
+        engine
+            .emit(EventKind::OrchestratorDecision {
+                summary: "a fold-valid decision".to_string(),
+                detail: None,
+            })
+            .expect("a fold-valid emit must land");
+
+        let lines_after = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines_after, lines_before + 1, "exactly one event appended");
+        assert_eq!(
+            engine.state.last_seq,
+            seq_before + 1,
+            "the event folded exactly once"
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(engine.paths.state_file()).unwrap())
+                .unwrap();
+        assert_eq!(
+            snapshot["lastSeq"].as_u64().unwrap(),
+            seq_before + 1,
+            "the snapshot reflects the fold"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Flight Rules approval pinning (ticket flight-rules-resolution-pin,
+    // KRZ-342, design D-E)
+    // -----------------------------------------------------------------------
+
+    /// Vendor a schema-4 standards pack at `vendor/pack` and commit it on
+    /// main: RFC-001 approved with an unscoped advisory rule, RFC-002 with
+    /// the parametrized status holding a `crates/`-scoped gated must rule.
+    fn flight_rules_pin_vendored_pack(root: &std::path::Path, rfc2_status: &str) {
+        let files = [
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-approve-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n\n[[gate]]\nname = \"zz-gate\"\ncommand = \"cd .\"\n".to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz advisory\nstatus: approved\nowner: zz\n---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rules/ZZ-ADV-001.md".to_string(),
+                "---\nid: ZZ-ADV-001\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: active\n\
+                 statement: zz advisory statement.\ndomains: [zz]\n\
+                 stages: [planning, implementation, validation, merge]\nchecker: agent-judgement\n\
+                 ---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-002-slug/rfc.md".to_string(),
+                format!(
+                    "---\nid: RFC-002\ntitle: zz blocking\nstatus: {rfc2_status}\nowner: zz\n---\nprose\n"
+                ),
+            ),
+            (
+                "vendor/pack/standards/RFC-002-slug/rules/ZZ-MUST-001.md".to_string(),
+                "---\nid: ZZ-MUST-001\nrevision: 1\nrfc: RFC-002\nlevel: must\nstatus: active\n\
+                 statement: zz blocking statement.\ndomains: [zz]\n\
+                 stages: [implementation, validation, merge]\nwhen-paths: [crates/]\n\
+                 checker: gate:zz-gate\nwaivable: false\n---\nprose\n"
+                    .to_string(),
+            ),
+        ];
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the standards pack"]);
+    }
+
+    fn flight_rules_pin_plan(touch_set: Vec<String>) -> Plan {
+        Plan {
+            goal: "goal".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "m".into(),
+                features: vec![PlanFeature {
+                    title: "f".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec![],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set,
+            standards_manifest: None,
+        }
+    }
+
+    fn flight_rules_pin_engine(root: &std::path::Path) -> MissionEngine {
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let cfg = MissionConfig {
+            pack_dir: Some("vendor/pack".to_string()),
+            ..MissionConfig::default()
+        };
+        MissionEngine::create(backend, root, "goal", cfg).expect("create engine")
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_pins_manifest_and_emits_resolved() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        let mut engine = flight_rules_pin_engine(&root);
+        engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect("approve");
+
+        // The pin folded into mission state and names the trusted source.
+        let pin = engine
+            .state
+            .mission
+            .standards_manifest
+            .clone()
+            .expect("a standards pin");
+        assert_eq!(pin.pack_name, "zz-approve-pack");
+        assert_eq!(pin.pack_dir, "vendor/pack");
+        assert_eq!(pin.source, crate::types::StandardsPinSource::RepoTracked);
+        let ids: Vec<&str> = pin.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["ZZ-ADV-001", "ZZ-MUST-001"]);
+
+        // plan.json (the committed consent artifact) carries the manifest…
+        let plan_json = std::fs::read_to_string(engine.paths.plan_file()).unwrap();
+        assert!(plan_json.contains("\"standardsManifest\""), "{plan_json}");
+        assert!(plan_json.contains(&pin.digest), "{plan_json}");
+        // …and plan.md renders the review surface (digest, ids, revisions,
+        // statuses, statements, scopes, checker bindings).
+        let plan_md = std::fs::read_to_string(engine.paths.plan_md_file()).unwrap();
+        assert!(plan_md.contains("Flight Rules standards"), "{plan_md}");
+        assert!(plan_md.contains("ZZ-MUST-001 r1"), "{plan_md}");
+        assert!(plan_md.contains("gate:zz-gate"), "{plan_md}");
+
+        // The event trail reads: plan.approved → standards.resolved, the
+        // latter naming the former's seq.
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        let approved = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+            .expect("plan.approved");
+        let resolved = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::StandardsResolved {
+                    approval_seq,
+                    rules,
+                    ..
+                } => Some((*approval_seq, rules.len())),
+                _ => None,
+            })
+            .expect("standards.resolved");
+        assert_eq!(resolved.0, approved.seq);
+        assert_eq!(resolved.1, 2);
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_rejects_a_stale_carried_manifest() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+
+        // A fabricated (stale/substituted) carried manifest: wrong digest.
+        let mut engine = flight_rules_pin_engine(&root);
+        let mut plan = flight_rules_pin_plan(vec!["crates/**".to_string()]);
+        plan.standards_manifest = Some(Box::new(crate::types::StandardsPin {
+            pack_name: "zz-approve-pack".to_string(),
+            pack_dir: "vendor/pack".to_string(),
+            standards_root: "standards".to_string(),
+            digest: "0".repeat(64),
+            source: crate::types::StandardsPinSource::RepoTracked,
+            task_class: None,
+            touch_set: vec!["crates/**".to_string()],
+            context_paths: Vec::new(),
+            gates: Vec::new(),
+            rules: vec![],
+        }));
+        let err = engine.approve_plan(plan).expect_err("must reject");
+        assert!(format!("{err}").contains("stale or substituted"), "{err}");
+        // Rejection happened BEFORE any side effect: no branch, no events
+        // beyond mission.created, no plan.json.
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(!engine.repo.branch_exists(&branch).unwrap());
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "a rejected approval emits nothing: {events:?}"
+        );
+        assert!(!engine.paths.plan_file().exists());
+
+        // The plan carrying the EXACT trusted resolution approves (the
+        // draft-then-approve-later path).
+        let mut engine = flight_rules_pin_engine(&root);
+        let fresh = crate::pack::resolution::approval_pin(
+            &engine.repo,
+            &engine.state.config,
+            &root,
+            "main",
+            None,
+            None,
+            &["crates/**".to_string()],
+        )
+        .expect("pin")
+        .expect("standards govern");
+        let mut plan = flight_rules_pin_plan(vec!["crates/**".to_string()]);
+        plan.standards_manifest = Some(Box::new(fresh));
+        engine.approve_plan(plan).expect("an exact pin approves");
+    }
+
+    #[test]
+    fn flight_rules_pin_approve_plan_malformed_base_pack_fails_before_side_effects() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // A malformed corpus COMMITTED to the base (a rule with an unknown
+        // status vocabulary word): approval must fail before the mission
+        // branch or any event exists.
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        std::fs::write(
+            root.join("vendor/pack/standards/RFC-002-slug/rfc.md"),
+            "---\nid: RFC-002\ntitle: zz blocking\nstatus: bogus\nowner: zz\n---\nprose\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "break the corpus"]);
+
+        let mut engine = flight_rules_pin_engine(&root);
+        let err = engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect_err("a malformed base pack must fail approval");
+        let text = format!("{err}");
+        assert!(text.contains("RFC-002"), "names the file/field: {text}");
+
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(
+            !engine.repo.branch_exists(&branch).unwrap(),
+            "no mission branch was created"
+        );
+        assert_eq!(
+            engine.repo.current_branch().unwrap(),
+            "main",
+            "the checkout never moved"
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "no run side effects: {events:?}"
+        );
+    }
+
+    #[test]
+    fn flight_rules_pin_mission_branch_pack_edit_is_ignored_and_surfaced() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_pin_vendored_pack(&root, "enforced");
+        let mut engine = flight_rules_pin_engine(&root);
+        engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect("approve");
+        let pinned = engine.state.mission.standards_manifest.clone().unwrap();
+
+        // No edit: the surface stays silent.
+        engine
+            .surface_standards_branch_edit()
+            .expect("surface sweep");
+        assert!(
+            engine.state.recent_decisions.is_empty(),
+            "no note without an edit: {:?}",
+            engine.state.recent_decisions
+        );
+
+        // The mission branch rewrites the pack: retire the enforced RFC.
+        // (Worktree isolation is the default, so the primary checkout never
+        // left main — check the branch out explicitly to commit the edit
+        // onto it; the surface itself reads refs, not the checkout.)
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        let branch = engine.state.mission.mission_branch.clone();
+        // `-f`: approve_plan's untracked plan-file twins in the primary are
+        // byte-identical to the branch's tracked copies, so forcing past
+        // them loses nothing.
+        run(&["checkout", "-f", &branch]);
+        std::fs::write(
+            root.join("vendor/pack/standards/RFC-002-slug/rfc.md"),
+            "---\nid: RFC-002\ntitle: zz blocking\nstatus: retired\nowner: zz\n---\nprose\n",
+        )
+        .unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "mission edits its own rules"]);
+        run(&["checkout", "main"]);
+
+        engine
+            .surface_standards_branch_edit()
+            .expect("surface sweep");
+        // IGNORED: the folded pin is byte-identical…
+        assert_eq!(
+            engine.state.mission.standards_manifest.as_ref(),
+            Some(&pinned),
+            "the mission's own pack edit never reshapes its pin"
+        );
+        // …and SURFACED: one advisory decision naming the pack and the pin.
+        let decision = engine
+            .state
+            .recent_decisions
+            .iter()
+            .find(|d| d.contains("standards pack edited"))
+            .expect("the edit is surfaced");
+        assert!(decision.contains("the pin governs"), "{decision}");
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.contains("standards pack edited") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("the decision carries detail");
+        assert!(detail.contains("vendor/pack"), "{detail}");
+        assert!(detail.contains(&pinned.digest), "{detail}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Flight Rules workflow projections (ticket
+    // flight-rules-workflow-projection, KRZ-345, design D-D/D-G)
+    // -----------------------------------------------------------------------
+
+    /// Vendor a schema-4 pack whose rules exercise the planning projection:
+    /// ZZ-SEED-001 (unscoped — always in the seed's candidate set) plus one
+    /// planning-stage rule per path prefix (crates/, docs/, apps/, src/) so
+    /// successive plans can keep widening the touch set into NEW rules (the
+    /// fixed-point loop's delta).
+    fn flight_rules_projection_vendored_pack(root: &std::path::Path) {
+        let mut files = vec![
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-projection-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz planning policy\nstatus: approved\nowner: \
+                 zz\n---\nprose\n"
+                    .to_string(),
+            ),
+        ];
+        let rule = |id: &str, when_paths: Option<&str>| {
+            let mut body = format!(
+                "---\nid: {id}\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: active\n\
+                 statement: zz statement for {id}.\ndomains: [zz]\nstages: [planning]\n"
+            );
+            if let Some(paths) = when_paths {
+                body.push_str(&format!("when-paths: [{paths}]\n"));
+            }
+            body.push_str("checker: agent-judgement\n---\nprose\n");
+            (
+                format!("vendor/pack/standards/RFC-001-slug/rules/{id}.md"),
+                body,
+            )
+        };
+        files.push(rule("ZZ-SEED-001", None));
+        files.push(rule("ZZ-WIDE-001", Some("crates/")));
+        files.push(rule("ZZ-DOCS-001", Some("docs/")));
+        files.push(rule("ZZ-APPS-001", Some("apps/")));
+        files.push(rule("ZZ-SRC-001", Some("src/")));
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the projection pack"]);
+    }
+
+    /// The streaming orchestrator script: session-start seed turn, then one
+    /// reply per engine turn (the draft_test.rs `orch_script` shape).
+    fn projection_orch_script(replies: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            replies
+                .iter()
+                .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+                .collect(),
+        )
+    }
+
+    /// A parseable plan JSON reply carrying the given touch set; the goal
+    /// doubles as the marker distinguishing which scripted plan came back.
+    fn projection_plan_json(touch_set: &[&str], marker: &str) -> String {
+        serde_json::json!({
+            "goal": marker,
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{"title": "F1", "spec": "s", "validationCriteria": ["c"]}],
+            }],
+            "touchSet": touch_set,
+        })
+        .to_string()
+    }
+
+    fn flight_rules_projection_engine(
+        root: &std::path::Path,
+        mock: Arc<crate::backend_mock::MockBackend>,
+    ) -> MissionEngine {
+        let backend: Arc<dyn AgentBackend> = mock;
+        let cfg = MissionConfig {
+            pack_dir: Some("vendor/pack".to_string()),
+            ..MissionConfig::default()
+        };
+        MissionEngine::create(backend, root, "goal", cfg).expect("create engine")
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_planning_seed_carries_the_projection() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec!["seeded".to_string()]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs[0].prompt else {
+            panic!("the planning session seeds via a streaming prompt");
+        };
+        // The planning-stage projection lands in the seed: the unscoped rule,
+        // its source, the boundary, and the honest advisory label — while the
+        // crates/-scoped rule stays OUT (the seed hints never reach it).
+        assert!(seed.contains("planning projection"), "{seed}");
+        assert!(seed.contains("`ZZ-SEED-001` r1"), "{seed}");
+        assert!(
+            seed.contains("source: pack `zz-projection-pack` root `standards`, RFC `RFC-001`"),
+            "the rule names its source: {seed}"
+        );
+        assert!(seed.contains("candidate resolution at `main`"), "{seed}");
+        assert!(seed.contains("untrusted content boundary"), "{seed}");
+        assert!(seed.contains("advisory — cannot block"), "{seed}");
+        assert!(
+            !seed.contains("ZZ-WIDE-001"),
+            "path-scoped rules wait for the plan's touch set: {seed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_no_pack_seed_is_byte_identical() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // No pack vendored; the default config carries no packDir.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec!["seeded".to_string()]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs[0].prompt else {
+            panic!("the planning session seeds via a streaming prompt");
+        };
+        assert_eq!(
+            seed,
+            "MISSION GOAL:\ngoal\n\nYou are in the planning phase. Interrogate the goal and \
+             the repository (read-only), ask the user sharp questions if anything material is \
+             ambiguous, then propose the validation contract, milestones and features. Do not \
+             emit the plan JSON until asked.",
+            "no standards ⇒ the seed is byte-for-byte the pre-Flight-Rules prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_revision_loop_converges() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+                projection_plan_json(&["crates/**"], "plan-v2"),
+            ]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::Ready(plan) = request else {
+            panic!("the revised plan reaches the fixed point: {request:?}");
+        };
+        assert_eq!(plan.goal, "plan-v2", "the REVISED plan is offered");
+
+        let messages = &mock.injected_messages()[0];
+        assert_eq!(
+            messages.len(),
+            3,
+            "seed turn + plan demand + exactly ONE bounded revision turn: {messages:?}"
+        );
+        let revision = &messages[2];
+        assert!(
+            revision.contains("activates Flight Rules policy you have not seen"),
+            "{revision}"
+        );
+        assert!(
+            revision.contains("`ZZ-WIDE-001` r1"),
+            "the exact delta is delivered: {revision}"
+        );
+        assert!(
+            !revision.contains("ZZ-SEED-001"),
+            "the seed-delivered rule is never re-delivered: {revision}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_parks_after_bounded_revisions() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        flight_rules_projection_vendored_pack(&root);
+        // Every reply widens the touch set into another rule: the loop never
+        // converges inside the revision budget and planning parks.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+                projection_plan_json(&["crates/**", "docs/**"], "plan-v2"),
+                projection_plan_json(&["crates/**", "docs/**", "apps/**"], "plan-v3"),
+                projection_plan_json(&["crates/**", "docs/**", "apps/**", "src/**"], "plan-v4"),
+            ]),
+        ]));
+        let mut engine = flight_rules_projection_engine(&root, mock.clone());
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::NotReady(text) = request else {
+            panic!("a non-converging plan is never offered for approval: {request:?}");
+        };
+        assert!(text.contains("Planning parked"), "{text}");
+        assert!(
+            text.contains("ZZ-SRC-001"),
+            "the park names the rules still unaccounted for: {text}"
+        );
+        assert_eq!(
+            mock.injected_messages()[0].len(),
+            5,
+            "plan demand + three bounded revision turns, then the park"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_rules_projection_request_plan_no_pack_never_revises() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // No pack: any touch set is offered immediately, byte-identical.
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            projection_orch_script(vec![
+                "seeded".to_string(),
+                projection_plan_json(&["crates/**"], "plan-v1"),
+            ]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.planning_turn("goal").await.expect("planning turn");
+
+        let request = engine.request_plan().await.expect("request_plan");
+        let PlanRequest::Ready(plan) = request else {
+            panic!("a standards-free mission offers the plan untouched: {request:?}");
+        };
+        assert_eq!(plan.goal, "plan-v1");
+        assert_eq!(
+            mock.injected_messages()[0].len(),
+            2,
+            "no revision turn without standards"
+        );
+    }
+
+    #[test]
+    fn flight_rules_projection_approve_plan_over_budget_fails_closed() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // One rule whose statement alone exceeds the hard byte cap: approval
+        // must fail naming the rule — never truncate policy to fit (D-D/D-J).
+        let fat = "x".repeat(crate::pack::projection::MAX_PROJECTION_STATEMENT_BYTES + 1);
+        let files = [
+            (
+                "vendor/pack/pack.toml".to_string(),
+                "[pack]\nname = \"zz-fat-pack\"\nschema = 4\n\n[standards]\nroot = \
+                 \"standards\"\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rfc.md".to_string(),
+                "---\nid: RFC-001\ntitle: zz fat\nstatus: approved\nowner: zz\n---\nprose\n"
+                    .to_string(),
+            ),
+            (
+                "vendor/pack/standards/RFC-001-slug/rules/ZZ-FAT-001.md".to_string(),
+                format!(
+                    "---\nid: ZZ-FAT-001\nrevision: 1\nrfc: RFC-001\nlevel: should\nstatus: \
+                     active\nstatement: {fat}\ndomains: [zz]\nstages: [planning, \
+                     implementation, validation, merge]\nchecker: agent-judgement\n---\nprose\n"
+                ),
+            ),
+        ];
+        for (rel, body) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "vendor the over-budget pack"]);
+
+        let mut engine = flight_rules_pin_engine(&root);
+        let err = engine
+            .approve_plan(flight_rules_pin_plan(vec!["crates/**".to_string()]))
+            .expect_err("over-budget applicable policy must fail approval");
+        let text = format!("{err}");
+        assert!(text.contains("ZZ-FAT-001"), "names the excess rule: {text}");
+        assert!(text.contains("never truncated"), "{text}");
+
+        // The refusal landed BEFORE any approval side effect: no mission
+        // branch, no events beyond mission.created, no plan.json.
+        let branch = engine.state.mission.mission_branch.clone();
+        assert!(!engine.repo.branch_exists(&branch).unwrap());
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::MissionCreated { .. })),
+            "a refused approval emits nothing: {events:?}"
+        );
+        assert!(!engine.paths.plan_file().exists());
     }
 
     // -----------------------------------------------------------------------
@@ -5950,6 +9562,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("codex".to_string());
         cfg.skip_functional = true;
+        cfg.validator_allow_uncontained_degrade = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
@@ -6018,6 +9631,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("droid".to_string());
         cfg.skip_functional = true;
+        cfg.validator_allow_uncontained_degrade = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
@@ -6124,12 +9738,15 @@ pub(crate) mod tests {
             known_gaps: vec![],
             commits: vec![],
             commands_run: vec!["gc lint".to_string(), "gc lint".to_string()],
+            escalation: None,
+            questions: None,
         };
         let run = WorkerRun {
             id: "run-1".to_string(),
             role: Role::Worker,
             feature_id: Some("f1".to_string()),
             milestone_id: None,
+            candidate: None,
             sdk_session_id: "sdk-1".to_string(),
             model: "m".to_string(),
             quant: "n/a".to_string(),
@@ -6180,6 +9797,8 @@ pub(crate) mod tests {
                 touch_set: vec![],
                 deny_exceptions: vec![],
                 egress_grants: vec![],
+                executor_route: None,
+                standards_manifest: None,
             },
             runs,
             totals: TokenUsage::default(),
@@ -6190,12 +9809,15 @@ pub(crate) mod tests {
             latest_plan_revision: 0,
             pending_revision: None,
             pending_grant_request: None,
+            pending_questions: vec![],
+            question_count: 0,
             last_seq: 0,
             escalated_milestones: 0,
             local_executor_milestones: 0,
             workspace_provider: None,
             workspace_pin: None,
             workspace_lifecycle: None,
+            resolved_divergence_units: std::collections::BTreeSet::new(),
         };
 
         assert_eq!(
@@ -6505,6 +10127,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             worker_isolation: WorkerIsolation::Checkout,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
@@ -6566,6 +10189,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             worker_isolation: WorkerIsolation::Checkout,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
@@ -6708,6 +10332,164 @@ pub(crate) mod tests {
         );
         assert!(validator_snapshot_leftovers(&engine).is_empty());
         assert_eq!(mock.started_specs().len(), 1);
+    }
+
+    /// Mandatory containment (tickets `validator-mandatory-containment` and
+    /// `validator-containment-degrade-fail-closed`): with the default
+    /// `enforce: off` a validation round STILL wraps the validator where the
+    /// platform and backend can contain it — the pre-resolved sandbox reaches
+    /// the session spec with the snapshot as the writable root, the real
+    /// checkout as the read-deny root, and the session-private scratch
+    /// pinned — the posture is recorded as an orchestrator decision, the
+    /// round completes, and the after-fingerprint tripwire stays armed as
+    /// defense-in-depth (never the only net). Where the platform cannot
+    /// contain (no bwrap, no Seatbelt) the round FAILS CLOSED by default —
+    /// no uncontained validator session spawns — and only the explicit
+    /// `validatorAllowUncontainedDegrade` opt-in restores the loudly
+    /// degraded round (14th-pass reversal of the 224fa73 degrade default).
+    #[tokio::test]
+    async fn validator_containment_wraps_enforce_off_round_and_records_posture() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let containable = cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux") && crate::sandbox::command_available("bwrap"));
+        if !containable {
+            // Fail closed by default (ticket
+            // validator-containment-degrade-fail-closed): the round errors
+            // naming the opt-in flag, and no uncontained validator session
+            // ever spawns.
+            let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+            let backend: Arc<dyn AgentBackend> = mock.clone();
+            let mut engine = single_milestone_engine(backend, &root);
+            engine.state.config.validator_allow_uncontained_degrade = false;
+            let err = engine
+                .validation_round(0)
+                .await
+                .expect_err("an uncontainable platform fails the round closed by default");
+            assert!(
+                err.to_string().contains("validatorAllowUncontainedDegrade"),
+                "the fail-closed error names the opt-in flag: {err}"
+            );
+            assert!(
+                mock.started_specs().is_empty(),
+                "no uncontained validator session spawns"
+            );
+            assert!(validator_snapshot_leftovers(&engine).is_empty());
+
+            // The explicit opt-in restores the loud degrade: the round
+            // completes with the note recorded — never silently bare.
+            let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                clean_validator_script(),
+            ]));
+            let backend: Arc<dyn AgentBackend> = mock.clone();
+            let mut engine = single_milestone_engine(backend, &root);
+            engine.state.config.validator_allow_uncontained_degrade = true;
+            engine.validation_round(0).await.unwrap();
+            let specs = mock.started_specs();
+            assert_eq!(specs.len(), 1);
+            assert!(
+                specs[0].sandbox.is_none(),
+                "the opted-in degrade runs unwrapped — never silently wrapped"
+            );
+            let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+            let decisions: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                decisions
+                    .iter()
+                    .any(|s| s.contains("NOT sandbox-contained")),
+                "the LOUD degradation note is recorded per round: {decisions:?}"
+            );
+            assert!(validator_snapshot_leftovers(&engine).is_empty());
+            return;
+        }
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = single_milestone_engine(backend, &root);
+
+        engine.validation_round(0).await.unwrap();
+
+        // The contained round completes…
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "the contained round still completes: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        // …and the after-fingerprint remains — defense-in-depth, not the
+        // only net: the tripwire ran and stayed silent on a clean round.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidatorTamper { .. })),
+            "the tripwire stays armed: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1);
+        let decisions: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let sandbox = specs[0]
+            .sandbox
+            .as_ref()
+            .expect("enforce: off no longer leaves the validator unwrapped");
+        let expected_cwd = engine.paths.runs_dir().join("validator-snapshot-scrutiny");
+        assert_eq!(
+            sandbox.inputs.session_cwd, expected_cwd,
+            "the snapshot is the writable root"
+        );
+        assert_eq!(
+            sandbox.inputs.tmpdir,
+            crate::backend_claude::scratch_home_root(&specs[0].session_id),
+            "the writable scratch is pinned to THIS session's private root"
+        );
+        assert_eq!(
+            sandbox.inputs.validator_read_deny_roots,
+            vec![engine.paths.repo_root.clone()],
+            "checkout mode: the real checkout is the single read-deny root"
+        );
+        assert!(
+            sandbox.inputs.extra_write.is_empty(),
+            "no operator extraWrite widening under the mandatory wrap"
+        );
+        assert!(
+            decisions
+                .iter()
+                .any(|s| s.contains("sandbox-contained (mandatory)")),
+            "the contained posture is recorded per round: {decisions:?}"
+        );
+        // The generated profile read-denies the real tree's contents
+        // (string-level; the applied sandbox-exec/bwrap probes live in
+        // crate::sandbox's tests).
+        let profile = crate::sandbox::generate_profile(&sandbox.inputs);
+        let readme = format!("(literal \"{}\")", root.join("README.md").display());
+        assert!(
+            profile.contains(&readme),
+            "the real checkout's source files are read-denied:\n{profile}"
+        );
+        let git_dir = format!("\"{}\"", root.join(".git").display());
+        assert!(
+            !profile.contains(&git_dir),
+            "the shared git dir stays readable (the inspection surface):\n{profile}"
+        );
+        assert!(validator_snapshot_leftovers(&engine).is_empty());
     }
 
     /// A validator that commits inside its session moves only the
@@ -6979,6 +10761,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         cfg.worker.backend = Some("local".to_string());
@@ -7071,6 +10854,482 @@ pub(crate) mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Declared pty-script that never executed (ticket
+    // pty-script-skip-vacuous-green): the final-gate backstop
+    // ---------------------------------------------------------------------------
+
+    /// A declared pty-script assertion with NO validation.pty.transcript
+    /// event in the log never executed (every round skipped it) — the gate
+    /// flags it. A recorded verdict (pass OR fail: the session ran and the
+    /// round's verdict stands) clears it, and non-pty assertions are never
+    /// flagged.
+    #[test]
+    fn final_gate_declared_pty_without_transcript_verdict_is_flagged() {
+        let pty = |id: &str| Assertion {
+            id: id.to_string(),
+            statement: "s".to_string(),
+            check: AssertionCheck::PtyScript,
+            command: None,
+            pty_script: Some(PtyScript {
+                command: "./repl".to_string(),
+                steps: Vec::new(),
+                timeout_secs: None,
+            }),
+        };
+        let contract = vec![
+            pty("a-pty"),
+            pty("a-pty-2"),
+            Assertion {
+                id: "a-cmd".to_string(),
+                statement: "s".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("true".to_string()),
+                pty_script: None,
+            },
+        ];
+        let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m".to_string(),
+            kind: EventKind::ValidationPtyTranscript {
+                milestone_id: "ms-1".to_string(),
+                assertion_id: id.to_string(),
+                verdict,
+                artefact_ref: format!("file:runs/pty-transcripts/{id}-deadbeef.log"),
+                detail: None,
+            },
+        };
+        let flagged_ids = |contract: &[Assertion], events: &[Event]| -> Vec<String> {
+            unexecuted_pty_assertions(contract, events)
+                .iter()
+                .map(|a| a.id.clone())
+                .collect()
+        };
+
+        // No transcript events at all: both declared pty assertions are
+        // unexecuted; the command assertion is irrelevant to the check.
+        assert_eq!(
+            flagged_ids(&contract, &[]),
+            vec!["a-pty".to_string(), "a-pty-2".to_string()]
+        );
+
+        // A FAIL verdict still means the session EXECUTED — the round's
+        // verdict stands (the round's validator judges fail evidence); only
+        // the never-executed assertion is flagged. An event naming an
+        // assertion the contract does not declare clears nothing.
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Fail, 1),
+            transcript_event("a-pty-elsewhere", crate::gate::GateVerdict::Pass, 2),
+        ];
+        assert_eq!(flagged_ids(&contract, &events), vec!["a-pty-2".to_string()]);
+
+        // Verdicts on record for both: nothing flagged.
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Pass, 1),
+            transcript_event("a-pty-2", crate::gate::GateVerdict::Pass, 2),
+        ];
+        assert!(flagged_ids(&contract, &events).is_empty());
+
+        // A contract with no pty assertions flags nothing, events or not.
+        assert!(flagged_ids(&contract[2..], &[]).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Confirm-on-pass: the guarded local functional validator
+    // (ticket local-inference-validator-guarded, KRZ-206b)
+    // ---------------------------------------------------------------------------
+
+    /// A chat-completions body whose single message carries `report` — the
+    /// stub local endpoint's answer to every request (one local verdict per
+    /// test). Drives a REAL [`crate::backend_local::LocalBackend`], so the
+    /// local functional verdict travels the same HTTP seam as in production.
+    fn local_stub_body(report: serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": report.to_string()}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10}
+        })
+        .to_string()
+    }
+
+    /// A single-milestone engine whose FUNCTIONAL validator is local-backed
+    /// (the stub endpoint at `base_url`); scrutiny is skipped so the only
+    /// validator in play is the functional role under test. One command
+    /// assertion (`true` — a deterministic engine-side PASS) gives the local
+    /// verdict a mechanical check to pass.
+    fn local_functional_engine(
+        backend: Arc<dyn AgentBackend>,
+        root: &std::path::Path,
+        base_url: String,
+    ) -> MissionEngine {
+        let mut cfg = MissionConfig {
+            skip_scrutiny: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        cfg.validator_functional.backend = Some("local".to_string());
+        cfg.validator_functional.base_url = Some(base_url);
+        cfg.validator_functional.context_budget = Some(100_000);
+        // The local backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — the
+        // guarded-local tests exercise the local lane itself, under the
+        // degrade.
+        cfg.validator_allow_uncontained_degrade = true;
+        let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
+        engine.state.mission.validation_contract = vec![Assertion {
+            id: "a1".to_string(),
+            statement: "the build passes".to_string(),
+            check: AssertionCheck::Command,
+            command: Some("true".to_string()),
+            pty_script: None,
+        }];
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        engine
+    }
+
+    /// KRZ-206b pin: a local functional PASS on a contract-command assertion
+    /// NEVER greens the round alone — the frontier confirmation runs first,
+    /// and only its agreement completes the milestone. The comparison is
+    /// recorded on `validation.confirm`: the local-vs-frontier miss-rate
+    /// ground truth lives in the event store.
+    #[tokio::test]
+    async fn guarded_local_validator_pass_triggers_frontier_confirm_before_green() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(), // the frontier confirmation: agrees
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        // Exactly one LOCAL session (the primary — one HTTP request) and
+        // exactly one FRONTIER session (the confirmation — one mock start,
+        // on the claude fallback model, never another local call).
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let specs = mock.started_specs();
+        assert_eq!(specs.len(), 1, "only the confirmation runs on the mock");
+        assert_eq!(
+            specs[0].model, "sonnet",
+            "the confirmation is the FRONTIER functional session"
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let confirm_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    local_run_id,
+                    confirm_run_id,
+                    confirmed,
+                    disagreements,
+                    judgment_opportunity,
+                } if milestone_id == "ms-1" => {
+                    assert_eq!(confirmed, &vec!["a1".to_string()]);
+                    assert!(disagreements.is_empty());
+                    assert!(
+                        !judgment_opportunity,
+                        "a command-assertion confirmation is no judgment opportunity"
+                    );
+                    assert_ne!(local_run_id, confirm_run_id);
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "validation.confirm must land on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        let completed_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("an agreed confirmation completes the milestone");
+        assert!(
+            confirm_seq < completed_seq,
+            "the confirmation must land BEFORE the green: confirm seq {confirm_seq}, \
+             completed seq {completed_seq}"
+        );
+    }
+
+    /// 14th-pass review pin: a contract with NO command assertions hands the
+    /// local session pure judgment, and its all-clean report is confirmed
+    /// exactly like a command-assertion PASS — but there are no assertion
+    /// ids to list, so the event must mark the judgment opportunity
+    /// explicitly or the miss-rate denominator undercounts (a clean
+    /// judgment-only confirmation is one opportunity, zero misses).
+    #[tokio::test]
+    async fn guarded_local_validator_judgment_only_confirm_counts_the_opportunity() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            clean_validator_script(), // the frontier confirmation: agrees
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+        // Judgment-only: no command assertions at all.
+        engine.state.mission.validation_contract = vec![Assertion {
+            id: "j1".to_string(),
+            statement: "the diff reads correct".to_string(),
+            check: AssertionCheck::AgentJudgement,
+            command: None,
+            pty_script: None,
+        }];
+        // The local backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — the
+        // guarded-local tests exercise exactly that degraded local lane.
+        engine.state.config.validator_allow_uncontained_degrade = true;
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let (confirmed, disagreements, judgment_opportunity) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    confirmed,
+                    disagreements,
+                    judgment_opportunity,
+                    ..
+                } if milestone_id == "ms-1" => Some((
+                    confirmed.clone(),
+                    disagreements.clone(),
+                    *judgment_opportunity,
+                )),
+                _ => None,
+            })
+            .expect("the judgment-only PASS still runs the frontier confirmation");
+        assert!(
+            confirmed.is_empty(),
+            "no command assertions to confirm: {confirmed:?}"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "the frontier tier agreed: {disagreements:?}"
+        );
+        assert!(
+            judgment_opportunity,
+            "the judgment-only confirmation is one miss-rate opportunity the \
+             lists cannot name — recording it is the whole point"
+        );
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "an agreed judgment-only confirmation completes the milestone"
+        );
+    }
+
+    /// KRZ-206b pin: local PASS vs frontier FAIL is a recorded miss and fails
+    /// CLOSED — the frontier finding stands as a round finding, the milestone
+    /// does NOT complete, and the finding flows to the fix path.
+    #[tokio::test]
+    async fn guarded_local_validator_disagreement_fails_closed_to_frontier() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The frontier confirmation disagrees: a1 is failing.
+            tier_escalation_finding_script("a1"),
+            // The conversion turn answers the finding with a fix feature.
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The miss is recorded (the measurement): nothing confirmed, one
+        // disagreement on a1.
+        let (confirmed, disagreements) = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ValidationConfirm {
+                    milestone_id,
+                    confirmed,
+                    disagreements,
+                    ..
+                } if milestone_id == "ms-1" => Some((confirmed.clone(), disagreements.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "validation.confirm must land on the log: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            confirmed.is_empty(),
+            "a1 was overturned — no check stays confirmed: {confirmed:?}"
+        );
+        assert_eq!(disagreements.len(), 1);
+        assert_eq!(disagreements[0].subject, "a1");
+        // ...and it FAILED CLOSED: the frontier verdict became a round
+        // finding (no silent green), never a completion.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { milestone_id, finding, .. } if milestone_id == "ms-1" && finding.subject == "a1")),
+            "the disagreement must fail closed as a validation.finding: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a disagreed PASS must not complete the milestone"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "the failed-closed finding flows to the fix path: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// KRZ-206b pin (the deliberate asymmetry): a local FAIL is trusted
+    /// WITHOUT a frontier confirmation — failures are visible (they cost a
+    /// fix cycle); misses are the danger. No confirmation session runs and
+    /// no `validation.confirm` lands.
+    #[tokio::test]
+    async fn guarded_local_validator_local_fail_is_trusted_without_confirmation() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({
+                "findings": [{
+                    "subject": "a1",
+                    "severity": "critical",
+                    "evidence": "the local validator sees a1 failing"
+                }],
+                "summary": "a1 fails"
+            })),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The only mock session: the conversion turn's fix-feature reply.
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        // One local session (the primary), and the ONLY mock session is the
+        // conversion orchestrator — no frontier validator ever ran.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.started_specs().len(),
+            1,
+            "only the conversion orchestrator runs on the mock — no confirmation"
+        );
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationConfirm { .. })),
+            "a local FAIL triggers no confirmation: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationFinding { milestone_id, finding, .. } if milestone_id == "ms-1" && finding.subject == "a1")),
+            "the local FAIL is trusted as a round finding: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "a failed round must not complete the milestone"
+        );
+    }
+
+    /// KRZ-206b pin: an untrusted confirmation fails CLOSED — the round
+    /// blocks rather than greening an unconfirmed local PASS.
+    #[tokio::test]
+    async fn guarded_local_validator_untrusted_confirmation_blocks_instead_of_greening() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (base_url, _requests, _received) = crate::backend_local::tests::spawn_stub(
+            "HTTP/1.1 200 OK",
+            local_stub_body(serde_json::json!({"findings": [], "summary": "clean"})),
+        )
+        .await;
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            // The frontier confirmation crashes without a report.
+            crate::backend_mock::MockScript::single_shot("not json")
+                .with_exit(SessionExit::Failed("confirm crashed".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = local_functional_engine(backend, &root, base_url);
+
+        engine.validation_round(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("cannot green the gate unconfirmed"))),
+            "an untrusted confirmation blocks honestly: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::ValidationConfirm { .. })),
+            "no comparison record without a trusted confirmation: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1")),
+            "an unconfirmed local PASS must never complete the milestone"
+        );
+    }
+
     /// Companion to the escalation test: a mission whose executor is already
     /// on the frontier tier still blocks at the fix-cycle cap — the guard
     /// only changes behaviour while the executor is Local.
@@ -7082,6 +11341,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
 
@@ -7136,6 +11396,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         cfg.worker.backend = Some("local".to_string());
@@ -7184,6 +11445,949 @@ pub(crate) mod tests {
         assert_eq!(
             engine.state.config.backend_kind(Role::ValidatorScrutiny),
             BackendKind::Claude
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker self-escalation to the frontier advisor
+    // (ticket backend-routing-abstraction, KRZ-331)
+    // -----------------------------------------------------------------------
+
+    /// The escalation event names the SOURCE route the escalating worker ran
+    /// on and the TARGET advisor route — and the emission is record-only:
+    /// the validator route and the executor tier are byte-identical after it
+    /// (a worker escalation can never bypass the floor's validator
+    /// requirements; the tier flip is tier.escalated's job, and that is
+    /// orchestrator-initiated only).
+    #[tokio::test]
+    async fn routing_abstraction_escalation_event_names_source_and_target_routes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
+
+        // A recorded worker run to escalate from (the fold validates the run
+        // reference as a corruption guard, so the run must exist).
+        engine
+            .emit(EventKind::WorkerSpawned {
+                run_id: "r-1".to_string(),
+                role: Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            })
+            .unwrap();
+
+        let outcome = |escalation: Option<&str>| runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result: RunResult::Pass,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: Some(WorkerReport {
+                result: RunResult::Pass,
+                summary: "s".to_string(),
+                files_touched: vec![],
+                tests_added: vec![],
+                test_evidence: String::new(),
+                dependencies_added: vec![],
+                known_gaps: vec![],
+                commits: vec![],
+                commands_run: vec![],
+                escalation: escalation.map(|s| s.to_string()),
+                questions: None,
+            }),
+            validator_report: None,
+            exit: SessionExit::Completed,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        };
+
+        let validators_before = (
+            engine.state.config.validator_scrutiny.clone(),
+            engine.state.config.validator_functional.clone(),
+        );
+        engine
+            .emit_worker_escalation(
+                "f-1-1",
+                &outcome(Some("spec ambiguity beyond my confidence")),
+            )
+            .unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let recorded: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerEscalated {
+                    run_id,
+                    feature_id,
+                    from,
+                    to,
+                    reason,
+                } => Some((
+                    run_id.clone(),
+                    feature_id.clone(),
+                    *from,
+                    *to,
+                    reason.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one worker.escalated: {events:?}"
+        );
+        let (run_id, feature_id, from, to, reason) = &recorded[0];
+        assert_eq!(run_id, "r-1");
+        assert_eq!(feature_id, "f-1-1");
+        assert_eq!(
+            *from,
+            ExecutorTier::Local,
+            "the source route is the tier the worker session ran on"
+        );
+        assert_eq!(
+            *to,
+            ExecutorTier::Frontier,
+            "the target route is the frontier advisor"
+        );
+        assert_eq!(reason, "spec ambiguity beyond my confidence");
+
+        // Record-only: the floor is untouched.
+        assert_eq!(engine.state.config.validator_scrutiny, validators_before.0);
+        assert_eq!(
+            engine.state.config.validator_functional,
+            validators_before.1
+        );
+        assert_eq!(
+            engine.state.executor_tier(),
+            ExecutorTier::Local,
+            "a worker escalation never flips the executor tier"
+        );
+
+        // No escalation requested (or no report at all) ⇒ no event.
+        engine
+            .emit_worker_escalation("f-1-1", &outcome(None))
+            .unwrap();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::WorkerEscalated { .. }))
+                .count(),
+            1,
+            "a report without an escalation request must not record one"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured human questions (ticket structured-human-question-events)
+    // -----------------------------------------------------------------------
+
+    /// Engine with an approved one-milestone/one-feature plan, ms-1 started,
+    /// and worker run r-1 spawned on f-1-1 — the context refs a
+    /// `question.opened` can name (the fold validates them).
+    #[cfg(test)]
+    fn question_events_engine() -> Option<(tempfile::TempDir, MissionEngine)> {
+        question_events_engine_with(Arc::new(crate::backend_mock::MockBackend::new()))
+    }
+
+    /// [`question_events_engine`] over a caller-supplied (scripted) backend,
+    /// for tests that drive an orchestrator turn after the question flow.
+    #[cfg(test)]
+    fn question_events_engine_with(
+        backend: Arc<dyn AgentBackend>,
+    ) -> Option<(tempfile::TempDir, MissionEngine)> {
+        let (_dir, root) = lessons_test_repo()?;
+        let mut engine = MissionEngine::create(
+            backend,
+            &root,
+            "goal",
+            MissionConfig {
+                worker_isolation: WorkerIsolation::Checkout,
+                ..MissionConfig::default()
+            },
+        )
+        .expect("create engine");
+        engine
+            .approve_plan(Plan {
+                goal: "g".into(),
+                validation_contract: vec![],
+                milestones: vec![PlanMilestone {
+                    title: "m".into(),
+                    features: vec![PlanFeature {
+                        title: "f".into(),
+                        spec: "s".into(),
+                        validation_criteria: vec![],
+                    }],
+                }],
+                considered_alternatives: None,
+                command_grants: vec![],
+                touch_set: vec![],
+                standards_manifest: None,
+            })
+            .expect("approve plan");
+        engine
+            .emit(EventKind::MilestoneStarted {
+                milestone_id: "ms-1".to_string(),
+                start_sha: "sha-1".to_string(),
+            })
+            .unwrap();
+        engine
+            .emit(EventKind::WorkerSpawned {
+                run_id: "r-1".to_string(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".to_string()),
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "s-1".to_string(),
+                model: "m".to_string(),
+                quant: "n/a".to_string(),
+                weight_hash: None,
+                prompt_hash: "h".to_string(),
+                transcript_path: "runs/r-1.jsonl".to_string(),
+            })
+            .unwrap();
+        Some((_dir, engine))
+    }
+
+    /// A worker outcome whose report carries the given questions (and no
+    /// escalation) — the "ask the human" payload the run path hands
+    /// [`MissionEngine::emit_worker_questions`].
+    #[cfg(test)]
+    fn question_outcome(
+        questions: Option<Vec<crate::types::ReportQuestion>>,
+    ) -> runner::RunOutcome {
+        runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result: RunResult::Partial,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: Some(WorkerReport {
+                result: RunResult::Partial,
+                summary: "blocked on a human choice".to_string(),
+                files_touched: vec![],
+                tests_added: vec![],
+                test_evidence: String::new(),
+                dependencies_added: vec![],
+                known_gaps: vec![],
+                commits: vec![],
+                commands_run: vec![],
+                escalation: None,
+                questions,
+            }),
+            validator_report: None,
+            exit: SessionExit::Completed,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        }
+    }
+
+    /// Build a minimal worker outcome with the given result/exit for the
+    /// spawn_auth_death classifier tests.
+    fn auth_death_outcome(result: RunResult, exit: SessionExit) -> runner::RunOutcome {
+        runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: None,
+            validator_report: None,
+            exit,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+        }
+    }
+
+    #[test]
+    fn spawn_auth_death_cursor_instant_auth_death_classifies() {
+        // The m-eee81f shape: cursor died in ~1s with an auth error and no
+        // terminal event.
+        let outcome = auth_death_outcome(
+            RunResult::Fail,
+            SessionExit::Failed(
+                "cursor exited with exit status: 1 without emitting a terminal event; \
+                 stderr tail: Error: Authentication required"
+                    .to_string(),
+            ),
+        );
+        let action = spawn_auth_death(&outcome, BackendKind::Cursor)
+            .expect("cursor instant auth death must classify");
+        assert!(action.contains("cursor"), "{action}");
+    }
+
+    #[test]
+    fn spawn_auth_death_genuine_slow_failure_does_not_classify() {
+        // A worker that RAN, emitted a terminal event, and failed its
+        // judgement: the "without emitting" signal is absent, so even an
+        // auth-shaped stderr tail does not classify — this consumes budget.
+        let outcome = auth_death_outcome(
+            RunResult::Fail,
+            SessionExit::Failed(
+                "cursor exited with exit status: 1; stderr tail: authentication required"
+                    .to_string(),
+            ),
+        );
+        assert!(
+            spawn_auth_death(&outcome, BackendKind::Cursor).is_none(),
+            "a run that produced a terminal event is a genuine failure, not an auth death"
+        );
+        // A passing run never classifies.
+        let pass = auth_death_outcome(RunResult::Pass, SessionExit::Completed);
+        assert!(spawn_auth_death(&pass, BackendKind::Cursor).is_none());
+        // A clean abort (interrupt/budget) never classifies.
+        let aborted = auth_death_outcome(RunResult::Partial, SessionExit::Aborted);
+        assert!(spawn_auth_death(&aborted, BackendKind::Cursor).is_none());
+    }
+
+    #[test]
+    fn spawn_auth_death_per_backend_signatures_and_unknown_backends() {
+        let cursor_death = |tail: &str| {
+            auth_death_outcome(
+                RunResult::Fail,
+                SessionExit::Failed(format!(
+                    "agent exited with exit status: 1 without emitting a terminal event; \
+                     stderr tail: {tail}"
+                )),
+            )
+        };
+        // codex: 401.
+        let o = cursor_death("http 401 unauthorized");
+        assert!(spawn_auth_death(&o, BackendKind::Codex).is_some());
+        // claude: not logged in / oauth.
+        let o = cursor_death("Not logged in");
+        assert!(spawn_auth_death(&o, BackendKind::Claude).is_some());
+        let o = cursor_death("OAuth token expired");
+        assert!(spawn_auth_death(&o, BackendKind::Claude).is_some());
+        // An unrecognized signature does not classify.
+        let o = cursor_death("segfault");
+        assert!(spawn_auth_death(&o, BackendKind::Cursor).is_none());
+        // A backend with no known signature (kimi/local/…) never classifies.
+        let o = cursor_death("authentication required");
+        assert!(spawn_auth_death(&o, BackendKind::Kimi).is_none());
+    }
+
+    #[test]
+    fn question_events_worker_report_opens_pending_decision_projection() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![
+                    crate::types::ReportQuestion {
+                        text: "Which storage engine should the cache use?".to_string(),
+                        options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                    },
+                    crate::types::ReportQuestion {
+                        text: "What should the flag be called?".to_string(),
+                        options: vec![],
+                    },
+                ])),
+            )
+            .unwrap();
+
+        let pending = &engine.state.pending_questions;
+        assert_eq!(pending.len(), 2, "both asks parked: {pending:?}");
+        assert_eq!(engine.state.question_count, 2);
+        // Engine-minted ids, per-mission monotonic — never model-supplied.
+        assert_eq!(pending[0].question_id, "q-1");
+        assert_eq!(pending[1].question_id, "q-2");
+        assert_eq!(pending[0].options, vec!["sqlite", "in-memory"]);
+        assert!(pending[1].options.is_empty(), "empty options = free text");
+        for q in pending {
+            assert_eq!(q.role, Role::Worker);
+            assert_eq!(q.run_id.as_deref(), Some("r-1"));
+            assert_eq!(q.feature_id.as_deref(), Some("f-1-1"));
+            assert_eq!(q.milestone_id.as_deref(), Some("ms-1"));
+        }
+        // The events landed in the log (the replay source of truth).
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionOpened { .. }))
+                .count(),
+            2
+        );
+        // Opening a question parks NOTHING (contrast the grant park).
+        assert!(engine.state.pending_grant_request.is_none());
+        assert_eq!(engine.state.mission.status, MissionStatus::Running);
+    }
+
+    #[test]
+    fn question_events_caps_truncate_and_scrub_at_write() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        // A token the anthropic-api-key rule flags (same shape as the scrub
+        // tests' anchor): model-authored text must never reach the log. The
+        // secret leads the over-long strings so truncation (which follows the
+        // scrub) can't cut it away first — the redaction marker must be what
+        // survives.
+        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        let long_text = format!("{SECRET}{}", "x".repeat(600));
+        let questions: Vec<crate::types::ReportQuestion> = (0..6)
+            .map(|i| crate::types::ReportQuestion {
+                text: if i == 0 {
+                    long_text.clone()
+                } else {
+                    format!("question {i}")
+                },
+                options: (0..6)
+                    .map(|o| {
+                        if o == 0 {
+                            format!("{SECRET}{}", "y".repeat(200))
+                        } else {
+                            format!("option {o}")
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(Some(questions)))
+            .unwrap();
+
+        // The 4-question cap: first four opened, the rest dropped WITH an
+        // operator-visible note (never silently).
+        assert_eq!(engine.state.pending_questions.len(), 4);
+        assert!(
+            engine
+                .state
+                .recent_decisions
+                .iter()
+                .any(|d| d.contains("beyond the 4-question cap")),
+            "the drop is narrated: {:?}",
+            engine.state.recent_decisions
+        );
+        let first = &engine.state.pending_questions[0];
+        assert!(
+            first.text.chars().count() <= 500 + "… [truncated]".len(),
+            "text capped: {} chars",
+            first.text.chars().count()
+        );
+        assert_eq!(first.options.len(), 4, "options capped");
+        assert!(
+            first.options[0].chars().count() <= 100 + "… [truncated]".len(),
+            "option text capped: {} chars",
+            first.options[0].chars().count()
+        );
+        // Scrubbed at write: the secret shape appears NOWHERE in the log.
+        let raw = std::fs::read_to_string(engine.paths.events_file()).expect("read log");
+        assert!(
+            !raw.contains(SECRET),
+            "model-authored secret must be scrubbed from events.jsonl"
+        );
+        assert!(raw.contains("[REDACTED]"), "redaction marker present");
+    }
+
+    /// Prose fallback (ticket structured-human-question-events): a report
+    /// without a `questions` key — every backend without a structured ask —
+    /// opens nothing and the mission flows exactly as before.
+    #[test]
+    fn question_events_prose_only_report_opens_nothing() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(None))
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+        assert_eq!(engine.state.question_count, 0);
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::QuestionOpened { .. })),
+            "no question events for a prose-only report"
+        );
+        // Some questions but an empty list behaves the same.
+        engine
+            .emit_worker_questions("ms-1", "f-1-1", &question_outcome(Some(vec![])))
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+    }
+
+    /// End-to-end through the EXISTING control path: an `answer-question`
+    /// control file drains to `question.answered`, which routes the answer
+    /// onto the user-message consult — and a replayed (duplicate) answer
+    /// file is warn-logged and swallowed, never a brick, and never a
+    /// queue-clearing decision either.
+    #[tokio::test]
+    async fn question_events_answer_reaches_mission_via_control_drain() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::AnswerQuestion {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                option: Some(0),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+
+        assert!(engine.state.pending_questions.is_empty());
+        assert_eq!(engine.state.pending_user_messages.len(), 1);
+        assert!(
+            engine.state.pending_user_messages[0].contains("sqlite"),
+            "the answer reached the consult path: {:?}",
+            engine.state.pending_user_messages
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let answered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::QuestionAnswered {
+                    question_id,
+                    answer,
+                    via,
+                    option,
+                } => Some((question_id.clone(), answer.clone(), via.clone(), *option)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].0, "q-1");
+        assert_eq!(answered[0].1, "sqlite");
+        assert_eq!(answered[0].2, "answer-question");
+        assert_eq!(answered[0].3, Some(0));
+
+        // Duplicate answer (the crash-between-emit-and-acknowledge window):
+        // warn-logged and swallowed — never a brick, NEVER a second
+        // question.answered, and (ticket answer-replay-wipes-queued-answer)
+        // NEVER an orchestrator.decision either: the decision fold consumes
+        // pending_user_messages, so narrating the replay with one would wipe
+        // the just-queued answer before the consult can read it.
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::AnswerQuestion {
+                question_id: "q-1".to_string(),
+                answer: "sqlite".to_string(),
+                option: Some(0),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        assert!(
+            !engine
+                .state
+                .recent_decisions
+                .iter()
+                .any(|d| d.contains("answer for question q-1 ignored")),
+            "the replay is no longer narrated by a queue-clearing decision: {:?}",
+            engine.state.recent_decisions
+        );
+        assert_eq!(
+            engine.state.pending_user_messages.len(),
+            1,
+            "the queued answer survives the replayed duplicate: {:?}",
+            engine.state.pending_user_messages
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionAnswered { .. }))
+                .count(),
+            1,
+            "the duplicate never lands a second question.answered"
+        );
+        assert!(control::drain(&engine.paths).unwrap().is_empty());
+    }
+
+    /// Regression for ticket `answer-replay-wipes-queued-answer`: a duplicate
+    /// `answer-question` control file drained AFTER the answer was queued
+    /// (the crash-replay window) must leave `pending_user_messages` intact,
+    /// so the user-message consult still delivers the queued answer to the
+    /// orchestrator (whose decision then drains the queue).
+    #[tokio::test]
+    async fn answer_replay_duplicate_keeps_queued_answer_for_consult() {
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            lesson_orch_script("proceeding with sqlite"),
+        ]));
+        let Some((_dir, mut engine)) = question_events_engine_with(mock.clone()) else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+
+        // The answer lands, then the SAME control file is replayed by the
+        // next drain (the crash-between-emit-and-acknowledge window).
+        for _ in 0..2 {
+            control::enqueue(
+                &engine.paths,
+                &ControlCommand::AnswerQuestion {
+                    question_id: "q-1".to_string(),
+                    answer: "sqlite".to_string(),
+                    option: Some(0),
+                },
+            )
+            .unwrap();
+            engine.drain_control().await.unwrap();
+        }
+        assert_eq!(
+            engine.state.pending_user_messages.len(),
+            1,
+            "the replayed duplicate never wipes the queued answer: {:?}",
+            engine.state.pending_user_messages
+        );
+
+        // The consult still consumes the answer: the orchestrator turn
+        // carries the queued line and its decision drains the queue.
+        engine.consult_user_messages().await.unwrap();
+        let injected = mock.injected_messages();
+        assert!(
+            injected.iter().flatten().any(|m| m.contains("sqlite")),
+            "the consult delivered the queued answer to the orchestrator: {injected:?}"
+        );
+        assert!(
+            engine.state.pending_user_messages.is_empty(),
+            "the consult's decision drains the queue"
+        );
+    }
+
+    /// The answer cross-checks (engine-side, mirroring the grant echo
+    /// discipline): unknown id, empty answer, out-of-range option, and
+    /// option text that doesn't match the parked question are all refused
+    /// BEFORE any event lands.
+    #[test]
+    fn question_events_answer_validation_refuses_stale_answers() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Which storage engine?".to_string(),
+                    options: vec!["sqlite".to_string(), "in-memory".to_string()],
+                }])),
+            )
+            .unwrap();
+        let seq_before = engine.state.last_seq;
+
+        assert!(engine
+            .answer_pending_question("q-nope", "sqlite", None)
+            .is_err());
+        assert!(engine.answer_pending_question("q-1", "   ", None).is_err());
+        assert!(engine
+            .answer_pending_question("q-1", "sqlite", Some(9))
+            .is_err());
+        assert!(engine
+            .answer_pending_question("q-1", "in-memory", Some(0))
+            .is_err());
+        assert_eq!(
+            engine.state.last_seq, seq_before,
+            "a refused answer appends nothing"
+        );
+        assert_eq!(engine.state.pending_questions.len(), 1);
+
+        // Free text on an optioned question (the "Other" path) IS accepted.
+        engine
+            .answer_pending_question("q-1", "postgres, actually", None)
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+
+        // The answer is scrubbed + capped at the write boundary too: an
+        // operator pasting a token into an over-long answer lands redacted
+        // and truncated in the corpus-exported log.
+        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "Another?".to_string(),
+                    options: vec![],
+                }])),
+            )
+            .unwrap();
+        let long_answer = format!("{SECRET}{}", "z".repeat(600));
+        engine
+            .answer_pending_question("q-2", &long_answer, None)
+            .unwrap();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let answers: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::QuestionAnswered { answer, .. } => Some(answer.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers.len(), 2, "both answers recorded");
+        let answer = &answers[1];
+        assert!(!answer.contains(SECRET), "answer redacted at write");
+        assert!(answer.contains("[REDACTED]"));
+        assert!(
+            answer.chars().count() <= 500 + "… [truncated]".len(),
+            "answer capped: {} chars",
+            answer.chars().count()
+        );
+    }
+
+    /// The clear sweep: milestone-scoped clears remove only that milestone's
+    /// asks; a mission-end clear removes them all — the projection never
+    /// shows an unanswerable "your move".
+    #[test]
+    fn question_events_clear_open_questions_scopes() {
+        let Some((_dir, mut engine)) = question_events_engine() else {
+            return;
+        };
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![
+                    crate::types::ReportQuestion {
+                        text: "first".to_string(),
+                        options: vec![],
+                    },
+                    crate::types::ReportQuestion {
+                        text: "second".to_string(),
+                        options: vec![],
+                    },
+                ])),
+            )
+            .unwrap();
+        assert_eq!(engine.state.pending_questions.len(), 2);
+
+        // Milestone scope: only ms-1's asks clear. (Both opens here are
+        // ms-1-scoped, so one remains after a foreign milestone's sweep.)
+        engine
+            .clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some("ms-2")
+            })
+            .unwrap();
+        assert_eq!(
+            engine.state.pending_questions.len(),
+            2,
+            "foreign scope clears nothing"
+        );
+        engine
+            .clear_open_questions("milestone completed", |q| {
+                q.milestone_id.as_deref() == Some("ms-1")
+            })
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+
+        // Mission-end scope: everything clears.
+        engine
+            .emit_worker_questions(
+                "ms-1",
+                "f-1-1",
+                &question_outcome(Some(vec![crate::types::ReportQuestion {
+                    text: "third".to_string(),
+                    options: vec![],
+                }])),
+            )
+            .unwrap();
+        engine
+            .clear_open_questions("mission completed", |_| true)
+            .unwrap();
+        assert!(engine.state.pending_questions.is_empty());
+        // Ids are never reused across clears (the folded count only grows).
+        assert_eq!(engine.state.question_count, 3);
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::QuestionCleared { .. }))
+                .count(),
+            3
+        );
+    }
+
+    /// End-to-end through the worker run path: a worker report carrying an
+    /// `escalation` reason records the `worker.escalated` event BEFORE the
+    /// judgement turn — the frontier advisor act — that consumes the same
+    /// report, and the mission's floor is otherwise byte-identical: the
+    /// feature completes on the judgement, the executor tier never flips,
+    /// and the validator configs are untouched.
+    #[tokio::test]
+    async fn routing_abstraction_worker_escalation_reaches_advisor_leaving_floor_untouched() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let report = serde_json::json!({
+            "result": "pass",
+            "summary": "built it; flagged an approach call for advice",
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "cargo test: ok",
+            "dependenciesAdded": [],
+            "knownGaps": [],
+            "commits": [],
+            "commandsRun": [],
+            "escalation": "chose the retry policy arbitrarily — wants frontier advice"
+        });
+        let judgement =
+            serde_json::json!({"decision": "complete", "guidance": "", "summary": "advice: policy is fine"})
+                .to_string();
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&report),
+            // The long-lived orchestrator session: init/ready, then the
+            // judgement verdict for this run.
+            {
+                use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+                crate::backend_mock::MockScript::streaming(vec![
+                    mock_init("orch-session"),
+                    mock_result_text("ready"),
+                ])
+                .responding(vec![vec![
+                    mock_text(&judgement),
+                    mock_result_text(&judgement),
+                ]])
+            },
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![Feature {
+                id: "f-1-1".to_string(),
+                title: "f".to_string(),
+                spec: "s".to_string(),
+                validation_criteria: vec![],
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: vec![],
+                commits: vec![],
+                respawns: 0,
+            }],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        let validators_before = (
+            engine.state.config.validator_scrutiny.clone(),
+            engine.state.config.validator_functional.clone(),
+        );
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let escalated: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::WorkerEscalated { .. }))
+            .collect();
+        assert_eq!(
+            escalated.len(),
+            1,
+            "exactly one worker.escalated: {events:?}"
+        );
+        match &escalated[0].kind {
+            EventKind::WorkerEscalated {
+                feature_id,
+                from,
+                to,
+                reason,
+                ..
+            } => {
+                assert_eq!(feature_id, "f-1-1");
+                assert_eq!(*from, ExecutorTier::Frontier);
+                assert_eq!(*to, ExecutorTier::Frontier);
+                assert_eq!(
+                    reason,
+                    "chose the retry policy arbitrarily — wants frontier advice"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // The record lands BEFORE the advisor act that consumes the request.
+        let judgement_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, .. }
+                    if summary.starts_with("judgement for f-1-1") =>
+                {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the judgement decision must be recorded");
+        assert!(
+            escalated[0].seq < judgement_seq,
+            "the escalation is recorded before the judgement that advises on it"
+        );
+
+        // The floor is unaffected: the feature completed on the judgement
+        // (escalation neither blocks nor short-circuits), the executor tier
+        // never flipped, and the validator route is byte-identical.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1")),
+            "the feature completes on the judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        assert_eq!(engine.state.config.validator_scrutiny, validators_before.0);
+        assert_eq!(
+            engine.state.config.validator_functional,
+            validators_before.1
         );
     }
 
@@ -7467,6 +12671,43 @@ pub(crate) mod tests {
         (dir, script_path)
     }
 
+    /// Like [`write_codex_stub_no_report`] but stateful: the FIRST `exec`
+    /// invocation serves the no-report fixture and every later one serves the
+    /// reporting fixture — a transient hiccup the bounded same-backend retry
+    /// recovers from. `--version` probes do not advance the marker.
+    #[cfg(unix)]
+    fn write_codex_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny_no_report.jsonl"),
+        )
+        .expect("fixture exists");
+        let report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex_exec_scrutiny.jsonl"),
+        )
+        .expect("fixture exists");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("codex-stub-flaky.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report.display(),
+                no_report = no_report.display()
+            ),
+        )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
+    }
+
     /// RAII guard: points `KRANZ_CODEX_BIN` at a working stub so
     /// `discover_codex_binary` deterministically resolves it as the FIRST
     /// candidate, regardless of whatever real `codex` install happens to sit
@@ -7526,6 +12767,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("codex".to_string());
         cfg.skip_functional = true;
+        // The codex backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the codex lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 
@@ -7696,33 +12942,25 @@ pub(crate) mod tests {
 
     /// A codex scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (usage present, no `agent_message`) must trigger the
-    /// bounded runtime-retry fallback exactly once: a loud
-    /// `orchestrator.decision` naming the retry, a second `ValidatorScrutiny`
-    /// run actually executed against the claude (mock) backend, and that
-    /// retry's findings folded into a fix feature like any other scrutiny
-    /// run's would.
+    /// bounded runtime retry exactly once ON THE SAME backend — claude is not
+    /// a universal fallback (it may be unauthenticated or absent on the
+    /// host): a loud `orchestrator.decision` naming the codex retry, a second
+    /// `ValidatorScrutiny` run against the codex stub (which reports on the
+    /// retry), and that retry's findings folded into a fix feature like any
+    /// other scrutiny run's would. The injected claude (mock) backend starts
+    /// only for the orchestrator conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_scrutiny_no_report_falls_back_to_claude_once() {
+    async fn codex_scrutiny_no_report_retries_on_codex_once() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+        let (_stub_dir, stub_path) = write_codex_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after codex produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
-        let backend: Arc<dyn AgentBackend> = mock;
+        let backend: Arc<dyn AgentBackend> = mock.clone();
         let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
             .expect("create engine");
         engine
@@ -7735,7 +12973,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend codex retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -7746,14 +12984,14 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("retrying once with the claude scrutiny validator")
+                        if summary.contains("retrying once with the codex scrutiny validator")
                 )
             })
             .collect();
         assert_eq!(
             retry_decisions.len(),
             1,
-            "expected exactly one loud retry decision: {:?}",
+            "expected exactly one loud retry decision naming codex: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
@@ -7769,15 +13007,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial codex run plus one claude retry run: {:?}",
+            "expected the initial codex run plus one same-backend codex retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            mock.started_specs().len(),
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the codex stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the codex retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
@@ -7786,6 +13031,73 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.origin == FeatureOrigin::Fix),
             "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
+
+    /// The retry is bounded: when the same-backend retry ALSO fails to
+    /// produce a trusted report, the round blocks the milestone honestly
+    /// instead of collapsing an aborted validator into "no findings".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_scrutiny_retry_exhausted_blocks_milestone() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let (_stub_dir, stub_path) = write_codex_stub_no_report();
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(backend, &root, "goal", codex_scrutiny_cfg())
+            .expect("create engine");
+        engine
+            .state
+            .mission
+            .milestones
+            .push(codex_scrutiny_milestone());
+
+        let env_guard = CodexStubEnvGuard::engage(&stub_path);
+        engine
+            .validation_round(0)
+            .await
+            .expect("validation round returns with the milestone blocked");
+        drop(env_guard);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
+
+        let scrutiny_spawns = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::WorkerSpawned { role, .. } if *role == Role::ValidatorScrutiny
+                )
+            })
+            .count();
+        assert_eq!(
+            scrutiny_spawns,
+            2,
+            "expected the initial codex run plus exactly one bounded retry: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { reason, .. }
+                    if reason.contains("did not produce a trusted report after retry")
+            )),
+            "expected the milestone blocked on the exhausted retry: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
+            "an untrusted validator pair must not fold phantom findings into fix features"
+        );
+        assert!(
+            mock.started_specs().is_empty(),
+            "no findings means no conversion turn — the mock backend never starts"
         );
     }
 
@@ -7828,25 +13140,33 @@ pub(crate) mod tests {
         (dir, script_path)
     }
 
-    /// Like [`write_droid_stub`] but the stub cats
-    /// `droid_exec_scrutiny_no_report.json` — a result object with an empty
-    /// `result` string — so `parse_validator_report` returns `None` even
-    /// though the stub exits 0. Models a droid run that completed but never
-    /// emitted a parseable report.
+    /// Like [`write_droid_stub`] but stateful: the FIRST `exec` invocation
+    /// serves `droid_exec_scrutiny_no_report.json` (empty `result`, no
+    /// parseable report) and every later one serves the reporting fixture —
+    /// a transient hiccup the bounded same-backend retry recovers from.
+    /// `--version` probes do not advance the marker.
     #[cfg(unix)]
-    fn write_droid_stub_no_report() -> (tempfile::TempDir, PathBuf) {
+    fn write_droid_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fixture = std::fs::canonicalize(
+        let no_report = std::fs::canonicalize(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/droid_exec_scrutiny_no_report.json"),
         )
         .expect("fixture exists");
-        let script_path = dir.path().join("droid-stub-no-report.sh");
+        let report = std::fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/droid_exec_scrutiny.json"),
+        )
+        .expect("fixture exists");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("droid-stub-flaky.sh");
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
-                fixture.display()
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'droid-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report.display(),
+                no_report = no_report.display()
             ),
         )
         .expect("write stub script");
@@ -7900,6 +13220,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("droid".to_string());
         cfg.skip_functional = true;
+        // The droid backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the droid lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 
@@ -8121,28 +13446,20 @@ pub(crate) mod tests {
 
     /// A droid scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (empty `result` string) must trigger the bounded
-    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
-    /// naming the retry, mentioning "droid" and "retrying once", and that
-    /// retry actually ran on the injected claude (mock) backend.
+    /// runtime retry exactly once ON THE SAME backend: a loud
+    /// `orchestrator.decision` naming the droid retry, a second
+    /// `ValidatorScrutiny` run against the droid stub (which reports on the
+    /// retry), and the injected claude (mock) backend starting only for the
+    /// orchestrator conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn droid_runtime_retry_falls_back_to_claude() {
+    async fn droid_runtime_retry_retries_on_droid() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_droid_stub_no_report();
+        let (_stub_dir, stub_path) = write_droid_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after droid produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
@@ -8158,7 +13475,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend droid retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -8169,7 +13486,7 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("droid") && summary.contains("retrying once")
+                        if summary.contains("retrying once with the droid scrutiny validator")
                 )
             })
             .collect();
@@ -8192,22 +13509,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial droid run plus one claude retry run: {:?}",
+            "expected the initial droid run plus one same-backend droid retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
         assert_eq!(
             mock.started_specs().len(),
-            2,
-            "the injected claude/mock backend must have started once for the retry \
-             validator run and once for the fix-feature conversion turn"
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the droid stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the droid retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
@@ -8294,14 +13611,37 @@ pub(crate) mod tests {
         )
     }
 
-    /// Like [`write_kimi_stub`] but the stub cats [`KIMI_STUB_NO_REPORT_JSONL`].
+    /// Like [`write_kimi_stub`] but stateful: the FIRST `-p` invocation
+    /// serves [`KIMI_STUB_NO_REPORT_JSONL`] and every later one serves
+    /// [`KIMI_STUB_REPORT_JSONL`] — a transient hiccup the bounded
+    /// same-backend retry recovers from. `--version` probes do not advance
+    /// the marker.
     #[cfg(unix)]
-    fn write_kimi_stub_no_report() -> (tempfile::TempDir, PathBuf) {
-        write_kimi_stub_with_payload(
-            "kimi-stub-no-report.sh",
-            "kimi_exec_scrutiny_report_no_report.jsonl",
-            KIMI_STUB_NO_REPORT_JSONL,
+    fn write_kimi_stub_flaky_no_report() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let no_report_path = dir.path().join("kimi_exec_scrutiny_no_report.jsonl");
+        std::fs::write(&no_report_path, KIMI_STUB_NO_REPORT_JSONL)
+            .expect("write no-report payload");
+        let report_path = dir.path().join("kimi_exec_scrutiny_report.jsonl");
+        std::fs::write(&report_path, KIMI_STUB_REPORT_JSONL).expect("write report payload");
+        let marker = dir.path().join("called-once");
+        let script_path = dir.path().join("kimi-stub-flaky.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'kimi-cli 0.0.0-test'\n  exit 0\nfi\nif [ -f '{marker}' ]; then\n  cat '{report}'\nelse\n  touch '{marker}'\n  cat '{no_report}'\nfi\nexit 0\n",
+                marker = marker.display(),
+                report = report_path.display(),
+                no_report = no_report_path.display()
+            ),
         )
+        .expect("write stub script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat stub script")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod stub script");
+        (dir, script_path)
     }
 
     /// RAII guard: points `KRANZ_KIMI_BIN` at a working stub so
@@ -8347,6 +13687,11 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("kimi".to_string());
         cfg.skip_functional = true;
+        // The kimi backend cannot apply the resolved sandbox profile, so
+        // mandatory validator containment fails closed without the explicit
+        // opt-in (ticket validator-containment-degrade-fail-closed) — these
+        // tests exercise the kimi lane itself, under the degrade.
+        cfg.validator_allow_uncontained_degrade = true;
         cfg
     }
 
@@ -8502,28 +13847,22 @@ pub(crate) mod tests {
 
     /// A kimi scrutiny run that exits 0 but never emits a parseable
     /// `ValidatorReport` (plain-prose final text) must trigger the bounded
-    /// runtime-retry fallback exactly once: a loud `orchestrator.decision`
-    /// naming the retry, mentioning "kimi" and "retrying once", and that
-    /// retry actually ran on the injected claude (mock) backend.
+    /// runtime retry exactly once ON THE SAME backend — claude is not a
+    /// universal fallback (it may be unauthenticated or absent on the host):
+    /// a loud `orchestrator.decision` naming the kimi retry, a second
+    /// `ValidatorScrutiny` run against the kimi stub (which reports on the
+    /// retry), and that retry's findings folded into a fix feature. The
+    /// injected claude (mock) backend starts only for the orchestrator
+    /// conversion turn — never for a validator.
     #[cfg(unix)]
     #[tokio::test]
-    async fn kimi_runtime_retry_falls_back_to_claude() {
+    async fn kimi_runtime_retry_retries_on_kimi() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let (_stub_dir, stub_path) = write_kimi_stub_no_report();
+        let (_stub_dir, stub_path) = write_kimi_stub_flaky_no_report();
 
-        let retry_report = serde_json::json!({
-            "findings": [{
-                "subject": "retry-finding",
-                "severity": "major",
-                "evidence": "claude retry scrutiny run found this after kimi produced no report",
-                "suggestedFix": "address it"
-            }],
-            "summary": "one finding from the claude retry run"
-        });
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
-            crate::backend_mock::MockScript::single_shot_json(&retry_report),
             lesson_orch_script(&codex_fix_features_reply(1)),
         ]));
         let backend: Arc<dyn AgentBackend> = mock.clone();
@@ -8539,7 +13878,7 @@ pub(crate) mod tests {
         engine
             .validation_round(0)
             .await
-            .expect("validation round must complete via the claude retry fallback");
+            .expect("validation round must complete via the same-backend kimi retry");
         drop(env_guard);
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events.jsonl");
@@ -8550,7 +13889,7 @@ pub(crate) mod tests {
                 matches!(
                     &e.kind,
                     EventKind::OrchestratorDecision { summary, .. }
-                        if summary.contains("kimi") && summary.contains("retrying once")
+                        if summary.contains("retrying once with the kimi scrutiny validator")
                 )
             })
             .collect();
@@ -8573,22 +13912,22 @@ pub(crate) mod tests {
         assert_eq!(
             scrutiny_spawns,
             2,
-            "expected the initial kimi run plus one claude retry run: {:?}",
+            "expected the initial kimi run plus one same-backend kimi retry: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
 
         assert_eq!(
             mock.started_specs().len(),
-            2,
-            "the injected claude/mock backend must have started once for the retry \
-             validator run and once for the fix-feature conversion turn"
+            1,
+            "the injected claude/mock backend must start only for the fix-feature \
+             conversion turn — the retry runs on the kimi stub, never on claude"
         );
 
         assert!(
             events
                 .iter()
                 .any(|e| matches!(&e.kind, EventKind::FixFeatureCreated { .. })),
-            "expected the claude retry's findings converted into a fix feature: {:?}",
+            "expected the kimi retry's findings converted into a fix feature: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
         assert!(
@@ -8597,6 +13936,1394 @@ pub(crate) mod tests {
                 .iter()
                 .any(|f| f.origin == FeatureOrigin::Fix),
             "fix feature from the retry's findings must be folded into mission state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Heterogeneous dispatch pool (ticket heterogeneous-dispatch-pool,
+    // KRZ-303; the positioning ADR's 2026-07-31 boundary gloss)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_pool_report(summary: &str) -> serde_json::Value {
+        serde_json::json!({
+            "result": "pass",
+            "summary": summary,
+            "filesTouched": [],
+            "testsAdded": [],
+            "testEvidence": "",
+            "dependenciesAdded": [],
+            "knownGaps": [],
+            "commits": [],
+            "commandsRun": []
+        })
+    }
+
+    fn dispatch_pool_cfg() -> MissionConfig {
+        MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            worker_candidates: vec![
+                CandidateSpec {
+                    backend: "claude".into(),
+                    model: "sonnet".into(),
+                },
+                CandidateSpec {
+                    backend: "codex".into(),
+                    model: "gpt-5-codex".into(),
+                },
+            ],
+            ..MissionConfig::default()
+        }
+    }
+
+    fn dispatch_pool_milestone(engine: &MissionEngine) -> Milestone {
+        Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![Feature {
+                id: "f-1-1".to_string(),
+                title: "f".to_string(),
+                spec: "s".to_string(),
+                validation_criteria: vec![],
+                origin: FeatureOrigin::Plan,
+                status: FeatureStatus::Pending,
+                worker_runs: vec![],
+                commits: vec![],
+                respawns: 0,
+            }],
+            status: MilestoneStatus::Active,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        }
+    }
+
+    /// A passing single-shot worker script that leaves `path` dirty in its
+    /// session worktree (so the pool checkpoint has a deliverable to commit).
+    fn dispatch_pool_pass_script(
+        summary: &str,
+        path: &str,
+        contents: &str,
+    ) -> crate::backend_mock::MockScript {
+        crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(summary))
+            .writes_file(path, contents)
+    }
+
+    /// Acceptance hint 1: one brief to two mock backends yields two sibling
+    /// run records linked to one unit id, each in its own worktree — and the
+    /// freeze holds: no winner, no completion, the mission parks for the
+    /// human judgement act.
+    #[tokio::test]
+    async fn dispatch_pool_two_backends_yield_sibling_candidates() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let state = engine.state();
+        // Two sibling run records, each candidate-linked to the one unit id.
+        let mut linked: Vec<&WorkerRun> = state
+            .runs
+            .values()
+            .filter(|r| r.role == Role::Worker && r.candidate.is_some())
+            .collect();
+        linked.sort_by_key(|r| r.candidate.as_ref().unwrap().index);
+        assert_eq!(linked.len(), 2, "expected two candidate-linked run records");
+        assert_eq!(
+            linked[0].candidate,
+            Some(CandidateLink {
+                unit: "f-1-1".to_string(),
+                index: 0,
+                count: 2,
+                backend: "claude".to_string(),
+            })
+        );
+        assert_eq!(
+            linked[1].candidate,
+            Some(CandidateLink {
+                unit: "f-1-1".to_string(),
+                index: 1,
+                count: 2,
+                backend: "codex".to_string(),
+            })
+        );
+        // Each stream ran in its OWN worktree (the M3 isolation idiom), and
+        // the worktree dirs are reaped afterwards while the branches persist.
+        let claude_specs = claude_mock.started_specs();
+        let codex_specs = codex_mock.started_specs();
+        assert_eq!(claude_specs.len(), 1, "claude stream ran exactly once");
+        assert_eq!(codex_specs.len(), 1, "codex stream ran exactly once");
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
+        let c1_path = pool_worktree_path(&root, &mission_id, "f-1-1", 1);
+        assert_eq!(claude_specs[0].cwd, c0_path);
+        assert_eq!(codex_specs[0].cwd, c1_path);
+        assert_ne!(c0_path, c1_path, "streams must not share a worktree");
+        assert!(
+            !c0_path.exists() && !c1_path.exists(),
+            "worktree dirs are reaped after the dispatch; branches carry the deliverables"
+        );
+        // The candidate branches are kept, each carrying its stream's
+        // checkpointed deliverable (the mock's dirty write).
+        for (index, file) in [(0usize, "claude.txt"), (1usize, "codex.txt")] {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            assert!(
+                engine.repo.branch_exists(&branch).unwrap(),
+                "candidate branch {branch} must be kept for judgement"
+            );
+            let commits = engine.repo.commits_between(&pre_run_sha, &branch).unwrap();
+            assert_eq!(
+                commits.len(),
+                1,
+                "candidate {index} branch carries exactly its checkpoint commit"
+            );
+            let shown = engine
+                .repo
+                .show_file(&branch, file)
+                .expect("git show works")
+                .expect("candidate branch carries the stream's file");
+            let shown = String::from_utf8(shown).unwrap();
+            assert!(shown.contains("was here"), "{file} on {branch}: {shown}");
+        }
+        // Siblings are one logical dispatch: no respawn budget charged.
+        let feature = &state.mission.milestones[0].features[0];
+        assert_eq!(feature.worker_runs.len(), 2);
+        assert_eq!(feature.respawns, 0);
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The dispatch decision names N and proves the wall-clock overlap.
+        let decision = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    Some((summary.clone(), detail.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .expect("a dispatch pool decision must be recorded");
+        assert!(
+            decision
+                .0
+                .contains("unit f-1-1 fanned out to 2 candidates (peak 2 concurrent)"),
+            "decision names N and the overlap: {}",
+            decision.0
+        );
+        assert!(
+            decision.1.contains("CANDIDATE FOR JUDGEMENT")
+                && decision
+                    .1
+                    .contains("divergence for scrutiny, not throughput"),
+            "the decision detail states the freeze properties: {}",
+            decision.1
+        );
+        // Both terminal states recorded (both passed here).
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec![RunResult::Pass, RunResult::Pass]);
+        // The freeze: no winner — the unit is neither completed nor failed,
+        // and the milestone parks for the human judgement act.
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+                if feature_id == "f-1-1"
+            )),
+            "no code path completes or fails the unit from a candidate"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { milestone_id, reason }
+                if milestone_id == "ms-1" && reason.contains("candidate for judgement")
+            )),
+            "the milestone must park for judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Acceptance hint 3: one stream failing (a crashed backend session) does
+    /// not abort its sibling — both terminal states are recorded.
+    #[tokio::test]
+    async fn dispatch_pool_one_stream_failure_keeps_sibling_terminal_state() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(
+                "codex claimed pass before dying",
+            ))
+            .with_exit(SessionExit::Failed("codex exploded".to_string())),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // The sibling's failure must not error the dispatch itself.
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // Both streams got run records (replayed in candidate order) with
+        // their own terminal states: pass for the survivor, fail for the
+        // crashed sibling.
+        let spawns: Vec<Option<CandidateLink>> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerSpawned { candidate, .. } => Some(candidate.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawns.len(), 2, "both streams spawned: {spawns:?}");
+        assert_eq!(spawns[0].as_ref().map(|c| c.index), Some(0));
+        assert_eq!(spawns[1].as_ref().map(|c| c.index), Some(1));
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![RunResult::Pass, RunResult::Fail],
+            "both terminal states recorded, in candidate order"
+        );
+        // The failure is named in the dispatch record, and the mission still
+        // parks for judgement (never auto-completes from the survivor).
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(detail.contains("run Fail"), "failed stream named: {detail}");
+        assert!(
+            detail.contains("run Pass"),
+            "surviving stream named: {detail}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } if feature_id == "f-1-1"
+        )));
+    }
+
+    /// 12th-pass review (P1): the pool checkpoint reopens each candidate's
+    /// HOSTILE worktree and runs status/commit there with the engine's
+    /// ambient privileges. A worker that planted `core.fsmonitor` in the
+    /// (shared) git config or a hook in the (shared) hooks dir must never
+    /// get its payload EXECUTED by those engine git invocations — and the
+    /// checkpoint must still commit the deliverable. Fixture idiom mirrors
+    /// validator_integrity's planted-fsmonitor test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_checkpoint_hooks_disabled_against_planted_fsmonitor_and_hook() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Premise-gate (ticket gate-sandbox-supervision-dogfood): the planted
+        // fsmonitor payload identifies its parent via `ps -p $PPID`, but
+        // `/bin/ps` is setuid root on this host's macOS and setuid exec is
+        // kernel-denied inside ANY Seatbelt sandbox (probed 2026-08-05 —
+        // EPERM even under `(allow default)`, not SBPL-expressible). Under
+        // a wrapped `cargo test` the payload can never log, so the
+        // anti-vacuity assertion below would fail on the sandbox's presence
+        // rather than the engine's behavior — skip with a detectable
+        // marker, the same posture as the nested-sandbox skips.
+        if std::process::Command::new("ps")
+            .args(["-p", &std::process::id().to_string(), "-o", "command="])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): \
+                 pool_checkpoint_hooks_disabled_against_planted_fsmonitor_and_hook — \
+                 /bin/ps cannot execute inside the gate sandbox wrap, so the fsmonitor \
+                 payload's identity logging is unobservable here; skipping"
+            );
+            return;
+        }
+        let Some((dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // Arm the hostile metadata the way a worker would from inside its
+        // session (a linked worktree shares the main repo's git dir): a
+        // `core.fsmonitor` command (fired by `git status`) and a pre-commit
+        // hook (fired by `git commit`). The fsmonitor payload logs its PARENT
+        // command line so the assertion below can tell the checkpoint's own
+        // status/commit apart from Phase A machinery; both payloads log
+        // OUTSIDE the repo so they can never become deliverable content.
+        let fsmonitor_log = dir.path().join("fsmonitor-invocations");
+        let hook_log = dir.path().join("hook-invocations");
+        let fsmonitor = dir.path().join("evil-fsmonitor");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\nps -p $PPID -o command= >> '{}'\nexit 1\n",
+                fsmonitor_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho \"pre-commit:$PWD\" >> '{}'\n",
+                hook_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()]);
+
+        // Fixture proof (validator-integrity idiom): ORDINARY git invocations
+        // execute both payloads — then reset the logs so any later invocation
+        // can only have come from the engine's dispatch.
+        git(&["status", "--porcelain"]);
+        git(&["commit", "--allow-empty", "-m", "fixture probe"]);
+        assert!(
+            std::fs::read_to_string(&fsmonitor_log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git status runs the planted fsmonitor"
+        );
+        assert!(
+            std::fs::read_to_string(&hook_log)
+                .map(|hits| !hits.is_empty())
+                .unwrap_or(false),
+            "fixture: ordinary git commit runs the planted pre-commit hook"
+        );
+        std::fs::remove_file(&fsmonitor_log).unwrap();
+        std::fs::remove_file(&hook_log).unwrap();
+
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine.run_feature(0, 0).await.unwrap();
+
+        // The checkpoint's own git never executed either payload. The
+        // fsmonitor log may hold `git worktree add`'s INTERNAL `reset --hard`
+        // (Phase A fork, which populates each new worktree via a child reset
+        // that refreshes its index) — that runs BEFORE the worker session
+        // could have planted anything, so it is not the checkpoint surface
+        // this finding covers; what must never appear is a checkpoint-shaped
+        // invocation (status/add/commit) executing the planted payload. The
+        // pre-commit hook has no such pre-worker noise: it must not fire at
+        // all.
+        let fsmonitor_hits = std::fs::read_to_string(&fsmonitor_log).unwrap_or_default();
+        for line in fsmonitor_hits.lines() {
+            assert!(
+                line.contains("reset --hard"),
+                "only worktree-add's internal reset may consult the planted fsmonitor — \
+                 the checkpoint's own status/add/commit must never execute it: {fsmonitor_hits}"
+            );
+        }
+        assert!(
+            !hook_log.exists(),
+            "the checkpoint must never execute the planted hook: {}",
+            std::fs::read_to_string(&hook_log).unwrap_or_default()
+        );
+
+        // And the happy path still commits both deliverables — the checkpoint
+        // commit lands with hooks disabled.
+        let mission_id = engine.mission_id().to_string();
+        for (index, file) in [(0usize, "claude.txt"), (1usize, "codex.txt")] {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            let commits = engine.repo.commits_between(&pre_run_sha, &branch).unwrap();
+            assert_eq!(
+                commits.len(),
+                1,
+                "candidate {index} carries exactly its checkpoint commit"
+            );
+            let shown = engine
+                .repo
+                .show_file(&branch, file)
+                .expect("git show works")
+                .expect("candidate branch carries the deliverable");
+            assert!(String::from_utf8(shown).unwrap().contains("was here"));
+        }
+    }
+
+    /// 12th-pass review (P2): a candidate whose worktree cannot be INSPECTED
+    /// at the checkpoint (here: the worker removed its `.git`) was once read
+    /// as "clean, 0 commits" and REAPED with its deliverable inside. Now the
+    /// candidate is recorded FAILED exactly where stream failures are
+    /// recorded, its worktree dir + branch survive — and the sibling's happy
+    /// path is byte-identical.
+    #[tokio::test]
+    async fn candidate_inspection_failure_fails_pool_candidate_and_preserves_bytes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here")
+                .removes_path(".git"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        let pre_run_sha = engine.repo.head_sha().unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        // The inspection failure must not error the dispatch itself.
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        // Candidate 0's worktree dir SURVIVES with the deliverable bytes
+        // inside (nothing was verified, so nothing is destroyed)…
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
+        assert!(
+            c0_path.exists(),
+            "an uninspectable candidate's worktree dir must be preserved, not reaped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(c0_path.join("claude.txt")).unwrap(),
+            "claude was here",
+            "the unverified deliverable bytes survive for human inspection"
+        );
+        // … and so does its branch.
+        let c0_branch = format!("kranz/pool/{mission_id}/f-1-1-c0");
+        assert!(
+            engine.repo.branch_exists(&c0_branch).unwrap(),
+            "an uninspectable candidate's branch must be preserved"
+        );
+        // The healthy sibling is reaped exactly as before — only the failed
+        // candidate is preserved.
+        let c1_path = pool_worktree_path(&root, &mission_id, "f-1-1", 1);
+        assert!(
+            !c1_path.exists(),
+            "the healthy sibling's worktree dir is reaped as before"
+        );
+        let c1_branch = format!("kranz/pool/{mission_id}/f-1-1-c1");
+        let sibling_commits = engine
+            .repo
+            .commits_between(&pre_run_sha, &c1_branch)
+            .unwrap();
+        assert_eq!(
+            sibling_commits.len(),
+            1,
+            "the sibling's checkpoint commit still lands"
+        );
+
+        // The failure is recorded where stream failures are recorded: the
+        // dispatch decision detail. The sibling's line keeps its exact
+        // happy-path shape.
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("- candidate 0/1: `claude` / `sonnet` → branch `kranz/pool/")
+                && detail.contains("worktree inspection failed")
+                && detail.contains("preserved for inspection"),
+            "the inspection failure is the candidate's recorded terminal state: {detail}"
+        );
+        assert!(
+            detail.contains("- candidate 1/1: `codex` / `gpt-5-codex` → branch `kranz/pool/")
+                && detail.contains("— run Pass, 1 commit(s)"),
+            "the sibling's decision line keeps its byte-identical happy-path shape: {detail}"
+        );
+        // Both streams still completed Pass (the failure is at the
+        // checkpoint, after the runs), and the freeze holds: the unit is
+        // neither completed nor failed from a candidate.
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec![RunResult::Pass, RunResult::Pass]);
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+            if feature_id == "f-1-1"
+        )));
+
+        // The preserved dir lives in the shared temp dir (outside the
+        // repo tempdir) — sweep it so the test leaves nothing behind.
+        let _ = std::fs::remove_dir_all(&c0_path);
+    }
+
+    /// 13th-pass review (P2): a candidate whose inspection FAILED still has
+    /// a run record (its stream completed Pass), so run-record presence
+    /// alone once let it into the divergence comparison — letting
+    /// rejected/untouched bytes produce an apparent agreement or
+    /// divergence. Now only successfully inspected candidates participate:
+    /// with one of two streams uninspectable there is ONE eligible
+    /// candidate, below the two-candidate floor, so NO record is emitted at
+    /// all — and the surviving posture still parks for judgement.
+    #[tokio::test]
+    async fn divergence_eligibility_excludes_failed_inspection_candidates() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here")
+                .removes_path(".git"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // Crux: BOTH streams still carry run records with terminal Pass —
+        // eligibility must NOT be inferred from that alone…
+        let completed: Vec<RunResult> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::WorkerCompleted { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![RunResult::Pass, RunResult::Pass],
+            "both streams completed; only the INSPECTION failed"
+        );
+        // …and with just one inspected candidate there is NO comparison:
+        // no divergence record, and no vacuous one-stream "agreement".
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. })),
+            "a failed-inspection candidate must not join the comparison — \
+             fewer than two eligible candidates means NO record: {:?}",
+            events
+                .iter()
+                .filter(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. }))
+                .map(|e| &e.kind)
+                .collect::<Vec<_>>()
+        );
+        // The surviving posture still parks for judgement, with the
+        // inspection failure named in the dispatch record.
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("worktree inspection failed"),
+            "the failed candidate is named in the decision detail: {detail}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+            if feature_id == "f-1-1"
+        )));
+
+        // Sweep the preserved worktree dir (shared temp dir, outside the
+        // repo tempdir) so the test leaves nothing behind.
+        let mission_id = engine.mission_id().to_string();
+        let c0_path = pool_worktree_path(&root, &mission_id, "f-1-1", 0);
+        let _ = std::fs::remove_dir_all(&c0_path);
+    }
+
+    /// 12th-pass review (P2, parallel-batch half): the M3 checkpoint treats
+    /// an uninspectable worktree the same way — the feature is failed via
+    /// the checkpoint decision record, and the cleanup guard spares BOTH its
+    /// worktree dir and its branch. Both workers sabotage their own `.git`
+    /// so the (racy) script→feature assignment cannot make the outcome
+    /// nondeterministic; the happy-path half of the guard is covered by the
+    /// existing parallel integration tests and the pool sibling above.
+    #[tokio::test]
+    async fn candidate_inspection_failure_fails_parallel_feature_and_preserves_bytes() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("one", "deliverable.txt", "worker output")
+                .removes_path(".git"),
+            dispatch_pool_pass_script("two", "deliverable.txt", "worker output")
+                .removes_path(".git"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let mut engine = MissionEngine::create(
+            backend,
+            &root,
+            "goal",
+            MissionConfig {
+                worker_isolation: WorkerIsolation::Checkout,
+                ..MissionConfig::default()
+            },
+        )
+        .unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        // Two Pending plan features on one Active milestone.
+        let mut milestone = dispatch_pool_milestone(&engine);
+        milestone.features.push(Feature {
+            id: "f-1-2".to_string(),
+            title: "f".to_string(),
+            spec: "s".to_string(),
+            validation_criteria: vec![],
+            origin: FeatureOrigin::Plan,
+            status: FeatureStatus::Pending,
+            worker_runs: vec![],
+            commits: vec![],
+            respawns: 0,
+        });
+        engine.state.mission.milestones.push(milestone);
+
+        engine
+            .run_parallel_batch(0, &[("f-1-1".to_string(), 0), ("f-1-2".to_string(), 1)])
+            .await
+            .unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        for feature_id in ["f-1-1", "f-1-2"] {
+            // The checkpoint decision records the inspection failure…
+            assert!(
+                events.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::OrchestratorDecision { summary, .. }
+                        if summary == &format!(
+                            "parallel checkpoint for {feature_id}: worktree inspection failed"
+                        )
+                )),
+                "inspection failure decision recorded for {feature_id}"
+            );
+            // … the feature is failed with the preservation named…
+            assert!(
+                events.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::FeatureFailed { feature_id: fid, reason, .. }
+                        if fid == feature_id
+                            && reason.contains("worktree inspection failed")
+                            && reason.contains("preserved")
+                )),
+                "feature.failed names the preservation for {feature_id}"
+            );
+            // … and BOTH the worktree dir (deliverable bytes inside) and its
+            // branch survive the cleanup guard.
+            let wt = parallel_worktree_path(&root, &mission_id, feature_id);
+            assert!(
+                wt.exists(),
+                "{feature_id}'s uninspectable worktree dir must be preserved"
+            );
+            assert_eq!(
+                std::fs::read_to_string(wt.join("deliverable.txt")).unwrap(),
+                "worker output",
+                "{feature_id}'s unverified deliverable bytes survive"
+            );
+            assert!(
+                engine
+                    .repo
+                    .branch_exists(&format!("kranz/wt/{mission_id}/{feature_id}"))
+                    .unwrap(),
+                "{feature_id}'s branch must be preserved"
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { .. })),
+            "nothing merges from an unverified worktree"
+        );
+
+        // The preserved dirs live in the shared temp dir — sweep them.
+        for feature_id in ["f-1-1", "f-1-2"] {
+            let _ = std::fs::remove_dir_all(parallel_worktree_path(&root, &mission_id, feature_id));
+        }
+    }
+
+    /// Failure isolation at the spawn boundary: a candidate whose backend
+    /// cannot start gets NO fabricated run record — its terminal state is
+    /// recorded in the dispatch decision, and its sibling runs unaffected.
+    #[tokio::test]
+    async fn dispatch_pool_spawn_failure_records_stream_terminal_state() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        // No scripts queued: start() errors, exactly a backend-unavailable
+        // spawn failure.
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::new());
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        assert_eq!(claude_mock.started_specs().len(), 1);
+        assert_eq!(
+            codex_mock.started_specs().len(),
+            0,
+            "the failed stream never started a session"
+        );
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let spawns: Vec<&EventKind> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                kind @ EventKind::WorkerSpawned { .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spawns.len(),
+            1,
+            "only the surviving stream has a run record — never a fabricated one: {spawns:?}"
+        );
+        let detail = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    detail.clone()
+                }
+                _ => None,
+            })
+            .expect("dispatch decision recorded");
+        assert!(
+            detail.contains("stream failed, no run record") && detail.contains("no script queued"),
+            "the spawn failure is the stream's recorded terminal state: {detail}"
+        );
+        // The survivor's sibling linkage still names the full sibling set.
+        match spawns[0] {
+            EventKind::WorkerSpawned { candidate, .. } => {
+                let link = candidate.as_ref().expect("survivor is candidate-linked");
+                assert_eq!(link.count, 2);
+                assert_eq!(link.unit, "f-1-1");
+            }
+            _ => unreachable!("filtered to spawned"),
+        }
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { milestone_id, reason }
+            if milestone_id == "ms-1" && reason.contains("1/2 candidate stream(s)")
+        )));
+    }
+
+    /// The re-dispatch guard: a unit with a recorded candidate set is never
+    /// fanned out again silently (each dispatch is N paid sessions) — it
+    /// re-parks with the same judgement-pending reason.
+    #[tokio::test]
+    async fn dispatch_pool_redispatch_guard_never_refans_silently() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+        engine.run_feature(0, 0).await.unwrap();
+
+        assert_eq!(claude_mock.started_specs().len(), 1, "no silent re-fan-out");
+        assert_eq!(codex_mock.started_specs().len(), 1, "no silent re-fan-out");
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let blocked = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. }))
+            .count();
+        assert_eq!(
+            blocked, 1,
+            "the milestone is already parked; the guard must not spam duplicate blocks"
+        );
+        let spawns = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::WorkerSpawned { .. }))
+            .count();
+        assert_eq!(spawns, 2, "exactly the first dispatch's two streams ran");
+    }
+
+    /// Acceptance hint 2 (consent): plan approval names N and the multiplied
+    /// estimate — the pool's cost multiplier is explicit in the surface the
+    /// operator approves, and the persisted estimate prices the SUM.
+    #[tokio::test]
+    async fn dispatch_pool_plan_approval_consent_names_n_and_multiplied_estimate() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let cfg = dispatch_pool_cfg();
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg.clone()).unwrap();
+        let plan = Plan {
+            goal: "g".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "m".into(),
+                features: vec![PlanFeature {
+                    title: "f".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec![],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+        };
+
+        engine.approve_plan(plan.clone()).unwrap();
+
+        // What the operator consents to: the fresh-repo calibration is the
+        // built-in default band, so the approval estimate is the raw
+        // pool-multiplied estimate.
+        let expected = cost::estimate(&plan, &cfg, &cost::EstimateParams::default());
+        let single = cost::estimate(
+            &plan,
+            &MissionConfig {
+                worker_candidates: vec![],
+                ..cfg.clone()
+            },
+            &cost::EstimateParams::default(),
+        );
+        assert_eq!(expected.worker_runs, single.worker_runs * 2.0);
+
+        let plan_md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+        assert!(
+            plan_md.contains("## Dispatch pool — 2 candidates per unit of work"),
+            "plan.md names N:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("`claude` / `sonnet`") && plan_md.contains("`codex` / `gpt-5-codex`"),
+            "plan.md names the candidates:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("Cost multiplies by 2")
+                && plan_md.contains("budget applies to that SUM"),
+            "plan.md states the multiplier and the sum-budget:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains("candidate for judgement") && plan_md.contains("not throughput"),
+            "plan.md states the freeze properties:\n{plan_md}"
+        );
+        assert!(
+            plan_md.contains(&format!("expected ~${:.2}", expected.expected_usd)),
+            "plan.md renders the MULTIPLIED estimate (${:.2}), not the single-backend one (${:.2}):\n{plan_md}",
+            expected.expected_usd,
+            single.expected_usd
+        );
+        // The persisted approval estimate (what the completion report will
+        // compare actuals against) is the multiplied one.
+        let persisted: cost::CostEstimate =
+            serde_json::from_str(&std::fs::read_to_string(engine.paths().estimate_file()).unwrap())
+                .unwrap();
+        assert_eq!(persisted.expected_usd, expected.expected_usd);
+        assert_eq!(persisted.worker_runs, expected.worker_runs);
+    }
+
+    /// Acceptance hint 2 (regression): an empty pool is today's exact
+    /// single-backend behavior — the sequential run/judge path, no candidate
+    /// linkage anywhere.
+    #[tokio::test]
+    async fn dispatch_pool_absent_pool_is_single_backend_regression() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let report = dispatch_pool_report("did the thing");
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot("auth ok"),
+            crate::backend_mock::MockScript::single_shot_json(&report)
+                .with_exit(SessionExit::Aborted),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock.clone();
+        let cfg = MissionConfig {
+            max_respawns: 0,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        assert!(
+            cfg.worker_candidates.is_empty(),
+            "default config has no pool"
+        );
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        // The sequential path: one run, no candidate linkage, the existing
+        // fail/respawn judgement — no pool parking.
+        let spawns: Vec<&EventKind> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                kind @ EventKind::WorkerSpawned { .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        match spawns[0] {
+            EventKind::WorkerSpawned { candidate, .. } => assert_eq!(*candidate, None),
+            _ => unreachable!(),
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureFailed { feature_id, .. } if feature_id == "f-1-1"
+            )),
+            "the sequential judgement still fails the feature"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { .. })),
+            "no pool parking on the single-backend path"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("dispatch pool:")
+            )),
+            "no pool decision on the single-backend path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Divergence as a first-class event (ticket divergence-first-class-event,
+    // KRZ-304)
+    // -----------------------------------------------------------------------
+
+    /// The streaming orchestrator session for the resolution tests: one
+    /// init/ready pair, then one scripted reply per unblock decision turn.
+    fn divergence_orch_script(replies: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            replies
+                .iter()
+                .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+                .collect(),
+        )
+    }
+
+    /// Acceptance hint 1 (noted): two divergent candidate diffs produce ONE
+    /// divergence record referencing BOTH candidates — run ids, branch refs,
+    /// backends, and the exact tree hashes the verdict was computed from —
+    /// emitted before the milestone parks for judgement.
+    #[tokio::test]
+    async fn divergence_event_divergent_candidates_record_references_both_streams() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let mission_id = engine.mission_id().to_string();
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let noted: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::DivergenceNoted { .. }))
+            .collect();
+        assert_eq!(noted.len(), 1, "exactly one comparison record per unit");
+        let EventKind::DivergenceNoted {
+            unit,
+            candidates,
+            diverged,
+        } = &noted[0].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(unit, "f-1-1");
+        assert!(diverged, "different contents must record a divergence");
+        assert_eq!(candidates.len(), 2, "the record references BOTH streams");
+        // Candidate order is stream order; every ref (run id, branch,
+        // backend, tree) names the candidate diff it was computed from.
+        let expected_runs: Vec<String> = {
+            let mut linked: Vec<&WorkerRun> = engine
+                .state()
+                .runs
+                .values()
+                .filter(|r| r.candidate.is_some())
+                .collect();
+            linked.sort_by_key(|r| r.candidate.as_ref().unwrap().index);
+            linked.iter().map(|r| r.id.clone()).collect()
+        };
+        for (index, candidate) in candidates.iter().enumerate() {
+            let branch = format!("kranz/pool/{mission_id}/f-1-1-c{index}");
+            assert_eq!(candidate.run_id, expected_runs[index]);
+            assert_eq!(candidate.branch, branch);
+            assert_eq!(
+                candidate.tree,
+                engine
+                    .repo
+                    .rev_parse(&format!("{branch}^{{tree}}"))
+                    .unwrap(),
+                "the tree hash pins the exact candidate bytes"
+            );
+        }
+        assert_eq!(candidates[0].backend, "claude");
+        assert_eq!(candidates[1].backend, "codex");
+        assert_ne!(
+            candidates[0].tree, candidates[1].tree,
+            "divergent streams carry distinct tree hashes"
+        );
+        // The record lands BEFORE the park it explains.
+        let noted_seq = noted[0].seq;
+        let blocked_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the milestone parks for judgement");
+        assert!(
+            noted_seq < blocked_seq,
+            "the record precedes the park: noted seq {noted_seq}, blocked seq {blocked_seq}"
+        );
+    }
+
+    /// Acceptance hint 3 (agreement, the load-bearing rule): identical
+    /// candidate trees produce the agreement record (`diverged: false`) —
+    /// **logged, never trusted**: the park posture is byte-identical to the
+    /// divergent case, no gate is consulted or skipped because the streams
+    /// agreed, and no code path completes the unit.
+    #[tokio::test]
+    async fn divergence_event_identical_candidates_log_agreement_and_no_gate_is_skipped() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Both streams write the SAME path with the SAME bytes: the two
+        // checkpoint commits differ (per-index messages) but the branch
+        // TREES are identical — agreement is a tree comparison, never a
+        // commit-message one.
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "same.txt", "identical bytes"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "same.txt", "identical bytes"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let noted = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::DivergenceNoted {
+                    unit,
+                    candidates,
+                    diverged,
+                } => Some((unit, candidates, diverged)),
+                _ => None,
+            })
+            .expect("identical streams still produce the record");
+        assert_eq!(noted.0, "f-1-1");
+        assert!(!noted.2, "identical trees record agreement, not divergence");
+        assert_eq!(noted.1.len(), 2);
+        assert_eq!(
+            noted.1[0].tree, noted.1[1].tree,
+            "same bytes on both branches → one tree hash"
+        );
+
+        // Agreement changes NOTHING about the mission's course:
+        // - the milestone parks with the SAME judgement-pending reason as
+        //   the divergent case (no "streams agreed" shortcut);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { milestone_id, reason }
+                if milestone_id == "ms-1" && reason.contains("candidate for judgement")
+            )),
+            "agreement never un-parks the judgement: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        // - no gate was consulted, so none could have been skipped on the
+        //   agreement (the ladder runs only in the normal validation flow,
+        //   after judgement — never on the stream verdict);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::GateResult { .. })),
+            "no gate.result anywhere: agreement skips no gate"
+        );
+        // - the unit is neither completed nor failed from the agreement;
+        // - and no validation round ran (a unit is done when gates are
+        //   green and no escalation is open — not when streams agree).
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+                if feature_id == "f-1-1"
+            )),
+            "agreement never completes or fails the unit"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::MilestoneValidating { .. })),
+            "agreement never starts a validation round"
+        );
+    }
+
+    /// Acceptance hint 1 (resolution): the operator's steer on the parked
+    /// milestone appends ONE resolution naming the chosen candidate, the
+    /// why, and the decider — before the unblock it rides on. First
+    /// judgement wins: a later steer re-acting on the same unit records no
+    /// second resolution (the folded set is the durable memory).
+    #[tokio::test]
+    async fn divergence_event_resolution_records_the_decider_once() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let first = serde_json::json!({
+            "action": "unblock-skip-findings",
+            "note": "candidate 1 kept the parser total",
+            "candidate": 1,
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "action": "skip-milestone",
+            "note": "skip it now",
+            "candidate": 0,
+        })
+        .to_string();
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("claude candidate", "claude.txt", "claude was here"),
+            divergence_orch_script(vec![first, second]),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+        engine.run_feature(0, 0).await.unwrap();
+
+        // The operator judges: "candidate 1, and carry on".
+        engine
+            .emit(EventKind::UserMessage {
+                text: "take candidate 1".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        let status = engine.handle_blocked(0).await.unwrap();
+        assert_eq!(status, None, "an unblock action moves the milestone");
+
+        // A second steer re-acts on the same unit (here: dispose of it) —
+        // the FIRST resolution already stands, so nothing new is recorded.
+        engine
+            .emit(EventKind::UserMessage {
+                text: "actually, just skip the milestone".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let resolutions: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::DivergenceResolved { .. }))
+            .collect();
+        assert_eq!(
+            resolutions.len(),
+            1,
+            "first judgement wins — no second resolution for the unit"
+        );
+        let EventKind::DivergenceResolved {
+            unit,
+            selected,
+            reason,
+            decided_by,
+        } = &resolutions[0].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(unit, "f-1-1");
+        assert_eq!(*selected, Some(1), "the operator's candidate, verbatim");
+        assert_eq!(reason, "candidate 1 kept the parser total");
+        assert_eq!(decided_by, "operator", "the unblock path names the decider");
+        // The resolution precedes the unblock it rode in on.
+        let unblock_seq = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::MilestoneUnblocked { milestone_id, .. } if milestone_id == "ms-1" => {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+            .expect("the unblock landed");
+        assert!(
+            resolutions[0].seq < unblock_seq,
+            "record-then-move: resolution seq {} < unblock seq {unblock_seq}",
+            resolutions[0].seq
+        );
+        // The folded set is the restart-safe memory of "already judged".
+        assert!(
+            engine.state().resolved_divergence_units.contains("f-1-1"),
+            "the unit joins the folded resolution set"
+        );
+        // The second steer still disposed of the milestone — the dedupe
+        // suppresses only the duplicate RECORD, never the operator's act.
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1"
+            )),
+            "the skip still completes the milestone"
         );
     }
 }

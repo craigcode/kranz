@@ -1,4 +1,5 @@
 ---
+state: done
 title: Pipeline view must surface actionable work and reach the backlog list
 priority: 2
 schedule: once

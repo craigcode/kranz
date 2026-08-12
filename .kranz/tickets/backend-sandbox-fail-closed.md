@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 103ff40: BackendKind::supports_sandbox_enforcement() capability seam (exhaustive match), config::validate rejects enforce!=off on codex/droid/kimi/local with role+backend+mode+remedy, readiness parks via the same validation. Edge flagged: executor-tier routing can flip worker to local post-create; readiness re-validation still parks at drain. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Reject sandbox-configured non-Claude backends instead of silently ignoring enforcement (P1)
 priority: 1
 schedule: once

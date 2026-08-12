@@ -1,4 +1,5 @@
 ---
+state: done
 title: Validator allowlists must cover brief-granted read-only commands
 priority: 2
 schedule: once

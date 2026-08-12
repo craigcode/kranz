@@ -576,6 +576,8 @@ mod tests {
                 role,
                 feature_id: feature_id.map(|s| s.to_string()),
                 milestone_id: milestone_id.map(|s| s.to_string()),
+                candidate: None,
+                executor_route: None,
                 sdk_session_id: "sdk-1".to_string(),
                 model: model.to_string(),
                 quant: "n/a".to_string(),

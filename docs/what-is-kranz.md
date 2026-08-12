@@ -42,6 +42,12 @@ vibe.
 - **Queue and drain.** Missions serialize per repo (they own the working
   tree). Approvals can enqueue; `kranz work` drains the queue one mission at a
   time, crash-safely.
+- **Govern engineering standards.** Schema-4 packs can carry stable,
+  lifecycle-managed SHOULD/MUST Flight Rules. Kranz deterministically pins
+  the applicable revisions at approval, runs their deterministic/contextual/
+  human checkers, records exact waivers, and reports cross-mission
+  effectiveness. `spec-review` and `incident-review` tickets reuse the same
+  evidence path for immutable tracked artifacts and a required review output.
 
 ## Quickstart
 
@@ -168,6 +174,17 @@ the Slack bridge (Socket Mode, buttons calling the same approve/abandon
 endpoints), and the G2 glasses app are all just renderers of
 `GET /api/missions` and posters to `POST /api/*` (mutation-token gated). None
 of them hold mission state; kill any of them and the missions don't notice.
+
+### What kranz will not build
+
+The positioning ADR freezes new in-harness execution primitives — worker
+pools beyond the shipped M3 machinery, prompt routing sophistication,
+context-management features, or anything else whose purpose is to make an
+agent write better code (plus the standing non-goals: terminal replacement,
+editor/LSP shells, a general agentic IDE). Heterogeneous dispatch is the one
+carve-out, as an evidence primitive with three properties. The retained-vs-
+frozen split and its rationale:
+`docs/knowledge/decisions/positioning-governance-evidence-layer.md`.
 
 ## Where to go next
 

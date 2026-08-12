@@ -1,4 +1,5 @@
 ---
+state: done
 title: Slack socket-mode bridge must detect a dead connection and reconnect
 priority: 2
 schedule: once

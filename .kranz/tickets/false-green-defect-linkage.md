@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Superseded by the flight-surgeon console (fc93a23); marked 2026-07-30 by operator. Do not work.
 title: False-green detection via defect→mission linkage
 priority: 1
 schedule: once

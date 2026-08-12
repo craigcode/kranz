@@ -66,6 +66,13 @@ pub struct MockScript {
     /// scripted validator MOVE HEAD, as a real `git commit`-capable validator
     /// could (validator-immutability-proof tests). Empty by default.
     pub commits: Vec<String>,
+    /// Paths to REMOVE from the session's working directory (`spec.cwd`) when
+    /// the session starts, applied AFTER `writes` and `commits` — the seam
+    /// that lets a scripted worker sabotage its own worktree metadata (e.g.
+    /// delete its `.git`), so the engine's checkpoint finds an uninspectable
+    /// worktree exactly as a hostile worker could leave one (12th-pass
+    /// review, candidate-inspection-failure tests). Empty by default.
+    pub removes: Vec<String>,
     /// CONNECTs this session issues through the egress proxy named by
     /// `spec.env[HTTPS_PROXY]` at start (3.3b): the seam that lets a scripted
     /// `fs+net` session be REFUSED a destination so the run's outcome carries
@@ -86,6 +93,7 @@ impl Default for MockScript {
             hold_result_until_started: None,
             writes: Vec::new(),
             commits: Vec::new(),
+            removes: Vec::new(),
             proxy_connects: Vec::new(),
         }
     }
@@ -172,6 +180,16 @@ impl MockScript {
     /// tests).
     pub fn commits_all(mut self, message: impl Into<String>) -> Self {
         self.commits.push(message.into());
+        self
+    }
+
+    /// Remove `path` (relative to the session's working directory) when the
+    /// session starts, applied after any `writes_file`/`commits_all` — lets
+    /// a scripted worker sabotage its own worktree (e.g. delete its `.git`)
+    /// so the engine's checkpoint faces an uninspectable worktree
+    /// (12th-pass review, candidate-inspection-failure tests).
+    pub fn removes_path(mut self, path: impl Into<String>) -> Self {
+        self.removes.push(path.into());
         self
     }
 
@@ -476,6 +494,35 @@ impl AgentBackend for MockBackend {
             repo.ensure_identity()?;
             for message in &script.commits {
                 repo.add_all_and_commit(message)?;
+            }
+        }
+
+        // Sabotage seam (see [`MockScript::removes`]): applied AFTER writes
+        // and commits, so a scripted worker can leave a deliverable AND an
+        // uninspectable tree — the order a real hostile worker's actions
+        // would produce.
+        for rel_path in &script.removes {
+            let target = spec.cwd.join(rel_path);
+            let metadata = std::fs::symlink_metadata(&target).map_err(|e| {
+                EngineError::Backend(format!(
+                    "mock: failed to stat {} for scripted removal: {e}",
+                    target.display()
+                ))
+            })?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&target).map_err(|e| {
+                    EngineError::Backend(format!(
+                        "mock: failed to remove {}: {e}",
+                        target.display()
+                    ))
+                })?;
+            } else {
+                std::fs::remove_file(&target).map_err(|e| {
+                    EngineError::Backend(format!(
+                        "mock: failed to remove {}: {e}",
+                        target.display()
+                    ))
+                })?;
             }
         }
 

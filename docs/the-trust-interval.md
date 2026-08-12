@@ -35,6 +35,19 @@ unreviewed, 242% more incidents per PR, 6x bugs per developer with
 AI-assisted code. The harness is the unit that turns "predicts the next
 token" into "does the work" — this repo is that unit with a consent spine.
 
+A second convergence is the shape of the work itself. The first agentic
+systems were hand-drawn graphs: deterministic pipelines that occasionally
+called a model as a subroutine. The industry flipped that — the model
+became the loop, coordinating itself — and is now flipping again, to
+graphs the model constructs at runtime: subagents, agent teams, dynamic
+workflows (Claude Code's creator describes the ladder; the "graph
+engineering" label is a framing over that talk, not a phrase from it).
+The pendulum's lesson is the one this repo is built on: the durable value
+is not the loop and not the graph, but the **conditions** under which a
+model can safely build and run one — gates, evidence, budgets, and a
+human holding the moments of authority. Loops commoditize with every
+model release. The conditions are what you can own, measure, and defend.
+
 ## The differentiators, with receipts
 
 **Consent inside the loop, not around it.** Missions pause at the moments of
@@ -101,6 +114,9 @@ from the same event logs that drive everything else:
 - **The escalation ledger** — every block, grant, and revision with what was
   proposed and what was decided. It doubles as the consent corpus for
   fine-tuning work: labeled human judgment, not just execution traces.
+
+The four metrics are now a published vocabulary with definitions,
+denominators, and reproduce-commands: **`docs/metrics.md`**.
 
 (Status note, 2026-07-23: the console SHIPPED as mission m-d1e3c3 —
 `kranz outcomes`, the dashboard panel, and the `/kranz outcomes` Slack

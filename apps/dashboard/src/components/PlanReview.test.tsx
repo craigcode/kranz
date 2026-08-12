@@ -57,6 +57,45 @@ beforeEach(() => {
 });
 
 describe('PlanReview', () => {
+  it('flight_rules_dashboard_groups_exact_consent_by_rfc_with_digest_and_waiver_posture', () => {
+    const governed = plan();
+    governed.standardsManifest = {
+      packName: 'engineering-codex',
+      packDir: 'vendor/codex',
+      standardsRoot: 'standards',
+      digest: 'ab'.repeat(32),
+      source: 'repo-tracked',
+      rules: [
+        {
+          id: 'ENG-RUST-014',
+          revision: 3,
+          rfc: 'RFC-014',
+          level: 'must',
+          effectiveStatus: 'enforced',
+          statement: 'Rust changes must pass the workspace gate.',
+          domains: ['rust'],
+          stages: ['validation'],
+          whenPaths: ['crates/'],
+          taskClasses: [],
+          checker: 'gate:workspace',
+          waivable: false,
+        },
+      ],
+    };
+    useKranzStore.setState((state) => ({
+      planning: { ...state.planning, review: { plan: governed, estimate: estimate() } },
+    }));
+
+    render(<PlanReview />);
+
+    expect(screen.getByLabelText('Flight Rules consent')).toBeTruthy();
+    expect(screen.getByText('RFC-014')).toBeTruthy();
+    expect(screen.getByText('ENG-RUST-014 r3')).toBeTruthy();
+    expect(screen.getByText(/enforced · MUST/)).toBeTruthy();
+    expect(screen.getByText(/waiver: prohibited/)).toBeTruthy();
+    expect(screen.getByText(`sha256:${'ab'.repeat(32)}`)).toBeTruthy();
+  });
+
   it('renders considered alternatives from the reviewed plan', () => {
     render(<PlanReview />);
 

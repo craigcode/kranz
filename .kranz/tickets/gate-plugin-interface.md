@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: gate.rs (Gate trait, two-section GatePipeline — model-before-deterministic unrepresentable, verdict-authoritative GateOutcome with optional score), merge-gate suite adapted via MergeSuiteGate. gate_plugin filter: 7 tests green. Full gates green.
 title: Gate plugin interface — ordered, typed, registrable gates
 priority: 1
 schedule: once

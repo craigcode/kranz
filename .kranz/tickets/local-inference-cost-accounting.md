@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: tag+exclude+trailer landed: MissionCostClass (Frontier/Local/Mixed) classifies from folded config+escalation count; calibrate() excludes non-frontier with excluded_non_frontier counter; report.md cost trailer notes local $0-marginal / mixed. Pin test: local+mixed never enter the frontier corpus. Cache-miss modeling split to cache-miss-tier-switch-pricing.md (pri 3)
 title: Local-run cost accounting so calibration stays clean
 priority: 3
 schedule: once

@@ -107,6 +107,14 @@ pub struct SessionSpec {
     /// Additive field (docs/scoping/worker-sandboxing.md): populated by
     /// `runner.rs` for worker/validator sessions. Non-claude backends ignore it.
     pub sandbox: Option<crate::sandbox::ResolvedSandbox>,
+    /// Hook-status lane seed (ticket `agent-hooks-status-signals`): when the
+    /// mission config opts in AND the role's backend is hook-capable
+    /// ([`crate::types::BackendKind::supports_hook_status_signals`]), the
+    /// runner registers a per-run capability token and carries it here so
+    /// the backend can install its lifecycle-hook projection at spawn.
+    /// Backends without a hook surface ignore this field exactly like
+    /// `settings_json` — a `Some` on them is a byte-identical no-op.
+    pub hook_status: Option<crate::hook_status::HookStatusSeed>,
 }
 
 /// Normalized events surfaced from a session's output stream.

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented
 title: Backend readiness and quota preflight before queue drain
 priority: 2
 schedule: once

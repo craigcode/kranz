@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: dispatch stamps external_ref=kranz-<slug(title)> (never clobbers); kranz-run-bead posts one deduped mission-id+outcome comment. EXTERNAL-REF/RETURN-PATH round-trip cases green on live bd 1.0.5 with all 5 selftests.
 title: "Beads bridge: provenance + return path (D-BW-2 brief 2)"
 priority: 2
 schedule: once

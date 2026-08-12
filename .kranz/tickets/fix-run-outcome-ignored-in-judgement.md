@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in f4ba469 (Craig); reviewed + negative-tested + gates green
 title: Worker/validator run failures ignored after a parseable report (gate hole)
 priority: 1
 schedule: once

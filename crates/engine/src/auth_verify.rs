@@ -71,6 +71,7 @@ fn probe_spec(candidate_env: &HashMap<String, String>) -> SessionSpec {
         max_turns: Some(1),
         env: candidate_env.clone(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
