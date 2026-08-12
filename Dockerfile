@@ -36,7 +36,7 @@ RUN cargo build --release --locked -p kranz \
     && strip target/release/kranz
 
 # ---- runtime -----------------------------------------------------------------
-FROM debian:stable-slim@sha256:328d16499860ae6cb9b345e2e4cebca08c2a36e4f7278482c7bd1f39d71e5bfd AS runtime
+FROM debian:stable-slim@sha256:0d97731c59efdde181e19c4a5ec22d16e9eefcb73175598b9b7bae712c7214eb AS runtime
 
 # git: Kranz shells out to the git binary for every mission ref (git_ops.rs).
 # ca-certificates: TLS trust for the scoped push to a remote and for the
