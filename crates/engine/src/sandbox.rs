@@ -165,15 +165,32 @@ pub fn resolve_for_session(
     session_cwd: &Path,
     mission_dir: &Path,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
-    resolve_for_session_target(
+    let resolved = resolve_for_session_target(
         role_sandbox,
         session_cwd,
         mission_dir,
         std::env::consts::OS,
         command_available("bwrap"),
         crate::sandbox_container::detect(),
-    )
+    );
+    prewarm_xcrun_for_resolved_seatbelt(resolved.0.as_ref());
+    resolved
 }
+
+/// Apple command-line-tool shims refresh a per-user `xcrun_db*` file even for
+/// read-only Git commands. The profile correctly refuses that shared write,
+/// so refresh the cache outside the sandbox once per resolved Seatbelt
+/// session. Gate wrappers use the same bounded helper; command wrapping never
+/// performs the prewarm itself.
+#[cfg(target_os = "macos")]
+fn prewarm_xcrun_for_resolved_seatbelt(sandbox: Option<&ResolvedSandbox>) {
+    if sandbox.is_some_and(|sandbox| sandbox.backend == SandboxBackend::Seatbelt) {
+        crate::command_exec::prewarm_xcrun_cache_outside_sandbox();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prewarm_xcrun_for_resolved_seatbelt(_sandbox: Option<&ResolvedSandbox>) {}
 
 fn resolve_for_session_target(
     role_sandbox: &crate::types::SandboxConfig,
@@ -354,7 +371,7 @@ pub fn resolve_validator_containment(
     read_deny_roots: &[PathBuf],
     allow_uncontained_degrade: bool,
 ) -> crate::error::Result<ValidatorContainment> {
-    resolve_validator_containment_target(
+    let resolved = resolve_validator_containment_target(
         role_sandbox,
         backend,
         session_cwd,
@@ -364,7 +381,11 @@ pub fn resolve_validator_containment(
         std::env::consts::OS,
         command_available("bwrap"),
         crate::sandbox_container::detect(),
-    )
+    );
+    if let Ok(containment) = &resolved {
+        prewarm_xcrun_for_resolved_seatbelt(containment.sandbox.as_ref());
+    }
+    resolved
 }
 
 /// [`resolve_validator_containment`] parameterized on the target OS, `bwrap`
@@ -2223,6 +2244,60 @@ mod tests {
         assert_eq!(resolved.inputs.session_cwd, session.path());
         assert_eq!(resolved.inputs.mission_dir, mission.path());
         assert!(!resolved.inputs.tmpdir.as_os_str().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_prewarms_apple_git_cache_before_profile_use() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize disposable repository");
+        assert!(init.success());
+        let mission = tempfile::tempdir().unwrap();
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+
+        // Resolution performs the bounded host-side prewarm before the
+        // generated profile can deny the shared xcrun cache refresh.
+        let (resolved, warn) = resolve_for_session(&cfg, repo.path(), mission.path());
+        assert!(warn.is_none());
+        let resolved = resolved.expect("Seatbelt resolves on macOS");
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path =
+            write_profile_file(profile_dir.path(), &generate_profile(&resolved.inputs)).unwrap();
+        let output = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(profile_path)
+            .arg("/usr/bin/git")
+            .args(["status", "--short"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run Apple Git under the resolved profile");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "Apple Git must run: {stderr}");
+        assert!(
+            !stderr.contains("xcrun_db"),
+            "the host-side prewarm must prevent an in-sandbox cache refresh: {stderr}"
+        );
     }
 
     #[cfg(target_os = "macos")]
