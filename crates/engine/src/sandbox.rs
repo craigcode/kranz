@@ -894,7 +894,9 @@ pub fn effective_egress(configured: &[String]) -> Vec<String> {
 /// (under `<root>/.kranz/...`) and the shared git dir stay readable; the
 /// validator provably reads only its snapshot's contents. Denies take
 /// precedence over the broad allow regardless of clause order (the same
-/// guarantee the authority deny above relies on).
+/// guarantee the authority deny above relies on). Every Seatbelt session
+/// also keeps `/dev/null` writable: shells, Git, and agent tool runners use
+/// it for ordinary redirects even outside validator sessions.
 pub fn generate_profile(inputs: &SandboxInputs) -> String {
     let write_paths = write_allowlist(inputs);
 
@@ -969,14 +971,15 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
             profile.push_str(&format!("  (literal \"{lit}\")\n"));
         }
         profile.push_str(")\n");
-        // `/dev/null` must stay writable even under deny-default (the gate
-        // wrap's documented finding, `gate_profile_extras` — probed
-        // 2026-08-03): git and the shell open it O_RDWR in ordinary
-        // operation, and a validator session that cannot dies with
-        // "could not open '/dev/null'" on plain `git status`.
-        profile.push_str("\n(allow file-write* (literal \"/dev/null\"))\n");
         profile.push('\n');
     }
+    // `/dev/null` must stay writable even under deny-default (the gate
+    // wrap's documented finding, `gate_profile_extras` — probed
+    // 2026-08-03): Git, shells, and agent tool runners open it O_RDWR in
+    // ordinary operation. This applies to every session, not only the
+    // validator shape above.
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+    profile.push('\n');
     match inputs.enforce {
         crate::types::SandboxEnforce::FsNet => {
             // Loopback-only egress: the session's proxy hops (CONNECT to
@@ -1426,6 +1429,7 @@ mod tests {
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
         // `fs` must allow network so the sandboxed agent can reach its API.
         assert!(profile.contains("(allow network*)"));
         assert!(!profile.contains("(deny network*)"));
@@ -2302,6 +2306,19 @@ mod tests {
             "expected write inside session_cwd to succeed"
         );
         assert!(inside_file.exists(), "expected inside file to be created");
+
+        let dev_null_status = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("echo hi > /dev/null 2>&1")
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            dev_null_status.success(),
+            "ordinary shell redirects to /dev/null must succeed"
+        );
 
         let outside_file = outside.path().join(format!(
             "kranz_sandbox_should_fail_{}",
