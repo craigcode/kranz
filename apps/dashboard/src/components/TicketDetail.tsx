@@ -144,6 +144,19 @@ export function TicketDetail({ slug }: { slug: string }) {
 
         <ListSection title="Scoping answers" items={ticket.scopingAnswers} />
         <ListSection title="Acceptance hints" items={ticket.acceptanceHints} />
+        {ticket.reviewArtifact != null && (
+          <div className="ticket-section">
+            <div className="section-label">Review artifact contract</div>
+            <div>
+              <span className="dim">read-only input </span>
+              <code>{ticket.reviewArtifact}</code>
+            </div>
+            <div>
+              <span className="dim">required output </span>
+              <code>{ticket.reviewOutput}</code>
+            </div>
+          </div>
+        )}
         <ListSection title="Needs context" items={ticket.needsContext} />
         {ticket.wrongPlan !== null && (
           <div className="ticket-section">

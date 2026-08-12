@@ -17,6 +17,7 @@ import type {
   MissionHookStatus,
   MissionState,
   MissionSummary,
+  MissionStandardsView,
   Outcomes,
   Plan,
   PlanRequestResponse,
@@ -28,6 +29,7 @@ import type {
   TicketSummary,
   TranscriptEntry,
   WorkspaceSummary,
+  StandardsWaiverResult,
 } from './types';
 
 declare global {
@@ -197,6 +199,23 @@ export const api = {
 
   missionState(id: string): Promise<MissionState> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
+  },
+
+  standards(id: string): Promise<MissionStandardsView> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/standards`);
+  },
+
+  approveStandardsWaiver(
+    id: string,
+    body: {
+      ruleId: string;
+      revision: number;
+      findingSubject: string;
+      reason: string;
+      expiresAt: string;
+    },
+  ): Promise<StandardsWaiverResult> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/standards/waiver`, body);
   },
 
   workspace(id: string): Promise<WorkspaceSummary> {

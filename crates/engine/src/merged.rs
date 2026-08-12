@@ -18,11 +18,22 @@ use std::path::Path;
 /// when any ref fails to resolve; a per-mission git failure here must not
 /// fail the whole list.
 pub fn merged_bit(repo: &GitRepo, mission: &Mission) -> Option<bool> {
-    if !repo.branch_exists(&mission.mission_branch).ok()? {
+    merged_bit_for_branches(repo, &mission.mission_branch, &mission.base_branch)
+}
+
+/// [`merged_bit`] over bare branch names, for callers holding the
+/// reducer-folded refs rather than the whole [`Mission`] (the outcomes
+/// comparison fold's memoized per-mission inputs).
+pub fn merged_bit_for_branches(
+    repo: &GitRepo,
+    mission_branch: &str,
+    base_branch: &str,
+) -> Option<bool> {
+    if !repo.branch_exists(mission_branch).ok()? {
         return None;
     }
-    let mission_tip = repo.rev_parse(&mission.mission_branch).ok()?;
-    let base_tip = repo.rev_parse(&mission.base_branch).ok()?;
+    let mission_tip = repo.rev_parse(mission_branch).ok()?;
+    let base_tip = repo.rev_parse(base_branch).ok()?;
     repo.is_ancestor(&mission_tip, &base_tip).ok()
 }
 

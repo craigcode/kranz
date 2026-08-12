@@ -90,6 +90,22 @@ beforeEach(() => {
 });
 
 describe('TicketDetail', () => {
+  it('shows the immutable input and required review output', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({
+        taskClass: 'spec-review',
+        reviewArtifact: 'docs/api.md',
+        reviewOutput: 'reviews/api.md',
+      }),
+    );
+
+    render(<TicketDetail slug="fix-b" />);
+
+    expect(await screen.findByText('Review artifact contract')).toBeTruthy();
+    expect(screen.getByText('docs/api.md')).toBeTruthy();
+    expect(screen.getByText('reviews/api.md')).toBeTruthy();
+  });
+
   it('disables Queue for run and names the blocker for a blocked review ticket', async () => {
     vi.mocked(api.ticket).mockResolvedValueOnce(
       makeTicket({ blockedBy: ['dep-a'], isBlocked: true }),

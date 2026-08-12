@@ -92,14 +92,18 @@ its proving test.
 - **Precedence: deny-wins.** SBPL is deny-default and denies take
   precedence over allows regardless of clause order (verified with
   sandbox-exec); the explicit deny sets — mission-metadata writes, authority
-  reads (`serve.token`, `serve.read.token`, `config.json`, cargo
-  credentials), shared cargo-cache writes, validator read-deny — survive
+  reads (`serve.token`, `serve.read.token`, `config.json`,
+  `domain-terms.local`, the `hook-status/` projection, the mission
+  `control/` inbox, cargo credentials), shared cargo-cache writes,
+  validator read-deny — survive
   EVERY allow, including an `extraWrite` broad enough to cover them.
   Test: `composition_audit_explicit_denies_survive_a_covering_extra_write_allow`.
   The bwrap argv composes the same denies as ro-bind/tmpfs masks.
 - **Bypass paths:** none. Validator containment is mandatory regardless of
-  `sandbox.enforce` (uncontainable platform/backend degrades with a loud
-  per-round decision, never silently).
+  `sandbox.enforce` (an uncontainable platform/backend FAILS CLOSED by
+  default — 14th-pass reversal of the loud-degrade default; the
+  `validatorAllowUncontainedDegrade` config flag is the explicit per-repo
+  opt-in back to the loud per-round degrade).
 
 ### 3. Secret/domain allowlist waivers (`crates/engine/src/scrub.rs`, `domain_lint.rs`, `.kranz/secret-allowlist`, `.kranz/domain-allowlist`)
 

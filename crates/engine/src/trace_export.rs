@@ -174,6 +174,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -281,6 +282,7 @@ mod tests {
                 crate::events::EventKind::FeatureFailed {
                     feature_id: "f-1-2".to_string(),
                     reason: "gave up".to_string(),
+                    commits: Vec::new(),
                 },
             ),
             ev(

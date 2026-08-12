@@ -415,8 +415,14 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
         )
         .route("/missions/outcomes", get(rest::mission_outcomes))
         .route("/escalation-metrics", get(rest::escalation_metrics))
+        .route("/standards-metrics", get(rest::standards_metrics))
         .route("/cost-per-merged-change", get(rest::cost_per_merged_change))
         .route("/missions/{id}/state", get(rest::mission_state))
+        .route("/missions/{id}/standards", get(rest::mission_standards))
+        .route(
+            "/missions/{id}/standards/waiver",
+            post(rest::post_standards_waiver),
+        )
         .route("/missions/{id}/workspace", get(rest::mission_workspace))
         .route("/missions/{id}/events", get(rest::mission_events))
         .route("/missions/{id}/plan", get(rest::mission_plan))

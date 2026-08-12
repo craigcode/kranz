@@ -150,6 +150,7 @@ pub fn gate_result_events(surface: GateSurface, reports: &[GateReport]) -> Vec<E
                 artefact_detail: report.outcome.artefact.detail.clone(),
                 score: report.outcome.score.map(|score| score.score),
                 threshold: report.outcome.score.map(|score| score.threshold),
+                rule_ids: report.outcome.rule_ids.clone(),
             }
         })
         .collect()

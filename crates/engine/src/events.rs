@@ -212,6 +212,15 @@ pub enum EventKind {
         #[serde(rename = "featureId")]
         feature_id: String,
         reason: String,
+        /// Commits the failed feature landed on the mission branch before the
+        /// judgement (empty for a run that never committed — the m-eee81f
+        /// auth-death class — and for parallel/dirty-tree paths where nothing
+        /// reached the branch). Recorded so the supersession guard can tell
+        /// "failed with real work" (started; re-proposal rejects) from
+        /// "failed commitless" (re-proposable). Additive; old logs default
+        /// to empty.
+        #[serde(default)]
+        commits: Vec<String>,
     },
 
     #[serde(rename = "feature.skipped")]
@@ -324,10 +333,11 @@ pub enum EventKind {
     /// The confirmations ARE the local-vs-frontier miss-rate ground truth
     /// the ticket's start precondition demands: misses = disagreement
     /// subjects, opportunities = confirmed + disagreement command
-    /// assertions, both computable from the log alone (join `localRunId` /
-    /// `confirmRunId` against `worker.spawned` for the models). Additive
-    /// event; absent in pre-field logs, which simply have no local-validator
-    /// confirmations to measure.
+    /// assertions + `judgmentOpportunity` (0/1), all computable from the
+    /// log alone (join `localRunId` / `confirmRunId` against
+    /// `worker.spawned` for the models). Additive event; absent in
+    /// pre-field logs, which simply have no local-validator confirmations
+    /// to measure.
     #[serde(rename = "validation.confirm")]
     ValidationConfirm {
         #[serde(rename = "milestoneId")]
@@ -344,6 +354,17 @@ pub enum EventKind {
         /// Frontier findings on subjects the local report passed — the
         /// misses. Failed closed: each stands as the round's verdict.
         disagreements: Vec<Finding>,
+        /// True when the confirmed PASS was JUDGMENT-only: a contract with
+        /// no command assertions hands the local session pure judgment, and
+        /// its all-clean report is confirmed exactly like a command-
+        /// assertion PASS — but there are no assertion ids to list, so
+        /// `confirmed`/`disagreements` alone would record ZERO opportunities
+        /// for a confirmation that covered one, silently undercounting the
+        /// miss-rate denominator (14th-pass review). Additive; absent
+        /// (= false) in logs predating the field, which simply never
+        /// recorded a judgment-only confirmation.
+        #[serde(default, rename = "judgmentOpportunity")]
+        judgment_opportunity: bool,
     },
 
     /// Pty-driven functional validation: one engine-run pty-script contract
@@ -449,6 +470,14 @@ pub enum EventKind {
         /// [`crate::gate::GateScore`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         threshold: Option<f64>,
+        /// The stable Flight Rules standards rule ids this evaluation
+        /// joined (KRZ-343, design D-H): the linkage the coverage matrix
+        /// joins on, from [`crate::gate::GateOutcome::rule_ids`]. Additive
+        /// and evidentiary only — a gate with no standards linkage carries
+        /// an empty list, which never hits the wire, so a boolean-only
+        /// gate's payload stays byte-identical.
+        #[serde(rename = "ruleIds", default, skip_serializing_if = "Vec::is_empty")]
+        rule_ids: Vec<String>,
     },
 
     /// One deterministic gate projected onto a Claude Code lifecycle hook
@@ -885,6 +914,180 @@ pub enum EventKind {
         #[serde(default)]
         version: String,
     },
+
+    /// The Flight Rules resolution record (KRZ-342, design D-D/D-E/D-H):
+    /// emitted at plan approval, immediately after `plan.approved`, when a
+    /// standards-configured pack governed the approval. Records the source
+    /// identity + digest, the selection inputs (stage, task class, touch
+    /// set), the selected rule revisions, and the `plan.approved` seq the
+    /// pin attaches to — the queryable provenance for the consent artifact
+    /// the plan's `standardsManifest` carries in full.
+    ///
+    /// D-H's record list, verified for KRZ-343: the source identity/digest,
+    /// selection inputs, stage, rule revisions, and approval sequence all
+    /// ride in this payload; the effective-time evaluation instant is the
+    /// event envelope's own `ts` — resolution runs in the same approve_plan
+    /// call as the emission, so the append stamp IS the instant the
+    /// effective statuses were judged (payloads never duplicate the envelope
+    /// clock anywhere in this schema). The RFC `effective_at` absorption
+    /// window itself stays unevaluated in this slice: KRZ-341 parses and
+    /// carries the field, and the stage-projection slice that evaluates it
+    /// (KRZ-345) records its own surfaces.
+    #[serde(rename = "standards.resolved")]
+    StandardsResolved {
+        /// `repo-tracked` or `external-pinned` ([`StandardsPinSource`]).
+        source: String,
+        #[serde(rename = "packName")]
+        pack_name: String,
+        #[serde(rename = "standardsRoot")]
+        standards_root: String,
+        /// sha256 over the pack's normalized canonical manifest text.
+        digest: String,
+        /// The resolution surface: `approval` for the pinning resolution
+        /// (stage-specific projections are KRZ-345's emitters).
+        stage: String,
+        #[serde(rename = "taskClass", default, skip_serializing_if = "Option::is_none")]
+        task_class: Option<String>,
+        #[serde(rename = "touchSet", default, skip_serializing_if = "Vec::is_empty")]
+        touch_set: Vec<String>,
+        #[serde(
+            rename = "contextPaths",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        context_paths: Vec<String>,
+        /// The selected rules, stable-sorted by id.
+        rules: Vec<StandardsRuleRef>,
+        /// The seq of the `plan.approved` event this resolution pins.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+    },
+
+    /// The Flight Rules policy-drift refusal (KRZ-342, design D-E/D-H):
+    /// emitted when merge re-resolves the LIVE base policy against the exact
+    /// scratch integration diff and the applicable ENFORCED set differs from
+    /// the approved pin's — the merge is refused and the mission requires
+    /// explicit revalidation/reapproval. `currentDigest` is `None` when the
+    /// live base no longer yields a readable standards manifest at all (a
+    /// removed or malformed pack — the ultimate drift, failed closed).
+    /// Audit-only in the reducer: the refusal already happened; the event is
+    /// the evidence.
+    #[serde(rename = "standards.drifted")]
+    StandardsDrifted {
+        /// The digest pinned at approval.
+        #[serde(rename = "approvedDigest")]
+        approved_digest: String,
+        /// The digest resolved from the live base, when one resolved.
+        #[serde(
+            rename = "currentDigest",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_digest: Option<String>,
+        /// The surface that detected the drift (`merge` in this slice).
+        surface: String,
+        /// Id-level descriptions of the changed applicable enforced rules
+        /// (added / removed / changed), stable-sorted.
+        #[serde(rename = "changedRules")]
+        changed_rules: Vec<String>,
+    },
+
+    /// The Flight Rules human waiver decision (ticket
+    /// `.kranz/tickets/flight-rules-waiver-decisions.md`, KRZ-344; design
+    /// D-I — "waivers are narrow human decisions"): the ONE authorized
+    /// exception path for a standards failure. Only an authenticated human
+    /// surface records it (`kranz standards waive` in this slice) — a model
+    /// may request a waiver or propose a fix but can NEVER approve one, so
+    /// no engine or backend code path emits this event. The binding is
+    /// deliberately narrow enough that the waiver cannot survive a
+    /// meaningful rule/finding/scope/diff change: it names the pinned rule
+    /// id + revision + manifest digest + approval sequence, the fingerprint
+    /// of the EXACT finding it subtracts, the affected paths, and the
+    /// sha256 over the affected-path diff (the whole diff for an unscoped
+    /// rule), plus the reason, the approver, and the expiry. A change to
+    /// the affected-path diff, the rule revision, the finding fingerprint,
+    /// or the pin — or the expiry passing — invalidates the waiver and
+    /// restores the block; unrelated paths receive no authority. It
+    /// subtracts EXACTLY ONE matching standards failure: it never disables
+    /// a checker, an RFC, a domain, or a class, and engine floor gates have
+    /// no waiver slot at all. Audit-only in the reducer: the coverage fold
+    /// joins it straight from the log.
+    #[serde(rename = "standards.waiver.approved")]
+    StandardsWaiverApproved {
+        /// The pinned rule id the waiver excepts (frontmatter `id:`).
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        /// The pinned rule revision — a waiver naming any other revision
+        /// joins nothing.
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        /// sha256 of the approved manifest the waiver binds to
+        /// ([`StandardsPin::digest`]).
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        /// The seq of the `plan.approved` event whose pin the waiver binds
+        /// — a re-approval supersedes every earlier waiver.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        /// sha256 fingerprint of the ONE finding this waiver subtracts
+        /// ([`crate::standards_waiver::finding_fingerprint`]).
+        #[serde(rename = "findingFingerprint")]
+        finding_fingerprint: String,
+        /// The affected paths the bound diff covers: the rule's
+        /// `when-paths` intersected with the mission diff, or the whole
+        /// changed set for an unscoped rule. Recorded so the audit names
+        /// exactly what the digest covers; empty when a scoped rule
+        /// matched no changed path (the waiver then binds the empty
+        /// scoped diff).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        /// sha256 over the affected-path diff bytes at approval time — a
+        /// later change to any affected path digests differently and
+        /// invalidates the waiver.
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        /// The human's reason, verbatim (scrubbed at write like every
+        /// payload string).
+        reason: String,
+        /// The approver principal: the authenticated identity where the
+        /// local authority model can name one, else honestly
+        /// `local-operator` (D-I — never invent a real-world identity).
+        approver: String,
+        /// The authenticated invocation surface (`cli` in this slice).
+        /// The coverage fold honors only recognized human surfaces — a
+        /// hand-cut event claiming a model surface carries no authority.
+        surface: String,
+        /// The expiry instant. The fold judges it against the log's own
+        /// frontier (the latest event instant — never a wall clock, so
+        /// replays stay byte-identical); an enforcement decision re-judges
+        /// it against its own clock.
+        #[serde(rename = "expiresAt")]
+        expires_at: DateTime<Utc>,
+    },
+
+    /// Positive human verdict for a rule whose typed checker is
+    /// `manual-attestation` (KRZ-346 D-F). Like a waiver, authority is narrow:
+    /// exact mission pin, rule revision, affected paths, and current diff.
+    /// Unlike a waiver it does not except a failing checker; it IS the
+    /// checker and therefore carries no finding fingerprint or expiry.
+    #[serde(rename = "standards.attestation.approved")]
+    StandardsAttestationApproved {
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        reason: String,
+        approver: String,
+        surface: String,
+    },
 }
 
 impl EventKind {
@@ -940,6 +1143,10 @@ impl EventKind {
             EventKind::WorkspaceReadinessReport { .. } => "workspace.readiness",
             EventKind::WorkspaceTeardown { .. } => "workspace.teardown",
             EventKind::WorkspaceProviderPinned { .. } => "workspace.provider.pinned",
+            EventKind::StandardsResolved { .. } => "standards.resolved",
+            EventKind::StandardsDrifted { .. } => "standards.drifted",
+            EventKind::StandardsWaiverApproved { .. } => "standards.waiver.approved",
+            EventKind::StandardsAttestationApproved { .. } => "standards.attestation.approved",
         }
     }
 
@@ -963,6 +1170,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -1499,7 +1707,7 @@ mod tests {
     /// shape, and round-trip — the miss-rate ground truth must survive serde
     /// verbatim, because the local-vs-frontier miss rate is computed from
     /// these bytes alone (misses = disagreement subjects; opportunities =
-    /// confirmed + disagreement command assertions).
+    /// confirmed + disagreement command assertions + judgmentOpportunity).
     #[test]
     fn guarded_local_validator_confirm_event_wire_shape_and_round_trip() {
         let event = EventKind::ValidationConfirm {
@@ -1513,7 +1721,9 @@ mod tests {
                 evidence: "frontier sees a failure the local pass missed".to_string(),
                 suggested_fix: "fix a2".to_string(),
                 class: String::new(),
+                rule: None,
             }],
+            judgment_opportunity: false,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "validation.confirm");
@@ -1525,6 +1735,10 @@ mod tests {
             json["payload"]["disagreements"][0]["subject"],
             serde_json::json!("a2")
         );
+        assert_eq!(
+            json["payload"]["judgmentOpportunity"],
+            serde_json::json!(false)
+        );
         assert_eq!(event.type_name(), "validation.confirm");
         let back: EventKind = serde_json::from_value(json).unwrap();
         match back {
@@ -1534,6 +1748,7 @@ mod tests {
                 confirm_run_id,
                 confirmed,
                 disagreements,
+                judgment_opportunity,
             } => {
                 assert_eq!(milestone_id, "ms-1");
                 assert_eq!(local_run_id, "run-local");
@@ -1541,7 +1756,25 @@ mod tests {
                 assert_eq!(confirmed, vec!["a1".to_string()]);
                 assert_eq!(disagreements.len(), 1);
                 assert_eq!(disagreements[0].subject, "a2");
+                assert!(!judgment_opportunity);
             }
+            _ => panic!("wrong variant"),
+        }
+
+        // A legacy line (the field predated) decodes with the additive
+        // default — pre-field logs simply never recorded a judgment-only
+        // confirmation.
+        let mut legacy = serde_json::to_value(&event).unwrap();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("judgmentOpportunity");
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ValidationConfirm {
+                judgment_opportunity,
+                ..
+            } => assert!(!judgment_opportunity, "absent reads as false"),
             _ => panic!("wrong variant"),
         }
     }
@@ -1614,6 +1847,7 @@ mod tests {
             artefact_detail: Some("[a-1] test-runner pipeline's grep anchors no nonzero count: `cargo test | grep ok`".to_string()),
             score: Some(0.42),
             threshold: Some(0.75),
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["type"], "gate.result");
@@ -1641,6 +1875,7 @@ mod tests {
                 artefact_detail,
                 score,
                 threshold,
+                rule_ids,
             } => {
                 assert_eq!(gate, "vacuous-filter");
                 assert_eq!(surface, crate::gate::GateSurface::Approval);
@@ -1651,6 +1886,7 @@ mod tests {
                 assert!(artefact_detail.as_deref().unwrap().contains("[a-1]"));
                 assert_eq!(score, Some(0.42));
                 assert_eq!(threshold, Some(0.75));
+                assert!(rule_ids.is_empty());
             }
             _ => panic!("wrong variant"),
         }
@@ -1661,6 +1897,8 @@ mod tests {
     /// stays OFF the wire (byte-identical to a payload that never had them)
     /// and a line without them parses back to `None` (serde default), so
     /// hand-written or future-trimmed logs fold like engine-written ones.
+    /// KRZ-343's `ruleIds` follows the same rule: a gate with no standards
+    /// linkage carries an empty list, which serializes as NO key.
     #[test]
     fn gate_result_event_optional_fields_are_additive() {
         let sparse = EventKind::GateResult {
@@ -1673,13 +1911,14 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&sparse).unwrap();
         assert_eq!(json["payload"]["surface"], "final-gate");
         assert_eq!(json["payload"]["kind"], "model-judged");
         assert_eq!(json["payload"]["verdict"], "pass");
         let payload = json["payload"].as_object().unwrap();
-        for absent in ["artefactDetail", "score", "threshold"] {
+        for absent in ["artefactDetail", "score", "threshold", "ruleIds"] {
             assert!(
                 !payload.contains_key(absent),
                 "payload must not contain {absent} when None: {json}"

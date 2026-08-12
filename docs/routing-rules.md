@@ -36,7 +36,10 @@ fallback is recorded.
 
 - The file is validated at draft (mission creation) and again at approve; an
   invalid file fails closed naming the file, the rule index, and the field
-  (owner: repo-setup).
+  (owner: repo-setup). An EMPTY table (`{}` or both lists empty) fails closed
+  the same way — a present file IS the table, so an empty one would silently
+  demote routing to the legacy floor; delete the file to keep the layered
+  config instead.
 - When the file exists it IS the routing table: it supersedes any
   layered-config `routing` key wholesale, and the supersession is recorded on
   the mission's decision log.

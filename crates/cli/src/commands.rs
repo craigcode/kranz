@@ -423,7 +423,44 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
         Command::Pack { command } => match command {
-            crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&dir),
+            crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&repo, &dir),
+        },
+        Command::Standards { command } => match command {
+            crate::cli::StandardsCommand::Metrics { json } => {
+                let report = kranz_engine::standards_metrics::compute(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::output::render_standards_metrics(&report));
+                }
+                Ok(0)
+            }
+            crate::cli::StandardsCommand::Lint { dir, against } => {
+                cmd_standards_lint(&repo, &dir, against.as_deref())
+            }
+            crate::cli::StandardsCommand::Waive {
+                rule,
+                revision,
+                finding,
+                reason,
+                expires,
+            } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_waive(
+                    &repo,
+                    &mission,
+                    &rule,
+                    revision,
+                    finding.as_deref(),
+                    &reason,
+                    &expires,
+                    lock_force,
+                )
+            }
+            crate::cli::StandardsCommand::Attest { rule, reason } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_attest(&repo, &mission, &rule, &reason, lock_force)
+            }
         },
         Command::Otel {
             endpoint,
@@ -1605,8 +1642,14 @@ fn warn_if_terms_file_unprotected(repo: &Path, terms_file: &Path) {
 /// valid pack prints what it registered; a directory without a pack.toml is
 /// not a pack and says so plainly (exit 0); an invalid pack fails closed
 /// with exit 1 naming the offending field.
-fn cmd_pack_lint(dir: &Path) -> Result<i32> {
-    match kranz_engine::pack::Pack::load(dir) {
+///
+/// Flight Rules trust (KRZ-341 D-A/D-J): when the directory is a tracked,
+/// in-repo pack the standards corpus may activate enforced rules; anything
+/// else lints as external/untracked — advisory-only, enforced content fails
+/// the load naming the remedy.
+fn cmd_pack_lint(repo: &Path, dir: &Path) -> Result<i32> {
+    let trust = kranz_engine::pack::standards::trust_for_dir(repo, dir);
+    match kranz_engine::pack::Pack::load_with_trust(dir, trust) {
         Ok(Some(pack)) => {
             print!("{}", kranz_engine::pack::render_lint(&pack));
             Ok(0)
@@ -1624,6 +1667,224 @@ fn cmd_pack_lint(dir: &Path) -> Result<i32> {
             Ok(1)
         }
     }
+}
+
+/// `kranz standards lint <pack> [--against <ref>]` (KRZ-341): report the
+/// normalized Flight Rules manifest of a schema-4 pack — RFCs, rules with
+/// effective lifecycle status and checker bindings, the content digest, and
+/// the trust posture. With `--against`, the base corpus is read from
+/// tracked blobs at that git ref (never the worktree) and lifecycle
+/// transition violations (D-B/D-C) are refused with exit 1.
+fn cmd_standards_lint(repo: &Path, dir: &Path, against: Option<&str>) -> Result<i32> {
+    let trust = kranz_engine::pack::standards::trust_for_dir(repo, dir);
+    let pack = match kranz_engine::pack::Pack::load_with_trust(dir, trust) {
+        Ok(Some(pack)) => pack,
+        Ok(None) => {
+            println!(
+                "no pack at {} (no {}) — nothing to lint",
+                dir.display(),
+                kranz_engine::pack::PACK_MANIFEST
+            );
+            return Ok(0);
+        }
+        Err(err) => {
+            eprintln!("invalid pack at {}: {err}", dir.display());
+            return Ok(1);
+        }
+    };
+    let Some(manifest) = &pack.standards else {
+        println!(
+            "pack `{}` (schema {}) at {} declares no [standards] root — nothing to lint",
+            pack.name,
+            pack.schema,
+            dir.display()
+        );
+        return Ok(0);
+    };
+    print!(
+        "{}",
+        kranz_engine::pack::standards::render_manifest(manifest, trust)
+    );
+    if let Some(refname) = against {
+        // The base comparison reads tracked blobs from THIS repo, so the
+        // pack must live inside it (tracked or not — an untracked pack
+        // simply has no base history and fails the trust gate at load).
+        let Some(pack_rel) = kranz_engine::pack::standards::repo_relative_dir(repo, dir) else {
+            eprintln!(
+                "--against reads the base pack from tracked git blobs in {}; {} is outside \
+                 the repo — external packs have no base history to compare against (D-A)",
+                repo.display(),
+                dir.display()
+            );
+            return Ok(1);
+        };
+        let git = kranz_engine::git_ops::GitRepo::open(repo)?;
+        let base = match kranz_engine::pack::standards::load_at_ref(&git, refname, &pack_rel) {
+            Ok(base) => base,
+            Err(err) => {
+                eprintln!("cannot load the base standards at `{refname}`: {err}");
+                return Ok(1);
+            }
+        };
+        let errors = kranz_engine::pack::standards::check_transitions(base.as_ref(), manifest);
+        print!(
+            "{}",
+            kranz_engine::pack::standards::render_transition_report(
+                refname,
+                base.as_ref(),
+                &errors
+            )
+        );
+        if !errors.is_empty() {
+            return Ok(1);
+        }
+    }
+    Ok(0)
+}
+
+/// `kranz standards waive --rule <id> --reason <text> --expires <rfc3339>`
+/// (KRZ-344, design D-I): the one authorized exception path for a
+/// standards failure. The engine validates every refusal shape and appends
+/// `standards.waiver.approved`; this wrapper displays the evidence the
+/// waiver binds. Refusals print plainly and exit 1 — they are operator
+/// feedback, not crashes. The approver is never a flag: the local
+/// authority model cannot name a person, so the record honestly carries
+/// `local-operator` plus the `cli` surface (D-I — a model can request a
+/// waiver but never approve one, and there is no identity to invent).
+#[allow(clippy::too_many_arguments)]
+fn cmd_standards_waive(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    revision: Option<u64>,
+    finding: Option<&str>,
+    reason: &str,
+    expires: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let expires_at = match chrono::DateTime::parse_from_rfc3339(expires) {
+        Ok(parsed) => parsed.with_timezone(&chrono::Utc),
+        Err(err) => {
+            eprintln!("waiver refused: --expires must be an RFC 3339 instant: {err}");
+            return Ok(1);
+        }
+    };
+    let request = kranz_engine::standards_waiver::WaiverRequest {
+        rule_id: rule.to_string(),
+        revision,
+        finding_subject: finding.map(str::to_string),
+        reason: reason.to_string(),
+        expires_at,
+    };
+    let outcome = match kranz_engine::standards_waiver::approve_standards_waiver(
+        repo, mission_id, &request, "cli", force_lock,
+    ) {
+        Ok(outcome) => outcome,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "waiver refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first (a waiver against a live mission would race the \
+                 runner's own appends).\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("waiver refused: {e}");
+            return Ok(1);
+        }
+    };
+    // Display the evidence the waiver binds — the finding, the rule, the
+    // affected paths, and the diff digest — exactly as recorded.
+    let pinned = &outcome.rule;
+    println!(
+        "recorded standards.waiver.approved (seq {})",
+        outcome.event.seq
+    );
+    println!("mission: {mission_id}");
+    println!(
+        "rule: {} r{} — {}, {}; checker {}; waivable: {}",
+        pinned.id,
+        pinned.revision,
+        pinned.level,
+        pinned.effective_status,
+        pinned.checker.as_deref().unwrap_or("-"),
+        pinned.waivable
+    );
+    println!("  statement: {}", pinned.statement);
+    println!(
+        "finding: {} (run {})\n  evidence: {}",
+        outcome.finding_subject, outcome.run_id, outcome.finding_evidence
+    );
+    println!("  fingerprint: sha256:{}", outcome.finding_fingerprint);
+    if pinned.when_paths.is_empty() {
+        println!(
+            "affected paths: the whole mission diff ({} path(s)) — the rule is unscoped",
+            outcome.affected_paths.len()
+        );
+    } else if outcome.affected_paths.is_empty() {
+        println!(
+            "affected paths: (none — the rule's when-paths match no changed path; the \
+             waiver binds the empty scoped diff)"
+        );
+    } else {
+        println!("affected paths: {}", outcome.affected_paths.join(", "));
+    }
+    println!(
+        "diff digest: sha256:{} (covers the affected-path diff at the mission branch tip)",
+        outcome.diff_digest
+    );
+    println!(
+        "approver: {} via cli\nreason: {reason}\nexpires: {}",
+        kranz_engine::standards_waiver::LOCAL_OPERATOR,
+        expires_at.to_rfc3339()
+    );
+    Ok(0)
+}
+
+/// Record the positive human checker verdict for one `manual-attestation`
+/// rule. This is intentionally separate from a waiver: the operator is
+/// attesting that the current diff satisfies the rule, not excepting a
+/// failure. The engine owns all binding and refusal checks.
+fn cmd_standards_attest(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    reason: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let record = match kranz_engine::standards_attestation::approve_attestation(
+        repo, mission_id, rule, reason, "cli", force_lock,
+    ) {
+        Ok(record) => record,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "attestation refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first.\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("attestation refused: {e}");
+            return Ok(1);
+        }
+    };
+    println!(
+        "recorded standards.attestation.approved (seq {})",
+        record.seq
+    );
+    println!("mission: {mission_id}");
+    println!("rule: {} r{}", record.rule_id, record.rule_revision);
+    if record.paths.is_empty() {
+        println!("affected paths: (none)");
+    } else {
+        println!("affected paths: {}", record.paths.join(", "));
+    }
+    println!("diff digest: sha256:{}", record.diff_digest);
+    println!(
+        "approver: {} via {}\nreason: {}",
+        record.approver, record.surface, record.reason
+    );
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

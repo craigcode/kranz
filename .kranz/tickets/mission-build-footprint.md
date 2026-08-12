@@ -2,6 +2,8 @@
 title: Mission build footprint — one full target/ per worktree does not fit small disks
 priority: 2
 schedule: once
+state: done
+state-note: Chose the pre-flight disk check shape (the ticket's 'cheap, honest' option): drain-time statvfs vs estimated footprint (target/ x2, 4 GiB floor) refuses with the number named, never dies mid-feature with os error 28. CARGO_TARGET_DIR sharing / debug-info reduction remain future footprint optimizations, not required by the acceptance.
 ---
 
 ## Goal

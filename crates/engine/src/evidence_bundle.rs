@@ -411,6 +411,19 @@ fn render_summary(
         out.push('\n');
     }
 
+    // Flight Rules coverage (KRZ-343, design D-H): the rule coverage matrix
+    // rides the chain, so the bundle renders the SAME fold the replay
+    // computed — no second derivation to drift. It follows the gate ladder
+    // it joins against. `None` (no approved standards pin — every
+    // pre-Flight-Rules mission) renders nothing, so those summaries stay
+    // byte-identical.
+    if let Some(coverage) = &chain.standards {
+        out.push_str(&crate::standards_coverage::render_coverage_markdown(
+            coverage,
+        ));
+        out.push('\n');
+    }
+
     out.push_str("## Sessions (workers and reviewers)\n\n");
     if chain.sessions.is_empty() {
         out.push_str("(no sessions recorded)\n\n");
@@ -973,6 +986,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -1002,6 +1016,7 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         }
     }
 
@@ -1506,5 +1521,222 @@ mod tests {
         assert!(outcome.files_written > 0);
         assert!(out.join(MANIFEST_FILE).is_file());
         assert!(out.join(LOG_FILE).is_file());
+    }
+
+    // ---- KRZ-343: the standards coverage matrix rides the bundle ----------
+
+    /// A plan carrying a three-rule standards pin (KRZ-342's consent
+    /// shape): one failed by a citing finding, one passed by a naming gate,
+    /// one never evaluated.
+    fn pinned_plan() -> Plan {
+        let rule = |id: &str, revision: u64, status: &str| crate::types::PinnedRule {
+            id: id.to_string(),
+            revision,
+            rfc: "RFC-001".to_string(),
+            level: "must".to_string(),
+            effective_status: status.to_string(),
+            statement: format!("statement for {id}"),
+            domains: Vec::new(),
+            stages: vec!["validation".to_string()],
+            when_paths: Vec::new(),
+            task_classes: Vec::new(),
+            checker: Some("gate:zz-gate".to_string()),
+            waivable: false,
+        };
+        Plan {
+            standards_manifest: Some(Box::new(crate::types::StandardsPin {
+                pack_name: "zz-pack".to_string(),
+                pack_dir: "vendor/pack".to_string(),
+                standards_root: "standards".to_string(),
+                digest: "ab".repeat(32),
+                source: crate::types::StandardsPinSource::RepoTracked,
+                task_class: None,
+                touch_set: vec!["crates/**".to_string()],
+                context_paths: Vec::new(),
+                gates: Vec::new(),
+                rules: vec![
+                    rule("ZZ-FAIL-001", 2, "enforced"),
+                    rule("ZZ-PASS-001", 1, "enforced"),
+                    rule("ZZ-QUIET-001", 1, "enforced"),
+                ],
+            })),
+            ..sample_plan()
+        }
+    }
+
+    /// A pinned mission: approval + the resolution record, a gate pass
+    /// naming ZZ-PASS-001 with a file artefact whose bytes were NEVER
+    /// written (the unresolved-artefact arm), a finding citing ZZ-FAIL-001,
+    /// and ZZ-QUIET-001 evaluated by nothing — ending COMPLETED.
+    fn seed_pinned_mission(root: &Path) -> MissionPaths {
+        let mut gate = gate_result(
+            "zz-gate",
+            GateSurface::FinalGate,
+            GateKind::Deterministic,
+            0,
+            "file:runs/gone.jsonl",
+        );
+        if let EventKind::GateResult { rule_ids, .. } = &mut gate {
+            *rule_ids = vec!["ZZ-PASS-001".to_string()];
+        }
+        seed_mission(
+            root,
+            "m-1",
+            vec![
+                created(),
+                EventKind::PlanApproved {
+                    plan: pinned_plan(),
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::StandardsResolved {
+                    source: "repo-tracked".to_string(),
+                    pack_name: "zz-pack".to_string(),
+                    standards_root: "standards".to_string(),
+                    digest: "ab".repeat(32),
+                    stage: "approval".to_string(),
+                    task_class: None,
+                    touch_set: vec!["crates/**".to_string()],
+                    context_paths: Vec::new(),
+                    rules: Vec::new(),
+                    approval_seq: 2,
+                },
+                gate,
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".into(),
+                    run_id: "v-1".into(),
+                    finding: crate::types::Finding {
+                        subject: "a-1".into(),
+                        severity: "major".into(),
+                        evidence: "the rule failed".into(),
+                        suggested_fix: String::new(),
+                        class: String::new(),
+                        rule: Some(crate::types::RuleCitation {
+                            id: "ZZ-FAIL-001".to_string(),
+                            revision: 2,
+                            source: "zz-pack standards".to_string(),
+                            digest: "ab".repeat(32),
+                            lifecycle: "enforced".to_string(),
+                            level: "must".to_string(),
+                            checker: Some("gate:zz-gate".to_string()),
+                        }),
+                    },
+                },
+                EventKind::MissionCompleted {},
+            ],
+        )
+    }
+
+    /// KRZ-343 (D-H): the bundle renders the coverage matrix from the SAME
+    /// fold the replay computed — summary.md carries the dispositions with
+    /// mechanism and artefact references, chain.json carries the machine
+    /// form — and the assembly stays byte-identical across runs.
+    #[test]
+    fn flight_rules_provenance_bundle_renders_coverage_byte_identically() {
+        let tmp = TempDir::new().unwrap();
+        seed_pinned_mission(tmp.path());
+        let first = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        let second = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        assert_eq!(first, second, "same log → byte-identical bundle");
+
+        let summary = first
+            .files
+            .iter()
+            .find(|file| file.path == SUMMARY_FILE)
+            .expect("summary ships");
+        let summary = String::from_utf8(summary.bytes.clone()).unwrap();
+        assert!(
+            summary.contains("## Flight Rules standards coverage"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("| ZZ-FAIL-001 | r2 | enforced | must | gate:zz-gate | failed |"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("| ZZ-PASS-001 | r1 | enforced | must | gate:zz-gate | passed |"),
+            "{summary}"
+        );
+        assert!(
+            summary
+                .contains("| ZZ-QUIET-001 | r1 | enforced | must | gate:zz-gate | not-evaluated |"),
+            "{summary}"
+        );
+        // The evidence cell names the artefact reference verbatim…
+        assert!(
+            summary.contains("gate.result seq 4 zz-gate pass `file:runs/gone.jsonl`"),
+            "{summary}"
+        );
+
+        let chain = first
+            .files
+            .iter()
+            .find(|file| file.path == CHAIN_FILE)
+            .expect("the chain ships");
+        let chain = String::from_utf8(chain.bytes.clone()).unwrap();
+        assert!(chain.contains("\"standards\""), "{chain}");
+        assert!(
+            chain.contains("\"disposition\": \"not-evaluated\""),
+            "{chain}"
+        );
+    }
+
+    /// The replay contract survives the matrix (KRZ-343): a referenced
+    /// artefact whose bytes are gone stays `unresolved` in the manifest —
+    /// the coverage row still names the reference, and nothing about the
+    /// missing bytes becomes an error or a pass.
+    #[test]
+    fn flight_rules_provenance_bundle_removed_artefacts_stay_unresolved() {
+        let tmp = TempDir::new().unwrap();
+        seed_pinned_mission(tmp.path());
+        // runs/gone.jsonl was never written: the gate's file ref is gone.
+        let bundle = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        let entry = manifest_entry(&bundle.manifest, "file:runs/gone.jsonl");
+        assert_eq!(entry.status, Some(ArtefactStatus::Unresolved));
+        assert_eq!(entry.path, None, "an unresolved entry has no bytes path");
+        // …and the matrix still renders the reference, marked passed ONLY
+        // because the gate stated a pass verdict — never because evidence
+        // was absent.
+        let summary = bundle
+            .files
+            .iter()
+            .find(|file| file.path == SUMMARY_FILE)
+            .expect("summary ships");
+        let summary = String::from_utf8(summary.bytes.clone()).unwrap();
+        assert!(summary.contains("`file:runs/gone.jsonl`"), "{summary}");
+        assert!(
+            summary.contains("Absence of evidence is never rendered as pass"),
+            "{summary}"
+        );
+    }
+
+    /// The byte-compat regression contract: the pre-Flight-Rules fixture
+    /// (no pin, no standards events) bundles with NO coverage section and
+    /// NO standards key in chain.json — byte-identical to what the export
+    /// produced before KRZ-343.
+    #[test]
+    fn flight_rules_provenance_bundle_pre_flight_rules_mission_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        seed_full_mission(tmp.path());
+        let bundle = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        let summary = bundle
+            .files
+            .iter()
+            .find(|file| file.path == SUMMARY_FILE)
+            .expect("summary ships");
+        let summary = String::from_utf8(summary.bytes.clone()).unwrap();
+        assert!(
+            !summary.contains("Flight Rules standards coverage"),
+            "no pin, no matrix: {summary}"
+        );
+        let chain = bundle
+            .files
+            .iter()
+            .find(|file| file.path == CHAIN_FILE)
+            .expect("the chain ships");
+        let chain = String::from_utf8(chain.bytes.clone()).unwrap();
+        assert!(
+            !chain.contains("\"standards\""),
+            "a pre-Flight-Rules chain carries no standards key: {chain}"
+        );
     }
 }

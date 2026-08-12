@@ -46,6 +46,10 @@
 //! ([`crate::workspace_contract`]):
 //! - **Missing file ⇒ `Ok(None)`** — today's layered-config/per-role
 //!   behavior, byte-identical. Never an error.
+//! - **Present-but-empty ⇒ fail closed** the same way: a present file IS
+//!   the routing table, so an empty one (`{}`, or both rule lists empty)
+//!   would silently demote routing to the legacy task-class floor — delete
+//!   the file to keep the layered config instead.
 //! - **Present-but-invalid ⇒ fail closed** at draft (mission creation) and
 //!   at approve, naming the file, the rule index, and the field.
 //! - **Present and valid ⇒ the file IS the table**: it supersedes any
@@ -78,8 +82,11 @@ struct RoutingRulesFile {
 /// Parse and validate routing-rules file bytes. Every validation failure
 /// names the file and the offending rule (index + field, via
 /// [`crate::routing::validate_table`]); parse failures carry the serde
-/// location. A valid file converts into the engine's [`RoutingConfig`]
-/// verbatim — both rule forms, order preserved.
+/// location. An EMPTY table is refused too — a present file IS the routing
+/// table, so `{}` would silently demote routing to the legacy task-class
+/// floor; the refusal names the file and points at the fix (delete the file
+/// to keep the layered config). A valid file converts into the engine's
+/// [`RoutingConfig`] verbatim — both rule forms, order preserved.
 pub fn parse_routing_rules(bytes: &[u8]) -> std::result::Result<RoutingConfig, String> {
     let file: RoutingRulesFile = serde_json::from_slice(bytes)
         .map_err(|e| format!("invalid JSON in {ROUTING_RULES_PATH}: {e}"))?;
@@ -87,6 +94,13 @@ pub fn parse_routing_rules(bytes: &[u8]) -> std::result::Result<RoutingConfig, S
         task_class_rules: file.task_class_rules,
         pattern_rules: file.pattern_rules,
     };
+    if routing.is_empty() {
+        return Err(format!(
+            "{ROUTING_RULES_PATH}: the rules table is empty: a present file IS the routing \
+             table, so an empty one would silently demote routing to the legacy task-class \
+             floor — delete the file to keep the layered config, or declare at least one rule"
+        ));
+    }
     crate::routing::validate_table(&routing)
         .map_err(|violation| format!("{ROUTING_RULES_PATH}: {violation}"))?;
     Ok(routing)
@@ -96,9 +110,9 @@ pub fn parse_routing_rules(bytes: &[u8]) -> std::result::Result<RoutingConfig, S
 /// mission-creation time — merge.rs's `live_base_sha` idiom): committed
 /// bytes only, so an uncommitted working-tree edit or a mission-branch edit
 /// can never re-route a mission. Missing ⇒ `Ok(None)` (the no-file
-/// regression: today's behavior, byte-identical); present-but-invalid ⇒ the
-/// fail-closed [`EngineError`] shape the workspace contract uses, owner
-/// repo-setup.
+/// regression: today's behavior, byte-identical); present-but-invalid or
+/// present-but-empty ⇒ the fail-closed [`EngineError`] shape the workspace
+/// contract uses, owner repo-setup.
 pub fn load_routing_rules_at_ref(repo: &GitRepo, ref_name: &str) -> Result<Option<RoutingConfig>> {
     match repo.show_file(ref_name, ROUTING_RULES_PATH)? {
         None => Ok(None),
@@ -329,6 +343,49 @@ mod tests {
         assert!(text.contains(ROUTING_RULES_PATH), "{text}");
         assert!(text.contains("owner: repo-setup"), "{text}");
         assert!(text.contains("taskClassRules[0].taskClass"), "{text}");
+    }
+
+    /// The empty-table wipe (ticket routing-rules-empty-table-wipe): a
+    /// PRESENT empty file must fail closed exactly like an invalid one —
+    /// `Some(empty)` would replace a non-empty layered table and silently
+    /// demote routing to the legacy task-class floor.
+    #[test]
+    fn routing_rules_config_empty_table_fails_closed_at_parse() {
+        for shape in [
+            b"{}".as_slice(),
+            br#"{"taskClassRules": [], "patternRules": []}"#.as_slice(),
+            br#"{"taskClassRules": []}"#.as_slice(),
+            br#"{"patternRules": []}"#.as_slice(),
+        ] {
+            let err = parse_routing_rules(shape).unwrap_err();
+            assert!(err.contains(ROUTING_RULES_PATH), "{err}");
+            assert!(err.contains("empty"), "{err}");
+        }
+        // And a non-empty valid file is unchanged.
+        assert!(parse_routing_rules(VALID.as_bytes()).is_ok());
+    }
+
+    /// Same posture at the load seam: a committed empty file fails closed
+    /// (owner: repo-setup) at the same point an invalid file does, while a
+    /// MISSING file still loads as `None` — the layered-config behavior,
+    /// byte-identical.
+    #[test]
+    fn routing_rules_config_empty_table_at_ref_fails_closed_missing_stays_none() {
+        let Some((dir, repo)) = git_repo() else {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        };
+        commit_rules(dir.path(), "main", "{}");
+        let err = load_routing_rules_at_ref(&repo, "main").unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains(ROUTING_RULES_PATH), "{text}");
+        assert!(text.contains("owner: repo-setup"), "{text}");
+        assert!(text.contains("empty"), "{text}");
+
+        // The seed commit carries no file: missing ⇒ None, never an error.
+        assert!(load_routing_rules_at_ref(&repo, "HEAD~1")
+            .unwrap()
+            .is_none());
     }
 
     /// The no-hardcoded-model-ids rule, pinned as a grep over this module's

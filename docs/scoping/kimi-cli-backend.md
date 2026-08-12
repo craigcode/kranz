@@ -250,21 +250,22 @@ Relevant flags (`kimi --help`):
 | Flag | Effect | validator (read-only) | worker (read-write) |
 |---|---|---|---|
 | default (no flag) | interactive approval prompts — **cannot** be used headlessly; blocks waiting for stdin | no (hangs) | no (hangs) |
-| `--plan` | plan mode; produces a plan, no writes | yes | no |
-| `-y`/`--yolo` | automatically approve all actions | no | yes |
-| `--auto` | "auto permission mode" (per the local session wire log's own system-reminder text: "Tool approvals will be handled automatically... Continue normally without pausing for approval prompts") | no (writes proceed unprompted) | yes |
+| `--plan` | plan mode; produces a plan, no writes | **rejected with `-p` (0.34)** | rejected with `-p` (0.34) |
+| `-y`/`--yolo` | automatically approve all actions | **rejected with `-p` (0.34)** | rejected with `-p` (0.34) |
+| `--auto` | auto permission mode | rejected with `-p` | rejected with `-p` |
 
-**Confirmed incompatibility:** `--auto` cannot be combined with `-p`/
-`--prompt` (`error: Cannot combine --prompt with --auto.`, free, exit 1,
-before any session starts). For a headless single-shot `backend_kimi`,
-**`--yolo` is therefore the only flag that both (a) avoids interactive
-approval prompts and (b) is accepted together with `-p`** — `--auto`'s
-"auto permission mode" is for the interactive/session-server surface, not
-`-p` prompt mode. A validator role that must guarantee no writes should
-instead use `--plan` (no `-y`/`--yolo`), which was not live-tested in
-combination with `-p` in this probe but is documented as producing no writes
-in `kimi --help`; flagged as inferred/unconfirmed for whoever picks up the
-worker/validator role-mapping implementation.
+**Confirmed incompatibility (0.34.0, live):** `--prompt` rejects EVERY
+permission flag — `error: Cannot combine --prompt with --plan.` (exit 1,
+before any session start), and the official CLI reference documents the
+same rejection for `--yolo` and `--auto`: *"`--prompt` cannot be used with
+`--yolo`, `--auto`, or `--plan` — non-interactive mode uses `auto`
+permission by default."* An earlier probe (pre-0.34) found `--yolo`
+accepted together with `-p`; 0.34 removed it. Consequence for
+`backend_kimi`: `build_args` passes **no** permission flag at all — in
+`-p` mode regular tool calls are auto-approved and only static deny rules
+apply, so the read-only/writable role split is NOT expressible on the kimi
+command line. Read-only posture for validator/orchestrator roles must come
+from the session profile / OS sandbox / contract sweep, never the argv.
 
 Static deny/allow rules live in `config.toml` under `[permission]`
 (confirmed from the binary's embedded TOML (de)serialization code, not
@@ -287,17 +288,18 @@ implementation should write (or `--add-dir`/require a pre-provisioned)
 no-main-write invariants encoded as `tool = "Bash"` deny patterns, since
 `--sandbox`-style flags were not found in `kimi --help` at all (no sandbox
 flag exists on this CLI, unlike Cursor's `--sandbox`) — isolation must come
-entirely from `--yolo`/`--plan` role choice plus these config-level deny
-rules plus external process/workspace controls (throwaway `--add-dir`
-workspaces, scoped credentials), the same posture `cursor-cli-backend.md`
-landed on for its own non-boundary `--sandbox` flag.
+entirely from these config-level deny rules plus external process/workspace
+controls (throwaway `--add-dir` workspaces, scoped credentials; `-p` carries
+no permission flag at all since 0.34), the same posture
+`cursor-cli-backend.md` landed on for its own non-boundary `--sandbox` flag.
 
 ### 6.1 Claude-CLI permission fields are ignored on this backend
 
 On the `kimi` backend, `SessionSpec`'s Claude-CLI permission fields
 (`permission_mode`/`allowed_tools`/`disallowed_tools`/`tools`) are ignored —
-`kimi -p` has no equivalent flag surface (see §6 above: `--yolo`/`--plan`
-plus `config.toml` `[permission]` rules are the only knobs). Enforcement for
+`kimi -p` has no equivalent flag surface (see §6 above: 0.34 rejects every
+permission flag with `-p`; only `config.toml` `[permission]` deny rules
+remain as a kimi-side knob). Enforcement for
 this backend therefore degrades to the writable-path flag
 (`SessionSpec.sandbox`, i.e. the `touch_set` grant surface) plus the OS
 sandbox plus the deterministic out-of-contract-write sweep
@@ -323,8 +325,9 @@ isolation model.
   value straight to `AgentEvent::Other`.
 - Tool-call/tool-result wire shape on `-p --output-format stream-json`
   stdout is unobserved (no tool-using capture was made; see §3).
-- `--plan` combined with `-p` was not live-tested (inferred read-only from
-  `--help` text only).
+- `--plan`/`--yolo`/`--auto` combined with `-p`: RESOLVED (0.34.0, live) —
+  all three are rejected at startup; `-p` always runs auto permission, so
+  `build_args` passes no permission flag.
 - The `KIMI_API_KEY` custom-provider env-var auth path (§2) was found in
   the binary's strings but not live-tested — no relocated-`$HOME` capture
   using it was attempted.
