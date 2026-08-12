@@ -1101,6 +1101,8 @@ mod sandbox_wrap {
     use super::*;
     use kranz_engine::backend_claude::sandbox_command;
     #[cfg(target_os = "macos")]
+    use kranz_engine::backend_claude::scratch_home_root;
+    #[cfg(target_os = "macos")]
     use kranz_engine::sandbox::{
         generate_profile, write_profile_file, ResolvedSandbox, SandboxBackend, SandboxInputs,
     };
@@ -1255,8 +1257,14 @@ mod sandbox_wrap {
 
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
         let script_dir = tempfile::tempdir().unwrap();
+        let session_id = format!("sandbox-start-{}", uuid::Uuid::new_v4());
+        let scratch = scratch_home_root(&session_id);
+        std::fs::remove_dir_all(&scratch).ok();
+        assert!(
+            !scratch.exists(),
+            "the regression requires a new scratch root"
+        );
 
         let outside_path = std::env::var("HOME")
             .map(PathBuf::from)
@@ -1267,7 +1275,9 @@ mod sandbox_wrap {
         // performs exactly the two writes the assertions below inspect: one
         // inside the allowlisted session cwd, one outside it under $HOME.
         let script_body = format!(
-            "#!/bin/sh\necho hi > ./inside.txt\necho hi > {}\nexit 0\n",
+            "#!/bin/sh\nmkdir -p \"$HOME/.claude/session-env\"\n\
+             echo ready > \"$HOME/.claude/session-env/probe\"\n\
+             echo hi > ./inside.txt\necho hi > {}\nexit 0\n",
             outside_path.display()
         );
         let script = write_script(script_dir.path(), "probe-claude.sh", &script_body);
@@ -1276,7 +1286,7 @@ mod sandbox_wrap {
             enforce: kranz_engine::types::SandboxEnforce::Fs,
             session_cwd: session.path().to_path_buf(),
             mission_dir: mission.path().to_path_buf(),
-            tmpdir: tmp.path().to_path_buf(),
+            tmpdir: scratch.clone(),
             extra_write: vec![],
             egress: vec![],
             validator_read_deny_roots: vec![],
@@ -1289,6 +1299,7 @@ mod sandbox_wrap {
 
         let backend = ClaudeBackend::new(script);
         let mut spec = base_spec(PromptMode::SingleShot("hello".to_string()));
+        spec.session_id = session_id;
         spec.cwd = session.path().to_path_buf();
         spec.sandbox = Some(resolved);
 
@@ -1302,6 +1313,7 @@ mod sandbox_wrap {
 
         let outside_exists = outside_path.exists();
         let inside_exists = session.path().join("inside.txt").exists();
+        let scratch_probe_exists = scratch.join("home/.claude/session-env/probe").exists();
         if outside_exists {
             std::fs::remove_file(&outside_path).ok();
         }
@@ -1317,6 +1329,12 @@ mod sandbox_wrap {
              wrapping (inside_exists: {inside_exists} — if true, the spawn ran UNSANDBOXED; \
              if false, the probe never completed)"
         );
+        assert!(
+            scratch_probe_exists,
+            "start() must seed the scratch root before generating the Seatbelt profile so the \
+             canonical temp-path spelling is writable"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }
 

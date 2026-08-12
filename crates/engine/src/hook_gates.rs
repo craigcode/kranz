@@ -327,11 +327,11 @@ pub fn evaluate(spec: &HookGateSpec, tool_name: &str, file_path: Option<&str>) -
     };
     let raw_path = Path::new(raw);
     let absolute = if raw_path.is_absolute() {
-        normalize_lexical(raw_path)
+        resolve_existing_prefix(raw_path)
     } else {
-        normalize_lexical(&spec.session_cwd.join(raw_path))
+        resolve_existing_prefix(&spec.session_cwd.join(raw_path))
     };
-    let cwd = normalize_lexical(&spec.session_cwd);
+    let cwd = resolve_existing_prefix(&spec.session_cwd);
     let rel = match absolute.strip_prefix(&cwd) {
         Ok(rel) => rel,
         Err(_) => {
@@ -369,10 +369,37 @@ pub fn evaluate(spec: &HookGateSpec, tool_name: &str, file_path: Option<&str>) -
     }
 }
 
-/// Lexical (no-filesystem) normalization: `.` dropped, `..` resolved by
-/// popping. Never resolves symlinks — a new `Write` target may not exist
-/// yet — and the failure direction of any alias mismatch is a BLOCK (the
-/// path fails `strip_prefix`), never an allow.
+/// Resolve the longest existing prefix before appending any not-yet-created
+/// suffix. Hook targets are often new files, so `canonicalize(path)` alone is
+/// insufficient; resolving the parent still collapses macOS's
+/// `/var` -> `/private/var` alias and existing symlink escapes. If no prefix
+/// resolves, retain the lexical path so the guard keeps its fail-closed
+/// `strip_prefix` posture.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let lexical = normalize_lexical(path);
+    let mut probe = lexical.as_path();
+    let mut suffix = Vec::new();
+
+    loop {
+        if let Ok(mut resolved) = probe.canonicalize() {
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return normalize_lexical(&resolved);
+        }
+        let Some(name) = probe.file_name() else {
+            return lexical;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = probe.parent() else {
+            return lexical;
+        };
+        probe = parent;
+    }
+}
+
+/// Lexical normalization used after filesystem aliases have been resolved:
+/// `.` is dropped and `..` pops one component.
 fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -771,6 +798,52 @@ mod tests {
         let broken = spec_fixture(&cwd, &["["]);
         assert!(matches!(
             evaluate(&broken, "Write", Some("src/lib.rs")),
+            GuardVerdict::Block { .. }
+        ));
+    }
+
+    /// The same checkout may arrive through two absolute spellings (macOS's
+    /// `/var` and `/private/var` is the live receipt). Both must judge
+    /// identically, while a symlink that actually escapes the checkout stays
+    /// blocked.
+    #[cfg(unix)]
+    #[test]
+    fn hook_gate_projection_resolves_path_aliases_and_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let src = checkout.join("src");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let alias = root.path().join("checkout-alias");
+        symlink(&checkout, &alias).unwrap();
+        let spec = spec_fixture(&alias, &["src/**"]);
+
+        assert_eq!(
+            evaluate(
+                &spec,
+                "Write",
+                Some(&checkout.join("src/new.ts").display().to_string())
+            ),
+            GuardVerdict::Allow,
+            "the canonical spelling of an aliased checkout must allow"
+        );
+        assert_eq!(
+            evaluate(
+                &spec,
+                "Write",
+                Some(&alias.join("src/new.ts").display().to_string())
+            ),
+            GuardVerdict::Allow,
+            "the alias spelling of the same checkout must allow"
+        );
+
+        symlink(&outside, checkout.join("escape")).unwrap();
+        assert!(matches!(
+            evaluate(&spec, "Write", Some("escape/outside.ts")),
             GuardVerdict::Block { .. }
         ));
     }

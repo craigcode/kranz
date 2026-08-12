@@ -796,6 +796,12 @@ impl AgentBackend for ClaudeBackend {
     async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
         let streaming = matches!(spec.prompt, PromptMode::Streaming(_));
         let args = build_args(&spec);
+        // Seed the cleared child environment before generating a Seatbelt
+        // profile. The per-session scratch root may not exist yet; creating it
+        // first lets `generate_profile` include both `/var/...` and its
+        // canonical `/private/var/...` spelling on macOS. Building the profile
+        // first left Claude unable to create `$HOME/.claude/session-env`.
+        let child_env = claude_child_env(&spec);
 
         let mut command = match &spec.sandbox {
             Some(resolved)
@@ -866,7 +872,6 @@ impl AgentBackend for ClaudeBackend {
         // rebuilt from the minimal allowlist (PATH, a scratch HOME, locale)
         // — never the full ambient set, so server secrets (GH_TOKEN,
         // SLACK_*, AWS_*) cannot reach this prompt-injectable child.
-        let child_env = claude_child_env(&spec);
         command
             .current_dir(&spec.cwd)
             .env_clear()
