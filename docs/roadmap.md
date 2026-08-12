@@ -123,11 +123,16 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; v0.1.0 tagged 2026-07-04 with linux/macos/windows binaries attached; remaining: crates.io + Homebrew, gated on the repo going public)
+## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; v0.1.0 tagged 2026-07-04 with linux/macos/windows binaries attached; remaining: public 0.2.0 crates + Homebrew release)
 
 The code is path-safe and lock-file based per §9 and is proven on Windows CI,
-including kill/resume. Tagged cross-platform binaries exist; crates.io and
-Homebrew publication remain gated on the repository going public.
+including kill/resume. Tagged cross-platform binaries exist. The four
+crates.io names are reserved by 0.0.1 placeholder packages, but the current
+source is substantially newer than the existing v0.1.0 tag; the next public
+distribution should therefore be a single version-aligned 0.2.0 release, not
+a reuse of v0.1.0. Publication and a real Homebrew tap remain gated on the
+repository going public. See the
+[operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
 - Push to a remote so the existing CI matrix (ubuntu + windows) actually runs;
   fix what Windows breaks. Process-tree kill via Job Objects (the documented
@@ -192,7 +197,7 @@ merge requires reapproval/revalidation; and old/no-pack missions remain
 unchanged. The executable evidence matrix and closure record are in
 [`docs/reviews/flight-rules-m55-proof.md`](reviews/flight-rules-m55-proof.md).
 
-## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; live deploy user-gated)
+## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; Railway live deploy operator-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP
 lifecycle already make Kranz location-independent. Two shapes, in order:
@@ -236,8 +241,11 @@ reviewable `kranz/*` branch; a Railway-hosted `kranz serve` takes a mission
 from browser conversation to COMPLETE with no local Kranz install; a human
 can open declared previews or take over the same workspace; and a leaked
 dashboard URL without the token reveals nothing and mutates nothing.
+The exact remaining provider, secret, volume, containment, and smoke-test
+decisions are captured in the
+[M4/M6 operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-## M7 — Worker sandboxing ◑ (tiers 1–3 shipped; live cross-platform proof remains)
+## M7 — Worker sandboxing ◑ (macOS live proof complete; cross-platform proof remains)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
@@ -247,6 +255,11 @@ egress proxy (`fs+net` on macOS routes loopback-only Seatbelt egress through
 it; structured denials surface on `RunOutcome` for the 3.3b grant flow).
 Windows parity and live cross-platform proof remain open. The sandbox still
 complements scrutiny: it bounds what CAN happen; validators judge what DID.
+The 2026-08-12 macOS hostile proof blocked a sibling write and disallowed
+CONNECT, landed the legitimate change through its real merge gate without the
+primary checkout leaving `main`, and measured +4.33% Node / +5.01% Rust median
+wrapper overhead on representative warm commands. See
+[the live-proof receipt](reviews/m7-hostile-fsnet-live-proof.md).
 
 Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
 writes outside its worktree + mission dir with blocked attempts surfaced as
@@ -254,7 +267,7 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-## M8 — Multi-repo operation ◑ (implementation shipped; cross-language end-to-end proof remains)
+## M8 — Multi-repo operation ◑ (cross-language proof complete; inbound Slack event remains)
 
 Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
 calibration, lessons all live in the repo) — but the operator surfaces
@@ -289,6 +302,13 @@ in any language.
   gitignore template, gate/registration answers), cold-start calibration honesty
   ("based on 0 missions" must read as the warning it is), and promoting
   the proven workerIsolation=worktree default so new repos start isolated.
+- [x] **TypeScript live proof**: a fresh dependency-free repository went
+  ticket → draft → queue → worktree execution → validation → its own Node gate
+  → repository-scoped gated merge. One host served it beside Kranz and kept a
+  single authenticated Slack bridge connected; explicit/channel/thread/
+  ambiguity routing passed the integration suite. No human inbound Slack event
+  was sent, so that final live-QA click remains. See
+  [the receipt](reviews/m8-typescript-live-proof.md).
 
 Done when: a TypeScript repo goes ticket → draft → queue → worktree run →
 gated merge (its own gates) without touching this repo's config; two

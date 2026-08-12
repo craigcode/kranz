@@ -2132,7 +2132,8 @@ pub(crate) fn refuse_non_loopback_without_insecure_lan(
     if !bind.is_loopback() && !insecure_lan {
         anyhow::bail!(
             "refusing to bind {bind}: non-loopback binds expose the API on the \
-             network (every /api GET/POST/WS requires the mutation token). \
+             network (reads require the read-only or mutation token; POSTs \
+             require the mutation token). \
              Re-run with `--insecure-lan` if you intentionally trust this \
              network (LAN/tailnet), or keep the default `--host 127.0.0.1`."
         );
@@ -2176,14 +2177,15 @@ async fn cmd_serve(
     if !bind.is_loopback() {
         eprintln!(
             "WARNING: binding {bind} with --insecure-lan — the API is reachable \
-             beyond this machine. Every /api GET, POST, and WS upgrade requires \
-             the mutation token (header or ?token=). Use only on a network you trust."
+             beyond this machine. Reads require the read-only or mutation token; \
+             POSTs require the mutation token. Use only on a network you trust."
         );
     }
     if read_auth && effective_require_read_token(bind.is_loopback(), read_auth) {
         eprintln!(
-            "--read-auth: GETs and the WS upgrade now require the mutation token too \
-             (same as POSTs), including on loopback."
+            "--read-auth: GETs and the WS upgrade now require the read-only or \
+             mutation token, including on loopback; POSTs still require mutation \
+             authority."
         );
     }
     // Bind BEFORE printing anything: `--port 0` picks an ephemeral port, and

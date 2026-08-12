@@ -10,10 +10,11 @@
 #      agent turn; at runtime it must be on PATH or pointed at by
 #      KRANZ_CLAUDE_BIN, and ANTHROPIC_API_KEY must be set (cloud auth path,
 #      not local OAuth). See the runtime TODO below.
-#   2. The mission's own target toolchain (cargo, node, go, python, …). A real
-#      mission image layers the repo's toolchain on top — via the repo's
-#      devcontainer.json when present, or a fatter base otherwise (roadmap M6,
-#      "Workspace provisioning"). Keeping those out here keeps the base small.
+#   2. Linux bubblewrap and the mission's own target toolchain (cargo, node,
+#      go, python, …). A real mission image layers the containment primitive
+#      and repo toolchain on top — via the repo's devcontainer.json when
+#      present, or a fatter base otherwise (roadmap M6, "Workspace
+#      provisioning"). Keeping those out here keeps the base small.
 
 # ---- builder -----------------------------------------------------------------
 # rust:1 tracks the latest 1.x; the workspace needs Rust 1.88+ (edition 2021,
@@ -60,6 +61,7 @@ COPY --from=builder /src/target/release/kranz /usr/local/bin/kranz
 #         && npm install -g @anthropic-ai/claude-code && rm -rf /var/lib/apt/lists/*
 #     or COPY a pre-installed claude and set KRANZ_CLAUDE_BIN to its path.
 #   - Layer the mission's target toolchain (devcontainer.json or a fat image).
+#   - Install bubblewrap before enabling Linux process-sandbox enforcement.
 #
 # Required at runtime (NOT baked into the image — pass at `docker run`):
 #   - ANTHROPIC_API_KEY  (cloud auth for the claude CLI)
