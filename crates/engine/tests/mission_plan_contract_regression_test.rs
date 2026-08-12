@@ -4,22 +4,13 @@
 //! form. `cargo test -p <pkg> <FILTER> <FILTER>` (no `--`) is rejected by
 //! cargo with "unexpected argument ... found" for a second bare filter, so a
 //! downstream gate running that string verbatim would fail even though the
-//! underlying tests pass. See .kranz/missions/m-2d5583/plan.json a3.
-
-use std::path::PathBuf;
-
-fn mission_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".kranz")
-        .join("missions")
-        .join("m-2d5583")
-}
+//! underlying tests pass. The historical assertion is preserved as a
+//! committed fixture so cleanup of runtime mission state cannot break the
+//! workspace gate.
 
 fn a3_command_from_plan_json() -> String {
-    let text = std::fs::read_to_string(mission_root().join("plan.json")).expect("read plan.json");
-    let plan: serde_json::Value = serde_json::from_str(&text).expect("plan.json parses");
+    let text = include_str!("fixtures/m-2d5583-plan.json");
+    let plan: serde_json::Value = serde_json::from_str(text).expect("plan.json parses");
     let assertions = plan["validationContract"]
         .as_array()
         .expect("validationContract array");
@@ -45,7 +36,7 @@ fn plan_json_a3_command_uses_dashdash_filter_form() {
 
 #[test]
 fn plan_md_a3_command_uses_dashdash_filter_form() {
-    let text = std::fs::read_to_string(mission_root().join("plan.md")).expect("read plan.md");
+    let text = include_str!("fixtures/m-2d5583-plan.md");
     assert!(
         text.contains(
             "cargo test -p kranz-engine -- approval_lint_never_blocks approval_lint_no_nested_runtime_panic"
