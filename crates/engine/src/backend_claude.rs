@@ -826,7 +826,11 @@ impl AgentBackend for ClaudeBackend {
                     && cfg!(target_os = "macos") =>
             {
                 let profile = crate::sandbox::generate_profile(&resolved.inputs);
-                let profile_dir = resolved.inputs.mission_dir.clone();
+                // Profiles are runtime evidence, not committed mission
+                // artifacts. `kranz init` ignores `missions/*/runs/`; writing
+                // them at the mission root left every sandboxed run with an
+                // untracked dirty checkout (live M8 proof m-bb3632).
+                let profile_dir = resolved.inputs.mission_dir.join("runs");
                 let profile_path = crate::sandbox::write_profile_file(&profile_dir, &profile)
                     .or_else(|_| {
                         crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile)

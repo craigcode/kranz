@@ -1334,6 +1334,24 @@ mod sandbox_wrap {
             "start() must seed the scratch root before generating the Seatbelt profile so the \
              canonical temp-path spelling is writable"
         );
+        let root_profiles = std::fs::read_dir(mission.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sb"))
+            .count();
+        let run_profiles = std::fs::read_dir(mission.path().join("runs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sb"))
+            .count();
+        assert_eq!(
+            root_profiles, 0,
+            "runtime sandbox profiles must not dirty the tracked mission root"
+        );
+        assert!(
+            run_profiles >= 1,
+            "the generated profile must live under the ignored runs directory"
+        );
         std::fs::remove_dir_all(&scratch).ok();
     }
 }
