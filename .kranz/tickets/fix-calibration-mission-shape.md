@@ -1,4 +1,5 @@
 ---
+state: done
 title: Shape-aware cost estimates (doc-heavy vs code missions)
 priority: 2
 schedule: once

@@ -323,8 +323,14 @@ fn effective_prompt(spec: &SessionSpec) -> String {
 /// separately via the `KIMI_MODEL_THINKING_EFFORT` env var (see
 /// [`effort_env_value`]) — `-m` has no `model:effort` suffix syntax
 /// (confirmed live in docs/scoping/kimi-cli-backend.md §4).
+///
+/// No permission flag is passed: kimi ≥ 0.34 rejects `--yolo`, `--auto` and
+/// `--plan` outright when combined with `-p` ("Cannot combine --prompt with
+/// --plan"), and non-interactive mode always runs the auto permission
+/// policy. The writable/read-only role distinction therefore cannot be
+/// expressed in argv — read-only roles rely on the session profile/sandbox,
+/// not the kimi command line.
 pub fn build_args(spec: &SessionSpec) -> Vec<String> {
-    let permission_flag = if spec.writable { "--yolo" } else { "--plan" };
     vec![
         "-p".into(),
         effective_prompt(spec),
@@ -332,7 +338,6 @@ pub fn build_args(spec: &SessionSpec) -> Vec<String> {
         spec.model.clone(),
         "--output-format".into(),
         "stream-json".into(),
-        permission_flag.into(),
     ]
 }
 
@@ -494,8 +499,8 @@ impl KimiStreamParser {
 // ---------------------------------------------------------------------------
 
 /// The [`AgentBackend`] for `kimi -p --output-format stream-json`:
-/// single-shot with the `--yolo`/`--plan` permission mode selected from the
-/// session role.
+/// single-shot; kimi ≥ 0.34 rejects every permission flag alongside `-p`,
+/// so non-interactive sessions always run kimi's auto permission policy.
 #[derive(Debug, Clone)]
 pub struct KimiBackend {
     binary: PathBuf,
@@ -924,6 +929,14 @@ mod tests {
 
     #[test]
     fn kimi_discovery_honors_env_override_exclusively() {
+        // ENV_TEST_LOCK first: tempfile resolves its parent from ambient
+        // TMP/TEMP, and env-poisoning tests elsewhere in this binary (e.g.
+        // the cfg(windows) TEMP=C:\operator-tmp fixture) hold the same lock —
+        // without it a parallel windows test's poisoned TEMP makes tempdir()
+        // fail with NotFound (windows-latest CI, run 30935850957).
+        let _env_lock = crate::agent_env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = super::KIMI_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1038,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_build_args_ignores_claude_only_fields_and_uses_plan_for_read_only() {
+    fn kimi_build_args_ignores_claude_only_fields_and_passes_no_permission_flag() {
         let spec = SessionSpec {
             cwd: PathBuf::from("."),
             prompt: PromptMode::SingleShot("do the thing".to_string()),
@@ -1058,6 +1071,7 @@ mod tests {
             max_turns: Some(10),
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(
@@ -1069,14 +1083,16 @@ mod tests {
                 "kimi-code/k3".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
-                "--plan".to_string(),
             ]
         );
+        // kimi ≥ 0.34 rejects --plan/--yolo/--auto alongside -p outright.
+        assert!(!args.contains(&"--plan".to_string()));
+        assert!(!args.contains(&"--yolo".to_string()));
         assert_eq!(effort_env_value(&spec), Some("high"));
     }
 
     #[test]
-    fn kimi_build_args_uses_yolo_for_writable_sessions() {
+    fn kimi_build_args_writable_sessions_pass_no_permission_flag() {
         let spec = SessionSpec {
             cwd: PathBuf::from("."),
             prompt: PromptMode::SingleShot("do the thing".to_string()),
@@ -1096,6 +1112,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let args = build_args(&spec);
         assert_eq!(
@@ -1107,9 +1124,9 @@ mod tests {
                 "kimi-code/k3".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
-                "--yolo".to_string(),
             ]
         );
+        assert!(!args.contains(&"--yolo".to_string()));
         assert_eq!(effort_env_value(&spec), None);
     }
 
@@ -1136,6 +1153,7 @@ mod tests {
             max_turns: None,
             env: Default::default(),
             sandbox: None,
+            hook_status: None,
         };
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()

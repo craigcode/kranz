@@ -96,22 +96,58 @@ kranz work                      # drain the queue (run missions)
     they run WRAPPED in the resolved worker sandbox profile when
     `sandbox.enforce != off` (`command_exec::GateSandbox`,
     `run_bounded_gate_command_sandboxed`); `off` keeps the env-only posture
-    byte-for-byte. Validators never see the real checkout:
+    byte-for-byte. The gate wrap's supervision policy is gate-SPECIFIC
+    (ticket gate-sandbox-supervision-dogfood, `gate_profile_extras`):
+    `(allow signal (target same-sandbox))` lets a wrapped gate signal its
+    OWN descendant tree (never host processes) so `cargo test --workspace`
+    runs green as a wrapped contract command — the session profile
+    generator stays untouched, and what no sandbox can host (setuid
+    `/bin/ps` exec, nested `sandbox_apply`) skips with the detectable
+    `SKIP-UNDER-WRAP` marker, held green by the `rust-macos-wrapped-suite`
+    CI job. Validators never see the real checkout:
     each session runs in a throwaway snapshot (`validator_snapshot.rs`,
-    warmed `target/` copy included) and only its verdict crosses back; the
-    `validator.tamper` fingerprint on the real checkout is now a tripwire
-    whose drift means the isolation itself failed.
+    warmed `target/` copy included) and only its verdict crosses back — and
+    the snapshot is separation, not containment, so validator sessions are
+    ADDITIONALLY wrapped regardless of `sandbox.enforce`
+    (`sandbox::resolve_validator_containment`): the snapshot is the sole
+    writable root, the real checkout's source tree is read-denied, and the
+    shared `.git` is readable but write-denied; uncontainable
+    platforms/backends FAIL CLOSED by default (14th-pass reversal of the
+    224fa73 loud-degrade decision — the degrade reopens the
+    modify→use→restore path; `validatorAllowUncontainedDegrade` in
+    `.kranz/config.json` is the explicit per-repo opt-in back to the loud
+    per-round degrade). The `validator.tamper` fingerprint on the real checkout is
+    the tripwire (defense-in-depth) whose drift means the isolation itself
+    failed.
 
 ## Tracked vs runtime
 
 Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
 contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
+`.kranz/routing-rules.json` (routing rules, base-branch-owned, validated at
+draft/approve; `crates/engine/src/routing_rules.rs`, docs/routing-rules.md),
 `.kranz/tickets/<slug>.md`, `.kranz/tickets/<slug>.notes.jsonl` (append-only
-discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`), and each
+discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`),
+`.kranz/domain-denylist.json` + `.kranz/domain-allowlist` (clean-room lint
+policy — salted hashes and reviewed waiver fingerprints only, never readable
+terms; `crates/engine/src/domain_lint.rs`, docs/domain-lint.md), and each
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
-`.kranz/config.json`, `serve.token`, `serve.read.token`, `.kranz/tickets/*.status`.
+`.kranz/config.json`, `serve.token`, `serve.read.token`,
+`.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`,
+`.kranz/hook-status/` (ephemeral hook-signal projection — registrations +
+latest signal per run; `crates/engine/src/hook_status.rs`).
+Ticket lifecycle state is committed in the ticket .md itself: the additive
+`state:` frontmatter key (`open` default; terminal `done`/`superseded`/
+`wontfix`, optional `state-note:`) is the single source of truth — the
+gitignored `.status` sidecar is a write-through cache of it (frontmatter
+wins on conflict, logged; absent key = sidecar governs as before). Reads
+resolve via `Ticket::read_state`; lifecycle writes go through
+`Ticket::write_lifecycle` (both files); `kranz ticket migrate-state`
+(dry-run, `--yes` to apply) folds existing terminal sidecars into
+frontmatter, skipping git-dirty tickets by name
+(`crates/engine/src/migrate_state.rs`).
 
 ## Change discipline
 
@@ -119,3 +155,15 @@ Small, focused changes with tests. Every change gets reviewed against the
 five axes (correctness, readability, architecture, security, performance)
 before merge. Prefer the standard library and existing utilities over new
 dependencies.
+
+The positioning ADR's freeze applies at the point of temptation: new
+in-harness execution primitives — worker pools beyond the shipped M3
+machinery, prompt routing sophistication, context-management features,
+anything whose purpose is to make an agent write better code — are NOT
+built (docs/knowledge/decisions/positioning-governance-evidence-layer.md;
+the heterogeneous dispatch pool is the one carve-out, an evidence
+primitive with three properties). If a change drifts toward a frozen
+surface, stop and check the boundary first; `docs/what-is-kranz.md` and
+the frozen modules' doc headers (`prompts.rs`, `knowledge.rs`) carry the
+same pointer.
+

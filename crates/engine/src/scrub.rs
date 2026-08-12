@@ -909,4 +909,35 @@ mod tests {
             "under-cap content still scans: {findings:?}"
         );
     }
+
+    /// Composition audit (ticket `config-fail-open-audit`): a
+    /// `.kranz/secret-allowlist` waiver is scoped to ONE (rule, value)
+    /// fingerprint — it silences the exact reviewed finding and nothing
+    /// else. No waiver shape disables a whole rule, so the list can only
+    /// ever grow by reviewed, per-finding entries; it is a subtract-only
+    /// filter over the finding stream, never a replace of the rule set.
+    #[test]
+    fn composition_audit_secret_allowlist_waives_one_fingerprint_never_a_rule() {
+        let text_a = "sk-ant-api03-CompositionAuditValueA1";
+        let text_b = "sk-ant-api03-CompositionAuditValueB2";
+        let findings = scan_text(&format!("{text_a} {text_b}"));
+        assert_eq!(findings.len(), 2, "both keys must be found: {findings:?}");
+
+        // Waiving finding A leaves finding B standing under the SAME rule —
+        // a waiver cannot take the rule down with it.
+        let waived: std::collections::BTreeSet<String> =
+            [findings[0].fingerprint.clone()].into_iter().collect();
+        let remaining = filter_allowed(findings, &waived);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].rule_id, "anthropic-api-key");
+
+        // An empty or garbage waiver text changes nothing.
+        let findings = scan_text(text_a);
+        assert_eq!(
+            filter_allowed(findings.clone(), &Default::default()),
+            findings
+        );
+        let garbage = read_allowlist_text("# reviewed\nnot-a-fingerprint\n");
+        assert_eq!(filter_allowed(findings.clone(), &garbage), findings);
+    }
 }

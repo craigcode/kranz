@@ -165,6 +165,7 @@ fn completed_mission_events(
                 feature_id: None,
                 milestone_id: None,
                 candidate: None,
+                executor_route: None,
                 sdk_session_id: "s".into(),
                 model: "sonnet".into(),
                 quant: "n/a".into(),

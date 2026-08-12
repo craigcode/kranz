@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 8da93ce (Craig); reviewed + tested + gates green
 title: is_repo_busy races the per-mission lock (two missions, one repo)
 priority: 2
 schedule: once

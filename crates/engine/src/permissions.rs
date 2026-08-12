@@ -514,4 +514,97 @@ mod tests {
             .allowed_tools
             .contains(&"Bash(gc lint*)".to_string()));
     }
+
+    /// Composition audit (ticket `config-fail-open-audit`): config
+    /// `deny_patterns` must EXTEND the built-in worker deny list, never
+    /// replace it. This is the audit's most dangerous replace-shaped
+    /// regression target: if a custom list ever displaced WORKER_DENY, the
+    /// worker could push, publish, sudo, and open raw network sockets while
+    /// the operator believed the §4.7 rails were still on.
+    #[test]
+    fn composition_audit_config_deny_patterns_extend_never_replace_builtin_worker_deny() {
+        let cfg = MissionConfig {
+            deny_patterns: vec!["rm -rf *".to_string(), "TodoWrite".to_string()],
+            ..MissionConfig::default()
+        };
+        let profile = for_role(Role::Worker, &cfg, &[], &[], &[]);
+        for builtin in WORKER_DENY {
+            assert!(
+                profile.disallowed_tools.iter().any(|r| r == builtin),
+                "built-in worker deny {builtin} must survive a custom deny_patterns list"
+            );
+        }
+        // The custom entries ride alongside (wrapped as tool rules as needed).
+        assert!(profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(rm -rf *)"));
+        assert!(profile.disallowed_tools.iter().any(|r| r == "TodoWrite"));
+    }
+
+    /// Composition audit: plan command grants add ALLOWS only — they never
+    /// lift a deny rule. Deny precedence in Claude Code (deny rules win over
+    /// allows) is what makes this safe: a granted command that still matches
+    /// a deny rule stays denied until the operator-approved WorkerDeny grant
+    /// lifts the exact rule (deny_exceptions, event-logged). A regression
+    /// that lets a grant silently erode the deny list fails here.
+    #[test]
+    fn composition_audit_grants_add_allows_without_lifting_deny() {
+        let cfg = MissionConfig::default();
+        let grants = vec!["git push".to_string()];
+        let profile = for_role(Role::Worker, &cfg, &[], &grants, &[]);
+        // The grant's allow pattern is present...
+        assert!(profile
+            .allowed_tools
+            .contains(&"Bash(git push*)".to_string()));
+        // ...but the matching deny rule is NOT removed by the allow, so deny
+        // precedence keeps the command blocked at enforcement time.
+        assert!(profile
+            .disallowed_tools
+            .contains(&"Bash(git push*)".to_string()));
+    }
+
+    /// Composition audit: `bypassPermissions` is reachable ONLY through the
+    /// dangerously-named config key — the naming rule's one escape valve.
+    /// No other config shape (custom deny lists, grants, validator command
+    /// allows) may flip a role into bypass mode.
+    #[test]
+    fn composition_audit_bypass_permissions_requires_the_dangerously_named_key() {
+        let roles = [
+            Role::Worker,
+            Role::Orchestrator,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ];
+        let mut cfg = MissionConfig {
+            deny_patterns: vec!["sudo".to_string()],
+            allow_validator_commands: vec!["anything at all".to_string()],
+            ..MissionConfig::default()
+        };
+        for role in roles {
+            let profile = for_role(
+                role,
+                &cfg,
+                &["cargo test".to_string()],
+                &["git push".to_string()],
+                &[],
+            );
+            assert_ne!(
+                profile.permission_mode.as_deref(),
+                Some("bypassPermissions"),
+                "{role:?} must never reach bypassPermissions without the dangerous key"
+            );
+        }
+        cfg.dangerously_allow_all = true;
+        for role in roles {
+            let profile = for_role(role, &cfg, &[], &[], &[]);
+            assert_eq!(
+                profile.permission_mode.as_deref(),
+                Some("bypassPermissions"),
+                "{role:?}: the dangerously-named key is the sanctioned escape valve"
+            );
+            assert!(profile.disallowed_tools.is_empty());
+            assert!(profile.allowed_tools.is_empty());
+        }
+    }
 }

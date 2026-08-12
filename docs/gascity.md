@@ -1,10 +1,14 @@
 # Gas City integration — spike findings (2026-07-04)
 
-Status: spike complete; **parked as documented optionality**, not wired into
-daily flow. The pack lives in [packaging/gascity/](../packaging/gascity/).
-Target: Gas City only (`gc` 1.3.2) — the gastown-era surface (agents.json,
-`gt prime`, tmux detection) is deliberately not used. Plan of record:
-[gascity-citizenship.md](gascity-citizenship.md).
+Status: **demo-ready** (2026-08-10). The pack lives in
+[packaging/gascity/](../packaging/gascity/) and is now event-driven:
+`kranz-dispatch` runs on `bead.created`, and `kranz-run-bead` emits
+`kranz.mission.started/blocked/complete` City events. Live-city validation
+against a real supervisor is still human-gated (see
+[gascity-citizenship.md](gascity-citizenship.md) Stage 1). For a disposable-city
+demo runbook, see [gascity-demo.md](gascity-demo.md). Target: Gas City only
+(`gc` 1.3.2) — the gastown-era surface (agents.json, `gt prime`, tmux
+detection) is deliberately not used.
 
 ## What was proven live
 

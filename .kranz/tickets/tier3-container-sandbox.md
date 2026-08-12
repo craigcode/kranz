@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: 7f0ef53 + d8d86de: M7 Tier-3 container provider — sandbox.provider/image config (additive), runtime detection (docker/podman/nerdctl/Apple), --read-only write boundary, fs+net ⇒ --network none (macOS's first egress boundary), non-empty egress refuses (per-host filtering deferred to the egress-proxy ticket), fail-closed at resolve and runner layers, 11 new tests + docker smoke test green on CI ubuntu (skipped locally, no runtime). Windows-only mount-literal failure fixed via shared mount_arg. Doc … (truncated)
 title: Tier-3 container sandbox provider for validation and execution (microVM isolation)
 priority: 3
 schedule: once

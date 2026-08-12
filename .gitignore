@@ -22,7 +22,12 @@ dist/
 .kranz/slack-threads.json
 .kranz/slack/
 .kranz/queue/
+.kranz/hook-status/
 .kranz/tickets/*.status
 .kranz/serve.token
 .kranz/serve.read.token
+# operator-local plaintext domain vocabulary (the input to
+# `kranz domain-lint --seed-config`; never committed — the committed
+# denylist is salted hashes only, see docs/domain-lint.md)
+.kranz/domain-terms.local
 /notes.txt

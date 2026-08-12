@@ -1,4 +1,5 @@
 ---
+state: done
 title: Host-side ticket drafting, REST backlog surface, and blocked-by dependencies
 priority: 2
 schedule: once

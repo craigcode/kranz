@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: research and slice-1 design shipped in 952cbc0; vault slice shipped separately
 title: Deep research — persistent repo-knowledge store for agents and humans
 priority: 2
 schedule: once

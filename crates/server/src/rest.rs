@@ -22,7 +22,7 @@ use kranz_engine::types::{
     ControlCommand, MissionState, MissionStatus, RoleConfig, SandboxEnforce, WorkerIsolation,
 };
 use kranz_engine::{config, control};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -116,6 +116,16 @@ pub(crate) async fn escalation_metrics(
     Ok(Json(metrics))
 }
 
+/// Cross-mission Flight Rules effectiveness fold (KRZ-348). Read-only and
+/// recomputed from event logs plus traced defect ticket links on every call.
+pub(crate) async fn standards_metrics(
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<kranz_engine::standards_metrics::StandardsMetricsReport>, ApiError> {
+    Ok(Json(kranz_engine::standards_metrics::compute(
+        &server.repo_root,
+    )?))
+}
+
 /// `GET /api/cost-per-merged-change?windowDays=30` — cost per merged change
 /// for the served repo (ticket `cost-per-merged-change`, KRZ-329): the cost
 /// fold over missions closed in the window beside the merged-change count
@@ -178,6 +188,154 @@ pub(crate) async fn mission_state(
     }
     let events = EventLog::read_events(&events_path)?;
     Ok(Json(reducer::fold(&events)?))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StandardsWaiverCandidate {
+    rule: kranz_engine::types::PinnedRule,
+    finding_subject: String,
+    finding_evidence: String,
+    run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MissionStandardsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<kranz_engine::types::StandardsPin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<kranz_engine::standards_coverage::StandardsCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waiver_candidates: Vec<StandardsWaiverCandidate>,
+}
+
+fn fold_standards_view(
+    id: &str,
+    events: &[Event],
+) -> kranz_engine::error::Result<MissionStandardsView> {
+    let state = reducer::fold(events)?;
+    let manifest = state.mission.standards_manifest.clone();
+    let coverage = kranz_engine::standards_coverage::standards_coverage(id, events);
+    let mut waiver_candidates = Vec::new();
+    if let (Some(pin), Some(coverage)) = (manifest.as_ref(), coverage.as_ref()) {
+        for row in coverage.rules.iter().filter(|row| {
+            row.disposition == kranz_engine::standards_coverage::RuleDisposition::Failed
+        }) {
+            let Some(rule) = pin
+                .rules
+                .iter()
+                .find(|rule| rule.id == row.id && rule.revision == row.revision && rule.waivable)
+            else {
+                continue;
+            };
+            if let Some((finding_subject, finding_evidence, run_id)) = events
+                .iter()
+                .filter(|event| event.mission_id == id)
+                .rev()
+                .find_map(|event| match &event.kind {
+                    EventKind::ValidationFinding {
+                        finding, run_id, ..
+                    } if finding.rule.as_ref().is_some_and(|citation| {
+                        citation.id == rule.id
+                            && citation.revision == rule.revision
+                            && citation.digest == pin.digest
+                    }) =>
+                    {
+                        Some((
+                            finding.subject.clone(),
+                            finding.evidence.clone(),
+                            run_id.clone(),
+                        ))
+                    }
+                    _ => None,
+                })
+            {
+                waiver_candidates.push(StandardsWaiverCandidate {
+                    rule: rule.clone(),
+                    finding_subject,
+                    finding_evidence,
+                    run_id,
+                });
+            }
+        }
+    }
+    Ok(MissionStandardsView {
+        manifest,
+        coverage,
+        waiver_candidates,
+    })
+}
+
+/// Typed Flight Rules read model. No configured standards is represented by
+/// `{}` so old missions add no empty warning surface.
+pub(crate) async fn mission_standards(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<MissionStandardsView>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let events = EventLog::read_events(&paths.events_file())?;
+    Ok(Json(fold_standards_view(&id, &events)?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StandardsWaiverBody {
+    rule_id: String,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    finding_subject: Option<String>,
+    reason: String,
+    expires_at: String,
+}
+
+/// Authenticated REST twin of `kranz standards waive`. It intentionally
+/// refuses while the mission engine holds the append lock; the UI keeps the
+/// evidence visible and tells the operator to pause/stop before retrying.
+pub(crate) async fn post_standards_waiver(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<StandardsWaiverBody>,
+) -> Result<Json<Value>, ApiError> {
+    mission_paths(&server, &id)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
+        .map_err(|error| ApiError::bad_request(format!("expiresAt must be RFC 3339: {error}")))?
+        .with_timezone(&chrono::Utc);
+    let request = kranz_engine::standards_waiver::WaiverRequest {
+        rule_id: body.rule_id,
+        revision: body.revision,
+        finding_subject: body.finding_subject,
+        reason: body.reason,
+        expires_at,
+    };
+    let outcome = kranz_engine::standards_waiver::approve_standards_waiver(
+        &server.repo_root,
+        &id,
+        &request,
+        "rest",
+        kranz_engine::event_log::LockForce::No,
+    )
+    .map_err(|error| match error {
+        kranz_engine::error::EngineError::LockHeld(_) => ApiError::conflict(format!(
+            "waiver refused: mission '{id}' is still running; pause or stop it before approving this exception"
+        )),
+        other => ApiError::unprocessable(format!("waiver refused: {other}")),
+    })?;
+    Ok(Json(json!({
+        "recorded": true,
+        "seq": outcome.event.seq,
+        "rule": outcome.rule,
+        "findingSubject": outcome.finding_subject,
+        "findingEvidence": outcome.finding_evidence,
+        "runId": outcome.run_id,
+        "affectedPaths": outcome.affected_paths,
+        "diffDigest": outcome.diff_digest,
+        "findingFingerprint": outcome.finding_fingerprint,
+    })))
 }
 
 /// `GET /api/missions/:id/workspace` — effective local execution workspace,
@@ -620,6 +778,75 @@ pub(crate) async fn mission_readiness(
     ))
 }
 
+/// `POST /api/hook-status` — the hook-status lane's ONLY write (ticket
+/// `agent-hooks-status-signals`, [`kranz_engine::hook_status`]). Receives
+/// one mapped lifecycle signal from a session's `kranz hook-status` relay
+/// and records it in the ephemeral `.kranz/hook-status/` projection.
+///
+/// Authenticates with the per-RUN capability token in the body — never the
+/// serve mutation token (a worker-readable file can only ever carry a
+/// token whose forgery ceiling is lying about its own run's status), so
+/// the route is exempt from the mutation-token gate exactly like the
+/// GitHub webhook's HMAC route. The payload is untrusted even on loopback:
+/// the body is route-limited to
+/// [`kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES`], ids are safe-id
+/// checked (path traversal), the token is constant-time compared against
+/// the registered hash, stale registrations reject, and the handler's only
+/// write is the projection file — no event, no state mutation, no grant
+/// path exists here.
+pub(crate) async fn post_hook_status(
+    State(server): State<Arc<ServerState>>,
+    Json(body): Json<kranz_engine::hook_status::SignalPost>,
+) -> Result<impl IntoResponse, ApiError> {
+    use kranz_engine::hook_status::RecordRejection;
+    match kranz_engine::hook_status::record_signal(
+        &server.repo_root,
+        &body.mission_id,
+        &body.run_id,
+        &body.token,
+        body.signal,
+        body.detail.as_deref(),
+        chrono::Utc::now(),
+    ) {
+        Ok(_) => Ok((StatusCode::ACCEPTED, Json(json!({ "recorded": true })))),
+        Err(RecordRejection::UnsafeId) | Err(RecordRejection::UnknownRun) => Err(
+            ApiError::not_found(format!("unknown hook-status run '{}'", body.run_id)),
+        ),
+        Err(RecordRejection::TokenMismatch) => Err(ApiError::unauthorized(
+            "hook-status token does not match this run's registration",
+        )),
+        Err(RecordRejection::Stale) => Err(ApiError::unauthorized(
+            "hook-status registration is stale (past its acceptance TTL)",
+        )),
+        Err(RecordRejection::RegistrationUnreadable) => Err(ApiError::internal(
+            "hook-status projection entry could not be read or written",
+        )),
+    }
+}
+
+/// `GET /api/missions/:id/hook-status` — the ephemeral hook-signal
+/// projection for one mission, re-read from disk per request like every
+/// other derived read. Additive and explicitly NON-authoritative: the
+/// payload carries `authoritative: false` so no consumer can mistake
+/// hook-derived signals for folded mission state (the fold is untouched —
+/// nothing in this lane can change a mission's terminal state).
+pub(crate) async fn mission_hook_status(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let paths = mission_paths(&server, &id)?;
+    if !paths.events_file().is_file() {
+        return Err(unknown_mission(&id));
+    }
+    let runs = kranz_engine::hook_status::read_mission_signals(&server.repo_root, &id);
+    Ok(Json(json!({
+        "missionId": id,
+        "authoritative": false,
+        "note": "hook-derived lifecycle signals; observability only, never folded mission state",
+        "runs": runs,
+    })))
+}
+
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(
@@ -812,6 +1039,42 @@ pub(crate) async fn post_grant_deny(
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuestionAnswerBody {
+    /// The open question's engine-minted id (`q-<n>`).
+    question_id: String,
+    /// The chosen option's text verbatim, or free text.
+    answer: String,
+    /// 0-based option index when an offered option was picked; absent for
+    /// free-text answers.
+    #[serde(default)]
+    option: Option<u32>,
+}
+
+/// `POST /api/missions/:id/question/answer` — answer an open structured
+/// question (ticket `structured-human-question-events`): the pending-decision
+/// projection's input edge, enqueued onto the EXISTING control path (D-X: no
+/// new server). The engine lands it as `question.answered`, which the reducer
+/// routes onto the mission's user-message consult.
+pub(crate) async fn post_question_answer(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<QuestionAnswerBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paths =
+        require_pending_question(&server, &id, &body.question_id, body.option, &body.answer)?;
+    control::enqueue(
+        &paths,
+        &ControlCommand::AnswerQuestion {
+            question_id: body.question_id,
+            answer: body.answer,
+            option: body.option,
+        },
+    )?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers (also used by the WS handler)
 // ---------------------------------------------------------------------------
@@ -910,6 +1173,49 @@ fn require_pending_grant(
     }
 }
 
+/// Confirm question `question_id` is open (and an option-index answer is in
+/// range and matches the offered option), so the enqueued answer can't land
+/// on a different (or absent) question than the operator saw — the same
+/// stale-decision discipline as [`require_pending_grant`]. The engine
+/// re-validates at drain time; this pre-check is what lets the caller get an
+/// honest 409 instead of a silently ignored 202.
+fn require_pending_question(
+    server: &ServerState,
+    id: &str,
+    question_id: &str,
+    option: Option<u32>,
+    answer: &str,
+) -> Result<MissionPaths, ApiError> {
+    let paths = require_revisable_mission(server, id)?;
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    let Some(pending) = state
+        .pending_questions
+        .iter()
+        .find(|q| q.question_id == question_id)
+    else {
+        return Err(ApiError::conflict(format!(
+            "mission '{id}' has no open question '{question_id}'"
+        )));
+    };
+    if let Some(index) = option {
+        match pending.options.get(index as usize) {
+            Some(expected) if expected == answer => {}
+            Some(expected) => {
+                return Err(ApiError::conflict(format!(
+                    "answer `{answer}` does not match option {index} (`{expected}`) of question '{question_id}'"
+                )))
+            }
+            None => {
+                return Err(ApiError::conflict(format!(
+                    "question '{question_id}' has no option {index} (it offered {})",
+                    pending.options.len()
+                )))
+            }
+        }
+    }
+    Ok(paths)
+}
+
 fn simple_line_diff(old_name: &str, new_name: &str, old: &str, new: &str) -> String {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
@@ -968,7 +1274,10 @@ mod tests {
     use kranz_engine::event_log::{EventLog, LockForce};
     use kranz_engine::events::EventKind;
     use kranz_engine::paths::MissionPaths;
-    use kranz_engine::types::{GrantKind, MissionConfig};
+    use kranz_engine::types::{
+        Finding, GrantKind, MissionConfig, PinnedRule, Plan, PlanFeature, PlanMilestone,
+        RuleCitation, StandardsPin, StandardsPinSource,
+    };
     use serde_json::Value;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -998,6 +1307,377 @@ mod tests {
             mission_branch: "kranz/mission-x".into(),
             config: MissionConfig::default(),
         }
+    }
+
+    fn post_json(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flight_rules_dashboard_standards_view_is_typed_and_hides_nonwaivable_actions() {
+        let tmp = TempDir::new().unwrap();
+        let digest = "ab".repeat(32);
+        let rule = |id: &str, waivable: bool| PinnedRule {
+            id: id.to_string(),
+            revision: 2,
+            rfc: "RFC-001".to_string(),
+            level: "must".to_string(),
+            effective_status: "enforced".to_string(),
+            statement: format!("statement for {id}"),
+            domains: vec!["security".to_string()],
+            stages: vec!["validation".to_string()],
+            when_paths: Vec::new(),
+            task_classes: Vec::new(),
+            checker: Some("gate:secure".to_string()),
+            waivable,
+        };
+        let rules = vec![rule("ZZ-WAIVE-001", true), rule("ZZ-LOCKED-001", false)];
+        let pin = StandardsPin {
+            pack_name: "zz-pack".to_string(),
+            pack_dir: "vendor/pack".to_string(),
+            standards_root: "standards".to_string(),
+            digest: digest.clone(),
+            source: StandardsPinSource::RepoTracked,
+            task_class: None,
+            touch_set: vec!["src/**".to_string()],
+            context_paths: Vec::new(),
+            gates: Vec::new(),
+            rules: rules.clone(),
+        };
+        let plan = Plan {
+            goal: "governed change".to_string(),
+            validation_contract: Vec::new(),
+            milestones: vec![PlanMilestone {
+                title: "one".to_string(),
+                features: vec![PlanFeature {
+                    title: "change".to_string(),
+                    spec: "implement".to_string(),
+                    validation_criteria: Vec::new(),
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: Vec::new(),
+            touch_set: vec!["src/**".to_string()],
+            standards_manifest: Some(Box::new(pin)),
+        };
+        let finding = |rule: &PinnedRule| Finding {
+            subject: format!("flight-rule:{}", rule.id),
+            severity: "critical".to_string(),
+            evidence: format!("{} failed with exact evidence", rule.id),
+            suggested_fix: "fix it".to_string(),
+            class: "standards-authoritative".to_string(),
+            rule: Some(RuleCitation {
+                id: rule.id.clone(),
+                revision: rule.revision,
+                source: "zz-pack standards".to_string(),
+                digest: digest.clone(),
+                lifecycle: rule.effective_status.clone(),
+                level: rule.level.clone(),
+                checker: rule.checker.clone(),
+            }),
+        };
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("governed change"),
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: kranz_engine::reducer::ENGINE_RUN_ID.to_string(),
+                    finding: finding(&rules[0]),
+                },
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".to_string(),
+                    run_id: kranz_engine::reducer::ENGINE_RUN_ID.to_string(),
+                    finding: finding(&rules[1]),
+                },
+            ],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .oneshot(get("/api/missions/m-1/standards"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["manifest"]["digest"], digest);
+        assert_eq!(body["coverage"]["rules"][0]["disposition"], "failed");
+        assert_eq!(body["waiverCandidates"].as_array().unwrap().len(), 1);
+        assert_eq!(body["waiverCandidates"][0]["rule"]["id"], "ZZ-WAIVE-001");
+        assert!(body["waiverCandidates"][0]["findingEvidence"]
+            .as_str()
+            .unwrap()
+            .contains("exact evidence"));
+    }
+
+    /// The lane end to end over HTTP: a registered run's signal POST lands
+    /// in the ephemeral projection and is served by the per-mission GET —
+    /// labelled non-authoritative — while the mission's folded state and
+    /// its event log stay byte-identical (hooks never become mission
+    /// state; a terminal mission stays terminal).
+    #[tokio::test]
+    async fn hook_status_signal_endpoint_records_serves_and_never_touches_state() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![created("terminal"), EventKind::MissionCompleted {}],
+        );
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let events_before =
+            std::fs::read(MissionPaths::new(tmp.path(), "m-1").events_file()).unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "needs-input",
+                    "detail": "Shell was refused",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .clone()
+            .oneshot(get("/api/missions/m-1/hook-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["authoritative"], false);
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["runId"], "r-1");
+        assert_eq!(runs[0]["signal"]["signal"], "needs-input");
+        assert_eq!(runs[0]["signal"]["detail"], "Shell was refused");
+        assert!(
+            runs[0]["signal"]["receivedAt"].as_str().is_some(),
+            "{runs:?}"
+        );
+
+        // Folded mission state is untouched by the lane: the terminal
+        // mission still folds Complete and the event log is byte-identical.
+        let response = app.oneshot(get("/api/missions/m-1/state")).await.unwrap();
+        let state = body_json(response).await;
+        assert_eq!(state["mission"]["status"], "complete");
+        let events_after =
+            std::fs::read(MissionPaths::new(tmp.path(), "m-1").events_file()).unwrap();
+        assert_eq!(events_before, events_after);
+    }
+
+    /// Untrusted-payload discipline over HTTP: wrong tokens, unknown runs,
+    /// traversal ids, malformed bodies, and oversized bodies are all
+    /// rejected; nothing is written for any of them.
+    #[tokio::test]
+    async fn hook_status_signal_endpoint_rejects_untrusted_payloads() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        // Wrong capability token → 401.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-WRONG",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Unknown run → 404 (no oracle about neighboring runs).
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-9",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Path traversal in the mission id → 404, never a joined path.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "../m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A signal outside the vocabulary is a 4xx — the lane can never
+        // spell a state transition ("complete", "blocked", ...).
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "complete",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "an out-of-vocabulary signal must be rejected: {}",
+            response.status()
+        );
+
+        // Malformed JSON → 4xx.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/hook-status", "{not json"))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+
+        // Oversized body → 413 (the route's own 16 KiB limit).
+        let oversized = format!(
+            "{{\"token\":\"tok-1\",\"missionId\":\"m-1\",\"runId\":\"r-1\",\"signal\":\"running\",\"detail\":\"{}\"}}",
+            "x".repeat(kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES)
+        );
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/hook-status", &oversized))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // None of the rejections recorded anything.
+        let views = kranz_engine::hook_status::read_mission_signals(tmp.path(), "m-1");
+        assert!(views.iter().all(|v| v.signal.is_none()), "{views:?}");
+    }
+
+    /// The POST authenticates with the per-run capability token, NOT the
+    /// serve mutation token: with the gate armed, the signal POST goes
+    /// through WITHOUT `x-kranz-token` while an ordinary mutation POST is
+    /// still rejected.
+    #[tokio::test]
+    async fn hook_status_signal_post_is_exempt_from_the_mutation_token_gate() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            Some("serve-secret".to_string()),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "running",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the per-run capability token authenticates the lane, not the serve token"
+        );
+
+        // An ordinary mutation without the serve token is still refused.
+        let response = app
+            .oneshot(post_json(
+                "/api/missions/m-1/revise",
+                "{\"instructions\":\"x\"}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Install hygiene at the server seam: serving and recording never
+    /// writes hook config into the repo's tracked tree — the only tree the
+    /// lane writes is the gitignored `.kranz/hook-status/` projection.
+    #[tokio::test]
+    async fn hook_status_signal_server_writes_nothing_into_the_tracked_tree() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("x")]);
+        kranz_engine::hook_status::register(tmp.path(), "m-1", "r-1", "tok-1", chrono::Utc::now())
+            .unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/hook-status",
+                &serde_json::json!({
+                    "token": "tok-1",
+                    "missionId": "m-1",
+                    "runId": "r-1",
+                    "signal": "turn-finished",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response = app
+            .oneshot(get("/api/missions/m-1/hook-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !tmp.path().join(".cursor").exists(),
+            "no cursor hook config may appear in the repo tree"
+        );
+        assert!(
+            kranz_engine::hook_status::hook_status_dir(tmp.path()).is_dir(),
+            "the projection is the lane's only write"
+        );
     }
 
     #[tokio::test]
@@ -1111,6 +1791,22 @@ mod tests {
         assert_eq!(body["falseGreens"]["completedMissions"], 0);
         assert!(body["falseGreens"]["falseGreenRate"].is_null());
         assert_eq!(body["ledger"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn flight_rules_metrics_endpoint_empty_repo_is_machine_readable() {
+        let tmp = TempDir::new().unwrap();
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/standards-metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        assert_eq!(body["minimumSamples"], 5);
+        assert!(body["definitions"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()));
+        assert_eq!(body["rules"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -1274,6 +1970,41 @@ mod tests {
         assert_eq!(grant["rubberStamp"], true);
     }
 
+    /// KRZ-333: the same endpoint also serves the industry-comparison set as
+    /// a structurally separate section with its inline definitions — the CLI
+    /// and the served payload stay one wire shape. The tempdir is no git
+    /// repo, so the git-derived slots read absent naming their dependency.
+    #[tokio::test]
+    async fn comparison_metrics_outcomes_endpoint_serves_the_section() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![created("seeded"), EventKind::MissionCompleted {}],
+        );
+        let app = crate::router(tmp.path().to_path_buf(), None);
+
+        let response = app.oneshot(get("/api/missions/outcomes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        let comparison = &body["comparison"];
+        assert_eq!(comparison["windowDays"], 30);
+        assert!(comparison["assistedChangeShare"]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("agent-involved by construction"));
+        assert!(comparison["defectDensity"]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("traced-from-mission frontmatter"));
+        // The empty resolution slot names its missing lifecycle timestamps.
+        assert!(comparison["defectResolutionTime"]["dependency"]
+            .as_str()
+            .unwrap()
+            .contains("open/close timestamps"));
+    }
+
     /// `workspaceLifecycle` (ticket workspace-idle-hibernate): present with
     /// the folded transition state + its event ts when a teardown carried an
     /// outcome, null when none did (v1 keep-only logs) — consumers degrade
@@ -1337,6 +2068,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 

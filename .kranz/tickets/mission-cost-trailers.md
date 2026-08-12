@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in this polish commit; reviewed + gates green
 title: Mission + cost trailers on kranz-authored merge and report commits
 priority: 3
 schedule: once

@@ -41,7 +41,7 @@ export type Role =
 
 export type RunResult = 'pass' | 'fail' | 'partial';
 
-export type AssertionCheck = 'command' | 'agent-judgement';
+export type AssertionCheck = 'command' | 'agent-judgement' | 'pty-script';
 
 export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -97,6 +97,9 @@ export interface Ticket {
   context: string;
   scopingAnswers: string[];
   acceptanceHints: string[];
+  taskClass?: string | null;
+  reviewArtifact?: string | null;
+  reviewOutput?: string | null;
   state: TicketState;
   needsContext: string[];
   /** Planner's draft-stage wrong-plan escalation reason (server always emits
@@ -117,7 +120,21 @@ export interface Assertion {
   statement: string;
   check: AssertionCheck;
   command?: string;
+  /** The scripted terminal session when `check` is `pty-script` (engine
+   * `pty_harness`; absent for every other check). */
+  ptyScript?: PtyScript;
 }
+
+/** One scripted terminal session declared by a `pty-script` assertion. */
+export interface PtyScript {
+  command: string;
+  steps: PtyStep[];
+  timeoutSecs?: number;
+}
+
+export type PtyStep =
+  | { op: 'send'; text: string }
+  | { op: 'expect'; pattern: string; regex?: boolean; timeoutMs?: number };
 
 export interface Feature {
   id: string;
@@ -149,6 +166,7 @@ export interface Mission {
   createdAt: string; // ISO-8601
   baseBranch: string;
   missionBranch: string;
+  standardsManifest?: StandardsPin;
 }
 
 export interface Plan {
@@ -157,6 +175,123 @@ export interface Plan {
   milestones: PlanMilestone[];
   consideredAlternatives?: ConsideredAlternatives;
   touchSet?: string[];
+  standardsManifest?: StandardsPin;
+}
+
+export interface PinnedRule {
+  id: string;
+  revision: number;
+  rfc: string;
+  level: string;
+  effectiveStatus: string;
+  statement: string;
+  domains: string[];
+  stages: string[];
+  whenPaths: string[];
+  taskClasses: string[];
+  checker?: string;
+  waivable: boolean;
+}
+
+export interface PinnedGate {
+  id: string;
+  command: string;
+  whenPaths?: string[];
+}
+
+export interface StandardsPin {
+  packName: string;
+  packDir: string;
+  standardsRoot: string;
+  digest: string;
+  source: 'repo-tracked' | 'external-pinned';
+  taskClass?: string;
+  touchSet?: string[];
+  contextPaths?: string[];
+  gates?: PinnedGate[];
+  rules: PinnedRule[];
+}
+
+export type RuleDisposition =
+  | 'passed'
+  | 'failed'
+  | 'advisory'
+  | 'waived'
+  | 'not-evaluated'
+  | 'not-applicable';
+
+export interface WaiverJoin {
+  seq: number;
+  approver: string;
+  surface: string;
+  reason: string;
+  expiresAt: string;
+}
+
+export interface CoverageEvidence {
+  seq: number;
+  event: string;
+  mechanism: string;
+  bearing: 'pass' | 'fail' | 'waived';
+  reference: string;
+  waiver?: WaiverJoin;
+}
+
+export interface RuleCoverage {
+  id: string;
+  revision: number;
+  lifecycle: string;
+  level: string;
+  checker?: string;
+  statement?: string;
+  disposition: RuleDisposition;
+  evidence?: CoverageEvidence[];
+  note?: string;
+}
+
+export interface StandardsDriftRecord {
+  seq: number;
+  approvedDigest: string;
+  currentDigest?: string;
+  changedRules: string[];
+}
+
+export interface StandardsCoverage {
+  packName: string;
+  packDir: string;
+  standardsRoot: string;
+  digest: string;
+  source: string;
+  approvalSeq: number;
+  resolutionSeq?: number;
+  resolvedAt?: string;
+  rules: RuleCoverage[];
+  drift?: StandardsDriftRecord[];
+}
+
+export interface StandardsWaiverCandidate {
+  rule: PinnedRule;
+  findingSubject: string;
+  findingEvidence: string;
+  runId: string;
+}
+
+export interface MissionStandardsView {
+  manifest?: StandardsPin;
+  coverage?: StandardsCoverage;
+  waiverCandidates?: StandardsWaiverCandidate[];
+}
+
+export interface StandardsWaiverResult {
+  recorded: true;
+  seq: number;
+  rule: PinnedRule;
+  findingSubject: string;
+  findingEvidence: string;
+  runId: string;
+  affectedPaths: string[];
+  diffDigest: string;
+  findingFingerprint: string;
 }
 
 export interface ConsideredAlternatives {
@@ -196,6 +331,24 @@ export interface PendingGrantRequest {
   command: string;
 }
 
+/**
+ * An open structured human question (the pending-decision projection's
+ * second kind, rendered in the same "your move" area as the parked grant).
+ * Absent on pre-field snapshots (`pendingQuestions` omitted then).
+ */
+export interface PendingQuestion {
+  /** Engine-minted id (`q-<n>`) — the handle every answer path names. */
+  questionId: string;
+  /** Who asked — 'worker' in this pass. */
+  role: Role;
+  text: string;
+  /** The structured choices offered (empty = free-text answer expected). */
+  options?: string[];
+  runId?: string;
+  featureId?: string;
+  milestoneId?: string;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;
@@ -220,6 +373,17 @@ export interface Finding {
   evidence: string;
   suggestedFix?: string;
   class?: string;
+  rule?: RuleCitation;
+}
+
+export interface RuleCitation {
+  id: string;
+  revision: number;
+  source: string;
+  digest: string;
+  lifecycle: string;
+  level: string;
+  checker?: string;
 }
 
 export interface WorkerRun {
@@ -290,6 +454,8 @@ export interface MissionState {
   latestPlanRevision: number;
   pendingRevision?: PendingRevision;
   pendingGrantRequest?: PendingGrantRequest;
+  /** Open structured human questions, in open order. Omitted when empty. */
+  pendingQuestions?: PendingQuestion[];
   lastSeq: number;
 }
 
@@ -357,6 +523,9 @@ export type EventKind =
   | { type: 'grant.requested'; payload: { milestoneId: string; command: string } }
   | { type: 'grant.approved'; payload: { command: string } }
   | { type: 'grant.denied'; payload: { command: string; reason: string } }
+  | { type: 'question.opened'; payload: { questionId: string; role: Role; text: string; options?: string[]; runId?: string; featureId?: string; milestoneId?: string } }
+  | { type: 'question.answered'; payload: { questionId: string; answer: string; via: string; option?: number } }
+  | { type: 'question.cleared'; payload: { questionId: string; why: string } }
   | { type: 'milestone.started'; payload: { milestoneId: string; startSha: string } }
   | { type: 'feature.started'; payload: { featureId: string } }
   | { type: 'worker.spawned'; payload: { runId: string; role: Role; featureId?: string; milestoneId?: string; sdkSessionId: string; model: string; promptHash: string; transcriptPath: string } }
@@ -367,6 +536,11 @@ export type EventKind =
   | { type: 'feature.skipped'; payload: { featureId: string; reason: string } }
   | { type: 'milestone.validating'; payload: { milestoneId: string } }
   | { type: 'validation.finding'; payload: { milestoneId: string; runId: string; finding: Finding } }
+  | { type: 'gate.result'; payload: { gate: string; surface: string; kind: string; index: number; verdict: 'pass' | 'fail'; artefactRef: string; artefactDetail?: string; score?: number; threshold?: number; ruleIds?: string[] } }
+  | { type: 'standards.resolved'; payload: { source: string; packName: string; standardsRoot: string; digest: string; stage: string; taskClass?: string; touchSet: string[]; contextPaths?: string[]; rules: Array<{ id: string; revision: number; effectiveStatus: string }>; approvalSeq: number } }
+  | { type: 'standards.drifted'; payload: { approvedDigest: string; currentDigest?: string; surface: string; changedRules: string[] } }
+  | { type: 'standards.waiver.approved'; payload: { ruleId: string; ruleRevision: number; manifestDigest: string; approvalSeq: number; findingFingerprint: string; paths?: string[]; diffDigest: string; reason: string; approver: string; surface: string; expiresAt: string } }
+  | { type: 'standards.attestation.approved'; payload: { ruleId: string; ruleRevision: number; manifestDigest: string; approvalSeq: number; paths?: string[]; diffDigest: string; reason: string; approver: string; surface: string } }
   | { type: 'validator.tamper'; payload: { milestoneId: string; runId: string; role: Role; headBefore: string; headAfter: string; appeared: string[]; resolved: string[] } }
   | { type: 'fixfeature.created'; payload: { milestoneId: string; feature: Feature } }
   | { type: 'milestone.blocked'; payload: { milestoneId: string; reason: string } }
@@ -501,6 +675,36 @@ export interface WorkspaceSummary {
     previews: number;
   };
 }
+
+/** The hook-status lane's signal vocabulary (ticket
+ *  `agent-hooks-status-signals`) — deliberately much smaller than mission
+ *  status, so no hook payload can spell a state transition. */
+export type HookStatusSignalKind = 'running' | 'needs-input' | 'interrupted' | 'turn-finished';
+
+/** One accepted hook-derived signal occurrence. */
+export interface HookStatusSignalRecord {
+  signal: HookStatusSignalKind;
+  detail?: string;
+  receivedAt: string;
+}
+
+/** One run's ephemeral projection entry (latest signal wins). */
+export interface RunHookStatusView {
+  runId: string;
+  registeredAt: string;
+  signal?: HookStatusSignalRecord;
+}
+
+/** `GET /api/missions/:id/hook-status` — the ephemeral hook-signal
+ *  projection. `authoritative` is always false: hook-derived signals are
+ *  observability, never folded mission state. */
+export interface MissionHookStatus {
+  missionId: string;
+  authoritative: false;
+  note: string;
+  runs: RunHookStatusView[];
+}
+
 
 /** This host's queue-drain tracker (`MissionHost::drain` / `drain_state_json`). */
 export interface DrainState {

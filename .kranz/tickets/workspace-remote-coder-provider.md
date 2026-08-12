@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the M6 arc: remote Coder-shaped provider (workspace_remote.rs, SubstrateClient, coder-v1) + token fixtures waived (91a1ce1).
 title: Thin remote WorkspaceProvider adapter (Coder-shaped substrate)
 priority: 3
 schedule: once

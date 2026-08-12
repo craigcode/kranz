@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: verified 2026-07-24: burned serve.token expunged 2026-07-20 (SHAs 9b21172/81159c7 unreachable from any ref); full-history kranz scan run root..HEAD, all 58 findings reviewed as false positives (identifiers, env reads, fixtures, placeholders, detector canaries, pid-derived lock tokens, token plumbing) and fingerprinted in .kranz/secret-allowlist with justifications; re-scan clean (exit 0, 'secret scan passed', demonstrably non-vacuous). operator-gates.md box flipped [x].
 title: Scrub the burned serve.token (and audit for other secrets) from git history before going public
 priority: 2
 schedule: once

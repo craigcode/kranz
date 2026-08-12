@@ -1,4 +1,5 @@
 ---
+state: done
 title: Pipeline view polish: error states, id truncation, action gating on dead rows
 priority: 2
 schedule: once

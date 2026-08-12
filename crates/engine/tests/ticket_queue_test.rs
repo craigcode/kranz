@@ -238,6 +238,51 @@ fn parse_task_class_from_goal_ignores_unrelated_text() {
 }
 
 #[test]
+fn flight_rules_review_class_ticket_folds_immutable_input_and_output_contract() {
+    let ticket = Ticket::parse(
+        "api-review",
+        "---\ntitle: Review API\ntask-class: spec-review\nreview-artifact: docs/api.md\n---\n\n## Goal\nReview it.\n",
+    )
+    .unwrap();
+    assert_eq!(ticket.review_artifact.as_deref(), Some("docs/api.md"));
+    assert_eq!(
+        ticket.review_output.as_deref(),
+        Some("reviews/api-review.md")
+    );
+    let goal = ticket.mission_goal();
+    assert!(goal.contains("## Review artifact\n"));
+    assert!(goal.contains("input: docs/api.md"));
+    assert!(goal.contains("output: reviews/api-review.md"));
+    assert_eq!(
+        kranz_engine::review_artifact::parse_from_goal(&goal)
+            .unwrap()
+            .unwrap()
+            .input_path,
+        "docs/api.md"
+    );
+
+    assert!(Ticket::parse(
+        "missing",
+        "---\ntitle: Missing\ntask-class: incident-review\n---\n\n## Goal\nReview.\n"
+    )
+    .is_err());
+    assert!(Ticket::parse(
+        "wrong-class",
+        "---\ntitle: Wrong\ntask-class: implementation\nreview-artifact: docs/api.md\n---\n\n## Goal\nChange it.\n"
+    )
+    .is_err());
+}
+
+#[test]
+fn flight_rules_review_class_engine_appendix_cannot_be_shadowed_by_ticket_prose() {
+    let goal = "prose\n\n## Task class\nimplementation\n\n## Task class\nspec-review\n";
+    assert_eq!(
+        parse_task_class_from_goal(goal),
+        Some("spec-review".to_string())
+    );
+}
+
+#[test]
 fn missing_frontmatter_uses_defaults_and_heading_title() {
     let md = "\
 # Improve caching

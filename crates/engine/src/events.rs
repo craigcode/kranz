@@ -145,6 +145,19 @@ pub enum EventKind {
         /// run is a labelled candidate from the moment it exists.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         candidate: Option<CandidateLink>,
+        /// The effective executor route and the rule that decided it (ticket
+        /// `routing-rules-config`): routing is provenance, not a hidden
+        /// implementation detail, so it rides the same event that already
+        /// records the model. Additive; present only on Worker-role spawns of
+        /// missions whose seed carried a task class — absent everywhere else
+        /// and in every pre-provenance log, where it folds to `None` and
+        /// `None` never hits the wire.
+        #[serde(
+            rename = "executorRoute",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        executor_route: Option<crate::types::ExecutorRoute>,
         #[serde(rename = "sdkSessionId")]
         sdk_session_id: String,
         model: String,
@@ -199,6 +212,15 @@ pub enum EventKind {
         #[serde(rename = "featureId")]
         feature_id: String,
         reason: String,
+        /// Commits the failed feature landed on the mission branch before the
+        /// judgement (empty for a run that never committed — the m-eee81f
+        /// auth-death class — and for parallel/dirty-tree paths where nothing
+        /// reached the branch). Recorded so the supersession guard can tell
+        /// "failed with real work" (started; re-proposal rejects) from
+        /// "failed commitless" (re-proposable). Additive; old logs default
+        /// to empty.
+        #[serde(default)]
+        commits: Vec<String>,
     },
 
     #[serde(rename = "feature.skipped")]
@@ -294,6 +316,89 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
+    /// Local-validator confirm-on-pass (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b; review addendum §4 of
+    /// docs/scoping/local-inference-executor-tier.md): a LOCAL functional
+    /// validator's PASS never greens a gate alone — a frontier functional
+    /// session re-judged the same milestone and engine-captured
+    /// contract-command evidence, and this event records the comparison.
+    /// `confirmed` names the contract-command assertions both tiers pass;
+    /// `disagreements` carries every frontier finding on a subject the local
+    /// report passed (a local PASS vs frontier FAIL — the miss), each of
+    /// which ALSO lands as a `validation.finding` and fails closed into the
+    /// round as the frontier verdict. A local FAIL never triggers this
+    /// event: failures are visible (they cost a fix cycle), misses are the
+    /// danger — the asymmetry is deliberate.
+    ///
+    /// The confirmations ARE the local-vs-frontier miss-rate ground truth
+    /// the ticket's start precondition demands: misses = disagreement
+    /// subjects, opportunities = confirmed + disagreement command
+    /// assertions + `judgmentOpportunity` (0/1), all computable from the
+    /// log alone (join `localRunId` / `confirmRunId` against
+    /// `worker.spawned` for the models). Additive event; absent in
+    /// pre-field logs, which simply have no local-validator confirmations
+    /// to measure.
+    #[serde(rename = "validation.confirm")]
+    ValidationConfirm {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        /// Run id of the LOCAL functional session whose PASS was confirmed.
+        #[serde(rename = "localRunId")]
+        local_run_id: String,
+        /// Run id of the FRONTIER confirmation session.
+        #[serde(rename = "confirmRunId")]
+        confirm_run_id: String,
+        /// Contract-command assertion ids both the local report and the
+        /// frontier confirmation pass.
+        confirmed: Vec<String>,
+        /// Frontier findings on subjects the local report passed — the
+        /// misses. Failed closed: each stands as the round's verdict.
+        disagreements: Vec<Finding>,
+        /// True when the confirmed PASS was JUDGMENT-only: a contract with
+        /// no command assertions hands the local session pure judgment, and
+        /// its all-clean report is confirmed exactly like a command-
+        /// assertion PASS — but there are no assertion ids to list, so
+        /// `confirmed`/`disagreements` alone would record ZERO opportunities
+        /// for a confirmation that covered one, silently undercounting the
+        /// miss-rate denominator (14th-pass review). Additive; absent
+        /// (= false) in logs predating the field, which simply never
+        /// recorded a judgment-only confirmation.
+        #[serde(default, rename = "judgmentOpportunity")]
+        judgment_opportunity: bool,
+    },
+
+    /// Pty-driven functional validation: one engine-run pty-script contract
+    /// assertion (ticket `pty-functional-validation`, module
+    /// [`crate::pty_harness`]) produced a bounded session transcript under
+    /// the mission's gitignored `runs/pty-transcripts/`; this audit record
+    /// names the milestone, the assertion, the stated verdict, and the
+    /// transcript's `file:`-schemed mission-relative reference (the
+    /// [`crate::gate_results`] ArtefactRef idiom — mission-relative, never
+    /// an absolute host path, resolving to "unresolved" rather than erroring
+    /// once the bytes are pruned). Record-only: the verdict reaches the
+    /// round through the functional validator's evidence block, not through
+    /// this event, so the reducer treats it as an audit record exactly like
+    /// `validation.snapshot`. Additive event; absent in pre-field logs,
+    /// which simply have no pty-driven validations.
+    #[serde(rename = "validation.pty.transcript")]
+    ValidationPtyTranscript {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        /// The contract assertion the session drove.
+        #[serde(rename = "assertionId")]
+        assertion_id: String,
+        /// The verdict the harness stated — pass (every expect matched) or
+        /// fail (the failing session's transcript is the evidence).
+        verdict: crate::gate::GateVerdict,
+        /// The `file:`-schemed mission-relative transcript path.
+        #[serde(rename = "artefactRef")]
+        artefact_ref: String,
+        /// The per-step summary (contract-authored patterns and timings —
+        /// no raw target output).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// One gate evaluation, recorded as a first-class event (ticket
     /// `.kranz/tickets/gate-results-first-class-events`, KRZ-312 — the
     /// governance evidence layer's last substrate gap before
@@ -365,6 +470,57 @@ pub enum EventKind {
         /// [`crate::gate::GateScore`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         threshold: Option<f64>,
+        /// The stable Flight Rules standards rule ids this evaluation
+        /// joined (KRZ-343, design D-H): the linkage the coverage matrix
+        /// joins on, from [`crate::gate::GateOutcome::rule_ids`]. Additive
+        /// and evidentiary only — a gate with no standards linkage carries
+        /// an empty list, which never hits the wire, so a boolean-only
+        /// gate's payload stays byte-identical.
+        #[serde(rename = "ruleIds", default, skip_serializing_if = "Vec::is_empty")]
+        rule_ids: Vec<String>,
+    },
+
+    /// One deterministic gate projected onto a Claude Code lifecycle hook
+    /// fired IN-PROCESS inside a worker session (ticket
+    /// `.kranz/tickets/claude-code-hook-gate-projection.md`, KRZ-302; module
+    /// [`crate::hook_gates`]). The first projection is the out-of-contract
+    /// write rule: a `PreToolUse` hook on the file-writing tools judges the
+    /// target path against the mission's `touch_set` and blocks an
+    /// out-of-contract write before it happens. The payload carries the
+    /// gate identity, the hook event, the tool, the judged path, and the
+    /// guard's verdict (`blocked` — refused in-process; `error` — the guard
+    /// itself failed open, so only the engine-side sweep can judge it).
+    ///
+    /// Additive, RECORD-ONLY (the `gate.result` template): the engine-side
+    /// gate ladder remains authoritative — hooks are defense-in-depth, never
+    /// a replacement — so this event drives no state transition; it is the
+    /// in-process layer's evidence landing in the log (folded from the
+    /// per-session record file after the session stream closes, BEFORE
+    /// `worker.completed`). `runId` is stamped from the run's metadata at
+    /// fold time, never from the session-writable record file.
+    #[serde(rename = "hook.gate.fired")]
+    HookGateFired {
+        #[serde(rename = "runId")]
+        run_id: String,
+        /// Gate identity (e.g. `out-of-contract-write`) — the same
+        /// defect-class name the engine-side sweep reports, so one gate
+        /// reads at two layers.
+        gate: String,
+        /// The lifecycle event that fired (`PreToolUse`).
+        #[serde(rename = "hookEvent")]
+        hook_event: String,
+        /// The tool whose call was judged (`Write`, `Edit`, ...).
+        tool: String,
+        /// The judged target (repo-relative when it resolved inside the
+        /// checkout, else the raw path).
+        subject: String,
+        /// `blocked` | `error` (see the variant docs).
+        verdict: String,
+        /// The guard's reason / error note, scrubbed and truncated at fold
+        /// time. Absent when the record carried none; `None` never hits the
+        /// wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 
     /// The candidate-comparison record of a heterogeneous dispatch pool
@@ -460,6 +616,144 @@ pub enum EventKind {
         from: ExecutorTier,
         to: ExecutorTier,
         reason: String,
+    },
+
+    /// Worker-initiated escalation to the frontier advisor (ticket
+    /// `backend-routing-abstraction`, KRZ-331): a worker whose report carried
+    /// an `escalation` reason judged its task beyond its route's confidence
+    /// and asked for frontier-tier advice. Distinct from `tier.escalated` —
+    /// that is the ORCHESTRATOR's fix-cycle-cap valve, which flips the
+    /// executor tier and resets the milestone; THIS is the WORKER's request,
+    /// layered on top of the deterministic routing floor and never replacing
+    /// it.
+    ///
+    /// RECORD-ONLY (the `gate.result` additive template): the fold validates
+    /// the run reference as a corruption guard and changes NO state — the
+    /// validator route, the executor tier, the respawn budget, and every
+    /// milestone status are all untouched, so a worker escalation can never
+    /// bypass the floor's validator requirements. The judgement turn that
+    /// already reads the worker's report IS the frontier advisor act
+    /// consuming the request (the orchestrator role's model/endpoint,
+    /// frontier-floor enforced by `config::validate`); this event is the
+    /// provenance that the request was made, feeding the escalation record
+    /// the ticket requires of every escalation. Old logs without any
+    /// worker.escalated fold unchanged.
+    ///
+    /// Routes are capability classes ([`ExecutorTier`]), never model ids —
+    /// the same discipline as the routing table itself.
+    #[serde(rename = "worker.escalated")]
+    WorkerEscalated {
+        #[serde(rename = "runId")]
+        run_id: String,
+        /// The feature whose worker asked (denormalized onto the event so
+        /// the log reads without a join; the run record is the join of
+        /// record).
+        #[serde(rename = "featureId")]
+        feature_id: String,
+        /// Source route: the executor capability class the escalating worker
+        /// session ran on.
+        from: ExecutorTier,
+        /// Target route: the advisor capability class requested — always
+        /// `frontier` in this pass (see the variant docs).
+        to: ExecutorTier,
+        /// WHY the worker asked, verbatim from its report (already
+        /// credential-scrubbed with the report text it was parsed from).
+        reason: String,
+    },
+
+    /// A worker asked the human a structured question (ticket
+    /// `structured-human-question-events`): the report's `questions` payload
+    /// (the "ask the human" tool shape — text plus capped structured choices)
+    /// opened as ONE entry of the pending-decision projection
+    /// ([`crate::types::MissionState::pending_questions`]) that the dashboard
+    /// and Slack render beside grants — the D-X channel-unification ruling:
+    /// permission prompts stay on the grant flow, ticket underspecification
+    /// stays on NeedsContext, and ONLY orchestrator/worker structured asks
+    /// land here, so this is not a third competing human-input inbox.
+    ///
+    /// Unlike `grant.requested`, opening a question parks NOTHING: the
+    /// worker's own run result drives the mission's course exactly as before
+    /// (a prose-only report opens no question at all — the prose fallback),
+    /// and an answer reaches the running mission through the existing
+    /// user-message consult fold (see `question.answered`). The id is
+    /// engine-minted (`q-<n>` from the folded
+    /// [`crate::types::MissionState::question_count`] — restart-safe, never
+    /// reused), never model-supplied. Text and options are credential-
+    /// scrubbed and size-capped at write (orchestrator.rs caps); `role`
+    /// names who asked (`worker` today — an orchestrator ask path can land
+    /// without a schema change). The run/feature/milestone refs are
+    /// denormalized context so surfaces render without a join.
+    #[serde(rename = "question.opened")]
+    QuestionOpened {
+        /// Engine-minted id (`q-<n>`, per-mission monotonic).
+        #[serde(rename = "questionId")]
+        question_id: String,
+        /// Who asked — `worker` in this pass.
+        role: Role,
+        /// The question text (scrubbed, capped at write).
+        text: String,
+        /// Structured choices the asker offered (each scrubbed + capped, the
+        /// list capped at write). EMPTY means a free-text answer is expected.
+        /// Absent in pre-field logs and omitted from the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+        /// The run whose report carried the ask. `None` never hits the wire.
+        #[serde(rename = "runId", default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Feature the asking run worked on (context ref). `None` never hits
+        /// the wire.
+        #[serde(rename = "featureId", default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+        /// Milestone the asking run worked under (context ref; the clear-on-
+        /// complete sweep keys on it). `None` never hits the wire.
+        #[serde(
+            rename = "milestoneId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        milestone_id: Option<String>,
+    },
+
+    /// The operator answered an open question (ticket
+    /// `structured-human-question-events`), mirroring
+    /// `grant.requested` → `grant.approved`: the reducer cross-checks the id
+    /// against the parked projection (a stale or forged answer for a question
+    /// that is not open fails the fold), removes it from
+    /// [`crate::types::MissionState::pending_questions`], and folds the answer
+    /// onto `pending_user_messages` — the EXISTING consult path, so the
+    /// answer reaches the running mission (and replays after restart) with no
+    /// new delivery mechanism. `answer` is the chosen option's text verbatim
+    /// or the operator's free text (scrubbed + capped at write — an operator
+    /// can paste a token into an answer box, and the log is corpus-exported);
+    /// `option` records the 0-based index when an offered option was picked,
+    /// `None` for free text. `via` names the control path that delivered it
+    /// (the `answer-question` control kind today; a free-form string so a
+    /// future `msg`-carried answer needs no schema change).
+    #[serde(rename = "question.answered")]
+    QuestionAnswered {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        answer: String,
+        via: String,
+        /// 0-based index into the question's `options` when an offered option
+        /// was picked; absent for free-text answers. `None` never hits the
+        /// wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<u32>,
+    },
+
+    /// An open question stopped being actionable WITHOUT an answer (ticket
+    /// `structured-human-question-events`) — its milestone completed, or the
+    /// mission ended with the ask still open. Third kind rather than a
+    /// resolution field on `question.opened` for the same reason grants are
+    /// two kinds: the log is append-only, so a later resolution can only ever
+    /// be a second event. `why` is the engine's reason verbatim
+    /// ("milestone completed", "mission completed", ...).
+    #[serde(rename = "question.cleared")]
+    QuestionCleared {
+        #[serde(rename = "questionId")]
+        question_id: String,
+        why: String,
     },
 
     #[serde(rename = "milestone.blocked")]
@@ -620,6 +914,180 @@ pub enum EventKind {
         #[serde(default)]
         version: String,
     },
+
+    /// The Flight Rules resolution record (KRZ-342, design D-D/D-E/D-H):
+    /// emitted at plan approval, immediately after `plan.approved`, when a
+    /// standards-configured pack governed the approval. Records the source
+    /// identity + digest, the selection inputs (stage, task class, touch
+    /// set), the selected rule revisions, and the `plan.approved` seq the
+    /// pin attaches to — the queryable provenance for the consent artifact
+    /// the plan's `standardsManifest` carries in full.
+    ///
+    /// D-H's record list, verified for KRZ-343: the source identity/digest,
+    /// selection inputs, stage, rule revisions, and approval sequence all
+    /// ride in this payload; the effective-time evaluation instant is the
+    /// event envelope's own `ts` — resolution runs in the same approve_plan
+    /// call as the emission, so the append stamp IS the instant the
+    /// effective statuses were judged (payloads never duplicate the envelope
+    /// clock anywhere in this schema). The RFC `effective_at` absorption
+    /// window itself stays unevaluated in this slice: KRZ-341 parses and
+    /// carries the field, and the stage-projection slice that evaluates it
+    /// (KRZ-345) records its own surfaces.
+    #[serde(rename = "standards.resolved")]
+    StandardsResolved {
+        /// `repo-tracked` or `external-pinned` ([`StandardsPinSource`]).
+        source: String,
+        #[serde(rename = "packName")]
+        pack_name: String,
+        #[serde(rename = "standardsRoot")]
+        standards_root: String,
+        /// sha256 over the pack's normalized canonical manifest text.
+        digest: String,
+        /// The resolution surface: `approval` for the pinning resolution
+        /// (stage-specific projections are KRZ-345's emitters).
+        stage: String,
+        #[serde(rename = "taskClass", default, skip_serializing_if = "Option::is_none")]
+        task_class: Option<String>,
+        #[serde(rename = "touchSet", default, skip_serializing_if = "Vec::is_empty")]
+        touch_set: Vec<String>,
+        #[serde(
+            rename = "contextPaths",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        context_paths: Vec<String>,
+        /// The selected rules, stable-sorted by id.
+        rules: Vec<StandardsRuleRef>,
+        /// The seq of the `plan.approved` event this resolution pins.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+    },
+
+    /// The Flight Rules policy-drift refusal (KRZ-342, design D-E/D-H):
+    /// emitted when merge re-resolves the LIVE base policy against the exact
+    /// scratch integration diff and the applicable ENFORCED set differs from
+    /// the approved pin's — the merge is refused and the mission requires
+    /// explicit revalidation/reapproval. `currentDigest` is `None` when the
+    /// live base no longer yields a readable standards manifest at all (a
+    /// removed or malformed pack — the ultimate drift, failed closed).
+    /// Audit-only in the reducer: the refusal already happened; the event is
+    /// the evidence.
+    #[serde(rename = "standards.drifted")]
+    StandardsDrifted {
+        /// The digest pinned at approval.
+        #[serde(rename = "approvedDigest")]
+        approved_digest: String,
+        /// The digest resolved from the live base, when one resolved.
+        #[serde(
+            rename = "currentDigest",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_digest: Option<String>,
+        /// The surface that detected the drift (`merge` in this slice).
+        surface: String,
+        /// Id-level descriptions of the changed applicable enforced rules
+        /// (added / removed / changed), stable-sorted.
+        #[serde(rename = "changedRules")]
+        changed_rules: Vec<String>,
+    },
+
+    /// The Flight Rules human waiver decision (ticket
+    /// `.kranz/tickets/flight-rules-waiver-decisions.md`, KRZ-344; design
+    /// D-I — "waivers are narrow human decisions"): the ONE authorized
+    /// exception path for a standards failure. Only an authenticated human
+    /// surface records it (`kranz standards waive` in this slice) — a model
+    /// may request a waiver or propose a fix but can NEVER approve one, so
+    /// no engine or backend code path emits this event. The binding is
+    /// deliberately narrow enough that the waiver cannot survive a
+    /// meaningful rule/finding/scope/diff change: it names the pinned rule
+    /// id + revision + manifest digest + approval sequence, the fingerprint
+    /// of the EXACT finding it subtracts, the affected paths, and the
+    /// sha256 over the affected-path diff (the whole diff for an unscoped
+    /// rule), plus the reason, the approver, and the expiry. A change to
+    /// the affected-path diff, the rule revision, the finding fingerprint,
+    /// or the pin — or the expiry passing — invalidates the waiver and
+    /// restores the block; unrelated paths receive no authority. It
+    /// subtracts EXACTLY ONE matching standards failure: it never disables
+    /// a checker, an RFC, a domain, or a class, and engine floor gates have
+    /// no waiver slot at all. Audit-only in the reducer: the coverage fold
+    /// joins it straight from the log.
+    #[serde(rename = "standards.waiver.approved")]
+    StandardsWaiverApproved {
+        /// The pinned rule id the waiver excepts (frontmatter `id:`).
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        /// The pinned rule revision — a waiver naming any other revision
+        /// joins nothing.
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        /// sha256 of the approved manifest the waiver binds to
+        /// ([`StandardsPin::digest`]).
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        /// The seq of the `plan.approved` event whose pin the waiver binds
+        /// — a re-approval supersedes every earlier waiver.
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        /// sha256 fingerprint of the ONE finding this waiver subtracts
+        /// ([`crate::standards_waiver::finding_fingerprint`]).
+        #[serde(rename = "findingFingerprint")]
+        finding_fingerprint: String,
+        /// The affected paths the bound diff covers: the rule's
+        /// `when-paths` intersected with the mission diff, or the whole
+        /// changed set for an unscoped rule. Recorded so the audit names
+        /// exactly what the digest covers; empty when a scoped rule
+        /// matched no changed path (the waiver then binds the empty
+        /// scoped diff).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        /// sha256 over the affected-path diff bytes at approval time — a
+        /// later change to any affected path digests differently and
+        /// invalidates the waiver.
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        /// The human's reason, verbatim (scrubbed at write like every
+        /// payload string).
+        reason: String,
+        /// The approver principal: the authenticated identity where the
+        /// local authority model can name one, else honestly
+        /// `local-operator` (D-I — never invent a real-world identity).
+        approver: String,
+        /// The authenticated invocation surface (`cli` in this slice).
+        /// The coverage fold honors only recognized human surfaces — a
+        /// hand-cut event claiming a model surface carries no authority.
+        surface: String,
+        /// The expiry instant. The fold judges it against the log's own
+        /// frontier (the latest event instant — never a wall clock, so
+        /// replays stay byte-identical); an enforcement decision re-judges
+        /// it against its own clock.
+        #[serde(rename = "expiresAt")]
+        expires_at: DateTime<Utc>,
+    },
+
+    /// Positive human verdict for a rule whose typed checker is
+    /// `manual-attestation` (KRZ-346 D-F). Like a waiver, authority is narrow:
+    /// exact mission pin, rule revision, affected paths, and current diff.
+    /// Unlike a waiver it does not except a failing checker; it IS the
+    /// checker and therefore carries no finding fingerprint or expiry.
+    #[serde(rename = "standards.attestation.approved")]
+    StandardsAttestationApproved {
+        #[serde(rename = "ruleId")]
+        rule_id: String,
+        #[serde(rename = "ruleRevision")]
+        rule_revision: u64,
+        #[serde(rename = "manifestDigest")]
+        manifest_digest: String,
+        #[serde(rename = "approvalSeq")]
+        approval_seq: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        #[serde(rename = "diffDigest")]
+        diff_digest: String,
+        reason: String,
+        approver: String,
+        surface: String,
+    },
 }
 
 impl EventKind {
@@ -646,11 +1114,18 @@ impl EventKind {
             EventKind::ValidationFinding { .. } => "validation.finding",
             EventKind::ValidatorTamper { .. } => "validator.tamper",
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
+            EventKind::ValidationConfirm { .. } => "validation.confirm",
+            EventKind::ValidationPtyTranscript { .. } => "validation.pty.transcript",
             EventKind::GateResult { .. } => "gate.result",
+            EventKind::HookGateFired { .. } => "hook.gate.fired",
             EventKind::DivergenceNoted { .. } => "divergence.noted",
             EventKind::DivergenceResolved { .. } => "divergence.resolved",
             EventKind::FixFeatureCreated { .. } => "fixfeature.created",
             EventKind::TierEscalated { .. } => "tier.escalated",
+            EventKind::WorkerEscalated { .. } => "worker.escalated",
+            EventKind::QuestionOpened { .. } => "question.opened",
+            EventKind::QuestionAnswered { .. } => "question.answered",
+            EventKind::QuestionCleared { .. } => "question.cleared",
             EventKind::MilestoneBlocked { .. } => "milestone.blocked",
             EventKind::MilestoneUnblocked { .. } => "milestone.unblocked",
             EventKind::MilestoneCompleted { .. } => "milestone.completed",
@@ -668,6 +1143,10 @@ impl EventKind {
             EventKind::WorkspaceReadinessReport { .. } => "workspace.readiness",
             EventKind::WorkspaceTeardown { .. } => "workspace.teardown",
             EventKind::WorkspaceProviderPinned { .. } => "workspace.provider.pinned",
+            EventKind::StandardsResolved { .. } => "standards.resolved",
+            EventKind::StandardsDrifted { .. } => "standards.drifted",
+            EventKind::StandardsWaiverApproved { .. } => "standards.waiver.approved",
+            EventKind::StandardsAttestationApproved { .. } => "standards.attestation.approved",
         }
     }
 
@@ -691,6 +1170,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -1222,6 +1702,133 @@ mod tests {
         }
     }
 
+    /// The additive `validation.confirm` event (ticket
+    /// `local-inference-validator-guarded`, KRZ-206b): wire name, payload
+    /// shape, and round-trip — the miss-rate ground truth must survive serde
+    /// verbatim, because the local-vs-frontier miss rate is computed from
+    /// these bytes alone (misses = disagreement subjects; opportunities =
+    /// confirmed + disagreement command assertions + judgmentOpportunity).
+    #[test]
+    fn guarded_local_validator_confirm_event_wire_shape_and_round_trip() {
+        let event = EventKind::ValidationConfirm {
+            milestone_id: "ms-1".to_string(),
+            local_run_id: "run-local".to_string(),
+            confirm_run_id: "run-frontier".to_string(),
+            confirmed: vec!["a1".to_string()],
+            disagreements: vec![Finding {
+                subject: "a2".to_string(),
+                severity: "major".to_string(),
+                evidence: "frontier sees a failure the local pass missed".to_string(),
+                suggested_fix: "fix a2".to_string(),
+                class: String::new(),
+                rule: None,
+            }],
+            judgment_opportunity: false,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "validation.confirm");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["localRunId"], "run-local");
+        assert_eq!(json["payload"]["confirmRunId"], "run-frontier");
+        assert_eq!(json["payload"]["confirmed"], serde_json::json!(["a1"]));
+        assert_eq!(
+            json["payload"]["disagreements"][0]["subject"],
+            serde_json::json!("a2")
+        );
+        assert_eq!(
+            json["payload"]["judgmentOpportunity"],
+            serde_json::json!(false)
+        );
+        assert_eq!(event.type_name(), "validation.confirm");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::ValidationConfirm {
+                milestone_id,
+                local_run_id,
+                confirm_run_id,
+                confirmed,
+                disagreements,
+                judgment_opportunity,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(local_run_id, "run-local");
+                assert_eq!(confirm_run_id, "run-frontier");
+                assert_eq!(confirmed, vec!["a1".to_string()]);
+                assert_eq!(disagreements.len(), 1);
+                assert_eq!(disagreements[0].subject, "a2");
+                assert!(!judgment_opportunity);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // A legacy line (the field predated) decodes with the additive
+        // default — pre-field logs simply never recorded a judgment-only
+        // confirmation.
+        let mut legacy = serde_json::to_value(&event).unwrap();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("judgmentOpportunity");
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ValidationConfirm {
+                judgment_opportunity,
+                ..
+            } => assert!(!judgment_opportunity, "absent reads as false"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `validation.pty.transcript` event (ticket
+    /// `pty-functional-validation`): wire name, payload shape, and
+    /// round-trip — the audit record binding a pty-script assertion's
+    /// verdict to its transcript artifact must survive serde verbatim, and
+    /// a legacy line without `detail` still decodes (serde default).
+    #[test]
+    fn validation_pty_transcript_round_trips() {
+        let event = EventKind::ValidationPtyTranscript {
+            milestone_id: "ms-1".to_string(),
+            assertion_id: "a-pty".to_string(),
+            verdict: crate::gate::GateVerdict::Fail,
+            artefact_ref: "file:runs/pty-transcripts/a-pty-0123abcd.log".to_string(),
+            detail: Some("step 1 ok step 2 FAILED (expect `echo:hello` timed out)".to_string()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "validation.pty.transcript");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["assertionId"], "a-pty");
+        assert_eq!(
+            json["payload"]["artefactRef"],
+            "file:runs/pty-transcripts/a-pty-0123abcd.log"
+        );
+        assert_eq!(event.type_name(), "validation.pty.transcript");
+        let back: EventKind = serde_json::from_value(json.clone()).unwrap();
+        match back {
+            EventKind::ValidationPtyTranscript {
+                milestone_id,
+                assertion_id,
+                verdict,
+                artefact_ref,
+                detail,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(assertion_id, "a-pty");
+                assert_eq!(verdict, crate::gate::GateVerdict::Fail);
+                assert_eq!(artefact_ref, "file:runs/pty-transcripts/a-pty-0123abcd.log");
+                assert!(detail.unwrap().contains("FAILED"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A legacy line without `detail` still decodes (serde default).
+        let mut legacy = json;
+        legacy["payload"].as_object_mut().unwrap().remove("detail");
+        let back: EventKind = serde_json::from_value(legacy).unwrap();
+        match back {
+            EventKind::ValidationPtyTranscript { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
     /// The additive `gate.result` event (ticket
     /// `gate-results-first-class-events`, KRZ-312): wire name, exact payload
     /// shape, and round-trip. A full record — surface, ladder section +
@@ -1240,6 +1847,7 @@ mod tests {
             artefact_detail: Some("[a-1] test-runner pipeline's grep anchors no nonzero count: `cargo test | grep ok`".to_string()),
             score: Some(0.42),
             threshold: Some(0.75),
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["type"], "gate.result");
@@ -1267,6 +1875,7 @@ mod tests {
                 artefact_detail,
                 score,
                 threshold,
+                rule_ids,
             } => {
                 assert_eq!(gate, "vacuous-filter");
                 assert_eq!(surface, crate::gate::GateSurface::Approval);
@@ -1277,6 +1886,7 @@ mod tests {
                 assert!(artefact_detail.as_deref().unwrap().contains("[a-1]"));
                 assert_eq!(score, Some(0.42));
                 assert_eq!(threshold, Some(0.75));
+                assert!(rule_ids.is_empty());
             }
             _ => panic!("wrong variant"),
         }
@@ -1287,6 +1897,8 @@ mod tests {
     /// stays OFF the wire (byte-identical to a payload that never had them)
     /// and a line without them parses back to `None` (serde default), so
     /// hand-written or future-trimmed logs fold like engine-written ones.
+    /// KRZ-343's `ruleIds` follows the same rule: a gate with no standards
+    /// linkage carries an empty list, which serializes as NO key.
     #[test]
     fn gate_result_event_optional_fields_are_additive() {
         let sparse = EventKind::GateResult {
@@ -1299,13 +1911,14 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         };
         let json = serde_json::to_value(&sparse).unwrap();
         assert_eq!(json["payload"]["surface"], "final-gate");
         assert_eq!(json["payload"]["kind"], "model-judged");
         assert_eq!(json["payload"]["verdict"], "pass");
         let payload = json["payload"].as_object().unwrap();
-        for absent in ["artefactDetail", "score", "threshold"] {
+        for absent in ["artefactDetail", "score", "threshold", "ruleIds"] {
             assert!(
                 !payload.contains_key(absent),
                 "payload must not contain {absent} when None: {json}"
@@ -1346,6 +1959,50 @@ mod tests {
         }
     }
 
+    /// The additive `worker.escalated` event (ticket
+    /// `backend-routing-abstraction`, KRZ-331): wire name, exact payload
+    /// shape, and round-trip — the gate.result template. The payload names
+    /// the source and target routes as capability classes (ExecutorTier's
+    /// lowercase wire form), never model ids.
+    #[test]
+    fn routing_abstraction_worker_escalated_wire_shape_and_round_trip() {
+        let kind = EventKind::WorkerEscalated {
+            run_id: "r-1".to_string(),
+            feature_id: "f-1-1".to_string(),
+            from: ExecutorTier::Local,
+            to: ExecutorTier::Frontier,
+            reason: "spec ambiguity beyond my confidence".to_string(),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "worker.escalated");
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["featureId"], "f-1-1");
+        assert_eq!(json["payload"]["from"], "local");
+        assert_eq!(json["payload"]["to"], "frontier");
+        assert_eq!(
+            json["payload"]["reason"],
+            "spec ambiguity beyond my confidence"
+        );
+        assert_eq!(kind.type_name(), "worker.escalated");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerEscalated {
+                run_id,
+                feature_id,
+                from,
+                to,
+                reason,
+            } => {
+                assert_eq!(run_id, "r-1");
+                assert_eq!(feature_id, "f-1-1");
+                assert_eq!(from, ExecutorTier::Local);
+                assert_eq!(to, ExecutorTier::Frontier);
+                assert_eq!(reason, "spec ambiguity beyond my confidence");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     /// The additive `candidate` on `worker.spawned` (ticket
     /// heterogeneous-dispatch-pool, KRZ-303): the sibling linkage round-trips
     /// when present, old log lines without it fold to None, and None never
@@ -1359,6 +2016,7 @@ mod tests {
                 feature_id: Some("f-1-1".into()),
                 milestone_id: None,
                 candidate,
+                executor_route: None,
                 sdk_session_id: "s".into(),
                 model: "sonnet".into(),
                 quant: "n/a".into(),
@@ -1405,6 +2063,85 @@ mod tests {
         .unwrap();
         match old {
             EventKind::WorkerSpawned { candidate, .. } => assert_eq!(candidate, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `executorRoute` field (ticket `routing-rules-config`):
+    /// the effective route + deciding rule round-trips in camelCase when
+    /// present, old log lines without it fold to None, and None never hits
+    /// the wire (byte-identical to pre-provenance logs).
+    #[test]
+    fn routing_rules_config_worker_spawned_executor_route_is_additive() {
+        fn spawned(executor_route: Option<crate::types::ExecutorRoute>) -> EventKind {
+            EventKind::WorkerSpawned {
+                run_id: "r-1".into(),
+                role: Role::Worker,
+                feature_id: Some("f-1-1".into()),
+                milestone_id: None,
+                candidate: None,
+                executor_route,
+                sdk_session_id: "s".into(),
+                model: "sonnet".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "h".into(),
+                transcript_path: "t".into(),
+            }
+        }
+
+        // Some: camelCase wire shape, full round-trip — rule omitted when
+        // the fall-through decided (None never serializes).
+        let route = crate::types::ExecutorRoute {
+            tier: crate::types::ExecutorTier::Local,
+            rule: Some("taskClassRules[0]".to_string()),
+        };
+        let json = serde_json::to_value(spawned(Some(route.clone()))).unwrap();
+        assert_eq!(json["payload"]["executorRoute"]["tier"], "local");
+        assert_eq!(
+            json["payload"]["executorRoute"]["rule"],
+            "taskClassRules[0]"
+        );
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerSpawned { executor_route, .. } => {
+                assert_eq!(executor_route, Some(route))
+            }
+            _ => panic!("wrong variant"),
+        }
+        let fall_through = crate::types::ExecutorRoute {
+            tier: crate::types::ExecutorTier::Frontier,
+            rule: None,
+        };
+        let json = serde_json::to_value(spawned(Some(fall_through))).unwrap();
+        assert_eq!(json["payload"]["executorRoute"]["tier"], "frontier");
+        assert!(
+            !json["payload"]["executorRoute"]
+                .as_object()
+                .unwrap()
+                .contains_key("rule"),
+            "a fall-through route must not serialize a rule key: {json}"
+        );
+
+        // None: omitted from the wire (byte-identical to pre-provenance logs).
+        let json = serde_json::to_value(spawned(None)).unwrap();
+        assert!(
+            !json["payload"]
+                .as_object()
+                .unwrap()
+                .contains_key("executorRoute"),
+            "executorRoute must not serialize when None: {json}"
+        );
+
+        // Old log line (pre-provenance): folds with executor_route = None.
+        let old: EventKind = serde_json::from_str(
+            r#"{"type":"worker.spawned","payload":{"runId":"r-1","role":"worker","featureId":"f-1-1","sdkSessionId":"s","model":"sonnet","promptHash":"h","transcriptPath":"t"}}"#,
+        )
+        .unwrap();
+        match old {
+            EventKind::WorkerSpawned { executor_route, .. } => {
+                assert_eq!(executor_route, None)
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -1567,5 +2304,214 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The additive `hook.gate.fired` event (ticket
+    /// claude-code-hook-gate-projection, KRZ-302): wire name and payload
+    /// round-trip, `detail` is omitted when None, and a sparse wire line
+    /// folds with serde defaults — the gate.result additive template.
+    #[test]
+    fn hook_gate_projection_event_wire_shape_round_trips() {
+        let fired = EventKind::HookGateFired {
+            run_id: "r-1".into(),
+            gate: "out-of-contract-write".into(),
+            hook_event: "PreToolUse".into(),
+            tool: "Write".into(),
+            subject: "docs/oops.md".into(),
+            verdict: "blocked".into(),
+            detail: Some("matches none of the declared touch-set globs".into()),
+        };
+        let json = serde_json::to_value(&fired).unwrap();
+        assert_eq!(json["type"], "hook.gate.fired");
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["gate"], "out-of-contract-write");
+        assert_eq!(json["payload"]["hookEvent"], "PreToolUse");
+        assert_eq!(json["payload"]["tool"], "Write");
+        assert_eq!(json["payload"]["subject"], "docs/oops.md");
+        assert_eq!(json["payload"]["verdict"], "blocked");
+        assert_eq!(fired.type_name(), "hook.gate.fired");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::HookGateFired {
+                run_id,
+                gate,
+                verdict,
+                detail,
+                ..
+            } => {
+                assert_eq!(run_id, "r-1");
+                assert_eq!(gate, "out-of-contract-write");
+                assert_eq!(verdict, "blocked");
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("matches none of the declared touch-set globs")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // detail = None stays off the wire (additive; old readers never see
+        // the key), and a wire line without it folds to None.
+        let no_detail = EventKind::HookGateFired {
+            run_id: "r-2".into(),
+            gate: "out-of-contract-write".into(),
+            hook_event: "PreToolUse".into(),
+            tool: "Edit".into(),
+            subject: "x".into(),
+            verdict: "error".into(),
+            detail: None,
+        };
+        let json = serde_json::to_value(&no_detail).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("detail"),
+            "detail must not serialize when None: {json}"
+        );
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"hook.gate.fired","payload":{"runId":"r-3","gate":"out-of-contract-write","hookEvent":"PreToolUse","tool":"Write","subject":"y","verdict":"blocked"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::HookGateFired { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive question events (ticket
+    /// `structured-human-question-events`): wire names, exact payload shapes,
+    /// and round-trips. Every optional field stays OFF the wire when absent,
+    /// and sparse wire lines (hand-written or future-trimmed logs) fold with
+    /// serde defaults — the gate.result additive template.
+    #[test]
+    fn question_events_wire_shapes_and_round_trips() {
+        let opened = EventKind::QuestionOpened {
+            question_id: "q-1".into(),
+            role: Role::Worker,
+            text: "Which storage engine should the cache use?".into(),
+            options: vec!["sqlite".into(), "in-memory".into()],
+            run_id: Some("r-1".into()),
+            feature_id: Some("f-1-1".into()),
+            milestone_id: Some("ms-1".into()),
+        };
+        let json = serde_json::to_value(&opened).unwrap();
+        assert_eq!(json["type"], "question.opened");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["role"], "worker");
+        assert_eq!(
+            json["payload"]["text"],
+            "Which storage engine should the cache use?"
+        );
+        assert_eq!(
+            json["payload"]["options"],
+            serde_json::json!(["sqlite", "in-memory"])
+        );
+        assert_eq!(json["payload"]["runId"], "r-1");
+        assert_eq!(json["payload"]["featureId"], "f-1-1");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(opened.type_name(), "question.opened");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::QuestionOpened {
+                question_id,
+                role,
+                options,
+                milestone_id,
+                ..
+            } => {
+                assert_eq!(question_id, "q-1");
+                assert_eq!(role, Role::Worker);
+                assert_eq!(options.len(), 2);
+                assert_eq!(milestone_id.as_deref(), Some("ms-1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Empty options (a free-text ask) and absent context refs stay off
+        // the wire, and a sparse line folds them to the defaults.
+        let free_text = EventKind::QuestionOpened {
+            question_id: "q-2".into(),
+            role: Role::Worker,
+            text: "What should the flag be called?".into(),
+            options: vec![],
+            run_id: None,
+            feature_id: None,
+            milestone_id: None,
+        };
+        let json = serde_json::to_value(&free_text).unwrap();
+        let payload = json["payload"].as_object().unwrap();
+        for absent in ["options", "runId", "featureId", "milestoneId"] {
+            assert!(
+                !payload.contains_key(absent),
+                "payload must not contain {absent} when empty/None: {json}"
+            );
+        }
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"question.opened","payload":{"questionId":"q-2","role":"worker","text":"What should the flag be called?"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::QuestionOpened {
+                options,
+                run_id,
+                feature_id,
+                milestone_id,
+                ..
+            } => {
+                assert!(options.is_empty());
+                assert_eq!(run_id, None);
+                assert_eq!(feature_id, None);
+                assert_eq!(milestone_id, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let answered = EventKind::QuestionAnswered {
+            question_id: "q-1".into(),
+            answer: "sqlite".into(),
+            via: "answer-question".into(),
+            option: Some(0),
+        };
+        let json = serde_json::to_value(&answered).unwrap();
+        assert_eq!(json["type"], "question.answered");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["answer"], "sqlite");
+        assert_eq!(json["payload"]["via"], "answer-question");
+        assert_eq!(json["payload"]["option"], 0);
+        assert_eq!(answered.type_name(), "question.answered");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::QuestionAnswered { .. }));
+
+        // option = None (free-text answer) stays off the wire; a sparse line
+        // folds it to None.
+        let free_answer = EventKind::QuestionAnswered {
+            question_id: "q-2".into(),
+            answer: "call it --cache-dir".into(),
+            via: "answer-question".into(),
+            option: None,
+        };
+        let json = serde_json::to_value(&free_answer).unwrap();
+        assert!(
+            !json["payload"].as_object().unwrap().contains_key("option"),
+            "option must not serialize when None: {json}"
+        );
+        let sparse: EventKind = serde_json::from_str(
+            r#"{"type":"question.answered","payload":{"questionId":"q-2","answer":"call it --cache-dir","via":"answer-question"}}"#,
+        )
+        .unwrap();
+        match sparse {
+            EventKind::QuestionAnswered { option, .. } => assert_eq!(option, None),
+            _ => panic!("wrong variant"),
+        }
+
+        let cleared = EventKind::QuestionCleared {
+            question_id: "q-1".into(),
+            why: "milestone completed".into(),
+        };
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "question.cleared");
+        assert_eq!(json["payload"]["questionId"], "q-1");
+        assert_eq!(json["payload"]["why"], "milestone completed");
+        assert_eq!(cleared.type_name(), "question.cleared");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, EventKind::QuestionCleared { .. }));
     }
 }

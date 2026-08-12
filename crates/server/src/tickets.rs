@@ -159,6 +159,9 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "context": ticket.context,
         "scopingAnswers": ticket.scoping_answers,
         "acceptanceHints": ticket.acceptance_hints,
+        "taskClass": ticket.task_class,
+        "reviewArtifact": ticket.review_artifact,
+        "reviewOutput": ticket.review_output,
         "trigger": ticket.trigger,
         "state": state,
         "needsContext": needs_context_questions(&ticket.raw_body),
@@ -307,6 +310,23 @@ Ship the thing.
         let ticket = load(tmp.path(), "linked");
         let json = ticket_full_json(tmp.path(), &ticket);
         assert_eq!(json["missionId"], "m-abc123");
+    }
+
+    #[test]
+    fn flight_rules_review_class_ticket_json_surfaces_artifact_contract() {
+        let tmp = TempDir::new().unwrap();
+        let dir = Ticket::tickets_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("spec.md"),
+            "---\ntitle: Review spec\ntask-class: spec-review\nreview-artifact: docs/spec.md\nreview-output: reviews/spec.md\n---\n\n## Goal\nReview it.\n",
+        )
+        .unwrap();
+        let ticket = load(tmp.path(), "spec");
+        let json = ticket_full_json(tmp.path(), &ticket);
+        assert_eq!(json["taskClass"], "spec-review");
+        assert_eq!(json["reviewArtifact"], "docs/spec.md");
+        assert_eq!(json["reviewOutput"], "reviews/spec.md");
     }
 
     #[test]
@@ -531,6 +551,7 @@ Ship the thing.
                 statement: "cargo test passes".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".into()),
+                pty_script: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "M1".into(),
@@ -543,6 +564,7 @@ Ship the thing.
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 

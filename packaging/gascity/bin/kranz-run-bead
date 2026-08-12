@@ -89,6 +89,14 @@ CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
 
 bd() { gc --city "$CITY" bd "$@"; }
 
+# Best-effort City event emission (Stage 3): surfaces kranz mission progress
+# in the city's event stream. `gc event emit` always exits 0, so a failed
+# event write never changes the exit-code contract below.
+event_emit() {
+    TYPE=$1; MSG=$2
+    gc --city "$CITY" event emit "$TYPE" --subject "$ID" --message "$MSG" >/dev/null 2>&1 || true
+}
+
 # Client-side lease heartbeat (f-3-1): bd 1.0.5 has no lease/TTL/heartbeat
 # field, so the bridge keeps its own. While the mission runs, a background
 # loop renews $LEASE_FILE with `<pid> <unix-ts> <start-token>`; on ANY
@@ -127,6 +135,8 @@ trap 'exit 143' TERM
 printf '%s %s %s\n' "$$" "$(date +%s)" "$START_TOKEN" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
     mv -f "$LEASE_FILE.init.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
+event_emit "kranz.mission.started" "kranz mission started for bead $ID"
+
 LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
 CODE=$?
 
@@ -135,10 +145,12 @@ CODE=$?
 case $CODE in
     0)
         bd close "$ID" --reason "kranz mission COMPLETE — $LINE" >/dev/null
+        event_emit "kranz.mission.complete" "kranz mission COMPLETE for bead $ID — $LINE"
         ;;
     2)
         bd update "$ID" --status blocked >/dev/null 2>&1
         bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
+        event_emit "kranz.mission.blocked" "kranz mission BLOCKED for bead $ID — $LINE"
         gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
             -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \
             --notify >/dev/null 2>&1 || true

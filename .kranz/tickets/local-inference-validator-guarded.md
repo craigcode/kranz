@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: functional validator may run local for mechanical checks; scrutiny local rejected; confirm-on-pass with additive validation.confirm event — disagreement fails closed, untrusted confirmation blocks, local fail trusted without confirm; confirmations are the miss-rate ground truth. guarded_local_validator filter: 7 green; full gates green.
 title: Local validator for mechanical checks only, frontier-confirmed on judgment
 priority: 4
 schedule: once

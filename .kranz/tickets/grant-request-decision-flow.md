@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: command, touch-set, and worker-deny grant flows shipped 2026-07-13; remaining egress work is tracked separately
 title: Grant-request decision flow — fail closed, then offer the narrowest consent
 priority: 2
 schedule: once

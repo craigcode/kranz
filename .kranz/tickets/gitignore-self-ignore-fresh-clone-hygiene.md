@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: option (b) implemented: probe accepts engine-materialized .kranz/.gitignore when it carries the full KRANZ_GITIGNORE_RULES canonical set (paths.rs, single source with the engine writer); gutted files fall through to the committed-bytes standard; dogfood now 10/10 Pass
 title: .kranz/.gitignore is self-ignoring — fresh clones lose runtime hygiene
 priority: 3
 schedule: once

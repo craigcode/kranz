@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in 670b896 (codex-built, reviewed, gates green)
 title: Non-Claude backends (Codex, Droid) run read-only — unusable as builder/worker roles
 priority: 2
 schedule: once

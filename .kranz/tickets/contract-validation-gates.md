@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: contract_gates.rs — four named deterministic gates (vacuous-filter, wrong-polarity, passes-on-base, env-sensitive) through the gate interface; verdicts into approval/final-gate decisions + plan.md. Advisory posture preserved. contract_gate_ filter: 16 tests green; full suite green.
 title: Contract-validation gates — formalize the contract-defect class
 priority: 1
 schedule: once

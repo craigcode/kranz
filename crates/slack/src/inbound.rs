@@ -35,14 +35,14 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    APPROVE_ACTION_ID, APPROVE_GRANT_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION,
-    CONFIG_BACKEND_BLOCK, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
-    CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
-    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, DENY_GRANT_ACTION_ID, MERGE_ACTION_ID,
-    NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
-    NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK,
-    NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID,
-    REJECT_REVISION_ACTION_ID, START_ACTION_ID,
+    ANSWER_QUESTION_ACTION_ID, APPROVE_ACTION_ID, APPROVE_GRANT_ACTION_ID,
+    APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION, CONFIG_BACKEND_BLOCK, CONFIG_CALLBACK_ID,
+    CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK,
+    CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK,
+    DENY_GRANT_ACTION_ID, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
+    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
+    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK,
+    QUEUE_TICKET_ACTION_ID, REJECT_REVISION_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -307,6 +307,17 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    /// Answer an open structured question from an option button (ticket
+    /// `structured-human-question-events`). The option INDEX is validated
+    /// against the parked question at enqueue (same stale-decision
+    /// discipline as the grant commands).
+    AnswerQuestion {
+        mission_id: String,
+        question_id: String,
+        option: u32,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// `/kranz work` → report the queue state (entries + whether the repo is
     /// busy) as an ephemeral, and point at the `kranz work` dispatcher for
     /// actually draining it. REPORT-ONLY: the bridge must never spawn a mission
@@ -419,6 +430,7 @@ fn route_interactive(payload: &Value) -> Action {
         RejectRevision,
         ApproveGrant,
         DenyGrant,
+        AnswerQuestion,
     }
     for action in actions {
         let kind = match action.get("action_id").and_then(Value::as_str) {
@@ -430,6 +442,7 @@ fn route_interactive(payload: &Value) -> Action {
             Some(id) if id == REJECT_REVISION_ACTION_ID => ButtonKind::RejectRevision,
             Some(id) if id == APPROVE_GRANT_ACTION_ID => ButtonKind::ApproveGrant,
             Some(id) if id == DENY_GRANT_ACTION_ID => ButtonKind::DenyGrant,
+            Some(id) if id == ANSWER_QUESTION_ACTION_ID => ButtonKind::AnswerQuestion,
             _ => continue,
         };
         // The mission id or ticket slug rides in the button `value`.
@@ -496,6 +509,20 @@ fn route_interactive(payload: &Value) -> Action {
                             response_url,
                         }
                     }
+                    ButtonKind::AnswerQuestion => {
+                        let Some((mission_id, question_id, option)) =
+                            parse_question_button_value(&value)
+                        else {
+                            return Action::Ignore;
+                        };
+                        Action::AnswerQuestion {
+                            mission_id,
+                            question_id,
+                            option,
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::Start => Action::ApproveStart {
                         mission_id: value,
                         user_id,
@@ -544,6 +571,21 @@ fn parse_grant_button_value(value: &str) -> Option<(String, String)> {
         return None;
     }
     Some((mission_id.to_string(), command.to_string()))
+}
+
+/// Split a question button value `<mission-id>:<question-id>:<option-index>`.
+/// Mission ids and the engine-minted question ids (`q-<n>`) never contain
+/// `:`, so the two colons split cleanly into exactly three parts.
+fn parse_question_button_value(value: &str) -> Option<(String, String, u32)> {
+    let (mission_id, rest) = value.split_once(':')?;
+    let (question_id, option) = rest.split_once(':')?;
+    let mission_id = mission_id.trim();
+    let question_id = question_id.trim();
+    if mission_id.is_empty() || question_id.is_empty() {
+        return None;
+    }
+    let option = option.trim().parse::<u32>().ok()?;
+    Some((mission_id.to_string(), question_id.to_string(), option))
 }
 
 /// A modal `view_submission` → [`Action::NewMission`] when it is our
@@ -1568,6 +1610,51 @@ mod tests {
                 response_url: Some("https://hooks.slack/g".into()),
             }
         );
+    }
+
+    /// The question option button (ticket structured-human-question-events):
+    /// `<mission>:<question>:<index>` routes to the answer action; malformed
+    /// values are ignored, never guessed at.
+    #[test]
+    fn question_events_block_actions_option_button_routes_to_answer() {
+        let click = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Uq" },
+                "response_url": "https://hooks.slack/q",
+                "actions": [
+                    { "action_id": ANSWER_QUESTION_ACTION_ID, "value": "m-42:q-1:0", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&click, &lookup_none()).action,
+            Action::AnswerQuestion {
+                mission_id: "m-42".into(),
+                question_id: "q-1".into(),
+                option: 0,
+                user_id: Some("Uq".into()),
+                response_url: Some("https://hooks.slack/q".into()),
+            }
+        );
+
+        for bad in ["m-42:q-1", "m-42:q-1:notanumber", ":q-1:0", "m-42::0"] {
+            let env = json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "actions": [
+                        { "action_id": ANSWER_QUESTION_ACTION_ID, "value": bad, "type": "button" }
+                    ]
+                }
+            });
+            assert_eq!(
+                route(&env, &lookup_none()).action,
+                Action::Ignore,
+                "malformed value {bad:?} must be ignored"
+            );
+        }
     }
 
     #[test]

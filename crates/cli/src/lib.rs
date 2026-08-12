@@ -11,6 +11,10 @@
 //! - [`config_cmd`] — `kranz config show|set|unset|role` (layered files +
 //!   mid-mission role changes)
 //! - [`exec`] — `kranz exec -f mission.md`, fully headless missions for CI
+//! - [`hook_guard`] — `kranz hook-guard`, the Claude Code lifecycle-hook
+//!   command the engine installs into worker sessions (internal plumbing)
+//! - [`hook_status`] — `kranz hook-status`, the cursor CLI lifecycle-hook
+//!   signal relay (internal plumbing, observational only)
 //! - [`otel`] — event-log-to-span mapping for the `kranz otel` sidecar
 //! - [`output`] — pure rendering (status tree, plan review, cost estimate)
 //! - [`ready`] — repo-readiness scorecard for onboarding
@@ -27,6 +31,8 @@ pub mod cli;
 pub mod commands;
 pub mod config_cmd;
 pub mod exec;
+pub mod hook_guard;
+pub mod hook_status;
 pub mod host_bridge;
 pub mod init;
 pub mod merged_costs;

@@ -1,4 +1,5 @@
 ---
+state: done
 title: Out-of-contract write audit + worker env hygiene
 priority: 2
 schedule: once

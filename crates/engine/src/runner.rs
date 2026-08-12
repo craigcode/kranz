@@ -20,7 +20,8 @@
 //! incompatible with running N worker sessions concurrently: two live sessions
 //! would race the one `&mut EventLog`. So a run may instead target an
 //! in-memory buffer ([`LogTarget::Buffer`]): every [`EventKind`] the run would
-//! have appended (`worker.spawned`, throttled `worker.message` deltas,
+//! have appended (`worker.spawned`, throttled `worker.message` deltas, any
+//! folded `hook.gate.fired` records — KRZ-302, [`crate::hook_gates`],
 //! `worker.completed`) is collected in order into a `Vec` and returned
 //! alongside the [`RunOutcome`], and NOTHING touches the EventLog. The engine
 //! then replays those buffered kinds through its own single-writer `emit`
@@ -164,6 +165,12 @@ pub struct RunMeta {
     pub milestone_id: Option<String>,
     pub model: String,
     pub prompt_hash: String,
+    /// The effective executor route + deciding rule (ticket
+    /// `routing-rules-config`), stamped onto `worker.spawned`. The caller
+    /// passes the mission's seed-time record ([`crate::types::Mission`]'s
+    /// folded `executor_route`); `None` for missions whose seed carried no
+    /// task class and for non-worker runs, which never hits the wire.
+    pub executor_route: Option<crate::types::ExecutorRoute>,
 }
 
 /// Everything the engine learns from one completed session.
@@ -257,11 +264,12 @@ pub async fn run_session(
 /// With [`LogTarget::Live`] this is byte-for-byte the sequential behaviour
 /// (every kind appended to the log immediately). With [`LogTarget::Buffer`]
 /// the exact same kinds — `worker.spawned`, throttled `worker.message` deltas,
-/// `worker.completed` — are collected in append order into the buffer instead,
-/// and NO log is touched, so the session can run concurrently with others; the
-/// engine replays the buffer through its own single-writer `emit` afterwards
-/// (preserving monotonic seq). The transcript file is written live in both
-/// modes (it is not the single-writer log).
+/// any folded `hook.gate.fired` records (KRZ-302), `worker.completed` — are
+/// collected in append order into the buffer instead, and NO log is touched,
+/// so the session can run concurrently with others; the engine replays the
+/// buffer through its own single-writer `emit` afterwards (preserving
+/// monotonic seq). The transcript file is written live in both modes (it is
+/// not the single-writer log).
 pub async fn run_session_to(
     backend: &dyn AgentBackend,
     mut spec: SessionSpec,
@@ -288,6 +296,7 @@ pub async fn run_session_to(
         // The runner is pool-agnostic: a dispatch-pool replay stamps the
         // sibling linkage onto the buffered kind at emit time (KRZ-303).
         candidate: None,
+        executor_route: run_meta.executor_route.clone(),
         sdk_session_id,
         model: run_meta.model.clone(),
         quant: "n/a".to_string(),
@@ -303,6 +312,12 @@ pub async fn run_session_to(
     // resolve_sandbox_or_refuse).
     let egress_proxy = crate::egress_proxy::maybe_start_for_session(&mut spec, paths).await?;
 
+    // KRZ-302 (hook gate projection): the session id keys this run's
+    // hook-gate record file (hook_gates::record_file), so it must be
+    // captured before the spec moves into the backend. The fold below is a
+    // no-op for sessions that never had hook config projected (validators,
+    // orchestrators, every non-claude backend).
+    let hook_gate_session_id = spec.session_id.clone();
     let mut session = backend.start(spec).await?;
     let session_id = session.session_id();
 
@@ -446,6 +461,16 @@ pub async fn run_session_to(
         }
     };
 
+    // KRZ-302 (hook gate projection): fold the session's hook records into
+    // structured `hook.gate.fired` events BEFORE `worker.completed` — a
+    // gate-failing action inside the session is visible as an event before
+    // session-end processing completes. The events are record-only
+    // defense-in-depth evidence; the engine-side out-of-contract sweep
+    // remains the authoritative layer (hook_gates module docs).
+    for kind in crate::hook_gates::records_to_events(&hook_gate_session_id, &run_meta.run_id) {
+        log.record(kind)?;
+    }
+
     log.record(EventKind::WorkerCompleted {
         run_id: run_meta.run_id.clone(),
         result,
@@ -532,7 +557,23 @@ pub fn worker_report_schema() -> serde_json::Value {
             "dependenciesAdded": { "type": "array", "items": { "type": "string" } },
             "knownGaps": { "type": "array", "items": { "type": "string" } },
             "commits": { "type": "array", "items": { "type": "string" } },
-            "commandsRun": { "type": "array", "items": { "type": "string" } }
+            "commandsRun": { "type": "array", "items": { "type": "string" } },
+            "escalation": { "type": "string" },
+            // Structured "ask the human" payload (ticket
+            // structured-human-question-events): text + optional structured
+            // choices; empty options asks for free text.
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text"],
+                    "properties": {
+                        "text": { "type": "string" },
+                        "options": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            }
         }
     })
 }
@@ -613,6 +654,9 @@ pub async fn run_worker(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
+    executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_worker_in(
@@ -631,6 +675,9 @@ pub async fn run_worker(
         egress_grants,
         deny_exceptions,
         auth_verdict,
+        touch_set,
+        executor_route,
+        standards_pin,
     )
     .await
 }
@@ -660,10 +707,14 @@ pub async fn run_worker_in(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
+    executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
         &paths.repo_root,
+        &paths.mission_id,
         feature,
         plan_goal,
         milestone_title,
@@ -675,6 +726,9 @@ pub async fn run_worker_in(
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
+        touch_set,
+        executor_route,
+        standards_pin,
     )?;
     let mut target = LogTarget::Live(log);
     run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
@@ -684,7 +738,8 @@ pub async fn run_worker_in(
 /// the shared log (roadmap M3 wall-clock overlap).
 ///
 /// Returns the `worker.spawned` / `worker.message` / `worker.completed` kinds
-/// this run produced, in append order, alongside the [`RunOutcome`]. It takes
+/// this run produced (plus any `hook.gate.fired` records folded at session
+/// end, KRZ-302), in append order, alongside the [`RunOutcome`]. It takes
 /// NO `&mut EventLog`, so N of these can run concurrently (each in its own
 /// worktree) via `tokio::join!`/`JoinSet` without racing the single writer.
 /// The engine replays the returned kinds through its own single-writer `emit`
@@ -712,10 +767,14 @@ pub async fn run_worker_in_buffered(
     egress_grants: &[String],
     deny_exceptions: &[String],
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
+    executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
         &paths.repo_root,
+        &paths.mission_id,
         feature,
         plan_goal,
         milestone_title,
@@ -727,6 +786,9 @@ pub async fn run_worker_in_buffered(
         deny_exceptions,
         paths.mission_dir(),
         auth_verdict,
+        touch_set,
+        executor_route,
+        standards_pin,
     )?;
     let mut target = LogTarget::Buffer(Vec::new());
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
@@ -839,10 +901,19 @@ fn seed_worker_env(
 /// buffered worker paths. Identical spec construction guarantees a buffered
 /// run and a live run are byte-for-byte the same session, differing only in
 /// where their event kinds land.
+///
+/// `touch_set` is the mission's declared touch-set: a non-empty set is
+/// projected onto the session's Claude Code lifecycle hooks (KRZ-302,
+/// [`crate::hook_gates`]) so an out-of-contract write is blocked in-process
+/// — defense-in-depth under the authoritative engine-side sweep. Non-claude
+/// backends ignore `settings_json` by design, so their sessions behave
+/// exactly as before; an empty set projects nothing (the sweep's
+/// advisory-off posture).
 #[allow(clippy::too_many_arguments)]
 fn build_worker_spec(
     cfg: &MissionConfig,
     repo_root: &std::path::Path,
+    mission_id: &str,
     feature: &Feature,
     plan_goal: &str,
     milestone_title: &str,
@@ -854,6 +925,9 @@ fn build_worker_spec(
     deny_exceptions: &[String],
     mission_dir: std::path::PathBuf,
     auth_verdict: AuthVerdict,
+    touch_set: &[String],
+    executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<(SessionSpec, RunMeta)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
@@ -884,14 +958,29 @@ fn build_worker_spec(
     // than silently dropping the pack the operator configured). No packDir
     // ⇒ None ⇒ the prompt and its recorded hash are byte-identical.
     let pack = crate::pack::load_for_config(cfg, repo_root).map_err(EngineError::Config)?;
-    let mut pack_prompt_hash = None;
+    let mut extended_prompt_hash = None;
     if let Some(pack) = &pack {
         let section = pack.prompt_section(role);
         if !section.is_empty() {
             role_prompt.push_str(&section);
             // The recorded hash must name the exact text the session ran
             // with — the template hash would no longer be true.
-            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
+
+    // Flight Rules stage projection (KRZ-345, design D-G): the approved
+    // pin's implementation-stage rules append through the same channel,
+    // inside the marked untrusted boundary, and the recorded hash covers the
+    // exact projection text (replay identifies the manifest/projection
+    // digest from the header). No pin / no applicable rule ⇒ None ⇒ the
+    // prompt and its hash stay byte-identical.
+    if let Some(pin) = standards_pin {
+        if let Some(section) =
+            crate::pack::projection::session_section(pin, role).map_err(EngineError::Config)?
+        {
+            role_prompt.push_str(&section);
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
         }
     }
 
@@ -931,6 +1020,7 @@ fn build_worker_spec(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     };
     spec.env = contract_env(base_sha);
     let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -948,14 +1038,72 @@ fn build_worker_spec(
         permissions::for_role(role, cfg, &[], grants, deny_exceptions),
         &mut spec,
     );
+    // KRZ-302: project the out-of-contract write rule onto the session's
+    // Claude Code lifecycle hooks (settings_json) — a PreToolUse guard
+    // blocks an out-of-contract write IN-PROCESS. Defense-in-depth only:
+    // the engine-side contract_sweep stays authoritative, and non-claude
+    // backends ignore settings_json entirely.
+    crate::hook_gates::project_worker_hook_gates(&mut spec, touch_set);
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Ticket agent-hooks-status-signals: seed the OPTIONAL, non-authoritative
+    // hook-status lane. Both gates are deliberate:
+    // - config opt-in (`hookStatus.enabled` + a loopback endpoint), off by
+    //   default — absent config is a byte-identical session;
+    // - the role's configured backend must be hook-capable
+    //   (cursor only today) — every other backend would ignore the seed
+    //   anyway, so gating here also avoids a registration file no POST will
+    //   ever arrive for.
+    // Registration failure degrades to NO lane with a loud warning — the
+    // lane is observability, never a reason to fail a spawn.
+    if let Some(hook_cfg) = &cfg.hook_status {
+        if let Some(endpoint) = crate::hook_status::resolved_endpoint(hook_cfg) {
+            let kind = crate::config::parse_backend(role_cfg.backend.as_deref()).ok();
+            if kind.is_some_and(crate::types::BackendKind::supports_hook_status_signals) {
+                let token = crate::hook_status::mint_token();
+                match crate::hook_status::register(
+                    repo_root,
+                    mission_id,
+                    &run_id,
+                    &token,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(_) => {
+                        spec.hook_status = Some(crate::hook_status::HookStatusSeed {
+                            endpoint: endpoint.to_string(),
+                            token,
+                            mission_id: mission_id.to_string(),
+                            run_id: run_id.clone(),
+                        });
+                        tracing::info!(
+                            session_id = %spec.session_id,
+                            mission = %mission_id,
+                            "hook-status lane seeded (non-authoritative observability only)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %spec.session_id,
+                            mission = %mission_id,
+                            error = %e,
+                            "hook-status registration failed; the session spawns without the \
+                             lane (mission state is unaffected — the lane is observational)"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let run_meta = RunMeta {
-        run_id: uuid::Uuid::new_v4().to_string(),
+        run_id,
         role,
         feature_id: Some(feature.id.clone()),
         milestone_id: None,
         model: role_cfg.model.clone(),
-        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
+        prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
+        executor_route,
     };
     Ok((spec, run_meta))
 }
@@ -990,6 +1138,7 @@ pub async fn run_validator(
     egress_grants: &[String],
     worker_commands: &[String],
     guidance: Option<&str>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     let cwd = paths.repo_root.clone();
     run_validator_in(
@@ -1009,6 +1158,12 @@ pub async fn run_validator(
         worker_commands,
         guidance,
         None,
+        // The wrapper keeps the byte-identical pre-containment path (the
+        // role's own sandbox resolution); production validation rounds
+        // pre-resolve the mandatory containment wrap in the orchestrator
+        // and pass it through here (ticket validator-mandatory-containment).
+        None,
+        standards_pin,
     )
     .await
 }
@@ -1021,6 +1176,19 @@ pub async fn run_validator(
 /// [`contract_env`]) is preserved regardless of `session_cwd`. `run_validator`
 /// is the thin wrapper that passes `paths.repo_root`, keeping the checkout-mode
 /// path byte-for-byte.
+///
+/// `validator_sandbox` is the MANDATORY containment resolution from the
+/// orchestrator (ticket `validator-mandatory-containment`,
+/// [`crate::sandbox::resolve_validator_containment`]): `Some` attaches the
+/// pre-resolved wrap (the role's enforced sandbox plus the real-checkout
+/// read-deny roots, or the mandatory `fs`-tier wrap under `enforce: off`);
+/// `None` falls back to the role's own resolution — the byte-identical
+/// pre-containment path the `run_validator` wrapper keeps (its callers
+/// predate the orchestrator-driven containment; every production validation
+/// round resolves through the orchestrator). A pre-resolved sandbox still
+/// gets its scratch root pinned to THIS session's private scratch, the same
+/// pin [`resolve_sandbox_or_refuse`] applies — the orchestrator resolved
+/// before the session id existed.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validator_in(
     backend: &dyn AgentBackend,
@@ -1039,6 +1207,8 @@ pub async fn run_validator_in(
     worker_commands: &[String],
     guidance: Option<&str>,
     contract_results: Option<&str>,
+    validator_sandbox: Option<crate::sandbox::ResolvedSandbox>,
+    standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
     if !matches!(kind, Role::ValidatorScrutiny | Role::ValidatorFunctional) {
         return Err(EngineError::InvalidState(format!(
@@ -1061,6 +1231,14 @@ pub async fn run_validator_in(
                 }
                 (AssertionCheck::AgentJudgement, _) => {
                     format!("- [{}] {} (agent-judgement)", a.id, a.statement)
+                }
+                (AssertionCheck::PtyScript, _) => {
+                    let command = a
+                        .pty_script
+                        .as_ref()
+                        .map(|s| s.command.as_str())
+                        .unwrap_or("MISSING");
+                    format!("- [{}] {} (pty-script: `{}`)", a.id, a.statement, command)
                 }
             })
             .collect::<Vec<_>>()
@@ -1104,12 +1282,25 @@ pub async fn run_validator_in(
     // append to the rendered role prompt through the same channel; the load
     // fails closed and no packDir leaves prompt and hash byte-identical.
     let pack = crate::pack::load_for_config(cfg, &paths.repo_root).map_err(EngineError::Config)?;
-    let mut pack_prompt_hash = None;
+    let mut extended_prompt_hash = None;
     if let Some(pack) = &pack {
         let section = pack.prompt_section(kind);
         if !section.is_empty() {
             role_prompt.push_str(&section);
-            pack_prompt_hash = Some(prompts::hash_text(&role_prompt));
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
+        }
+    }
+
+    // Flight Rules stage projection (KRZ-345, design D-G): the approved
+    // pin's validation-stage rules append through the same channel, inside
+    // the marked untrusted boundary; the recorded hash covers the exact
+    // projection text. No pin / no applicable rule ⇒ byte-identical.
+    if let Some(pin) = standards_pin {
+        if let Some(section) =
+            crate::pack::projection::session_section(pin, kind).map_err(EngineError::Config)?
+        {
+            role_prompt.push_str(&section);
+            extended_prompt_hash = Some(prompts::hash_text(&role_prompt));
         }
     }
 
@@ -1181,14 +1372,25 @@ pub async fn run_validator_in(
         max_turns: role_cfg.max_turns,
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     };
     spec.env = contract_env(base_sha);
-    spec.sandbox = resolve_sandbox_or_refuse(
-        role_cfg,
-        session_cwd,
-        &paths.mission_dir(),
-        &spec.session_id,
-    )?;
+    spec.sandbox = match validator_sandbox {
+        Some(mut resolved) => {
+            // The orchestrator pre-resolved the mandatory containment wrap
+            // (ticket validator-mandatory-containment) before this session
+            // id existed — pin the writable scratch to THIS session's
+            // private root, the same pin resolve_sandbox_or_refuse applies.
+            resolved.inputs.tmpdir = crate::backend_claude::scratch_home_root(&spec.session_id);
+            Some(resolved)
+        }
+        None => resolve_sandbox_or_refuse(
+            role_cfg,
+            session_cwd,
+            &paths.mission_dir(),
+            &spec.session_id,
+        )?,
+    };
     apply_egress_grants(&mut spec.sandbox, egress_grants);
     permissions::apply(
         permissions::for_role(kind, cfg, &combined_commands, grants, &[]),
@@ -1201,7 +1403,10 @@ pub async fn run_validator_in(
         feature_id: None,
         milestone_id: Some(milestone.id.clone()),
         model: role_cfg.model.clone(),
-        prompt_hash: pack_prompt_hash.unwrap_or_else(|| prompts::hash(kind)),
+        prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(kind)),
+        // Task-class routing decides the WORKER executor tier only; validator
+        // sessions are never routed, so there is no route to record.
+        executor_route: None,
     };
     run_session(backend, spec, log, paths, run_meta, cancel).await
 }
@@ -1318,6 +1523,7 @@ mod tests {
                     tmpdir: std::path::PathBuf::from("/t"),
                     extra_write: vec![],
                     egress,
+                    validator_read_deny_roots: Vec::new(),
                 },
                 container: None,
             }
@@ -1358,6 +1564,42 @@ mod tests {
         let mut no_sandbox = None;
         apply_egress_grants(&mut no_sandbox, &["x.example:443".to_string()]);
         assert!(no_sandbox.is_none());
+    }
+
+    /// Composition audit (ticket `config-fail-open-audit`): operator-approved
+    /// egress grants EXTEND the proxy allowlist end to end — after the grant
+    /// fold, `effective_egress` still leads with the compiled-in Anthropic
+    /// floor, keeps the configured `egress[]`, and only then adds the granted
+    /// destination. A grant can never narrow what was already allowed. (The
+    /// mission-side grant list is itself extend-only in the reducer.)
+    #[test]
+    fn composition_audit_egress_grants_extend_the_allowlist_never_replace() {
+        let mut sandbox = Some(crate::sandbox::ResolvedSandbox {
+            backend: crate::sandbox::SandboxBackend::Seatbelt,
+            inputs: crate::sandbox::SandboxInputs {
+                enforce: crate::types::SandboxEnforce::FsNet,
+                session_cwd: std::path::PathBuf::from("/s"),
+                mission_dir: std::path::PathBuf::from("/m"),
+                tmpdir: std::path::PathBuf::from("/t"),
+                extra_write: vec![],
+                egress: vec!["crates.io:443".to_string()],
+                validator_read_deny_roots: Vec::new(),
+            },
+            container: None,
+        });
+        apply_egress_grants(&mut sandbox, &["registry.npmjs.org:443".to_string()]);
+
+        let effective = crate::sandbox::effective_egress(&sandbox.as_ref().unwrap().inputs.egress);
+        assert_eq!(
+            effective,
+            vec![
+                "api.anthropic.com:443".to_string(),
+                "*.anthropic.com:443".to_string(),
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string(),
+            ],
+            "floor + configured + granted, in that order — nothing replaced"
+        );
     }
 
     #[test]
@@ -1419,6 +1661,7 @@ mod tests {
             max_turns: None,
             env: contract_env(Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")),
             sandbox: None,
+            hook_status: None,
         }
     }
 

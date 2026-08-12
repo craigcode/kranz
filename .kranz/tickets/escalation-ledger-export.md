@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Superseded by the flight-surgeon console (fc93a23); marked 2026-07-30 by operator. Do not work.
 title: Escalation ledger as a queryable, exportable corpus
 priority: 2
 schedule: once

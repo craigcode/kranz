@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done in the M6 arc: .kranz/workspace.json schema (both absolute forms), validated at draft/approve (workspace_contract.rs); CI green.
 title: Tracked workspace contract schema (.kranz/workspace.json)
 priority: 1
 schedule: once

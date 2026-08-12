@@ -1,4 +1,5 @@
 ---
+state: done
 title: backend_local — HTTP-in-engine local-inference backend + per-role config
 priority: 3
 schedule: once

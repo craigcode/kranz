@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: slices 1 and 2 shipped in af5b187 and 54b4f79
 title: Lessons manifest/body split — index in prompts, bodies fetched on demand
 priority: 2
 schedule: once

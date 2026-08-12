@@ -1,4 +1,5 @@
 ---
+state: done
 title: Smoke-test contract command assertions against the base tree at approve_plan time
 priority: 2
 schedule: once

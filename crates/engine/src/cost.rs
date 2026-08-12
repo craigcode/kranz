@@ -43,6 +43,12 @@ pub fn is_droid_model(model: &str) -> bool {
 /// importable engine-wide.
 pub const DEFAULT_KIMI_MODEL: &str = "kimi-code/k3";
 
+/// Default model id for the Cursor backend, importable engine-wide: `gpt-5`,
+/// the `--help` example id and the probe's default (`agent --list-models`
+/// catalogs are account-specific, so the default stays the documented
+/// example rather than a captured catalog entry).
+pub const DEFAULT_CURSOR_MODEL: &str = "gpt-5";
+
 /// Whether `model` names a kimi-family model (same substring match
 /// [`pricing_for_model`] uses to select kimi pricing).
 pub fn is_kimi_model(model: &str) -> bool {
@@ -718,6 +724,7 @@ fn counts_plan(milestones: usize, features: usize) -> Plan {
         considered_alternatives: None,
         command_grants: Vec::new(),
         touch_set: Vec::new(),
+        standards_manifest: None,
     }
 }
 
@@ -739,6 +746,7 @@ fn mission_plan(state: &MissionState) -> Plan {
         considered_alternatives: None,
         command_grants: state.mission.command_grants.clone(),
         touch_set: state.mission.touch_set.clone(),
+        standards_manifest: state.mission.standards_manifest.clone().map(Box::new),
         validation_contract: state.mission.validation_contract.clone(),
         milestones: state
             .mission
@@ -1071,6 +1079,7 @@ mod tests {
                     considered_alternatives: None,
                     command_grants: vec![],
                     touch_set: vec![],
+                    standards_manifest: None,
                 },
                 base_sha: None,
             },

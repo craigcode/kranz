@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: hook_gates.rs projection + kranz hook-guard (exit 2 blocks with model feedback); out-of-contract rule enforced in-process; records fold to additive hook.gate.fired before worker.completed; sweep stays authoritative (bypass-tested); non-claude backends unchanged. hook_gate_projection filter: 17 green; full gates green.
 title: Project kranz gates onto Claude Code lifecycle hooks
 priority: 1
 schedule: once

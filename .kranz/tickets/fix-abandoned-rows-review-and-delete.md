@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: codex-built, opus-reviewed, gate-verified, merged
 title: Abandoned pipeline rows need review + delete affordances (inert ≠ dead-end)
 priority: 2
 schedule: once

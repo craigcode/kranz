@@ -6,7 +6,7 @@
 //! work on machines without a `claude` binary installed.
 
 use crate::backlog;
-use crate::cli::{Cli, Command, GrantCommand, RevisionCommand, TicketCommand};
+use crate::cli::{Cli, Command, GrantCommand, QuestionCommand, RevisionCommand, TicketCommand};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -123,6 +123,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 println!("{}", output::render_provenance_json(&chain)?);
             } else {
                 print!("{}", output::render_provenance(&chain));
+            }
+            Ok(0)
+        }
+        Command::GateScores { gate, json } => {
+            let series = kranz_engine::gate_scores::compute_gate_score_series(&repo, &gate)?;
+            if json {
+                println!("{}", output::render_gate_score_series_json(&series)?);
+            } else {
+                print!("{}", output::render_gate_score_series(&series));
             }
             Ok(0)
         }
@@ -267,6 +276,26 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Question { command } => {
+            match command {
+                QuestionCommand::List { id } => {
+                    print!("{}", cmd_list_questions(&repo, &id)?);
+                }
+                QuestionCommand::Answer {
+                    id,
+                    question_id,
+                    answer,
+                    option,
+                } => {
+                    cmd_answer_question(&repo, &id, &question_id, &answer, option)?;
+                    println!("answer for question {question_id} queued for mission {id}");
+                    if let Some(hint) = control_queue_hint(&repo, &id) {
+                        println!("{hint}");
+                    }
+                }
+            }
+            Ok(0)
+        }
         Command::Missions => {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
@@ -322,6 +351,22 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
+        Command::DomainLint { seed_config, json } => {
+            cmd_domain_lint(&repo, seed_config.as_deref(), json)
+        }
+        Command::HookGuard { config } => {
+            let mut stdin = std::io::stdin();
+            Ok(crate::hook_guard::run_hook_guard(&config, &mut stdin))
+        }
+        Command::HookStatus { config } => {
+            let mut stdin = std::io::stdin();
+            Ok(crate::hook_status::run_hook_status(
+                &config,
+                &mut stdin,
+                &crate::hook_status::post_signal,
+            )
+            .await)
+        }
         Command::Ready { json, all } => {
             if all {
                 let config = kranz_engine::paths::global_config()
@@ -378,7 +423,44 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             crate::config_cmd::cmd_config(&repo, command, cli.mission.as_deref())
         }
         Command::Pack { command } => match command {
-            crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&dir),
+            crate::cli::PackCommand::Lint { dir } => cmd_pack_lint(&repo, &dir),
+        },
+        Command::Standards { command } => match command {
+            crate::cli::StandardsCommand::Metrics { json } => {
+                let report = kranz_engine::standards_metrics::compute(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", crate::output::render_standards_metrics(&report));
+                }
+                Ok(0)
+            }
+            crate::cli::StandardsCommand::Lint { dir, against } => {
+                cmd_standards_lint(&repo, &dir, against.as_deref())
+            }
+            crate::cli::StandardsCommand::Waive {
+                rule,
+                revision,
+                finding,
+                reason,
+                expires,
+            } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_waive(
+                    &repo,
+                    &mission,
+                    &rule,
+                    revision,
+                    finding.as_deref(),
+                    &reason,
+                    &expires,
+                    lock_force,
+                )
+            }
+            crate::cli::StandardsCommand::Attest { rule, reason } => {
+                let mission = select_mission(&repo, cli.mission.as_deref())?;
+                cmd_standards_attest(&repo, &mission, &rule, &reason, lock_force)
+            }
         },
         Command::Otel {
             endpoint,
@@ -437,6 +519,7 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             // wins over the global `--mission`.
             backlog::cmd_ticket_approve(repo, &slug, explicit.as_deref().or(mission), force)
         }
+        TicketCommand::MigrateState { yes } => backlog::cmd_ticket_migrate_state(repo, yes),
     }
 }
 
@@ -1281,6 +1364,91 @@ pub fn cmd_deny_grant(
     )?)
 }
 
+/// Render the mission's open structured questions (ticket
+/// `structured-human-question-events`) — the pending-decision projection the
+/// dashboard and Slack also render — one block per question: id, ask, and
+/// the indexed options (or a free-text note).
+pub fn cmd_list_questions(repo: &Path, mission_id: &str) -> Result<String> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    if state.pending_questions.is_empty() {
+        return Ok(format!("mission {mission_id} has no open questions\n"));
+    }
+    let mut out = String::new();
+    for q in &state.pending_questions {
+        out.push_str(&format!(
+            "{} ({}): {}\n",
+            q.question_id,
+            q.feature_id.as_deref().unwrap_or("mission"),
+            q.text
+        ));
+        if q.options.is_empty() {
+            out.push_str("  free-text answer expected\n");
+        } else {
+            for (index, option) in q.options.iter().enumerate() {
+                out.push_str(&format!("  [{index}] {option}\n"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Enqueue an AnswerQuestion control command (ticket
+/// `structured-human-question-events`). Returns the queued file path.
+pub fn cmd_answer_question(
+    repo: &Path,
+    mission_id: &str,
+    question_id: &str,
+    answer: &str,
+    option: Option<u32>,
+) -> Result<PathBuf> {
+    let paths = require_pending_question(repo, mission_id, question_id, option, answer)?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::AnswerQuestion {
+            question_id: question_id.to_string(),
+            answer: answer.to_string(),
+            option,
+        },
+    )?)
+}
+
+/// Resolve the mission and confirm question `question_id` is open (and an
+/// option-index answer is in range and matches the offered option), so the
+/// enqueued answer can't silently land on a different (or absent) question
+/// than the operator saw — the same stale-decision discipline as
+/// [`require_pending_grant`]. The engine re-validates at drain time.
+fn require_pending_question(
+    repo: &Path,
+    mission_id: &str,
+    question_id: &str,
+    option: Option<u32>,
+    answer: &str,
+) -> Result<MissionPaths> {
+    let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
+    let state = load_state(repo, &mission_id)?;
+    let Some(pending) = state
+        .pending_questions
+        .iter()
+        .find(|q| q.question_id == question_id)
+    else {
+        bail!("mission {mission_id} has no open question '{question_id}'");
+    };
+    if let Some(index) = option {
+        match pending.options.get(index as usize) {
+            Some(expected) if expected == answer => {}
+            Some(expected) => bail!(
+                "answer `{answer}` does not match option {index} (`{expected}`) of question '{question_id}'"
+            ),
+            None => bail!(
+                "question '{question_id}' has no option {index} (it offered {})",
+                pending.options.len()
+            ),
+        }
+    }
+    Ok(MissionPaths::new(repo, &mission_id))
+}
+
 fn require_revisable_mission(repo: &Path, mission_id: &str) -> Result<MissionPaths> {
     let mission_id = control::resolve_active_mission(repo, Some(mission_id))?;
     let state = load_state(repo, &mission_id)?;
@@ -1352,13 +1520,136 @@ pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {
     }
 }
 
+/// `kranz domain-lint` (KRZ-314 clean-room boundary — see
+/// `kranz_engine::domain_lint` module docs and docs/domain-lint.md).
+///
+/// Default mode lints the scoped tree against the committed hashed denylist:
+/// exit 0 clean, exit 1 with each unwaived hit printed as
+/// `<fingerprint> <path>:<line>` — never the matched text, which is the
+/// vocabulary the boundary protects. `--seed-config` is the other half of
+/// the workflow: regenerate the hash config from the operator-local
+/// plaintext terms file (kept outside the repo), preserving the salt so
+/// existing waiver fingerprints survive.
+pub fn cmd_domain_lint(repo: &Path, seed_config: Option<&Path>, json: bool) -> Result<i32> {
+    use kranz_engine::domain_lint as dl;
+    let config_path = repo.join(dl::DENYLIST_PATH);
+
+    if let Some(terms_file) = seed_config {
+        let terms = std::fs::read_to_string(terms_file)
+            .with_context(|| format!("read terms file {}", terms_file.display()))?;
+        let existing = std::fs::read_to_string(&config_path).ok();
+        let config = dl::seed_config(existing.as_deref(), &terms)?;
+        // A repo may not have a .kranz/ directory yet (lint-only use).
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&config_path, &config)
+            .with_context(|| format!("write {}", config_path.display()))?;
+        let denylist = dl::load_denylist(&config)?;
+        // The report is the count and the salt's fate — never a term.
+        println!(
+            "seeded {} ({} hashed terms, {})",
+            dl::DENYLIST_PATH,
+            denylist.term_count(),
+            if existing.is_some() {
+                "salt preserved"
+            } else {
+                "fresh salt"
+            }
+        );
+        warn_if_terms_file_unprotected(repo, terms_file);
+        return Ok(0);
+    }
+
+    let config_text = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "read {} — seed it with `kranz domain-lint --seed-config <terms-file>` (docs/domain-lint.md)",
+            dl::DENYLIST_PATH
+        )
+    })?;
+    let denylist = dl::load_denylist(&config_text)?;
+    let allowed = std::fs::read_to_string(repo.join(dl::ALLOWLIST_PATH))
+        .ok()
+        .map(|text| kranz_engine::scrub::read_allowlist_text(&text))
+        .unwrap_or_default();
+    let report = dl::lint_tree(repo, &denylist, &allowed)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "passed": report.is_clean(),
+                "filesScanned": report.files_scanned,
+                "filesSkipped": report.files_skipped,
+                "findings": report.findings,
+            }))?
+        );
+    }
+    if report.is_clean() {
+        if !json {
+            println!(
+                "domain lint passed ({} files scanned)",
+                report.files_scanned
+            );
+        }
+        Ok(0)
+    } else {
+        if !json {
+            println!(
+                "domain lint failed: {} unwaived hit(s); add a fingerprint to {} only for a reviewed false positive:",
+                report.findings.len(),
+                dl::ALLOWLIST_PATH
+            );
+            for finding in &report.findings {
+                println!("{} {}:{}", finding.fingerprint, finding.path, finding.line);
+            }
+        }
+        Ok(1)
+    }
+}
+
+/// Loudly warn when the plaintext terms file lives inside the repo and is
+/// not gitignored — that file IS the protected vocabulary, so tracking it
+/// would be the leak the boundary exists to prevent (the lint itself would
+/// flag it on the next run; better to say so at seed time).
+fn warn_if_terms_file_unprotected(repo: &Path, terms_file: &Path) {
+    let (Ok(repo), Ok(terms_file)) = (repo.canonicalize(), terms_file.canonicalize()) else {
+        return;
+    };
+    let Ok(relative) = terms_file.strip_prefix(&repo) else {
+        return; // outside the repo: exactly where the plaintext belongs
+    };
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .current_dir(&repo)
+        .status()
+        .map(|status| status.success())
+        // A failed probe must not nag; the lint is the backstop either way.
+        .unwrap_or(true);
+    if !ignored {
+        eprintln!(
+            "warning: {} is inside the repo and NOT gitignored — move it outside the repo or use {} (gitignored)",
+            relative.display(),
+            kranz_engine::domain_lint::TERMS_LOCAL_PATH
+        );
+    }
+}
+
 /// `kranz pack lint <dir>` (ticket pack-contract-gates-prompts): fully-local
 /// pack contract validation — no City infrastructure, no repo needed. A
 /// valid pack prints what it registered; a directory without a pack.toml is
 /// not a pack and says so plainly (exit 0); an invalid pack fails closed
 /// with exit 1 naming the offending field.
-fn cmd_pack_lint(dir: &Path) -> Result<i32> {
-    match kranz_engine::pack::Pack::load(dir) {
+///
+/// Flight Rules trust (KRZ-341 D-A/D-J): when the directory is a tracked,
+/// in-repo pack the standards corpus may activate enforced rules; anything
+/// else lints as external/untracked — advisory-only, enforced content fails
+/// the load naming the remedy.
+fn cmd_pack_lint(repo: &Path, dir: &Path) -> Result<i32> {
+    let trust = kranz_engine::pack::standards::trust_for_dir(repo, dir);
+    match kranz_engine::pack::Pack::load_with_trust(dir, trust) {
         Ok(Some(pack)) => {
             print!("{}", kranz_engine::pack::render_lint(&pack));
             Ok(0)
@@ -1376,6 +1667,224 @@ fn cmd_pack_lint(dir: &Path) -> Result<i32> {
             Ok(1)
         }
     }
+}
+
+/// `kranz standards lint <pack> [--against <ref>]` (KRZ-341): report the
+/// normalized Flight Rules manifest of a schema-4 pack — RFCs, rules with
+/// effective lifecycle status and checker bindings, the content digest, and
+/// the trust posture. With `--against`, the base corpus is read from
+/// tracked blobs at that git ref (never the worktree) and lifecycle
+/// transition violations (D-B/D-C) are refused with exit 1.
+fn cmd_standards_lint(repo: &Path, dir: &Path, against: Option<&str>) -> Result<i32> {
+    let trust = kranz_engine::pack::standards::trust_for_dir(repo, dir);
+    let pack = match kranz_engine::pack::Pack::load_with_trust(dir, trust) {
+        Ok(Some(pack)) => pack,
+        Ok(None) => {
+            println!(
+                "no pack at {} (no {}) — nothing to lint",
+                dir.display(),
+                kranz_engine::pack::PACK_MANIFEST
+            );
+            return Ok(0);
+        }
+        Err(err) => {
+            eprintln!("invalid pack at {}: {err}", dir.display());
+            return Ok(1);
+        }
+    };
+    let Some(manifest) = &pack.standards else {
+        println!(
+            "pack `{}` (schema {}) at {} declares no [standards] root — nothing to lint",
+            pack.name,
+            pack.schema,
+            dir.display()
+        );
+        return Ok(0);
+    };
+    print!(
+        "{}",
+        kranz_engine::pack::standards::render_manifest(manifest, trust)
+    );
+    if let Some(refname) = against {
+        // The base comparison reads tracked blobs from THIS repo, so the
+        // pack must live inside it (tracked or not — an untracked pack
+        // simply has no base history and fails the trust gate at load).
+        let Some(pack_rel) = kranz_engine::pack::standards::repo_relative_dir(repo, dir) else {
+            eprintln!(
+                "--against reads the base pack from tracked git blobs in {}; {} is outside \
+                 the repo — external packs have no base history to compare against (D-A)",
+                repo.display(),
+                dir.display()
+            );
+            return Ok(1);
+        };
+        let git = kranz_engine::git_ops::GitRepo::open(repo)?;
+        let base = match kranz_engine::pack::standards::load_at_ref(&git, refname, &pack_rel) {
+            Ok(base) => base,
+            Err(err) => {
+                eprintln!("cannot load the base standards at `{refname}`: {err}");
+                return Ok(1);
+            }
+        };
+        let errors = kranz_engine::pack::standards::check_transitions(base.as_ref(), manifest);
+        print!(
+            "{}",
+            kranz_engine::pack::standards::render_transition_report(
+                refname,
+                base.as_ref(),
+                &errors
+            )
+        );
+        if !errors.is_empty() {
+            return Ok(1);
+        }
+    }
+    Ok(0)
+}
+
+/// `kranz standards waive --rule <id> --reason <text> --expires <rfc3339>`
+/// (KRZ-344, design D-I): the one authorized exception path for a
+/// standards failure. The engine validates every refusal shape and appends
+/// `standards.waiver.approved`; this wrapper displays the evidence the
+/// waiver binds. Refusals print plainly and exit 1 — they are operator
+/// feedback, not crashes. The approver is never a flag: the local
+/// authority model cannot name a person, so the record honestly carries
+/// `local-operator` plus the `cli` surface (D-I — a model can request a
+/// waiver but never approve one, and there is no identity to invent).
+#[allow(clippy::too_many_arguments)]
+fn cmd_standards_waive(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    revision: Option<u64>,
+    finding: Option<&str>,
+    reason: &str,
+    expires: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let expires_at = match chrono::DateTime::parse_from_rfc3339(expires) {
+        Ok(parsed) => parsed.with_timezone(&chrono::Utc),
+        Err(err) => {
+            eprintln!("waiver refused: --expires must be an RFC 3339 instant: {err}");
+            return Ok(1);
+        }
+    };
+    let request = kranz_engine::standards_waiver::WaiverRequest {
+        rule_id: rule.to_string(),
+        revision,
+        finding_subject: finding.map(str::to_string),
+        reason: reason.to_string(),
+        expires_at,
+    };
+    let outcome = match kranz_engine::standards_waiver::approve_standards_waiver(
+        repo, mission_id, &request, "cli", force_lock,
+    ) {
+        Ok(outcome) => outcome,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "waiver refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first (a waiver against a live mission would race the \
+                 runner's own appends).\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("waiver refused: {e}");
+            return Ok(1);
+        }
+    };
+    // Display the evidence the waiver binds — the finding, the rule, the
+    // affected paths, and the diff digest — exactly as recorded.
+    let pinned = &outcome.rule;
+    println!(
+        "recorded standards.waiver.approved (seq {})",
+        outcome.event.seq
+    );
+    println!("mission: {mission_id}");
+    println!(
+        "rule: {} r{} — {}, {}; checker {}; waivable: {}",
+        pinned.id,
+        pinned.revision,
+        pinned.level,
+        pinned.effective_status,
+        pinned.checker.as_deref().unwrap_or("-"),
+        pinned.waivable
+    );
+    println!("  statement: {}", pinned.statement);
+    println!(
+        "finding: {} (run {})\n  evidence: {}",
+        outcome.finding_subject, outcome.run_id, outcome.finding_evidence
+    );
+    println!("  fingerprint: sha256:{}", outcome.finding_fingerprint);
+    if pinned.when_paths.is_empty() {
+        println!(
+            "affected paths: the whole mission diff ({} path(s)) — the rule is unscoped",
+            outcome.affected_paths.len()
+        );
+    } else if outcome.affected_paths.is_empty() {
+        println!(
+            "affected paths: (none — the rule's when-paths match no changed path; the \
+             waiver binds the empty scoped diff)"
+        );
+    } else {
+        println!("affected paths: {}", outcome.affected_paths.join(", "));
+    }
+    println!(
+        "diff digest: sha256:{} (covers the affected-path diff at the mission branch tip)",
+        outcome.diff_digest
+    );
+    println!(
+        "approver: {} via cli\nreason: {reason}\nexpires: {}",
+        kranz_engine::standards_waiver::LOCAL_OPERATOR,
+        expires_at.to_rfc3339()
+    );
+    Ok(0)
+}
+
+/// Record the positive human checker verdict for one `manual-attestation`
+/// rule. This is intentionally separate from a waiver: the operator is
+/// attesting that the current diff satisfies the rule, not excepting a
+/// failure. The engine owns all binding and refusal checks.
+fn cmd_standards_attest(
+    repo: &Path,
+    mission_id: &str,
+    rule: &str,
+    reason: &str,
+    force_lock: LockForce,
+) -> Result<i32> {
+    let record = match kranz_engine::standards_attestation::approve_attestation(
+        repo, mission_id, rule, reason, "cli", force_lock,
+    ) {
+        Ok(record) => record,
+        Err(kranz_engine::error::EngineError::LockHeld(e)) => {
+            eprintln!(
+                "attestation refused: an engine still holds mission '{mission_id}'s lock — stop \
+                 the running mission first.\n  (underlying: {e})"
+            );
+            return Ok(1);
+        }
+        Err(e) => {
+            eprintln!("attestation refused: {e}");
+            return Ok(1);
+        }
+    };
+    println!(
+        "recorded standards.attestation.approved (seq {})",
+        record.seq
+    );
+    println!("mission: {mission_id}");
+    println!("rule: {} r{}", record.rule_id, record.rule_revision);
+    if record.paths.is_empty() {
+        println!("affected paths: (none)");
+    } else {
+        println!("affected paths: {}", record.paths.join(", "));
+    }
+    println!("diff digest: sha256:{}", record.diff_digest);
+    println!(
+        "approver: {} via {}\nreason: {}",
+        record.approver, record.surface, record.reason
+    );
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: resolved in 90f6146 (Craig): fail-closed refusal + false-positive tests
 title: Verify the always-on secret-scan ingest gate doesn't over-redact real content
 priority: 3
 schedule: once

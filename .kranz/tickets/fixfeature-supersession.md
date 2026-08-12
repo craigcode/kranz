@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Landed at fc2c4d9: implicit supersession of fix features + last_seq fix (7e4bcd4); committed during the m-83d1ed salvage arc.
 title: "fixfeature supersession: a re-proposal supersedes the prior registration"
 priority: 3
 schedule: once

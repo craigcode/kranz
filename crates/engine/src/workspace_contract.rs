@@ -409,6 +409,39 @@ mod tests {
         assert!(loaded.is_none());
     }
 
+    /// Composition audit (ticket `config-fail-open-audit`): the contract's
+    /// two postures are exactly the documented pair — MISSING is `Ok(None)`
+    /// (worktree-only behavior: no bootstrap promises exist to weaken), and
+    /// PRESENT-BUT-INVALID fails closed naming the violation. Nothing in
+    /// between: a contract that parses but breaks a rule is never half-read.
+    #[test]
+    fn composition_audit_workspace_contract_missing_is_none_and_invalid_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(load_workspace_contract(dir.path())
+            .expect("a missing contract loads as None, never an error")
+            .is_none());
+
+        for (json, needle) in [
+            // A newer schema version is never half-read.
+            (r#"{"schemaVersion": 2}"#, "unsupported schemaVersion 2"),
+            // A missing version defaults to 0 and fails closed too.
+            (r#"{"bootstrap": ["true"]}"#, "unsupported schemaVersion 0"),
+            // A secret VALUE shape in the names-only list.
+            (
+                r#"{"schemaVersion": 1, "secrets": ["sk-live-abc"]}"#,
+                "not a secret NAME",
+            ),
+            // A mount escaping the absolute-without-'..' rule.
+            (
+                r#"{"schemaVersion": 1, "mounts": ["/var/../etc"]}"#,
+                "absolute path without '..'",
+            ),
+        ] {
+            let err = parse_workspace_contract(json.as_bytes()).unwrap_err();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+    }
+
     #[test]
     fn workspace_contract_loads_from_repo_root() {
         let dir = tempfile::tempdir().expect("tempdir");

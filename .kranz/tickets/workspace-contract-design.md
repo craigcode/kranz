@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: D-A…D-H accepted 2026-07-25 with two implementation notes (egress scoping: bootstrap local-worktree-first, local-container gated on the egress proxy or fs-tier-scoped; mount/cache-dir convention to be designed into the schema) and one delivery re-sequence (pin-at-approval ahead of local-container-workspace). Acceptance recorded in docs/scoping/workspace-contract.md status header.
 title: Accept M6 workspace contract + provider seam design (D-A…D-H)
 priority: 1
 schedule: once

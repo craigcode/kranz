@@ -29,12 +29,14 @@ fn plan() -> Plan {
                 statement: "the build succeeds".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test --workspace".into()),
+                pty_script: None,
             },
             Assertion {
                 id: "a-2".into(),
                 statement: "the widget reads honestly".into(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                pty_script: None,
             },
         ],
         milestones: vec![PlanMilestone {
@@ -56,6 +58,7 @@ fn plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -399,4 +402,229 @@ fn report_workspace_section_renders_provider_pin() {
         !report.contains("- **Provider:**"),
         "absent pin ⇒ no Provider line: {report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// KRZ-343 (design D-H): the Flight Rules coverage matrix in report.md
+// ---------------------------------------------------------------------------
+
+/// The base plan plus a two-rule standards pin (the KRZ-342 consent shape).
+fn pinned_plan() -> Plan {
+    let rule =
+        |id: &str, revision: u64, status: &str, level: &str| kranz_engine::types::PinnedRule {
+            id: id.into(),
+            revision,
+            rfc: "RFC-001".into(),
+            level: level.into(),
+            effective_status: status.into(),
+            statement: format!("statement for {id}"),
+            domains: vec![],
+            stages: vec!["validation".into()],
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: Some("gate:zz-gate".into()),
+            waivable: false,
+        };
+    Plan {
+        standards_manifest: Some(Box::new(kranz_engine::types::StandardsPin {
+            pack_name: "zz-pack".into(),
+            pack_dir: "vendor/pack".into(),
+            standards_root: "standards".into(),
+            digest: "ab".repeat(32),
+            source: kranz_engine::types::StandardsPinSource::RepoTracked,
+            task_class: None,
+            touch_set: vec!["crates/**".into()],
+            context_paths: Vec::new(),
+            gates: Vec::new(),
+            rules: vec![
+                rule("ZZ-FAIL-001", 2, "enforced", "must"),
+                rule("ZZ-QUIET-001", 1, "enforced", "must"),
+            ],
+        })),
+        ..plan()
+    }
+}
+
+/// A pinned mission's log: approval + the resolution record, a gate pass
+/// naming one rule, a finding citing the other, completion.
+fn pinned_events() -> (Vec<kranz_engine::events::Event>, Plan) {
+    let p = pinned_plan();
+    let events = vec![
+        ev(
+            1,
+            EventKind::MissionCreated {
+                goal: p.goal.clone(),
+                base_branch: "main".into(),
+                mission_branch: "kranz/mission-m-test".into(),
+                config: MissionConfig::default(),
+            },
+        ),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: p.clone(),
+                base_sha: Some("deadbeef".into()),
+            },
+        ),
+        ev(
+            3,
+            EventKind::StandardsResolved {
+                source: "repo-tracked".into(),
+                pack_name: "zz-pack".into(),
+                standards_root: "standards".into(),
+                digest: "ab".repeat(32),
+                stage: "approval".into(),
+                task_class: None,
+                touch_set: vec!["crates/**".into()],
+                context_paths: Vec::new(),
+                rules: vec![
+                    kranz_engine::types::StandardsRuleRef {
+                        id: "ZZ-FAIL-001".into(),
+                        revision: 2,
+                        effective_status: "enforced".into(),
+                    },
+                    kranz_engine::types::StandardsRuleRef {
+                        id: "ZZ-QUIET-001".into(),
+                        revision: 1,
+                        effective_status: "enforced".into(),
+                    },
+                ],
+                approval_seq: 2,
+            },
+        ),
+        ev(
+            4,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "abc".into(),
+            },
+        ),
+        ev(
+            5,
+            EventKind::MilestoneValidating {
+                milestone_id: "ms-1".into(),
+            },
+        ),
+        ev(
+            6,
+            EventKind::GateResult {
+                gate: "zz-gate".into(),
+                surface: kranz_engine::gate::GateSurface::FinalGate,
+                kind: kranz_engine::gate::GateKind::Deterministic,
+                index: 0,
+                verdict: kranz_engine::gate::GateVerdict::Pass,
+                artefact_ref: "file:runs/gate-zz.jsonl".into(),
+                artefact_detail: None,
+                score: None,
+                threshold: None,
+                rule_ids: vec!["ZZ-QUIET-001".into()],
+            },
+        ),
+        ev(
+            7,
+            EventKind::ValidationFinding {
+                milestone_id: "ms-1".into(),
+                run_id: kranz_engine::reducer::ENGINE_RUN_ID.into(),
+                finding: kranz_engine::types::Finding {
+                    subject: "a-1".into(),
+                    severity: "major".into(),
+                    evidence: "the rule's gate failed".into(),
+                    suggested_fix: String::new(),
+                    class: String::new(),
+                    rule: Some(kranz_engine::types::RuleCitation {
+                        id: "ZZ-FAIL-001".into(),
+                        revision: 2,
+                        source: "zz-pack standards".into(),
+                        digest: "ab".repeat(32),
+                        lifecycle: "enforced".into(),
+                        level: "must".into(),
+                        checker: Some("gate:zz-gate".into()),
+                    }),
+                },
+            },
+        ),
+        ev(8, EventKind::MissionCompleted {}),
+    ];
+    (events, p)
+}
+
+/// D-H: the completion report renders the coverage matrix — each applicable
+/// rule's disposition with its mechanism and artefact references — between
+/// the validation history and the contract outcomes. Absence of evidence is
+/// never rendered as pass.
+#[test]
+fn flight_rules_provenance_report_renders_the_coverage_matrix() {
+    let (events, p) = pinned_events();
+    let state = reducer::fold(&events).unwrap();
+    let report = render_mission_report(
+        &state,
+        &events,
+        &p,
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+
+    assert!(
+        report.contains("## Flight Rules standards coverage"),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "Pack `zz-pack` (`vendor/pack`, source repo-tracked) — standards root \
+             `standards`, digest `sha256:{}`.",
+            "ab".repeat(32)
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("Pinned at plan approval (seq 2)"),
+        "{report}"
+    );
+    // The failed row: finding citation + mechanism + evidence reference.
+    assert!(
+        report.contains(
+            "| ZZ-FAIL-001 | r2 | enforced | must | gate:zz-gate | failed | validation.finding \
+             seq 7 engine fail `a-1` |"
+        ),
+        "{report}"
+    );
+    // The passed row: positive gate evidence only.
+    assert!(
+        report.contains(
+            "| ZZ-QUIET-001 | r1 | enforced | must | gate:zz-gate | passed | gate.result seq 6 \
+             zz-gate pass `file:runs/gate-zz.jsonl` |"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("Absence of evidence is never rendered as pass"),
+        "{report}"
+    );
+    // Section order: validation history → coverage → contract outcomes.
+    let history = report.find("## Validation history").unwrap();
+    let coverage = report.find("## Flight Rules standards coverage").unwrap();
+    let outcomes = report.find("## Contract outcomes").unwrap();
+    assert!(history < coverage && coverage < outcomes, "{report}");
+}
+
+/// The byte-compat regression contract: a pre-Flight-Rules mission (no
+/// standards pin anywhere in its log) renders a report with NO coverage
+/// section — byte-identical to what it produced before KRZ-343.
+#[test]
+fn flight_rules_provenance_pre_flight_rules_report_is_unchanged() {
+    let state = completed_state();
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        !report.contains("Flight Rules standards coverage"),
+        "no pin, no matrix: {report}"
+    );
+    assert!(!report.contains("not-evaluated"), "{report}");
 }

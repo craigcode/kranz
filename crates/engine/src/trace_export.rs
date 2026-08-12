@@ -174,6 +174,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -184,6 +185,7 @@ mod tests {
             feature_id: Some(feature_id.to_string()),
             milestone_id: None,
             candidate: None,
+            executor_route: None,
             sdk_session_id: format!("sess-{run_id}"),
             model: "sonnet".to_string(),
             quant: "n/a".to_string(),
@@ -213,6 +215,8 @@ mod tests {
                 known_gaps: vec![],
                 commits: vec!["deadbeef commit".to_string()],
                 commands_run: vec![],
+                escalation: None,
+                questions: None,
             }),
         }
     }
@@ -278,6 +282,7 @@ mod tests {
                 crate::events::EventKind::FeatureFailed {
                     feature_id: "f-1-2".to_string(),
                     reason: "gave up".to_string(),
+                    commits: Vec::new(),
                 },
             ),
             ev(

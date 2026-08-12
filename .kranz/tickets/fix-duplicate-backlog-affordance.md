@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in this polish commit; reviewed + gates green
 title: Two "Backlog" affordances in the pipeline view mean different things
 priority: 3
 schedule: once

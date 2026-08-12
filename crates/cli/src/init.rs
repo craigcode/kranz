@@ -29,6 +29,7 @@ const RUNTIME_IGNORE_PATTERNS: &[&str] = &[
     ".kranz/slack-threads.json",
     ".kranz/slack/",
     ".kranz/queue/",
+    ".kranz/hook-status/",
     ".kranz/tickets/*.status",
     ".kranz/serve.token",
     ".kranz/serve.read.token",

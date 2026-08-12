@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: mission m-642a1a complete, merged 2026-07-05 — sidecar restored after tracked-on-branch/ignored-on-main checkout crossfire deleted it
 title: Status-aware Start button on the dashboard mission page
 priority: 2
 schedule: once

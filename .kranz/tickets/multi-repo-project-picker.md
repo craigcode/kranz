@@ -1,4 +1,5 @@
 ---
+state: done
 title: Multi-repo project picker with groups, pins, search, and activity counts
 priority: 3
 schedule: once

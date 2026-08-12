@@ -1,4 +1,5 @@
 ---
+state: done
 title: Dogfood M2.9 Slack E2E — check the live-validation gate
 priority: 2
 schedule: once

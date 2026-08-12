@@ -1,4 +1,5 @@
 ---
+state: done
 title: The pipeline view: one list, stage chips, one-tap actions, ticket capture
 priority: 2
 schedule: once

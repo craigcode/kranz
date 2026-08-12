@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped in 952cbc0
 title: kranz ready — agent-readiness score for a repo (0-100 + highest-leverage fix)
 priority: 3
 schedule: once

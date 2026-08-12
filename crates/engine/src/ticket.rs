@@ -6,7 +6,22 @@
 //! hints`). The `.md` stays human-authored; mutable pipeline status lives in a
 //! sibling `<slug>.status` JSON file so the ticket text is never rewritten by
 //! the engine (except the explicit "needs context" append the orchestrator
-//! makes).
+//! makes, and the committed lifecycle state below).
+//!
+//! ## Committed lifecycle state (design: ticket-state-frontmatter)
+//!
+//! The `.status` sidecar is gitignored runtime: on a fresh clone it vanishes,
+//! and with it any operator verdict like done/superseded — a closed ticket
+//! would silently re-enter the ready path. The durable home for that verdict
+//! is the ticket .md itself: an optional additive `state:` frontmatter key
+//! ([`TicketLifecycle`]; `open` default, plus terminal `done`, `superseded`,
+//! `wontfix`) with an optional free-text `state-note:`. It is the SINGLE
+//! SOURCE OF TRUTH: reads resolve with frontmatter precedence (a diverging
+//! sidecar cache is logged, never silently followed), and the one lifecycle
+//! write path — [`Ticket::write_lifecycle`] — writes BOTH, demoting the
+//! sidecar to a write-through cache so existing readers keep working. A
+//! ticket with NO `state:` key reads its sidecar exactly as before this
+//! schema existed (backcompat).
 //!
 //! [`Ticket::mission_goal`] folds the whole ticket into one readable markdown
 //! blob so the non-interactive draft driver can seed the orchestrator with the
@@ -28,7 +43,9 @@ const TASK_CLASS_HEADING: &str = "## Task class\n";
 /// to route the executor tier for a mission seeded from a ticket, since by
 /// the time `create` runs it only has the folded goal, not the `Ticket`.
 pub fn parse_task_class_from_goal(goal: &str) -> Option<String> {
-    let idx = goal.find(TASK_CLASS_HEADING)?;
+    // The engine-authored appendix is last. `rfind` prevents ticket prose
+    // containing a lookalike heading from shadowing the governed value.
+    let idx = goal.rfind(TASK_CLASS_HEADING)?;
     let rest = &goal[idx + TASK_CLASS_HEADING.len()..];
     let line = rest.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_string())
@@ -61,6 +78,67 @@ impl Schedule {
     }
 }
 
+/// The committed, operator-declared lifecycle state of a ticket — the
+/// optional `state:` frontmatter key (design: ticket-state-frontmatter).
+/// Unlike the pipeline [`TicketState`] (which the engine flips as a ticket
+/// moves draft → review → queue → run), this is the human's terminal verdict,
+/// and it lives IN the committed .md so it survives a fresh clone. Terminal
+/// values (`done`/`superseded`/`wontfix`) exclude the ticket from ready/queue
+/// evaluation exactly like terminal pipeline states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TicketLifecycle {
+    /// Not operator-closed; the sidecar pipeline state governs. This is also
+    /// the meaning of an ABSENT `state:` key (backcompat with tickets
+    /// authored before the schema existed).
+    #[default]
+    Open,
+    Done,
+    Superseded,
+    Wontfix,
+}
+
+impl TicketLifecycle {
+    /// The frontmatter spelling (lower-case, matching the other keys).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TicketLifecycle::Open => "open",
+            TicketLifecycle::Done => "done",
+            TicketLifecycle::Superseded => "superseded",
+            TicketLifecycle::Wontfix => "wontfix",
+        }
+    }
+
+    /// Parse a `state:` value. An unknown value is a hard error naming the
+    /// ticket (the same rule as `defer-until`, and for the mirror-image
+    /// reason): silently defaulting a mistyped terminal state back to open
+    /// would re-queue work its author explicitly closed — the very bug this
+    /// schema exists to fix.
+    fn parse(slug: &str, raw: &str) -> Result<TicketLifecycle> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "open" => Ok(TicketLifecycle::Open),
+            "done" => Ok(TicketLifecycle::Done),
+            "superseded" => Ok(TicketLifecycle::Superseded),
+            "wontfix" => Ok(TicketLifecycle::Wontfix),
+            other => Err(EngineError::Config(format!(
+                "ticket {slug}: invalid state '{other}' (expected open, done, \
+                 superseded, or wontfix)"
+            ))),
+        }
+    }
+
+    /// The pipeline projection of a terminal lifecycle state, or `None` for
+    /// [`TicketLifecycle::Open`]: an open ticket makes no lifecycle claim on
+    /// the pipeline, so the sidecar state governs it.
+    fn terminal_pipeline_state(self) -> Option<TicketState> {
+        match self {
+            TicketLifecycle::Open => None,
+            TicketLifecycle::Done => Some(TicketState::Done),
+            TicketLifecycle::Superseded => Some(TicketState::Superseded),
+            TicketLifecycle::Wontfix => Some(TicketState::Wontfix),
+        }
+    }
+}
+
 /// A parsed ticket: frontmatter fields plus body sections.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ticket {
@@ -80,6 +158,12 @@ pub struct Ticket {
     /// Backlog task class (`task-class: execution-class` frontmatter), used
     /// to route the executor to a tier via [`crate::config::task_class_to_tier`].
     pub task_class: Option<String>,
+    /// Tracked text artifact reviewed by `spec-review` / `incident-review`.
+    /// It is context, never a writable deliverable.
+    pub review_artifact: Option<String>,
+    /// Required review deliverable. Review tickets default this to
+    /// `reviews/<slug>.md`; non-review tickets carry neither field.
+    pub review_output: Option<String>,
     /// External trigger provenance (`trigger: ci-failure|pr-comment`
     /// frontmatter) — set on webhook-drafted tickets (design D-F,
     /// [`crate::hooks`]); `None` on human-authored tickets.
@@ -95,6 +179,15 @@ pub struct Ticket {
     /// against the clock at listing/admission time — no scheduler machinery;
     /// `None` means ready now.
     pub defer_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Operator-declared lifecycle (`state:` frontmatter; see the module
+    /// docs). `None` = the key is absent, so the `.status` sidecar governs
+    /// exactly as before this schema existed (backcompat); `Some(Open)` = an
+    /// explicit open, which defers to the sidecar the same way.
+    pub lifecycle: Option<TicketLifecycle>,
+    /// The free-text `state-note:` frontmatter carried alongside a lifecycle
+    /// state (e.g. "superseded by the flight-surgeon console"). Never parsed
+    /// for meaning — notes are discussion, not a second state channel.
+    pub state_note: Option<String>,
     /// The full markdown body (everything after the frontmatter block).
     pub raw_body: String,
 }
@@ -123,6 +216,15 @@ pub enum TicketState {
     /// [`Failed`] so operators can re-queue after fixing the environment
     /// without treating the mission run itself as a failure.
     Parked,
+    /// Operator-closed without delivery (`state: superseded` frontmatter —
+    /// the work moved elsewhere). Reached only through frontmatter
+    /// precedence ([`Ticket::read_state`]) or the lifecycle write path;
+    /// terminal everywhere [`Done`] is. Additive serde variant: sidecars
+    /// written before it existed never spelled it.
+    Superseded,
+    /// Operator-closed as not-worth-doing (`state: wontfix` frontmatter).
+    /// Same reachability and terminality as [`Superseded`].
+    Wontfix,
 }
 
 /// On-disk shape of `<slug>.status`.
@@ -135,6 +237,30 @@ struct StatusFile {
     /// ticket→mission link `kranz ticket approve <slug>` resolves by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mission_id: Option<String>,
+}
+
+/// One observed frontmatter/sidecar disagreement: the committed frontmatter
+/// `state:` won over the `.status` sidecar cache. Surfaced (and
+/// `tracing::warn!`-logged by [`Ticket::read_state`]) rather than silently
+/// resolved — design rule 2 is "never a silent divergence".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDivergence {
+    /// The winning state, projected from the frontmatter lifecycle.
+    pub frontmatter: TicketState,
+    /// The discarded sidecar cache state.
+    pub sidecar: TicketState,
+}
+
+/// The outcome of resolving a ticket's effective state under frontmatter
+/// precedence (see [`Ticket::resolve_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTicketState {
+    /// The state every ready/queue/list evaluation must use.
+    pub state: TicketState,
+    /// `Some` when a present sidecar disagreed with a terminal frontmatter
+    /// state (the frontmatter won). `None` when they agree, when the
+    /// frontmatter defers, or when the cache is simply cold.
+    pub divergence: Option<StateDivergence>,
 }
 
 impl Ticket {
@@ -248,9 +374,13 @@ impl Ticket {
         let mut max_budget_usd: Option<f64> = None;
         let mut blocked_by: Vec<String> = Vec::new();
         let mut task_class: Option<String> = None;
+        let mut review_artifact: Option<String> = None;
+        let mut review_output: Option<String> = None;
         let mut trigger: Option<String> = None;
         let mut traced_from_mission: Option<String> = None;
         let mut defer_until: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut lifecycle: Option<TicketLifecycle> = None;
+        let mut state_note: Option<String> = None;
 
         for (key, value) in front {
             match key.as_str() {
@@ -269,6 +399,14 @@ impl Ticket {
                 "task-class" | "taskclass" => {
                     let v = value.scalar().trim().to_string();
                     task_class = if v.is_empty() { None } else { Some(v) };
+                }
+                "review-artifact" | "reviewartifact" => {
+                    let v = value.scalar().trim().to_string();
+                    review_artifact = if v.is_empty() { None } else { Some(v) };
+                }
+                "review-output" | "reviewoutput" => {
+                    let v = value.scalar().trim().to_string();
+                    review_output = if v.is_empty() { None } else { Some(v) };
                 }
                 // External trigger provenance (design D-F); additive — older
                 // readers ignore it via the unknown-key arm below.
@@ -293,6 +431,23 @@ impl Ticket {
                     }
                 }
                 "schedule" => schedule = Schedule::parse(&value.scalar()),
+                // The committed lifecycle state (design
+                // ticket-state-frontmatter); additive — older readers ignore
+                // it via the unknown-key arm below. An empty value is absent;
+                // an unknown one is a hard parse error (see
+                // [`TicketLifecycle::parse`]).
+                "state" => {
+                    let v = value.scalar().trim().to_string();
+                    if !v.is_empty() {
+                        lifecycle = Some(TicketLifecycle::parse(slug, &v)?);
+                    }
+                }
+                // Free-text companion to `state:`; additive. Never parsed for
+                // meaning — notes are discussion, not a state channel.
+                "state-note" | "statenote" => {
+                    let v = value.scalar().trim().to_string();
+                    state_note = if v.is_empty() { None } else { Some(v) };
+                }
                 "maxbudgetusd" | "max-budget-usd" => {
                     if let Ok(b) = value.scalar().parse::<f64>() {
                         max_budget_usd = Some(b);
@@ -315,6 +470,15 @@ impl Ticket {
             .filter(|t| !t.trim().is_empty())
             .or(sections.first_heading)
             .unwrap_or_else(|| slug.to_string());
+        let review_contract = crate::review_artifact::from_ticket_fields(
+            slug,
+            task_class.as_deref(),
+            review_artifact.as_deref(),
+            review_output.as_deref(),
+        )?;
+        let (review_artifact, review_output) = review_contract
+            .map(|contract| (Some(contract.input_path), Some(contract.output_path)))
+            .unwrap_or((None, None));
 
         Ok(Ticket {
             slug: slug.to_string(),
@@ -329,9 +493,13 @@ impl Ticket {
             acceptance_hints: sections.acceptance_hints,
             blocked_by,
             task_class,
+            review_artifact,
+            review_output,
             trigger,
             traced_from_mission,
             defer_until,
+            lifecycle,
+            state_note,
             raw_body: body,
         })
     }
@@ -425,6 +593,17 @@ impl Ticket {
             out.push('\n');
         }
 
+        let review_contract = crate::review_artifact::from_ticket_fields(
+            &self.slug,
+            self.task_class.as_deref(),
+            self.review_artifact.as_deref(),
+            self.review_output.as_deref(),
+        )
+        .expect("parsed ticket keeps a valid review-artifact contract");
+        if let Some(contract) = review_contract {
+            out.push_str(&crate::review_artifact::render_goal_section(&contract));
+        }
+
         if let Some(task_class) = self.task_class.as_deref().map(str::trim) {
             if !task_class.is_empty() {
                 out.push('\n');
@@ -449,23 +628,97 @@ impl Ticket {
         Self::tickets_dir(repo_root).join(format!("{slug}.md"))
     }
 
-    /// Read the pipeline state; a missing or unreadable status file is
-    /// [`TicketState::New`]. An invalid slug never touches the filesystem.
-    pub fn read_state(repo_root: &Path, slug: &str) -> TicketState {
-        if !Self::valid_slug(slug) {
-            return TicketState::New;
-        }
-        let path = Self::status_path(repo_root, slug);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<StatusFile>(&text) {
-                Ok(sf) => sf.state,
+    /// The `state:` frontmatter lifecycle of a ticket, scanned without
+    /// parsing body sections. `None` when the .md is missing, has no
+    /// frontmatter block, or carries no `state:` key — all cases where the
+    /// sidecar governs exactly as before the schema existed.
+    fn frontmatter_lifecycle(repo_root: &Path, slug: &str) -> Option<TicketLifecycle> {
+        let text = std::fs::read_to_string(Self::md_path(repo_root, slug)).ok()?;
+        let (front, _) = split_frontmatter(slug, &text).ok()?;
+        for (key, value) in front {
+            if key != "state" {
+                continue;
+            }
+            let v = value.scalar().trim().to_string();
+            if v.is_empty() {
+                return None;
+            }
+            return match TicketLifecycle::parse(slug, &v) {
+                Ok(lifecycle) => Some(lifecycle),
+                // [`Ticket::parse`] hard-errors on the same value, so the
+                // ticket is already dropped (loudly) from every listing; the
+                // read path stays total and lets the sidecar govern.
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "unreadable ticket status; treating as new");
-                    TicketState::New
+                    tracing::warn!(slug, error = %e, "invalid frontmatter state; sidecar governs");
+                    None
                 }
-            },
-            Err(_) => TicketState::New,
+            };
         }
+        None
+    }
+
+    /// The sidecar's pipeline state, or `None` when no readable `.status`
+    /// exists. Distinguishing absent from [`TicketState::New`] matters for
+    /// divergence reporting: a cold cache (fresh clone) cannot disagree.
+    fn sidecar_state(repo_root: &Path, slug: &str) -> Option<TicketState> {
+        Self::read_status_file(repo_root, slug).map(|sf| sf.state)
+    }
+
+    /// Resolve the effective ticket state under FRONTMATTER PRECEDENCE
+    /// (design ticket-state-frontmatter): a terminal `state:` key in the
+    /// committed .md wins over the `.status` sidecar — the sidecar is a
+    /// write-through cache, never the truth. A PRESENT sidecar that
+    /// disagrees is reported as a [`StateDivergence`] (a missing sidecar is
+    /// a cold cache, not a divergence). An absent key or an explicit `open`
+    /// defers to the sidecar; no sidecar at all is [`TicketState::New`].
+    pub fn resolve_state(repo_root: &Path, slug: &str) -> ResolvedTicketState {
+        if !Self::valid_slug(slug) {
+            return ResolvedTicketState {
+                state: TicketState::New,
+                divergence: None,
+            };
+        }
+        let sidecar = Self::sidecar_state(repo_root, slug);
+        let defer = |state: TicketState| ResolvedTicketState {
+            state,
+            divergence: None,
+        };
+        let Some(lifecycle) = Self::frontmatter_lifecycle(repo_root, slug) else {
+            return defer(sidecar.unwrap_or(TicketState::New));
+        };
+        let Some(terminal) = lifecycle.terminal_pipeline_state() else {
+            // Explicit `open`: no lifecycle claim — the pipeline governs.
+            return defer(sidecar.unwrap_or(TicketState::New));
+        };
+        let divergence = match sidecar {
+            Some(sidecar) if sidecar != terminal => Some(StateDivergence {
+                frontmatter: terminal,
+                sidecar,
+            }),
+            _ => None,
+        };
+        ResolvedTicketState {
+            state: terminal,
+            divergence,
+        }
+    }
+
+    /// Read the effective pipeline state; a missing or unreadable status file
+    /// is [`TicketState::New`], and an invalid slug never touches the
+    /// filesystem. Frontmatter precedence per [`Self::resolve_state`]: a
+    /// terminal `state:` key wins, and a diverging sidecar cache is logged —
+    /// never a silent divergence (design rule 2).
+    pub fn read_state(repo_root: &Path, slug: &str) -> TicketState {
+        let resolved = Self::resolve_state(repo_root, slug);
+        if let Some(divergence) = &resolved.divergence {
+            tracing::warn!(
+                slug,
+                frontmatter = ?divergence.frontmatter,
+                sidecar = ?divergence.sidecar,
+                "ticket frontmatter state overrides diverging .status cache"
+            );
+        }
+        resolved.state
     }
 
     /// Write the pipeline state (plus an optional note) as JSON. Nothing
@@ -508,6 +761,56 @@ impl Ticket {
                 None
             }
         }
+    }
+
+    /// The raw sidecar record — pipeline state plus note — or `None` when no
+    /// readable `.status` exists. Crate-internal: the state fold
+    /// ([`crate::migrate_state`]) needs the note to carry it into the
+    /// frontmatter `state-note:`, and only the fold should be reading sidecar
+    /// notes at all (notes are never parsed for state).
+    pub(crate) fn sidecar_record(
+        repo_root: &Path,
+        slug: &str,
+    ) -> Option<(TicketState, Option<String>)> {
+        Self::read_status_file(repo_root, slug).map(|sf| (sf.state, sf.note))
+    }
+
+    /// The ONE lifecycle write path (design ticket-state-frontmatter, rule 2:
+    /// the `.status` sidecar is a write-through cache of the committed
+    /// frontmatter `state:` — every lifecycle change writes BOTH, so no
+    /// reader of either file can observe them apart, and a fresh clone loses
+    /// only the cache, never the verdict).
+    ///
+    /// Upserts the `state:` (and `state-note:`, replacing or removing it)
+    /// lines inside the ticket .md's frontmatter block — every other byte
+    /// preserved — then mirrors the terminal pipeline projection into the
+    /// sidecar via [`Self::write_state`].
+    ///
+    /// Terminal states only: `Open` is the ABSENCE of a terminal claim, so
+    /// there is nothing to cache — un-close a ticket by removing the `state:`
+    /// key and resetting the pipeline by hand. Pipeline transitions
+    /// (Drafting/Review/Queued/…) keep using [`Self::write_state`], which
+    /// never touches the committed .md.
+    pub fn write_lifecycle(
+        repo_root: &Path,
+        slug: &str,
+        state: TicketLifecycle,
+        note: Option<String>,
+    ) -> Result<()> {
+        Self::ensure_valid_slug(slug)?;
+        let terminal = state.terminal_pipeline_state().ok_or_else(|| {
+            EngineError::Config(format!(
+                "write_lifecycle takes a terminal state (done, superseded, wontfix); \
+                 'open' is the absence of a `state:` key (ticket {slug})"
+            ))
+        })?;
+        let note = note.map(|n| bound_state_note(&n)).filter(|n| !n.is_empty());
+        let md = Self::md_path(repo_root, slug);
+        let text = std::fs::read_to_string(&md)?;
+        let updated = upsert_frontmatter_state(slug, &text, state, note.as_deref())?;
+        atomic_write(&md, updated.as_bytes())?;
+        Self::write_state(repo_root, slug, terminal, note)?;
+        Ok(())
     }
 
     /// Durably link the ticket to the mission `kranz draft` created for it.
@@ -749,6 +1052,14 @@ fn bound_reason(reason: &str) -> String {
     truncate_one(reason.trim())
 }
 
+/// Bound a `state-note` for ONE frontmatter line: whitespace-flattened (a raw
+/// newline would split the frontmatter record across lines), trimmed, and
+/// length-capped like a needs-context question. Written unquoted — the
+/// frontmatter parser reads a scalar back verbatim (same as `title:`).
+fn bound_state_note(note: &str) -> String {
+    truncate_one(&note.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// Truncate each question to [`MAX_QUESTION_CHARS`] characters (char-boundary
 /// safe) and cap the total number of questions to [`MAX_QUESTION_COUNT`],
 /// appending a single "N more omitted" marker when truncated.
@@ -918,6 +1229,110 @@ fn unquote(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Upsert the `state:` / `state-note:` lines inside a ticket's frontmatter
+/// block, preserving every other byte (BOM, key order, body). An existing
+/// line is replaced in place; a missing one is inserted right after the
+/// opening fence (`state:` first, then `state-note:`); a `None` note REMOVES
+/// the `state-note:` line so a stale note can never describe a state it no
+/// longer belongs to. A frontmatter-less ticket gains a fresh block above its
+/// body. An unclosed frontmatter block is a hard error (same as the parser).
+/// Same line-level idiom as [`Ticket::seed_traced_from_mission`].
+fn upsert_frontmatter_state(
+    slug: &str,
+    text: &str,
+    state: TicketLifecycle,
+    note: Option<&str>,
+) -> Result<String> {
+    let state_line = format!("state: {}", state.as_str());
+    let note_line = note.map(|n| format!("state-note: {n}"));
+
+    let (bom, source) = match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    };
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let has_frontmatter = lines
+        .first()
+        .map(|line| line.trim_end() == "---")
+        .unwrap_or(false);
+
+    let mut out = String::with_capacity(
+        text.len() + state_line.len() + note_line.as_deref().map_or(0, str::len) + 8,
+    );
+    out.push_str(bom);
+
+    if !has_frontmatter {
+        out.push_str("---\n");
+        out.push_str(&state_line);
+        out.push('\n');
+        if let Some(line) = &note_line {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("---\n\n");
+        out.push_str(source);
+        return Ok(out);
+    }
+
+    // Scan the frontmatter block for its closing fence and any existing
+    // state lines (key spelling-tolerant, like the parser).
+    let mut closing: Option<usize> = None;
+    let mut state_idx: Option<usize> = None;
+    let mut note_idx: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        if line.trim_end() == "---" {
+            closing = Some(i);
+            break;
+        }
+        if !line.trim_start().starts_with('#') {
+            if let Some((key, _)) = line.split_once(':') {
+                match normalize_key(key).as_str() {
+                    "state" if state_idx.is_none() => state_idx = Some(i),
+                    "state-note" | "statenote" if note_idx.is_none() => note_idx = Some(i),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if closing.is_none() {
+        return Err(EngineError::Config(format!(
+            "ticket {slug}: frontmatter opened with `---` but was never closed"
+        )));
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        // Missing keys insert right after the opening fence, state first.
+        if i == 1 {
+            if state_idx.is_none() {
+                out.push_str(&state_line);
+                out.push('\n');
+            }
+            if note_idx.is_none() {
+                if let Some(line) = &note_line {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        if state_idx == Some(i) {
+            out.push_str(&state_line);
+            out.push('\n');
+            continue;
+        }
+        if note_idx == Some(i) {
+            // Replace in place, or drop the line entirely when no note
+            // remains — a stale note must not outlive its state.
+            if let Some(line) = &note_line {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

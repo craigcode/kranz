@@ -14,8 +14,10 @@ import type {
   DrainState,
   EscalationMetrics,
   MissionEvent,
+  MissionHookStatus,
   MissionState,
   MissionSummary,
+  MissionStandardsView,
   Outcomes,
   Plan,
   PlanRequestResponse,
@@ -27,6 +29,7 @@ import type {
   TicketSummary,
   TranscriptEntry,
   WorkspaceSummary,
+  StandardsWaiverResult,
 } from './types';
 
 declare global {
@@ -198,8 +201,31 @@ export const api = {
     return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
   },
 
+  standards(id: string): Promise<MissionStandardsView> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/standards`);
+  },
+
+  approveStandardsWaiver(
+    id: string,
+    body: {
+      ruleId: string;
+      revision: number;
+      findingSubject: string;
+      reason: string;
+      expiresAt: string;
+    },
+  ): Promise<StandardsWaiverResult> {
+    return postJson(`/api/missions/${encodeURIComponent(id)}/standards/waiver`, body);
+  },
+
   workspace(id: string): Promise<WorkspaceSummary> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/workspace`);
+  },
+
+  /** The ephemeral hook-signal projection (ticket
+   *  `agent-hooks-status-signals`) — hook-derived, never mission state. */
+  hookStatus(id: string): Promise<MissionHookStatus> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/hook-status`);
   },
 
   events(id: string, since?: number): Promise<MissionEvent[]> {
@@ -294,6 +320,23 @@ export const api = {
     if (reason !== undefined) body.reason = reason;
     await postJson<{ queued: boolean }>(
       `/api/missions/${encodeURIComponent(id)}/grant/deny`,
+      body,
+    );
+  },
+
+  async answerQuestion(
+    id: string,
+    questionId: string,
+    answer: string,
+    option?: number,
+  ): Promise<void> {
+    const body: { questionId: string; answer: string; option?: number } = {
+      questionId,
+      answer,
+    };
+    if (option !== undefined) body.option = option;
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/question/answer`,
       body,
     );
   },

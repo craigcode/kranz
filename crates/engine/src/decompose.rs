@@ -156,6 +156,7 @@ pub async fn plan_decomposition(
         max_turns: role_cfg.max_turns,
         env: std::collections::HashMap::new(),
         sandbox: None,
+        hook_status: None,
     };
     permissions::apply(
         permissions::for_role(Role::Orchestrator, cfg, &[], &[], &[]),

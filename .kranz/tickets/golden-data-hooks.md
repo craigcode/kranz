@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at dd05242: clone/migrate/reset/skewCheck golden data hooks with owned skew blocks (workspace_data.rs).
 title: Golden data clone / migrate / reset / skew hooks for workspaces
 priority: 2
 schedule: once

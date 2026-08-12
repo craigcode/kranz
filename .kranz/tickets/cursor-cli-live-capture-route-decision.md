@@ -1,4 +1,5 @@
 ---
+state: done
 title: Cursor CLI live capture + backend route decision (post-auth)
 priority: 2
 schedule: once

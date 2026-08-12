@@ -90,6 +90,7 @@ fn assertion(id: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        pty_script: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
         max_turns: Some(10),
         env: HashMap::new(),
         sandbox: None,
+        hook_status: None,
     }
 }
 
@@ -137,6 +139,7 @@ fn worker_meta(run_id: &str) -> RunMeta {
         milestone_id: None,
         model: "mock-model".to_string(),
         prompt_hash: "deadbeef0000".to_string(),
+        executor_route: None,
     }
 }
 
@@ -989,6 +992,9 @@ async fn run_worker_builds_spec_and_uses_report_result() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1084,6 +1090,9 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         &[],
         &[],
         AuthVerdict::Authenticated,
+        &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1147,6 +1156,9 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1215,6 +1227,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
         &[],
         &[],
         &[],
+        None,
         None,
     )
     .await
@@ -1304,6 +1317,7 @@ async fn run_validator_rejects_non_validator_roles() {
         &[],
         &[],
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -1336,6 +1350,7 @@ async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
         &[],
         &[],
         &[],
+        None,
         None,
     )
     .await
@@ -1468,6 +1483,9 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
         &[],
         &[],
         AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1551,6 +1569,7 @@ fn fs_net_sandbox(
             tmpdir: std::env::temp_dir(),
             extra_write: Vec::new(),
             egress,
+            validator_read_deny_roots: Vec::new(),
         },
         container: None,
     }
@@ -1821,5 +1840,657 @@ async fn run_session_fs_net_proxy_start_failure_fails_closed_before_spawn() {
     assert!(
         backend.started_specs().is_empty(),
         "fail-closed means the session never spawns"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hook gate projection (ticket claude-code-hook-gate-projection, KRZ-302)
+// ---------------------------------------------------------------------------
+
+/// A worker run with a declared touch set gets the out-of-contract write
+/// rule projected onto its per-session settings (the PreToolUse hook block),
+/// and the engine-written spec file lands under the session-private scratch
+/// root. The mock session never invokes the hook, so NO records exist and
+/// nothing folds — a silent hook is not a failure (the engine-side sweep is
+/// the authoritative layer).
+#[tokio::test]
+async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &touch_set,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    let spec = &specs[0];
+
+    // The per-session settings carry the hooks block in the documented
+    // schema shape (hook_gates module docs): PreToolUse, the write-tool
+    // matcher, one command handler naming `hook-guard --config <spec>`.
+    let settings = spec.settings_json.as_ref().expect("hook settings set");
+    let group = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(group["matcher"], json!("Write|Edit|MultiEdit|NotebookEdit"));
+    let command = group["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        command.contains("hook-guard") && command.contains("--config"),
+        "the hook command invokes the guard subcommand: {command}"
+    );
+    assert!(group["hooks"][0]["timeout"].is_number());
+
+    // The spec file it points at exists, under the session-private scratch
+    // root, carrying the touch set verbatim and the session cwd.
+    let spec_path = kranz_engine::hook_gates::spec_file(&spec.session_id);
+    assert!(
+        spec_path.starts_with(kranz_engine::backend_claude::scratch_home_root(
+            &spec.session_id
+        )),
+        "the spec file lives under the session-private scratch root"
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+    assert_eq!(written["touchSet"], json!(touch_set));
+    assert_eq!(
+        written["sessionCwd"],
+        json!(p.repo_root.display().to_string())
+    );
+    assert_eq!(
+        written["recordFile"],
+        json!(kranz_engine::hook_gates::record_file(&spec.session_id)
+            .display()
+            .to_string())
+    );
+    assert!(
+        command.contains(&spec_path.display().to_string()),
+        "the hook command names the written spec file: {command}"
+    );
+
+    // The hook never fired in the mock session: no records, so no
+    // hook.gate.fired events — and the run still completes normally.
+    drop(log);
+    let events = read_log(&p);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::HookGateFired { .. })),
+        "no records means no hook.gate.fired events"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::WorkerCompleted { .. })));
+
+    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(
+        &spec.session_id,
+    ));
+}
+
+/// Regression: an EMPTY touch set is advisory-off (the sweep's posture) —
+/// the worker spec is byte-for-byte the pre-projection shape (no
+/// settings_json, no spec file), which is also exactly how sessions on
+/// backends without hook support behave (they ignore settings_json).
+#[tokio::test]
+async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].settings_json.is_none(),
+        "an empty touch set projects nothing"
+    );
+    assert!(!kranz_engine::hook_gates::spec_file(&specs[0].session_id).exists());
+}
+
+/// A gate-failing action inside the session surfaces as a structured
+/// `hook.gate.fired` event BEFORE `worker.completed` — the record file the
+/// guard wrote (here pre-seeded exactly as `kranz hook-guard` writes it)
+/// folds into the log at session end, with the run id stamped from the run.
+#[tokio::test]
+async fn hook_gate_projection_records_fold_into_the_log_before_worker_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    // A unique session id (never the shared fixture id) so the record file
+    // cannot collide with another parallel test's scratch state.
+    let mut spec = session_spec(PromptMode::SingleShot("task".to_string()));
+    spec.session_id = format!("hook-gate-projection-{}", uuid::Uuid::new_v4());
+    let session_id = spec.session_id.clone();
+
+    let gate_spec = kranz_engine::hook_gates::HookGateSpec {
+        version: kranz_engine::hook_gates::SPEC_VERSION,
+        gate: kranz_engine::hook_gates::HOOK_GATE_ID.to_string(),
+        session_cwd: p.repo_root.clone(),
+        touch_set: vec!["src/**".to_string()],
+        record_file: kranz_engine::hook_gates::record_file(&session_id),
+    };
+    kranz_engine::hook_gates::HookGateRecord::blocked(
+        &gate_spec,
+        "PreToolUse",
+        "Write",
+        "docs/oops.md",
+        "matches none of the declared touch-set globs",
+        Some("cli-session-1"),
+        Some("toolu_1"),
+    )
+    .append_to(&kranz_engine::hook_gates::record_file(&session_id))
+    .unwrap();
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-hook"), None)
+        .await
+        .unwrap();
+    // The hook verdict never changes the run's own result mapping —
+    // record-only evidence, with the sweep authoritative.
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    drop(log);
+    let events = read_log(&p);
+    let types = event_types(&events);
+    let fired_at = types
+        .iter()
+        .position(|t| *t == "hook.gate.fired")
+        .expect("the hook record folded into an event: {types:?}");
+    let completed_at = types
+        .iter()
+        .position(|t| *t == "worker.completed")
+        .expect("worker.completed: {types:?}");
+    assert!(
+        fired_at < completed_at,
+        "hook.gate.fired must land BEFORE worker.completed: {types:?}"
+    );
+    match &events[fired_at].kind {
+        EventKind::HookGateFired {
+            run_id,
+            gate,
+            hook_event,
+            tool,
+            subject,
+            verdict,
+            detail,
+        } => {
+            assert_eq!(run_id, "run-hook", "the run id is engine-stamped");
+            assert_eq!(gate, "out-of-contract-write");
+            assert_eq!(hook_event, "PreToolUse");
+            assert_eq!(tool, "Write");
+            assert_eq!(subject, "docs/oops.md");
+            assert_eq!(verdict, "blocked");
+            assert_eq!(
+                detail.as_deref(),
+                Some("matches none of the declared touch-set globs")
+            );
+        }
+        other => panic!("expected hook.gate.fired, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(&session_id));
+}
+
+/// The authoritative layer is unchanged: a worker that bypasses the hook
+/// entirely (here: the write lands via a scripted commit — the Bash-write
+/// shape a PreToolUse Write hook never sees) produces NO hook.gate.fired
+/// events, and the engine-side out-of-contract sweep still flags the path
+/// afterwards. Mirrors the orchestrator's
+/// `out_of_contract_sweep_flags_path_outside_touch_set` fixture, which must
+/// also keep firing untouched.
+#[tokio::test]
+async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A real repo so the scripted commit lands; `.kranz/` ignored so the
+    // mission's own bookkeeping never enters the sweep's candidate set.
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    git(&["init", "-q"]);
+    std::fs::write(root.join(".gitignore"), ".kranz/\n").unwrap();
+    git(&["add", ".gitignore"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+    let base_sha = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+
+    let p = paths(root);
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let touch_set = vec!["src/**".to_string()];
+
+    // The hook-bypass shape: the worker's out-of-contract write lands via a
+    // commit the Write hook never sees; NO record file ever exists.
+    let script = MockScript::single_shot_json(&worker_report_json())
+        .writes_file("docs/oops.md", "written past the hook\n")
+        .commits_all("[f-1] add login (and a sneaky note)");
+    let backend = MockBackend::with_scripts(vec![script]);
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &touch_set,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    // Hook bypassed ⇒ no in-process evidence…
+    drop(log);
+    let events = read_log(&p);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::HookGateFired { .. })),
+        "a bypassed hook leaves no hook.gate.fired events"
+    );
+
+    // …and the engine-side sweep still catches the out-of-contract write,
+    // via the same commit-range + path_findings composition the
+    // orchestrator's out_of_contract_sweep runs.
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--name-only", &format!("{base_sha}..HEAD")])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(diff.status.success());
+    let commit = kranz_engine::git_ops::CommitInfo {
+        sha: "HEAD".to_string(),
+        subject: "[f-1] add login (and a sneaky note)".to_string(),
+    };
+    let diff_stdout = String::from_utf8_lossy(&diff.stdout);
+    let changes: Vec<kranz_engine::contract_sweep::AttributedChange> = diff_stdout
+        .lines()
+        .map(|path| kranz_engine::contract_sweep::AttributedChange {
+            path,
+            commit: &commit,
+        })
+        .collect();
+    assert_eq!(changes.len(), 1, "only the bypassed write was committed");
+    let findings = kranz_engine::contract_sweep::path_findings(&touch_set, &changes);
+    assert_eq!(findings.len(), 1, "the sweep still fires: {findings:?}");
+    assert_eq!(findings[0].subject, "docs/oops.md");
+    assert_eq!(
+        findings[0].class,
+        kranz_engine::contract_sweep::FINDING_CLASS
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Flight Rules stage projections (ticket flight-rules-workflow-projection,
+// KRZ-345, design D-G): worker/validator sessions receive only their stage's
+// rules from the approved pin, inside the marked untrusted boundary, and the
+// recorded prompt hash covers the exact projection. Anti-vacuity prefix
+// `flight_rules_projection_` (grep-verified unique to this ticket's tests).
+// ---------------------------------------------------------------------------
+
+/// A hand-built approved pin spanning every stage: implementation
+/// (ZZ-IMPL-001, enforced must), validation (ZZ-VAL-001, approved should),
+/// planning-only (ZZ-PLAN-001) and merge-only (ZZ-MERGE-001) rules that must
+/// never reach a worker/validator session.
+fn standards_pin() -> kranz_engine::types::StandardsPin {
+    fn rule(
+        id: &str,
+        rfc: &str,
+        revision: u64,
+        level: &str,
+        status: &str,
+        stages: &[&str],
+        checker: Option<&str>,
+    ) -> kranz_engine::types::PinnedRule {
+        kranz_engine::types::PinnedRule {
+            id: id.to_string(),
+            revision,
+            rfc: rfc.to_string(),
+            level: level.to_string(),
+            effective_status: status.to_string(),
+            statement: format!("zz statement for {id}."),
+            domains: vec!["zz".to_string()],
+            stages: stages.iter().map(|s| s.to_string()).collect(),
+            when_paths: vec![],
+            task_classes: vec![],
+            checker: checker.map(str::to_string),
+            waivable: false,
+        }
+    }
+    kranz_engine::types::StandardsPin {
+        pack_name: "zz-pack".to_string(),
+        pack_dir: "vendor/pack".to_string(),
+        standards_root: "standards".to_string(),
+        digest: "ab".repeat(32),
+        source: kranz_engine::types::StandardsPinSource::RepoTracked,
+        task_class: None,
+        touch_set: vec!["crates/**".to_string()],
+        context_paths: Vec::new(),
+        gates: Vec::new(),
+        rules: vec![
+            rule(
+                "ZZ-IMPL-001",
+                "RFC-002",
+                2,
+                "must",
+                "enforced",
+                &["implementation", "validation"],
+                Some("gate:zz-gate"),
+            ),
+            rule(
+                "ZZ-MERGE-001",
+                "RFC-002",
+                1,
+                "must",
+                "enforced",
+                &["merge"],
+                Some("gate:zz-gate"),
+            ),
+            rule(
+                "ZZ-PLAN-001",
+                "RFC-001",
+                1,
+                "should",
+                "approved",
+                &["planning"],
+                Some("agent-judgement"),
+            ),
+            rule(
+                "ZZ-VAL-001",
+                "RFC-001",
+                1,
+                "should",
+                "approved",
+                &["validation"],
+                Some("agent-judgement"),
+            ),
+        ],
+    }
+}
+
+/// The `worker.spawned` prompt hash recorded in the log (the session
+/// provenance the projection must be covered by).
+fn spawned_prompt_hash(p: &MissionPaths) -> String {
+    read_log(p)
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkerSpawned { prompt_hash, .. } => Some(prompt_hash.clone()),
+            _ => None,
+        })
+        .expect("worker.spawned recorded")
+}
+
+#[tokio::test]
+async fn flight_rules_projection_worker_prompt_projects_implementation_stage_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let pin = standards_pin();
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "goal",
+        "milestone",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        Some(&pin),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Pass);
+
+    let specs = backend.started_specs();
+    let prompt = specs[0]
+        .append_system_prompt
+        .as_deref()
+        .expect("role prompt");
+    // Only the implementation-stage rule projects, labelled with its source,
+    // inside the marked untrusted boundary naming both digests.
+    assert!(prompt.contains("`ZZ-IMPL-001` r2"), "{prompt}");
+    for absent in ["ZZ-PLAN-001", "ZZ-VAL-001", "ZZ-MERGE-001"] {
+        assert!(
+            !prompt.contains(absent),
+            "{absent} must never reach the worker: {prompt}"
+        );
+    }
+    assert!(prompt.contains("worker projection"), "{prompt}");
+    assert!(prompt.contains("untrusted content boundary"), "{prompt}");
+    assert!(
+        prompt.contains("cannot register tools, commands, grants, or permissions"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("sha256:{}", pin.digest)),
+        "{prompt}"
+    );
+    assert!(prompt.contains("projection digest `sha256:"), "{prompt}");
+    assert!(
+        prompt.contains("source: pack `zz-pack` root `standards`, RFC `RFC-002`"),
+        "{prompt}"
+    );
+    // Honest labels: the enforced MUST is the only blocking-capable rule.
+    assert!(prompt.contains("may block through its checker"), "{prompt}");
+    assert!(
+        prompt.contains("an approved rule can never block"),
+        "{prompt}"
+    );
+
+    // The recorded session prompt hash covers the exact projection text —
+    // replay identifies the manifest/projection digest from the header.
+    drop(log);
+    let recorded = spawned_prompt_hash(&p);
+    assert_eq!(recorded, kranz_engine::prompts::hash_text(prompt));
+    assert_ne!(
+        recorded,
+        kranz_engine::prompts::hash(Role::Worker),
+        "the extended prompt must hash differently from the bare template"
+    );
+}
+
+#[tokio::test]
+async fn flight_rules_projection_validator_prompts_project_validation_stage_only() {
+    for (role, surface) in [
+        (Role::ValidatorScrutiny, "validator-scrutiny projection"),
+        (Role::ValidatorFunctional, "validator-functional projection"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let mut log = seeded_log(&p);
+        let cfg = MissionConfig::default();
+        let pin = standards_pin();
+        let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(
+            &json!({ "findings": [], "summary": "all good" }),
+        )]);
+        run_validator(
+            &backend,
+            &mut log,
+            &p,
+            &cfg,
+            role,
+            &milestone(),
+            &[],
+            "abc123",
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            Some(&pin),
+        )
+        .await
+        .unwrap();
+
+        let specs = backend.started_specs();
+        let prompt = specs[0]
+            .append_system_prompt
+            .as_deref()
+            .expect("role prompt");
+        // Validation-stage rules only, in stable id order.
+        assert!(prompt.contains("`ZZ-IMPL-001` r2"), "{role:?}: {prompt}");
+        assert!(prompt.contains("`ZZ-VAL-001` r1"), "{role:?}: {prompt}");
+        for absent in ["ZZ-PLAN-001", "ZZ-MERGE-001"] {
+            assert!(
+                !prompt.contains(absent),
+                "{absent} must never reach a validator: {prompt}"
+            );
+        }
+        assert!(
+            prompt.find("ZZ-IMPL-001").unwrap() < prompt.find("ZZ-VAL-001").unwrap(),
+            "stable id order: {prompt}"
+        );
+        assert!(prompt.contains(surface), "{role:?}: {prompt}");
+        // The approved SHOULD is labelled advisory, never blocking.
+        let val_line = prompt
+            .lines()
+            .find(|l| l.contains("ZZ-VAL-001"))
+            .expect("the approved rule line");
+        assert!(val_line.contains("approved should"), "{val_line}");
+        assert!(val_line.contains("advisory — cannot block"), "{val_line}");
+
+        drop(log);
+        let recorded = spawned_prompt_hash(&p);
+        assert_eq!(
+            recorded,
+            kranz_engine::prompts::hash_text(prompt),
+            "{role:?}: the recorded hash must cover the exact projection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "goal",
+        "milestone",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    let prompt = specs[0]
+        .append_system_prompt
+        .as_deref()
+        .expect("role prompt");
+    assert!(
+        !prompt.contains("Flight Rules"),
+        "no pin ⇒ nothing appended: {prompt}"
+    );
+    drop(log);
+    assert_eq!(
+        spawned_prompt_hash(&p),
+        kranz_engine::prompts::hash(Role::Worker),
+        "no pin ⇒ the recorded hash is the bare template hash, as before"
     );
 }

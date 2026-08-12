@@ -1,4 +1,5 @@
 ---
+state: done
 title: Cross-vendor scrutiny: Codex as an optional validator backend
 priority: 2
 schedule: once

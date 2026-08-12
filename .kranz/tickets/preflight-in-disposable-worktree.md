@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done at 4dd5d92: probes run in disposable detached worktree under runs/ (RAII cleanup + stale sweep), under the cleared contract env, via consolidated run_command_bounded (concurrent pipe drain, unix pgroup/Windows Job Object kill); profile file moved to gitignored runs/. Primary checkout byte-untouched verified by test. Tests 2>&1 | grep -qE 'test result: ok. [1-9]'
 title: Run sandbox preflight in a disposable worktree, never the primary checkout (P1)
 priority: 2
 schedule: once

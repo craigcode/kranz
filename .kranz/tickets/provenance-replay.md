@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: kranz provenance <mission> [--json] — ladder + sessions (backend/model/prompt hash) + human decisions with seq + outcome from the log alone; runs/-removed degrades to unresolved; byte-identical replays. provenance_replay filter: 8 green; full gates green. Live-verified on m-533143.
 title: Provenance replay — reconstruct why a unit passed from the log alone
 priority: 1
 schedule: once

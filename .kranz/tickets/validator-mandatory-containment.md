@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: mandatory validator containment regardless of enforce — snapshot sole writable root, real tree read-denied with .git/.kranz carve-outs, loud degrade per spawn on uncontainable platforms/backends, fingerprint demoted to layer-3 tripwire. validator_containment filter: 14 green (15th on linux CI); full gates green.
 title: "Mandatory containment for validator sessions — snapshot alone is not isolation"
 priority: 1
 schedule: once

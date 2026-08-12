@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Done: backend_acp.rs (ACP v1) — full session streaming, tool calls as events, permission seam with denial events, kill/death leaves resumable log, additive BackendKind::Acp (worker-only, opt-in). backend_acp filter: 14 green; full gates green. Follow-up: live ACP soak.
 title: ACP worker backend — spawn, supervise, and record an external agent
 priority: 1
 schedule: once

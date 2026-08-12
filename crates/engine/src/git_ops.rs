@@ -102,6 +102,18 @@ pub enum CheckpointOutcome {
     RefusedBySecretScan { detail: String },
 }
 
+/// One entry of a recursive tree listing ([`GitRepo::ls_tree_recursive`]):
+/// the git file mode (`100644`/`100755` regular blob, `120000` symlink,
+/// `160000` submodule commit), the object kind (`blob`/`commit`), the blob
+/// size in bytes (`None` for non-blobs), and the repo-relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub mode: String,
+    pub kind: String,
+    pub size: Option<u64>,
+    pub path: String,
+}
+
 /// Handle to a local git repository rooted at a working-tree directory.
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -786,6 +798,41 @@ impl GitRepo {
         })
     }
 
+    /// Count first-parent commits on `branch` whose committer date falls in
+    /// `(since, until]` (`git rev-list --first-parent --count --since
+    /// --until`) — the landed-changes denominator of the industry-comparison
+    /// fold (ticket `outcomes-comparison-metrics`, KRZ-333). First-parent
+    /// counts one entry per change that landed on the branch's own line of
+    /// history — a direct commit or a `--no-ff` merge — never the commits a
+    /// merge brought with it, so a landed mission merge and a hand-written
+    /// commit each count once. git's `--since` is exclusive and `--until`
+    /// inclusive; the timestamps go to git verbatim as RFC 3339.
+    pub fn count_first_parent_commits(
+        &self,
+        branch: &str,
+        since: &chrono::DateTime<chrono::Utc>,
+        until: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        if branch.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing count_first_parent_commits with flag-shaped ref {branch:?}"
+            )));
+        }
+        let out = self.run(&[
+            "rev-list",
+            "--first-parent",
+            "--count",
+            &format!("--since={}", since.to_rfc3339()),
+            &format!("--until={}", until.to_rfc3339()),
+            branch,
+        ])?;
+        out.trim().parse::<u64>().map_err(|e| {
+            EngineError::Git(format!(
+                "git rev-list --first-parent --count {branch} returned non-numeric output {out:?}: {e}"
+            ))
+        })
+    }
+
     /// `git diff --stat <from>..<to>` output, verbatim.
     pub fn diff_stat(&self, from: &str, to: &str) -> Result<String> {
         let range = format!("{from}..{to}");
@@ -879,6 +926,35 @@ impl GitRepo {
     pub fn diff_head_paths(&self, paths: &[&Path]) -> Result<String> {
         let mut args: Vec<OsString> = vec!["diff".into(), "HEAD".into(), "--".into()];
         args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
+        self.run_os(&args)
+    }
+
+    /// Full `git diff <from>..<to> -- <paths>` output, verbatim — the
+    /// affected-path diff a Flight Rules waiver's digest binds (KRZ-344
+    /// D-I): only changes under the named paths alter the bytes, so an
+    /// unrelated-path change can never invalidate (or be covered by) the
+    /// waiver. Refuses flag-shaped refs (the [`GitRepo::changed_paths`]
+    /// guard) and an EMPTY path set — `git diff <range> --` with no
+    /// pathspec silently means the WHOLE diff, which would bind authority
+    /// the caller never scoped.
+    pub fn diff_range_paths(&self, from: &str, to: &str, paths: &[String]) -> Result<String> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing diff_range_paths with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
+        if paths.is_empty() {
+            return Err(EngineError::Git(
+                "refusing diff_range_paths with an empty path set — `--` alone means the \
+                 whole diff, not an empty one"
+                    .to_string(),
+            ));
+        }
+        let range = format!("{from}..{to}");
+        let mut args: Vec<OsString> = vec!["diff".into(), range.into(), "--".into()];
+        args.extend(paths.iter().map(OsString::from));
         self.run_os(&args)
     }
 
@@ -1191,6 +1267,90 @@ impl GitRepo {
                 )))
             }
         }
+    }
+
+    /// Whether `path` is tracked in the index (`git ls-files --error-unmatch
+    /// -- <path>`): exit 0 ⇒ tracked; exit 1 ⇒ untracked/absent (NOT an
+    /// error); any other status is a real git failure. The Flight Rules
+    /// trust boundary (KRZ-341, D-A/D-J) uses this to decide whether a pack
+    /// may activate ENFORCED rules: only tracked, repo-relative pack bytes
+    /// have provable base history.
+    pub fn is_tracked(&self, path: &str) -> Result<bool> {
+        if path.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing is_tracked with flag-shaped path {path:?}"
+            )));
+        }
+        let out = self.probe(&["ls-files", "--error-unmatch", "--", path])?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(EngineError::Git(format!(
+                "git ls-files --error-unmatch -- {path} failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            ))),
+        }
+    }
+
+    /// Recursive `git ls-tree -r -l <refname> -- <prefix>`: every entry under
+    /// `prefix` at `refname` with its git mode, object kind, and blob size.
+    /// The Flight Rules loader (KRZ-341) reads a standards corpus from a
+    /// PINNED base tree through this — never from the worktree — so a mission
+    /// branch edit cannot reshape the policy judging it. A flag-shaped ref
+    /// or prefix is refused before invoking git (mirroring [`Self::show_file`]).
+    pub fn ls_tree_recursive(&self, refname: &str, prefix: &str) -> Result<Vec<TreeEntry>> {
+        for slot in [refname, prefix] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing ls-tree with flag-shaped argument {slot:?}"
+                )));
+            }
+        }
+        let out = self.probe(&["ls-tree", "-r", "-l", refname, "--", prefix])?;
+        if !out.status.success() {
+            return Err(EngineError::Git(format!(
+                "git ls-tree -r -l {refname} -- {prefix} failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut entries = Vec::new();
+        for line in stdout.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            // `<mode> SP <type> SP <oid> SP <size> TAB <path>`; size is `-`
+            // for non-blobs. A path git had to C-quote (control/non-ASCII
+            // bytes) keeps its leading `"` here so the consumer fails closed
+            // instead of misreading an unquoted rendering.
+            let Some((meta, path)) = line.split_once('\t') else {
+                return Err(EngineError::Git(format!(
+                    "git ls-tree emitted an unparseable line: {line:?}"
+                )));
+            };
+            let fields: Vec<&str> = meta.split_whitespace().collect();
+            let [mode, kind, _oid, size] = fields.as_slice() else {
+                return Err(EngineError::Git(format!(
+                    "git ls-tree emitted an unparseable line: {line:?}"
+                )));
+            };
+            let size = match *size {
+                "-" => None,
+                digits => Some(digits.parse::<u64>().map_err(|_| {
+                    EngineError::Git(format!("git ls-tree emitted a bad size in line: {line:?}"))
+                })?),
+            };
+            entries.push(TreeEntry {
+                mode: (*mode).to_string(),
+                kind: (*kind).to_string(),
+                size,
+                path: path.to_string(),
+            });
+        }
+        Ok(entries)
     }
 
     /// Whether `path` is currently untracked in the working tree

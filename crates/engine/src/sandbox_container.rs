@@ -35,6 +35,15 @@
 //! Node on PATH plus the mission toolchain — the same layering the repo's
 //! `Dockerfile` comment block spells out for the M6 cloud image (see the
 //! "What this image intentionally does NOT bundle" section there).
+//!
+//! Engine-run gates (ticket container-gate-wrapper): the same `run --rm -i
+//! --read-only` shape also executes validation/final/merge gate commands
+//! inside the mission container — see [`container_gate_run_args`] for the
+//! gate-specific deltas (named container for timeout teardown, the gate's
+//! sanitized env forwarded via `-e`, and a toolchain posture that mounts the
+//! rustup toolchain + npm cache read-only but NEVER the real Cargo root:
+//! the gate's `CARGO_HOME` is a seeded cache-only home precisely because the
+//! real one is a credential directory).
 
 use std::path::Path;
 
@@ -121,22 +130,27 @@ fn mount_arg(host_abs: &str, read_only: bool) -> String {
     )
 }
 
-pub fn container_run_args(
-    inputs: &SandboxInputs,
-    spec: &ContainerSpec,
-    binary: &Path,
-    args: &[String],
-    proxy_url: Option<&str>,
-) -> Vec<String> {
-    let mut out: Vec<String> = vec![
+/// `run --rm -i --read-only` — the shared prologue: the writable set is
+/// exactly the declared mounts; everything else is denied by the runtime.
+fn run_prologue() -> Vec<String> {
+    vec![
         "run".to_string(),
         "--rm".to_string(),
         "-i".to_string(),
-        // Writable set = the declared mounts below; everything else denied.
         "--read-only".to_string(),
-    ];
-    // (path, read-only) mounts, deduplicated; session_cwd first so it is the
-    // working directory's own mount.
+    ]
+}
+
+/// The declared write/audit mount set: `session_cwd` (rw), `mission_dir`
+/// (ro — the engine writes mission metadata from outside the sandbox, and
+/// this ro mount stacks over the rw session_cwd mount when checkout mode
+/// makes the mission dir its descendant — the container analogue of the
+/// tier-2 mission-metadata write deny), the session-private scratch `tmpdir`
+/// (rw, also `HOME`/`TMPDIR` inside the container — NOT the shared system
+/// temp root, which would expose sibling missions' worktrees), and each
+/// `extra_write` entry (rw). Deduplicated, `session_cwd` first so it is the
+/// working directory's own mount; nested mounts stack deepest-last.
+fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
     let mut mounts: Vec<(String, bool)> = Vec::new();
     let mut add_mount = |path: &Path, ro: bool| {
         let host = crate::sandbox::absolutize(path).display().to_string();
@@ -145,13 +159,7 @@ pub fn container_run_args(
         }
     };
     add_mount(&inputs.session_cwd, false);
-    // Read-only: the engine writes mission metadata from outside the
-    // sandbox, and this ro mount stacks over the rw session_cwd mount when
-    // checkout mode makes the mission dir its descendant — the container
-    // analogue of the tier-2 mission-metadata write deny.
     add_mount(&inputs.mission_dir, true);
-    // The session-private scratch doubles as the container's HOME/TMPDIR, so
-    // it must be writable and mounted at the identical host path.
     add_mount(&inputs.tmpdir, false);
     for extra in &inputs.extra_write {
         add_mount(extra, false);
@@ -160,15 +168,18 @@ pub fn container_run_args(
         out.push("-v".to_string());
         out.push(mount_arg(&host, ro));
     }
-    // Authority material must stay unreadable inside the container: the
-    // session_cwd mount otherwise carries the repo's `.kranz/serve.token`
-    // (mutation authority over `kranz serve` on loopback) and `config.json`
-    // (Slack/remote-workspace credentials) in with it. Mask each file that
-    // exists at spawn time with a /dev/null bind — the container analogue of
-    // the tier-2 read deny (crate::sandbox::authority_read_deny_paths derives
-    // the same set from the mission dir for the process sandboxes; here the
-    // session mount is the only path that can carry them). A token file
-    // created AFTER spawn is a residual gap the Seatbelt profile lacks.
+}
+
+/// Authority material must stay unreadable inside the container: the
+/// session_cwd mount otherwise carries the repo's `.kranz/serve.token`
+/// (mutation authority over `kranz serve` on loopback) and `config.json`
+/// (Slack/remote-workspace credentials) in with it. Mask each file that
+/// exists at spawn time with a /dev/null bind — the container analogue of
+/// the tier-2 read deny (crate::sandbox::authority_read_deny_paths derives
+/// the same set from the mission dir for the process sandboxes; here the
+/// session mount is the only path that can carry them). A token file
+/// created AFTER spawn is a residual gap the Seatbelt profile lacks.
+fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
     let session_root = crate::sandbox::absolutize(&inputs.session_cwd);
     for name in ["serve.token", "serve.read.token", "config.json"] {
         let authority = session_root.join(".kranz").join(name);
@@ -177,6 +188,12 @@ pub fn container_run_args(
             out.push(format!("/dev/null:{}:ro", authority.display()));
         }
     }
+}
+
+/// The working directory (the session/gate cwd itself) plus the scratch
+/// env: the session-private scratch doubles as the container's HOME/TMPDIR,
+/// so it is mounted at the identical host path and named in the env.
+fn push_workdir_and_scratch_env(out: &mut Vec<String>, inputs: &SandboxInputs) {
     out.push("-w".to_string());
     out.push(
         crate::sandbox::absolutize(&inputs.session_cwd)
@@ -190,13 +207,34 @@ pub fn container_run_args(
     out.push(format!("HOME={scratch}"));
     out.push("-e".to_string());
     out.push(format!("TMPDIR={scratch}"));
-    // Toolchain caches cross as READ-ONLY mounts + matching env (6th-pass
-    // review: without them a container session cold-bootstraps a whole
-    // rustup toolchain + registry into scratch, the container twin of the
-    // m-533143 ENOSPC regression). rw would let a poisoned cache ride into
-    // the operator's later builds — the same class as a shared target/, so
-    // ro it is: a cache MISS (uncached crate) fails visibly inside the
-    // container rather than writing through to the operator's cache.
+}
+
+/// Which toolchain-cache posture [`push_toolchain_caches`] mounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolchainMount {
+    /// Agent sessions: the whole Cargo home crosses read-only (registry +
+    /// shims + credentials alike — the session posture landed with tier 3).
+    Session,
+    /// Engine-run gates: the real Cargo root NEVER crosses — the gate's
+    /// `CARGO_HOME` is a seeded cache-only home precisely because the real
+    /// root carries registry credentials and credential-provider config
+    /// (`agent_env::cache_only_cargo_home`), and ro-mounting it would reopen
+    /// the exact read exposure that home exists to close. Only the shim dir
+    /// (`<cargo>/bin` — rustup proxies and installed binaries, never
+    /// credentials, which live at the root) is mounted so the forwarded
+    /// PATH's `cargo` shim resolves; the gate env's own `CARGO_HOME` (under
+    /// the rw scratch) crosses via the forwarded `-e` set instead.
+    Gate,
+}
+
+/// Toolchain caches cross as READ-ONLY mounts + matching env (6th-pass
+/// review: without them a container session cold-bootstraps a whole
+/// rustup toolchain + registry into scratch, the container twin of the
+/// m-533143 ENOSPC regression). rw would let a poisoned cache ride into
+/// the operator's later builds — the same class as a shared target/, so
+/// ro it is: a cache MISS (uncached crate) fails visibly inside the
+/// container rather than writing through to the operator's cache.
+fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
     for (var, default_subdir) in [
         ("RUSTUP_HOME", ".rustup"),
         ("CARGO_HOME", ".cargo"),
@@ -208,6 +246,18 @@ pub fn container_run_args(
                 std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(default_subdir))
             });
         if let Some(host) = host {
+            if mode == ToolchainMount::Gate && var == "CARGO_HOME" {
+                // Gate mode: the credential-bearing root stays out; only the
+                // shim dir crosses (see ToolchainMount::Gate). No -e either —
+                // the gate env's cache-only CARGO_HOME is forwarded instead.
+                let bin = host.join("bin");
+                if bin.is_dir() {
+                    let mounted = crate::sandbox::absolutize(&bin).display().to_string();
+                    out.push("-v".to_string());
+                    out.push(mount_arg(&mounted, true));
+                }
+                continue;
+            }
             if host.is_dir() {
                 let mounted = crate::sandbox::absolutize(&host).display().to_string();
                 out.push("-v".to_string());
@@ -217,6 +267,15 @@ pub fn container_run_args(
             }
         }
     }
+}
+
+/// The network posture: `fs+net` with an empty egress list maps to
+/// `--network none` (the hard boundary); `fs+net` with a non-empty egress
+/// list keeps the runtime default bridge and forwards the egress-proxy
+/// endpoint (`proxy_url` — sessions only; engine-run gates are never wired
+/// through the proxy and their resolution FAILS CLOSED on that pair instead,
+/// so a gate never silently bridges). `fs` passes no network flag.
+fn push_network(out: &mut Vec<String>, inputs: &SandboxInputs, proxy_url: Option<&str>) {
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
         if inputs.egress.is_empty() {
             out.push("--network".to_string());
@@ -248,9 +307,105 @@ pub fn container_run_args(
             ));
         }
     }
+}
+
+pub fn container_run_args(
+    inputs: &SandboxInputs,
+    spec: &ContainerSpec,
+    binary: &Path,
+    args: &[String],
+    proxy_url: Option<&str>,
+) -> Vec<String> {
+    let mut out = run_prologue();
+    push_policy_mounts(&mut out, inputs);
+    push_authority_masks(&mut out, inputs);
+    push_workdir_and_scratch_env(&mut out, inputs);
+    push_toolchain_caches(&mut out, ToolchainMount::Session);
+    push_network(&mut out, inputs, proxy_url);
     out.push(spec.image.clone());
     out.push(binary.display().to_string());
     out.extend(args.iter().cloned());
+    out
+}
+
+/// Env vars the gate builder itself emits (the scratch block's HOME/TMPDIR,
+/// the cache block's RUSTUP_HOME/NPM_CONFIG_CACHE) or deliberately ignores
+/// (the Windows TEMP pair — POSIX scratch TMPDIR is the in-container temp
+/// posture): the forwarded caller env must not duplicate them. `CARGO_HOME`
+/// is NOT skipped — gate mode suppresses the cache block's own CARGO_HOME
+/// (the credential root never crosses), so the caller's cache-only home
+/// under the rw scratch is the one the gate sees.
+const GATE_FORWARD_ENV_SKIP: &[&str] = &[
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "RUSTUP_HOME",
+    "NPM_CONFIG_CACHE",
+];
+
+/// Build the `<runtime> run` argv for ONE engine-run gate command (ticket
+/// container-gate-wrapper): the same read-only-root + declared-mount shape
+/// an agent session gets, with four gate-specific deltas.
+///
+/// - The payload is `sh -c <command>` (contract/gate commands are
+///   user-authored shell lines needing real shell semantics — the same
+///   trust decision the host gate makes in `command_exec::shell_argv`), not
+///   an agent binary.
+/// - `--name <container_name>`: the bounded core's timeout SIGKILL reaches
+///   the runtime CLIENT's process group, not the in-container tree (the
+///   daemon owns those processes), so the caller force-removes the named
+///   container on the timeout path. `--rm` still reaps every normal exit.
+/// - The gate's COMPLETE sanitized env crosses via `-e` flags — `docker run`
+///   forwards no client env into the container, and contract commands need
+///   `KRANZ_BASE_SHA`, the cache-only `CARGO_HOME`, and PATH. The env the
+///   caller hands over is already the allowlisted contract/merge env
+///   (`agent_env::contract_command_env`, or `command_exec::sanitized_gate_env`
+///   with its cache-only CARGO_HOME), never ambient secrets; the keys the
+///   builder emits itself ([`GATE_FORWARD_ENV_SKIP`]) are excluded, and the
+///   order is sorted so the argv is deterministic.
+/// - Toolchain posture is [`ToolchainMount::Gate`]: the rustup toolchain and
+///   npm cache cross read-only (the gate runs the repo's own toolchain from
+///   the host's rustup — the established ro-mount pattern), the real Cargo
+///   root NEVER crosses (credential directory — only `<cargo>/bin`'s shims
+///   do). Image assumption: the configured `sandbox.image` must carry
+///   whatever the host toolchain mounts do not (a non-rustup cargo, node,
+///   go…) — the same assumption worker sessions already carry, documented in
+///   the module doc; with `DEFAULT_IMAGE` a `cargo` gate fails loudly with
+///   "not found", never silently on the host.
+///
+/// `fs+net` keeps the session handling (empty egress → `--network none`);
+/// `fs+net` with a NON-EMPTY egress list must have been refused by the
+/// resolution (fail closed — no proxy exists for engine-side gates), so
+/// `push_network` is called with `proxy_url: None` here.
+pub fn container_gate_run_args(
+    inputs: &SandboxInputs,
+    spec: &ContainerSpec,
+    command: &str,
+    env: &std::collections::HashMap<String, String>,
+    container_name: &str,
+) -> Vec<String> {
+    let mut out = run_prologue();
+    out.push("--name".to_string());
+    out.push(container_name.to_string());
+    push_policy_mounts(&mut out, inputs);
+    push_authority_masks(&mut out, inputs);
+    push_workdir_and_scratch_env(&mut out, inputs);
+    push_toolchain_caches(&mut out, ToolchainMount::Gate);
+    push_network(&mut out, inputs, None);
+    let mut forwarded: Vec<(&String, &String)> = env.iter().collect();
+    forwarded.sort_by_key(|(key, _)| *key);
+    for (key, value) in forwarded {
+        if GATE_FORWARD_ENV_SKIP.contains(&key.as_str()) {
+            continue;
+        }
+        out.push("-e".to_string());
+        out.push(format!("{key}={value}"));
+    }
+    out.push(spec.image.clone());
+    out.push("sh".to_string());
+    out.push("-c".to_string());
+    out.push(command.to_string());
     out
 }
 
@@ -290,6 +445,7 @@ mod tests {
             tmpdir: PathBuf::from("/work/scratch"),
             extra_write: vec![PathBuf::from("/home/op/.cargo")],
             egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
         }
     }
 
@@ -385,6 +541,7 @@ mod tests {
             tmpdir: scratch.clone(),
             extra_write: vec![cargo.clone()],
             egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
         };
         let args = container_run_args(
             &inputs,
@@ -416,9 +573,9 @@ mod tests {
         let session = dir.path().join("session");
         let kranz_dir = session.join(".kranz");
         std::fs::create_dir_all(&kranz_dir).unwrap();
-        let serve_token = kranz_dir.join("serve.token");
+        let masked_token_file = kranz_dir.join("serve.token");
         let config = kranz_dir.join("config.json");
-        std::fs::write(&serve_token, "secret").unwrap();
+        std::fs::write(&masked_token_file, "secret").unwrap();
         std::fs::write(&config, "{}").unwrap();
         let mut inputs = inputs(SandboxEnforce::Fs);
         inputs.session_cwd = session;
@@ -433,7 +590,7 @@ mod tests {
         let joined = args.join(" ");
         let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
 
-        for masked in [&serve_token, &config] {
+        for masked in [&masked_token_file, &config] {
             assert!(
                 joined.contains(&format!("/dev/null:{}:ro", abs(masked))),
                 "missing /dev/null mask for {}: {args:?}",
@@ -444,6 +601,205 @@ mod tests {
         assert!(
             !joined.contains("serve.read.token"),
             "absent authority files must not be masked: {args:?}"
+        );
+    }
+
+    /// The gate argv shape (ticket container-gate-wrapper): the same
+    /// declared-mount policy an agent session gets (gate cwd rw, mission dir
+    /// ro, scratch rw, extra_write rw, authority masks, `-w`, scratch
+    /// HOME/TMPDIR), PLUS the gate deltas — a named container, the caller's
+    /// sanitized env forwarded as sorted `-e` flags (minus the keys the
+    /// builder emits itself), and an `sh -c <command>` payload after the
+    /// image. Expectations derive paths through the same absolutize +
+    /// mount_arg the builder uses (POSIX/Windows path forms differ).
+    #[test]
+    fn container_gate_wrap_args_mounts_policy_forwards_env_and_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let mission = dir.path().join("mission");
+        let scratch = dir.path().join("scratch");
+        let extra = dir.path().join("extra");
+        for dir in [&gate, &mission, &scratch, &extra] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let kranz_dir = gate.join(".kranz");
+        std::fs::create_dir_all(&kranz_dir).unwrap();
+        let masked_token_file = kranz_dir.join("serve.token");
+        std::fs::write(&masked_token_file, "secret").unwrap();
+        let inputs = SandboxInputs {
+            enforce: SandboxEnforce::Fs,
+            session_cwd: gate.clone(),
+            mission_dir: mission.clone(),
+            tmpdir: scratch.clone(),
+            extra_write: vec![extra.clone()],
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let env: std::collections::HashMap<String, String> = [
+            ("ZZZ_BASE".to_string(), "deadbeef".to_string()),
+            ("AAA_FIRST".to_string(), "1".to_string()),
+            ("CARGO_HOME".to_string(), "/scratch/cache-only".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            // The builder-owned keys: forwarded copies of these must NOT
+            // appear with the caller's values.
+            ("HOME".to_string(), "/caller/home".to_string()),
+            ("TMPDIR".to_string(), "/caller/tmp".to_string()),
+            ("RUSTUP_HOME".to_string(), "/caller/rustup".to_string()),
+            ("NPM_CONFIG_CACHE".to_string(), "/caller/npm".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let args = container_gate_run_args(
+            &inputs,
+            &spec(),
+            "cargo test --workspace",
+            &env,
+            "kranz-gate-test",
+        );
+        let joined = args.join(" ");
+        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+
+        // The session mount policy, unchanged.
+        assert!(args.contains(&"--read-only".to_string()));
+        assert!(joined.contains(&mount_arg(&abs(&gate), false)));
+        assert!(joined.contains(&mount_arg(&abs(&mission), true)));
+        assert!(joined.contains(&mount_arg(&abs(&scratch), false)));
+        assert!(joined.contains(&mount_arg(&abs(&extra), false)));
+        assert!(joined.contains(&format!("-w {}", abs(&gate))));
+        assert!(joined.contains(&format!("-e HOME={}", abs(&scratch))));
+        assert!(joined.contains(&format!("-e TMPDIR={}", abs(&scratch))));
+        assert!(
+            joined.contains(&format!("/dev/null:{}:ro", abs(&masked_token_file))),
+            "authority material must stay /dev/null-masked: {args:?}"
+        );
+
+        // The gate deltas: named container, sh -c payload after the image.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "kranz-gate-test"),
+            "the gate container must carry the caller-chosen name: {args:?}"
+        );
+        assert!(
+            joined.ends_with(&format!("{DEFAULT_IMAGE} sh -c cargo test --workspace")),
+            "image then sh -c payload: {args:?}"
+        );
+
+        // The caller env crosses — sorted (AAA before ZZZ)…
+        let index_of = |needle: &str| {
+            args.windows(2)
+                .position(|w| w[0] == "-e" && w[1] == needle)
+                .unwrap_or_else(|| panic!("missing -e {needle}: {args:?}"))
+        };
+        assert!(index_of("AAA_FIRST=1") < index_of("ZZZ_BASE=deadbeef"));
+        index_of("CARGO_HOME=/scratch/cache-only");
+        index_of("PATH=/usr/bin:/bin");
+        // …minus the keys the builder emits itself (no caller-valued
+        // duplicates of HOME/TMPDIR/the toolchain cache vars).
+        for skipped in [
+            "-e HOME=/caller/home",
+            "-e TMPDIR=/caller/tmp",
+            "-e RUSTUP_HOME=/caller/rustup",
+            "-e NPM_CONFIG_CACHE=/caller/npm",
+        ] {
+            assert!(
+                !joined.contains(skipped),
+                "builder-owned env key must not be forwarded with the caller value: {skipped}\n{args:?}"
+            );
+        }
+    }
+
+    /// The gate toolchain posture (ticket container-gate-wrapper): the real
+    /// Cargo root NEVER crosses — it is a credential directory
+    /// (`credentials.toml` rides at its root), and the gate's cache-only
+    /// CARGO_HOME exists precisely to keep those bytes away from
+    /// worker-authored gate code. Only the credential-free `<cargo>/bin`
+    /// shim dir is mounted (ro), so the forwarded PATH's rustup shim
+    /// resolves; the caller's cache-only CARGO_HOME crosses via `-e`.
+    #[test]
+    fn container_gate_wrap_args_never_mounts_the_real_cargo_root() {
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("bin")).unwrap();
+        std::fs::write(cargo.path().join("credentials.toml"), "operator-secret").unwrap();
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = SandboxInputs {
+            enforce: SandboxEnforce::Fs,
+            session_cwd: dir.path().join("gate"),
+            mission_dir: dir.path().join("mission"),
+            tmpdir: dir.path().join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let env: std::collections::HashMap<String, String> =
+            [("CARGO_HOME".to_string(), "/scratch/cache-only".to_string())]
+                .into_iter()
+                .collect();
+        let args = container_gate_run_args(&inputs, &spec(), "true", &env, "kranz-gate-test");
+        let joined = args.join(" ");
+        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+
+        let root = abs(cargo.path());
+        let bin = abs(&cargo.path().join("bin"));
+        assert!(
+            joined.contains(&mount_arg(&bin, true)),
+            "the shim dir must cross read-only: {args:?}"
+        );
+        assert!(
+            !joined.contains(&mount_arg(&root, true)),
+            "the credential-bearing Cargo root must NEVER be mounted: {args:?}"
+        );
+        assert!(
+            !joined.contains(&format!("-e CARGO_HOME={root}")),
+            "no -e may point CARGO_HOME at the real root: {args:?}"
+        );
+        assert!(
+            joined.contains("-e CARGO_HOME=/scratch/cache-only"),
+            "the caller's cache-only CARGO_HOME crosses instead: {args:?}"
+        );
+    }
+
+    /// The gate network posture mirrors the session container's (ticket
+    /// container-gate-wrapper): `fs+net` with an empty egress list is the
+    /// hard `--network none` boundary (engine-run gates are never wired
+    /// through the egress proxy, and the resolution FAILS CLOSED on a
+    /// non-empty list, so the builder never sees the proxy-routed branch);
+    /// `fs` keeps the runtime default bridge/NAT.
+    #[test]
+    fn container_gate_wrap_args_fs_net_empty_egress_disables_network() {
+        let env = std::collections::HashMap::new();
+        let fs_net = container_gate_run_args(
+            &inputs(SandboxEnforce::FsNet),
+            &spec(),
+            "true",
+            &env,
+            "kranz-gate-test",
+        );
+        let network = fs_net
+            .windows(2)
+            .find(|w| w[0] == "--network")
+            .expect("fs+net must pass a --network flag");
+        assert_eq!(network[1], "none");
+        assert!(
+            !fs_net.iter().any(|a| a.starts_with("HTTPS_PROXY=")),
+            "gates are never wired through the egress proxy: {fs_net:?}"
+        );
+
+        let fs = container_gate_run_args(
+            &inputs(SandboxEnforce::Fs),
+            &spec(),
+            "true",
+            &env,
+            "kranz-gate-test",
+        );
+        assert!(
+            !fs.iter().any(|a| a == "--network"),
+            "fs must not restrict the network (runtime default bridge): {fs:?}"
         );
     }
 
@@ -495,6 +851,7 @@ mod tests {
             tmpdir: scratch.path().to_path_buf(),
             extra_write: Vec::new(),
             egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
         };
         let spec = ContainerSpec {
             runtime,

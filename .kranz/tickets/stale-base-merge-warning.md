@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: landed in this polish commit; reviewed + gates green
 title: Warn when merging a mission whose base is stale relative to sibling merges
 priority: 3
 schedule: once

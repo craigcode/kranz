@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: shipped in 22df707 and hardened in 5abccde
 title: Codex workspace-write sandbox must grant writes to kranz's worktree (temp-dir path)
 priority: 3
 schedule: once

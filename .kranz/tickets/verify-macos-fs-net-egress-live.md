@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: resolved in 90f6146 (Craig): fail-closed refusal + false-positive tests
 title: Add a live sandbox-exec test proving macOS fs+net egress actually blocks a disallowed host
 priority: 2
 schedule: once

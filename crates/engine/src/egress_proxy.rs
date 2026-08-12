@@ -565,9 +565,11 @@ mod tests {
                     tmpdir: std::env::temp_dir(),
                     extra_write: Vec::new(),
                     egress,
+                    validator_read_deny_roots: Vec::new(),
                 },
                 container: None,
             }),
+            hook_status: None,
         }
     }
 

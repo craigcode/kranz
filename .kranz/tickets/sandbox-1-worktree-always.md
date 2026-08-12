@@ -1,4 +1,5 @@
 ---
+state: done
 title: Workers and validators always run in dedicated worktrees
 priority: 2
 schedule: once

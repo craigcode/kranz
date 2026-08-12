@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: implemented
 title: Ranked freshness-aware repo knowledge injection for planning
 priority: 2
 schedule: once
