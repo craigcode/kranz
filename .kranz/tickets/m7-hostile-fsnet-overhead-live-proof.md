@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: macOS hostile mission m-ed91b6 landed through the merge API; exact filesystem and egress denials were recorded, the primary checkout stayed on main, and warm Node/Rust measurements were +4.33%/+5.01%. Linux live proof and Windows parity remain roadmap scope.
 title: Prove M7 with a hostile macOS fs+net mission and measured gate overhead
 priority: 1
 schedule: once
@@ -44,3 +45,7 @@ the median wall-clock delta against the roadmap's approximate 10% target.
   with `off` versus `fs+net`, reporting medians and percentage delta.
 - A committed receipt includes environment facts, exact commands, mission and
   commit ids, raw timings, containment observations, limitations, and cleanup.
+
+## Receipt
+
+See [the committed M7 live-proof receipt](../../docs/reviews/m7-hostile-fsnet-live-proof.md).

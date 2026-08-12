@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: TypeScript mission m-bb3632 landed through its own Node gate and repo-scoped merge API; one host served two healthy repos and kept one authenticated Slack bridge connected. Routing was proven by integration tests; no inbound human Slack event was sent.
 title: Prove M8 end to end with a fresh TypeScript repository and live multi-repo host
 priority: 1
 schedule: once
@@ -43,3 +44,7 @@ unambiguous.
   bleed.
 - A committed receipt records commands, relevant SHAs, mission id, gate
   results, routing evidence, limitations, and cleanup.
+
+## Receipt
+
+See [the committed M8 live-proof receipt](../../docs/reviews/m8-typescript-live-proof.md).
