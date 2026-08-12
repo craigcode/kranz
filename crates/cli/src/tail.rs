@@ -262,7 +262,9 @@ impl EventRenderer {
                 ansi::BLUE,
                 format!("complete ({} commit(s))", commits.len()),
             ),
-            EventKind::FeatureFailed { feature_id, reason } => (
+            EventKind::FeatureFailed {
+                feature_id, reason, ..
+            } => (
                 format!("feature {feature_id}"),
                 ansi::RED,
                 format!("FAILED: {reason}"),
@@ -616,6 +618,47 @@ impl EventRenderer {
                         format!("contract v{version}")
                     }
                 ),
+            ),
+            EventKind::StandardsResolved {
+                pack_name,
+                digest,
+                rules,
+                ..
+            } => (
+                "standards".to_string(),
+                ansi::BLUE,
+                format!(
+                    "resolved: pack {pack_name} · {} rule(s) pinned · sha256:{digest}",
+                    rules.len()
+                ),
+            ),
+            EventKind::StandardsDrifted { changed_rules, .. } => (
+                "standards".to_string(),
+                ansi::RED,
+                format!(
+                    "policy drift: merge refused ({} change(s) to the applicable enforced set)",
+                    changed_rules.len()
+                ),
+            ),
+            EventKind::StandardsWaiverApproved {
+                rule_id,
+                rule_revision,
+                approver,
+                ..
+            } => (
+                "standards".to_string(),
+                ansi::BLUE,
+                format!("waiver approved: {rule_id} r{rule_revision} by {approver}"),
+            ),
+            EventKind::StandardsAttestationApproved {
+                rule_id,
+                rule_revision,
+                approver,
+                ..
+            } => (
+                "standards".to_string(),
+                ansi::BLUE,
+                format!("attestation approved: {rule_id} r{rule_revision} by {approver}"),
             ),
         };
 

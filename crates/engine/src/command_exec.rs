@@ -564,11 +564,26 @@ fn gate_profile_extras() -> String {
     // works; without it both ioctls EPERM). No ptmx, no pty: the harness
     // is validator tooling that deserves the same gate the rest of the
     // wrapped suite gets, not a skip.
+    //
+    // 14th-pass review (ticket gate-wrap-file-ioctl-unscoped): the ioctl
+    // allow is SCOPED to exactly that pty surface — /dev/ptmx plus the
+    // tty-slave regex — never the unrestricted `(allow file-ioctl)` every
+    // wrapped gate used to get (an unscoped allow lets worker-authored gate
+    // code ioctl any device it can open: terminal injection into the
+    // operator's tty, TIOCSTI-class surfaces, disk ioctls). Re-probed
+    // 2026-08-09 under sandbox-exec on macOS (arm64): the scoped shape
+    // passes the full openpty + termios + TIOCSWINSZ + read/write chain
+    // (PTY-OK, slave /dev/ttys003), and dropping the ioctl line entirely
+    // EPERMs at openpty — the scoped filter is what the chain needs, no
+    // more. The gate profile cannot know at resolve time whether the
+    // contract carries pty assertions (merge gates never see one), so the
+    // scoped lines ride every wrapped gate — the surface they open is the
+    // pty device pair and nothing else.
     String::from(
         "\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/ptmx\"))\n\
          (allow file-read* (literal \"/dev/ptmx\"))\n\
          (allow file-read* file-write* (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
-         (allow file-ioctl)\n\
+         (allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
          (allow signal (target same-sandbox))\n",
     )
 }
@@ -923,6 +938,49 @@ async fn run_shell_command_sandboxed_with_code(
         }
     }
     (code, output)
+}
+
+/// Synchronous bridge for gate execution from approval-time code that runs
+/// inside an ambient Tokio runtime. The actual bounded/sandboxed executor is
+/// async; attempting to build and `block_on` a second runtime on the caller's
+/// runtime thread panics. A scoped OS thread owns the short-lived runtime,
+/// while borrowed cwd/env/sandbox inputs remain valid until it joins.
+///
+/// `Some(code)` means the command reached an exit status; `None` covers
+/// spawn/wrap failures, timeout/tree kill, signal termination, or runtime
+/// setup failure. The output always carries the bounded diagnostic tail.
+pub(crate) fn run_shell_command_sandboxed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+) -> (Option<i32>, String) {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return (
+                        None,
+                        format!("failed to create approval gate runtime: {error}"),
+                    )
+                }
+            };
+            runtime.block_on(run_shell_command_sandboxed_with_code(
+                cwd, command, timeout, env, sandbox,
+            ))
+        });
+        worker.join().unwrap_or_else(|_| {
+            (
+                None,
+                "approval gate runner panicked before producing a verdict".to_string(),
+            )
+        })
+    })
 }
 
 /// Child setup shared by every bounded run: piped stdout/stderr (drained
@@ -1548,28 +1606,38 @@ mod tests {
             "poisoned ambient vars reached the contract command: {output}"
         );
 
-        // A full env dump shows exactly the contract boundary.
-        let (ok, dump) = run_shell_command(dir.path(), "env", &env).await;
-        assert!(ok, "{dump}");
-        for leaked in [
-            "GH_TOKEN",
-            "SLACK_BOT_TOKEN",
-            "AWS_SECRET_ACCESS_KEY",
-            "hunter2",
-        ] {
+        // Inspect names separately from values. `run_shell_command` retains a
+        // bounded output tail, and launcher-managed PATH values can themselves
+        // exceed that bound; a raw `env` dump could therefore discard the
+        // leading `PATH=` and make this boundary test host-PATH-dependent.
+        let (ok, names) =
+            run_shell_command(dir.path(), "env | sed 's/=.*//' | LC_ALL=C sort", &env).await;
+        assert!(ok, "{names}");
+        for leaked in ["GH_TOKEN", "SLACK_BOT_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
             assert!(
-                !dump.contains(leaked),
-                "contract env leaked {leaked}:\n{dump}"
+                !names.lines().any(|name| name == leaked),
+                "contract env leaked {leaked}:\n{names}"
             );
         }
-        assert!(dump.contains("PATH="), "PATH must cross:\n{dump}");
         assert!(
-            dump.contains(&format!("HOME={}", scratch.path().display())),
-            "HOME must be the per-mission scratch:\n{dump}"
+            names.lines().any(|name| name == "PATH"),
+            "PATH must cross:\n{names}"
+        );
+
+        let (ok, managed) = run_shell_command(
+            dir.path(),
+            "printf 'HOME=%s\nKRANZ_BASE_SHA=%s\nCARGO_HOME=%s\n' \"$HOME\" \"$KRANZ_BASE_SHA\" \"$CARGO_HOME\"",
+            &env,
+        )
+        .await;
+        assert!(ok, "{managed}");
+        assert!(
+            managed.contains(&format!("HOME={}", scratch.path().display())),
+            "HOME must be the per-mission scratch:\n{managed}"
         );
         assert!(
-            dump.contains("KRANZ_BASE_SHA=deadbeef"),
-            "base sha must reach the contract env:\n{dump}"
+            managed.contains("KRANZ_BASE_SHA=deadbeef"),
+            "base sha must reach the contract env:\n{managed}"
         );
         let cargo_home = env.get("CARGO_HOME").expect("CARGO_HOME");
         assert!(
@@ -1577,8 +1645,8 @@ mod tests {
             "contract CARGO_HOME must live under mission scratch: {cargo_home}"
         );
         assert!(
-            dump.contains(&format!("CARGO_HOME={cargo_home}")),
-            "cache-only Cargo home must reach the child:\n{dump}"
+            managed.contains(&format!("CARGO_HOME={cargo_home}")),
+            "cache-only Cargo home must reach the child:\n{managed}"
         );
     }
 
@@ -1938,9 +2006,24 @@ mod tests {
             "the gate profile must add the /dev/null device write allow:\n{profile}"
         );
         assert!(
-            profile.contains("(literal \"/dev/ptmx\")") && profile.contains("file-ioctl"),
+            profile.contains("(literal \"/dev/ptmx\")"),
             "pty harness support (pty-functional-validation): the gate profile must \
-             permit the ptmx multiplexer and the grantpt/unlockpt ioctls:\n{profile}"
+             permit the ptmx multiplexer:\n{profile}"
+        );
+        // 14th-pass review (ticket gate-wrap-file-ioctl-unscoped): the ioctl
+        // allow is pinned SCOPED to the pty device pair — a bare
+        // `(allow file-ioctl)` re-widen must fail loudly here.
+        assert!(
+            profile.contains(
+                "(allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))"
+            ),
+            "the grantpt/unlockpt ioctl allow must be scoped to /dev/ptmx and the \
+             tty slave nodes:\n{profile}"
+        );
+        assert!(
+            !profile.contains("(allow file-ioctl)"),
+            "the ioctl allow must never be unscoped again (every device the gate \
+             can open becomes ioctl-able):\n{profile}"
         );
         assert!(
             !profile.contains("xcrun_db"),
@@ -2011,6 +2094,38 @@ mod tests {
                 .to_string()
                 .contains("refusing to run engine-run gates unsandboxed"),
             "{error}"
+        );
+    }
+
+    /// The pty-era extras, pinned as TEXT (ticket
+    /// gate-wrap-file-ioctl-unscoped, 14th-pass review): the file-ioctl
+    /// allow must stay scoped to exactly the pty device pair the harness
+    /// needs — `/dev/ptmx` (grantpt/unlockpt land on the master fd) plus
+    /// the tty-slave regex (termios/winsize on the slave) — so a future
+    /// re-widen to the unrestricted `(allow file-ioctl)` fails loudly.
+    /// Scoped-for-every-gate is deliberate: the gate profile cannot know at
+    /// resolve time whether the contract carries pty assertions (merge
+    /// gates never see one), and the scoped surface is the pty pair alone.
+    #[test]
+    fn gate_profile_extras_scopes_file_ioctl_to_pty_devices() {
+        let extras = gate_profile_extras();
+        assert!(
+            extras.contains(
+                "(allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))"
+            ),
+            "the ioctl allow must be scoped to the pty device pair:\n{extras}"
+        );
+        assert!(
+            !extras.contains("(allow file-ioctl)"),
+            "the unrestricted ioctl allow must not return:\n{extras}"
+        );
+        // The rest of the pty surface stays (multiplexer read+write, slave
+        // read+write) — the scoped ioctl is useless without them.
+        assert!(extras.contains("(literal \"/dev/ptmx\")"), "{extras}");
+        assert!(extras.contains("^/dev/tty[p-t][0-9a-f]+$"), "{extras}");
+        assert!(
+            extras.contains("(allow signal (target same-sandbox))"),
+            "{extras}"
         );
     }
 

@@ -724,6 +724,7 @@ fn counts_plan(milestones: usize, features: usize) -> Plan {
         considered_alternatives: None,
         command_grants: Vec::new(),
         touch_set: Vec::new(),
+        standards_manifest: None,
     }
 }
 
@@ -745,6 +746,7 @@ fn mission_plan(state: &MissionState) -> Plan {
         considered_alternatives: None,
         command_grants: state.mission.command_grants.clone(),
         touch_set: state.mission.touch_set.clone(),
+        standards_manifest: state.mission.standards_manifest.clone().map(Box::new),
         validation_contract: state.mission.validation_contract.clone(),
         milestones: state
             .mission
@@ -1077,6 +1079,7 @@ mod tests {
                     considered_alternatives: None,
                     command_grants: vec![],
                     touch_set: vec![],
+                    standards_manifest: None,
                 },
                 base_sha: None,
             },

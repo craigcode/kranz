@@ -46,6 +46,7 @@ fn sample_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 

@@ -10,11 +10,15 @@ side.
 ## How it works
 
 Two halves, split by Gas City's order-exec deadline: `bin/kranz-dispatch`
-(the order, on a cooldown) marks ready `kranz`-labeled beads `in_progress`
-(direct status write, not an atomic claim) and spools
+(the order, fired instantly on `bead.created`) marks ready `kranz`-labeled
+beads `in_progress` (direct status write, not an atomic claim) and spools
 mission briefs; `bin/kranz-city-worker` (a supervised long-running session —
 see `agents/kranz-worker/`) drains the spool strictly serially, running each
-brief and mapping the exit code back into City state. Dispatch flow:
+brief and mapping the exit code back into City state. A slow cooldown
+backstop order (`orders/kranz-dispatch-backstop.toml`, 15m) re-runs the same
+`kranz-dispatch` so a dead claim in a quiet city is reclaimed and a bead
+re-readied after a reopen/refine (which fires `bead.updated`, not
+`bead.created`) is picked up. Dispatch flow:
 
 1. Bead fields → ticket-shaped `mission.md`
    (`title → ## Goal`, `description → ## Context`,
@@ -45,17 +49,18 @@ thread, CLI) — the escalation mail says where.
 2. Copy `orders/kranz-dispatch.toml` into your city's `orders/`, set
    `KRANZ_RIG_DIR`, put `bin/kranz-dispatch` (and `kranz`, `jq`) on PATH.
 3. Create work: `gc bd create "<goal>" --context "..." --acceptance "..."
-   --label kranz`, then `gc order run kranz-dispatch` (or let the cooldown
-   trigger fire).
+   --label kranz`; the `bead.created` event fires `kranz-dispatch`
+   instantly. A re-readied bead (reopened then refined) and a dead claim in
+   a quiet city are picked up by the 15-minute backstop order, or immediately
+   by `gc order run kranz-dispatch`.
 
 Bead-authoring rule of thumb: briefs must be self-sufficient — kranz exits 3
 (underspecified) rather than guessing, and the bead bounces back for
 refinement. Put constraints in `--context` and testable outcomes in
 `--acceptance`.
 
-Known spike-era deviations and the production path (event triggers, sling
-targets via agent-script, multi-rig routing): see `docs/gascity.md` in the
-kranz repo.
+Known spike-era deviations and the production path (multi-rig routing, sling
+targets via agent-script): see `docs/gascity.md` in the kranz repo.
 
 ## Testing the bridge
 

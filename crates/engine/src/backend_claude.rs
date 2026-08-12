@@ -581,10 +581,11 @@ fn tool_use_summary(tool: &str, input: Option<&Value>) -> String {
 /// permission-rule and hook blocks (§4.7 guardrail surfacing) plus the
 /// structured refusal shapes observed in the m-9e4ef3/m-3cda6a blocks that
 /// carry neither word — "requires approval", "Contains expansion", and
-/// "output redirection … blocked". Those are matched unconditionally (as
-/// "hook" already was): a false positive parks an operator-visible,
-/// deny-by-default grant request, while a false negative silently aborts
-/// the session with deniedToolResults=0 — the miss is the expensive one.
+/// "output redirection … blocked". Those are matched only when they carry
+/// denial context (is_error, or a block/deny/reject phrase), not by bare
+/// substring: a false positive parks an operator-visible, deny-by-default
+/// grant request, while a false negative silently aborts the session with
+/// deniedToolResults=0 — the miss is the expensive one.
 fn parse_user(value: Value) -> Vec<AgentEvent> {
     let blocks = value
         .pointer("/message/content")
@@ -603,9 +604,12 @@ fn parse_user(value: Value) -> Vec<AgentEvent> {
             .unwrap_or(false);
         let lower = text.to_lowercase();
         let denied = (is_error && lower.contains("permission"))
-            || lower.contains("hook")
-            || lower.contains("requires approval")
-            || lower.contains("contains expansion")
+            || (lower.contains("hook")
+                && (lower.contains("block")
+                    || lower.contains("denied")
+                    || lower.contains("reject")))
+            || (is_error && lower.contains("requires approval"))
+            || (is_error && lower.contains("contains expansion"))
             || (lower.contains("output redirection") && lower.contains("blocked"));
         events.push(AgentEvent::ToolResult {
             tool: None,

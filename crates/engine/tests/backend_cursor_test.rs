@@ -511,6 +511,7 @@ async fn run_home_capture(
         AuthVerdict::Inconclusive,
         &[],
         None,
+        None,
     )
     .await
     .expect("run_worker should complete");
@@ -695,6 +696,7 @@ async fn backend_cursor_cli_death_mid_run_leaves_a_resumable_event_log() {
         &[],
         AuthVerdict::Inconclusive,
         &[],
+        None,
         None,
     )
     .await

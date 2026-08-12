@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: workerCandidates fan-out (2..=8, validated), per-stream worktrees+branches, CandidateLink on worker.spawned (additive), parks for judgement with no winner path, consent multiplier in estimate+plan.md, failure isolation. dispatch_pool filter: 19 green; full gates green."
 title: Heterogeneous dispatch — one unit of work to N backends
 priority: 2
 schedule: once
@@ -18,7 +20,12 @@ Diversity across harnesses is the point — differently-shaped scaffolding
 produces differently-shaped errors; cross-provider scrutiny
 (docs/reviews/ampcode.md §1) is the two-stream degenerate case. Cost
 multiplies by N: plan approval must show the multiplier as part of spend
-consent, and the per-mission budget applies to the sum.
+consent, and the per-mission budget applies to the sum. Reference
+mechanics from the Warp/Oz scan (2026-08-04): harness-agnostic agent
+addressing and lifecycle state events (in-progress/succeeded/failed/
+blocked/cancelled) on a durable bus — kranz's equivalent is a unified
+per-session lifecycle vocabulary mapped from every backend into the event
+log once, so folds and dashboards never special-case per backend.
 
 ## Acceptance hints
 - Dispatching one brief to two mock backends yields two sibling run records

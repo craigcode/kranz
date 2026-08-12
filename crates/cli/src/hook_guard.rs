@@ -25,6 +25,7 @@
 //! nothing but the spec file and stdin — no new credential or env channel.
 
 use kranz_engine::hook_gates::{GuardVerdict, HookGateRecord, HookGateSpec};
+use kranz_engine::hook_status::STDIN_PAYLOAD_MAX_BYTES;
 use std::io::Read;
 use std::path::Path;
 
@@ -49,14 +50,30 @@ pub fn run_hook_guard(config: &Path, stdin: &mut impl Read) -> i32 {
         }
     };
 
-    let mut payload_text = String::new();
-    if let Err(e) = stdin.read_to_string(&mut payload_text) {
+    // Bounded read — the same idiom and cap as the hook-status relay
+    // (crates/cli/src/hook_status.rs, 14th-pass review: this read was
+    // unbounded): the payload is CLI-produced but the channel is
+    // session-adjacent, so a boundless read would let a broken or hostile
+    // producer exhaust memory in the guard. Over the cap fails OPEN like
+    // any guard error — enforcement never silently blocks on guard failure;
+    // the engine-side sweep stays authoritative.
+    let mut payload_bytes = Vec::new();
+    if let Err(e) = stdin
+        .take((STDIN_PAYLOAD_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut payload_bytes)
+    {
         return guard_error(
             &spec,
             &format!("failed to read the hook payload on stdin: {e}"),
         );
     }
-    let payload: serde_json::Value = match serde_json::from_str(&payload_text) {
+    if payload_bytes.len() > STDIN_PAYLOAD_MAX_BYTES {
+        return guard_error(
+            &spec,
+            &format!("hook payload exceeds {STDIN_PAYLOAD_MAX_BYTES} bytes"),
+        );
+    }
+    let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
         Ok(payload) => payload,
         Err(e) => {
             return guard_error(&spec, &format!("hook payload was not JSON: {e}"));
@@ -207,5 +224,28 @@ mod tests {
         let stdin = payload("Write", Some("src/lib.rs")).into_bytes();
         let code = run_hook_guard(&missing, &mut stdin.as_slice());
         assert_eq!(code, 1);
+    }
+
+    /// 14th-pass review: the stdin read is bounded like the hook-status
+    /// relay's — an oversized payload fails OPEN (exit 1, an `error`
+    /// record), never an unbounded buffer in the guard.
+    #[test]
+    fn hook_guard_stdin_read_is_bounded_fail_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_spec(dir.path(), &["src/**"]);
+
+        let oversized = vec![b'x'; STDIN_PAYLOAD_MAX_BYTES + 1];
+        let code = run_hook_guard(&config, &mut oversized.as_slice());
+        assert_eq!(code, 1, "over the cap is a guard error, failing open");
+        let records = std::fs::read_to_string(dir.path().join("records.jsonl")).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(records.lines().next().unwrap()).unwrap();
+        assert_eq!(record["verdict"], "error");
+
+        // Exactly AT the cap the read still proceeds (and fails open on the
+        // non-JSON bytes) — the bound does not eat legitimate payloads.
+        let at_cap = vec![b'x'; STDIN_PAYLOAD_MAX_BYTES];
+        let code = run_hook_guard(&config, &mut at_cap.as_slice());
+        assert_eq!(code, 1, "at the cap the payload is read and judged");
     }
 }

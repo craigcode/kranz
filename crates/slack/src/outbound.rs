@@ -255,6 +255,7 @@ mod tests {
                 deny_exceptions: vec![],
                 egress_grants: vec![],
                 executor_route: None,
+                standards_manifest: None,
             },
             runs: Default::default(),
             totals: TokenUsage::default(),
@@ -308,6 +309,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         };
         let out = classify(
             &ev(EventKind::PlanApproved {
@@ -345,6 +347,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         };
         let out = classify(
             &ev(EventKind::PlanRevisionProposed {

@@ -3,6 +3,8 @@ title: Human-approved, exact, expiring Flight Rules waiver decisions
 priority: 1
 schedule: once
 blocked-by: [flight-rules-resolution-pin, flight-rules-finding-provenance]
+state: done
+state-note: Implemented — standards.waiver.approved event (rule id+revision, manifest digest, approval seq, finding fingerprint, affected paths, affected-path-diff digest, reason, local-operator + cli surface, expiry), `kranz standards waive` with fail-closed refusals (waivable:false / unpinned rule / revision mismatch / absent finding / already-waived / past expiry), the coverage fold's waived join (exactly-one subtraction, log-frontier expiry, human-surface check) named through the shared matrix renderer. 16 flight_rules_waiver_* tests; full workspace gates green.
 ---
 
 ## Goal
@@ -29,3 +31,6 @@ out of scope.
 - Replay/report/evidence name the waiver and reason without relying on free-form orchestrator decision parsing.
 - No `--ignore-standards`, auto-waive, wildcard, or permanent default exists.
 - Anti-vacuity: unique filter `flight_rules_waiver_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-344's entire binding surface is absent from the base this mission branches from (main @ 90a4bdc): `git grep -ci standards main -- crates apps` returns exactly one hit, a doc comment at crates/engine/src/pack.rs:7. There is no schema-4 `[standards]` root (pack.rs:194-208 supports only SCHEMA_BASE 2 and SCHEMA_CONTRACT 3), so no rule can declare `waivable: true` or carry a `revision`; types.rs:518 `Finding` is still subject/severity/evidence/suggestedFix/class with no rule id, revision, checke … (truncated)

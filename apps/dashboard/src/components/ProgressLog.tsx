@@ -97,6 +97,31 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
         text: `Finding [${e.payload.finding.severity}]: ${truncate(e.payload.finding.evidence, 80)}`,
         tone: 'warn',
       };
+    case 'gate.result':
+      return {
+        text: `Gate ${e.payload.gate}: ${e.payload.verdict}${(e.payload.ruleIds ?? []).length > 0 ? ` (${e.payload.ruleIds?.join(', ')})` : ''}`,
+        tone: e.payload.verdict === 'pass' ? 'ok' : 'bad',
+      };
+    case 'standards.resolved':
+      return {
+        text: `Flight Rules resolved: ${e.payload.rules.length} rule(s), ${e.payload.digest.slice(0, 10)}…`,
+        tone: 'info',
+      };
+    case 'standards.drifted':
+      return {
+        text: `Flight Rules drift refused merge: ${truncate(e.payload.changedRules.join('; '), 76)}`,
+        tone: 'bad',
+      };
+    case 'standards.waiver.approved':
+      return {
+        text: `Standards waiver approved: ${e.payload.ruleId} r${e.payload.ruleRevision}`,
+        tone: 'warn',
+      };
+    case 'standards.attestation.approved':
+      return {
+        text: `Standards attestation approved: ${e.payload.ruleId} r${e.payload.ruleRevision}`,
+        tone: 'ok',
+      };
     case 'validator.tamper': {
       const p = e.payload;
       const what =
