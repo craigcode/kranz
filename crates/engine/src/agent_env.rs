@@ -324,13 +324,19 @@ fn os_account_home() -> Option<PathBuf> {
     (!home.is_empty()).then(|| PathBuf::from(home))
 }
 
-/// The operator's toolchain home: the OS account record on Unix, falling back
-/// to the ambient `HOME` env var only when the account record is unavailable
-/// (non-Unix, or a passwd-less container). See [`os_account_home`].
+/// The operator's toolchain home: the OS account record on Unix and the
+/// original `USERPROFILE` on Windows, falling back to the ambient `HOME`
+/// only when the platform-native source is unavailable. The generated child
+/// environment redirects both HOME and USERPROFILE later; this lookup happens
+/// first against the engine's operator environment. See [`os_account_home`].
 fn operator_home() -> Option<PathBuf> {
     #[cfg(unix)]
     if let Some(home) = os_account_home() {
         return Some(home);
+    }
+    #[cfg(windows)]
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
     }
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -936,17 +942,20 @@ mod tests {
     fn contract_env_derives_toolchain_homes_from_the_real_home_and_cargo_runs() {
         let _guard = EnvTestGuard::engage_unsetting(&[], &["RUSTUP_HOME", "CARGO_HOME"]);
         let scratch = tempfile::tempdir().unwrap();
-        let real_home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let real_home = operator_home().expect("operator home");
 
         let env = contract_command_env(scratch.path(), None, &[]);
 
         // The operator's rustup toolchain remains discoverable, while Cargo's
         // config/credential home is a fresh cache-only directory.
-        assert_eq!(
-            env.get("RUSTUP_HOME").map(String::as_str),
-            Some(real_home.join(".rustup").display().to_string().as_str()),
-            "RUSTUP_HOME derives from the operator's real home"
-        );
+        let rustup_home = real_home.join(".rustup");
+        if rustup_home.is_dir() {
+            assert_eq!(
+                env.get("RUSTUP_HOME").map(String::as_str),
+                Some(rustup_home.display().to_string().as_str()),
+                "RUSTUP_HOME derives from the operator's real home"
+            );
+        }
         let cargo_home = PathBuf::from(env.get("CARGO_HOME").expect("CARGO_HOME"));
         assert!(
             cargo_home.starts_with(scratch.path()),

@@ -9562,6 +9562,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("codex".to_string());
         cfg.skip_functional = true;
+        cfg.validator_allow_uncontained_degrade = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
@@ -9630,6 +9631,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig::default();
         cfg.validator_scrutiny.backend = Some("droid".to_string());
         cfg.skip_functional = true;
+        cfg.validator_allow_uncontained_degrade = true;
 
         let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             crate::backend_mock::MockScript::single_shot_json(&serde_json::json!({
@@ -10125,6 +10127,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             worker_isolation: WorkerIsolation::Checkout,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, &root, "goal", cfg).unwrap();
@@ -10186,6 +10189,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             worker_isolation: WorkerIsolation::Checkout,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         let mut engine = MissionEngine::create(backend, root, "goal", cfg).unwrap();
@@ -10358,6 +10362,7 @@ pub(crate) mod tests {
             let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![]));
             let backend: Arc<dyn AgentBackend> = mock.clone();
             let mut engine = single_milestone_engine(backend, &root);
+            engine.state.config.validator_allow_uncontained_degrade = false;
             let err = engine
                 .validation_round(0)
                 .await
@@ -10756,6 +10761,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         cfg.worker.backend = Some("local".to_string());
@@ -11335,6 +11341,7 @@ pub(crate) mod tests {
         let cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
 
@@ -11389,6 +11396,7 @@ pub(crate) mod tests {
         let mut cfg = MissionConfig {
             skip_functional: true,
             max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
             ..MissionConfig::default()
         };
         cfg.worker.backend = Some("local".to_string());

@@ -368,6 +368,10 @@ fn worktree_cfg() -> MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
         worker_isolation: WorkerIsolation::Worktree,
+        // Validator behavior is under test here, not the host sandbox. Opt in
+        // explicitly so the same fixtures can run on uncontainable Windows
+        // without changing the production fail-closed default.
+        validator_allow_uncontained_degrade: true,
         ..MissionConfig::default()
     }
 }
@@ -377,6 +381,7 @@ fn checkout_cfg() -> MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
         worker_isolation: WorkerIsolation::Checkout,
+        validator_allow_uncontained_degrade: true,
         ..MissionConfig::default()
     }
 }

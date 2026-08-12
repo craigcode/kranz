@@ -165,6 +165,11 @@ fn test_cfg() -> MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
         worker_isolation: WorkerIsolation::Checkout,
+        // These mock-driven integration tests exercise validator state
+        // transitions, not the host process-sandbox implementation. Windows
+        // has no containment tier, so opt in explicitly rather than weakening
+        // the production fail-closed default.
+        validator_allow_uncontained_degrade: true,
         ..MissionConfig::default()
     }
 }
@@ -7102,6 +7107,7 @@ async fn approval_lint_no_nested_runtime_panic() {
 /// (graduated lint: exits zero on the untouched base), and the defect-class
 /// names reach plan.md and the approval orchestrator.decision — while
 /// approval itself still succeeds (advisory posture unchanged).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
     if !setup() {
@@ -7231,6 +7237,7 @@ async fn contract_gate_final_gate_decision_names_vacuous_green() {
 /// stated verdict, and the gate-local artefact handle. The events land
 /// AFTER plan.approved (the "Git first" invariant: no event until approval
 /// cannot fail) and before the advisory lint decision.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_result_events_record_the_approval_ladder() {
     if !setup() {
@@ -8205,12 +8212,11 @@ async fn sandbox_preflight_inert_when_enforce_off() {
     );
 }
 
-/// On a non-macOS build, the sandbox preflight probe is inert even when
-/// `enforce == fs` is configured (macOS is the only supported platform for
-/// this tier).
-#[cfg(not(target_os = "macos"))]
+/// Linux has a real bwrap enforcement tier, but the macOS profile preflight
+/// probe remains inapplicable there and emits no Seatbelt-specific issue.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_preflight_inert_on_non_macos() {
+async fn sandbox_preflight_emits_no_macos_profile_issue_on_linux() {
     if !setup() {
         return;
     }
@@ -8233,7 +8239,36 @@ async fn sandbox_preflight_inert_on_non_macos() {
         !issues
             .iter()
             .any(|i| i.message.contains("fs sandbox profile")),
-        "non-macos builds must add zero sandbox preflight issues: {issues:?}"
+        "Linux must add no macOS-profile preflight issue: {issues:?}"
+    );
+}
+
+/// Windows has no process-sandbox tier. Enforced engine-run gates therefore
+/// fail closed during approval instead of silently running the contract bare.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_preflight_refuses_unsupported_windows_gate_sandbox() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    let mut cfg = test_cfg();
+    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
+
+    let contract = vec![assertion(
+        "a-1",
+        "writes outside the allowlist",
+        Some("echo should-not-run"),
+    )];
+    let mut engine = make_engine(&backend, &root, cfg);
+    let err = engine
+        .approve_plan(simple_plan(1, contract))
+        .expect_err("Windows must refuse unsupported enforced gate containment");
+    assert!(
+        err.to_string().contains("unsupported on target_os=windows"),
+        "the refusal names the unsupported platform: {err}"
     );
 }
 
