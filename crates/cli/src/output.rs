@@ -760,6 +760,84 @@ pub fn render_provenance(chain: &ProvenanceChain) -> String {
         ));
     }
 
+    // Standards coverage (KRZ-343, design D-H): the rule coverage matrix
+    // folded into the chain — each applicable pinned rule's disposition
+    // with its mechanism and evidence joins, and any drift refusals. A
+    // mission with no approved pin (every pre-Flight-Rules log) renders
+    // NOTHING here, so those text views stay byte-identical.
+    if let Some(coverage) = &chain.standards {
+        out.push('\n');
+        out.push_str("Standards coverage\n");
+        out.push_str(&format!(
+            "  pack {} ({}, {}) — root {}, sha256:{}\n",
+            coverage.pack_name,
+            coverage.pack_dir,
+            coverage.source,
+            coverage.standards_root,
+            coverage.digest
+        ));
+        let resolution = match (coverage.resolution_seq, coverage.resolved_at) {
+            (Some(seq), Some(ts)) => {
+                format!(
+                    "standards.resolved seq {seq} (evaluated {})",
+                    ts.to_rfc3339()
+                )
+            }
+            _ => "no standards.resolved event in this log".to_string(),
+        };
+        out.push_str(&format!(
+            "  pinned at plan approval (seq {}); {resolution}\n",
+            coverage.approval_seq
+        ));
+        for rule in &coverage.rules {
+            let checker = rule.checker.as_deref().unwrap_or("-");
+            let evidence = if rule.evidence.is_empty() {
+                "no evidence named this rule (never rendered as pass)".to_string()
+            } else {
+                rule.evidence
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} seq {} {} {} `{}`",
+                            entry.event, entry.seq, entry.mechanism, entry.bearing, entry.reference
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let note = rule
+                .note
+                .as_deref()
+                .map(|note| format!(" — {}", one_line(note, 120)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {} r{}  {} {}  {}  {}{}  — {}\n",
+                rule.id,
+                rule.revision,
+                rule.lifecycle,
+                rule.level,
+                checker,
+                rule.disposition.as_str().to_uppercase(),
+                note,
+                evidence
+            ));
+        }
+        for record in &coverage.drift {
+            let current = record
+                .current_digest
+                .as_deref()
+                .map(|digest| format!("sha256:{digest}"))
+                .unwrap_or_else(|| "(no readable manifest on the live base)".to_string());
+            out.push_str(&format!(
+                "  [seq {}] policy drift refused: approved sha256:{} → current {} — {}\n",
+                record.seq,
+                record.approved_digest,
+                current,
+                one_line(&record.changed_rules.join("; "), 120)
+            ));
+        }
+    }
+
     out.push('\n');
     out.push_str("Sessions\n");
     if chain.sessions.is_empty() {
@@ -1167,6 +1245,7 @@ mod tests {
                 artefact_detail: None,
                 score: Some(score),
                 threshold: Some(threshold),
+                rule_ids: Vec::new(),
             }
         }
 
@@ -1486,6 +1565,7 @@ mod tests {
                 considered_alternatives: None,
                 command_grants: vec![],
                 touch_set: vec![],
+                standards_manifest: None,
             }
         }
 
@@ -1506,6 +1586,7 @@ mod tests {
                 artefact_detail: None,
                 score: None,
                 threshold: None,
+                rule_ids: Vec::new(),
             }
         }
 
@@ -1767,6 +1848,129 @@ mod tests {
                 "the empty ledger reads plainly:\n{text}"
             );
         }
+
+        /// KRZ-343 (D-H): the text view renders the standards coverage
+        /// matrix — each applicable rule's disposition with its mechanism
+        /// and evidence joins — while a pin-less mission renders NO section
+        /// (byte-identical pre-Flight-Rules output).
+        #[test]
+        fn flight_rules_provenance_cli_text_renders_standards_coverage() {
+            let tmp = TempDir::new().unwrap();
+            let paths = MissionPaths::new(tmp.path(), "m-1");
+            let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+            let rule = |id: &str, revision: u64| kranz_engine::types::PinnedRule {
+                id: id.to_string(),
+                revision,
+                rfc: "RFC-001".to_string(),
+                level: "must".to_string(),
+                effective_status: "enforced".to_string(),
+                statement: format!("statement for {id}"),
+                domains: Vec::new(),
+                stages: vec!["validation".to_string()],
+                when_paths: Vec::new(),
+                task_classes: Vec::new(),
+                checker: Some("gate:zz-gate".to_string()),
+                waivable: false,
+            };
+            let mut plan = sample_plan();
+            plan.standards_manifest = Some(Box::new(kranz_engine::types::StandardsPin {
+                pack_name: "zz-pack".to_string(),
+                pack_dir: "vendor/pack".to_string(),
+                standards_root: "standards".to_string(),
+                digest: "ab".repeat(32),
+                source: kranz_engine::types::StandardsPinSource::RepoTracked,
+                task_class: None,
+                touch_set: vec!["crates/**".to_string()],
+                context_paths: Vec::new(),
+                gates: Vec::new(),
+                rules: vec![rule("ZZ-FAIL-001", 2), rule("ZZ-QUIET-001", 1)],
+            }));
+            let mut gate = gate_result(
+                "zz-gate",
+                GateSurface::FinalGate,
+                GateKind::Deterministic,
+                0,
+                "file:runs/gate-zz.jsonl",
+            );
+            if let EventKind::GateResult { rule_ids, .. } = &mut gate {
+                *rule_ids = vec!["ZZ-QUIET-001".to_string()];
+            }
+            for kind in [
+                EventKind::MissionCreated {
+                    goal: "ship the thing".into(),
+                    base_branch: "main".into(),
+                    mission_branch: "kranz/mission-x".into(),
+                    config: MissionConfig::default(),
+                },
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: Some("deadbeef".to_string()),
+                },
+                EventKind::StandardsResolved {
+                    source: "repo-tracked".to_string(),
+                    pack_name: "zz-pack".to_string(),
+                    standards_root: "standards".to_string(),
+                    digest: "ab".repeat(32),
+                    stage: "approval".to_string(),
+                    task_class: None,
+                    touch_set: vec!["crates/**".to_string()],
+                    context_paths: Vec::new(),
+                    rules: Vec::new(),
+                    approval_seq: 2,
+                },
+                gate,
+                EventKind::ValidationFinding {
+                    milestone_id: "ms-1".into(),
+                    run_id: "v-1".into(),
+                    finding: kranz_engine::types::Finding {
+                        subject: "a-1".into(),
+                        severity: "major".into(),
+                        evidence: "the rule failed".into(),
+                        suggested_fix: String::new(),
+                        class: String::new(),
+                        rule: Some(kranz_engine::types::RuleCitation {
+                            id: "ZZ-FAIL-001".to_string(),
+                            revision: 2,
+                            source: "zz-pack standards".to_string(),
+                            digest: "ab".repeat(32),
+                            lifecycle: "enforced".to_string(),
+                            level: "must".to_string(),
+                            checker: Some("gate:zz-gate".to_string()),
+                        }),
+                    },
+                },
+                EventKind::MissionCompleted {},
+            ] {
+                log.append(kind).unwrap();
+            }
+            drop(log);
+
+            let chain = compute_provenance(tmp.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            for line in [
+                "Standards coverage",
+                "pack zz-pack (vendor/pack, repo-tracked) — root standards",
+                "pinned at plan approval (seq 2); standards.resolved seq 3 (evaluated ",
+                "ZZ-FAIL-001 r2  enforced must  gate:zz-gate  FAILED  — validation.finding seq 5 v-1 fail `a-1`",
+                "ZZ-QUIET-001 r1  enforced must  gate:zz-gate  PASSED  — gate.result seq 4 zz-gate pass `file:runs/gate-zz.jsonl`",
+            ] {
+                assert!(text.contains(line), "missing line: {line}\n{text}");
+            }
+            // The JSON form carries the same matrix.
+            let json = render_provenance_json(&chain).unwrap();
+            assert!(json.contains("\"standards\""), "{json}");
+            assert!(json.contains("\"disposition\": \"failed\""), "{json}");
+
+            // Pin-less mission (the seed_repo fixture): NO section, and the
+            // JSON has no standards key — pre-Flight-Rules byte-compat.
+            let tmp2 = TempDir::new().unwrap();
+            seed_repo(tmp2.path());
+            let chain = compute_provenance(tmp2.path(), "m-1").unwrap();
+            let text = render_provenance(&chain);
+            assert!(!text.contains("Standards coverage"), "{text}");
+            let json = render_provenance_json(&chain).unwrap();
+            assert!(!json.contains("\"standards\""), "{json}");
+        }
     }
 
     #[test]
@@ -1797,6 +2001,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         };
         let events = vec![
             Event {
@@ -1959,6 +2164,7 @@ mod tests {
                 artefact_detail: None,
                 score: Some(1.0),
                 threshold: Some(1.0),
+                rule_ids: Vec::new(),
             })
             .unwrap();
 
@@ -1970,5 +2176,105 @@ mod tests {
             assert_eq!(round_tripped.evaluations[0].score, Some(1.0));
             assert_eq!(round_tripped.evaluations[0].threshold, Some(1.0));
         }
+    }
+}
+pub fn render_standards_metrics(
+    report: &kranz_engine::standards_metrics::StandardsMetricsReport,
+) -> String {
+    fn rate(value: Option<f64>) -> String {
+        value
+            .map(|value| format!("{:.1}%", value * 100.0))
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Flight Rules effectiveness (minimum {} samples for conclusions)",
+        report.minimum_samples
+    );
+    for definition in &report.definitions {
+        let _ = writeln!(out, "  definition: {definition}");
+    }
+    if report.rules.is_empty() {
+        out.push_str("no approval-pinned Flight Rules evidence recorded yet\n");
+        return out;
+    }
+    for rule in &report.rules {
+        let _ = writeln!(
+            out,
+            "{} r{} — applicable {}, evaluated {}, advisory {}, failed {}, blocked {}, waived {}, not-evaluated {}, false-green {}",
+            rule.id,
+            rule.revision,
+            rule.applicable_missions,
+            rule.evaluated_missions,
+            rule.advisory_missions,
+            rule.failed_missions,
+            rule.blocked_missions,
+            rule.waived_missions,
+            rule.not_evaluated_missions,
+            rule.false_green_missions,
+        );
+        let _ = writeln!(
+            out,
+            "  rates: evaluation {}, advisory {}, failure {}, block {}, waiver {}; mean resolution {}",
+            rate(rule.evaluation_rate),
+            rate(rule.advisory_rate),
+            rate(rule.failure_rate),
+            rate(rule.block_rate),
+            rate(rule.waiver_rate),
+            rule.mean_resolution_ms
+                .map(|millis| format!("{millis:.0} ms"))
+                .unwrap_or_else(|| "—".to_string()),
+        );
+        if rule.conclusions_suppressed {
+            let samples = if rule.evaluated_missions == 0 {
+                rule.applicable_missions
+            } else {
+                rule.evaluated_missions
+            };
+            let _ = writeln!(
+                out,
+                "  conclusions suppressed: {samples} relevant sample(s), need {}",
+                report.minimum_samples
+            );
+        }
+        if let Some(scores) = &rule.score_distribution {
+            let _ = writeln!(
+                out,
+                "  scores: n {}, min {:.3}, mean {:.3}, max {:.3}, near threshold {}",
+                scores.samples, scores.minimum, scores.mean, scores.maximum, scores.near_threshold,
+            );
+        }
+        for smell in &rule.smells {
+            let _ = writeln!(
+                out,
+                "  smell {} (n={}): {} — {}",
+                smell.kind, smell.samples, smell.observed, smell.definition
+            );
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod standards_metrics_output_tests {
+    use super::*;
+
+    #[test]
+    fn flight_rules_metrics_cli_empty_report_keeps_denominator_definition_visible() {
+        let report = kranz_engine::standards_metrics::StandardsMetricsReport {
+            minimum_samples: 5,
+            definitions: vec!["applicable = approval-pinned rule/revision".to_string()],
+            rules: Vec::new(),
+        };
+        let text = render_standards_metrics(&report);
+        assert!(text.contains("minimum 5 samples"), "{text}");
+        assert!(text.contains("definition: applicable"), "{text}");
+        assert!(
+            text.contains("no approval-pinned Flight Rules evidence"),
+            "{text}"
+        );
     }
 }

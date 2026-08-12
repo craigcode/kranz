@@ -541,6 +541,7 @@ mod tests {
             considered_alternatives: None,
             command_grants: vec![],
             touch_set: vec![],
+            standards_manifest: None,
         }
     }
 
@@ -555,6 +556,7 @@ mod tests {
             artefact_detail: None,
             score: None,
             threshold: None,
+            rule_ids: Vec::new(),
         }
     }
 
@@ -742,6 +744,7 @@ mod tests {
                 EventKind::FeatureFailed {
                     feature_id: "f-1-2".to_string(),
                     reason: "gave up".to_string(),
+                    commits: Vec::new(),
                 },
             ),
             // Engine-owned workspace-gate lift: NOT a human judgement.

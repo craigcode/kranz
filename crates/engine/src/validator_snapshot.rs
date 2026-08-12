@@ -48,8 +48,11 @@
 //! `sandbox.enforce`, with the snapshot as the sole writable root, the
 //! real checkout's source tree read-denied, and the shared `.git` readable
 //! but write-denied. Where the platform or backend cannot contain, the
-//! round records the loud degradation decision and the snapshot plus the
-//! tripwire are the remaining layers.
+//! resolution FAILS CLOSED by default (ticket
+//! `validator-containment-degrade-fail-closed`); only the explicit
+//! `validatorAllowUncontainedDegrade` opt-in runs the round anyway, with
+//! the loud degradation decision recorded and the snapshot plus the
+//! tripwire as the remaining layers.
 //!
 //! Two honest limits, both covered by the fingerprint-turned-tripwire on
 //! the real checkout:

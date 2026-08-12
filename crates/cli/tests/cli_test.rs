@@ -66,6 +66,7 @@ fn sample_plan() -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -711,6 +712,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
             EventKind::FeatureFailed {
                 feature_id: "f-1-2".to_string(),
                 reason: "gave up".to_string(),
+                commits: Vec::new(),
             },
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
@@ -1036,6 +1038,7 @@ fn status_icons_cover_terminal_states() {
             EventKind::FeatureFailed {
                 feature_id: "f-1-1".to_string(),
                 reason: "no good".to_string(),
+                commits: Vec::new(),
             },
             EventKind::FeatureSkipped {
                 feature_id: "f-1-2".to_string(),

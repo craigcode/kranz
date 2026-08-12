@@ -41,7 +41,9 @@ use kranz_engine::error::EngineError;
 use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::git_ops::KranzCommitMetadata;
-use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::merge::{
+    merge_mission_with_standards_evidence, MergeReport, StandardsMergeEvidence,
+};
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
 use kranz_engine::queue;
@@ -706,6 +708,19 @@ impl MissionHost {
             ))
         })?;
         let mission_branch = state.mission.mission_branch.clone();
+        // The approved Flight Rules pin (KRZ-342, D-E) rides into the merge:
+        // a repo-tracked pin makes merge re-resolve the live base policy
+        // against the exact scratch integration diff and refuse on
+        // enforced-set drift; `None` keeps the merge byte-identical.
+        let standards_pin = state.mission.standards_manifest.clone();
+        let standards_coverage = kranz_engine::standards_coverage::standards_coverage(id, &events);
+        let standards_evidence = StandardsMergeEvidence::from_mission_events(
+            id,
+            standards_pin.as_ref(),
+            standards_coverage.as_ref(),
+            &events,
+            chrono::Utc::now(),
+        );
         let metadata = KranzCommitMetadata {
             mission_id: state.mission.id.clone(),
             cost_usd: state.total_cost_usd,
@@ -743,12 +758,14 @@ impl MissionHost {
         }
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            let report = merge_mission(
+            let report = merge_mission_with_standards_evidence(
                 &repo,
                 &base_branch,
                 &base_sha,
                 &mission_branch,
                 Some(metadata),
+                standards_pin.as_ref(),
+                &standards_evidence,
                 |cmd, cwd| {
                     if gate_policy.enforces_on_this_host() {
                         kranz_engine::command_exec::run_bounded_gate_command_sandboxed(
@@ -805,6 +822,53 @@ impl MissionHost {
             ))),
             MergeReport::RefusedPreMerge { detail } => Err(ApiError::conflict(format!(
                 "merge refused before it started: {detail}"
+            ))),
+            MergeReport::StandardsDrifted {
+                approved_digest,
+                current_digest,
+                changed_rules,
+            } => {
+                // KRZ-342 (D-E/D-H): the refusal is the merge's answer; the
+                // `standards.drifted` event is its evidence. Append it to the
+                // mission log best-effort — the mission is Complete, so no
+                // engine should hold the log lock; a held lock downgrades to
+                // a server-log warning, never to a silent 4xx.
+                if let Err(error) = EventLog::acquire(
+                    &paths,
+                    id,
+                    std::time::Duration::ZERO,
+                    LockForce::No,
+                )
+                .and_then(|mut log| {
+                    log.append(kranz_engine::events::EventKind::StandardsDrifted {
+                        approved_digest: approved_digest.clone(),
+                        current_digest: current_digest.clone(),
+                        surface: "merge".to_string(),
+                        changed_rules: changed_rules.clone(),
+                    })
+                    .map(|_| ())
+                }) {
+                    tracing::warn!(mission = %id, %error, "standards.drifted event could not be appended; the merge refusal stands");
+                }
+                Err(ApiError::unprocessable(format!(
+                    "refusing to merge: the live base Flight Rules policy drifted from the \
+                     approved pin (approved sha256:{approved_digest}, current {}) — the \
+                     applicable enforced set changed; revalidate and re-approve the mission:\n{}",
+                    current_digest
+                        .as_deref()
+                        .map(|d| format!("sha256:{d}"))
+                        .unwrap_or_else(|| "<unreadable>".to_string()),
+                    changed_rules.join("\n")
+                )))
+            }
+            MergeReport::StandardsFailed {
+                rule_id,
+                checker,
+                output,
+            } => Err(ApiError::unprocessable(kranz_engine::scrub::scrub(
+                &format!(
+                    "Flight Rules merge checker refused {rule_id} ({checker}):\n{output}"
+                ),
             ))),
         }
     }

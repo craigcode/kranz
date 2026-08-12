@@ -165,6 +165,11 @@ fn test_cfg() -> MissionConfig {
         skip_scrutiny: true,
         skip_functional: true,
         worker_isolation: WorkerIsolation::Checkout,
+        // These mock-driven integration tests exercise validator state
+        // transitions, not the host process-sandbox implementation. Windows
+        // has no containment tier, so opt in explicitly rather than weakening
+        // the production fail-closed default.
+        validator_allow_uncontained_degrade: true,
         ..MissionConfig::default()
     }
 }
@@ -202,6 +207,7 @@ fn simple_plan(features: usize, contract: Vec<Assertion>) -> Plan {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     }
 }
 
@@ -261,6 +267,23 @@ fn worker_fail() -> MockScript {
         "result": "fail",
         "summary": "could not make the tests pass",
     }))
+}
+
+/// Worker script: the backend CLI dies in seconds with an auth error and NO
+/// terminal event (ticket worker-spawn-auth-failure-budget) — no result event
+/// is replayed, and the exit carries the "without emitting a result message"
+/// plus the claude auth signature ("Not logged in"). This is the m-eee81f
+/// cursor auth-death shape, on the claude kind the mock backend maps to.
+fn worker_auth_death() -> MockScript {
+    MockScript {
+        events: vec![mock_init("mock-session")],
+        exit: kranz_engine::backend::SessionExit::Failed(
+            "claude exited with exit status: 1 without emitting a result message; \
+             stderr tail: Error: Not logged in"
+                .to_string(),
+        ),
+        ..Default::default()
+    }
 }
 
 /// Validator script returning the given findings.
@@ -818,13 +841,10 @@ async fn invalid_workspace_contract_refused_at_approve() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{"schemaVersion": 1, "secrets": ["sk-live-value-not-a-name"]}"#,
-    )
-    .unwrap();
+    commit_workspace_contract(
+        &root,
+        r#"{"schemaVersion": 1, "secrets": ["sk-live-value-not-a-name"]}"#,
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -889,11 +909,9 @@ async fn valid_workspace_contract_approves() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{
+    commit_workspace_contract(
+        &root,
+        r#"{
             "schemaVersion": 1,
             "bootstrap": ["cargo fetch"],
             "services": [{"name": "db", "start": "docker compose up db", "port": {"policy": {"fixed": 5432}}}],
@@ -902,8 +920,7 @@ async fn valid_workspace_contract_approves() {
             "secrets": ["DATABASE_URL"],
             "mounts": ["/var/cache/cargo"]
         }"#,
-    )
-    .unwrap();
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -986,13 +1003,10 @@ async fn workspace_provider_pin_with_contract_records_schema_version() {
         return;
     }
     let (_dir, root) = init_repo();
-    let kranz_dir = root.join(".kranz");
-    std::fs::create_dir_all(&kranz_dir).unwrap();
-    std::fs::write(
-        kranz_dir.join("workspace.json"),
-        br#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
-    )
-    .unwrap();
+    commit_workspace_contract(
+        &root,
+        r#"{"schemaVersion": 1, "readiness": ["pg_isready"]}"#,
+    );
 
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -4059,6 +4073,13 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
     drop(engine);
     let events = read_log(&paths);
     let types = event_types(&events);
+    let decision_summaries: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::OrchestratorDecision { summary, .. } => Some(summary.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(
         types.contains(&"validation.finding"),
         "gate finding surfaced: {types:?}"
@@ -4079,9 +4100,9 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
         events.iter().any(|e| matches!(
             &e.kind,
             EventKind::OrchestratorDecision { summary, .. }
-                if summary.contains("refused waive") && summary.contains("a-1")
+                if summary.contains("refused model waive") && summary.contains("a-1")
         )),
-        "must surface the refuse-waive decision: {types:?}"
+        "must surface the refuse-waive decision: {types:?}; decisions: {decision_summaries:?}"
     );
 }
 
@@ -4235,6 +4256,228 @@ async fn noncommand_finding_marked_command_broken_does_not_escalate() {
 }
 
 // ---------------------------------------------------------------------------
+// 3d-3. Declared pty-script assertions that never execute cannot green
+// (ticket pty-script-skip-vacuous-green)
+// ---------------------------------------------------------------------------
+
+/// A plan DECLARES a pty-script assertion but no session ever executes it —
+/// here via the host-independent "did not execute" case (check=pty-script
+/// with no script payload; the harness SKIP arms — non-unix host — are
+/// unit-covered in pty_harness). The functional validator greens its round
+/// anyway (the vacuous-green hole), and still the mission must NOT
+/// complete: the final gate finds no validation.pty.transcript verdict for
+/// the declared assertion and raises a critical, non-waivable finding
+/// naming it.
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_pty_script_that_never_executes_cannot_green() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![Assertion {
+        id: "a-pty".to_string(),
+        statement: "the REPL echoes input back".to_string(),
+        check: AssertionCheck::PtyScript,
+        command: None,
+        pty_script: None,
+    }];
+
+    // Session-start order: worker, orchestrator (streaming), functional
+    // validator (greens the round despite the cannot-run evidence line).
+    // Orchestrator turns: seed, dirty-tree, judgement f-1-1, then the
+    // final-gate conversion turn — the finding is class "command-assertion",
+    // so the orchestrator escalates it to the operator as un-runnable here.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            command_broken_reply("a-pty", "declared pty-script never executed on this host"),
+        ]),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Blocked,
+        "a declared pty-script that never executed must not green"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"mission.completed"),
+        "no vacuous green off a green round: {types:?}"
+    );
+    // The gate's finding surfaces on the feed, attributed to the engine,
+    // naming the assertion whose declared validation never ran.
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } => Some(finding.clone()),
+            _ => None,
+        })
+        .expect("final-gate finding surfaced for the unexecuted pty-script");
+    assert_eq!(finding.subject, "a-pty");
+    assert_eq!(
+        finding.class, "command-assertion",
+        "non-waivable class: {finding:?}"
+    );
+    assert!(
+        finding.evidence.contains("validation.pty.transcript")
+            && finding.evidence.contains("never executed"),
+        "the finding names the missing verdict: {}",
+        finding.evidence
+    );
+    let blocked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("milestone.blocked event present");
+    assert!(
+        blocked.contains("a-pty"),
+        "blocked reason names the assertion id: {blocked}"
+    );
+}
+
+/// The other side of the backstop (unix hosts): a declared pty-script that
+/// EXECUTES and PASSES greens exactly as before — the round drives the
+/// scripted session, the transcript event lands, and the final gate's
+/// unexecuted-assertion scan finds the verdict and stays silent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_pty_script_executes_and_passes_greens() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // The pty_harness REPL fixture: a `> ` prompt that echoes input back as
+    // `echo:<line>` and says `bye` on `quit`.
+    let contract = vec![Assertion {
+        id: "a-pty".to_string(),
+        statement: "the REPL echoes input back".to_string(),
+        check: AssertionCheck::PtyScript,
+        command: None,
+        pty_script: Some(PtyScript {
+            command: "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
+                 printf 'bye\\n'; exit 0;; *) printf 'echo:%s\\n> ' \"$line\";; esac; done"
+                .to_string(),
+            steps: vec![
+                PtyStep::Expect {
+                    pattern: "> ".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+                PtyStep::Send {
+                    text: "hello\n".to_string(),
+                },
+                PtyStep::Expect {
+                    pattern: "echo:hello".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+                PtyStep::Send {
+                    text: "quit\n".to_string(),
+                },
+                PtyStep::Expect {
+                    pattern: "bye".to_string(),
+                    regex: false,
+                    timeout_ms: Some(10_000),
+                },
+            ],
+            timeout_secs: Some(30),
+        }),
+    }];
+
+    // Session-start order: worker, orchestrator (streaming), functional
+    // validator (no findings). Orchestrator turns: seed, dirty-tree,
+    // judgement f-1-1, capture (NONE).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(
+        status,
+        MissionStatus::Complete,
+        "a declared pty-script that executed and passed still greens"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    // The round drove the session and recorded the verdict — exactly the
+    // evidence the final gate's backstop keys on.
+    let verdict = events.iter().find_map(|e| match &e.kind {
+        EventKind::ValidationPtyTranscript {
+            assertion_id,
+            verdict,
+            ..
+        } if assertion_id == "a-pty" => Some(*verdict),
+        _ => None,
+    });
+    assert_eq!(
+        verdict,
+        Some(kranz_engine::gate::GateVerdict::Pass),
+        "the executed session's verdict is on the log"
+    );
+    // The gate recorded its posture and found nothing to flag.
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary == "pty-script assertions not re-run at the final gate"
+    )));
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-pty"
+        )),
+        "no finding for an executed pty-script: {:?}",
+        event_types(&events)
+    );
+    // The transcript artifact landed under the mission's runs/ dir.
+    let transcripts = paths.runs_dir().join("pty-transcripts");
+    assert!(
+        transcripts.is_dir() && std::fs::read_dir(&transcripts).unwrap().next().is_some(),
+        "transcript artifact written under {}",
+        transcripts.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3e. Capture-turn best-effort: an erroring capture turn never stalls
 // completion (mission.completed still fires, no lesson is written).
 // ---------------------------------------------------------------------------
@@ -4378,9 +4621,75 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     let events = read_log(&paths);
     assert!(events.iter().any(|e| matches!(
         &e.kind,
-        EventKind::FeatureFailed { feature_id, reason }
+        EventKind::FeatureFailed { feature_id, reason, .. }
             if feature_id == "f-1-1" && reason.contains("respawn budget exhausted")
     )));
+}
+
+/// Ticket worker-spawn-auth-failure-budget: a worker whose backend CLI dies
+/// in seconds with an auth signature is an INFRASTRUCTURE failure — it must
+/// NOT consume the respawn budget or fail the feature. The milestone blocks
+/// with a `backend unauthenticated` reason naming the re-auth action; the
+/// feature stays Active so it re-runs once the operator re-auths.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_auth_death_blocks_milestone_without_burning_respawn_budget() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_auth_death(), // f-1-1: the backend CLI auth-dies instantly
+    ]));
+    // A generous respawn budget: the point is that NONE of it is consumed.
+    let cfg = MissionConfig {
+        max_respawns: 3,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+
+    // The mission parks for operator action, it does NOT fail the feature.
+    assert_eq!(status, MissionStatus::Blocked);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(
+        ms.features[0].status,
+        FeatureStatus::Active,
+        "the feature stays active (re-runs on re-auth), not failed"
+    );
+    assert_eq!(
+        ms.features[0].respawns, 0,
+        "an auth death must not consume the respawn budget"
+    );
+    assert_eq!(
+        ms.features[0].worker_runs.len(),
+        1,
+        "exactly one worker run — no respawn was spawned"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneBlocked { reason, .. }
+                if reason.contains("unauthenticated") && reason.contains("claude")
+        )),
+        "a milestone.blocked naming the backend and the re-auth action"
+    );
+    // And the feature was never failed.
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FeatureFailed { feature_id, .. } if feature_id == "f-1-1"
+        )),
+        "an auth death must not fail the feature"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4922,6 +5231,7 @@ async fn out_of_contract_write_parks_a_touch_grant_and_approve_completes() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec!["src/**".to_string()],
+        standards_manifest: None,
     };
     let worker = MockScript::single_shot_json(&json!({
         "result": "pass",
@@ -5022,6 +5332,7 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec!["src/**".to_string()],
+        standards_manifest: None,
     };
     let worker = MockScript::single_shot_json(&json!({
         "result": "pass",
@@ -6647,13 +6958,13 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     assert!(detail.contains("[a-2] false"), "{detail}");
 }
 
-/// finding f-1-2: when the working tree is not clean at base (a tracked file
-/// has uncommitted changes when `approve_plan` runs), the lint report must
-/// carry `tree_clean_at_base: false` and its dirty-tree note must show up in
-/// both plan.md and the `orchestrator.decision` detail — while approval
-/// still succeeds, since the lint is advisory only.
+/// Approval-time assertion commands are agent-authored code. They run in a
+/// detached disposable worktree at the pinned base SHA, never in the primary
+/// checkout, even when sandbox enforcement is off. A command that overwrites
+/// a tracked source file therefore cannot alter the operator's tree, and the
+/// disposable registration/directory is gone before approval returns.
 #[tokio::test(flavor = "multi_thread")]
-async fn approval_lint_notes_dirty_tree_at_base() {
+async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
     if !setup() {
         return;
     }
@@ -6661,39 +6972,79 @@ async fn approval_lint_notes_dirty_tree_at_base() {
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
 
-    // Dirty a tracked file (README.md, committed by init_repo) without
-    // staging or committing it, so the tree is unclean when approve_plan
-    // resolves `base` and runs the lint.
-    std::fs::write(root.join("README.md"), "dirty\n").unwrap();
-
     let plan = simple_plan(
         1,
-        vec![assertion("", "not-yet-landed assertion", Some("false"))],
+        vec![assertion(
+            "",
+            "hostile approval assertion",
+            Some("printf 'tampered\\n' > README.md"),
+        )],
     );
     engine.approve_plan(plan).unwrap();
 
     let paths = engine.paths().clone();
+    assert_eq!(
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+        "seed\n",
+        "the approval command must not alter the primary checkout"
+    );
+    assert!(
+        !paths
+            .runs_dir()
+            .join("approval-contract-lint-worktree")
+            .exists(),
+        "the disposable approval worktree is cleaned"
+    );
+    assert!(
+        !raw_git(&root, &["worktree", "list", "--porcelain"])
+            .contains("approval-contract-lint-worktree"),
+        "the disposable worktree registration is pruned"
+    );
     let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
     assert!(
-        md.contains("note: contract lint ran against a working tree with uncommitted changes"),
+        md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
         "{md}"
     );
-
-    drop(engine);
-    let events = read_log(&paths);
-    let decision = events.iter().find_map(|e| match &e.kind {
-        EventKind::OrchestratorDecision { summary, detail }
-            if summary.contains("contract lint") =>
-        {
-            Some((summary.clone(), detail.clone()))
-        }
-        _ => None,
-    });
-    let (_summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
-    let detail = detail.expect("decision carries the full lint summary");
     assert!(
-        detail.contains("note: contract lint ran against a working tree with uncommitted changes"),
-        "{detail}"
+        !md.contains("working tree with uncommitted changes"),
+        "the pinned disposable tree is clean: {md}"
+    );
+}
+
+/// A predictable mission-branch name is not an authority channel. If a
+/// branch already contains commits before approval, those bytes were not
+/// derived from the pinned approval base and must not be smuggled into the
+/// mission deliverable.
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_refuses_preexisting_mission_branch_commits() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    let branch = engine.state().mission.mission_branch.clone();
+
+    raw_git(&root, &["checkout", "-b", &branch]);
+    std::fs::write(root.join("planted.txt"), "not approved\n").unwrap();
+    raw_git(&root, &["add", "planted.txt"]);
+    raw_git(&root, &["commit", "-m", "planted mission commit"]);
+    raw_git(&root, &["checkout", "main"]);
+
+    let error = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("pre-existing mission bytes must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to approve pre-existing commits"),
+        "{error}"
+    );
+    assert!(
+        !read_log(engine.paths())
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::PlanApproved { .. })),
+        "the refusal emits no approval authority"
     );
 }
 
@@ -6724,10 +7075,9 @@ async fn approval_lint_never_blocks() {
 }
 
 /// finding a3 / feature f-1-2: the contract lint runs its command
-/// assertions synchronously (never constructing a nested `tokio::Runtime`),
-/// so driving `approve_plan` from inside a live tokio runtime must not
-/// panic with "Cannot start a runtime from within a runtime" and must
-/// return Ok.
+/// assertions through a scoped OS-thread bridge, so driving `approve_plan`
+/// from inside a live tokio runtime must not panic with "Cannot start a
+/// runtime from within a runtime" and must return Ok.
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_lint_no_nested_runtime_panic() {
     if !setup() {
@@ -6744,8 +7094,8 @@ async fn approval_lint_no_nested_runtime_panic() {
             assertion("", "fails on base", Some("false")),
         ],
     );
-    // No panic (and no Err) proves the lint used the synchronous
-    // std::process::Command path rather than spinning up a nested runtime.
+    // No panic (and no Err) proves the gate runtime lived on the bridge
+    // thread rather than being nested on this Tokio worker.
     engine.approve_plan(plan).unwrap();
     assert_eq!(engine.state().mission.status, MissionStatus::Approved);
 }
@@ -6757,6 +7107,7 @@ async fn approval_lint_no_nested_runtime_panic() {
 /// (graduated lint: exits zero on the untouched base), and the defect-class
 /// names reach plan.md and the approval orchestrator.decision — while
 /// approval itself still succeeds (advisory posture unchanged).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
     if !setup() {
@@ -6886,6 +7237,7 @@ async fn contract_gate_final_gate_decision_names_vacuous_green() {
 /// stated verdict, and the gate-local artefact handle. The events land
 /// AFTER plan.approved (the "Git first" invariant: no event until approval
 /// cannot fail) and before the advisory lint decision.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_result_events_record_the_approval_ladder() {
     if !setup() {
@@ -7860,12 +8212,11 @@ async fn sandbox_preflight_inert_when_enforce_off() {
     );
 }
 
-/// On a non-macOS build, the sandbox preflight probe is inert even when
-/// `enforce == fs` is configured (macOS is the only supported platform for
-/// this tier).
-#[cfg(not(target_os = "macos"))]
+/// Linux has a real bwrap enforcement tier, but the macOS profile preflight
+/// probe remains inapplicable there and emits no Seatbelt-specific issue.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_preflight_inert_on_non_macos() {
+async fn sandbox_preflight_emits_no_macos_profile_issue_on_linux() {
     if !setup() {
         return;
     }
@@ -7888,7 +8239,36 @@ async fn sandbox_preflight_inert_on_non_macos() {
         !issues
             .iter()
             .any(|i| i.message.contains("fs sandbox profile")),
-        "non-macos builds must add zero sandbox preflight issues: {issues:?}"
+        "Linux must add no macOS-profile preflight issue: {issues:?}"
+    );
+}
+
+/// Windows has no process-sandbox tier. Enforced engine-run gates therefore
+/// fail closed during approval instead of silently running the contract bare.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_preflight_refuses_unsupported_windows_gate_sandbox() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+
+    let mut cfg = test_cfg();
+    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
+
+    let contract = vec![assertion(
+        "a-1",
+        "writes outside the allowlist",
+        Some("echo should-not-run"),
+    )];
+    let mut engine = make_engine(&backend, &root, cfg);
+    let err = engine
+        .approve_plan(simple_plan(1, contract))
+        .expect_err("Windows must refuse unsupported enforced gate containment");
+    assert!(
+        err.to_string().contains("unsupported on target_os=windows"),
+        "the refusal names the unsupported platform: {err}"
     );
 }
 
@@ -8216,6 +8596,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     engine.approve_plan(plan).unwrap();
 
@@ -8250,6 +8631,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     let err = engine
         .approve_revised_plan(drops_completed)
@@ -8288,6 +8670,7 @@ async fn approve_revised_plan_rejects_dropping_a_completed_milestone() {
         considered_alternatives: None,
         command_grants: vec![],
         touch_set: vec![],
+        standards_manifest: None,
     };
     let err = engine
         .approve_revised_plan(alters_completed)
@@ -9760,10 +10143,10 @@ async fn pack_contract_no_pack_behavior_is_byte_identical() {
     );
 }
 
-/// An invalid pack fails CLOSED at run start — the error names the
-/// offending field and no worker ever spawns.
+/// An invalid untracked pack fails CLOSED before approval — the error names
+/// the offending field, no consent event lands, and no worker ever spawns.
 #[tokio::test(flavor = "multi_thread")]
-async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
+async fn pack_contract_invalid_pack_fails_closed_before_approval() {
     if !setup() {
         return;
     }
@@ -9784,12 +10167,9 @@ async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
         ..test_cfg()
     };
     let mut engine = make_engine(&backend, &root, cfg);
-    engine.approve_plan(simple_plan(1, vec![])).unwrap();
-
-    let err = timeout(TEST_TIMEOUT, engine.run())
-        .await
-        .expect("run must not hang")
-        .expect_err("an invalid pack must fail the run closed");
+    let err = engine
+        .approve_plan(simple_plan(1, vec![]))
+        .expect_err("an invalid pack must fail approval closed");
     let msg = err.to_string();
     assert!(
         msg.contains("duplicate [[gate]] name `zz-dup`"),
@@ -9799,9 +10179,10 @@ async fn pack_contract_invalid_pack_fails_closed_at_run_start() {
     drop(engine);
     let events = read_log(&paths);
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::WorkerSpawned { .. })),
-        "nothing spends when the pack cannot load"
+        !events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::PlanApproved { .. } | EventKind::WorkerSpawned { .. }
+        )),
+        "neither consent nor spend may occur when the pack cannot load"
     );
 }

@@ -60,6 +60,16 @@
 //! harness skip cleanly" is the absence case, mirroring browser QA. A
 //! declared target that fails to spawn is NOT a skip: the deliverable
 //! declared runnable does not run, which FAILS the assertion honestly.
+//!
+//! A DECLARED pty-script whose session SKIPs (a host that cannot drive a
+//! pty) is not a soft skip either (ticket `pty-script-skip-vacuous-green`):
+//! the declared functional validation never ran, so the evidence line FAILS
+//! naming the skip reason, the skip is recorded for the round's loud
+//! decision, and no transcript artifact/event exists for it — the absence
+//! of a `validation.pty.transcript` verdict is what the final gate's
+//! vacuous-green backstop keys on (it re-runs only command assertions, so
+//! without that check a declared pty-script that skipped every round would
+//! green the mission without its declared validation ever executing).
 
 use crate::command_exec::GateSandbox;
 use crate::types::{Assertion, AssertionCheck, PtyScript};
@@ -92,8 +102,9 @@ pub enum PtyVerdict {
     /// An `expect` step missed (timeout, target exit, invalid pattern), a
     /// `send` could not be delivered, or the target failed to spawn.
     Fail,
-    /// The harness could not run at all on this host (non-unix platform) —
-    /// rendered loudly, never counted as pass or fail.
+    /// The harness could not run at all on this host (non-unix platform).
+    /// For a DECLARED assertion this is FAIL evidence naming the skip
+    /// reason (ticket `pty-script-skip-vacuous-green`) — never a soft pass.
     Skipped,
 }
 
@@ -141,15 +152,30 @@ pub(crate) struct PtyAssertionArtifact {
     pub detail: String,
 }
 
+/// A DECLARED pty-script assertion whose session never ran (the harness
+/// reported [`PtyVerdict::Skipped`] — this host cannot drive a pty). The
+/// orchestrator surfaces each as a loud per-round decision; the final gate
+/// independently refuses to green a declared pty assertion with no
+/// `validation.pty.transcript` verdict in the log (ticket
+/// `pty-script-skip-vacuous-green`).
+#[derive(Debug)]
+pub(crate) struct PtySkippedAssertion {
+    pub assertion_id: String,
+    /// Why the harness could not run (the session core's skip note).
+    pub note: String,
+}
+
 /// The result of running every pty-script assertion of a validation
 /// contract: rendered evidence lines for the functional validator's task
 /// (same block the command-assertion results feed) plus the transcript
 /// artifacts for event emission. `rendered` is `None` when the contract
-/// declares no pty scripts — today's behavior byte-for-byte.
+/// declares no pty scripts — today's behavior byte-for-byte. `skipped`
+/// names every declared assertion whose session never ran.
 #[derive(Debug)]
 pub(crate) struct PtyAssertionRun {
     pub rendered: Option<String>,
     pub artifacts: Vec<PtyAssertionArtifact>,
+    pub skipped: Vec<PtySkippedAssertion>,
 }
 
 /// Run every pty-script assertion in `contract` as part of the validation
@@ -160,9 +186,12 @@ pub(crate) struct PtyAssertionRun {
 /// is sequential today; parallel ptys would interleave transcript writes
 /// and muddy the evidence order).
 ///
-/// Never fails the ROUND: every failure mode lands as a rendered FAIL/SKIP
-/// line against the named assertion (evidence for the validator), the same
-/// fail-closed-as-evidence posture the bounded command path takes.
+/// Never fails the ROUND: every failure mode lands as a rendered FAIL line
+/// against the named assertion (evidence for the validator), the same
+/// fail-closed-as-evidence posture the bounded command path takes. A SKIP
+/// verdict (this host cannot drive a pty) is FAIL evidence too — a declared
+/// pty-script that did not execute must never read as a soft pass (ticket
+/// `pty-script-skip-vacuous-green`).
 pub(crate) async fn run_pty_assertions(
     contract: &[Assertion],
     root: &Path,
@@ -178,14 +207,18 @@ pub(crate) async fn run_pty_assertions(
         return PtyAssertionRun {
             rendered: None,
             artifacts: Vec::new(),
+            skipped: Vec::new(),
         };
     }
     let mut rendered = String::new();
     let mut artifacts = Vec::new();
+    let mut skipped = Vec::new();
     for assertion in pty_assertions {
         let Some(script) = assertion.pty_script.clone() else {
             // Mirrors the `(check=command but no command — cannot run)` arm:
             // a malformed contract entry is rendered, never silently dropped.
+            // No session runs and no transcript event exists for it, so the
+            // final gate's unexecuted-assertion backstop flags it too.
             rendered.push_str(&format!(
                 "- [{}] (check=pty-script but no pty script — cannot run)\n",
                 assertion.id
@@ -207,6 +240,7 @@ pub(crate) async fn run_pty_assertions(
                 }
             };
         let root = root.to_path_buf();
+        let command = script.command.clone();
         let outcome =
             tokio::task::spawn_blocking(move || imp::run_session(&script, &wrapped, &root, &env))
                 .await
@@ -219,60 +253,86 @@ pub(crate) async fn run_pty_assertions(
                     truncated: false,
                     note: Some(format!("pty driver task failed: {join_error}")),
                 });
-        if outcome.verdict == PtyVerdict::Skipped {
-            let note = outcome.note.as_deref().unwrap_or("unsupported host");
-            rendered.push_str(&format!(
-                "- [{}] pty-script → SKIP ({note})\n",
-                assertion.id
-            ));
-            continue;
+        let (line, artifact, skip) = fold_outcome(assertion, &command, &outcome, runs_dir);
+        rendered.push_str(&line);
+        if let Some(artifact) = artifact {
+            artifacts.push(artifact);
         }
-        // The transcript lands as a validation artifact regardless of
-        // verdict — a FAILING session's transcript is the most valuable
-        // evidence of all. A write failure drops the reference (never emit
-        // a file: ref whose bytes are absent) but keeps the verdict.
-        let transcript_rel = write_transcript(runs_dir, &assertion.id, &outcome);
-        let pass = outcome.verdict == PtyVerdict::Pass;
-        let detail = step_summary(&outcome);
-        let verdict = if pass { "PASS" } else { "FAIL" };
-        let reference = transcript_rel
-            .as_deref()
-            .map(crate::gate_results::file_artefact_ref)
-            .unwrap_or_else(|| "(transcript write failed)".to_string());
-        rendered.push_str(&format!(
-            "- [{}] pty-script `{}` → {verdict} ({detail}; transcript {reference})\n",
-            assertion.id,
-            script_command_str(assertion),
-        ));
-        if !pass {
-            let tail = tail_text(&outcome.transcript, FAIL_TAIL_BYTES);
-            if !tail.is_empty() {
-                rendered.push_str(&format!("{}\n", crate::scrub::scrub(&tail)));
-            }
-        }
-        if let Some(rel) = transcript_rel {
-            artifacts.push(PtyAssertionArtifact {
-                assertion_id: assertion.id.clone(),
-                pass,
-                transcript_rel: rel,
-                detail,
-            });
+        if let Some(skip) = skip {
+            skipped.push(skip);
         }
     }
     PtyAssertionRun {
         rendered: Some(rendered),
         artifacts,
+        skipped,
     }
 }
 
-/// The command string of an assertion's pty script for rendering; the
-/// caller only reaches here with `Some`, but stay total anyway.
-fn script_command_str(assertion: &Assertion) -> &str {
-    assertion
-        .pty_script
-        .as_ref()
-        .map(|s| s.command.as_str())
-        .unwrap_or("MISSING")
+/// Fold one finished session outcome into its evidence-block line, the
+/// optional transcript artifact, and — for a SKIP — the skip record.
+/// Factored out of the drive loop so the skip arm, which only the non-unix
+/// session core produces in production, is testable on every host with a
+/// synthetic outcome (ticket `pty-script-skip-vacuous-green`).
+fn fold_outcome(
+    assertion: &Assertion,
+    command: &str,
+    outcome: &PtyRunOutcome,
+    runs_dir: &Path,
+) -> (
+    String,
+    Option<PtyAssertionArtifact>,
+    Option<PtySkippedAssertion>,
+) {
+    if outcome.verdict == PtyVerdict::Skipped {
+        // A DECLARED pty-script that did not execute is not a skip: the
+        // declared functional validation never ran, so the evidence FAILS
+        // and names the skip reason. No transcript artifact is emitted (no
+        // session ran, so no transcript exists) — the absence of a
+        // validation.pty.transcript verdict for the assertion is exactly
+        // what the final gate's vacuous-green backstop keys on.
+        let note = outcome.note.as_deref().unwrap_or("unsupported host");
+        return (
+            format!(
+                "- [{}] pty-script → FAIL (declared pty-script did not execute: SKIP — {note})\n",
+                assertion.id
+            ),
+            None,
+            Some(PtySkippedAssertion {
+                assertion_id: assertion.id.clone(),
+                note: note.to_string(),
+            }),
+        );
+    }
+    // The transcript lands as a validation artifact regardless of verdict —
+    // a FAILING session's transcript is the most valuable evidence of all.
+    // A write failure drops the reference (never emit a file: ref whose
+    // bytes are absent) but keeps the verdict.
+    let transcript_rel = write_transcript(runs_dir, &assertion.id, outcome);
+    let pass = outcome.verdict == PtyVerdict::Pass;
+    let detail = step_summary(outcome);
+    let verdict = if pass { "PASS" } else { "FAIL" };
+    let reference = transcript_rel
+        .as_deref()
+        .map(crate::gate_results::file_artefact_ref)
+        .unwrap_or_else(|| "(transcript write failed)".to_string());
+    let mut line = format!(
+        "- [{}] pty-script `{}` → {verdict} ({detail}; transcript {reference})\n",
+        assertion.id, command
+    );
+    if !pass {
+        let tail = tail_text(&outcome.transcript, FAIL_TAIL_BYTES);
+        if !tail.is_empty() {
+            line.push_str(&format!("{}\n", crate::scrub::scrub(&tail)));
+        }
+    }
+    let artifact = transcript_rel.map(|rel| PtyAssertionArtifact {
+        assertion_id: assertion.id.clone(),
+        pass,
+        transcript_rel: rel,
+        detail,
+    });
+    (line, artifact, None)
 }
 
 /// The one-line per-step summary carried in the evidence line and the
@@ -816,7 +876,6 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use crate::types::PtyScript;
     use crate::types::PtyStep;
 
@@ -1007,6 +1066,7 @@ mod tests {
         .await;
         assert!(run.rendered.is_none(), "no pty assertions → no evidence");
         assert!(run.artifacts.is_empty(), "no pty assertions → no artifacts");
+        assert!(run.skipped.is_empty(), "no pty assertions → no skips");
 
         // A declared pty-script check without a script is a malformed
         // contract entry — rendered as cannot-run, never silently dropped.
@@ -1031,6 +1091,69 @@ mod tests {
             "{rendered}"
         );
         assert!(run.artifacts.is_empty());
+        // Not a harness SKIP (no session core was consulted) — the final
+        // gate's unexecuted-assertion backstop flags it via the missing
+        // transcript verdict instead.
+        assert!(run.skipped.is_empty());
+    }
+
+    /// Regression for ticket `pty-script-skip-vacuous-green`: a DECLARED
+    /// pty-script whose session SKIPs (a non-unix host, or any wrap that
+    /// cannot host a pty) never produced the declared functional validation,
+    /// so the evidence line FAILS naming the skip reason and the skip is
+    /// recorded for the round's loud decision — a soft SKIP line is
+    /// reserved for contracts that never declared a pty script. No
+    /// transcript artifact exists (no session ran): the missing
+    /// `validation.pty.transcript` verdict is the final gate's signal.
+    /// Synthetic outcome, so the skip arm is exercised on every host.
+    #[test]
+    fn pty_validation_declared_pty_skip_fails_and_names_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let assertion = Assertion {
+            id: "a-pty".to_string(),
+            statement: "the REPL echoes input back".to_string(),
+            check: AssertionCheck::PtyScript,
+            command: None,
+            pty_script: Some(PtyScript {
+                command: "./repl".to_string(),
+                steps: Vec::new(),
+                timeout_secs: None,
+            }),
+        };
+        let outcome = PtyRunOutcome {
+            verdict: PtyVerdict::Skipped,
+            steps: Vec::new(),
+            transcript: Vec::new(),
+            truncated: false,
+            note: Some(
+                "pty validation is implemented for unix hosts only (libc openpty)".to_string(),
+            ),
+        };
+        let (line, artifact, skip) = fold_outcome(&assertion, "./repl", &outcome, dir.path());
+        assert!(line.contains("[a-pty]"), "assertion named: {line}");
+        assert!(
+            line.contains("→ FAIL"),
+            "a declared skip is FAIL evidence, not a soft skip: {line}"
+        );
+        assert!(
+            line.contains("did not execute"),
+            "the skip is named as a non-execution: {line}"
+        );
+        assert!(
+            line.contains("unix hosts only"),
+            "the skip reason is named: {line}"
+        );
+        assert!(
+            !line.contains("→ SKIP"),
+            "no soft skip line for a declared assertion: {line}"
+        );
+        assert!(
+            artifact.is_none(),
+            "no session ran — no transcript artifact may exist"
+        );
+        let skip = skip.expect("the skip is recorded for the round decision");
+        assert_eq!(skip.assertion_id, "a-pty");
+        assert!(skip.note.contains("unix hosts only"), "{}", skip.note);
     }
 
     /// The transcript is bounded: a target spewing output past

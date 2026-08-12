@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Done: abandon_mission flushes the event log, then calls work::reconcile_ticket_for_mission exactly as the run/drain paths do (Abandoned maps to ticket failed), warn-not-fail on reconcile error. Regression test mission_catalog::tests::abandon_reconcile_marks_the_linked_ticket_failed (filter abandon_reconcile_ matches only it); full workspace gates green."
 title: kranz abandon must reconcile the linked ticket state
 priority: 3
 schedule: once

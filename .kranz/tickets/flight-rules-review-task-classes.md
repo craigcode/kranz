@@ -3,6 +3,8 @@ title: Reuse Flight Rules for spec and incident review task classes
 priority: 3
 schedule: once
 blocked-by: [flight-rules-workflow-projection, flight-rules-enforcement-binding, flight-rules-dashboard-report]
+state: done
+state-note: Implemented — spec-review and incident-review use one immutable tracked input plus one required nonempty review deliverable, the same pinned resolver/checkers/findings/waivers/evidence path as code missions, and no external tracker or parallel result schema. Source mutation, empty delivery, unsafe paths, and prompt-shadowing fail closed; dedicated flight_rules_review_class_* tests are green.
 ---
 
 ## Goal
@@ -24,3 +26,6 @@ with external spec stores or incident trackers stay outside core.
 - The run delivers a review artifact and honest outcome; it neither mutates the source artifact nor passes vacuously on an empty deliverable.
 - No Jira/Linear/PagerDuty/Google Docs client, hosted standards service, or general semantic-search subsystem enters core.
 - Anti-vacuity: unique filter `flight_rules_review_class_` reports a nonzero pass count.
+
+## Wrong plan (from orchestrator)
+KRZ-349 is step 9 of 9 in the Flight Rules delivery sequence (docs/scoping/flight-rules-engineering-standards.md:374) and every input it consumes is absent from the base this mission branches from (main @ 90a4bdc, re-verified this turn): crates/engine/src/pack/ contains only toml.rs, `git cat-file -e HEAD:crates/engine/src/pack/standards.rs` fails, and a repo-wide grep finds no StandardsManifest, no standards resolver, no `pub mod standards`, no rule/revision/stage/lifecycle type and no `standar … (truncated)

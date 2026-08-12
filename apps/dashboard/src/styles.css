@@ -1030,6 +1030,107 @@ button {
   max-height: 34%;
 }
 
+.standards-panel {
+  max-height: 44%;
+  overflow-y: auto;
+  padding: 7px 8px 9px;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.panel-heading-row h2 {
+  margin: 0;
+  font-size: 11px;
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+
+.standards-digest {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.standards-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.standards-disposition {
+  border: 1px solid currentColor;
+  border-radius: 10px;
+  padding: 0 5px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.disposition-passed { color: var(--green); }
+.disposition-failed { color: var(--red); }
+.disposition-advisory,
+.disposition-not-evaluated { color: var(--amber); }
+.disposition-waived { color: var(--blue); }
+.disposition-not-applicable { color: var(--dim); }
+
+.standards-coverage-list > li {
+  border-top: 1px solid var(--border);
+  padding: 6px 0;
+}
+
+.standards-evidence {
+  margin-top: 3px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+
+.standards-drift {
+  padding: 7px;
+  border: 1px solid var(--red);
+  background: var(--red-soft);
+}
+
+.standards-drift p,
+.standards-drift ul {
+  margin: 4px 0;
+}
+
+.standards-waiver-open {
+  text-align: left;
+  border: 1px solid var(--blue);
+  border-radius: 3px;
+  background: var(--blue-soft);
+  color: var(--blue);
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.standards-waiver-form {
+  display: grid;
+  gap: 5px;
+  padding: 7px;
+  border: 1px solid var(--blue);
+  background: var(--blue-soft);
+}
+
+.standards-waiver-form p {
+  margin: 0;
+}
+
+.standards-waiver-form label {
+  display: grid;
+  gap: 2px;
+}
+
+.standards-waiver-form textarea {
+  min-height: 54px;
+  resize: vertical;
+}
+
+.standards-recorded {
+  margin: 0;
+  color: var(--green);
+}
+
 .workspace-body {
   display: grid;
   gap: 5px;
@@ -2085,6 +2186,70 @@ button {
 
 .plan-alternatives li {
   margin: 3px 0;
+}
+
+.standards-consent {
+  margin-bottom: 12px;
+}
+
+.standards-pack-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  align-items: baseline;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  font-size: 11px;
+}
+
+.standards-pack-line code {
+  overflow-wrap: anywhere;
+}
+
+.standards-rfc h3 {
+  margin: 9px 0 3px;
+  font: 600 11px/1.4 var(--mono);
+  color: var(--dim);
+}
+
+.standards-rule-list,
+.standards-coverage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.standards-rule-card {
+  border-left: 2px solid var(--accent);
+  padding: 5px 8px;
+  margin: 4px 0;
+  background: var(--accent-soft);
+}
+
+.standards-rule-card p {
+  margin: 3px 0;
+}
+
+.standards-rule-head,
+.panel-heading-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.standards-state-text,
+.standards-rule-meta {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.standards-rule-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
 }
 
 .plan-milestones {

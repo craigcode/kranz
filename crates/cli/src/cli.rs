@@ -609,6 +609,15 @@ pub enum Command {
         #[command(subcommand)]
         command: PackCommand,
     },
+
+    /// Work with Flight Rules standards (KRZ-341): the schema-4 pack
+    /// standards corpus — RFCs, rules, the normalized manifest + content
+    /// digest, and the lifecycle transition lint
+    /// (docs/scoping/flight-rules-engineering-standards.md)
+    Standards {
+        #[command(subcommand)]
+        command: StandardsCommand,
+    },
 }
 
 /// Subcommands under `kranz pack` — the pack contract surface (ticket
@@ -626,6 +635,90 @@ pub enum PackCommand {
     Lint {
         /// The pack directory containing pack.toml
         dir: PathBuf,
+    },
+}
+
+/// Subcommands under `kranz standards` — the Flight Rules surface (ticket
+/// `.kranz/tickets/flight-rules-pack-contract.md`, KRZ-341).
+#[derive(Subcommand, Debug)]
+pub enum StandardsCommand {
+    /// Fold Flight Rules effectiveness across mission event logs and traced
+    /// defect tickets. Raw denominators are always shown; interpretive smells
+    /// remain suppressed below the documented minimum sample count.
+    Metrics {
+        /// Emit the deterministic machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Load a pack's [standards] corpus and print the normalized manifest:
+    /// every RFC and rule with its effective lifecycle status, checker
+    /// binding, and scopes, plus the sha256 content digest and the trust
+    /// posture (an external/untracked pack is advisory-only — enforced rules
+    /// are refused at load naming the remedy).
+    ///
+    /// With --against <ref>, the base pack is read from TRACKED BLOBS at
+    /// that git ref (never the worktree) and lifecycle transition violations
+    /// are refused: absent/draft → enforced, a semantic rule change without
+    /// a revision increment, a disappeared known rule ID, tombstone
+    /// reactivation. Exit 0 clean, 1 on load errors or refused transitions.
+    Lint {
+        /// The pack directory containing pack.toml
+        dir: PathBuf,
+
+        /// Base git ref (branch or sha) whose tracked pack bytes define the
+        /// approved lifecycle state for the transition check
+        #[arg(long, value_name = "REF")]
+        against: Option<String>,
+    },
+
+    /// Record an authorized human waiver for ONE standards failure (ticket
+    /// flight-rules-waiver-decisions, KRZ-344; design D-I) — the only
+    /// approval surface. Displays the finding, the pinned rule, the
+    /// affected paths, and the diff digest the waiver binds, then appends
+    /// `standards.waiver.approved` to the mission log. Refuses: a rule with
+    /// `waivable: false`, a rule absent from the approved pin (an expired/
+    /// retired rule or RFC is never pinned), a mismatched revision, an
+    /// absent finding, an already-waived finding, or a past expiry. The
+    /// approver is recorded honestly as `local-operator` plus this surface
+    /// — a model may request a waiver but can never approve one.
+    Waive {
+        /// The pinned rule id to except (e.g. ENG-RUST-014)
+        #[arg(long)]
+        rule: String,
+
+        /// The revision you believe you are waiving (defaults to the pinned
+        /// revision; a mismatch refuses rather than silently rebinding)
+        #[arg(long)]
+        revision: Option<u64>,
+
+        /// Waive only the latest finding with this subject (disambiguates
+        /// when several findings cite the rule)
+        #[arg(long)]
+        finding: Option<String>,
+
+        /// Why the exception is granted (recorded verbatim)
+        #[arg(long)]
+        reason: String,
+
+        /// Expiry instant, RFC 3339 (e.g. 2026-09-01T00:00:00Z) — must be
+        /// in the future; waivers are never permanent
+        #[arg(long, value_name = "RFC3339")]
+        expires: String,
+    },
+
+    /// Record the authorized human verdict for one approval-pinned
+    /// `manual-attestation` rule. The attestation binds to the current
+    /// affected paths and diff digest, so any relevant change invalidates
+    /// it. The approver is always the local operator using this CLI surface.
+    Attest {
+        /// The pinned manual-attestation rule id
+        #[arg(long)]
+        rule: String,
+
+        /// Why the operator judges the current change compliant
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -834,6 +927,150 @@ mod tests {
                 PackCommand::Lint { dir } => assert_eq!(dir, PathBuf::from("some/dir")),
             },
             other => panic!("expected Pack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flight_rules_contract_standards_lint_parses_dir_and_against() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "lint", "some/dir"]).unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against, None);
+                }
+                other => panic!("expected Lint, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "lint",
+            "some/dir",
+            "--against",
+            "main",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Lint { dir, against } => {
+                    assert_eq!(dir, PathBuf::from("some/dir"));
+                    assert_eq!(against.as_deref(), Some("main"));
+                }
+                other => panic!("expected Lint, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+    }
+
+    /// KRZ-344 (D-I): the waiver surface parses its full flag set; the
+    /// approver is never a flag — the record honestly names
+    /// `local-operator` plus the `cli` surface.
+    #[test]
+    fn flight_rules_waiver_standards_waive_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "waive",
+            "--rule",
+            "ZZ-FAIL-001",
+            "--reason",
+            "accepted risk",
+            "--expires",
+            "2026-09-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Waive {
+                    rule,
+                    revision,
+                    finding,
+                    reason,
+                    expires,
+                } => {
+                    assert_eq!(rule, "ZZ-FAIL-001");
+                    assert_eq!(revision, None);
+                    assert_eq!(finding, None);
+                    assert_eq!(reason, "accepted risk");
+                    assert_eq!(expires, "2026-09-01T00:00:00Z");
+                }
+                other => panic!("expected Waive, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "waive",
+            "--rule",
+            "ZZ-FAIL-001",
+            "--revision",
+            "2",
+            "--finding",
+            "a-1",
+            "--reason",
+            "accepted risk",
+            "--expires",
+            "2026-09-01T00:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Waive {
+                    revision, finding, ..
+                } => {
+                    assert_eq!(revision, Some(2));
+                    assert_eq!(finding.as_deref(), Some("a-1"));
+                }
+                other => panic!("expected Waive, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        // --reason and --expires are required: no silent permanent or
+        // reason-less waiver exists.
+        assert!(
+            Cli::try_parse_from(["kranz", "standards", "waive", "--rule", "ZZ-FAIL-001"]).is_err()
+        );
+    }
+
+    #[test]
+    fn flight_rules_enforcement_standards_attest_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "kranz",
+            "standards",
+            "attest",
+            "--rule",
+            "ZZ-MANUAL-001",
+            "--reason",
+            "reviewed the deployment evidence",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Standards { command } => match command {
+                StandardsCommand::Attest { rule, reason } => {
+                    assert_eq!(rule, "ZZ-MANUAL-001");
+                    assert_eq!(reason, "reviewed the deployment evidence");
+                }
+                other => panic!("expected Attest, got {other:?}"),
+            },
+            other => panic!("expected Standards, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["kranz", "standards", "attest", "--rule", "ZZ-MANUAL-001"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flight_rules_metrics_standards_metrics_parses_json() {
+        let cli = Cli::try_parse_from(["kranz", "standards", "metrics", "--json"]).unwrap();
+        match cli.command {
+            Command::Standards {
+                command: StandardsCommand::Metrics { json },
+            } => assert!(json),
+            other => panic!("expected standards metrics, got {other:?}"),
         }
     }
 

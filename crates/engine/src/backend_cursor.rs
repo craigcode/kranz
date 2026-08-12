@@ -138,42 +138,383 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 /// keychain succeeds). Seed an EMPTY keychain so the startup probe has a
 /// valid, secret-free domain. Never link or copy the operator's real login
 /// keychain — that would hand the session every credential reachable in it,
-/// defeating the scratch-HOME posture. Best-effort like the rest of the
-/// seed: on failure the session spawns anyway and the CLI fails loudly.
+/// defeating the scratch-HOME posture.
+///
+/// Two further live findings shape the seed (m-eee81f): an EMPTY-password
+/// keychain cannot be unlocked programmatically, and a fresh keychain
+/// defaults to a 300-second inactivity relock — long builds then relock it
+/// mid-session and every credential write pops a desktop dialog the
+/// operator cancels only to see again. So the seed creates the keychain
+/// with a real passphrase, sets a session-SCALE auto-lock (never the 300s
+/// default, never no-timeout), and unlocks at every spawn (unlock state
+/// lives in securityd, so the engine-side unlock covers the subsequently
+/// spawned CLI).
+///
+/// Non-interactivity invariant (14th-pass review, cargo-test hang): some
+/// `security` subcommands fall back to INTERACTIVE auth — a GUI password
+/// dialog at the operator — when they touch a LOCKED db without a
+/// passphrase (`set-keychain-settings`, `show-keychain-info`); others never
+/// prompt (`create-keychain -p`, `unlock-keychain -p`, `lock-keychain`).
+/// Every call below is therefore either passphrase-carrying or ordered so
+/// it only ever runs against a db this code path just unlocked.
+///
+/// Auto-lock restored on the seeded keychain: session-scale (the fresh-db
+/// 300s default relocked mid-build into desktop prompts — m-eee81f), never
+/// no-timeout; [`lock_session_login_keychain`] relocks at session end.
 #[cfg(target_os = "macos")]
-fn ensure_session_login_keychain(home: &Path) {
-    let keychains = home.join("Library").join("Keychains");
-    let db = keychains.join("login.keychain-db");
-    if db.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::create_dir_all(&keychains) {
-        tracing::warn!(
-            error = %e,
-            "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
-             fail startup with a security error under the relocated HOME"
-        );
-        return;
-    }
-    // HOME is pinned to the session home so any preference side effect of
-    // create-keychain lands in the scratch tree, never in the operator's
-    // real keychain search list.
-    let mut cmd = std::process::Command::new("security");
-    cmd.args(["create-keychain", "-p", ""])
-        .arg(&db)
+const SESSION_KEYCHAIN_LOCK_SECS: u32 = 8 * 60 * 60;
+
+/// The per-session keychain passphrase file: a dotfile beside the db it
+/// guards, inside the session-private scratch HOME.
+#[cfg(target_os = "macos")]
+fn session_keychain_secret_path(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Keychains")
+        .join(".login.keychain-passphrase")
+}
+
+/// Run an argv `security` invocation pinned to the session HOME, returning
+/// whether it exited 0. Only for subcommands that can never fall back to
+/// interactive auth (see the invariant above [`SESSION_KEYCHAIN_LOCK_SECS`])
+/// — currently just `lock-keychain` at session teardown; passphrase-carrying
+/// work goes through [`security_script_in_session_home`].
+///
+/// Bounded by [`SECURITY_TIMEOUT`]: a locked keychain makes `security` park
+/// on a GUI approval forever (observed live 2026-08-10, a 20-minute gate
+/// hang), so every spawn goes through the one bounded helper and a timeout
+/// surfaces as `Err(TimedOut)` — unavailable-not-authorized, never a hang.
+#[cfg(target_os = "macos")]
+fn security_in_session_home(home: &Path, args: &[&std::ffi::OsStr]) -> std::io::Result<bool> {
+    let output = security_bounded(home, args, None)?;
+    Ok(output.status.success())
+}
+
+/// Hard ceiling on any `security` invocation: a healthy subcommand answers in
+/// well under a second; anything past the bound is a locked keychain waiting
+/// on a GUI approval that will never come in a headless session.
+#[cfg(target_os = "macos")]
+const SECURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The one bounded `security` spawn (ticket security-cli-invocation-timeout):
+/// every `security` call in the engine goes through here so a locked keychain
+/// can never park a gate or a spawn. Polls `try_wait` against
+/// [`SECURITY_TIMEOUT`], kills the child on expiry, and reports the timeout
+/// as `Err(TimedOut)` naming the bound. `stdin_script`, when present, is fed
+/// to the child on a pipe (the `security -i` batch form).
+#[cfg(target_os = "macos")]
+fn security_bounded(
+    home: &Path,
+    args: &[&std::ffi::OsStr],
+    stdin_script: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    security_bounded_with_timeout(
+        Path::new("security"),
+        home,
+        args,
+        stdin_script,
+        SECURITY_TIMEOUT,
+    )
+}
+
+/// [`security_bounded`] with an explicit binary path and timeout — the unit
+/// under test for the locked-keychain hang regression (a stub `security`
+/// that sleeps forever must fail fast, never hang the caller). The production
+/// wrapper pins the binary to `security` resolved through the pinned
+/// `/usr/bin:/bin` PATH; only tests substitute a stub path.
+#[cfg(target_os = "macos")]
+fn security_bounded_with_timeout(
+    binary: &Path,
+    home: &Path,
+    args: &[&std::ffi::OsStr],
+    stdin_script: Option<&str>,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(args)
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin");
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if stdin_script.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
     if let Ok(user) = std::env::var("USER") {
         cmd.env("USER", user);
     }
-    if let Err(e) = cmd.status() {
-        tracing::warn!(
-            error = %e,
-            "cursor session keychain seed: security create-keychain failed to spawn; the \
-             CLI may fail startup with a security error under the relocated HOME"
-        );
+    // HOME is pinned to the session home so any preference side effect
+    // lands in the scratch tree, never in the operator's real keychain
+    // search list.
+    let mut child = cmd.spawn()?;
+    if let Some(script) = stdin_script {
+        if let Some(mut stdin) = child.stdin.take() {
+            // A broken pipe means the process died before reading; the wait
+            // below surfaces the real status.
+            let _ = stdin.write_all(script.as_bytes());
+        }
     }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "security did not exit within {}s (killed; locked keychain?)",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+    };
+    // The process has exited, so both pipes are at EOF and drain immediately.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run `security -i` with `script` fed on stdin: the one-shot commands have
+/// no passphrase-from-stdin form, so interactive mode is the only way to
+/// keep secrets out of argv (see the seed's doc above). stdout is dropped
+/// (interactive mode may echo prompts); stderr is captured for the
+/// failure warning — callers must redact any secret before logging it.
+/// Bounded by [`SECURITY_TIMEOUT`] like every `security` spawn.
+#[cfg(target_os = "macos")]
+fn security_script_in_session_home(
+    home: &Path,
+    script: &str,
+) -> std::io::Result<std::process::Output> {
+    security_bounded(home, &[std::ffi::OsStr::new("-i")], Some(script))
+}
+
+/// Write the per-session keychain passphrase 0600 (mode forced even when
+/// the file pre-exists — `mode()` applies only at creation), refusing a
+/// planted symlink like the repo's other secret-adjacent writes.
+#[cfg(target_os = "macos")]
+fn write_session_keychain_secret(path: &Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(secret.as_bytes())?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Seed/unlock the session's login keychain (see the block doc above
+/// [`SESSION_KEYCHAIN_LOCK_SECS`] for the full rationale). Secret hygiene
+/// (ticket keychain-passphrase-predictable-permanent-unlock — the seeded
+/// store is NOT empty forever; Cursor writes credentials into it, so the v2
+/// shortcuts stopped being free):
+///
+/// - The passphrase is a RANDOM per-session secret (uuid v4, the repo's
+///   randomness idiom) — never derived from the session id, which appears
+///   in paths and logs. It is persisted 0600 next to the db
+///   ([`session_keychain_secret_path`]) so later spawns into the same HOME
+///   re-unlock with the same secret, and it is never logged (the one
+///   captured `security` stderr is redacted before it can reach a warning).
+/// - argv hygiene: `security unlock-keychain` has no stdin/flag passphrase
+///   alternative (without `-p` it prompts via getpass(3) on the controlling
+///   tty, which a headless spawn does not have), so an argv `-p` would
+///   expose the secret to any same-user `ps`. The whole
+///   create/settings/unlock sequence is instead fed to `security -i`
+///   (interactive mode) on a PIPE ([`security_script_in_session_home`]):
+///   argv carries only `-i`, and the pipe contents are not visible to other
+///   processes. Verified live 2026-08-09: a stdin-fed batch behaves
+///   identically to the argv form (including quoted paths with spaces), a
+///   failed command does not abort the batch, and the process exit status
+///   is the LAST command's — so with `unlock-keychain` last, a non-zero
+///   exit means the unlock failed. Residual exposure: the secret lives in
+///   securityd's memory and in the 0600 file inside the session-private
+///   HOME — both reachable only to the same user, which the scratch-HOME
+///   threat model already accepts (the session itself runs with that HOME).
+/// - The store must not stay open forever: the seed restores a bounded
+///   auto-lock (`set-keychain-settings -lut
+///   [`SESSION_KEYCHAIN_LOCK_SECS`]`) and [`lock_session_login_keychain`]
+///   relocks it when the session ends.
+/// - GUI-prompt hygiene (the non-interactivity invariant above
+///   [`SESSION_KEYCHAIN_LOCK_SECS`]): `set-keychain-settings` on a LOCKED
+///   db falls back to interactive auth — a desktop password dialog — so it
+///   runs ONLY in batch B, after batch A's `unlock-keychain` reported
+///   success and the db is known-unlocked. A failed unlock skips the
+///   settings entirely: no call here can ever pop a prompt at the
+///   operator, even on a respawn into a scratch HOME this module's own
+///   teardown just relocked.
+///
+/// Returns true iff the seed left the session db UNLOCKED (batch A's
+/// unlock exited 0). This is the ONLY trustworthy non-interactive witness
+/// of lock state: for a `login.keychain-db` that securityd has previously
+/// unlocked this session, `unlock-keychain -p <wrong>` can exit 0 anyway
+/// (securityd credential caching — verified live 2026-08-09, and the probe
+/// attempt itself RE-UNLOCKS the db), while `show-keychain-info` /
+/// `set-keychain-settings` on a locked db either error 152 or HANG on a GUI
+/// dialog, nondeterministically. Callers/tests must therefore never probe
+/// lock state through `security`; they consume this return value instead.
+#[cfg(target_os = "macos")]
+fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
+    let keychains = home.join("Library").join("Keychains");
+    let db = keychains.join("login.keychain-db");
+    let db_exists = db.exists();
+    if !db_exists {
+        if let Err(e) = std::fs::create_dir_all(&keychains) {
+            tracing::warn!(
+                error = %e,
+                "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
+                 fail startup with a security error under the relocated HOME"
+            );
+            return false;
+        }
+    }
+    let secret_path = session_keychain_secret_path(home);
+    let stored = std::fs::read_to_string(&secret_path)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let passphrase = match (stored, db_exists) {
+        // The stored secret wins: later spawns into the same HOME re-unlock
+        // with the passphrase the db was created with.
+        (Some(secret), _) => secret,
+        // Pre-hardening seeds (acdc77b) derived the passphrase from the
+        // session id and left no secret file; keep unlocking those homes so
+        // a scratch HOME written before the upgrade never wedges.
+        (None, true) => format!("kranz-scratch-{session_id}"),
+        (None, false) => {
+            let fresh = uuid::Uuid::new_v4().simple().to_string();
+            if let Err(e) = write_session_keychain_secret(&secret_path, &fresh) {
+                tracing::warn!(
+                    error = %e,
+                    "cursor session keychain seed: cannot persist the passphrase; the CLI may \
+                     fail startup with a security error under the relocated HOME"
+                );
+                return false;
+            }
+            fresh
+        }
+    };
+    // Batch A carries the passphrase (stdin script, never argv): create
+    // (fresh db only), then unlock LAST — the batch's exit status is the
+    // last command's, so success means the db is now unlocked. Paths are
+    // quoted — verified handled by interactive mode.
+    let mut script = String::new();
+    if !db_exists {
+        script.push_str(&format!(
+            "create-keychain -p {passphrase} \"{}\"\n",
+            db.display()
+        ));
+    }
+    script.push_str(&format!(
+        "unlock-keychain -p {passphrase} \"{}\"\n",
+        db.display()
+    ));
+    match security_script_in_session_home(home, &script) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            // The passphrase is never logged: redact it from the captured
+            // stderr before it can reach a warning (a future `security`
+            // build that echoes its input would otherwise leak it).
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .replace(&passphrase, "<redacted>")
+                .trim()
+                .to_string();
+            tracing::warn!(
+                status = %output.status,
+                stderr = %stderr,
+                "cursor session keychain seed: unlock failed; the CLI may fail startup with \
+                 a security error under the relocated HOME"
+            );
+            // The db may still be LOCKED — applying settings now would fall
+            // back to an interactive GUI prompt (the failure this ordering
+            // exists to prevent). Skip batch B.
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cursor session keychain seed: security failed to spawn; the CLI may fail \
+                 startup with a security error under the relocated HOME"
+            );
+            return false;
+        }
+    }
+    // Batch B: the db is known-unlocked (batch A just succeeded), so
+    // bounding the auto-lock cannot prompt.
+    let settings = format!(
+        "set-keychain-settings -lut {SESSION_KEYCHAIN_LOCK_SECS} \"{}\"\n",
+        db.display()
+    );
+    match security_script_in_session_home(home, &settings) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .replace(&passphrase, "<redacted>")
+                .trim()
+                .to_string();
+            tracing::warn!(
+                status = %output.status,
+                stderr = %stderr,
+                "cursor session keychain seed: could not bound the auto-lock; the store keeps \
+                 its current lock settings"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cursor session keychain seed: could not bound the auto-lock; the store keeps \
+                 its current lock settings"
+            );
+        }
+    }
+    // Batch A's unlock reported success: the db is left unlocked.
+    true
+}
+
+/// Relock the seeded keychain at session end so the store is not left open
+/// past the session's life — the auto-lock timeout is only the backstop.
+/// `lock-keychain` takes only the db path and LOCKING never requires
+/// authorization, so this cannot fall back to an interactive prompt even
+/// on an already-locked db (it just exits non-zero); fire-and-forget at
+/// teardown, the status is returned only so tests can assert the command
+/// ran. Best-effort like the seed: a failure leaves the timeout.
+#[cfg(target_os = "macos")]
+fn lock_session_login_keychain(home: &Path) -> std::io::Result<bool> {
+    let db = home
+        .join("Library")
+        .join("Keychains")
+        .join("login.keychain-db");
+    if !db.exists() {
+        return Ok(false);
+    }
+    security_in_session_home(
+        home,
+        &[std::ffi::OsStr::new("lock-keychain"), db.as_os_str()],
+    )
 }
 
 /// The cleared environment one `agent` session spawns with, mirroring
@@ -190,7 +531,7 @@ fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, Str
         // relocation), but the macOS keychain domain must still exist.
         #[cfg(target_os = "macos")]
         if let Some(home) = spec.env.get("HOME") {
-            ensure_session_login_keychain(Path::new(home));
+            let _ = ensure_session_login_keychain(Path::new(home), &spec.session_id);
         }
         return crate::agent_env::agent_session_env(
             &spec.env,
@@ -203,7 +544,7 @@ fn cursor_child_env(spec: &SessionSpec) -> std::collections::HashMap<String, Str
     match seed_cursor_scratch_home(&scratch_root, real_home.as_deref()) {
         Ok(home) => {
             #[cfg(target_os = "macos")]
-            ensure_session_login_keychain(&home);
+            let _ = ensure_session_login_keychain(&home, &spec.session_id);
             tracing::info!(
                 session_id = %spec.session_id,
                 decision = "scratch-seeded",
@@ -670,15 +1011,25 @@ fn parse_terminal(value: Value, model: &str) -> AgentEvent {
     }
 }
 
-/// Whether an unparsed stdout line (or a stderr tail) names a known
-/// pre-billing rejection ([`PRE_BILLING_FAILURE_PHRASES`], probe item 5) —
-/// deterministic, user-readable, and never retried because no turn was
-/// billed.
-fn names_pre_billing_failure(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+/// Whether ONE line of CLI output names a known pre-billing rejection
+/// ([`PRE_BILLING_FAILURE_PHRASES`], probe item 5) — deterministic,
+/// user-readable, and never retried because no turn was billed.
+///
+/// The phrase must LEAD the (trimmed) line (14th-pass review — the match
+/// was a loose substring over the whole text): the observed rejections are
+/// the CLI's own plain-text lines (`Cannot use this model: <id>. Available
+/// models: ...`, `Authentication required`), and anchoring keeps text that
+/// merely QUOTES a rejection from tripping the detector — a torn
+/// stream-json fragment riding the transcript as `Other { "unparsed": ... }`
+/// (torn-line tolerance can land half of an assistant event there) or a
+/// tool's mid-turn stderr line relaying a remote's "Authentication
+/// required". A quoted phrase would relabel a failed turn as the
+/// billing-free config error it wasn't.
+fn names_pre_billing_failure(line: &str) -> bool {
+    let lower = line.trim_start().to_ascii_lowercase();
     PRE_BILLING_FAILURE_PHRASES
         .iter()
-        .any(|phrase| lower.contains(phrase))
+        .any(|phrase| lower.starts_with(phrase))
 }
 
 fn str_field(value: &Value, key: &str) -> String {
@@ -834,6 +1185,8 @@ impl AgentBackend for CursorBackend {
         Ok(Box::new(CursorSession {
             session_id: spec.session_id.clone(),
             model,
+            #[cfg(target_os = "macos")]
+            session_home: cursor_session_home(&spec),
             child,
             #[cfg(windows)]
             job,
@@ -861,6 +1214,11 @@ impl AgentBackend for CursorBackend {
 pub struct CursorSession {
     session_id: String,
     model: String,
+    /// macOS: the session-private HOME, remembered so the seeded login
+    /// keychain under it can be relocked when the session ends
+    /// ([`lock_session_login_keychain`]).
+    #[cfg(target_os = "macos")]
+    session_home: PathBuf,
     child: Child,
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
@@ -943,6 +1301,11 @@ impl CursorSession {
         if let Some(task) = self.stderr_task.take() {
             let _ = task.await;
         }
+        // macOS: the session is over — relock the seeded keychain so the
+        // store is not left open past the session's life (the auto-lock
+        // timeout is only the backstop).
+        #[cfg(target_os = "macos")]
+        let _ = lock_session_login_keychain(&self.session_home);
     }
 
     async fn finish_at_eof(&mut self) {
@@ -950,21 +1313,25 @@ impl CursorSession {
         if let Some(task) = self.stderr_task.take() {
             let _ = task.await;
         }
+        // macOS: same relock as kill_child — EOF means the session ended.
+        #[cfg(target_os = "macos")]
+        let _ = lock_session_login_keychain(&self.session_home);
         // A known pre-billing rejection (probe item 5) is reported as the
         // configuration error it is — the caller fixes the model id or
         // authenticates; nothing was billed and there is nothing to retry.
         // The stdout capture wins; the stderr tail is the fallback for a CLI
-        // that prints the rejection there instead. The guard matters: a
-        // COMPLETED turn (exit 0 with a success result) is never re-labeled —
-        // a tool's own stderr can legitimately contain one of the phrases
-        // mid-turn (e.g. a remote's "Authentication required").
+        // that prints the rejection there instead (matched per line — the
+        // tail is multi-line and the match is line-anchored). The guard
+        // matters: a COMPLETED turn (exit 0 with a success result) is never
+        // re-labeled — a tool's own stderr can legitimately contain one of
+        // the phrases mid-turn (e.g. a remote's "Authentication required").
         let completed = matches!(status, Ok(ref s) if s.success()) && self.saw_result;
         let pre_billing = if completed {
             None
         } else {
             self.pre_billing_failure.clone().or_else(|| {
                 let tail = self.stderr_tail();
-                names_pre_billing_failure(&tail).then_some(tail)
+                tail.lines().any(names_pre_billing_failure).then_some(tail)
             })
         };
         let exit = match (status, pre_billing) {
@@ -1152,15 +1519,107 @@ mod tests {
         assert_eq!(std::fs::read_dir(&seeded).unwrap().count(), 0);
     }
 
+    /// A spec carrying no relocated HOME (the validator/orchestrator shape)
+    /// spawns into a freshly seeded scratch HOME: the `.cursor` minimal set
+    /// crosses, and the child env's HOME points at it.
+    #[test]
+    fn cursor_child_env_without_relocated_home_seeds_cursor_config() {
+        let real_home = tempfile::tempdir().unwrap();
+        let cursor = real_home.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(cursor.join("cli-config.json"), "{}").unwrap();
+        std::fs::write(cursor.join("agent-cli-state.json"), "{}").unwrap();
+
+        let _home_guard =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", real_home.path().to_str().unwrap())]);
+        let session_spec = spec(Path::new("."), false);
+
+        let env = cursor_child_env(&session_spec);
+
+        let home = env.get("HOME").expect("child env carries HOME");
+        let seeded = Path::new(home).join(".cursor");
+        assert!(
+            seeded.join("cli-config.json").is_file(),
+            "validator-path HOME must carry the seeded cli-config.json"
+        );
+        assert!(
+            seeded.join("agent-cli-state.json").is_file(),
+            "validator-path HOME must carry the seeded agent-cli-state.json"
+        );
+    }
+
+    /// A `security` invocation against a locked keychain parks on a GUI
+    /// approval forever (the 2026-08-10 gate hang). The bounded helper must
+    /// kill the child at the deadline and fail with `TimedOut` naming the
+    /// bound — never hang. Regression: a stub `security` that sleeps 30s is
+    /// killed at the 1s test bound.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_bounded_kills_a_locked_keychain_hang_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("hung-security");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = security_bounded_with_timeout(
+            &stub,
+            home.path(),
+            &[std::ffi::OsStr::new("find-generic-password")],
+            None,
+            std::time::Duration::from_secs(1),
+        );
+
+        let error = result.expect_err("a hung security must be reported as timed out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            error.to_string().contains("did not exit within 1s"),
+            "the error names the bound: {error}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "killed at the deadline, not after the stub's 30s sleep"
+        );
+    }
+
+    /// Run `security` pinned to a session HOME, capturing status+output.
+    /// Passing the passphrase via argv is fine in tests — the secret is a
+    /// throwaway and the point under test is its value, not the transport.
+    /// Callers must pass only subcommands that cannot fall back to
+    /// interactive auth (see the non-interactivity invariant above
+    /// [`SESSION_KEYCHAIN_LOCK_SECS`]): `show-keychain-info` only ever
+    /// against a db the seed JUST reported unlocked.
+    #[cfg(target_os = "macos")]
+    fn security_output(home: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("security")
+            .args(args)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    }
+
     /// macOS: a relocated HOME gets an EMPTY login keychain (the CLI consults
     /// the keychain domain at startup even with CURSOR_API_KEY set and dies
-    /// with security exit 154 when none resolves through HOME).
+    /// with security exit 154 when none resolves through HOME), created with
+    /// a random per-session passphrase stored 0600 beside the db and left
+    /// unlocked for the session (auto-lock bounded — never the 300s default
+    /// that relocked mid-build, never no-timeout).
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_seeded_empty_when_absent() {
         let home = tempfile::tempdir().unwrap();
 
-        ensure_session_login_keychain(home.path());
+        // The seed's own unlock witness (batch A's exit 0) is the only
+        // trustworthy non-interactive evidence the store is left unlocked —
+        // this db path was never unlocked before, so its credential cache
+        // is empty and the witnessed unlock genuinely consumed the stored
+        // secret (see the ensure doc for why probing lock state through
+        // `security` is unsound).
+        assert!(ensure_session_login_keychain(home.path(), "test-session"));
 
         let db = home
             .path()
@@ -1170,6 +1629,12 @@ mod tests {
         let meta = std::fs::symlink_metadata(&db).unwrap();
         assert!(meta.is_file(), "the seed is a real file, never a link");
         assert!(meta.len() > 0, "security create-keychain writes a real db");
+        // The stored secret is the db's real passphrase by construction —
+        // one string is both written 0600 and fed to create-keychain — and
+        // the witnessed first unlock above consumed exactly it.
+        let unlock_material =
+            std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
+        assert!(!unlock_material.is_empty());
     }
 
     /// macOS: an existing keychain path is never replaced — the seed must
@@ -1183,9 +1648,174 @@ mod tests {
         let db = keychains.join("login.keychain-db");
         std::fs::write(&db, b"sentinel").unwrap();
 
-        ensure_session_login_keychain(home.path());
+        let _ = ensure_session_login_keychain(home.path(), "test-session");
 
         assert_eq!(std::fs::read(&db).unwrap(), b"sentinel");
+    }
+
+    /// macOS (ticket keychain-passphrase-predictable-permanent-unlock): the
+    /// seed's passphrase is a random per-session secret — two sessions never
+    /// share one, it is never derived from the session id, it persists 0600
+    /// under the session scratch HOME, and a respawn into the same HOME
+    /// reuses it (the db keeps the passphrase it was created with).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_hardened_secret_is_random_per_session_and_stored_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+
+        assert!(ensure_session_login_keychain(home_a.path(), "test-session"));
+        assert!(ensure_session_login_keychain(home_b.path(), "test-session"));
+
+        let path_a = session_keychain_secret_path(home_a.path());
+        let secret_a = std::fs::read_to_string(&path_a).unwrap();
+        let secret_b =
+            std::fs::read_to_string(session_keychain_secret_path(home_b.path())).unwrap();
+        assert_ne!(
+            secret_a, secret_b,
+            "each session gets its own random secret"
+        );
+        // Both homes were seeded with the SAME session id — the secret must
+        // not derive from it (the v2 hole was kranz-scratch-{session_id}).
+        assert!(!secret_a.contains("test-session"));
+        assert_eq!(secret_a.len(), 32, "a uuid v4 simple secret is 128 bits");
+        assert!(secret_a.chars().all(|c| c.is_ascii_hexdigit()));
+        let mode = std::fs::metadata(&path_a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the secret file must be owner-only, got {mode:o}"
+        );
+
+        assert!(ensure_session_login_keychain(home_a.path(), "test-session"));
+        assert_eq!(
+            std::fs::read_to_string(&path_a).unwrap(),
+            secret_a,
+            "a respawn into the same HOME reuses the stored secret"
+        );
+    }
+
+    /// macOS: the seed restores a bounded auto-lock (never the cleared
+    /// no-timeout of v2) and leaves the store unlocked for the session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_hardened_lock_timeout_is_bounded_and_unlocked() {
+        let home = tempfile::tempdir().unwrap();
+
+        assert!(
+            ensure_session_login_keychain(home.path(), "test-session"),
+            "the seed's own unlock witness: batch A exited 0, so the store \
+             is known-unlocked and show-keychain-info below cannot prompt"
+        );
+
+        let db = home
+            .path()
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db");
+        // show-keychain-info on a LOCKED db pops a GUI auth dialog (and hung
+        // the gate suite); it is only called here because the witness above
+        // proved the db unlocked.
+        let info = security_output(home.path(), &["show-keychain-info", db.to_str().unwrap()]);
+        assert!(
+            info.status.success(),
+            "show-keychain-info on the known-unlocked db: {}",
+            String::from_utf8_lossy(&info.stderr)
+        );
+        // show-keychain-info prints the settings line on STDERR.
+        let info_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&info.stdout),
+            String::from_utf8_lossy(&info.stderr)
+        );
+        assert!(
+            info_text.contains(&format!("timeout={SESSION_KEYCHAIN_LOCK_SECS}s")),
+            "the auto-lock is bounded, never no-timeout: {info_text}"
+        );
+    }
+
+    /// macOS: session teardown relocks the seeded store. The locked state
+    /// itself is NOT asserted: it cannot be probed non-interactively (the
+    /// wrong-pass probe lies and re-unlocks via securityd's credential
+    /// cache for a previously-unlocked login-named db; interrogating a
+    /// locked db can hang on a GUI dialog — see the ensure doc). What is
+    /// asserted: the teardown hook ran `lock-keychain` on the session db to
+    /// exit 0 — verified live 2026-08-09 to genuinely lock (a post-lock
+    /// `set-keychain-settings` fails 152) — idempotently, and the bounded
+    /// auto-lock is the independent backstop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_hardened_teardown_relocks_the_store() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(ensure_session_login_keychain(home.path(), "test-session"));
+
+        let ran = lock_session_login_keychain(home.path()).unwrap();
+        assert!(ran, "the teardown hook ran lock-keychain on the session db");
+
+        let again = lock_session_login_keychain(home.path()).unwrap();
+        assert!(
+            again,
+            "relocking an already-locked db neither prompts nor errors"
+        );
+
+        // The respawn path stays intact: the stored secret re-unlocks
+        // (prompt-free with -p supplied; also the exact command the next
+        // spawn's batch A runs).
+        let db = home
+            .path()
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db");
+        let unlock_material =
+            std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap();
+        assert!(
+            security_output(
+                home.path(),
+                &[
+                    "unlock-keychain",
+                    "-p",
+                    &unlock_material,
+                    db.to_str().unwrap(),
+                ]
+            )
+            .status
+            .success(),
+            "the stored secret re-unlocks after teardown"
+        );
+    }
+
+    /// macOS: a pre-hardening scratch HOME (db created with the
+    /// session-derived passphrase, no secret file) still unlocks — the
+    /// legacy fallback keeps in-flight homes from wedging across the
+    /// upgrade. The returned witness is honest here: this db path was never
+    /// successfully unlocked before ensure ran, so no securityd credential
+    /// cache can mask a wrong passphrase — had the fallback been wrong,
+    /// batch A would have exited non-zero.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_hardened_legacy_seed_still_unlocks() {
+        let home = tempfile::tempdir().unwrap();
+        let keychains = home.path().join("Library").join("Keychains");
+        std::fs::create_dir_all(&keychains).unwrap();
+        let db = keychains.join("login.keychain-db");
+        // Recreate the v2 shape: derived passphrase, no secret file, locked.
+        let created = security_output(
+            home.path(),
+            &[
+                "create-keychain",
+                "-p",
+                "kranz-scratch-test-session",
+                db.to_str().unwrap(),
+            ],
+        );
+        assert!(created.status.success());
+        let locked = security_output(home.path(), &["lock-keychain", db.to_str().unwrap()]);
+        assert!(locked.status.success());
+
+        assert!(
+            ensure_session_login_keychain(home.path(), "test-session"),
+            "the legacy derived passphrase still unlocks the pre-hardening db"
+        );
     }
 
     /// The one sanctioned auth var crosses when set; ambient secrets never do.
@@ -1500,5 +2130,30 @@ mod tests {
         assert!(names_pre_billing_failure("Authentication required"));
         assert!(!names_pre_billing_failure("README.md"));
         assert!(!names_pre_billing_failure(""));
+    }
+
+    /// 14th-pass review: the match is line-anchored, not a loose substring —
+    /// text that merely QUOTES a rejection (a torn stream-json fragment of
+    /// an assistant event, a tool relaying a remote's error mid-line) is not
+    /// a pre-billing failure.
+    #[test]
+    fn pre_billing_match_ignores_quoted_phrases_and_torn_json() {
+        // A torn stream-json line whose assistant text quotes the phrase.
+        assert!(!names_pre_billing_failure(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"the remote said Authentication required\""
+        ));
+        // Mid-line mentions (a tool's stderr relaying a remote's rejection).
+        assert!(!names_pre_billing_failure(
+            "remote: Authentication required"
+        ));
+        assert!(!names_pre_billing_failure(
+            "exit 1 upstream: Cannot use this model: gpt-5"
+        ));
+        // The CLI's own rejection lines still match: phrase-led,
+        // case-insensitive, leading whitespace tolerated.
+        assert!(names_pre_billing_failure(
+            "Cannot use this model: bogus-id. Available models: gpt-5"
+        ));
+        assert!(names_pre_billing_failure("  authentication required"));
     }
 }

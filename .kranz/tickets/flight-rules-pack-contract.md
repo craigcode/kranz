@@ -2,6 +2,8 @@
 title: Flight Rules pack contract — canonical RFC and rule schema
 priority: 1
 schedule: once
+state: done
+state-note: Implemented — schema-4 [standards] root, strict bounded loader (pack/standards.rs), normalized manifest + sha256 digest, kranz standards lint [--against ref] with transition refusals, trust-aware pack lint. 27 flight_rules_contract_* tests; full workspace gates green.
 ---
 
 ## Goal

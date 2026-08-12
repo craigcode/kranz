@@ -347,6 +347,7 @@ mod tests {
             deny_exceptions: vec![],
             egress_grants: vec![],
             executor_route: None,
+            standards_manifest: None,
         }
     }
 

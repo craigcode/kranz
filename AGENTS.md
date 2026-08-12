@@ -112,8 +112,11 @@ kranz work                      # drain the queue (run missions)
     (`sandbox::resolve_validator_containment`): the snapshot is the sole
     writable root, the real checkout's source tree is read-denied, and the
     shared `.git` is readable but write-denied; uncontainable
-    platforms/backends degrade with a loud per-round decision, never
-    silently. The `validator.tamper` fingerprint on the real checkout is
+    platforms/backends FAIL CLOSED by default (14th-pass reversal of the
+    224fa73 loud-degrade decision — the degrade reopens the
+    modify→use→restore path; `validatorAllowUncontainedDegrade` in
+    `.kranz/config.json` is the explicit per-repo opt-in back to the loud
+    per-round degrade). The `validator.tamper` fingerprint on the real checkout is
     the tripwire (defense-in-depth) whose drift means the isolation itself
     failed.
 
