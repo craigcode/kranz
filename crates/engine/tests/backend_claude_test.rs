@@ -618,12 +618,16 @@ fn user_message_line_is_one_json_line_in_wire_format() {
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).expect("write script");
-    let mut perms = std::fs::metadata(&path)
+    let staged = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&staged, body).expect("write staged script");
+    let mut perms = std::fs::metadata(&staged)
         .expect("script metadata")
         .permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("chmod script");
+    std::fs::set_permissions(&staged, perms).expect("chmod staged script");
+    // Publish an inode that was never open for writing. This avoids transient
+    // ETXTBSY failures when a Linux runner executes the script immediately.
+    std::fs::rename(&staged, &path).expect("publish script");
     path
 }
 
