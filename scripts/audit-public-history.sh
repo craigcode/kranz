@@ -14,6 +14,7 @@ fi
 markers=(
   '/Users/'craig'martin'
   'craigmartin8008''@''gmail.com'
+  'craig''@''craigmartin.com'
   'everything-''evenhub'
 )
 
