@@ -9,7 +9,7 @@
 //! WHY deterministic, metadata-only selection (D-D, and the positioning
 //! ADR's frozen surface): this module is a policy PROJECTION, not a
 //! retrieval/context engine. Rules reach a prompt purely by declared
-//! stage/task-class/when-paths metadata through [`super::resolution`]'s
+//! stage/task-class/when-paths metadata through [`crate::pack::resolution`]'s
 //! predicate — never by model judgement, text similarity, or prompt
 //! assembly sophistication. The same inputs always project the same
 //! stable-sorted rules, so a recorded session prompt hash names one exact
@@ -38,7 +38,7 @@
 //! approved-only rule can block.
 //!
 //! WHY hard caps with a fail-closed refusal (D-D/D-J): the applicable
-//! normative statements must fit the projection budget; [`check_budget`]
+//! normative statements must fit the projection budget; [`crate::pack::projection::check_budget`]
 //! refuses naming the excess rules — approval included — rather than
 //! silently dropping an enforced rule to fit a prompt budget. Full RFC
 //! rationale stays lazy (only the compact statements project), and
@@ -405,9 +405,9 @@ impl PlanningProjection {
 
 /// Resolve the planning-stage candidate set from the trusted source (D-D):
 /// for a repo-relative `packDir`, tracked blobs at `base_ref`
-/// ([`load_at_ref`] — a worktree or mission-branch edit is structurally
+/// ([`crate::pack::standards::load_at_ref`] — a worktree or mission-branch edit is structurally
 /// invisible); for an absolute `packDir`, one capability read under
-/// [`StandardsTrust::External`] (an effectively enforced rule fails the load
+/// [`crate::pack::standards::StandardsTrust::External`] (an effectively enforced rule fails the load
 /// naming the trust remedy, exactly as at approval). `Ok(None)` means no
 /// standards govern — no packDir, or a pack without a corpus at the trusted
 /// source — and every planning surface stays byte-identical.

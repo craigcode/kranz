@@ -29,7 +29,7 @@
 //! WHY the pin is engine-authored (D-E): the plan contract's
 //! `standardsManifest` is a consent artifact. Approval reloads the TRUSTED
 //! source — tracked base blobs for a repo-relative pack
-//! ([`super::standards::load_at_ref`], the merge-gates ownership idiom: a
+//! ([`crate::pack::standards::load_at_ref`], the merge-gates ownership idiom: a
 //! mission-branch edit is structurally invisible to it) or a single
 //! capability read for an external pack — resolves, and writes the pin. A
 //! plan CARRYING a manifest that differs from the fresh resolution is stale

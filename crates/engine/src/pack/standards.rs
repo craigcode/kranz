@@ -17,7 +17,7 @@
 //!
 //! WHY a hand-written frontmatter subset and not YAML: the engine's
 //! dependency tree has no YAML crate and AGENTS.md prefers existing
-//! utilities over new dependencies — the same call [`super::toml`] made for
+//! utilities over new dependencies — the same call `super::toml` made for
 //! the manifest. The subset is line-oriented and fully accountable: `key:
 //! value` scalars, `key: [a, b]` inline lists, double-quoted strings with
 //! `\\`/`\"` escapes, and `#` comments. Everything else — anchors, aliases,
@@ -28,7 +28,7 @@
 //!
 //! WHY the traversal is capability-relative and no-follow (D-J): house
 //! standards are prompt input and policy input. The pack dir is the
-//! operator-chosen anchor (the same trust basis as [`super::Pack::load`]'s
+//! operator-chosen anchor (the same trust basis as [`crate::pack::Pack::load`]'s
 //! textFile reads); every parent component is opened `open_dir_nofollow`,
 //! every leaf is stat-checked regular and read `FollowSymlinks::No` with a
 //! byte cap — a symlinked parent/leaf, a FIFO, a device, an oversized file,
@@ -49,11 +49,11 @@
 //! WHY the trust boundary (D-A/D-J): an external/untracked pack may supply
 //! approved ADVISORY rules but cannot activate ENFORCED rules in this slice
 //! — kranz has no base history with which to prove an external pack's
-//! lifecycle transitions. [`StandardsTrust::External`] plus an effectively
+//! lifecycle transitions. [`crate::pack::standards::StandardsTrust::External`] plus an effectively
 //! enforced rule is a load error naming the remedy (vendor the pack into
 //! the repo as a tracked, repo-relative `packDir`). Repo-relative packs are
 //! read from tracked blobs in the pinned base tree where the engine already
-//! does that ([`load_at_ref`], mirroring the merge-gate base-read idiom);
+//! does that ([`crate::pack::standards::load_at_ref`], mirroring the merge-gate base-read idiom);
 //! mission-time approval pinning is the next slice (KRZ-342).
 //!
 //! Loading and linting parse bytes only — no checker command or source text

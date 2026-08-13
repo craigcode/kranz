@@ -39,7 +39,7 @@ Branch `kranz/mission-m-d341a7` (from `main`). Plan of record: [plan.md](plan.md
 
 - [minor] f-1-1 — '## Current state names all five packaging/gascity file paths' — `find packaging/gascity -type f` returns six functional files (pack.toml, orders/kranz-dispatch.toml, bin/kranz-dispatch, bin/kranz-city-worker, bin/kranz-run-bead, agents/kranz-worker/agent.toml) plu… [truncated]
 - [minor] f-1-2/a9 — gc prime subsection overstates --strict behavior — docs/gascity-citizenship.md gc prime subsection (~lines 392–410) states that `gc prime kranz-worker` would 'under `--strict`, refuse to run without... a default worker prompt.' Independent verificatio… [truncated]
-- [minor] a9/f-1-3 — quoted live 'gc lint packaging/gascity: ok' not independently verifiable in this environment — The gc lint subsection (docs/gascity-citizenship.md:503–521) quotes a live run: `$ gc lint packaging/gascity` → `gc lint: <operator-home>/Data/kranz/packaging/gascity: ok`. Neither I nor the verifi… [truncated]
+- [minor] a9/f-1-3 — quoted live 'gc lint packaging/gascity: ok' not independently verifiable in this environment — The gc lint subsection (docs/gascity-citizenship.md:503–521) quotes a live run: `$ gc lint packaging/gascity` → `gc lint: <checkout>/packaging/gascity: ok`. Neither I nor the verifi… [truncated]
 
 Disposition: 1 fix feature(s) created.
 

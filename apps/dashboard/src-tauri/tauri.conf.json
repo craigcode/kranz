@@ -19,8 +19,8 @@
     "active": true,
     "targets": ["dmg", "msi", "appimage"],
     "category": "DeveloperTool",
-    "shortDescription": "Mission control for Claude Code, Codex, and Droid",
-    "longDescription": "Kranz is a local orchestration harness for headless AI agent CLIs (Claude Code, Codex, Droid): an orchestrator plans contract-first, fresh-context workers implement one feature at a time, independent validators judge each milestone, and you steer as project manager. This is the desktop Mission Control dashboard.",
+    "shortDescription": "Mission control for governed AI coding-agent work",
+    "longDescription": "Kranz is a local governance and evidence harness for headless AI coding agents. An orchestrator plans contract-first, fresh-context workers implement one feature at a time, independent validators judge each milestone, and you steer as project manager. This is the desktop Mission Control dashboard.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

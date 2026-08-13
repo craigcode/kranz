@@ -14,23 +14,37 @@ clean hosts without cloning the repository.
 
 ## Context
 
-The history scrub is complete, but the repository is still private. GitHub
-already has an older v0.1.0 release while crates.io has only 0.0.1 namespace
+The repository is still private. A prior history scrub is not sufficient for
+publication: `scripts/audit-public-history.sh` is the current fail-closed gate,
+and any marker it finds—including commit author/committer email metadata—must
+be classified and removed from every reachable ref before visibility changes.
+Existing GitHub pull-request refs retain some of
+that ancestry and cannot be force-updated, so the preferred route is a fresh
+public `craigcode/kranz` origin while this repository remains a renamed private
+archive; an in-place route requires GitHub Support cleanup and the same audit.
+GitHub already has an older v0.1.0 release while crates.io has only 0.0.1 namespace
 placeholders. Current main is substantially newer than the v0.1.0 tag, so
 publishing it as crate version 0.1.0 would create conflicting provenance. The
-checked-in Homebrew formula is also only a v0.1.0/all-zero-digest skeleton and
-no tap repository exists. See
+checked-in Homebrew asset is now a non-installable release template and no tap
+repository exists. See
 [the operator-readiness packet](../../docs/reviews/m4-m6-operator-readiness.md).
 
 ## Acceptance hints
 
-- The human-only public-visibility gate is explicitly approved and anonymous
-  clone plus rewritten history are rechecked before any package publication.
+- The historical v0.1.0 release stays only in the private archive, or is
+  withdrawn/explicitly marked unsupported on an approved in-place route; its
+  old binaries never silently become the public stable distribution.
+- The human-only origin-migration/public-visibility gate is explicitly
+  approved and both public audit scripts pass from an anonymous fresh clone
+  before package publication.
 - Root workspace/dependency versions, Tauri versions, tag, crates, release
   assets, and formula all agree on 0.2.0 (or a later version explicitly chosen
   before implementation).
-- Full workspace, dashboard, secret, advisory, and per-crate publish dry-run
-  gates pass at the exact release commit.
+- Full workspace, dashboard, secret, advisory, dependency-policy, rustdoc, and
+  packaging gates pass at the exact release commit. Engine dry-run passes
+  before publication; dependent dry-runs run bottom-up after each required
+  sibling version appears in the registry (Cargo cannot resolve an unpublished
+  sibling from crates.io merely because a workspace path exists).
 - Crates publish bottom-up and each dependency is visible in the index before
   its dependant is published.
 - The Homebrew tap uses the real tagged-tarball digest and current multi-agent

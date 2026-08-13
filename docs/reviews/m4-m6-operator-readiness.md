@@ -4,48 +4,61 @@ Date: 2026-08-12
 
 ## Outcome
 
-The repository is ready for the two remaining human decisions, but neither
-irreversible action should be performed silently from a development branch.
-M4 needs the owner to make the GitHub repository public and authorize one
+The two remaining milestones contain irreversible operator actions. M4 is not
+ready for public visibility until the fail-closed gates in
+`docs/public-readiness.md` pass; it then needs owner authorization for one
 version-aligned release. M6 needs a Railway account/project, bounded spend,
-and runtime credentials. The implementation work that can safely precede
-those decisions is either shipped or ticketed below.
+and runtime credentials.
 
 ## M4 — public distribution
 
 Verified state:
 
 - the GitHub repository is private;
-- the pre-public history rewrite and full-history secret review are complete;
+- the current tree has been sanitized, but the full-history privacy audit
+  identifies older operator-path/email/plugin metadata plus the maintainer
+  address in commit identity headers; GitHub's read-only PR refs retain part of
+  that ancestry, so the preferred public launch uses a fresh sanitized origin
+  while the existing repository remains a renamed private archive (the
+  alternative is GitHub Support cleanup plus a coordinated in-place mirror
+  rewrite);
 - GitHub release `v0.1.0` exists with Linux x86_64, macOS arm64, and Windows
   x86_64 assets, but its tag predates substantial current development;
 - crates.io names `kranz`, `kranz-engine`, `kranz-server`, and `kranz-slack`
   are reserved by 0.0.1 placeholder packages;
 - no `craigcode/homebrew-kranz` tap exists; and
-- `packaging/homebrew/kranz.rb` is a skeleton for v0.1.0 with an all-zero
-  digest and obsolete single-backend wording.
+- `packaging/homebrew/kranz.rb.in` is a non-installable, current-wording
+  release template, deliberately avoiding a bogus all-zero live formula.
 
 Publishing current source as crates.io 0.1.0 would make it disagree with the
 existing v0.1.0 tag and binary assets. The recommended next line is **0.2.0**:
-one source commit, one tag, four crates, three binary assets, the Tauri
-version, and the Homebrew formula must all agree.
+one source commit, one tag, four crates, four binary assets, the Tauri
+version, and the rendered Homebrew formula must all agree. Tauri desktop
+bundles are not part of this release line.
 
 Operator sequence after approving public visibility:
 
-1. Change repository visibility to public and verify anonymous clone, README
-   links, branch protections, issue settings, and the rewritten public history.
-2. Freeze the release commit and bump root workspace/package dependency,
-   Tauri, and formula versions together to 0.2.0.
-3. Run every workspace/dashboard/security gate plus `cargo publish --dry-run`
-   for all four crates.
-4. Tag and push `v0.2.0`; require all three release builds and asset uploads to
-   pass before writing release notes or publishing packages.
-5. Publish bottom-up: engine; server and Slack; CLI. Confirm each index entry
+1. Merge the pre-public hardening, build the sanitized history in a disposable
+   mirror, and obtain explicit approval for either the preferred clean-origin
+   migration or GitHub-assisted in-place cleanup. Make both public audit scripts
+   pass from a fresh clone containing pull refs.
+2. Create/change the public repository, keep the old release only in the
+   private archive (or withdraw/mark it unsupported in place), reapply the
+   public-only security and protected-environment controls, and verify the
+   anonymous visitor surface.
+3. Freeze the release commit and bump root workspace/package dependency and
+   Tauri versions to 0.2.0; add the dated changelog section.
+4. Run every workspace/dashboard/security/packaging gate. Cargo can dry-run the
+   engine before publication; dependent crates dry-run bottom-up after the
+   required sibling version reaches crates.io, or against a disposable local
+   registry before that.
+5. Tag and push `v0.2.0`; require the protected release workflow, four builds,
+   checksums, SBOM, and provenance attestations to pass before packages.
+6. Publish bottom-up: engine; server and Slack; CLI. Confirm each index entry
    resolves before publishing its dependants.
-6. Create the public `craigcode/homebrew-kranz` tap, replace the formula's
-   zero digest with the v0.2.0 source-tarball digest, and test a from-scratch
-   installation.
-7. On clean Linux, macOS, and Windows hosts, install without cloning this
+7. Create the public `craigcode/homebrew-kranz` tap, render the formula template
+   with the real v0.2.0 tarball digest, and test a from-scratch installation.
+8. On clean Linux, macOS, and Windows hosts, install without cloning this
    repository and reach `kranz --help` plus `kranz init`/`kranz ready` in a
    disposable repository.
 

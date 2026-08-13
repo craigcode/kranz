@@ -1,3 +1,5 @@
+#![allow(rustdoc::private_intra_doc_links)]
+
 //! Kranz Slack Socket Mode bridge (design: docs/backlog-and-slack.md).
 //!
 //! Socket Mode means the bridge opens an **outbound** websocket to Slack (the

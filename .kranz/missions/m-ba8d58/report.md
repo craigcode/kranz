@@ -26,7 +26,7 @@ Branch `kranz/mission-m-ba8d58` (from `main`). Plan of record: [plan.md](plan.md
 
 ### ms-1 round 1 — Honest stage derivation & inert dead rows
 
-- [critical] a3 — $ cd apps/dashboard && npx vitest run src/lib/api.test.ts RUN v4.1.9 <operator-home>/Data/kranz/apps/dashboard No test files found, exiting with code 1 filter: src/lib/api.test.ts include: **/*.{te… [truncated]
+- [critical] a3 — $ cd apps/dashboard && npx vitest run src/lib/api.test.ts RUN v4.1.9 <checkout>/apps/dashboard No test files found, exiting with code 1 filter: src/lib/api.test.ts include: **/*.{te… [truncated]
 
 Disposition: waived.
 - a3: Out of scope for ms-1: a3 (api non-JSON guard + api.test.ts) is contracted to ms-2/f-2-1, which is still pending and will implement and validate exactly this; not a defect in ms-1's delivered work (a1/a2).

@@ -1,3 +1,5 @@
+#![allow(rustdoc::private_intra_doc_links)]
+
 //! kranz CLI — clap surface, command implementations, and terminal rendering.
 //!
 //! The binary (`src/main.rs`) is a thin shim over this library so the

@@ -526,7 +526,7 @@ mutation. Run live against this pack:
 
 ```
 $ gc lint packaging/gascity
-gc lint: <operator-home>/Data/kranz/packaging/gascity: ok
+gc lint: <checkout>/packaging/gascity: ok
 ```
 
 The pack lints clean today. Adopt: it's free, non-mutating, and exactly the

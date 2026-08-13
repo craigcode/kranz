@@ -445,7 +445,7 @@ impl MissionHost {
 
     /// `POST /api/tickets/:slug/approve`: the shared `kranz_engine::deps`
     /// gate (cycle detection, unsatisfied-blocker refusal) plus the
-    /// enqueue side effects — the exact same core [`kranz_cli`]'s `kranz
+    /// enqueue side effects — the exact same core `kranz_cli`'s `kranz
     /// ticket approve` calls, so the CLI and REST surfaces can never drift.
     pub fn approve_ticket(
         &self,
@@ -1089,7 +1089,7 @@ impl MissionHost {
     }
 
     /// `POST /api/missions/:id/delete`: remove a TERMINAL mission's directory,
-    /// mirroring `kranz clean` exactly — [`cleanable_class`] decides, `all`
+    /// mirroring `kranz clean` exactly — `cleanable_class` decides, `all`
     /// opts in to deleting Complete missions (which otherwise stay: they feed
     /// the cost-calibration corpus), and a live lock is re-checked immediately
     /// before removal so nothing is ever deleted under a running engine.

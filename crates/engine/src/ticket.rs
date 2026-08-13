@@ -203,7 +203,7 @@ pub enum TicketState {
     NeedsContext,
     /// The planner escalated at draft time: it CAN plan, but believes the
     /// plan is likely wrong (goal misframed, premise broken). Parks like
-    /// [`NeedsContext`] — re-draftable, never schedulable/queueable — but is
+    /// [`TicketState::NeedsContext`] — re-draftable, never schedulable/queueable — but is
     /// distinct from it everywhere the state surfaces.
     WrongPlan,
     Review,
@@ -213,17 +213,17 @@ pub enum TicketState {
     Failed,
     /// Claimed then removed from the queue because backend readiness failed
     /// (missing binary, unauthenticated, unsupported config). Distinct from
-    /// [`Failed`] so operators can re-queue after fixing the environment
+    /// [`TicketState::Failed`] so operators can re-queue after fixing the environment
     /// without treating the mission run itself as a failure.
     Parked,
     /// Operator-closed without delivery (`state: superseded` frontmatter —
     /// the work moved elsewhere). Reached only through frontmatter
     /// precedence ([`Ticket::read_state`]) or the lifecycle write path;
-    /// terminal everywhere [`Done`] is. Additive serde variant: sidecars
+    /// terminal everywhere [`TicketState::Done`] is. Additive serde variant: sidecars
     /// written before it existed never spelled it.
     Superseded,
     /// Operator-closed as not-worth-doing (`state: wontfix` frontmatter).
-    /// Same reachability and terminality as [`Superseded`].
+    /// Same reachability and terminality as [`TicketState::Superseded`].
     Wontfix,
 }
 

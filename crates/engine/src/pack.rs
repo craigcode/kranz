@@ -23,7 +23,7 @@
 //! WHY gates compose AFTER the engine floor: a pack can add to the floor,
 //! never lower, reorder, or replace it. At the final gate the orchestrator
 //! registers the engine floor gates ([`crate::contract_gates`]) into ONE
-//! [`GatePipeline`] FIRST and pack gates after — registration order IS the
+//! [`crate::gate::GatePipeline`] FIRST and pack gates after — registration order IS the
 //! evaluation order within the deterministic section (gate.rs), so the
 //! composition is the guarantee, not a convention. This module closes the
 //! one remaining hole: a pack gate NAMED like an engine floor gate (which

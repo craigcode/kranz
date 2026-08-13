@@ -1,138 +1,171 @@
 # Cutting a release
 
-Kranz ships three ways: prebuilt binaries attached to a GitHub release
-(automated), a from-source `cargo install`, and — once the project is public —
-crates.io and a Homebrew tap. This runbook is the end-to-end procedure.
+Kranz distributes a CLI through GitHub release binaries, crates.io, and a
+Homebrew tap. The Tauri shell is build-checked but is not currently a supported
+release artifact. Do not advertise or attach desktop bundles until a separate
+signed, platform-specific bundle/notarization pipeline exists.
 
-The existing release artifact line is `v0.1.0`, while crates.io contains only
-0.0.1 namespace-reservation packages for `kranz`, `kranz-engine`,
-`kranz-server`, and `kranz-slack`. Current `main` is substantially newer than
-the `v0.1.0` source. Do not publish current source to crates.io as 0.1.0 or
-reuse that tag: cut the next aligned release as 0.2.0 (or a later explicitly
-chosen version) across every surface below.
+The historical v0.1.0 GitHub release is a private preview. It is 1,000+ commits
+behind the current source and predates substantial security hardening. Never
+reuse that tag or publish current source as 0.1.0. The first version-aligned
+public release is 0.2.0 unless the owner deliberately chooses a later version.
 
-## 0. One-time setup (done)
+## 0. Public-distribution prerequisites
 
-The repo slug is `craigcode/kranz`; the one-time `OWNER`-placeholder replacement
-this section used to describe is complete in `Cargo.toml`
-(`[workspace.package] repository`), `packaging/homebrew/kranz.rb` (`homepage`
-and `url`), and `README.md` (`brew tap craigcode/kranz`). Nothing to do here
-for future releases.
+Complete `docs/public-readiness.md`. In particular:
 
-`repository`, `keywords`, and `categories` live in `[workspace.package]` and are
-inherited by each publishable crate (`repository.workspace = true`, etc.), so
-the slug only exists in one place for the Cargo metadata.
+- both public audit scripts pass from a fresh clone containing every branch,
+  tag, and GitHub pull-request ref;
+- the old v0.1.0 release remains only in the private archive, or is withdrawn
+  or visibly marked unsupported on an approved in-place route;
+- the repository is public and an anonymous clone has been verified;
+- all four reserved crates.io names are controlled by the expected owners;
+- the `release` GitHub environment requires owner approval;
+- the repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`;
+  and
+- no release tag already exists for the chosen version.
 
-## 1. Bump the version
+These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
+branches, tags, crates, formulas, or releases.
 
-Versions are workspace-inherited. Bump `[workspace.package] version` in the
-root `Cargo.toml` once and every crate follows (they all use
-`version.workspace = true`). Also bump:
+## 1. Prepare the version pull request
 
-- `apps/dashboard/src-tauri/tauri.conf.json` — `"version"` (the Tauri desktop
-  app is a standalone workspace and does not inherit the root version).
-- `apps/dashboard/src-tauri/Cargo.toml` — `version` (same reason).
-- `packaging/homebrew/kranz.rb` — `version` and the `v#{version}` in `url`
-  (updated again in step 4 once the tag exists and its sha256 is known).
-- the three sibling dependency versions under root `[workspace.dependencies]`
-  so crates.io resolves the same release of `kranz-engine`, `kranz-server`,
-  and `kranz-slack` when it ignores their local `path` values.
+Versions are workspace-inherited. Update:
 
-Run `cargo update -p kranz-engine -p kranz-server -p kranz-slack -p kranz`
-(or `cargo check --workspace`) so `Cargo.lock` records the new version, and
-commit the bump.
+- `[workspace.package] version` in the root `Cargo.toml`;
+- `kranz-engine`, `kranz-server`, and `kranz-slack` version requirements under
+  root `[workspace.dependencies]`;
+- `apps/dashboard/src-tauri/tauri.conf.json`;
+- `apps/dashboard/src-tauri/Cargo.toml`; and
+- `CHANGELOG.md`, moving the relevant Unreleased entries into a dated version
+  section.
 
-## 2. Tag and push
+Do not render the Homebrew template yet: GitHub's tagged tarball and its digest
+do not exist until the tag exists.
 
-```sh
-git tag vX.Y.Z          # tag name MUST start with "v" — release.yml triggers on v*
-git push origin main
-git push origin vX.Y.Z  # this push is what fires the release build
-```
-
-Pushing the tag triggers `.github/workflows/release.yml`:
-
-- Matrix build on `ubuntu-latest`, `macos-latest`, `windows-latest`.
-- Each job runs `cargo build --release --locked -p kranz --bin kranz`,
-  renames the binary to `kranz-<os>-<arch>` (`.exe` on Windows), and attaches
-  it to the release for the tag via `softprops/action-gh-release`.
-- `release.yml` only *builds*; `ci.yml` already gates PRs and pushes to `main`
-  with clippy + the full test suite, so the release path does not re-test.
-
-Confirm all three matrix jobs are green and the three assets are attached to
-the GitHub release before continuing. (CI-green + the tag push are the
-human-gated step — do not automate past here without checking the run.)
-
-## 3. Write release notes
-
-Edit the GitHub release created by the tag: summarize changes, and point users
-at the attached `kranz-<os>-<arch>` assets and the install options in the
-README.
-
-## 4. Update the Homebrew formula
-
-The formula (`packaging/homebrew/kranz.rb`) is from-source: it fetches the tag's
-source tarball and runs `cargo install`. After the tag exists, compute the
-tarball sha256 and fill the placeholder:
+Run `cargo check --workspace --locked` so the root lockfile records the new
+workspace versions. Refresh the standalone Tauri lockfile with its locked
+check as needed. Then run the exact release check locally without querying
+remote main:
 
 ```sh
-curl -sL https://github.com/craigcode/kranz/archive/refs/tags/vX.Y.Z.tar.gz \
-  | shasum -a 256
+KRANZ_RELEASE_SKIP_MAIN_CHECK=1 scripts/check-release-version.sh vX.Y.Z
 ```
 
-Set `url` (to `.../tags/vX.Y.Z.tar.gz`), `version` (`X.Y.Z`), and `sha256` in
-the formula, then move it to your tap repo (`homebrew-kranz`) or open a
-homebrew-core PR. Verify locally with `brew install --build-from-source
-./packaging/homebrew/kranz.rb`.
+## 2. Run the release-candidate gates
 
-## 5. Publish to crates.io (once public)
-
-`kranz` (the CLI package) and `kranz-server`/`kranz-slack` depend on sibling crates by
-**path** (e.g. `kranz-engine = { version = "0.1.0", path = "crates/engine" }`).
-crates.io ignores the `path` and resolves each dependency by its `version`, but
-that only works if the dependency is already published at that version — so the
-order matters. The dependency DAG is:
-
-```
-engine  (no intra-workspace deps)
-  ├── server  (deps: engine)
-  ├── slack   (deps: engine)
-  └── cli     (deps: engine, server, slack)
-```
-
-Publish bottom-up, waiting for each crate to be live on crates.io (index
-propagation) before the crate that depends on it:
+Run commands directly and preserve their exit codes:
 
 ```sh
-cargo publish -p kranz-engine     # 1. base crate, no siblings
-cargo publish -p kranz-server     # 2. depends on engine
-cargo publish -p kranz-slack      # 2. depends on engine (independent of server)
-cargo publish -p kranz            # 3. the CLI — depends on engine + server + slack
+cargo fmt --all
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo build --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
+scripts/audit-public-tree.sh
+scripts/audit-public-history.sh
 ```
 
-Before the first real publication, verify ownership of all four reserved
-names and run `cargo publish --dry-run` for every package, not just the
-engine. A successful dry run proves packaging; it does not authorize the
-irreversible publish.
+Run the full dashboard gate from `apps/dashboard` and the locked Tauri check
+from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull
+request must pass every required GitHub check on the exact commit that will be
+tagged.
 
-Notes:
+## 3. Rehearse crate packaging honestly
 
-- The version in each `version = "X.Y.Z", path = ... ` sibling dependency (in
-  the root `[workspace.dependencies]`) MUST equal the version being published,
-  or the dependent crate will fail to resolve on crates.io. Because everything
-  is workspace-versioned, bumping the root `version` in step 1 keeps these in
-  sync — just remember to bump `[workspace.dependencies]` entries too if they
-  ever pin a different version.
-- `apps/dashboard` (the Tauri shell) is **not** published to crates.io; it is a
-  standalone workspace shipped only as the desktop bundle (`dmg`/`msi`/
-  `appimage` from `tauri build`).
-- Dry-run first: `cargo publish -p kranz-engine --dry-run`.
+Cargo removes workspace `path` dependencies when publishing and resolves their
+version from the target registry. Therefore a dependent crate cannot complete
+a crates.io dry-run until its sibling version is actually visible there. A
+claim that all four crates can dry-run before *any* publication is false.
 
-## Recap (order of operations)
+Before publication:
 
-1. Bump `version` (root Cargo.toml + tauri.conf.json + src-tauri Cargo.toml +
-   formula), commit.
-2. `git tag vX.Y.Z` and push the tag → `release.yml` builds + attaches binaries.
-3. Verify CI green + assets attached; write release notes.
-4. Update the Homebrew formula's `sha256`/`version`/`url`.
-5. (optional) `cargo publish` in order: engine → server, slack → cli.
+```sh
+cargo package --list -p kranz-engine
+cargo package --list -p kranz-server
+cargo package --list -p kranz-slack
+cargo package --list -p kranz
+cargo publish --dry-run -p kranz-engine
+```
+
+Inspect every package list for secrets, runtime state, oversized fixtures, and
+unintended generated files. If the release requires proof of all dependent
+packages before the first irreversible publish, use a disposable local Cargo
+registry; do not mislabel a crates.io-resolution failure as a source defect.
+
+## 4. Merge, tag, and approve GitHub publication
+
+After the version pull request merges and `main` is green, create an annotated
+tag on that exact commit and push it as a separate human action:
+
+```sh
+git switch main
+git pull --ff-only origin main
+scripts/check-release-version.sh vX.Y.Z
+git tag -a vX.Y.Z -m "Kranz vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The tag starts `.github/workflows/release.yml`. It rechecks version/main
+alignment, all reachable history, Rust/dashboard gates, documentation, and
+dependency policy before building. Each platform binary receives a GitHub
+build-provenance attestation. The final protected-environment job assembles the
+binaries, SPDX JSON SBOM, and `SHA256SUMS`; an owner must approve that job before
+GitHub creates the release.
+
+After approval, verify all assets, checksums, attestations, generated notes,
+and `kranz --version` on clean Linux, macOS, and Windows hosts. A failed matrix
+or missing evidence means no release—delete the draft/tag only through the
+documented operator recovery process.
+
+## 5. Publish crates bottom-up
+
+Publishing is irreversible. Run each dry-run immediately before its publish,
+then wait until crates.io resolves that exact version before continuing:
+
+```sh
+cargo publish --dry-run -p kranz-engine
+cargo publish -p kranz-engine
+
+cargo publish --dry-run -p kranz-server
+cargo publish -p kranz-server
+
+cargo publish --dry-run -p kranz-slack
+cargo publish -p kranz-slack
+
+cargo publish --dry-run -p kranz
+cargo publish -p kranz
+```
+
+`kranz-server` and `kranz-slack` are independent once `kranz-engine` is live;
+the CLI must be last because it depends on all three. Confirm ownership,
+package contents, repository URL, license, README rendering, and installability
+on crates.io after every step.
+
+## 6. Render and publish the Homebrew formula
+
+Download GitHub's tagged source tarball, compute its SHA-256 digest, and render
+`packaging/homebrew/kranz.rb.in` into the `craigcode/homebrew-kranz` tap by
+replacing `VERSION` and `SHA256`. Review the resulting diff; the committed file
+in this repository remains a template, not an installable all-zero formula.
+
+Test the rendered formula before pushing the tap:
+
+```sh
+brew install --build-from-source ./Formula/kranz.rb
+brew test kranz
+kranz --version
+```
+
+Finally verify a clean `brew tap craigcode/kranz && brew install kranz` and a
+clean `cargo install kranz --locked` without a Kranz source checkout.
+
+## 7. Close the release
+
+- Update the changelog comparison links if adopted.
+- Record clean-install evidence and artifact digests in the release notes.
+- Verify GitHub still reports every required security and branch rule.
+- Mark the M4 operator-release ticket done only after GitHub, crates.io,
+  Homebrew, and clean-host smoke tests all agree on the same version.

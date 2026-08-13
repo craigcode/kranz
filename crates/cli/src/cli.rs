@@ -459,7 +459,7 @@ pub enum Command {
         open: bool,
 
         /// Directory holding the built dashboard (index.html + assets).
-        /// Default search order: $KRANZ_DASHBOARD_DIST, <repo>/apps/dashboard/dist,
+        /// Default search order: `$KRANZ_DASHBOARD_DIST`, `<repo>/apps/dashboard/dist`,
         /// installed asset dirs, the kranz source checkout used to build the
         /// binary, then the embedded dashboard bundled into the CLI.
         #[arg(long, value_name = "DIR")]
@@ -476,7 +476,7 @@ pub enum Command {
         /// only — never mutations — so it is the token safe to hand to
         /// dashboards and agents. Stored next to serve.token at
         /// .kranz/serve.read.token (operator catalog:
-        /// ~/.kranz/serve/<endpoint>.read.token).
+        /// `~/.kranz/serve/<endpoint>.read.token`).
         #[arg(long, value_name = "TOKEN")]
         read_token: Option<String>,
 
@@ -535,7 +535,7 @@ pub enum Command {
         mission_id: Option<String>,
 
         /// Directory to write the bundle into (created; must be empty).
-        /// Defaults to ./evidence-bundle-<mission-id>
+        /// Defaults to `./evidence-bundle-<mission-id>`
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
     },
@@ -591,7 +591,7 @@ pub enum Command {
     /// Inspect and edit kranz configuration (files + mid-mission changes).
     ///
     /// Config resolves from three layers, later winning: compiled-in defaults
-    /// <- ~/.kranz/config.json (--global) <- <repo>/.kranz/config.json (the
+    /// <- `~/.kranz/config.json` (`--global`) <- `<repo>/.kranz/config.json` (the
     /// default target). `show` prints the effective merge; `set`/`unset` edit
     /// one layer file (validated before writing, other keys preserved);
     /// `role` is the MID-MISSION path — it enqueues a config-change control
@@ -650,13 +650,13 @@ pub enum StandardsCommand {
         json: bool,
     },
 
-    /// Load a pack's [standards] corpus and print the normalized manifest:
+    /// Load a pack's `[standards]` corpus and print the normalized manifest:
     /// every RFC and rule with its effective lifecycle status, checker
     /// binding, and scopes, plus the sha256 content digest and the trust
     /// posture (an external/untracked pack is advisory-only — enforced rules
     /// are refused at load naming the remedy).
     ///
-    /// With --against <ref>, the base pack is read from TRACKED BLOBS at
+    /// With `--against <ref>`, the base pack is read from TRACKED BLOBS at
     /// that git ref (never the worktree) and lifecycle transition violations
     /// are refused: absent/draft → enforced, a semantic rule change without
     /// a revision increment, a disappeared known rule ID, tombstone
@@ -817,7 +817,7 @@ pub enum TicketCommand {
         slug: String,
     },
 
-    /// Scaffold a new ticket at .kranz/tickets/<slug>.md (refuses to overwrite)
+    /// Scaffold a new ticket at `.kranz/tickets/<slug>.md` (refuses to overwrite)
     New {
         /// The ticket slug (used as the file stem)
         slug: String,
@@ -832,7 +832,7 @@ pub enum TicketCommand {
     },
 
     /// Append a note to a ticket's discussion
-    /// (.kranz/tickets/<slug>.notes.jsonl — append-only, committed with the
+    /// (`.kranz/tickets/<slug>.notes.jsonl` — append-only, committed with the
     /// ticket; D-BW-3). Author is $KRANZ_NOTE_AUTHOR, else "operator"
     Note {
         /// The ticket slug

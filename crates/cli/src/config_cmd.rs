@@ -54,7 +54,7 @@ pub enum ConfigCommand {
         #[arg(long, conflicts_with = "project")]
         global: bool,
 
-        /// Print only <repo>/.kranz/config.json (the project layer)
+        /// Print only `<repo>/.kranz/config.json` (the project layer)
         #[arg(long)]
         project: bool,
     },
@@ -75,7 +75,7 @@ pub enum ConfigCommand {
         /// The value (JSON if it parses, plain string otherwise)
         value: String,
 
-        /// Write to ~/.kranz/config.json instead of <repo>/.kranz/config.json
+        /// Write to `~/.kranz/config.json` instead of `<repo>/.kranz/config.json`
         #[arg(long)]
         global: bool,
     },
@@ -88,7 +88,7 @@ pub enum ConfigCommand {
         /// Dotted path into the config (e.g. worker.model)
         path: String,
 
-        /// Edit ~/.kranz/config.json instead of <repo>/.kranz/config.json
+        /// Edit `~/.kranz/config.json` instead of `<repo>/.kranz/config.json`
         #[arg(long)]
         global: bool,
     },

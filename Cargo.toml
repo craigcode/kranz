@@ -8,12 +8,13 @@ edition = "2021"
 # README quick-start floor; inherited by every member crate and checked in CI.
 rust-version = "1.88"
 license = "MIT"
-description = "Local mission-control harness for headless AI agent CLIs (Claude Code, Codex, Droid)."
+description = "Git-native mission control for governed, validated AI coding-agent work."
 readme = "README.md"
-# release.yml and the Homebrew formula reference this same craigcode/kranz
+# release.yml and the Homebrew formula template reference this same craigcode/kranz
 # slug (see docs/releasing.md).
 repository = "https://github.com/craigcode/kranz"
-keywords = ["claude", "agent", "orchestration", "mission-control", "ai"]
+homepage = "https://github.com/craigcode/kranz"
+keywords = ["agent", "orchestration", "mission-control", "validation", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]

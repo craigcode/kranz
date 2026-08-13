@@ -248,7 +248,7 @@ pub enum PipelineStage {
     Drafting,
     NeedsYou,
     /// Draft-stage wrong-plan escalation: parked for the operator like
-    /// [`NeedsYou`], but a distinct stage everywhere it renders.
+    /// [`PipelineStage::NeedsYou`], but a distinct stage everywhere it renders.
     WrongPlan,
     Reviewable,
     Queued,

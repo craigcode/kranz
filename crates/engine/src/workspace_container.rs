@@ -7,7 +7,7 @@
 //! worktrees cannot.
 //!
 //! Relationship to [`crate::sandbox_container`] (M7 tier 3): this provider
-//! REUSES its runtime detection ([`ContainerRuntime`]/[`detect`]) but the
+//! REUSES its runtime detection ([`ContainerRuntime`]/[`crate::sandbox_container::detect`]) but the
 //! concepts stay separate ("the APIs stay separate"): the sandbox is the
 //! process blast radius for agent CLIs — its tier-3 `--network none`
 //! semantics live in THAT layer — while the workspace is the runnable

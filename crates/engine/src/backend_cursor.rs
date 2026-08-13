@@ -55,7 +55,7 @@
 //! EVEN with `CURSOR_API_KEY` set, and the keychain domain resolves through
 //! `HOME`, so a relocated HOME without `Library/Keychains/login.keychain-db`
 //! dies pre-auth with `security` exit 154. Both spawn branches therefore
-//! seed an EMPTY login keychain ([`ensure_session_login_keychain`]) — never
+//! seed an EMPTY login keychain (`ensure_session_login_keychain`) — never
 //! a link to the operator's real keychain.
 //!
 //! Hook-status lane (ticket `agent-hooks-status-signals`,
@@ -64,7 +64,7 @@
 //! this hook-capable backend), [`CursorBackend::start`] installs the lane
 //! into the session-private HOME BEFORE spawning: `<home>/.cursor/
 //! hooks.json` (the CLI's documented user-level hook file — verified
-//! 2026-08-06 against https://cursor.com/docs/hooks: `version: 1` with
+//! 2026-08-06 against <https://cursor.com/docs/hooks>: `version: 1` with
 //! per-event `[{command, timeout}]` handlers, payloads delivered on stdin,
 //! exit 0 = ok / 2 = block / other = fail-open; there is NO HTTP hook
 //! type, so delivery to kranz's endpoint is the installed

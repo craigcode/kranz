@@ -30,8 +30,8 @@
 //!
 //! # The verified cursor hook surface (ground truth)
 //!
-//! Verified 2026-08-06 against the live docs (https://cursor.com/docs/hooks
-//! and https://cursor.com/docs/cli/changelog; the local `agent --help`
+//! Verified 2026-08-06 against the live docs (<https://cursor.com/docs/hooks>
+//! and <https://cursor.com/docs/cli/changelog>; the local `agent --help`
 //! prints no hook documentation):
 //!
 //! - Hooks are declared in `hooks.json` files; the USER-level file is
