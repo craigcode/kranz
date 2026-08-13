@@ -24,6 +24,13 @@ for marker in "${markers[@]}"; do
     printf 'public-history audit: marker remains in reachable history: %s\n%s\n' "$marker" "$matches" >&2
     failed=1
   fi
+
+  message_matches="$(git log --all --format='%H%x09%B' | grep -F "$marker" || true)"
+  if [ -n "$message_matches" ]; then
+    printf 'public-history audit: marker remains in commit messages: %s\n%s\n' \
+      "$marker" "$message_matches" >&2
+    failed=1
+  fi
 done
 
 # `git log -G` searches patches, not author/committer headers. Keep identity

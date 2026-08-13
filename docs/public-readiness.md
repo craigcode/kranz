@@ -17,8 +17,9 @@ hardening changes. Keep the repository private until every item below is true.
 
 If the history audit finds operator metadata, classify it before rewriting.
 Create a mirror backup, place the literal replacement mappings in an untracked
-file outside the repository, and use `git filter-repo --replace-text` in a
-disposable mirror clone. Commit author/committer headers need a separate
+file outside the repository, and use `git filter-repo --replace-text` plus
+`--replace-message` in a disposable mirror clone: blob replacement does not
+rewrite commit messages. Commit author/committer headers need a separate
 `--mailmap` rewrite: map the historical maintainer address to
 `6720093+craigcode@users.noreply.github.com`; replacing blob text does not edit
 commit identities. Re-run both audits there. Rewriting changes every
