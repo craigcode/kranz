@@ -21,7 +21,7 @@
 # README quick-start). The committed dashboard dist under
 # crates/cli/assets/dashboard/dist is embedded by crates/cli/build.rs, so the
 # release build needs no Node.js — pure cargo.
-FROM rust:1-slim@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS builder
+FROM rust:1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
 
 # git is present in the builder for any build script that inspects the repo;
 # the release build itself does not require it.
