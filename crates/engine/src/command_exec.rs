@@ -41,7 +41,7 @@
 //! EPERM. But that regex also let a wrapped gate WRITE the shared per-user
 //! xcrun database — including the operator's existing one, a mutation
 //! surface outside the mission that later developer-tool invocations rely
-//! on. The regex is GONE: [`prewarm_xcrun_cache_outside_sandbox`] refreshes
+//! on. The regex is GONE: `prewarm_xcrun_cache_outside_sandbox` refreshes
 //! the cache OUTSIDE the sandbox once per resolve (cheap, bounded,
 //! failure-tolerant), and a shim refresh that still races stale inside the
 //! sandbox now fails loudly with the shim's own EPERM — a documented edge,
@@ -509,7 +509,7 @@ pub(crate) struct GateSandboxResolution {
 /// module doc), but it also let a wrapped gate WRITE the shared per-user
 /// xcrun database — including the operator's existing one, a mutation
 /// surface outside the mission. The replacement posture is prewarm + deny:
-/// [`prewarm_xcrun_cache_outside_sandbox`] refreshes the cache unsandboxed
+/// `prewarm_xcrun_cache_outside_sandbox` refreshes the cache unsandboxed
 /// once per resolve, and a shim refresh that still races stale inside the
 /// sandbox fails loudly with the shim's own EPERM (the documented edge).
 ///

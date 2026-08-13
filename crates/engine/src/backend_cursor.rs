@@ -55,7 +55,7 @@
 //! EVEN with `CURSOR_API_KEY` set, and the keychain domain resolves through
 //! `HOME`, so a relocated HOME without `Library/Keychains/login.keychain-db`
 //! dies pre-auth with `security` exit 154. Both spawn branches therefore
-//! seed an EMPTY login keychain ([`ensure_session_login_keychain`]) — never
+//! seed an EMPTY login keychain (`ensure_session_login_keychain`) — never
 //! a link to the operator's real keychain.
 //!
 //! Hook-status lane (ticket `agent-hooks-status-signals`,
