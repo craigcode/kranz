@@ -2,8 +2,9 @@
 //! process lifecycle via a fake CLI script, and an ignored live smoke test).
 //!
 //! NOTE: expected fixture values (session id, token counts, cost) are taken
-//! from the committed fixture `tests/fixtures/stream_json_single_shot.jsonl`,
-//! which is real probed CLI output and the parser's ground truth.
+//! from the committed fixture `tests/fixtures/stream_json_single_shot.jsonl`.
+//! It preserves the shape of real probed CLI output while removing operator
+//! paths, installed-plugin inventory, request identifiers, and model reasoning.
 
 use kranz_engine::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const FIXTURE_SESSION_ID: &str = "3ab68fd6-491a-4fad-b848-a207c52e4fc2";
+const FIXTURE_SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

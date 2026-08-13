@@ -1,3 +1,5 @@
+#![allow(rustdoc::private_intra_doc_links)]
+
 //! Kranz engine — orchestration core (no UI deps).
 //!
 //! Kranz is a local mission-control harness: an orchestrator plans, fresh

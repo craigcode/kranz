@@ -391,7 +391,7 @@ fn managed_contract_keys() -> &'static [&'static str] {
 /// ([`CONTRACT_TOOLCHAIN_VARS`] / [`cache_only_cargo_home`]; without cache
 /// seeding every agent session re-downloads the registry into scratch, which
 /// filled the disk and killed mission m-533143), and on
-/// Windows the process-required passthroughs ([`AMBIENT_WINDOWS_VARS`])
+/// Windows the process-required passthroughs (`AMBIENT_WINDOWS_VARS`)
 /// plus `USERPROFILE = base_home`, `TEMP`/`TMP = base_home/tmp`, and
 /// `APPDATA`/`LOCALAPPDATA = base_home/AppData/{Roaming,Local}`. Then
 /// `extra` is applied verbatim, in order —

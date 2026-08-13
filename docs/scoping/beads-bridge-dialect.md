@@ -422,14 +422,14 @@ $ bd create "Fixture bead for assignee-clear probe" --type task --json
 }
 
 $ whoami
-craigmartin
+operator
 
 $ bd update tmp_MzT4KEnbla-0if --claim --json
 [
   {
     "id": "tmp_MzT4KEnbla-0if",
     "status": "in_progress",
-    "assignee": "craigmartin",
+    "assignee": "operator",
     ...
   }
 ]
@@ -496,10 +496,10 @@ destroyed by the `trap`-based cleanup on script exit; nothing persists outside `
       "status": "in_progress",
       "priority": 2,
       "issue_type": "task",
-      "assignee": "craigmartin",
+      "assignee": "operator",
       "owner": "ci@kranz.local",
       "created_at": "2026-07-30T02:23:51Z",
-      "created_by": "craigmartin",
+      "created_by": "operator",
       "updated_at": "2026-07-30T02:23:52Z",
       "started_at": "2026-07-30T02:23:52Z",
       "dependent_count": 0,
@@ -535,10 +535,10 @@ destroyed by the `trap`-based cleanup on script exit; nothing persists outside `
       "status": "in_progress",
       "priority": 2,
       "issue_type": "task",
-      "assignee": "craigmartin",
+      "assignee": "operator",
       "owner": "ci@kranz.local",
       "created_at": "2026-07-30T17:49:57Z",
-      "created_by": "craigmartin",
+      "created_by": "operator",
       "updated_at": "2026-07-30T17:49:58Z",
       "started_at": "2026-07-30T17:49:58Z",
       "dependent_count": 0,
@@ -557,10 +557,10 @@ destroyed by the `trap`-based cleanup on script exit; nothing persists outside `
       "status": "in_progress",
       "priority": 2,
       "issue_type": "task",
-      "assignee": "craigmartin",
+      "assignee": "operator",
       "owner": "ci@kranz.local",
       "created_at": "2026-07-30T17:49:57Z",
-      "created_by": "craigmartin",
+      "created_by": "operator",
       "updated_at": "2026-07-30T17:49:58Z",
       "started_at": "2026-07-30T17:49:58Z",
       "dependent_count": 0,

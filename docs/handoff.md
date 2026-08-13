@@ -69,7 +69,7 @@ suite on ubuntu + windows on every push. Windows-latest runs the
 `#[cfg(windows)]` process-tree-kill regression test — that's the real
 validation. Fix whatever windows-latest surfaces (likely none; it's clean on
 `x86_64-pc-windows-gnu` locally). Replace the `OWNER` placeholder in
-`Cargo.toml`, `packaging/homebrew/kranz.rb`, and README at the same time.
+`Cargo.toml`, `packaging/homebrew/kranz.rb.in`, and README at the same time.
 
 ### 2. Slack app + tokens → the bridge (M2.75)
 

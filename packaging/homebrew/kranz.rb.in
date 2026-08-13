@@ -1,0 +1,23 @@
+# Release template for the craigcode/homebrew-kranz tap.
+#
+# Replace VERSION with the tag version without `v` and SHA256 with the digest
+# of GitHub's tagged source tarball. Do not publish this template itself as a
+# formula; the release runbook verifies the rendered formula separately.
+class Kranz < Formula
+  desc "Git-native mission control for governed AI coding-agent work"
+  homepage "https://github.com/craigcode/kranz"
+  url "https://github.com/craigcode/kranz/archive/refs/tags/vVERSION.tar.gz"
+  version "VERSION"
+  sha256 "SHA256"
+  license "MIT"
+
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args(path: "crates/cli")
+  end
+
+  test do
+    assert_match "kranz", shell_output("#{bin}/kranz --help")
+  end
+end

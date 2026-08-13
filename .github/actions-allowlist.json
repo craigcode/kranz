@@ -1,0 +1,11 @@
+{
+  "github_owned_allowed": true,
+  "verified_allowed": false,
+  "patterns_allowed": [
+    "dtolnay/rust-toolchain@*",
+    "Swatinem/rust-cache@*",
+    "EmbarkStudios/cargo-deny-action@*",
+    "anchore/sbom-action@*",
+    "softprops/action-gh-release@*"
+  ]
+}

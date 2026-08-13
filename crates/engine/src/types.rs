@@ -49,7 +49,7 @@ pub struct Mission {
     /// or for missions created before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
-    /// e.g. "kranz/mission-<id>"
+    /// e.g. `kranz/mission-<id>`
     pub mission_branch: String,
     /// Read-only shell commands granted mission-wide to worker AND validator
     /// sessions; single source of truth carried from the approved `Plan`.
@@ -1392,8 +1392,9 @@ pub struct ExecutorRoute {
 
 /// How worker/validator sessions are isolated from the primary checkout.
 ///
-/// Default is [`Worktree`]: the primary checkout must stay byte-untouched
-/// across a mission (AGENTS.md). Operators may still opt into [`Checkout`]
+/// Default is [`WorkerIsolation::Worktree`]: the primary checkout must stay
+/// byte-untouched across a mission (AGENTS.md). Operators may still opt into
+/// [`WorkerIsolation::Checkout`]
 /// for backends that cannot write into temp-dir worktrees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

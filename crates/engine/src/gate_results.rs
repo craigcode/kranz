@@ -6,7 +6,7 @@
 //! Two halves, deliberately small:
 //!
 //! 1. **Emission shape** — [`gate_result_events`] converts one evaluated
-//!    [`GatePipeline`]'s reports into `gate.result` payloads, one event per
+//!    [`crate::gate::GatePipeline`]'s reports into `gate.result` payloads, one event per
 //!    gate, in pipeline order, assigning each gate its ladder position
 //!    (zero-based index within its kind/section). This is the ONLY place
 //!    that mapping lives, so the approval and final-gate surfaces can never

@@ -1553,7 +1553,7 @@ impl GitRepo {
     /// The git identity this repo resolves to right now: `(user.name,
     /// user.email)` from any config scope (local/global/system) visible to
     /// the calling process's environment, falling back to the same
-    /// `kranz`/`kranz@localhost` pair [`ensure_identity`] would write when
+    /// `kranz`/`kranz@localhost` pair [`Self::ensure_identity`] would write when
     /// neither key resolves.
     ///
     /// Used to carry the *engine's* resolved identity into a worker session

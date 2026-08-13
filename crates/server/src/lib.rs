@@ -1,3 +1,5 @@
+#![allow(rustdoc::private_intra_doc_links)]
+
 //! kranz-server — axum REST + WebSocket layer over a repo's mission data
 //! (docs/protocol.md is authoritative for every route and frame shape).
 //!

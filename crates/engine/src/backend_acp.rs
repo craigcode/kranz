@@ -27,7 +27,7 @@
 //!
 //! ACP v1's `usage_update` reports context-window state (`used`/`size`
 //! tokens) and an optional cumulative `cost` — NOT an input/output/cache
-//! token split. [`AgentEvent::Result.usage`] therefore stays the zero
+//! token split. [`AgentEvent::Result`] `usage` therefore stays the zero
 //! default (a fabricated split would be invented data), and `cost_usd` is
 //! `Some` only when the peer reported a USD amount. There is likewise no
 //! client-side price-table fallback: kranz cannot price an arbitrary ACP

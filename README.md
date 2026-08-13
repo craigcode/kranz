@@ -1,11 +1,10 @@
 # Kranz
 
-**Git-native mission control for headless coding agents.** Kranz is a local orchestration harness —
-named for Gene Kranz, the Apollo flight director — that runs long-horizon
-software missions the way Factory.ai's Missions/Mission Control does: an
-orchestrator plans, fresh-context workers implement one feature at a time,
-independent validators judge each milestone, and a human steers as project
-manager. The harness never touches the spacecraft; it runs the room.
+**Git-native mission control for headless coding agents.** Kranz is a local
+governance and evidence harness—named for Gene Kranz, the Apollo flight
+director. An orchestrator plans, fresh-context workers implement one feature
+at a time, independent validators judge each milestone, and a human steers as
+project manager. The harness never touches the spacecraft; it runs the room.
 
 The product is the few seconds between an agent wanting to act and a human
 trusting it. The consent surface — plan approval, command grants, the merge
@@ -13,10 +12,11 @@ gate — is kranz's answer to that interval, and the flight-surgeon console
 (`kranz outcomes`) measures it: grant-latency buckets turn "do you actually
 review?" into data.
 
-Built in Rust with Claude Code as the default runtime and optional Codex/Droid
-role backends. Claude sessions inherit your repo's CLAUDE.md,
-`.claude/skills`, `.mcp.json`, and hooks for free. Git is the source of truth;
-an append-only event log makes every mission `kill -9`-safe.
+Built in Rust with Claude Code as the default runtime. Role-specific backends
+also support Codex CLI, Factory Droid, Kimi Code, Cursor, ACP-compatible
+agents, and OpenAI-compatible local inference. Claude sessions can use a
+repository's `CLAUDE.md`, `.claude/skills`, `.mcp.json`, and hooks. Git is the
+source of truth; an append-only event log makes every mission `kill -9`-safe.
 
 ```
 ┌───────────┐   plan/judge    ┌────────────────────────────────┐
@@ -31,9 +31,12 @@ an append-only event log makes every mission `kill -9`-safe.
 
 ## Quick start
 
-Prerequisites: Rust 1.88+, git, and the [Claude Code CLI](https://claude.com/claude-code)
-(`claude`) installed and authenticated — Kranz discovers it on PATH and in the
-usual install locations, or set `KRANZ_CLAUDE_BIN` / `claudeBinary` in config.
+Prerequisites: Rust 1.88+, Git, and at least one configured agent backend. The
+default is the [Claude Code CLI](https://claude.com/claude-code) (`claude`),
+installed and authenticated. Kranz discovers it on `PATH` and in the usual
+install locations, or you can set `KRANZ_CLAUDE_BIN` / `claudeBinary` in
+configuration. Other backends have role and sandbox restrictions; run
+`kranz ready` before the first mission.
 
 ```sh
 cargo install --path crates/cli   # puts `kranz` on your PATH (~/.cargo/bin)
@@ -82,11 +85,12 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 cargo install --path crates/cli   # builds and installs the `kranz` binary
 ```
 
-**Prebuilt binaries.** Every tagged release (`vX.Y.Z`) ships binaries built by
-CI ([`.github/workflows/release.yml`](.github/workflows/release.yml)) for
-Linux, macOS, and Windows, attached to the GitHub release as
-`kranz-<os>-<arch>`. Download the one for your platform, `chmod +x` it (Unix),
-and drop it on your `PATH`.
+**Prebuilt binaries.** Supported tagged releases ship CI-built CLI binaries
+for Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64, plus a
+checksum manifest, an SBOM, and GitHub build provenance. Verify the checksum
+and provenance before placing a downloaded binary on your `PATH`. The
+historical v0.1.0 preview predates the current security posture and is not a
+supported public distribution.
 
 **Once published (planned).**
 
@@ -107,11 +111,12 @@ public release (see [docs/releasing.md](docs/releasing.md)).
 | Orchestrator | Plans contract-first; judges worker reports; converts or waives findings; decides respawns, dirty trees, unblocks; judges `agent-judgement` assertions at the final gate | One long-lived session per mission (resumable/re-seedable) | Digest, plan, reports, findings — never raw transcripts | Nothing — read + git-inspect only; the engine writes/commits `plan.json`/`plan.md` | opus · high |
 | Worker | Implements exactly one feature: tests first, implement until green, lint/build, commit `[feature-id]`-prefixed, end with a `WorkerReport` | Fresh per feature (bounded respawns) | Its spec + criteria + goal — never the mission transcript | Edits + Bash in the repo; denied push/publish/network/sudo | sonnet · medium |
 | Validator · scrutiny | Adversarial review of the milestone diff: tests asserting implementation, dead criteria, integration seams, out-of-intent regressions | Fresh per validation round | Milestone spec, contract, `start-sha..HEAD` diff | Read-only + inspect commands | opus · high |
-| Validator · functional | Actually **runs** the contract's commands + configured test/build/lint scripts; reports pass/fail with verbatim output as evidence | Fresh per validation round | Contract commands + milestone criteria | Read-only + exactly those commands | sonnet · medium |
+| Validator · functional | Judges the engine-captured results of contract commands and configured test/build/lint scripts; reports pass/fail from bounded verbatim evidence | Fresh per validation round | Contract results + milestone criteria | Read-only; optional explicitly configured live-QA tools | sonnet · medium |
 
-Two validators because they catch different failures: functional catches "it
-doesn't run"; scrutiny catches "it runs but it's wrong" — passing tests that
-assert the implementation, unwired criteria, broken seams between features.
+Two validators catch different failures: functional judges whether the
+engine-run gates worked; scrutiny catches "it runs but it's wrong"—passing
+tests that assert the implementation, unwired criteria, and broken seams
+between features.
 
 ## How it works
 
@@ -171,10 +176,14 @@ the base.
 ## Development
 
 ```sh
-cargo test --workspace          # 200+ tests, no model calls (mock backend seam)
+cargo test --workspace          # full workspace suite; no model calls by default
 cargo test -p kranz-engine -- --ignored   # + live smoke test (spawns claude)
 node scripts/mock-server.mjs    # dashboard dev harness with a canned mission
 ```
+
+The full contributor gate and pull-request expectations are in
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues belong in the private
+reporting channel described by [`SECURITY.md`](SECURITY.md), not a public issue.
 
 ## Cloud (preview)
 

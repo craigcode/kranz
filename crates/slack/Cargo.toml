@@ -7,6 +7,7 @@ license.workspace = true
 description = "Slack Socket Mode bridge for Kranz missions."
 readme.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
