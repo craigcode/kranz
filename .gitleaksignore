@@ -2,15 +2,13 @@
 # Kranz's scrubber. Do not replace these with path/rule-wide exceptions: a new
 # finding in either fixture must fail. A history rewrite changes commit hashes,
 # so regenerate and review this list after the pre-public rewrite.
-c2e7f3b8ff07372c64b11c94e51353bf8c3927f6:crates/engine/tests/hooks_test.rs:generic-api-key:281
-0dbf04983a6f9b3e97af3d6ee848b21305ce06e7:crates/engine/tests/scrub_test.rs:generic-api-key:37
-0dbf04983a6f9b3e97af3d6ee848b21305ce06e7:crates/engine/tests/scrub_test.rs:generic-api-key:50
-f5cb704c8b7564617542012578892b5e991a3f74:crates/engine/tests/scrub_test.rs:generic-api-key:99
-9f669140ffa6ea1a6bcadaa5e8818b0971c5a41c:crates/engine/tests/scrub_test.rs:gcp-api-key:153
-9f669140ffa6ea1a6bcadaa5e8818b0971c5a41c:crates/engine/tests/scrub_test.rs:stripe-access-token:176
-9f669140ffa6ea1a6bcadaa5e8818b0971c5a41c:crates/engine/tests/scrub_test.rs:stripe-access-token:177
-9f669140ffa6ea1a6bcadaa5e8818b0971c5a41c:crates/engine/tests/scrub_test.rs:generic-api-key:233
-d46f86559f86e42f9e16b0945c36079a43b68148:crates/engine/tests/scrub_test.rs:generic-api-key:92
-d46f86559f86e42f9e16b0945c36079a43b68148:crates/engine/tests/scrub_test.rs:private-key:109
-0b731d0a7fea9aede741d373f062f8f4674ea559:crates/engine/tests/scrub_test.rs:generic-api-key:37
-0b731d0a7fea9aede741d373f062f8f4674ea559:crates/engine/tests/scrub_test.rs:generic-api-key:50
+17603003ea8a02b4777e8203c8858595b1df5589:crates/engine/tests/hooks_test.rs:generic-api-key:281
+f392e714ff0f5736c35d9f6639af24da4aa78ffd:crates/engine/tests/scrub_test.rs:generic-api-key:37
+f392e714ff0f5736c35d9f6639af24da4aa78ffd:crates/engine/tests/scrub_test.rs:generic-api-key:50
+004989f85f9ddb797b4c21e7dfc0916f7f415cf1:crates/engine/tests/scrub_test.rs:generic-api-key:92
+d62d2b3352bb23a768c5d1050e2d3dc9839e032c:crates/engine/tests/scrub_test.rs:generic-api-key:99
+004989f85f9ddb797b4c21e7dfc0916f7f415cf1:crates/engine/tests/scrub_test.rs:private-key:109
+a5aeaafb6034f9585216f7fa5c159ed4346edabc:crates/engine/tests/scrub_test.rs:gcp-api-key:153
+a5aeaafb6034f9585216f7fa5c159ed4346edabc:crates/engine/tests/scrub_test.rs:stripe-access-token:176
+a5aeaafb6034f9585216f7fa5c159ed4346edabc:crates/engine/tests/scrub_test.rs:stripe-access-token:177
+a5aeaafb6034f9585216f7fa5c159ed4346edabc:crates/engine/tests/scrub_test.rs:generic-api-key:233
