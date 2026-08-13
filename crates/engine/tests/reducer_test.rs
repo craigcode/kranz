@@ -745,6 +745,11 @@ fn unknown_ids_are_invalid_state() {
             tag: "text".into(),
             content: "".into(),
         },
+        EventKind::WorkerEgressDenied {
+            run_id: "r-99".into(),
+            denials: vec![],
+            omitted_count: 0,
+        },
         completed("r-99", TokenUsage::default(), None),
         EventKind::MilestoneValidating {
             milestone_id: "ms-99".into(),

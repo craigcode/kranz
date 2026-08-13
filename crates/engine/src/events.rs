@@ -188,6 +188,22 @@ pub enum EventKind {
         content: String,
     },
 
+    /// Durable, run-attributed audit record for destinations refused by the
+    /// filtering egress proxy. Record-only: grant handling still uses
+    /// the in-memory [`crate::egress_proxy::EgressDenial`] returned by the
+    /// session, while this event survives runtime-artifact cleanup and can
+    /// be projected as bounded validator evidence.
+    #[serde(rename = "worker.egress.denied")]
+    WorkerEgressDenied {
+        #[serde(rename = "runId")]
+        run_id: String,
+        denials: Vec<crate::egress_proxy::EgressDenial>,
+        /// Repeated or over-cap denial records excluded from `denials`.
+        /// Additive default keeps an early/pre-field event readable.
+        #[serde(rename = "omittedCount", default)]
+        omitted_count: u64,
+    },
+
     #[serde(rename = "worker.completed")]
     WorkerCompleted {
         #[serde(rename = "runId")]
@@ -1106,6 +1122,7 @@ impl EventKind {
             EventKind::FeatureStarted { .. } => "feature.started",
             EventKind::WorkerSpawned { .. } => "worker.spawned",
             EventKind::WorkerMessage { .. } => "worker.message",
+            EventKind::WorkerEgressDenied { .. } => "worker.egress.denied",
             EventKind::WorkerCompleted { .. } => "worker.completed",
             EventKind::FeatureCompleted { .. } => "feature.completed",
             EventKind::FeatureFailed { .. } => "feature.failed",
@@ -1171,6 +1188,55 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+        }
+    }
+
+    /// Runtime egress evidence is an additive event, not a new required field
+    /// on worker.completed: legacy logs remain byte-compatible simply by not
+    /// containing this record, while new records preserve exact run
+    /// attribution and destination data.
+    #[test]
+    fn worker_egress_denied_round_trips() {
+        let event = EventKind::WorkerEgressDenied {
+            run_id: "run-1".to_string(),
+            denials: vec![crate::egress_proxy::EgressDenial {
+                host: "example.com".to_string(),
+                port: 443,
+            }],
+            omitted_count: 3,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "worker.egress.denied");
+        assert_eq!(json["payload"]["runId"], "run-1");
+        assert_eq!(json["payload"]["denials"][0]["host"], "example.com");
+        assert_eq!(json["payload"]["denials"][0]["port"], 443);
+        assert_eq!(json["payload"]["omittedCount"], 3);
+        assert_eq!(event.type_name(), "worker.egress.denied");
+
+        let mut legacy = json.clone();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("omittedCount");
+        match serde_json::from_value::<EventKind>(legacy).unwrap() {
+            EventKind::WorkerEgressDenied { omitted_count, .. } => assert_eq!(omitted_count, 0),
+            _ => panic!("wrong variant"),
+        }
+
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::WorkerEgressDenied {
+                run_id,
+                denials,
+                omitted_count,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(denials.len(), 1);
+                assert_eq!(denials[0].host, "example.com");
+                assert_eq!(denials[0].port, 443);
+                assert_eq!(omitted_count, 3);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

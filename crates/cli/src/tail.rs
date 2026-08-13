@@ -240,6 +240,24 @@ impl EventRenderer {
                 };
                 (tag, color, body)
             }
+            EventKind::WorkerEgressDenied {
+                run_id,
+                denials,
+                omitted_count,
+            } => {
+                let (tag, _) = self.run_tag(run_id);
+                let first = denials
+                    .first()
+                    .map(|denial| format!("{}:{}", denial.host, denial.port))
+                    .unwrap_or_else(|| "destination unavailable".to_string());
+                let more = (denials.len().saturating_sub(1) as u64).saturating_add(*omitted_count);
+                let suffix = if more > 0 {
+                    format!(" (+{more} additional record(s))")
+                } else {
+                    String::new()
+                };
+                (tag, ansi::RED, format!("EGRESS DENIED: {first}{suffix}"))
+            }
             EventKind::WorkerCompleted {
                 run_id,
                 result,

@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented bounded, scrubbed WorkerReport and durable run-specific egress evidence projection for functional agent-judgement validation, with prompt-injection and false-red regressions.
+state: done
 title: Project bounded runtime evidence into functional validation
 priority: 2
 schedule: once

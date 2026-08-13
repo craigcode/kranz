@@ -263,6 +263,15 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             run_mut(state, run_id)?; // stream delta: existence check only
         }
 
+        EventKind::WorkerEgressDenied { run_id, .. } => {
+            // Audit-only runtime evidence. The durable event deliberately
+            // adds no mutable state shape; consumers select the relevant run
+            // ids directly from the validated log. Still validate the run
+            // reference so a hand-edited event cannot cite a nonexistent
+            // session.
+            run_mut(state, run_id)?;
+        }
+
         EventKind::WorkerCompleted {
             run_id,
             result,

@@ -1920,8 +1920,31 @@ fn renderer_tags_worker_lines_and_truncates() {
     );
     assert_eq!(renderer.render(&denied), "[worker f-1-2] DENIED: git push");
 
-    let decision = event(
+    let egress_denied = event(
         4,
+        "m-1",
+        EventKind::WorkerEgressDenied {
+            run_id: "w-1".to_string(),
+            denials: vec![
+                kranz_engine::egress_proxy::EgressDenial {
+                    host: "example.com".to_string(),
+                    port: 443,
+                },
+                kranz_engine::egress_proxy::EgressDenial {
+                    host: "other.example".to_string(),
+                    port: 8443,
+                },
+            ],
+            omitted_count: 3,
+        },
+    );
+    assert_eq!(
+        renderer.render(&egress_denied),
+        "[worker f-1-2] EGRESS DENIED: example.com:443 (+4 additional record(s))"
+    );
+
+    let decision = event(
+        5,
         "m-1",
         EventKind::OrchestratorDecision {
             summary: "carry on".to_string(),

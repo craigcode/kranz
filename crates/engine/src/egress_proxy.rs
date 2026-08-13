@@ -13,7 +13,11 @@
 //! `{"ts","host","port"}` record appended — and fsynced — to
 //! `<mission_dir>/runs/egress-denials.jsonl` (gitignored runtime). The run
 //! reads the records ITS proxy wrote into `RunOutcome.denied_egress`, so a
-//! later grant flow (3.3b) has a trigger that names the destination.
+//! later grant flow (3.3b) has a trigger that names the destination. Before
+//! `worker.completed`, the runner also persists a bounded, deduplicated batch
+//! as a scrubbed, run-attributed `worker.egress.denied` audit event; that
+//! durable copy can be projected into functional validation after disposable
+//! runtime cleanup.
 //!
 //! Platform coverage:
 //!

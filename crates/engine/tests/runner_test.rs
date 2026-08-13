@@ -1609,7 +1609,8 @@ async fn first_started_spec(backend: &MockBackend) -> SessionSpec {
 
 /// A parked fs+net (Seatbelt) session's env points at the run's spawned
 /// proxy; an allowed CONNECT tunnels, a denied CONNECT gets a 403 and lands
-// in `RunOutcome.denied_egress` and the mission JSONL — all over loopback.
+/// in `RunOutcome.denied_egress`, the disposable mission JSONL, and the
+/// durable run-attributed event log — all over loopback.
 #[tokio::test]
 async fn run_session_fs_net_wires_proxy_env_and_surfaces_denials() {
     let dir = tempfile::tempdir().unwrap();
@@ -1693,14 +1694,18 @@ async fn run_session_fs_net_wires_proxy_env_and_surfaces_denials() {
     client.read_exact(&mut buf).await.unwrap();
     assert_eq!(buf, b"tunneled", "bytes tunnel through the run's proxy");
 
-    // Denied host: 403, never a silent timeout, and a structured record.
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT denied.example:443 HTTP/1.1\r\n\r\n")
-        .await
-        .unwrap();
-    let head = read_proxy_response_head(&mut client).await;
-    assert!(head.starts_with("HTTP/1.1 403"), "denied CONNECT: {head}");
+    // Denied host: 403, never a silent timeout. Repeat the same destination
+    // to prove the durable audit event deduplicates amplification while its
+    // omittedCount preserves the raw-record count.
+    for _ in 0..2 {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT denied.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_proxy_response_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "denied CONNECT: {head}");
+    }
 
     cancel.notify_one();
     let outcome = timeout(HANG_PROOF, run)
@@ -1711,19 +1716,59 @@ async fn run_session_fs_net_wires_proxy_env_and_surfaces_denials() {
 
     assert_eq!(
         outcome.denied_egress,
-        vec![EgressDenial {
-            host: "denied.example".to_string(),
-            port: 443,
-        }],
+        vec![
+            EgressDenial {
+                host: "denied.example".to_string(),
+                port: 443,
+            },
+            EgressDenial {
+                host: "denied.example".to_string(),
+                port: 443,
+            },
+        ],
         "the run surfaces exactly its own proxy's denials"
     );
 
     // The mission JSONL holds the fsynced record with a timestamp.
     let content = std::fs::read_to_string(p.egress_denials_file()).unwrap();
-    let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-    assert_eq!(record["host"], "denied.example");
-    assert_eq!(record["port"], 443);
-    assert!(record["ts"].is_string(), "record carries ts: {content}");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| {
+        record["host"] == "denied.example" && record["port"] == 443 && record["ts"].is_string()
+    }));
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    let denial_seq = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::WorkerEgressDenied {
+                run_id,
+                denials,
+                omitted_count,
+            } if run_id == "run-egress" => {
+                assert_eq!(denials.len(), 1);
+                assert_eq!(denials[0].host, "denied.example");
+                assert_eq!(denials[0].port, 443);
+                assert_eq!(*omitted_count, 1);
+                Some(event.seq)
+            }
+            _ => None,
+        })
+        .expect("runner persists a run-attributed denial event");
+    let completed_seq = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::WorkerCompleted { run_id, .. } if run_id == "run-egress" => Some(event.seq),
+            _ => None,
+        })
+        .expect("run has a completion event");
+    assert!(
+        denial_seq < completed_seq,
+        "denial evidence must land before the run completion boundary"
+    );
 }
 
 /// No fs+net ⇒ no proxy at all: no env, no denials, no denial file. Covers
