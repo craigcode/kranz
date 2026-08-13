@@ -1,5 +1,9 @@
 # Public-readiness gate
 
+Status (2026-08-13): **parked**. The clean-origin migration is complete, but
+the active repository remains private by explicit owner decision. This file is
+a dormant fail-closed checklist, not authorization to change visibility.
+
 Making Kranz public exposes every reachable Git object and every existing
 GitHub release asset. It is an operator action, separate from merging ordinary
 hardening changes. Keep the repository private until every item below is true.
@@ -38,34 +42,29 @@ ever pushed, rotate the affected credential immediately and follow GitHub's
 for PR refs, forks, and cached views; a local filter alone is not a containment
 claim.
 
-This repository already has pull-request refs whose ancestry contains the
-operator markers caught by the audit. GitHub makes those refs read-only, so a
-normal force-push of rewritten heads and tags cannot make the in-place audit
-pass. The preferred launch topology is therefore:
+The legacy repository had pull-request refs whose ancestry contained operator
+markers caught by the audit. GitHub makes those refs read-only, so the
+clean-origin migration used this topology:
 
-1. keep this repository private as the historical archive under a new private
-   name;
-2. create a fresh `craigcode/kranz` repository from the reviewed, rewritten
-   history without importing `refs/pull/*` or old releases;
+1. keep the legacy repository private as the historical archive under a new
+   private name;
+2. create a fresh private `craigcode/kranz` repository from the reviewed,
+   rewritten history without importing legacy `refs/pull/*` or old releases;
 3. reapply the ruleset, Actions restrictions, release lock, security settings,
    labels, Discussions, and protected environment; and
-4. run both audits from the new origin before making that origin public.
+4. run both audits from the new origin and keep that origin private.
 
-An in-place visibility change is acceptable only if GitHub Support confirms
-that the relevant pull-request/cached refs were removed and a fresh audit of
-every advertised ref passes. Renaming or replacing the origin is a coordinated,
-explicitly approved operator migration; this pull request deliberately does
-not perform it.
+That migration is recorded in
+[`reviews/private-clean-origin-migration.md`](reviews/private-clean-origin-migration.md).
+It does not pre-approve a future visibility change. A future proposal must
+re-audit every then-current advertised ref, obtain explicit owner approval,
+and re-verify all GitHub controls before changing visibility.
 
 ## Existing releases
 
-The v0.1.0 private-preview binaries predate substantial security hardening. On
-the preferred clean-origin route, leave them only in the private archive and
-do not import their tag or release. On an in-place route, delete the release or
-mark it as a clearly unsupported prerelease and verify that GitHub no longer
-presents it as the latest stable download. A history rewrite also requires
-recreating or removing tags whose release assets no longer correspond to their
-source.
+The v0.1.0 private-preview binaries predate substantial security hardening and
+remain only in the private archive. The active origin has no imported tag or
+release. They must never silently become the supported distribution.
 
 ## GitHub controls
 

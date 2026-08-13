@@ -123,26 +123,24 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class + distribution ◑ (CI green on ubuntu+windows incl. kill/resume; v0.1.0 tagged 2026-07-04 with linux/macos/windows binaries attached; remaining: public 0.2.0 crates + Homebrew release)
+## M4 — Windows first-class ✅; public distribution parked (private-repository decision 2026-08-13)
 
 The code is path-safe and lock-file based per §9 and is proven on Windows CI,
-including kill/resume. Tagged cross-platform binaries exist. The four
-crates.io names are reserved by 0.0.1 placeholder packages, but the current
-source is substantially newer than the existing v0.1.0 tag; the next public
-distribution should therefore be a single version-aligned 0.2.0 release, not
-a reuse of v0.1.0. Publication and a real Homebrew tap remain gated on the
-repository going public. See the
+including kill/resume. The historical v0.1.0 preview remains only in the
+private archive and is not a supported distribution. The active clean origin
+is private and has no release or tag. The owner explicitly parked public
+distribution; the reserved 0.0.1 crates.io names and Homebrew template remain
+dormant. Any future public-release proposal must be a new operator decision
+and use one version-aligned release rather than reviving v0.1.0. See the
 [operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-- Push to a remote so the existing CI matrix (ubuntu + windows) actually runs;
-  fix what Windows breaks. Process-tree kill via Job Objects (the documented
-  unix-process-group gap).
-- The §4.3 kill/resume acceptance test on Windows (`taskkill /F`).
-- Packaging: versioned releases, `cargo install kranz` from crates.io
-  and/or Homebrew tap; Tauri app bundles (`.dmg`/`.msi`).
+- [x] Run the CI matrix on Ubuntu, Windows, and macOS.
+- [x] Prove the Windows kill/resume path.
+- [x] Preserve release automation and packaging templates without publishing.
+- [x] Close the public-distribution ticket under the private-repository policy.
 
-Done when: CI is green on both platforms including the kill/resume test, and
-a new machine goes from nothing to `kranz plan` without cloning the repo.
+Done when: the supported source-install path and cross-platform CI are green;
+public package installation is outside the active private-product scope.
 
 ## M5 — Deeper validation & automation ◑ (exec, functional QA, OTEL, and secret scanning shipped; skill authoring remains)
 

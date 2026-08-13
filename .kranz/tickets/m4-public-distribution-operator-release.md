@@ -1,5 +1,6 @@
 ---
-state: open
+state: wontfix
+state-note: "Closed 2026-08-13: the owner explicitly retained private repository visibility. The clean private-origin migration and audits are complete, but no public visibility, crates.io, Homebrew, or public release is authorized. Open a new ticket only after an explicit policy change."
 title: Cut the first version-aligned public Kranz distribution
 priority: 1
 schedule: once
@@ -14,19 +15,17 @@ clean hosts without cloning the repository.
 
 ## Context
 
-The repository is still private. A prior history scrub is not sufficient for
-publication: `scripts/audit-public-history.sh` is the current fail-closed gate,
-and any marker it finds—including commit author/committer email metadata—must
-be classified and removed from every reachable ref before visibility changes.
-Existing GitHub pull-request refs retain some of
-that ancestry and cannot be force-updated, so the preferred route is a fresh
-public `craigcode/kranz` origin while this repository remains a renamed private
-archive; an in-place route requires GitHub Support cleanup and the same audit.
-GitHub already has an older v0.1.0 release while crates.io has only 0.0.1 namespace
-placeholders. Current main is substantially newer than the v0.1.0 tag, so
-publishing it as crate version 0.1.0 would create conflicting provenance. The
-checked-in Homebrew asset is now a non-installable release template and no tap
-repository exists. See
+The clean-origin migration is complete: `craigcode/kranz` is the active private
+repository and the legacy repository is retained as a private archived origin.
+The public-tree/public-history audits passed at the recorded migration
+boundary. Subsequent private-only GitHub rebase activity may carry operator
+identity metadata, so that receipt is not a continuing publication claim. The
+owner has chosen to keep the active repository private, and this release is
+deliberately not scheduled. The historical v0.1.0 release remains only in the
+private archive, while crates.io contains the 0.0.1 namespace placeholders. If
+the visibility decision changes, create a new ticket, rerun the fail-closed
+audits against then-current refs, remediate every result, and use the
+version-aligned release procedure in
 [the operator-readiness packet](../../docs/reviews/m4-m6-operator-readiness.md).
 
 ## Acceptance hints

@@ -1,51 +1,48 @@
 # M4 distribution and M6 cloud operator readiness
 
-Date: 2026-08-12
+Date: 2026-08-13
 
 ## Outcome
 
-The two remaining milestones contain irreversible operator actions. M4 is not
-ready for public visibility until the fail-closed gates in
-`docs/public-readiness.md` pass; it then needs owner authorization for one
-version-aligned release. M6 needs a Railway account/project, bounded spend,
-and runtime credentials.
+M4 public distribution is parked by explicit owner decision: the active clean
+origin remains private and no package publication is authorized. M6 is the
+only remaining operator-gated milestone; it needs a Railway account/project,
+bounded spend, and runtime credentials.
 
 ## M4 — public distribution
 
 Verified state:
 
-- the GitHub repository is private;
-- the current tree has been sanitized, but the full-history privacy audit
-  identifies older operator-path/email/plugin metadata plus the maintainer
-  address in commit identity headers; GitHub's read-only PR refs retain part of
-  that ancestry, so the preferred public launch uses a fresh sanitized origin
-  while the existing repository remains a renamed private archive (the
-  alternative is GitHub Support cleanup plus a coordinated in-place mirror
-  rewrite);
-- GitHub release `v0.1.0` exists with Linux x86_64, macOS arm64, and Windows
-  x86_64 assets, but its tag predates substantial current development;
+- `craigcode/kranz` is the active private clean origin;
+- its fresh-clone public-tree and public-history audits passed at the recorded
+  migration boundary, and its protected `main` CI was green;
+- the legacy repository is retained separately as a private archived origin;
+- the active origin has no imported tag or release; the historical v0.1.0
+  binaries remain only in the private archive and are unsupported;
 - crates.io names `kranz`, `kranz-engine`, `kranz-server`, and `kranz-slack`
   are reserved by 0.0.1 placeholder packages;
 - no `craigcode/homebrew-kranz` tap exists; and
 - `packaging/homebrew/kranz.rb.in` is a non-installable, current-wording
   release template, deliberately avoiding a bogus all-zero live formula.
 
-Publishing current source as crates.io 0.1.0 would make it disagree with the
-existing v0.1.0 tag and binary assets. The recommended next line is **0.2.0**:
-one source commit, one tag, four crates, four binary assets, the Tauri
-version, and the rendered Homebrew formula must all agree. Tauri desktop
-bundles are not part of this release line.
+The migration receipt is point-in-time evidence, not a promise that later
+private-only commits remain publishable. GitHub rebase merges after that
+boundary have already reintroduced operator identity metadata, so the current
+public-history audit correctly fails closed. A future policy reversal requires
+another complete audit and remediation before any visibility change.
 
-Operator sequence after approving public visibility:
+No public version is currently planned. If the private-repository decision is
+reversed, publishing current source as 0.1.0 would still create false
+provenance relative to the archived preview. The new proposal must choose one
+version-aligned release across source, crates, binaries, Tauri metadata, and
+the rendered Homebrew formula.
 
-1. Merge the pre-public hardening, build the sanitized history in a disposable
-   mirror, and obtain explicit approval for either the preferred clean-origin
-   migration or GitHub-assisted in-place cleanup. Make both public audit scripts
-   pass from a fresh clone containing pull refs.
-2. Create/change the public repository, keep the old release only in the
-   private archive (or withdraw/mark it unsupported in place), reapply the
-   public-only security and protected-environment controls, and verify the
-   anonymous visitor surface.
+Dormant operator sequence after a future explicit public-visibility approval:
+
+1. Open a new release ticket and re-run both public audit scripts from a fresh
+   clone containing every then-current advertised ref.
+2. Obtain explicit visibility approval, apply the public-only security and
+   protected-environment controls, and verify the anonymous visitor surface.
 3. Freeze the release commit and bump root workspace/package dependency and
    Tauri versions to 0.2.0; add the dated changelog section.
 4. Run every workspace/dashboard/security/packaging gate. Cargo can dry-run the

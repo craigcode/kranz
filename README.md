@@ -85,14 +85,11 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 cargo install --path crates/cli   # builds and installs the `kranz` binary
 ```
 
-**Prebuilt binaries.** Supported tagged releases ship CI-built CLI binaries
-for Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64, plus a
-checksum manifest, an SBOM, and GitHub build provenance. Verify the checksum
-and provenance before placing a downloaded binary on your `PATH`. The
-historical v0.1.0 preview predates the current security posture and is not a
-supported public distribution.
+**Prebuilt binaries.** The current private origin has no supported tagged
+binary distribution. The historical v0.1.0 preview remains only in the private
+archive and predates the current security posture.
 
-**Once published (planned).**
+**Public package distribution (parked).**
 
 ```sh
 cargo install kranz            # from crates.io
@@ -101,8 +98,9 @@ brew tap craigcode/kranz               # Homebrew (from-source formula)
 brew install kranz
 ```
 
-The crates.io and Homebrew paths are not live yet — they wait on the first
-public release (see [docs/releasing.md](docs/releasing.md)).
+The crates.io and Homebrew paths are not live. The repository owner has chosen
+to keep Kranz private; a future public release requires a new explicit decision
+and the complete [release gate](docs/releasing.md).
 
 ## The four roles
 
