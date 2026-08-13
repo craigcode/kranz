@@ -8,23 +8,15 @@
 //! `MissionState`). Both touches are compiler-forced, not scope creep, so
 //! the mission's own a9 command was extended to declare them via exact-path
 //! excludes rather than reverting code that must exist for the workspace to
-//! build. See .kranz/missions/m-3cda6a/plan.json a9.
+//! build. The historical assertion is preserved as a committed fixture so
+//! this test never depends on gitignored runtime mission state.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-fn mission_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".kranz")
-        .join("missions")
-        .join("m-3cda6a")
-}
-
 fn a9_command_from_plan_json() -> String {
-    let text = std::fs::read_to_string(mission_root().join("plan.json")).expect("read plan.json");
-    let plan: serde_json::Value = serde_json::from_str(&text).expect("plan.json parses");
+    let text = include_str!("fixtures/m-3cda6a-plan.json");
+    let plan: serde_json::Value = serde_json::from_str(text).expect("plan.json parses");
     let assertions = plan["validationContract"]
         .as_array()
         .expect("validationContract array");
@@ -53,7 +45,7 @@ fn plan_json_a9_command_excludes_compiler_forced_downstream_files() {
 
 #[test]
 fn plan_md_a9_command_matches_plan_json() {
-    let text = std::fs::read_to_string(mission_root().join("plan.md")).expect("read plan.md");
+    let text = include_str!("fixtures/m-3cda6a-plan.md");
     let command = a9_command_from_plan_json();
     assert!(
         text.contains(&command),

@@ -729,6 +729,19 @@ impl ClaudeBackend {
 /// the scratch-HOME seeding below, never through ambient inheritance.
 const CLAUDE_AUTH_ENV: &str = "ANTHROPIC_API_KEY";
 
+/// Claude Code's own temp-root override. Without it current CLIs place Bash
+/// session plumbing under `/tmp/claude-<uid>` even when `TMPDIR` points at the
+/// per-session scratch HOME, which is outside an enforced sandbox's writable
+/// set. Always pin it to the cleared env's already-private `TMPDIR`.
+const CLAUDE_TMPDIR_ENV: &str = "CLAUDE_CODE_TMPDIR";
+
+fn pin_claude_tmpdir(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    if let Some(tmpdir) = env.get("TMPDIR").cloned() {
+        env.insert(CLAUDE_TMPDIR_ENV.to_string(), tmpdir);
+    }
+    env
+}
+
 /// The cleared environment one `claude` session spawns with (ticket
 /// `agent-env-clear`; see [`crate::agent_env`]).
 ///
@@ -744,11 +757,11 @@ const CLAUDE_AUTH_ENV: &str = "ANTHROPIC_API_KEY";
 /// is injected explicitly when set (logged name-only in `agent_env`).
 fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
     if spec.env.contains_key("HOME") {
-        return crate::agent_env::agent_session_env(
+        return pin_claude_tmpdir(crate::agent_env::agent_session_env(
             &spec.env,
             &spec.session_id,
             Some(CLAUDE_AUTH_ENV),
-        );
+        ));
     }
     let real_home = std::env::var_os("HOME").map(PathBuf::from);
     let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
@@ -772,12 +785,12 @@ fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
                 "session spec carried no relocated HOME; spawning into a freshly seeded \
                  scratch HOME (agent-env-clear)"
             );
-            crate::agent_env::session_env_with_home(
+            pin_claude_tmpdir(crate::agent_env::session_env_with_home(
                 &spec.env,
                 &spec.session_id,
                 Some(CLAUDE_AUTH_ENV),
                 &home,
-            )
+            ))
         }
         Err(e) => {
             tracing::warn!(
@@ -786,7 +799,11 @@ fn claude_child_env(spec: &SessionSpec) -> HashMap<String, String> {
                 "scratch HOME seeding failed; session spawns into an empty scratch HOME \
                  and will fail auth loudly if no API key is injected"
             );
-            crate::agent_env::agent_session_env(&spec.env, &spec.session_id, Some(CLAUDE_AUTH_ENV))
+            pin_claude_tmpdir(crate::agent_env::agent_session_env(
+                &spec.env,
+                &spec.session_id,
+                Some(CLAUDE_AUTH_ENV),
+            ))
         }
     }
 }
@@ -796,6 +813,12 @@ impl AgentBackend for ClaudeBackend {
     async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
         let streaming = matches!(spec.prompt, PromptMode::Streaming(_));
         let args = build_args(&spec);
+        // Seed the cleared child environment before generating a Seatbelt
+        // profile. The per-session scratch root may not exist yet; creating it
+        // first lets `generate_profile` include both `/var/...` and its
+        // canonical `/private/var/...` spelling on macOS. Building the profile
+        // first left Claude unable to create `$HOME/.claude/session-env`.
+        let child_env = claude_child_env(&spec);
 
         let mut command = match &spec.sandbox {
             Some(resolved)
@@ -803,7 +826,11 @@ impl AgentBackend for ClaudeBackend {
                     && cfg!(target_os = "macos") =>
             {
                 let profile = crate::sandbox::generate_profile(&resolved.inputs);
-                let profile_dir = resolved.inputs.mission_dir.clone();
+                // Profiles are runtime evidence, not committed mission
+                // artifacts. `kranz init` ignores `missions/*/runs/`; writing
+                // them at the mission root left every sandboxed run with an
+                // untracked dirty checkout (live M8 proof m-bb3632).
+                let profile_dir = resolved.inputs.mission_dir.join("runs");
                 let profile_path = crate::sandbox::write_profile_file(&profile_dir, &profile)
                     .or_else(|_| {
                         crate::sandbox::write_profile_file(&resolved.inputs.tmpdir, &profile)
@@ -866,7 +893,6 @@ impl AgentBackend for ClaudeBackend {
         // rebuilt from the minimal allowlist (PATH, a scratch HOME, locale)
         // — never the full ambient set, so server secrets (GH_TOKEN,
         // SLACK_*, AWS_*) cannot reach this prompt-injectable child.
-        let child_env = claude_child_env(&spec);
         command
             .current_dir(&spec.cwd)
             .env_clear()
@@ -1392,6 +1418,13 @@ mod tests {
             child_env.contains(&format!("TMPDIR={}", scratch.path().join("tmp").display())),
             "TMPDIR must be <scratch>/tmp:\n{child_env}"
         );
+        assert!(
+            child_env.contains(&format!(
+                "CLAUDE_CODE_TMPDIR={}",
+                scratch.path().join("tmp").display()
+            )),
+            "Claude's private temp root must equal the sandbox-writable TMPDIR:\n{child_env}"
+        );
         assert!(child_env.contains("PATH="), "PATH must cross:\n{child_env}");
         assert!(
             child_env.contains("KRANZ_BASE_SHA=deadbeef"),
@@ -1432,6 +1465,13 @@ mod tests {
         assert!(
             child_env.contains(&format!("HOME={}", expected_home.display())),
             "a HOME-less spec must spawn into the per-session scratch HOME:\n{child_env}"
+        );
+        assert!(
+            child_env.contains(&format!(
+                "CLAUDE_CODE_TMPDIR={}",
+                expected_home.join("tmp").display()
+            )),
+            "validator/orchestrator Claude temp state must stay under the scratch HOME:\n{child_env}"
         );
         assert!(
             !child_env.contains("CLAUDE_CONFIG_DIR"),

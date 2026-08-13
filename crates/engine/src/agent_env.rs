@@ -755,16 +755,37 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sanitized_child_env_windows_redirects_profile_and_temp_to_scratch() {
-        // Create the scratch home BEFORE poisoning TEMP/TMP — tempfile
-        // resolves its parent from ambient TMP/TEMP, so engaging the guard
-        // first would break tempdir creation itself (CI, b4beb75).
+        // Create both roots BEFORE poisoning TEMP/TMP. The poison paths must
+        // exist: Rust tests share one process, so another concurrently
+        // running test may legitimately call tempfile while this guard is
+        // engaged. A nonexistent C:\operator-tmp made those unrelated tests
+        // fail nondeterministically on windows-latest.
         let home = tempfile::tempdir().unwrap();
+        let operator = tempfile::tempdir().unwrap();
+        let operator_temp = operator.path().join("operator-temp");
+        let operator_tmp = operator.path().join("operator-tmp");
+        let operator_roaming = operator.path().join("operator-roaming");
+        let operator_local = operator.path().join("operator-local");
+        for dir in [
+            &operator_temp,
+            &operator_tmp,
+            &operator_roaming,
+            &operator_local,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let operator_temp = operator_temp.display().to_string();
+        let operator_tmp = operator_tmp.display().to_string();
+        let operator_roaming = operator_roaming.display().to_string();
+        let operator_local = operator_local.display().to_string();
         let _poison = EnvTestGuard::engage(&[
-            ("TEMP", r"C:\operator-temp"),
-            ("TMP", r"C:\operator-tmp"),
-            ("APPDATA", r"C:\operator-roaming"),
-            ("LOCALAPPDATA", r"C:\operator-local"),
+            ("TEMP", &operator_temp),
+            ("TMP", &operator_tmp),
+            ("APPDATA", &operator_roaming),
+            ("LOCALAPPDATA", &operator_local),
         ]);
+        let _parallel_temp =
+            tempfile::tempdir().expect("ambient poison paths must remain usable by parallel tests");
 
         let env = sanitized_child_env(home.path(), &extra(&[]));
 

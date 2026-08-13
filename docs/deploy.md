@@ -1,11 +1,11 @@
 # Kranz cloud deploy runbook
 
-> **PREVIEW — not yet exercised end-to-end.** This is the M6 groundwork
-> runbook. The `Dockerfile`, the scoped-push primitive
-> (`GitRepo::push_mission_branch`), and the flows below are built and unit-
-> tested, but no cloud mission has run start-to-finish yet. Treat every command
-> here as a sketch to verify, not a guarantee. Track M6 in
-> [docs/roadmap.md](roadmap.md).
+> **PREVIEW — not yet exercised end-to-end.** The `Dockerfile`, the
+> ref-restricted push path, `kranz exec --push`, non-loopback serve mode, and
+> separate read authority are shipped and tested. No cloud mission or hosted
+> browser lifecycle has yet run start-to-finish. The remaining operator inputs
+> and exact acceptance checks are recorded in the
+> [M4/M6 readiness packet](reviews/m4-m6-operator-readiness.md).
 
 Locally, **Kranz never pushes** — git is the source of truth but stays on your
 machine (plan §4.4). Cloud missions are the one exception: the mission branch
@@ -60,15 +60,18 @@ into the image** (see the TODO block in the [`Dockerfile`](../Dockerfile)).
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | secret | Cloud auth for the `claude` CLI. Replaces local OAuth — the container has no browser to log in with. |
 | `KRANZ_CLAUDE_BIN` | path | Where the `claude` CLI lives, if not on `PATH`. Kranz shells out to it for every agent turn. |
+| `KRANZ_TOKEN` | secret | Stable mutation authority. Required for every API mutation; never give it to a read-only dashboard or agent. |
+| `KRANZ_READ_TOKEN` | secret | Stable read-only authority for gated GET/HEAD and WebSocket access. Safe for an observing dashboard; rejected by mutations. |
 | `KRANZ_SLACK_BOT_TOKEN` / `KRANZ_SLACK_APP_TOKEN` / `KRANZ_SLACK_CHANNEL` | secrets | Only for a persistent host running `--slack` (§D). The cloud host is its **own Kranz instance and needs its own Slack app** — clone the app and use *that clone's* tokens, never a Mac's (see [docs/slack-management.md](slack-management.md) "Running multiple instances"). |
 | `KRANZ_SLACK_INSTANCE` | plain (e.g. `cloud`) | Optional instance label for a `--slack` host: every message the cloud bridge posts gets a leading `[cloud]` tag so it is distinguishable from your other Kranz instances. |
 | a deploy key scoped to `kranz/*` | SSH key / GitHub App | Lets the container push the mission branch and **nothing else**. See §3 and §5. |
 
-The `claude` CLI and the mission's target toolchain (cargo / node / go / …) are
-**not** in the base image — they are deployment-specific layers. See the
-Dockerfile TODOs and roadmap M6 "Workspace provisioning" (devcontainer.json
-when present, a fat default image otherwise; that part is deliberately
-timeboxed and messy).
+The `claude` CLI, Linux bubblewrap, and the mission's target toolchain (cargo /
+node / go / …) are **not** in the base image — they are deployment-specific
+layers. The checked-in image can host the API, but it cannot execute a normal
+Claude mission safely by itself. The Railway proof image must add the agent
+CLI, the selected repository's toolchain, and the containment primitive, then
+prove that exact image digest before it is treated as a mission runner.
 
 ---
 
@@ -76,8 +79,9 @@ timeboxed and messy).
 
 The **only** push path in Kranz is `GitRepo::push_mission_branch(remote,
 branch)` in [`crates/engine/src/git_ops.rs`](../crates/engine/src/git_ops.rs).
-It is cloud-opt-in: no mission loop, CLI verb, or server endpoint calls it today
-— it exists for M6 wiring. What it guarantees:
+It is cloud-opt-in: `kranz exec --push <remote>` is the only shipped caller.
+The interactive/local mission loop and server merge API still never push.
+What the primitive guarantees:
 
 - The branch **must** start with `kranz/`. `main`, `master`, `HEAD`, a bare
   sha, a `src:dst` refspec, a leading-dash flag, or anything with whitespace is
@@ -91,8 +95,7 @@ It is cloud-opt-in: no mission loop, CLI verb, or server endpoint calls it today
 End-to-end review flow:
 
 ```
-container: kranz exec -f mission.md         # builds kranz/mission-<id> locally
-container: push_mission_branch("origin", "kranz/mission-<id>")   # scoped push
+container: kranz exec -f mission.md --push origin  # COMPLETE, then scoped push
    remote: kranz/mission-<id> appears (no PR yet, nothing merged)
     human: reviews the kranz/* branch, opens a PR, merges (or not)
 ```
@@ -106,26 +109,34 @@ guard's braces.
 
 ---
 
-## 4. Persistent-host sketch (Railway / Fly / VPS)
+## 4. Persistent-host sketch (Railway first)
 
 Goal: a browser-driven `kranz serve` on rented compute. Concretely:
 
-1. **Build & push the image** (see [`Dockerfile`](../Dockerfile)), with the
-   `claude` CLI and any needed toolchain layered on per the Dockerfile TODOs.
-2. **Attach a volume** mounted at the mission working tree so `.kranz`
-   (`events.jsonl`, `state.json`) persists across restarts. Killing the host
-   mid-mission otherwise loses the loop's progress (see roadmap M2.5).
-3. **Run the server**, optionally with the Slack bridge:
+1. **Build & push a derived image** (see [`Dockerfile`](../Dockerfile)) with
+   the `claude` CLI, bubblewrap, and the target repository's toolchain. Pin the
+   resulting digest in the deployment receipt.
+2. **Attach a persistent volume at `/work`** and clone or restore the target
+   repository there. The Git checkout and `.kranz` runtime state must both
+   survive restarts; an empty volume is not a runnable host.
+3. **Run the server on the platform-assigned port**, optionally with Slack.
+   The generic fixed-port Docker equivalent is:
 
    ```sh
    docker run \
      -e ANTHROPIC_API_KEY \
+     -e KRANZ_TOKEN -e KRANZ_READ_TOKEN \
      -e KRANZ_SLACK_BOT_TOKEN -e KRANZ_SLACK_APP_TOKEN -e KRANZ_SLACK_CHANNEL \
      -e KRANZ_SLACK_INSTANCE=cloud \
      -v kranz-data:/work \
      kranz-image \
-     serve --port 4560 --token "$KRANZ_MUTATION_TOKEN" --read-auth --slack
+     serve --host 0.0.0.0 --insecure-lan --port 4560 --read-auth --slack
    ```
+
+   On Railway, configure the equivalent start command with `--port "$PORT"`
+   through the platform's shell/command configuration. `KRANZ_TOKEN` and
+   `KRANZ_READ_TOKEN` are read directly by Kranz, avoiding secret values in
+   the command line.
 
    A `--slack` cloud host is a full Kranz instance on the Slack side: give it
    **its own cloned Slack app** (its own tokens, its own slash-command name)
@@ -138,25 +149,18 @@ Goal: a browser-driven `kranz serve` on rented compute. Concretely:
    [docs/slack-management.md](slack-management.md) "Running multiple
    instances".
 
-4. **Terminate TLS in front of it.** `kranz serve` binds **`127.0.0.1` only**
-   (`crates/server/src/lib.rs`) — it never listens on a public interface. So a
-   persistent host needs a reverse proxy (the platform's HTTPS router, Caddy,
-   nginx) terminating TLS and forwarding to `127.0.0.1:4560`. There is no raw-
-   public-bind mode, by design. The proxy must forward a **loopback**
-   `Host`/`Origin` (e.g. `127.0.0.1:4560` / `http://127.0.0.1:4560`) to the
-   upstream: on a loopback bind the server keeps its strict loopback
-   origin/Host allowlist by design and does not trust arbitrary public
-   origins, so a proxy that forwards its own public `Host`/`Origin` unchanged
-   will be rejected.
-5. **Carry the mutation token over TLS, and turn on `--read-auth`.** Every
-   `POST /api/…` must send the token in the `x-kranz-token` header (protocol:
-   "Authority: mutation token"). Since this shape puts a loopback `kranz
-   serve` behind a public-facing proxy, also pass `--read-auth` (§5) so `/api`
-   GETs and the WS upgrade require the same token — via `x-kranz-token`, or
-   `?token=` for the browser WS upgrade, which cannot set headers —
-   with `/api/health` exempted for unauthenticated liveness checks. Pin the
-   token with `--token` (as above) so the platform's secret store holds a
-   stable value; otherwise `serve` prints a fresh one per boot.
+4. **Use the platform's TLS router.** `kranz serve` supports non-loopback
+   binding only with the explicit `--insecure-lan` acknowledgment. It still
+   has no TLS, so Railway's HTTPS router must be the only public path to the
+   container port. Do not expose the container port through a second raw TCP
+   endpoint.
+5. **Keep read and mutation authority separate.** Every `POST /api/…` must
+   carry `KRANZ_TOKEN` through `x-kranz-token`. Gated GETs and the WS upgrade
+   accept either authority, but browser/observer clients should receive only
+   `KRANZ_READ_TOKEN` (header or WS `?token=`). `/api/health` remains
+   unauthenticated for platform liveness checks. Off-loopback binding already
+   arms the read gate; `--read-auth` makes the intended posture explicit and
+   preserves it if the deployment is later moved behind a loopback proxy.
 
 For the Slack control surface (thread-centric approve / steer, `/kranz`
 commands), an always-on `serve --slack` is the host — see
@@ -169,30 +173,25 @@ commands), an always-on `serve --slack` is the host — see
 
 Transcripts are source code. Treat the whole surface as sensitive.
 
-- **Token on reads too — `--read-auth`.** Locally the token gates only
-  mutations because the `127.0.0.1` bind is the real fence. Off-loopback binds
-  already require the token on reads unconditionally. For a loopback bind that
-  is nonetheless reachable through a reverse proxy (the persistent-host shape
-  in §4), pass `kranz serve --read-auth` to force the same read-token
-  requirement on loopback: `/api` GETs and the WS upgrade then require the
-  token — via the `x-kranz-token` header, or `?token=` for the browser WS
-  upgrade, which cannot set headers — just like mutations do, closing the gap
-  where a leaked dashboard URL could read transcripts, plans, and diffs
-  unauthenticated. `/api/health` stays exempt (unauthenticated liveness
-  checks). `--read-auth` is the deployment-ready mode — pass it any time the
-  process is exposed beyond a single local operator.
+- **Use read-only authority for observers.** Off-loopback binds always gate
+  reads; `--read-auth` also gates them on loopback. GET/HEAD and WS accept
+  either token, but mutations accept only `KRANZ_TOKEN`. Give dashboards and
+  observing agents `KRANZ_READ_TOKEN`; reserve mutation authority for the
+  operator. `/api/health` stays unauthenticated for liveness checks.
 - **Never expose the raw server.** `kranz serve` has no TLS. It must sit
-  **behind a reverse proxy that enforces TLS**, with `--read-auth` set so the
-  token is also required on reads. A leaked dashboard URL without the token
-  must reveal nothing and mutate nothing (aside from `/api/health`) — that is
-  the M6 acceptance bar.
+  **behind a reverse proxy that enforces TLS**. Use `--insecure-lan` only to
+  acknowledge the platform-internal non-loopback bind, not as permission to
+  publish a raw TCP port. A leaked dashboard URL without a token must reveal
+  nothing and mutate nothing (aside from `/api/health`) — that is the M6 bar.
 - **Scope the push credential.** The deploy key / GitHub App must be able to
   push `kranz/*` and nothing else — no `main`, no force, no merges. The
   in-code guard in `push_mission_branch` backs this up but is not a substitute
   for a correctly scoped credential.
-- **Secrets are runtime-only.** `ANTHROPIC_API_KEY`, Slack tokens, and the
-  deploy key are passed at run time via the platform's secret store — never
-  committed, never baked into the image, never in `.kranz` on the volume.
+- **Secrets are runtime-only.** `ANTHROPIC_API_KEY`, both serve tokens, Slack
+  tokens, and the deploy key are passed at run time via the platform's secret
+  store — never committed, never baked into the image, never in `.kranz` on
+  the volume. The serve process creates protected runtime token files while it
+  is live; sandbox authority-deny paths keep workers from reading them.
 - **`.kranz` is confidential.** The volume holds full transcripts. Restrict
   access to it as you would source code and secrets.
 

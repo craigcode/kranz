@@ -606,7 +606,7 @@ fn gate_profile_extras() -> String {
 /// surfaced as the shim's own error). That edge, and a brew-first PATH
 /// whose `git` is not the shim, are the documented limits of the prewarm.
 #[cfg(target_os = "macos")]
-fn prewarm_xcrun_cache_outside_sandbox() {
+pub(crate) fn prewarm_xcrun_cache_outside_sandbox() {
     let _ = run_with_timeout(
         std::path::Path::new("git"),
         &["--version".to_string()],

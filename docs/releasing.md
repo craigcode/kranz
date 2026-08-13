@@ -4,6 +4,13 @@ Kranz ships three ways: prebuilt binaries attached to a GitHub release
 (automated), a from-source `cargo install`, and — once the project is public —
 crates.io and a Homebrew tap. This runbook is the end-to-end procedure.
 
+The existing release artifact line is `v0.1.0`, while crates.io contains only
+0.0.1 namespace-reservation packages for `kranz`, `kranz-engine`,
+`kranz-server`, and `kranz-slack`. Current `main` is substantially newer than
+the `v0.1.0` source. Do not publish current source to crates.io as 0.1.0 or
+reuse that tag: cut the next aligned release as 0.2.0 (or a later explicitly
+chosen version) across every surface below.
+
 ## 0. One-time setup (done)
 
 The repo slug is `craigcode/kranz`; the one-time `OWNER`-placeholder replacement
@@ -27,6 +34,9 @@ root `Cargo.toml` once and every crate follows (they all use
 - `apps/dashboard/src-tauri/Cargo.toml` — `version` (same reason).
 - `packaging/homebrew/kranz.rb` — `version` and the `v#{version}` in `url`
   (updated again in step 4 once the tag exists and its sha256 is known).
+- the three sibling dependency versions under root `[workspace.dependencies]`
+  so crates.io resolves the same release of `kranz-engine`, `kranz-server`,
+  and `kranz-slack` when it ignores their local `path` values.
 
 Run `cargo update -p kranz-engine -p kranz-server -p kranz-slack -p kranz`
 (or `cargo check --workspace`) so `Cargo.lock` records the new version, and
@@ -75,7 +85,7 @@ the formula, then move it to your tap repo (`homebrew-kranz`) or open a
 homebrew-core PR. Verify locally with `brew install --build-from-source
 ./packaging/homebrew/kranz.rb`.
 
-## 5. Publish to crates.io (optional, once public)
+## 5. Publish to crates.io (once public)
 
 `kranz` (the CLI package) and `kranz-server`/`kranz-slack` depend on sibling crates by
 **path** (e.g. `kranz-engine = { version = "0.1.0", path = "crates/engine" }`).
@@ -99,6 +109,11 @@ cargo publish -p kranz-server     # 2. depends on engine
 cargo publish -p kranz-slack      # 2. depends on engine (independent of server)
 cargo publish -p kranz            # 3. the CLI — depends on engine + server + slack
 ```
+
+Before the first real publication, verify ownership of all four reserved
+names and run `cargo publish --dry-run` for every package, not just the
+engine. A successful dry run proves packaging; it does not authorize the
+irreversible publish.
 
 Notes:
 

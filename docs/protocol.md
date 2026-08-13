@@ -122,7 +122,9 @@ observable/resumable from anywhere.
 ## Authority: mutation token
 
 Every `POST /api/...` requires the per-serve session token via the
-`x-kranz-token` header (WS and GETs stay tokenless — read-only observation).
+`x-kranz-token` header. GETs and WS stay tokenless on the default loopback
+posture; `--read-auth` or any non-loopback bind gates them with either the
+mutation token or the separate read-only token described below.
 ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
 cannot present the token, so that route authenticates with its own per-repo
 HMAC signature and refuses closed when unconfigured (see §Webhooks).

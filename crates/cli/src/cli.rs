@@ -433,24 +433,23 @@ pub enum Command {
         /// Bind address. Default loopback; set e.g. 0.0.0.0 (LAN) or a
         /// tailnet IP to reach the API from other devices (glasses app,
         /// phones). Non-loopback binds require `--insecure-lan` — every
-        /// `/api` GET/POST/WS then requires the mutation token (header or
-        /// `?token=`).
+        /// `/api` GET/POST/WS then requires a token. Reads accept the
+        /// read-only token; POSTs require the mutation token.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Acknowledge that a non-loopback bind exposes the API on the
         /// network. Required when `--host` is not a loopback address;
-        /// off-loopback, GETs and WS upgrades require the mutation token
-        /// (same as POSTs). Ignored for loopback addresses (127.0.0.0/8,
-        /// ::1).
+        /// off-loopback, GETs and WS upgrades require either the read-only or
+        /// mutation token; POSTs require the mutation token. Ignored for
+        /// loopback addresses (127.0.0.0/8, ::1).
         #[arg(long)]
         insecure_lan: bool,
 
-        /// Force the mutation token to be required on `/api` GETs and the
-        /// WS upgrade (as well as POSTs) on ANY bind class, including
-        /// loopback — the deployment-ready read-auth mode. Off-loopback
-        /// binds already require it; `--read-auth` is orthogonal and simply
-        /// forces read-token enforcement on loopback too. Still requires
+        /// Require either the read-only or mutation token on `/api` GETs and
+        /// the WS upgrade on ANY bind class, including loopback. POSTs still
+        /// require the mutation token. Off-loopback binds already gate reads;
+        /// this flag forces that posture on loopback too. Still requires
         /// `--insecure-lan` for a non-loopback bind (unchanged).
         #[arg(long)]
         read_auth: bool,
