@@ -16,15 +16,19 @@ clean hosts without cloning the repository.
 ## Context
 
 The clean-origin migration is complete: `craigcode/kranz` is the active private
-repository and the legacy repository is retained as a private archived origin.
-The public-tree/public-history audits pass at the 2026-08-14 clean-origin
-rotation boundary. That receipt remains point-in-time evidence rather than a
-continuing publication claim. The owner has chosen to keep the active
-repository private, and this release is deliberately not scheduled. The
-historical v0.1.0 release remains only in the private archive, while crates.io
-contains the 0.0.1 namespace placeholders. If the visibility decision changes,
-create a new ticket, rerun the fail-closed audits against then-current refs,
-remediate every result, and use the version-aligned release procedure in
+repository and all superseded repositories are retained as private archived
+origins. The public-tree/public-history audits pass at the latest 2026-08-14
+clean-origin rotation boundary. The second rotation removed private author
+metadata from a GitHub merge commit after the required post-merge audit caught
+the recurrence; a disposable server-side merge then proved the corrected
+no-reply identity before rotation. That receipt remains point-in-time evidence
+rather than a continuing publication claim. The owner has chosen to keep the
+active repository private, and this release is deliberately not scheduled.
+The historical v0.1.0 release remains only in the private archive, while
+crates.io contains the 0.0.1 namespace placeholders. If the visibility
+decision changes, create a new ticket, rerun the fail-closed audits against
+then-current refs, remediate every result, and use the version-aligned release
+procedure in
 [the operator-readiness packet](../../docs/reviews/m4-m6-operator-readiness.md).
 
 ## Acceptance hints

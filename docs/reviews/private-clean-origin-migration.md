@@ -7,10 +7,14 @@ Identity remediation: 2026-08-14
 
 The active `craigcode/kranz` origin was rebuilt from the reviewed sanitized
 history and retained as a **private** repository. On 2026-08-14 it was rotated
-again after GitHub rebase merges introduced operator committer metadata into
-the active line and immutable pull-request refs retained those objects. The
-former active origin was renamed to `kranz-private-archive-20260814` and kept
-private. The fresh active origin imported only the rewritten `main`: no legacy
+after GitHub rebase merges introduced operator committer metadata into the
+active line and immutable pull-request refs retained those objects. A second
+rotation followed when pull request #1's GitHub merge commit recorded the
+operator's private address as its author while the account's email-privacy
+setting was disabled. The superseded origins were renamed to
+`kranz-private-archive-20260814` and
+`kranz-private-archive-20260814-merge-author`, then kept private and archived.
+Each fresh active origin imported only the audited `main`: no legacy
 pull-request refs, tags, releases, deploy keys, webhooks, or repository secrets
 were imported.
 
@@ -38,6 +42,12 @@ Kranz public or publish packages.
   identities.
 - The final migration CI run (`31674027215`), secret scan (`31674027211`), and
   domain lint (`31674027219`) completed successfully.
+- Pull request #1's contaminated merge object
+  `7f0e048e7adb742aaff9cbfee8aca631a19ee96e` maps to the surgical replacement
+  `6c1b1acf5755f2a6b4a2923c0c330041abc282ee`. Both commits have tree
+  `04a37fa918888351b6f6ea8389ae335de9a6eee9` and the same two parents. The
+  clean, signed Dependabot parent
+  `e4d2e5f4f994f6d9a1498cd74e888d2e8cae4311` remains byte-identical.
 
 ## 2026-08-14 identity remediation
 
@@ -54,6 +64,16 @@ check. The fresh repository accepts GitHub merge commits rather than
 server-side rebase commits; the latter recorded the operator account address
 after the first migration, while GitHub merge commits use the reviewed GitHub
 no-reply committer identity.
+
+The required post-merge history audit caught the pull request #1 recurrence
+before publication. GitHub merge commits use the pull request actor's account
+identity for the author, so merge-only policy is insufficient if that account
+exposes a private address. The operator enabled GitHub's email-privacy setting,
+then disposable pull request #2 proved a real server-created merge commit
+(`9e9672844493c5bdb819630ef940c4ed64464a84`) used
+`6720093+craigcode@users.noreply.github.com` as author and
+`noreply@github.com` as committer. That probe and its refs remain only in the
+private superseded origin; they are not imported into the fresh origin.
 
 This receipt remains point-in-time evidence, not publication approval. A
 future visibility proposal must re-audit every then-current advertised ref
@@ -74,8 +94,8 @@ from a new clone and produce its own receipt.
 
 ## Retained archive
 
-The legacy GitHub origin and the superseded 2026-08-14 active origin remain
-private and archived, with a separate offline mirror retained for recovery.
+The legacy GitHub origin and both superseded 2026-08-14 active origins remain
+private and archived, with separate offline mirrors retained for recovery.
 They are historical evidence, not active remotes for development,
 distribution, or release automation.
 

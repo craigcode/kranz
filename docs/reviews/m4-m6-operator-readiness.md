@@ -15,9 +15,10 @@ Verified state:
 
 - `craigcode/kranz` is the active private clean origin;
 - its fresh-clone public-tree and public-history audits passed at the
-  2026-08-14 identity-remediation boundary, and its protected `main` CI was
-  green;
-- the legacy repository is retained separately as a private archived origin;
+  2026-08-14 identity-remediation boundaries, and its protected `main` CI was
+  green at the first boundary;
+- the legacy repository and superseded clean origins are retained separately
+  as private archived evidence;
 - the active origin has no imported tag or release; the historical v0.1.0
   binaries remain only in the private archive and are unsupported;
 - crates.io names `kranz`, `kranz-engine`, `kranz-server`, and `kranz-slack`
@@ -27,11 +28,13 @@ Verified state:
   release template, deliberately avoiding a bogus all-zero live formula.
 
 The migration receipt is point-in-time evidence, not a promise that later
-private-only commits remain publishable. The 2026-08-14 clean-origin rotation
-removed the operator identity metadata retained by both `main` and immutable
-pull-request refs, and the current public-history audit passes. A future policy
-reversal still requires another complete audit at the proposed visibility
-boundary before any visibility change.
+private-only commits remain publishable. The 2026-08-14 clean-origin rotations
+removed operator identity metadata retained first by `main` and immutable
+pull-request refs, then by a later GitHub merge commit. The required audit
+caught that recurrence, the account email-privacy setting was corrected, and a
+disposable GitHub merge proved the no-reply author path before the second
+rewrite. A future policy reversal still requires another complete audit at the
+proposed visibility boundary before any visibility change.
 
 No public version is currently planned. If the private-repository decision is
 reversed, publishing current source as 0.1.0 would still create false
