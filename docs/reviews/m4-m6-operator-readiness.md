@@ -14,8 +14,9 @@ bounded spend, and runtime credentials.
 Verified state:
 
 - `craigcode/kranz` is the active private clean origin;
-- its fresh-clone public-tree and public-history audits passed at the recorded
-  migration boundary, and its protected `main` CI was green;
+- its fresh-clone public-tree and public-history audits passed at the
+  2026-08-14 identity-remediation boundary, and its protected `main` CI was
+  green;
 - the legacy repository is retained separately as a private archived origin;
 - the active origin has no imported tag or release; the historical v0.1.0
   binaries remain only in the private archive and are unsupported;
@@ -26,10 +27,11 @@ Verified state:
   release template, deliberately avoiding a bogus all-zero live formula.
 
 The migration receipt is point-in-time evidence, not a promise that later
-private-only commits remain publishable. GitHub rebase merges after that
-boundary have already reintroduced operator identity metadata, so the current
-public-history audit correctly fails closed. A future policy reversal requires
-another complete audit and remediation before any visibility change.
+private-only commits remain publishable. The 2026-08-14 clean-origin rotation
+removed the operator identity metadata retained by both `main` and immutable
+pull-request refs, and the current public-history audit passes. A future policy
+reversal still requires another complete audit at the proposed visibility
+boundary before any visibility change.
 
 No public version is currently planned. If the private-repository decision is
 reversed, publishing current source as 0.1.0 would still create false
