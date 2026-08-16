@@ -80,6 +80,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::SandboxProbe { json } => {
+            let report = kranz_engine::sandbox_windows::probe();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render_text());
+            }
+            Ok(0)
+        }
         Command::Outcomes {
             json,
             all,

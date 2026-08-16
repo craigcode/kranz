@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Accepted plan and phase-1 safety proof implemented on codex/roadmap-m8-m7-proof: Windows process enforcement remains fail-closed; the previously target-agnostic container resolver now also refuses Windows even when docker.exe is detected; exact session/gate refusal tests run in the Windows CI leg. Native AppContainer implementation and hostile Windows 11 receipt remain open.
+state-note: Accepted plan plus phase-1 refusal and phase-2 native capability probe implemented: Windows process/container enforcement remains fail-closed; Windows CI records the real OS build and System32-only processmodel.dll/export result, then runs exact non-vacuous session/gate refusal tests. Native AppContainer launch and hostile Windows 11 receipt remain open.
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -34,6 +34,20 @@ Accepted design: [`docs/scoping/m7-windows-containment.md`](../../docs/scoping/m
 - `enforce: off` is unchanged and remains explicitly unsandboxed.
 
 This closes the unsafe inference gap; it does not close the availability ticket.
+
+## Phase 2 — native capability probe
+
+- `kranz sandbox-probe [--json]` records the Windows version and checks
+  `processmodel.dll` for Microsoft's experimental process-sandbox export.
+- The DLL is loaded from System32 only. The probe neither calls the export nor
+  creates a profile, changes an ACL, or starts a child.
+- API presence is reported as capability evidence and never enables production
+  containment or relaxes the phase-1 fail-closed behavior.
+- The Windows CI leg prints the real-host report before running exact,
+  anti-vacuity-checked refusal tests.
+
+This closes the discovery step in the accepted delivery sequence; it does not
+prove a stable serialization contract, containment, or availability.
 
 ## Acceptance hints
 
