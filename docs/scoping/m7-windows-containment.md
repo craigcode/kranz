@@ -1,9 +1,9 @@
-# M7 Windows containment — accepted plan and phase-1 proof
+# M7 Windows containment — accepted plan and phase-1/2 proof
 
-Status: accepted 2026-08-15. Phase 1 (explicit fail-closed safety contract) is
-implemented and exercised by the Windows CI leg. Native containment and its
-hostile live receipt remain open; this document deliberately does not call the
-gap closed.
+Status: accepted 2026-08-15. Phase 1 (explicit fail-closed safety contract) and
+phase 2 (non-mutating native capability probe) are implemented and exercised by
+the Windows CI leg. Native containment and its hostile live receipt remain
+open; this document deliberately does not call the gap closed.
 
 ## Outcome first
 
@@ -110,8 +110,8 @@ would be ceremony, not evidence.
 1. **Shipped in this phase:** refuse the unproved Windows container provider in
    session and gate resolution; retain the existing process-provider refusal;
    name both contracts in Windows CI.
-2. Build a small capability probe for `processmodel.dll` and the experimental
-   export on an operator-controlled Windows 11 host. Record OS build and API
+2. **Shipped in this phase:** probe `processmodel.dll` and the experimental
+   export without calling it. Windows CI records the real OS build and API
    availability; absence is a supported result, never a degrade.
 3. Spike one headless fixture under AppContainer: one read-only toolchain root,
    one read/write worktree, one read/write private scratch, no network. Prove an
@@ -135,3 +135,23 @@ test leg remains the regression envelope.
 This phase proves fail-closed safety. It does not prove Windows sandbox
 availability, blocked-attempt telemetry, or overhead; those remain the ticket's
 explicit acceptance criteria.
+
+## Phase-2 receipt
+
+`kranz sandbox-probe [--json]` implements the accepted discovery-only seam. On
+Windows it asks the loader for `processmodel.dll` with
+`LOAD_LIBRARY_SEARCH_SYSTEM32`, records the OS build, and checks for
+`Experimental_CreateProcessInSandbox`. It intentionally never transmutes or
+calls the export, creates an AppContainer profile, changes an ACL, or launches a
+child. Every report carries `productionEnabled: false`.
+
+The exact Windows CI probe prints its structured report and asserts a real
+Windows version while retaining that production-disabled invariant. Each of
+the two phase-1 exact refusal tests is separately captured and checked for a
+nonzero passing-test count, so a renamed or unmatched filter cannot produce a
+vacuous green safety proof.
+
+This phase records whether a runner exposes the experimental candidate without
+guessing Microsoft's unpublished FlatBuffer schema or treating an unstable API
+as a production security boundary. The next phase remains a contained fixture
+using a documented serialization contract or the stable AppContainer APIs.

@@ -68,16 +68,28 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phase 1: make the negative safety contract a
-      # named Windows-host proof, not an incidental assertion buried in the
-      # full suite. These exact tests each run one non-vacuous fixture: a
-      # process Job Object and a detected docker.exe are both insufficient
-      # evidence, so session and engine-gate resolution refuse before spawn.
-      - name: Prove Windows enforced providers fail closed before spawn
+      # M7 Windows containment phases 1-2: record the real host/API candidate,
+      # then make the negative safety contract a named, non-vacuous Windows
+      # proof. API presence is capability evidence only and never enables the
+      # experimental launcher or relaxes either pre-spawn refusal.
+      - name: Probe Windows candidate and prove enforced providers fail closed
         if: matrix.os == 'windows-latest'
+        shell: bash
         run: |
-          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact
-          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn -- --exact
+          probe_log="$RUNNER_TEMP/kranz-windows-sandbox-probe.log"
+          cargo test -p kranz-engine sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture >"$probe_log" 2>&1
+          cat "$probe_log"
+          grep -qE 'test result: ok\. [1-9]' "$probe_log"
+
+          session_log="$RUNNER_TEMP/kranz-windows-session-refusal.log"
+          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact >"$session_log" 2>&1
+          cat "$session_log"
+          grep -qE 'test result: ok\. [1-9]' "$session_log"
+
+          gate_log="$RUNNER_TEMP/kranz-windows-gate-refusal.log"
+          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn -- --exact >"$gate_log" 2>&1
+          cat "$gate_log"
+          grep -qE 'test result: ok\. [1-9]' "$gate_log"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,

@@ -199,6 +199,14 @@ fn parses_status() {
 }
 
 #[test]
+fn parses_sandbox_probe() {
+    let cli = Cli::try_parse_from(["kranz", "sandbox-probe"]).unwrap();
+    assert!(matches!(cli.command, Command::SandboxProbe { json: false }));
+    let cli = Cli::try_parse_from(["kranz", "sandbox-probe", "--json"]).unwrap();
+    assert!(matches!(cli.command, Command::SandboxProbe { json: true }));
+}
+
+#[test]
 fn parses_export_traces() {
     let cli = Cli::try_parse_from(["kranz", "export-traces"]).unwrap();
     assert!(matches!(

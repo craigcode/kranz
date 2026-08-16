@@ -272,10 +272,12 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-Windows phase 1 now has an accepted plan and a named CI proof that both process
-and unproved container enforcement fail before spawn; native AppContainer
-availability and its hostile Windows 11 receipt remain the completion bar. See
-[the Windows containment decision](scoping/m7-windows-containment.md).
+Windows phases 1-2 now have an accepted plan, a named CI proof that both process
+and unproved container enforcement fail before spawn, and a System32-only
+native capability probe that records the Windows build and experimental API
+availability without invoking it. A production AppContainer launcher and its
+hostile Windows 11 receipt remain the completion bar. See [the Windows
+containment decision](scoping/m7-windows-containment.md).
 
 ## M8 — Multi-repo operation ✅ (live inbound Slack routing proof complete 2026-08-15)
 

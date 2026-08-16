@@ -112,6 +112,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Probe the native Windows AppContainer candidate without launching it.
+    ///
+    /// Loads processmodel.dll from System32 only, checks for Microsoft's
+    /// experimental process-sandbox export, and records the Windows build.
+    /// API presence never enables production enforcement by itself.
+    SandboxProbe {
+        /// Print the stable probe report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the flight-surgeon outcomes fold: autonomy ratio, grant-latency
     /// distribution, per-task-class rows, context reuse, the rubber-stamp
     /// flag, and the escalation ledger (read-only, no lock)
