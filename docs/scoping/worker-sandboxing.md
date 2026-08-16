@@ -3,10 +3,10 @@
 Status: tiers 1–2 shipped, tier 3 shipped (v1). Dedicated worktrees, write
 auditing, env hygiene, macOS Seatbelt filesystem enforcement, Linux bubblewrap
 filesystem/network isolation, fail-closed preflight behavior, the container
-provider, and a macOS-capable network boundary (the filtering egress proxy,
-3.3a) are implemented. Remaining: Windows parity, a hard per-host container
-egress boundary, live cross-platform overhead/hostile-brief proof, and the
-egress grant flow that consumes the proxy's denial signal (3.3b).
+provider, a macOS-capable network boundary (the filtering egress proxy, 3.3a),
+and the validator egress-grant flow that consumes its denial signal (3.3b) are
+implemented. Remaining: Windows parity, a hard per-host container egress
+boundary, and live Linux/Windows overhead and hostile-brief proof.
 
 ## Why
 
@@ -98,8 +98,13 @@ All of it asks the agent nicely. None of it constrains the process.
   The egress proxy does NOT cover bwrap in v1: its all-or-nothing netns
   cannot reach a host-side proxy without veth plumbing, so process-provider
   `fs+net` on Linux stays `--unshare-net` with no denial signal.
-- **Windows**: explicitly out of scope for the first pass (restricted
-  tokens/AppContainer are a different project); documented, not silent.
+- **Windows**: the first pass remains fail-closed rather than silently
+  uncontained. Phase 1 now also rejects the previously target-agnostic
+  container provider on Windows even when `docker.exe` is present: the shipped
+  mounts assume POSIX guest paths and `/dev/null` authority masks. The accepted
+  native AppContainer investigation, exact Windows CI refusal proof, and live
+  hostile-host completion bar are recorded in
+  [`m7-windows-containment.md`](m7-windows-containment.md).
 - Config per role:
   `sandbox: { enforce: "off" | "fs" | "fs+net", extraWrite: [...], egress: [...] }`.
   `SessionSpec` grows a `sandbox` field; `backend_claude` wraps the spawn.
@@ -123,8 +128,8 @@ All of it asks the agent nicely. None of it constrains the process.
   (`crate::egress_proxy`, ticket 3.3a): Seatbelt restricts outbound TCP to
   loopback, the proxy enforces the hostname allowlist at CONNECT time, and
   denials surface as structured records (`runs/egress-denials.jsonl` →
-  `RunOutcome.denied_egress`). The grant flow that consumes the signal is
-  3.3b. Windows support remains open (see Sequencing below).
+  `RunOutcome.denied_egress`). The validator grant flow that consumes the
+  signal shipped as 3.3b. Windows support remains open (see Sequencing below).
 
 ### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 
@@ -149,8 +154,9 @@ All of it asks the agent nicely. None of it constrains the process.
 - **Network policy, honest v1**: `fs` keeps the runtime default bridge/NAT
   (same permissiveness as the tier-2 fs tier). `fs+net` with an EMPTY
   egress list maps to `--network none` — a hard egress boundary that works
-  identically on macOS and Linux. The tradeoff is honest: `none` also
-  blocks the agent's API egress, so `fs+net` suits offline gates/validation
+  identically on macOS and Linux. Windows refuses this provider until a real
+  guest-path/authority-mask containment receipt exists. The tradeoff is
+  honest: `none` also blocks the agent's API egress, so `fs+net` suits offline gates/validation
   while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list
   keeps the bridge and points the session env at the run's host-side
   filtering egress proxy (`host.docker.internal`, forwarded with `-e`; the

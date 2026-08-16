@@ -142,15 +142,16 @@ and use one version-aligned release rather than reviving v0.1.0. See the
 Done when: the supported source-install path and cross-platform CI are green;
 public package installation is outside the active private-product scope.
 
-## M5 — Deeper validation & automation ◑ (exec, functional QA, OTEL, and secret scanning shipped; skill authoring remains)
+## M5 — Deeper validation & automation ◑ (exec, functional QA, OTEL, and secret scanning shipped; skill-capture boundary decision remains)
 
 - [x] Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
 - [x] `kranz exec -f mission.md` — fully headless missions for CI (plan file in,
   exit code out; no interactive approval, contract gates only).
 - Skill capture: the lessons loop records reusable mission knowledge, but
-  proposing human-approved `.claude/skills` entries from repeated worker
-  patterns remains open.
+  whether Kranz should propose consumer-specific skill files is now an explicit
+  positioning decision rather than unowned implementation work. Tracked by
+  [`m5-skill-capture-positioning-decision`](../.kranz/tickets/m5-skill-capture-positioning-decision.md).
 - [x] OTEL export of engine events (opt-in `kranz otel` sidecar shipped).
 - [x] Real secret scanning replacing the regex scrub — shipped 2026-07-07
   (`0b731d0`): curated + entropy detectors, redact-at-write ingest gate with
@@ -251,7 +252,13 @@ environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
 tier-3 container provider, and per-host egress enforcement via the filtering
 egress proxy (`fs+net` on macOS routes loopback-only Seatbelt egress through
 it; structured denials surface on `RunOutcome` for the 3.3b grant flow).
-Windows parity and live cross-platform proof remain open. The sandbox still
+Windows parity, Linux live proof, and the container per-host egress boundary
+remain open and are now tracked by
+[`m7-windows-containment-parity`](../.kranz/tickets/m7-windows-containment-parity.md),
+[`m7-linux-hostile-live-proof`](../.kranz/tickets/m7-linux-hostile-live-proof.md),
+and
+[`m7-container-per-host-egress-boundary`](../.kranz/tickets/m7-container-per-host-egress-boundary.md).
+The sandbox still
 complements scrutiny: it bounds what CAN happen; validators judge what DID.
 The 2026-08-12 macOS hostile proof blocked a sibling write and disallowed
 CONNECT, landed the legitimate change through its real merge gate without the
@@ -265,7 +272,12 @@ findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-## M8 — Multi-repo operation ◑ (cross-language proof complete; inbound Slack event remains)
+Windows phase 1 now has an accepted plan and a named CI proof that both process
+and unproved container enforcement fail before spawn; native AppContainer
+availability and its hostile Windows 11 receipt remain the completion bar. See
+[the Windows containment decision](scoping/m7-windows-containment.md).
+
+## M8 — Multi-repo operation ✅ (live inbound Slack routing proof complete 2026-08-15)
 
 Kranz is per-repo by construction (`.kranz/` state, tickets, missions,
 calibration, lessons all live in the repo) — but the operator surfaces
@@ -304,9 +316,13 @@ in any language.
   ticket → draft → queue → worktree execution → validation → its own Node gate
   → repository-scoped gated merge. One host served it beside Kranz and kept a
   single authenticated Slack bridge connected; explicit/channel/thread/
-  ambiguity routing passed the integration suite. No human inbound Slack event
-  was sent, so that final live-QA click remains. See
+  ambiguity routing passed the integration suite. See
   [the receipt](reviews/m8-typescript-live-proof.md).
+- [x] **Inbound Slack routing proof**: with two healthy repositories served by
+  one process, a human `/kranz status` event crossed the authenticated Socket
+  Mode bridge and the exact workspace/channel mapping returned the distinctive
+  status of the intended repository. See
+  [the live receipt](reviews/m8-inbound-slack-routing-proof.md).
 
 Done when: a TypeScript repo goes ticket → draft → queue → worktree run →
 gated merge (its own gates) without touching this repo's config; two

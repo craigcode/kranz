@@ -68,6 +68,16 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      # M7 Windows containment phase 1: make the negative safety contract a
+      # named Windows-host proof, not an incidental assertion buried in the
+      # full suite. These exact tests each run one non-vacuous fixture: a
+      # process Job Object and a detected docker.exe are both insufficient
+      # evidence, so session and engine-gate resolution refuse before spawn.
+      - name: Prove Windows enforced providers fail closed before spawn
+        if: matrix.os == 'windows-latest'
+        run: |
+          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact
+          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn -- --exact
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,
