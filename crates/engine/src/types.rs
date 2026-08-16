@@ -1093,7 +1093,9 @@ pub enum SandboxProvider {
     /// Tier-2 process sandboxing (Seatbelt on macOS, bubblewrap on Linux).
     #[default]
     Process,
-    /// Tier-3 container sandboxing (see `crate::sandbox_container`).
+    /// Tier-3 container sandboxing on live-proven macOS/Linux hosts (see
+    /// `crate::sandbox_container`). Windows refuses until its mount and
+    /// authority-mask contract has a real hostile-host receipt.
     Container,
 }
 
@@ -1113,7 +1115,8 @@ impl SandboxProvider {
     /// process provider qualifies on both supported platforms (macOS Seatbelt
     /// cuts outbound TCP to loopback; Linux bwrap `--unshare-net` removes the
     /// network entirely), so its proxy hop is the only reachable way out. The
-    /// container provider qualifies only with an EMPTY egress list
+    /// container provider qualifies only on its supported macOS/Linux hosts
+    /// and with an EMPTY egress list
     /// (`--network none`); a non-empty list keeps the runtime's default
     /// bridge, where the proxy env vars are advisory and a direct socket
     /// bypasses the filter — `config::validate` rejects that pair (fail

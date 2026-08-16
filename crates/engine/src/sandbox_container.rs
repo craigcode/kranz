@@ -20,6 +20,12 @@
 //! no egress list use `fs` (runtime default bridge/NAT, the same
 //! permissiveness as the tier-2 fs tier).
 //!
+//! Host support is deliberately macOS/Linux only. Session and gate resolution
+//! fail closed on Windows even when `docker.exe` is present: the shipped
+//! contract uses POSIX guest paths and `/dev/null` authority masks, and no
+//! Windows-container or Docker-Desktop hostile-host receipt exists. Runtime
+//! detection is not evidence that those mounts enforce the declared policy.
+//!
 //! Write policy: the container's root filesystem is read-only; the writable
 //! set is exactly the declared mounts — `session_cwd` (rw), `mission_dir`
 //! (ro, so the engine-owned audit log / state / control inbox / transcripts
@@ -50,7 +56,8 @@ use std::path::Path;
 use crate::sandbox::SandboxInputs;
 
 /// Image used when the role config does not name one. Minimal and
-/// pullable anywhere; production use should set `sandbox.image`.
+/// pullable on the supported macOS/Linux container path; production use
+/// should set `sandbox.image`.
 pub const DEFAULT_IMAGE: &str = "alpine:3";
 
 /// Container runtimes kranz knows how to drive, in PATH preference order.

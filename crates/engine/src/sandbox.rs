@@ -201,7 +201,13 @@ fn resolve_for_session_target(
     container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
     if role_sandbox.provider == crate::types::SandboxProvider::Container {
-        return resolve_container_target(role_sandbox, session_cwd, mission_dir, container_runtime);
+        return resolve_container_target(
+            role_sandbox,
+            session_cwd,
+            mission_dir,
+            target_os,
+            container_runtime,
+        );
     }
     match platform_support(role_sandbox.enforce, target_os) {
         SandboxDecision::Off => (None, None),
@@ -242,10 +248,28 @@ fn resolve_container_target(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
     mission_dir: &Path,
+    target_os: &str,
     runtime: Option<crate::sandbox_container::ContainerRuntime>,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
     if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
         return (None, None);
+    }
+    // The shipped container argv/mount contract is live-proven only for
+    // POSIX container targets on macOS/Linux. A Windows host is not a
+    // cosmetic path-separator variant: Windows containers have no `/dev/null`
+    // authority mask, while Linux containers under Docker Desktop need an
+    // explicit host-to-guest path mapping instead of reusing `C:\...` as the
+    // guest target. Merely finding `docker.exe` therefore cannot turn the
+    // provider into a proven boundary. Refuse before spawn until the Windows
+    // provider ticket lands a real hostile-host receipt.
+    if !matches!(target_os, "macos" | "linux") {
+        return (
+            None,
+            Some(format!(
+                "sandbox provider:container with enforce:{} is not live-proven on target_os={target_os}; refusing to run unsandboxed (or under an unverified container mount contract)",
+                enforce_label(role_sandbox.enforce)
+            )),
+        );
     }
     let Some(runtime) = runtime else {
         return (
@@ -2146,6 +2170,76 @@ mod tests {
         assert!(warn.contains("provider:container"), "{warn}");
         assert!(warn.contains("docker/podman/nerdctl/container"), "{warn}");
         assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
+    }
+
+    /// M7 Windows parity, phase 1: neither a Job Object nor the presence of
+    /// `docker.exe` is accepted as containment evidence. Both enforced
+    /// providers must refuse before a session can spawn; `off` remains the
+    /// operator's explicit unsandboxed posture.
+    #[test]
+    fn windows_enforced_session_providers_fail_closed_before_spawn() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let process = crate::types::SandboxConfig {
+                enforce,
+                provider: crate::types::SandboxProvider::Process,
+                image: None,
+                extra_write: vec![],
+                egress: vec![],
+            };
+            let (resolved, warning) = resolve_for_session_target(
+                &process,
+                session.path(),
+                mission.path(),
+                "windows",
+                false,
+                Some(crate::sandbox_container::ContainerRuntime::Docker),
+            );
+            assert!(resolved.is_none());
+            let warning = warning.expect("Windows process enforcement must refuse");
+            assert!(
+                warning.contains("unsupported on target_os=windows"),
+                "{warning}"
+            );
+            assert!(warning.contains("refusing to run unsandboxed"), "{warning}");
+
+            let container = container_cfg(enforce, vec![]);
+            let (resolved, warning) = resolve_for_session_target(
+                &container,
+                session.path(),
+                mission.path(),
+                "windows",
+                false,
+                Some(crate::sandbox_container::ContainerRuntime::Docker),
+            );
+            assert!(resolved.is_none());
+            let warning = warning.expect("an unproved Windows container must refuse");
+            assert!(
+                warning.contains("not live-proven on target_os=windows"),
+                "{warning}"
+            );
+            assert!(
+                warning.contains("unverified container mount contract"),
+                "{warning}"
+            );
+        }
+
+        let off = container_cfg(crate::types::SandboxEnforce::Off, vec![]);
+        let (resolved, warning) = resolve_for_session_target(
+            &off,
+            session.path(),
+            mission.path(),
+            "windows",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+        );
+        assert!(resolved.is_none());
+        assert!(warning.is_none());
     }
 
     #[test]

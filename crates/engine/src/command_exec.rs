@@ -728,6 +728,18 @@ fn resolve_gate_sandbox_target(
         // session resolution exactly (`sandbox::resolve_container_target` +
         // `runner::resolve_sandbox_or_refuse`): a requested container with
         // no runtime on PATH is refused — never a silent host-side gate.
+        // The container argv/mount contract is live-proven only for POSIX
+        // container targets on macOS/Linux. On Windows, a detected
+        // `docker.exe` says nothing about Linux-vs-Windows container mode,
+        // guest path mapping, or the `/dev/null` authority masks. Refuse
+        // before constructing an unverified gate command; session resolution
+        // applies the identical posture.
+        if !matches!(target_os, "macos" | "linux") {
+            return Err(crate::error::EngineError::Config(format!(
+                "sandbox provider:container with enforce:{} is not live-proven on target_os={target_os}; refusing to run engine-run gates under an unverified container mount contract",
+                sandbox_cfg.enforce.as_str()
+            )));
+        }
         let Some(runtime) = container_runtime else {
             return Err(crate::error::EngineError::Config(container_gate_note(
                 sandbox_cfg.enforce,
@@ -2133,8 +2145,9 @@ mod tests {
     /// provider:container + enforce != off + a detected runtime resolves to
     /// [`GateSandbox::Container`] with gate-shaped inputs (the gate cwd as the
     /// writable root, the scratch as tmpdir, the mission dir for the metadata
-    /// denies) and the configured/default image — on ANY target OS (the
-    /// container runtime, not the platform sandbox tier, is the mechanism).
+    /// denies) and the configured/default image — on the live-proven macOS
+    /// and Linux hosts. Windows fails closed even when `docker.exe` exists:
+    /// runtime presence does not prove guest path or authority-mask semantics.
     /// No runtime FAILS CLOSED with the shared note (mirroring session
     /// resolution — never a silent host-side gate); `fs+net` with a non-empty
     /// egress list FAILS CLOSED (advisory-only on the bridge, and no egress
@@ -2154,8 +2167,8 @@ mod tests {
         };
         let runtime = Some(crate::sandbox_container::ContainerRuntime::Docker);
 
-        // A detected runtime → the container wrap, target-OS-independent.
-        for target_os in ["macos", "linux", "windows"] {
+        // A detected runtime → the container wrap on live-proven hosts.
+        for target_os in ["macos", "linux"] {
             let resolution = resolve_gate_sandbox_target(
                 &container(crate::types::SandboxEnforce::Fs),
                 repo.path(),
@@ -2181,6 +2194,34 @@ mod tests {
             );
             assert_eq!(spec.image, crate::sandbox_container::DEFAULT_IMAGE);
         }
+
+        // A detected Windows runtime is not containment evidence. The
+        // shipped mount contract uses POSIX guest paths and `/dev/null`
+        // authority masks, neither of which has a Windows hostile-host
+        // receipt. Fail before the gate process starts.
+        let error = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "windows",
+            false,
+            runtime,
+        )
+        .expect_err("an unproved Windows container gate must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("not live-proven on target_os=windows"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("unverified container mount contract"),
+            "{error}"
+        );
 
         // A configured image rides into the spec (the mission container
         // image carries the gate's toolchain — the documented assumption).
@@ -2278,6 +2319,68 @@ mod tests {
         .unwrap();
         assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
         assert!(resolution.note.is_none());
+    }
+
+    /// M7 Windows parity, phase 1: engine-run gates must share the session
+    /// resolver's fail-closed posture. Neither a Job Object nor a detected
+    /// `docker.exe` proves filesystem/authority-mask containment, so both
+    /// enforced providers refuse before a gate command is built.
+    #[test]
+    fn windows_enforced_gate_providers_fail_closed_before_spawn() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let runtime = Some(crate::sandbox_container::ContainerRuntime::Docker);
+
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let process = fs_sandbox_config(enforce);
+            let error = resolve_gate_sandbox_target(
+                &process,
+                repo.path(),
+                &mission,
+                scratch.path(),
+                scratch.path(),
+                "windows",
+                false,
+                runtime,
+            )
+            .expect_err("Windows process gate enforcement must fail closed");
+            assert!(error
+                .to_string()
+                .contains("unsupported on target_os=windows"));
+            assert!(error
+                .to_string()
+                .contains("refusing to run engine-run gates unsandboxed"));
+
+            let container = crate::types::SandboxConfig {
+                enforce,
+                provider: crate::types::SandboxProvider::Container,
+                image: None,
+                extra_write: vec![],
+                egress: vec![],
+            };
+            let error = resolve_gate_sandbox_target(
+                &container,
+                repo.path(),
+                &mission,
+                scratch.path(),
+                scratch.path(),
+                "windows",
+                false,
+                runtime,
+            )
+            .expect_err("an unproved Windows container gate must fail closed");
+            assert!(error
+                .to_string()
+                .contains("not live-proven on target_os=windows"));
+            assert!(error
+                .to_string()
+                .contains("unverified container mount contract"));
+        }
     }
 
     /// 13th-pass review (P1), the prewarm half of the macOS xcrun posture:
