@@ -1819,25 +1819,52 @@ fn run_gate_sample(
     marker: &str,
     policy: &crate::command_exec::MergeGatePolicy,
     appcontainer: bool,
+    sample: &str,
 ) -> Result<f64> {
     let started = std::time::Instant::now();
-    let (ok, output) = if appcontainer {
-        crate::command_exec::run_bounded_gate_command_sandboxed(worktree, command, policy)
+    let (code, output) = if appcontainer {
+        crate::command_exec::run_bounded_gate_command_sandboxed_with_code(worktree, command, policy)
     } else {
-        crate::command_exec::run_bounded_gate_command(worktree, command)
+        let (ok, output) = crate::command_exec::run_bounded_gate_command(worktree, command);
+        (Some(i32::from(!ok)), output)
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    if !ok || !output.contains(marker) {
+    if code != Some(0) || !output.contains(marker) {
         let posture = if appcontainer {
             "AppContainer"
         } else {
             "unwrapped"
         };
+        let diagnostics = appcontainer
+            .then(|| gate_failure_diagnostics(worktree, policy))
+            .unwrap_or_default();
         return Err(EngineError::Backend(format!(
-            "{posture} normal gate failed or omitted {marker}: {output}"
+            "{posture} normal gate {sample} failed with exit {code:?} or omitted {marker}: \
+             {output:?}{diagnostics}"
         )));
     }
     Ok(elapsed_ms)
+}
+
+fn gate_failure_diagnostics(
+    worktree: &Path,
+    policy: &crate::command_exec::MergeGatePolicy,
+) -> String {
+    let mut diagnostics = String::from("; bounded AppContainer diagnostics:");
+    for (label, command) in [
+        ("cmd", "echo kranz-cmd-probe"),
+        ("where-node", "where node"),
+        ("node-version", "node --version"),
+        ("where-npm", "where npm"),
+        ("npm-version", "npm --version"),
+        ("node-script", "node node-gate.js"),
+    ] {
+        let (code, output) = crate::command_exec::run_bounded_gate_command_sandboxed_with_code(
+            worktree, command, policy,
+        );
+        diagnostics.push_str(&format!(" {label}=({code:?}, {output:?})"));
+    }
+    diagnostics
 }
 
 fn median_ms(samples: &[f64]) -> f64 {
@@ -1854,18 +1881,46 @@ fn measure_gate(
 ) -> Result<GateTimingReceipt> {
     // Warm both postures before retaining samples. Alternate their order so
     // runner drift does not systematically favor either side.
-    run_gate_sample(worktree, command, marker, policy, false)?;
-    run_gate_sample(worktree, command, marker, policy, true)?;
+    run_gate_sample(worktree, command, marker, policy, false, "warm-up")?;
+    run_gate_sample(worktree, command, marker, policy, true, "warm-up")?;
 
     let mut off_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
     let mut appcontainer_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
     for index in 0..GATE_OVERHEAD_REPETITIONS {
         if index % 2 == 0 {
-            off_samples_ms.push(run_gate_sample(worktree, command, marker, policy, false)?);
-            appcontainer_samples_ms.push(run_gate_sample(worktree, command, marker, policy, true)?);
+            off_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                policy,
+                false,
+                &format!("sample {}", index + 1),
+            )?);
+            appcontainer_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                policy,
+                true,
+                &format!("sample {}", index + 1),
+            )?);
         } else {
-            appcontainer_samples_ms.push(run_gate_sample(worktree, command, marker, policy, true)?);
-            off_samples_ms.push(run_gate_sample(worktree, command, marker, policy, false)?);
+            appcontainer_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                policy,
+                true,
+                &format!("sample {}", index + 1),
+            )?);
+            off_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                policy,
+                false,
+                &format!("sample {}", index + 1),
+            )?);
         }
     }
     let off_median_ms = median_ms(&off_samples_ms);

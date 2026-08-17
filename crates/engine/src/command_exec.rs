@@ -1361,14 +1361,28 @@ pub fn run_bounded_gate_command_sandboxed(
     command: &str,
     policy: &MergeGatePolicy,
 ) -> (bool, String) {
+    let (code, output) = run_bounded_gate_command_sandboxed_with_code(cwd, command, policy);
+    (code == Some(0), output)
+}
+
+/// The production sandboxed merge-gate runner with its exact child exit
+/// status retained. Normal callers need only the stable bool/output API
+/// above; the Windows production receipt keeps the status so a native CI
+/// failure can distinguish a missing output marker from a process failure.
+pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+    policy: &MergeGatePolicy,
+) -> (Option<i32>, String) {
     if !policy.enforces_on_this_host() {
-        return run_bounded_gate_command(cwd, command);
+        let (ok, output) = run_bounded_gate_command(cwd, command);
+        return (Some(i32::from(!ok)), output);
     }
     let scratch =
         std::env::temp_dir().join(format!("kranz-gate-{}", uuid::Uuid::new_v4().simple()));
     if std::fs::create_dir_all(scratch.join("tmp")).is_err() {
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's sandbox scratch at {}",
                 scratch.display()
@@ -1379,7 +1393,7 @@ pub fn run_bounded_gate_command_sandboxed(
     if !cargo_home.is_dir() {
         let _ = std::fs::remove_dir_all(&scratch);
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's cache-only Cargo home at {}",
                 cargo_home.display()
@@ -1397,7 +1411,7 @@ pub fn run_bounded_gate_command_sandboxed(
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch);
             return (
-                false,
+                None,
                 format!("could not resolve the gate sandbox (failing closed): {error}"),
             );
         }
@@ -1422,7 +1436,7 @@ pub fn run_bounded_gate_command_sandboxed(
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch);
-            return (false, format!("failed to create gate runtime: {error}"));
+            return (None, format!("failed to create gate runtime: {error}"));
         }
     };
     let (code, output) = runtime.block_on(run_shell_command_sandboxed_with_code(
@@ -1433,7 +1447,7 @@ pub fn run_bounded_gate_command_sandboxed(
         &resolution.sandbox,
     ));
     let _ = std::fs::remove_dir_all(&scratch);
-    (code == Some(0), output)
+    (code, output)
 }
 
 fn sanitized_gate_env() -> HashMap<String, String> {
