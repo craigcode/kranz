@@ -122,6 +122,39 @@ pub fn probe() -> WindowsSandboxProbeReport {
     platform::probe()
 }
 
+/// Private production-launcher dispatch used by the `kranz` binary before
+/// ordinary CLI initialization. Kept on this public platform module so the
+/// engine's Windows-only unsafe implementation remains crate-private.
+#[cfg(windows)]
+pub fn internal_launcher_requested() -> bool {
+    crate::appcontainer_windows::internal_launcher_requested()
+}
+
+#[cfg(windows)]
+pub fn run_internal_launcher() -> std::result::Result<u32, String> {
+    crate::appcontainer_windows::run_internal_launcher()
+}
+
+#[cfg(windows)]
+pub fn internal_self_test_requested() -> bool {
+    crate::appcontainer_windows::internal_self_test_requested()
+}
+
+#[cfg(windows)]
+pub fn run_production_hostile_self_test() -> std::result::Result<String, String> {
+    crate::appcontainer_windows::run_production_hostile_self_test()
+}
+
+#[cfg(windows)]
+pub fn internal_hostile_child_requested() -> bool {
+    crate::appcontainer_windows::internal_hostile_child_requested()
+}
+
+#[cfg(windows)]
+pub fn run_internal_hostile_child() -> std::result::Result<(), String> {
+    crate::appcontainer_windows::run_internal_hostile_child()
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;

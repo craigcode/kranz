@@ -8,6 +8,46 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Windows AppContainer sessions re-enter this trusted binary as a thin
+    // native launcher. Route that private argv before clap, tracing, or TLS
+    // initialization so the helper writes only the contained child's bytes to
+    // the inherited protocol pipes.
+    #[cfg(windows)]
+    if kranz_engine::sandbox_windows::internal_hostile_child_requested() {
+        return match kranz_engine::sandbox_windows::run_internal_hostile_child() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("kranz AppContainer hostile child: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    #[cfg(windows)]
+    if kranz_engine::sandbox_windows::internal_launcher_requested() {
+        return match kranz_engine::sandbox_windows::run_internal_launcher() {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(error) => {
+                eprintln!("kranz AppContainer launcher: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    #[cfg(windows)]
+    if kranz_engine::sandbox_windows::internal_self_test_requested() {
+        return match kranz_engine::sandbox_windows::run_production_hostile_self_test() {
+            Ok(receipt) => {
+                println!("{receipt}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("kranz AppContainer production self-test: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     // The dep graph enables BOTH rustls crypto backends (aws-lc-rs via
     // reqwest, ring via the OTLP client), so rustls cannot auto-select and
     // panics at the first TLS connection (found live: the Slack bridge's

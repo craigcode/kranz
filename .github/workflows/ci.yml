@@ -68,11 +68,11 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phases 1-3: record the real host/API candidate,
-      # prove the stable AppContainer token/ACL/network boundary in a disposable
-      # hostile fixture, then hold the production negative safety contract.
-      # Neither proof enables the launcher or relaxes either pre-spawn refusal.
-      - name: Probe and prove Windows containment while production fails closed
+      # M7 Windows containment phase-4 staging: exercise the exact production
+      # helper/ACL lease through the built kranz binary while the resolver's
+      # phase-1 refusal still governs. Only a green protected receipt permits
+      # the follow-up commit that enables SandboxBackend::AppContainer.
+      - name: Probe and prove Windows containment before production enablement
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -85,6 +85,11 @@ jobs:
           cargo test -p kranz-engine sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture >"$appcontainer_log" 2>&1
           cat "$appcontainer_log"
           grep -qE 'test result: ok\. [1-9]' "$appcontainer_log"
+
+          production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
+          cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture >"$production_log" 2>&1
+          cat "$production_log"
+          grep -qE 'test result: ok\. [1-9]' "$production_log"
 
           session_log="$RUNNER_TEMP/kranz-windows-session-refusal.log"
           cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact >"$session_log" 2>&1

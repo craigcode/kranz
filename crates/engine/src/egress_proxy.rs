@@ -511,7 +511,9 @@ async fn maybe_start_for_session_with(
     let route_host = match sandbox.backend {
         SandboxBackend::Seatbelt => "127.0.0.1",
         SandboxBackend::Container if !sandbox.inputs.egress.is_empty() => "host.docker.internal",
-        SandboxBackend::Bubblewrap | SandboxBackend::Container => return Ok(None),
+        SandboxBackend::Bubblewrap | SandboxBackend::AppContainer | SandboxBackend::Container => {
+            return Ok(None)
+        }
     };
     let allowlist = crate::sandbox::effective_egress(&sandbox.inputs.egress);
     let denial_file = paths.egress_denials_file();

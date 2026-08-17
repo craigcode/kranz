@@ -79,6 +79,9 @@ pub struct SandboxInputs {
 pub enum SandboxBackend {
     Seatbelt,
     Bubblewrap,
+    /// Stable Win32 AppContainer profile + path-specific SID ACLs. The
+    /// hostile child is created suspended and Job-owned before resume.
+    AppContainer,
     /// Tier-3: run the session inside a container (see
     /// [`crate::sandbox_container`]); `ResolvedSandbox::container` is `Some`.
     Container,
@@ -643,7 +646,7 @@ pub(crate) fn escape_sbpl_regex(path: &Path) -> String {
 /// writable. Mission metadata that would still be reachable through an
 /// allowed ancestor (checkout mode: `session_cwd` is the repo root) is
 /// carved back out by [`mission_write_denies`].
-fn write_allowlist(inputs: &SandboxInputs) -> Vec<PathBuf> {
+pub(crate) fn write_allowlist(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut write_paths: Vec<PathBuf> =
         vec![absolutize(&inputs.session_cwd), absolutize(&inputs.tmpdir)];
     write_paths.extend(inputs.extra_write.iter().map(|p| absolutize(p)));

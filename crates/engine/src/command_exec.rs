@@ -360,6 +360,11 @@ pub(crate) enum GateSandbox {
     Bubblewrap {
         inputs: Box<crate::sandbox::SandboxInputs>,
     },
+    /// Windows stable AppContainer launcher. Inputs ride along because each
+    /// command gets a unique profile, ACL lease, and private launch plan.
+    AppContainer {
+        inputs: Box<crate::sandbox::SandboxInputs>,
+    },
     /// Tier-3 container: `<runtime> run --rm -i --read-only --name <name> …
     /// <image> sh -c <command>` (ticket container-gate-wrapper). Inputs and
     /// spec ride along because the argv — the gate's sanitized env included
@@ -386,6 +391,10 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
+    /// Keeps the disposable profile and its exact original DACL snapshots
+    /// alive through the wrapper process. Absent on non-Windows builds.
+    #[cfg(windows)]
+    _appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
 }
 
 impl GateSandbox {
@@ -396,6 +405,7 @@ impl GateSandbox {
             GateSandbox::Disabled => crate::types::SandboxEnforce::Off,
             GateSandbox::Seatbelt { enforce, .. } => *enforce,
             GateSandbox::Bubblewrap { inputs } => inputs.enforce,
+            GateSandbox::AppContainer { inputs } => inputs.enforce,
             GateSandbox::Container { inputs, .. } => inputs.enforce,
         }
     }
@@ -423,6 +433,8 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
             GateSandbox::Seatbelt { profile_path, .. } => {
@@ -435,6 +447,8 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
             GateSandbox::Bubblewrap { inputs } => {
@@ -447,7 +461,30 @@ impl GateSandbox {
                     program: std::path::PathBuf::from("bwrap"),
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
+            }
+            GateSandbox::AppContainer { inputs } => {
+                #[cfg(windows)]
+                {
+                    let (program, args) = shell_argv(command);
+                    let prepared =
+                        crate::appcontainer_windows::prepare_launch(inputs, &program, &args, env)?;
+                    Ok(WrappedCommand {
+                        program: prepared.program,
+                        args: prepared.args,
+                        timeout_teardown: None,
+                        _appcontainer_lease: Some(prepared.lease),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (inputs, command, env);
+                    Err(crate::error::EngineError::Backend(
+                        "AppContainer gate wrapper is unavailable on this host".to_string(),
+                    ))
+                }
             }
             GateSandbox::Container { inputs, spec } => {
                 // Named per command (never per resolve): parallel gate
@@ -464,6 +501,8 @@ impl GateSandbox {
                         std::path::PathBuf::from(spec.runtime.binary()),
                         vec!["rm".to_string(), "-f".to_string(), name],
                     )),
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
         }
@@ -838,6 +877,13 @@ fn resolve_gate_sandbox_target(
                 }
                 crate::sandbox::SandboxBackend::Bubblewrap => Ok(GateSandboxResolution {
                     sandbox: GateSandbox::Bubblewrap {
+                        inputs: Box::new(inputs),
+                    },
+                    note: None,
+                    prewarmed_xcrun: false,
+                }),
+                crate::sandbox::SandboxBackend::AppContainer => Ok(GateSandboxResolution {
+                    sandbox: GateSandbox::AppContainer {
                         inputs: Box::new(inputs),
                     },
                     note: None,

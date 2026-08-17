@@ -22,6 +22,8 @@ pub mod plan_fit;
 pub mod types;
 
 pub mod agent_env;
+#[cfg(windows)]
+pub(crate) mod appcontainer_windows;
 pub mod auth_verify;
 pub mod backend_readiness;
 pub mod command_exec;
