@@ -1252,10 +1252,21 @@ fn internet_capability() -> Result<Vec<u8>> {
     well_known_sid(WinCapabilityInternetClientSid, "internetClient capability")
 }
 
-fn quote_arg(value: &OsStr) -> Vec<u16> {
+fn quote_arg(value: &OsStr, force_quotes: bool) -> Vec<u16> {
     let source: Vec<u16> = value.encode_wide().collect();
-    let mut out = Vec::with_capacity(source.len() + 2);
-    out.push(b'"' as u16);
+    // Match std::process::Command's CreateProcessW encoding: arguments only
+    // need outer quotes when empty or containing whitespace. Always quoting
+    // switches such as `/C` changes cmd.exe's special parsing of the command
+    // tail (`"/C" "set ...&& ..."` retains the tail's opening quote).
+    let quote = force_quotes
+        || source.is_empty()
+        || source
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16);
+    let mut out = Vec::with_capacity(source.len() + usize::from(quote) * 2);
+    if quote {
+        out.push(b'"' as u16);
+    }
     let mut slashes = 0usize;
     for unit in source {
         if unit == b'\\' as u16 {
@@ -1271,51 +1282,63 @@ fn quote_arg(value: &OsStr) -> Vec<u16> {
         }
         slashes = 0;
     }
-    out.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
-    out.push(b'"' as u16);
+    out.extend(std::iter::repeat_n(
+        b'\\' as u16,
+        slashes * if quote { 2 } else { 1 },
+    ));
+    if quote {
+        out.push(b'"' as u16);
+    }
     out
 }
 
 fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
-    let mut out = quote_arg(executable.as_os_str());
+    let mut out = quote_arg(executable.as_os_str(), true);
     for arg in args {
         out.push(b' ' as u16);
-        out.extend(quote_arg(OsStr::new(arg)));
+        out.extend(quote_arg(OsStr::new(arg), false));
     }
     out.push(0);
     out
 }
 
+/// Convert a canonical local-drive path (`\\?\D:\...`) into the ordinary DOS
+/// spelling accepted by cmd.exe as a current directory. Keep UNC/device paths
+/// untouched: collapsing `\\?\UNC\...` would change their meaning.
+fn local_dos_path(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let std::path::Prefix::VerbatimDisk(disk) = prefix.kind() else {
+        return path.to_path_buf();
+    };
+    let mut normalized = PathBuf::from(format!("{}:\\", char::from(disk).to_ascii_uppercase()));
+    for component in components {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => normalized.push(".."),
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) => return path.to_path_buf(),
+        }
+    }
+    normalized
+}
+
 fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> {
+    let cwd = local_dos_path(cwd);
     let mut components = cwd.components();
     let prefix = match components.next()? {
         std::path::Component::Prefix(prefix) => prefix,
         _ => return None,
     };
-    let (disk, value) = match prefix.kind() {
-        std::path::Prefix::Disk(disk) => (disk, cwd.as_os_str().to_owned()),
-        std::path::Prefix::VerbatimDisk(disk) => {
-            // `canonicalize` emits `\\?\D:\...` on Windows, but the hidden
-            // per-drive environment entry consumed by process creation is an
-            // ordinary DOS path (`=D:=D:\...`). Rebuild it without lossy
-            // UTF-16/string conversion.
-            let mut normalized =
-                PathBuf::from(format!("{}:\\", char::from(disk).to_ascii_uppercase()));
-            for component in components {
-                match component {
-                    std::path::Component::RootDir | std::path::Component::CurDir => {}
-                    std::path::Component::ParentDir => normalized.push(".."),
-                    std::path::Component::Normal(part) => normalized.push(part),
-                    std::path::Component::Prefix(_) => return None,
-                }
-            }
-            (disk, normalized.into_os_string())
-        }
+    let disk = match prefix.kind() {
+        std::path::Prefix::Disk(disk) => disk,
         _ => return None,
     };
     Some((
         OsString::from(format!("={}:", char::from(disk).to_ascii_uppercase())),
-        value,
+        cwd.into_os_string(),
     ))
 }
 
@@ -1426,9 +1449,15 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     startup.StartupInfo.hStdError = stderr.0;
     startup.lpAttributeList = attributes.list;
     let application = wide(plan.executable.as_os_str());
-    let cwd = wide(plan.cwd.as_os_str());
+    // `canonicalize` yields a verbatim local-drive path on Windows. The Win32
+    // API accepts that spelling, but cmd.exe classifies `\\?\C:\...` as a UNC
+    // current directory, falls back to the Windows directory, and runs the
+    // gate in the wrong place. Normalize only the local-drive prefix at this
+    // final process boundary.
+    let process_cwd = local_dos_path(&plan.cwd);
+    let cwd = wide(process_cwd.as_os_str());
     let mut line = command_line(&plan.executable, &plan.args);
-    let environment = environment_block(&plan.cwd)?;
+    let environment = environment_block(&process_cwd)?;
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -2062,5 +2091,31 @@ mod tests {
             assert_eq!(value, OsString::from(r"D:\gate\worktree"));
         }
         assert!(drive_current_directory_variable(Path::new(r"\\server\share\gate")).is_none());
+    }
+
+    #[test]
+    fn process_current_directory_strips_only_a_verbatim_disk_prefix() {
+        assert_eq!(
+            local_dos_path(Path::new(r"\\?\D:\gate\worktree")),
+            Path::new(r"D:\gate\worktree")
+        );
+        assert_eq!(
+            local_dos_path(Path::new(r"\\?\UNC\server\share\gate")),
+            Path::new(r"\\?\UNC\server\share\gate")
+        );
+    }
+
+    #[test]
+    fn command_line_leaves_cmd_switch_unquoted_and_quotes_command_tail() {
+        let encoded = command_line(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            &["/C".to_string(), "set X=1&& echo ok".to_string()],
+        );
+        let rendered = String::from_utf16(&encoded[..encoded.len() - 1])
+            .expect("the command line is valid UTF-16");
+        assert_eq!(
+            rendered,
+            r#""C:\Windows\System32\cmd.exe" /C "set X=1&& echo ok""#
+        );
     }
 }
