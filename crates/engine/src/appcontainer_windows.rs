@@ -523,9 +523,8 @@ fn env_value_ci<'a>(env: &'a HashMap<String, String>, name: &str) -> Option<&'a 
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
 }
 
-fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
-    let has_path = program.components().count() > 1;
-    let extensions: Vec<String> = if program.extension().is_some() {
+fn path_extensions(program: &Path, env: &HashMap<String, String>) -> Vec<String> {
+    if program.extension().is_some() {
         vec![String::new()]
     } else {
         env_value_ci(env, "PATHEXT")
@@ -534,7 +533,16 @@ fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .collect()
-    };
+    }
+}
+
+fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
+    find_all_on_path(program, env).into_iter().next()
+}
+
+fn find_all_on_path(program: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+    let has_path = program.components().count() > 1;
+    let extensions = path_extensions(program, env);
     let bases: Vec<PathBuf> = if has_path {
         vec![program.to_path_buf()]
     } else {
@@ -545,6 +553,7 @@ fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf
             .map(|dir| dir.join(program))
             .collect()
     };
+    let mut found = Vec::new();
     for base in bases {
         for extension in &extensions {
             let candidate = if extension.is_empty() {
@@ -555,15 +564,28 @@ fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf
                 PathBuf::from(value)
             };
             if candidate.is_file() {
-                return Some(candidate);
+                found.push(candidate);
+                break;
             }
         }
     }
-    None
+    found
 }
 
 fn resolve_path_file(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
-    find_on_path(program, env).and_then(|candidate| std::fs::canonicalize(candidate).ok())
+    resolve_nonsystem_path_files(program, env)
+        .into_iter()
+        .next()
+}
+
+fn resolve_nonsystem_path_files(program: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for candidate in find_all_on_path(program, env) {
+        push_entry_point(&mut files, &candidate);
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
@@ -611,6 +633,31 @@ fn push_npm_scripts(files: &mut Vec<PathBuf>, dir: &Path) {
     }
 }
 
+fn volume_root(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        )
+    })
+}
+
+/// Parent directories CreateProcess must traverse to reach an entry-point
+/// file. LPAC is not Users/Everyone/ALL APPLICATION PACKAGES, so a file ACE
+/// is useless unless each ancestor also allows FILE_TRAVERSE.
+fn ancestor_directories(path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if volume_root(dir) || system_managed_path(dir) {
+            break;
+        }
+        out.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    out
+}
+
 /// Exact Node/npm/Cargo files that must receive a direct (non-inheriting) RX
 /// ACE. Hosted Windows toolchains mark `node.exe`, `npm.cmd`, npm CLI scripts,
 /// and rustup proxies with `SE_DACL_PROTECTED`, so a parent-directory grant
@@ -632,7 +679,7 @@ fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
     ];
 
     let mut files = Vec::new();
-    if let Some(node) = resolve_path_file(Path::new("node"), env) {
+    for node in resolve_nonsystem_path_files(Path::new("node"), env) {
         push_entry_point(&mut files, &node);
         if let Some(dir) = node.parent() {
             for name in NODE_SHIMS {
@@ -641,14 +688,14 @@ fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
             push_npm_scripts(&mut files, dir);
         }
     }
-    if let Some(npm) = resolve_path_file(Path::new("npm"), env) {
+    for npm in resolve_nonsystem_path_files(Path::new("npm"), env) {
         push_entry_point(&mut files, &npm);
         if let Some(dir) = npm.parent() {
             push_npm_scripts(&mut files, dir);
         }
     }
     for program in ["cargo", "rustc", "rustup"] {
-        if let Some(exe) = resolve_path_file(Path::new(program), env) {
+        for exe in resolve_nonsystem_path_files(Path::new(program), env) {
             push_entry_point(&mut files, &exe);
         }
     }
@@ -658,6 +705,14 @@ fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
                 let bin = entry.path().join("bin");
                 for name in RUST_BINARIES {
                     push_entry_point(&mut files, &bin.join(name));
+                }
+                if let Ok(bin_entries) = std::fs::read_dir(&bin) {
+                    for file in bin_entries.flatten() {
+                        let path = file.path();
+                        if path.is_file() {
+                            push_entry_point(&mut files, &path);
+                        }
+                    }
                 }
             }
         }
@@ -880,11 +935,8 @@ fn read_roots(
     // added separately below. The recursive-root validator still refuses
     // either directory grant if it would cover Kranz authority or metadata.
     for program in ["node", "cargo"] {
-        if let Ok(executable) = resolve_executable(Path::new(program), env) {
-            if let Some(parent) = executable
-                .parent()
-                .filter(|path| !system_managed_path(path))
-            {
+        for executable in resolve_nonsystem_path_files(Path::new(program), env) {
+            if let Some(parent) = executable.parent() {
                 roots.push(parent.to_path_buf());
             }
         }
@@ -1022,13 +1074,22 @@ fn acl_changes(
             mode: AclMode::Grant,
         });
     }
+    let traverse = FILE_GENERIC_EXECUTE.0;
     for path in toolchain_entry_points(env) {
         changes.push(AclChange {
-            path,
+            path: path.clone(),
             permissions: rx,
             inherit: false,
             mode: AclMode::Grant,
         });
+        for ancestor in ancestor_directories(&path) {
+            changes.push(AclChange {
+                path: ancestor,
+                permissions: traverse,
+                inherit: false,
+                mode: AclMode::Grant,
+            });
+        }
     }
 
     let deny_all = FILE_GENERIC_READ.0
@@ -2338,5 +2399,29 @@ mod tests {
                 "missing {expected} in {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn ancestor_directories_stop_before_the_volume_root() {
+        let file = Path::new(r"\\?\C:\hostedtoolcache\windows\node\20.0.0\x64\node.exe");
+        let ancestors = ancestor_directories(file);
+        assert!(
+            ancestors
+                .iter()
+                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("x64"))),
+            "{ancestors:?}"
+        );
+        assert!(
+            ancestors
+                .iter()
+                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("hostedtoolcache"))),
+            "{ancestors:?}"
+        );
+        assert!(
+            ancestors.iter().all(|path| !volume_root(path)),
+            "{ancestors:?}"
+        );
+        assert!(volume_root(Path::new(r"\\?\C:\")));
+        assert!(volume_root(Path::new(r"C:\")));
     }
 }
