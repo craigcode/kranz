@@ -523,9 +523,8 @@ fn env_value_ci<'a>(env: &'a HashMap<String, String>, name: &str) -> Option<&'a 
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
 }
 
-fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
+fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
     let has_path = program.components().count() > 1;
-    let mut candidates = Vec::new();
     let extensions: Vec<String> = if program.extension().is_some() {
         vec![String::new()]
     } else {
@@ -556,11 +555,19 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
                 PathBuf::from(value)
             };
             if candidate.is_file() {
-                candidates.push(candidate);
+                return Some(candidate);
             }
         }
     }
-    let candidate = candidates.into_iter().next().ok_or_else(|| {
+    None
+}
+
+fn resolve_path_file(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
+    find_on_path(program, env).and_then(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
+fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
+    let candidate = find_on_path(program, env).ok_or_else(|| {
         EngineError::Backend(format!(
             "AppContainer child executable {:?} could not be resolved from the cleared PATH",
             program
@@ -582,6 +589,82 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
             candidate.display()
         ))
     })
+}
+
+fn push_entry_point(files: &mut Vec<PathBuf>, path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return;
+    };
+    if system_managed_path(&canon) {
+        return;
+    }
+    files.push(canon);
+}
+
+fn push_npm_scripts(files: &mut Vec<PathBuf>, dir: &Path) {
+    let npm_bin = dir.join("node_modules").join("npm").join("bin");
+    for name in ["npm-cli.js", "npx-cli.js", "npm-prefix.js"] {
+        push_entry_point(files, &npm_bin.join(name));
+    }
+}
+
+/// Exact Node/npm/Cargo files that must receive a direct (non-inheriting) RX
+/// ACE. Hosted Windows toolchains mark `node.exe`, `npm.cmd`, npm CLI scripts,
+/// and rustup proxies with `SE_DACL_PROTECTED`, so a parent-directory grant
+/// never reaches them.
+///
+/// Source: https://learn.microsoft.com/windows/win32/secauthz/ace-inheritance
+/// (`SE_DACL_PROTECTED` prevents a DACL from inheriting parent ACEs).
+fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
+    const NODE_SHIMS: &[&str] = &["npm.cmd", "npm", "npm.ps1", "npx.cmd", "npx", "npx.ps1"];
+    const RUST_BINARIES: &[&str] = &[
+        "cargo.exe",
+        "rustc.exe",
+        "rustdoc.exe",
+        "rustup.exe",
+        "cargo",
+        "rustc",
+        "rustdoc",
+        "rustup",
+    ];
+
+    let mut files = Vec::new();
+    if let Some(node) = resolve_path_file(Path::new("node"), env) {
+        push_entry_point(&mut files, &node);
+        if let Some(dir) = node.parent() {
+            for name in NODE_SHIMS {
+                push_entry_point(&mut files, &dir.join(name));
+            }
+            push_npm_scripts(&mut files, dir);
+        }
+    }
+    if let Some(npm) = resolve_path_file(Path::new("npm"), env) {
+        push_entry_point(&mut files, &npm);
+        if let Some(dir) = npm.parent() {
+            push_npm_scripts(&mut files, dir);
+        }
+    }
+    for program in ["cargo", "rustc", "rustup"] {
+        if let Some(exe) = resolve_path_file(Path::new(program), env) {
+            push_entry_point(&mut files, &exe);
+        }
+    }
+    if let Some(rustup) = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from) {
+        if let Ok(toolchains) = std::fs::read_dir(rustup.join("toolchains")) {
+            for entry in toolchains.flatten() {
+                let bin = entry.path().join("bin");
+                for name in RUST_BINARIES {
+                    push_entry_point(&mut files, &bin.join(name));
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 const GIT_POINTER_MAX_BYTES: u64 = 4096;
@@ -791,11 +874,11 @@ fn read_roots(
     }
     // Hosted Windows installs Node under C:\hostedtoolcache rather than the
     // operator profile, so the general caller-owned PATH rule above excludes
-    // it. Resolve only the Node and Cargo entry points required by the normal
-    // gate receipt and grant each installation directory RX; npm.cmd and
-    // node_modules/npm live beside node.exe, while rustup's actual toolchain
-    // root is added separately below. The recursive-root validator still
-    // refuses either grant if it would cover Kranz authority or metadata.
+    // it. Grant each installation directory RX for inheriting children, then
+    // add exact-file ACEs for node/npm/cargo entry points whose protected
+    // DACLs do not inherit that directory grant. rustup's toolchain root is
+    // added separately below. The recursive-root validator still refuses
+    // either directory grant if it would cover Kranz authority or metadata.
     for program in ["node", "cargo"] {
         if let Ok(executable) = resolve_executable(Path::new(program), env) {
             if let Some(parent) = executable
@@ -936,6 +1019,14 @@ fn acl_changes(
             path: root.clone(),
             permissions: rx,
             inherit: root.is_dir(),
+            mode: AclMode::Grant,
+        });
+    }
+    for path in toolchain_entry_points(env) {
+        changes.push(AclChange {
+            path,
+            permissions: rx,
+            inherit: false,
             mode: AclMode::Grant,
         });
     }
@@ -2189,5 +2280,63 @@ mod tests {
             rendered,
             r#""C:\Windows\System32\cmd.exe" /C "set X=1&& echo ok""#
         );
+    }
+
+    #[test]
+    fn toolchain_entry_points_include_protected_node_npm_and_cargo_files() {
+        let root = tempfile::tempdir().expect("temp toolchain root");
+        let node_dir = root.path().join("node");
+        let npm_bin = node_dir.join("node_modules").join("npm").join("bin");
+        let cargo_dir = root.path().join("cargo");
+        let rustc_bin = root
+            .path()
+            .join("rustup")
+            .join("toolchains")
+            .join("stable-x86_64-pc-windows-msvc")
+            .join("bin");
+        std::fs::create_dir_all(&npm_bin).expect("npm bin");
+        std::fs::create_dir_all(&cargo_dir).expect("cargo dir");
+        std::fs::create_dir_all(&rustc_bin).expect("rustc bin");
+        for name in ["node.exe", "npm.cmd", "npx.cmd"] {
+            std::fs::write(node_dir.join(name), "").expect("node shim");
+        }
+        std::fs::write(npm_bin.join("npm-cli.js"), "").expect("npm-cli.js");
+        std::fs::write(cargo_dir.join("cargo.exe"), "").expect("cargo.exe");
+        std::fs::write(rustc_bin.join("rustc.exe"), "").expect("rustc.exe");
+
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::join_paths([&node_dir, &cargo_dir])
+                .expect("PATH")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        env.insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
+        env.insert(
+            "RUSTUP_HOME".to_string(),
+            root.path().join("rustup").to_string_lossy().into_owned(),
+        );
+
+        let names: Vec<String> = toolchain_entry_points(&env)
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        for expected in [
+            "node.exe",
+            "npm.cmd",
+            "npx.cmd",
+            "npm-cli.js",
+            "cargo.exe",
+            "rustc.exe",
+        ] {
+            assert!(
+                names.iter().any(|name| name.eq_ignore_ascii_case(expected)),
+                "missing {expected} in {names:?}"
+            );
+        }
     }
 }
