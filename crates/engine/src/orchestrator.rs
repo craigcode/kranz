@@ -10863,20 +10863,31 @@ pub(crate) mod tests {
                 .any(|s| s.contains("sandbox-contained (mandatory)")),
             "the contained posture is recorded per round: {decisions:?}"
         );
-        // The generated profile read-denies the real tree's contents
-        // (string-level; the applied sandbox-exec/bwrap probes live in
-        // crate::sandbox's tests).
-        let profile = crate::sandbox::generate_profile(&sandbox.inputs);
-        let readme = format!("(literal \"{}\")", root.join("README.md").display());
-        assert!(
-            profile.contains(&readme),
-            "the real checkout's source files are read-denied:\n{profile}"
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            sandbox.backend,
+            crate::sandbox::SandboxBackend::AppContainer,
+            "Windows mandatory validator containment uses the production AppContainer backend"
         );
-        let git_dir = format!("\"{}\"", root.join(".git").display());
-        assert!(
-            !profile.contains(&git_dir),
-            "the shared git dir stays readable (the inspection surface):\n{profile}"
-        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            // The generated profile read-denies the real tree's contents
+            // (string-level; the applied sandbox-exec/bwrap probes live in
+            // crate::sandbox's tests). Windows has no Seatbelt profile: its
+            // equivalent DACL/LPAC behavior is covered by the native hostile
+            // AppContainer proof.
+            let profile = crate::sandbox::generate_profile(&sandbox.inputs);
+            let readme = format!("(literal \"{}\")", root.join("README.md").display());
+            assert!(
+                profile.contains(&readme),
+                "the real checkout's source files are read-denied:\n{profile}"
+            );
+            let git_dir = format!("\"{}\"", root.join(".git").display());
+            assert!(
+                !profile.contains(&git_dir),
+                "the shared git dir stays readable (the inspection surface):\n{profile}"
+            );
+        }
         assert!(validator_snapshot_leftovers(&engine).is_empty());
     }
 
