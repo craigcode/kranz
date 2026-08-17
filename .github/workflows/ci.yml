@@ -68,11 +68,11 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phase-4 staging: exercise the exact production
-      # helper/ACL lease through the built kranz binary while the resolver's
-      # phase-1 refusal still governs. Only a green protected receipt permits
-      # the follow-up commit that enables SandboxBackend::AppContainer.
-      - name: Probe and prove Windows containment before production enablement
+      # M7 Windows containment phase 4: exercise the exact production
+      # helper/ACL lease through the built kranz binary, then hold both the
+      # positive process-provider resolution and negative container-provider
+      # refusal contracts before the full workspace suite.
+      - name: Prove production Windows LPAC containment
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -91,13 +91,13 @@ jobs:
           cat "$production_log"
           grep -qE 'test result: ok\. [1-9]' "$production_log"
 
-          session_log="$RUNNER_TEMP/kranz-windows-session-refusal.log"
-          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact >"$session_log" 2>&1
+          session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
+          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact >"$session_log" 2>&1
           cat "$session_log"
           grep -qE 'test result: ok\. [1-9]' "$session_log"
 
-          gate_log="$RUNNER_TEMP/kranz-windows-gate-refusal.log"
-          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn -- --exact >"$gate_log" 2>&1
+          gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
+          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact >"$gate_log" 2>&1
           cat "$gate_log"
           grep -qE 'test result: ok\. [1-9]' "$gate_log"
       - run: cargo fmt --all --check
@@ -217,6 +217,28 @@ jobs:
       - run: cargo audit --deny unsound
         working-directory: apps/dashboard/src-tauri
       - run: cargo audit --deny unsound
+
+  # The Windows desktop binary is also a production mission host: its main
+  # must route the private LPAC launcher re-entry before Tauri initializes.
+  # The root Windows workspace job cannot compile this standalone crate, so
+  # keep a native Windows check beside the macOS desktop gate.
+  tauri-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
 
   dashboard:
     runs-on: ubuntu-latest

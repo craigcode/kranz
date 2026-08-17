@@ -128,6 +128,11 @@ pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) 
         {
             SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
         }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+            if target_os == "windows" =>
+        {
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        }
         crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet => {
             SandboxDecision::UnsupportedWarn
         }
@@ -2084,6 +2089,14 @@ mod tests {
             SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
         );
         assert_eq!(
+            platform_support(SandboxEnforce::Fs, "windows"),
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "windows"),
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        );
+        assert_eq!(
             platform_support(SandboxEnforce::Off, "linux"),
             SandboxDecision::Off
         );
@@ -2175,12 +2188,12 @@ mod tests {
         assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
     }
 
-    /// M7 Windows parity, phase 1: neither a Job Object nor the presence of
-    /// `docker.exe` is accepted as containment evidence. Both enforced
-    /// providers must refuse before a session can spawn; `off` remains the
-    /// operator's explicit unsandboxed posture.
+    /// M7 Windows parity, phase 4: the process provider resolves the stable
+    /// AppContainer backend. Merely finding `docker.exe` still does not prove
+    /// the Windows container mount contract, so that provider stays refused;
+    /// `off` remains the operator's explicit unsandboxed posture.
     #[test]
-    fn windows_enforced_session_providers_fail_closed_before_spawn() {
+    fn windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed() {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
@@ -2203,13 +2216,12 @@ mod tests {
                 false,
                 Some(crate::sandbox_container::ContainerRuntime::Docker),
             );
-            assert!(resolved.is_none());
-            let warning = warning.expect("Windows process enforcement must refuse");
-            assert!(
-                warning.contains("unsupported on target_os=windows"),
-                "{warning}"
-            );
-            assert!(warning.contains("refusing to run unsandboxed"), "{warning}");
+            assert!(warning.is_none(), "{warning:?}");
+            let resolved = resolved.expect("Windows process enforcement resolves");
+            assert_eq!(resolved.backend, SandboxBackend::AppContainer);
+            assert_eq!(resolved.inputs.enforce, enforce);
+            assert_eq!(resolved.inputs.session_cwd, session.path());
+            assert_eq!(resolved.inputs.mission_dir, mission.path());
 
             let container = container_cfg(enforce, vec![]);
             let (resolved, warning) = resolve_for_session_target(
@@ -3408,45 +3420,33 @@ mod tests {
         );
     }
 
-    /// Windows has no process-sandbox tier: FAIL CLOSED by default — the
-    /// 14th-pass reversal of the 224fa73 loud-degrade default (ticket
-    /// validator-containment-degrade-fail-closed). The error names the
-    /// platform and the opt-in flag; the flag restores the loud note.
+    /// M7 Windows parity, phase 4: validators resolve the same mandatory
+    /// AppContainer fs-tier wrap as other containable platforms, regardless
+    /// of the legacy uncontained-degrade opt-in.
     #[test]
-    fn validator_containment_off_windows_fails_closed_unless_opted_in() {
-        let err = resolve_validator_containment_target(
-            &off_cfg(),
-            crate::types::BackendKind::Claude,
-            Path::new("C:\\snap"),
-            Path::new("C:\\mission"),
-            &[PathBuf::from("C:\\repo")],
-            false,
-            "windows",
-            false,
-            None,
-        )
-        .expect_err("an uncontainable platform fails closed by default");
-        let err = err.to_string();
-        assert!(err.contains("target_os=windows"), "{err}");
-        assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
-
-        let containment = resolve_validator_containment_target(
-            &off_cfg(),
-            crate::types::BackendKind::Claude,
-            Path::new("C:\\snap"),
-            Path::new("C:\\mission"),
-            &[PathBuf::from("C:\\repo")],
-            true,
-            "windows",
-            false,
-            None,
-        )
-        .expect("the opt-in restores the loud degrade");
-        assert!(containment.sandbox.is_none());
-        let note = containment.note.expect("the loud note");
-        assert!(note.contains("target_os=windows"), "{note}");
-        assert!(note.contains("validator-mandatory-containment"), "{note}");
-        assert!(note.contains("after-fingerprint"), "{note}");
+    fn validator_containment_off_windows_resolves_appcontainer() {
+        let roots = vec![PathBuf::from("C:\\repo")];
+        for allow_uncontained_degrade in [false, true] {
+            let containment = resolve_validator_containment_target(
+                &off_cfg(),
+                crate::types::BackendKind::Claude,
+                Path::new("C:\\snap"),
+                Path::new("C:\\mission"),
+                &roots,
+                allow_uncontained_degrade,
+                "windows",
+                false,
+                None,
+            )
+            .expect("Windows resolves the mandatory AppContainer wrap");
+            assert!(containment.note.is_none(), "{:?}", containment.note);
+            let sandbox = containment.sandbox.expect("a wrap applies");
+            assert_eq!(sandbox.backend, SandboxBackend::AppContainer);
+            assert_eq!(sandbox.inputs.enforce, crate::types::SandboxEnforce::Fs);
+            assert_eq!(sandbox.inputs.session_cwd, PathBuf::from("C:\\snap"));
+            assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+            assert!(sandbox.inputs.extra_write.is_empty());
+        }
     }
 
     /// A backend that cannot honor the resolved sandbox must never silently
@@ -3531,18 +3531,18 @@ mod tests {
         );
     }
 
-    /// `enforce != off` stays fail-closed where the platform cannot honor it
-    /// (the runner's resolve_sandbox_or_refuse posture, unchanged).
+    /// `enforce != off` stays fail-closed on an unknown platform (the
+    /// runner's resolve_sandbox_or_refuse posture, unchanged).
     #[test]
     fn validator_containment_enforced_role_still_fails_closed_where_unsupported() {
         let err = resolve_validator_containment_target(
             &fs_cfg(),
             crate::types::BackendKind::Claude,
-            Path::new("C:\\snap"),
-            Path::new("C:\\mission"),
-            &[PathBuf::from("C:\\repo")],
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
             false,
-            "windows",
+            "solaris",
             false,
             None,
         )

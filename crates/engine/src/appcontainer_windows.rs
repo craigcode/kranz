@@ -1,4 +1,5 @@
-//! Stable Windows AppContainer launcher used by production session and gate paths.
+//! Stable Windows less-privileged AppContainer (LPAC) launcher used by
+//! production session and gate paths.
 //!
 //! The engine starts a trusted copy of itself as a thin launcher. That helper
 //! creates the prompt-injectable child suspended, assigns it to a kill-on-close
@@ -8,16 +9,19 @@
 //! not need a second Windows-only implementation.
 //!
 //! Filesystem authority is granted to a unique per-launch AppContainer SID. The
-//! parent snapshots every DACL it changes and restores those descriptors when the
-//! wrapped process is reaped or aborted; restoring an inheritable parent ACE also
-//! removes its inherited copies from descendants. The profile name is random and
-//! deleted with the same lease. A process crash can leave an inert orphan SID ACE,
-//! but no other AppContainer principal can use it and normal/abort paths restore
-//! the original descriptors exactly.
+//! parent retains a no-follow handle for every DACL it changes and removes only
+//! that SID's ACEs when the wrapped process is reaped or aborted; removing an
+//! inheritable parent ACE also removes its inherited copies from descendants.
+//! A bounded host-local mutex serializes those DACL read/modify/write batches,
+//! so this composes safely across overlapping launches that share Git/toolchain
+//! roots and restores the original descriptor exactly when no unrelated ACL
+//! change occurred. The profile name is random and deleted with the same lease.
+//! A process crash can leave an inert orphan SID ACE, but no other AppContainer
+//! principal can use it.
 
 use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -27,35 +31,43 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, GENERIC_READ, HANDLE, HLOCAL,
+    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS, EXPLICIT_ACCESS_W,
+    GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W,
     GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    CreateWellKnownSid, FreeSid, GetTokenInformation, TokenIsAppContainer,
-    WinCapabilityInternetClientSid, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
+    GetAclInformation, GetTokenInformation, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer,
+    WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
     NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, TOKEN_QUERY,
+    SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ReleaseMutex,
+    ResumeThread, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 pub(crate) const INTERNAL_LAUNCHER_ARG: &str = "__kranz-appcontainer-launch";
@@ -63,6 +75,9 @@ pub(crate) const INTERNAL_SELF_TEST_ARG: &str = "__kranz-appcontainer-self-test"
 pub(crate) const INTERNAL_HOSTILE_CHILD_ARG: &str = "__kranz-appcontainer-hostile-child";
 const PLAN_VERSION: u32 = 1;
 const SELF_TEST_MANIFEST: &str = "kranz-appcontainer-production-self-test.json";
+const DACL_MUTEX_NAME: &str = "Local\\Kranz.AppContainer.Dacl.v1";
+const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
+const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +109,7 @@ struct SelfTestManifest {
 #[serde(rename_all = "camelCase")]
 pub struct ProductionHostileReceipt {
     pub token_is_appcontainer: bool,
+    pub token_is_lpac: bool,
     pub toolchain_read: bool,
     pub toolchain_write_denied: bool,
     pub worktree_write: bool,
@@ -102,6 +118,8 @@ pub struct ProductionHostileReceipt {
     pub authority_read_denied: bool,
     pub real_checkout_read_denied: bool,
     pub shared_git_read: bool,
+    pub overlapping_lease_safe: bool,
+    pub tampered_git_pointer_refused: bool,
     pub network_denied: bool,
     pub dacl_restored: bool,
 }
@@ -118,6 +136,50 @@ pub(crate) struct PreparedLaunch {
 struct DaclSnapshot {
     path: PathBuf,
     acl: Option<Vec<u8>>,
+    handle: OwnedHandle,
+}
+
+#[derive(Debug)]
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct DaclMutationGuard {
+    handle: OwnedHandle,
+}
+
+impl DaclMutationGuard {
+    fn acquire() -> Result<Self> {
+        let name = wide(DACL_MUTEX_NAME);
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+            .map(OwnedHandle)
+            .map_err(|error| {
+                EngineError::Backend(format!(
+                    "failed to create/open the AppContainer DACL mutation mutex: {error}"
+                ))
+            })?;
+        match unsafe { WaitForSingleObject(handle.0, DACL_MUTEX_TIMEOUT_MS) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle }),
+            WAIT_TIMEOUT => Err(EngineError::Backend(format!(
+                "timed out after {DACL_MUTEX_TIMEOUT_MS}ms waiting for the AppContainer DACL mutation mutex"
+            ))),
+            status => Err(EngineError::Backend(format!(
+                "waiting for the AppContainer DACL mutation mutex returned {status:?}"
+            ))),
+        }
+    }
+}
+
+impl Drop for DaclMutationGuard {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { ReleaseMutex(self.handle.0) } {
+            tracing::error!(%error, "failed to release AppContainer DACL mutation mutex");
+        }
+    }
 }
 
 /// Parent-owned cleanup guard. It deliberately carries no SID pointer, so it
@@ -130,15 +192,32 @@ pub(crate) struct AppContainerLease {
 
 impl Drop for AppContainerLease {
     fn drop(&mut self) {
-        // Parent directories first: removing their inheritable AppContainer
-        // ACEs makes Windows retract inherited copies from existing children;
-        // the later child snapshots then restore any direct descriptor exactly.
-        self.original_dacls
-            .sort_by_key(|entry| entry.path.components().count());
-        for snapshot in &self.original_dacls {
-            if let Err(error) = restore_dacl(snapshot) {
-                tracing::error!(path = %snapshot.path.display(), error = %error,
-                    "failed to restore an AppContainer-modified DACL");
+        match (
+            DaclMutationGuard::acquire(),
+            derive_profile_sid(&self.profile_name),
+        ) {
+            (Ok(_guard), Ok(sid)) => {
+                // Parent directories first: removing their inheritable
+                // AppContainer ACEs makes Windows retract inherited copies
+                // from existing children. Remove ONLY this random profile's
+                // ACEs; replacing whole snapshots would race overlapping
+                // launches that legitimately touch shared Git/toolchain roots.
+                self.original_dacls
+                    .sort_by_key(|entry| entry.path.components().count());
+                for snapshot in &self.original_dacls {
+                    if let Err(error) = remove_profile_aces(snapshot, sid.0) {
+                        tracing::error!(path = %snapshot.path.display(), error = %error,
+                            "failed to remove AppContainer ACEs from a DACL");
+                    }
+                }
+            }
+            (Err(error), _) => {
+                tracing::error!(profile = %self.profile_name, error = %error,
+                    "failed to lock AppContainer DACL cleanup");
+            }
+            (_, Err(error)) => {
+                tracing::error!(profile = %self.profile_name, error = %error,
+                    "failed to derive AppContainer SID for DACL cleanup");
             }
         }
         if let Some(path) = self.plan_path.take() {
@@ -216,18 +295,36 @@ fn create_profile() -> Result<(String, OwnedSid)> {
 
 fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     let path_wide = wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            READ_CONTROL.0 | WRITE_DAC.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to retain no-follow DACL capability for {}: {error}",
+            path.display()
+        ))
+    })?;
     let mut acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(path_wide.as_ptr()),
+        GetSecurityInfo(
+            handle.0,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
             None,
             Some(&mut acl),
             None,
-            &mut descriptor,
+            Some(&mut descriptor),
         )
     })?;
     let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
@@ -240,45 +337,114 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     Ok(DaclSnapshot {
         path: path.to_path_buf(),
         acl,
+        handle,
     })
 }
 
-fn restore_dacl(snapshot: &DaclSnapshot) -> Result<()> {
-    if !snapshot.path.exists() {
-        return Ok(());
-    }
-    let path = wide(snapshot.path.as_os_str());
-    let acl = snapshot
-        .acl
-        .as_ref()
-        .map(|bytes| bytes.as_ptr() as *const ACL);
+fn remove_profile_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
+    let mut current_acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
-        SetNamedSecurityInfoW(
-            PWSTR(path.as_ptr().cast_mut()),
+        GetSecurityInfo(
+            snapshot.handle.0,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
             None,
-            acl,
+            Some(&mut current_acl),
+            None,
+            Some(&mut descriptor),
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    if current_acl.is_null() {
+        return Ok(());
+    }
+
+    let len = unsafe { (*current_acl).AclSize as usize };
+    let mut acl = unsafe { std::slice::from_raw_parts(current_acl.cast::<u8>(), len) }.to_vec();
+    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl_ptr,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to inspect DACL ACEs: {error}")))?;
+
+    // SetEntriesInAclW emits ordinary allow/deny ACEs for a SID trustee.
+    // Walk backwards so DeleteAce indices remain valid, and leave every ACE
+    // belonging to another concurrent launch or the operator untouched.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    for index in (0..info.AceCount).rev() {
+        let mut ace = null_mut();
+        unsafe { GetAce(acl_ptr, index, &mut ace) }
+            .map_err(|error| EngineError::Backend(format!("failed to read DACL ACE: {error}")))?;
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let trustee = match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => unsafe {
+                &(*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart as *const u32
+            },
+            ACCESS_DENIED_ACE_TYPE => unsafe {
+                &(*ace.cast::<ACCESS_DENIED_ACE>()).SidStart as *const u32
+            },
+            _ => continue,
+        };
+        if unsafe { EqualSid(PSID(trustee.cast_mut().cast()), sid) }.is_ok() {
+            unsafe { DeleteAce(acl_ptr, index) }.map_err(|error| {
+                EngineError::Backend(format!("failed to remove AppContainer DACL ACE: {error}"))
+            })?;
+        }
+    }
+
+    // DeleteAce leaves capacity in the ACL buffer. Compact the advertised
+    // size to the bytes still in use so an uncontended add/remove cycle
+    // recovers the original descriptor bytes instead of persisting slack.
+    let mut final_info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl_ptr,
+            (&mut final_info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to size cleaned DACL: {error}")))?;
+    let compact_len = u16::try_from(final_info.AclBytesInUse).map_err(|_| {
+        EngineError::Backend("cleaned DACL exceeded the Win32 ACL size limit".to_string())
+    })?;
+    unsafe { (*acl_ptr).AclSize = compact_len };
+
+    win32(unsafe {
+        SetSecurityInfo(
+            snapshot.handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl_ptr),
             None,
         )
     })
 }
 
-fn apply_acl_change(change: &AclChange, sid: PSID) -> Result<()> {
-    let path = wide(change.path.as_os_str());
+fn apply_acl_change(change: &AclChange, sid: PSID, handle: HANDLE) -> Result<()> {
     let mut old_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(path.as_ptr()),
+        GetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
             None,
             Some(&mut old_acl),
             None,
-            &mut descriptor,
+            Some(&mut descriptor),
         )
     })?;
     let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
@@ -304,8 +470,8 @@ fn apply_acl_change(change: &AclChange, sid: PSID) -> Result<()> {
     win32(unsafe { SetEntriesInAclW(Some(&[entry]), Some(old_acl), &mut new_acl) })?;
     let _new_acl = LocalAllocation(HLOCAL(new_acl.cast()));
     win32(unsafe {
-        SetNamedSecurityInfoW(
-            PWSTR(path.as_ptr().cast_mut()),
+        SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
@@ -382,43 +548,198 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
     })
 }
 
-fn git_read_roots(cwd: &Path) -> Vec<PathBuf> {
-    let dot_git = cwd.join(".git");
-    if dot_git.is_dir() {
-        return vec![dot_git];
+const GIT_POINTER_MAX_BYTES: u64 = 4096;
+
+fn read_small_regular_file(path: &Path, label: &str) -> Result<String> {
+    let path_wide = wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
     }
-    let Ok(pointer) = std::fs::read_to_string(&dot_git) else {
-        return Vec::new();
-    };
-    let Some(raw) = pointer
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir: "))
-    else {
-        return Vec::new();
-    };
-    let git_dir = {
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to open {label} {} without following reparse points: {error}",
+            path.display()
+        ))
+    })?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }.map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to inspect open {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    let attributes = info.dwFileAttributes;
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        || size > GIT_POINTER_MAX_BYTES
+    {
+        return Err(EngineError::Backend(format!(
+            "{label} {} must be a small no-follow regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = vec![0u8; size as usize];
+    let mut read = 0u32;
+    if !bytes.is_empty() {
+        unsafe { ReadFile(handle.0, Some(&mut bytes), Some(&mut read), None) }.map_err(
+            |error| {
+                EngineError::Backend(format!(
+                    "failed to read open {label} {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    if read as usize != bytes.len() {
+        return Err(EngineError::Backend(format!(
+            "{label} {} changed while it was being read",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        EngineError::Backend(format!(
+            "{label} {} is not valid UTF-8: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn resolve_git_dir(root: &Path) -> Result<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).map_err(|error| {
+        EngineError::Backend(format!("failed to inspect {}: {error}", dot_git.display()))
+    })?;
+    let candidate = if metadata.file_type().is_dir() {
+        dot_git
+    } else if metadata.file_type().is_file() {
+        let pointer = read_small_regular_file(&dot_git, "Git worktree pointer")?;
+        let mut nonempty = pointer.lines().filter(|line| !line.trim().is_empty());
+        let line = nonempty.next().ok_or_else(|| {
+            EngineError::Backend(format!(
+                "Git worktree pointer {} is empty",
+                dot_git.display()
+            ))
+        })?;
+        if nonempty.next().is_some() {
+            return Err(EngineError::Backend(format!(
+                "Git worktree pointer {} contains unexpected extra records",
+                dot_git.display()
+            )));
+        }
+        let raw = line.strip_prefix("gitdir: ").ok_or_else(|| {
+            EngineError::Backend(format!(
+                "Git worktree pointer {} has an invalid record",
+                dot_git.display()
+            ))
+        })?;
         let path = PathBuf::from(raw.trim());
         if path.is_absolute() {
             path
         } else {
-            cwd.join(path)
+            root.join(path)
         }
+    } else {
+        return Err(EngineError::Backend(format!(
+            "Git metadata entry {} is not a no-follow file or directory",
+            dot_git.display()
+        )));
     };
-    let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
-    let mut roots = vec![git_dir.clone()];
-    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
-        let common = PathBuf::from(common.trim());
-        let common = if common.is_absolute() {
-            common
-        } else {
-            git_dir.join(common)
-        };
-        roots.push(std::fs::canonicalize(&common).unwrap_or(common));
-    }
-    roots
+    std::fs::canonicalize(&candidate).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to canonicalize Git directory {}: {error}",
+            candidate.display()
+        ))
+    })
 }
 
-fn read_roots(executable: &Path, cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+fn resolve_common_dir(git_dir: &Path) -> Result<PathBuf> {
+    let commondir = git_dir.join("commondir");
+    match std::fs::symlink_metadata(&commondir) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let raw = read_small_regular_file(&commondir, "Git common-dir pointer")?;
+            let raw = raw.trim();
+            if raw.is_empty() || raw.lines().count() != 1 {
+                return Err(EngineError::Backend(format!(
+                    "Git common-dir pointer {} is invalid",
+                    commondir.display()
+                )));
+            }
+            let path = PathBuf::from(raw);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            };
+            std::fs::canonicalize(&path).map_err(|error| {
+                EngineError::Backend(format!(
+                    "failed to canonicalize Git common directory {}: {error}",
+                    path.display()
+                ))
+            })
+        }
+        Ok(_) => Err(EngineError::Backend(format!(
+            "Git common-dir pointer {} is not a no-follow regular file",
+            commondir.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
+        Err(error) => Err(EngineError::Backend(format!(
+            "failed to inspect Git common-dir pointer {}: {error}",
+            commondir.display()
+        ))),
+    }
+}
+
+fn trusted_git_read_root(cwd: &Path, mission_dir: &Path) -> Result<PathBuf> {
+    let mission = std::fs::canonicalize(mission_dir).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to canonicalize mission metadata root {}: {error}",
+            mission_dir.display()
+        ))
+    })?;
+    let missions = mission
+        .parent()
+        .filter(|path| path.file_name() == Some(OsStr::new("missions")));
+    let kranz = missions
+        .and_then(Path::parent)
+        .filter(|path| path.file_name() == Some(OsStr::new(".kranz")));
+    let repo = kranz.and_then(Path::parent).ok_or_else(|| {
+        EngineError::Backend(format!(
+            "mission metadata root {} is not under <repo>/.kranz/missions",
+            mission.display()
+        ))
+    })?;
+    let trusted_git_dir = resolve_git_dir(repo)?;
+    let trusted_common = resolve_common_dir(&trusted_git_dir)?;
+    let session_git_dir = resolve_git_dir(cwd)?;
+    let session_common = resolve_common_dir(&session_git_dir)?;
+    if session_common != trusted_common
+        || !(session_git_dir == trusted_common || path_contains(&trusted_common, &session_git_dir))
+    {
+        return Err(EngineError::Backend(format!(
+            "session Git metadata {} does not belong to trusted common directory {}; refusing before ACL mutation",
+            session_git_dir.display(),
+            trusted_common.display()
+        )));
+    }
+    Ok(trusted_common)
+}
+
+fn read_roots(
+    executable: &Path,
+    cwd: &Path,
+    mission_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(parent) = executable.parent() {
         if !system_managed_path(parent) {
@@ -426,28 +747,33 @@ fn read_roots(executable: &Path, cwd: &Path, env: &HashMap<String, String>) -> V
         }
     }
     if let Some(path) = env_value_ci(env, "PATH") {
-        roots.extend(
-            std::env::split_paths(path)
-                .filter(|entry| entry.is_dir() && caller_owned_path(entry, cwd)),
-        );
+        roots.extend(std::env::split_paths(path).filter_map(|entry| {
+            (entry.is_dir() && caller_owned_path(&entry, cwd))
+                .then(|| std::fs::canonicalize(entry).ok())
+                .flatten()
+        }));
     }
     if let Some(rustup) = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from) {
         if rustup.is_dir() {
-            roots.push(rustup);
+            if let Ok(root) = std::fs::canonicalize(rustup) {
+                roots.push(root);
+            }
         }
     }
     if let Some(cargo) = env_value_ci(env, "CARGO_HOME").map(PathBuf::from) {
         for name in ["bin", "registry", "git"] {
             let root = cargo.join(name);
             if root.exists() {
-                roots.push(root);
+                if let Ok(root) = std::fs::canonicalize(root) {
+                    roots.push(root);
+                }
             }
         }
     }
-    roots.extend(git_read_roots(cwd));
+    roots.push(trusted_git_read_root(cwd, mission_dir)?);
     roots.sort();
     roots.dedup();
-    roots
+    Ok(roots)
 }
 
 fn path_under_env(path: &Path, name: &str) -> bool {
@@ -534,7 +860,7 @@ fn acl_changes(
             )));
         }
     }
-    let read_roots = read_roots(executable, &inputs.session_cwd, env);
+    let read_roots = read_roots(executable, &inputs.session_cwd, &inputs.mission_dir, env)?;
     validate_recursive_roots(inputs, &write_roots, &read_roots)?;
 
     let mut changes = Vec::new();
@@ -669,14 +995,21 @@ pub(crate) fn prepare_launch(
         plan_path: None,
     };
     let changes = acl_changes(inputs, &executable, env)?;
-    let mut seen = BTreeSet::new();
+    // All DACL updates are read/modify/write operations. Serialize the batch
+    // across Kranz processes so simultaneous prepare/drop paths cannot publish
+    // stale ACL copies over one another on shared toolchain or Git roots.
+    let _guard = DaclMutationGuard::acquire()?;
+    let mut seen = BTreeMap::new();
     for change in &changes {
-        if seen.insert(change.path.clone()) {
+        if !seen.contains_key(&change.path) {
+            let index = lease.original_dacls.len();
             lease.original_dacls.push(snapshot_dacl(&change.path)?);
+            seen.insert(change.path.clone(), index);
         }
     }
     for change in &changes {
-        apply_acl_change(change, sid.0)?;
+        let snapshot = &lease.original_dacls[seen[&change.path]];
+        apply_acl_change(change, sid.0, snapshot.handle.0)?;
     }
 
     let plan = LaunchPlan {
@@ -734,9 +1067,13 @@ struct AttributeList {
 }
 
 impl AttributeList {
-    fn new(security: &SECURITY_CAPABILITIES, handles: &[HANDLE]) -> Result<Self> {
+    fn new(
+        security: &SECURITY_CAPABILITIES,
+        handles: &[HANDLE],
+        all_application_packages_policy: &u32,
+    ) -> Result<Self> {
         let mut bytes = 0usize;
-        let _ = unsafe { InitializeProcThreadAttributeList(None, 2, None, &mut bytes) };
+        let _ = unsafe { InitializeProcThreadAttributeList(None, 3, None, &mut bytes) };
         if bytes == 0 {
             return Err(EngineError::Backend(
                 "AppContainer attribute-list sizing returned zero bytes".to_string(),
@@ -744,7 +1081,7 @@ impl AttributeList {
         }
         let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
         let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
-        unsafe { InitializeProcThreadAttributeList(Some(list), 2, None, &mut bytes) }.map_err(
+        unsafe { InitializeProcThreadAttributeList(Some(list), 3, None, &mut bytes) }.map_err(
             |error| {
                 EngineError::Backend(format!(
                     "failed to initialize AppContainer attributes: {error}"
@@ -787,6 +1124,22 @@ impl AttributeList {
                 "failed to restrict inherited AppContainer handles: {error}"
             ))
         })?;
+        unsafe {
+            UpdateProcThreadAttribute(
+                result.list,
+                0,
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                Some((all_application_packages_policy as *const u32).cast()),
+                std::mem::size_of::<u32>(),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| {
+            EngineError::Backend(format!(
+                "failed to opt the AppContainer out of ALL APPLICATION PACKAGES: {error}"
+            ))
+        })?;
         Ok(result)
     }
 }
@@ -794,14 +1147,6 @@ impl AttributeList {
 impl Drop for AttributeList {
     fn drop(&mut self) {
         unsafe { DeleteProcThreadAttributeList(self.list) };
-    }
-}
-
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -846,29 +1191,29 @@ fn duplicate_standard_handle(
     Ok(OwnedHandle(duplicate))
 }
 
-fn internet_capability() -> Result<Vec<u8>> {
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE, label: &str) -> Result<Vec<u8>> {
     let mut bytes = 0u32;
-    let _ = unsafe { CreateWellKnownSid(WinCapabilityInternetClientSid, None, None, &mut bytes) };
+    let _ = unsafe { CreateWellKnownSid(kind, None, None, &mut bytes) };
     if bytes == 0 {
-        return Err(EngineError::Backend(
-            "internetClient capability SID sizing returned zero bytes".to_string(),
-        ));
+        return Err(EngineError::Backend(format!(
+            "{label} SID sizing returned zero bytes"
+        )));
     }
     let mut storage = vec![0u8; bytes as usize];
     unsafe {
         CreateWellKnownSid(
-            WinCapabilityInternetClientSid,
+            kind,
             None,
             Some(PSID(storage.as_mut_ptr().cast())),
             &mut bytes,
         )
     }
-    .map_err(|error| {
-        EngineError::Backend(format!(
-            "failed to build internetClient capability SID: {error}"
-        ))
-    })?;
+    .map_err(|error| EngineError::Backend(format!("failed to build {label} SID: {error}")))?;
     Ok(storage)
+}
+
+fn internet_capability() -> Result<Vec<u8>> {
+    well_known_sid(WinCapabilityInternetClientSid, "internetClient capability")
 }
 
 fn quote_arg(value: &OsStr) -> Vec<u16> {
@@ -978,7 +1323,11 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     let stdout = duplicate_standard_handle(STD_OUTPUT_HANDLE)?;
     let stderr = duplicate_standard_handle(STD_ERROR_HANDLE)?;
     let inherited = [stdin.0, stdout.0, stderr.0];
-    let attributes = AttributeList::new(&security, &inherited)?;
+    // LPAC opts out of the broad ALL APPLICATION PACKAGES principal. This is
+    // required for an allowlist boundary: a regular AppContainer can still
+    // access operator resources whose DACL grants that shared group.
+    let all_application_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+    let attributes = AttributeList::new(&security, &inherited, &all_application_packages_policy)?;
 
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -1042,7 +1391,7 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     Ok(exit_code)
 }
 
-fn is_appcontainer_process() -> Result<bool> {
+fn token_flag(class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<bool> {
     let mut access_handle = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut access_handle) }
         .map_err(|error| EngineError::Backend(format!("failed to open child token: {error}")))?;
@@ -1052,19 +1401,30 @@ fn is_appcontainer_process() -> Result<bool> {
     unsafe {
         GetTokenInformation(
             access_handle.0,
-            TokenIsAppContainer,
+            class,
             Some((&mut value as *mut u32).cast()),
             std::mem::size_of::<u32>() as u32,
             &mut returned,
         )
     }
-    .map_err(|error| EngineError::Backend(format!("failed to inspect child token: {error}")))?;
+    .map_err(|error| EngineError::Backend(format!("failed to inspect child {label}: {error}")))?;
     if returned as usize != std::mem::size_of::<u32>() {
-        return Err(EngineError::Backend(
-            "TokenIsAppContainer returned an unexpected byte count".to_string(),
-        ));
+        return Err(EngineError::Backend(format!(
+            "{label} returned an unexpected byte count"
+        )));
     }
     Ok(value != 0)
+}
+
+fn is_appcontainer_process() -> Result<bool> {
+    token_flag(TokenIsAppContainer, "TokenIsAppContainer")
+}
+
+fn is_lpac_process() -> Result<bool> {
+    token_flag(
+        TokenIsLessPrivilegedAppContainer,
+        "TokenIsLessPrivilegedAppContainer",
+    )
 }
 
 struct SelfTestRoot(PathBuf);
@@ -1093,8 +1453,8 @@ impl Drop for SelfTestRoot {
 
 /// Exercise the exact production helper, ACL lease, validator denial, stdio
 /// inheritance, and hard-offline fs+net posture. The CLI integration test and
-/// Windows CI invoke this private entry point; production remains fail-closed
-/// until this receipt passes on the target host.
+/// Windows CI invoke this private entry point; the protected receipt is the
+/// release gate for the enabled production resolver.
 pub fn run_production_hostile_self_test() -> std::result::Result<String, String> {
     production_hostile_self_test().map_err(|error| error.to_string())
 }
@@ -1108,24 +1468,56 @@ fn production_hostile_self_test() -> Result<String> {
     let scratch = root.0.join("scratch");
     let outside = root.0.join("outside");
     let real_checkout = root.0.join("real-checkout");
-    let real_git = real_checkout.join(".git");
+    let trusted_git = repo.join(".git");
+    let worktree_git = trusted_git.join("worktrees").join("self-test");
     for path in [
-        &mission, &worktree, &scratch, &outside, &real_git, &kranz_dir,
+        &mission,
+        &worktree,
+        &scratch,
+        &outside,
+        &real_checkout,
+        &worktree_git,
+        &kranz_dir,
     ] {
         std::fs::create_dir_all(path).map_err(|error| {
             EngineError::Backend(format!("failed to create {}: {error}", path.display()))
         })?;
     }
+    // Make the sibling root deliberately accessible to the broad principal
+    // carried by regular AppContainers. The hostile write can stay denied
+    // only if the production child is actually LPAC and opts out of that
+    // ambient group; a plain AppContainer must fail this receipt.
+    {
+        let outside_acl = snapshot_dacl(&outside)?;
+        let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
+        let broad_appcontainer_grant = AclChange {
+            path: outside.clone(),
+            permissions: FILE_GENERIC_READ.0
+                | FILE_GENERIC_WRITE.0
+                | FILE_GENERIC_EXECUTE.0
+                | FILE_DELETE_CHILD.0
+                | DELETE.0,
+            inherit: true,
+            mode: AclMode::Grant,
+        };
+        let _guard = DaclMutationGuard::acquire()?;
+        apply_acl_change(
+            &broad_appcontainer_grant,
+            PSID(any_package.as_mut_ptr().cast()),
+            outside_acl.handle.0,
+        )?;
+    }
     let authority_file = kranz_dir.join("serve.token");
     std::fs::write(&authority_file, "must-not-cross")?;
     let real_source = real_checkout.join("source.rs");
     std::fs::write(&real_source, "must-not-read")?;
-    let shared_git_marker = real_git.join("inspection-marker");
+    let shared_git_marker = trusted_git.join("inspection-marker");
     std::fs::write(&shared_git_marker, "git-readable")?;
     std::fs::write(
         worktree.join(".git"),
-        format!("gitdir: {}\n", real_git.display()),
+        format!("gitdir: {}\n", worktree_git.display()),
     )?;
+    std::fs::write(worktree_git.join("commondir"), "../..\n")?;
 
     let executable = std::env::current_exe().map_err(|error| {
         EngineError::Backend(format!("failed to locate self-test executable: {error}"))
@@ -1172,6 +1564,15 @@ fn production_hostile_self_test() -> Result<String> {
     };
     let env = crate::agent_env::sanitized_child_env(&scratch.join("home"), &[]);
     let before = snapshot_dacl(&worktree)?;
+    // Both leases touch the same worktree, toolchain, scratch, and Git roots.
+    // Dropping the first must remove only its own SID, leaving the second
+    // launch functional; dropping the second must recover the exact baseline.
+    let overlapping = prepare_launch(
+        &inputs,
+        &executable,
+        &[INTERNAL_HOSTILE_CHILD_ARG.to_string()],
+        &env,
+    )?;
     let prepared = prepare_launch(
         &inputs,
         &executable,
@@ -1183,6 +1584,7 @@ fn production_hostile_self_test() -> Result<String> {
         args,
         lease,
     } = prepared;
+    drop(overlapping.lease);
     let output = std::process::Command::new(program)
         .args(args)
         .current_dir(&worktree)
@@ -1210,9 +1612,22 @@ fn production_hostile_self_test() -> Result<String> {
             EngineError::Backend(format!("failed to read production receipt: {error}"))
         })?)
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
+    receipt.overlapping_lease_safe = true;
     receipt.dacl_restored = before.acl == after.acl;
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", outside.display()),
+    )?;
+    receipt.tampered_git_pointer_refused = prepare_launch(
+        &inputs,
+        &executable,
+        &[INTERNAL_HOSTILE_CHILD_ARG.to_string()],
+        &env,
+    )
+    .is_err();
     let _ = std::fs::remove_file(&toolchain_denied_write);
     let all_passed = receipt.token_is_appcontainer
+        && receipt.token_is_lpac
         && receipt.toolchain_read
         && receipt.toolchain_write_denied
         && receipt.worktree_write
@@ -1221,6 +1636,8 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.authority_read_denied
         && receipt.real_checkout_read_denied
         && receipt.shared_git_read
+        && receipt.overlapping_lease_safe
+        && receipt.tampered_git_pointer_refused
         && receipt.network_denied
         && receipt.dacl_restored;
     if !all_passed {
@@ -1250,6 +1667,7 @@ fn hostile_child() -> Result<()> {
     .map_err(|error| EngineError::Backend(format!("invalid hostile-child manifest: {error}")))?;
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
+        token_is_lpac: is_lpac_process()?,
         toolchain_read: std::fs::metadata(&manifest.executable).is_ok(),
         toolchain_write_denied: std::fs::write(&manifest.toolchain_denied_write, "escape").is_err(),
         worktree_write: std::fs::write(&manifest.worktree_write, "allowed").is_ok(),
@@ -1259,6 +1677,10 @@ fn hostile_child() -> Result<()> {
         real_checkout_read_denied: std::fs::read(&manifest.real_source).is_err(),
         shared_git_read: std::fs::read_to_string(&manifest.shared_git_marker)
             .is_ok_and(|value| value == "git-readable"),
+        // The parent records overlap and pointer assertions after this child
+        // exits; neither can be observed from inside the hostile process.
+        overlapping_lease_safe: false,
+        tampered_git_pointer_refused: false,
         network_denied: TcpStream::connect_timeout(
             &manifest.loopback_addr,
             std::time::Duration::from_secs(2),

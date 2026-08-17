@@ -8243,32 +8243,17 @@ async fn sandbox_preflight_emits_no_macos_profile_issue_on_linux() {
     );
 }
 
-/// Windows has no process-sandbox tier. Enforced engine-run gates therefore
-/// fail closed during approval instead of silently running the contract bare.
+/// Windows now resolves the production AppContainer process tier. This
+/// integration-level consumer guards the public platform decision without
+/// trying to re-enter the test-harness executable as a production helper.
 #[cfg(windows)]
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_preflight_refuses_unsupported_windows_gate_sandbox() {
-    if !setup() {
-        return;
-    }
-    let (_dir, root) = init_repo();
-    let backend = Arc::new(MockBackend::new());
-
-    let mut cfg = test_cfg();
-    cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
-
-    let contract = vec![assertion(
-        "a-1",
-        "writes outside the allowlist",
-        Some("echo should-not-run"),
-    )];
-    let mut engine = make_engine(&backend, &root, cfg);
-    let err = engine
-        .approve_plan(simple_plan(1, contract))
-        .expect_err("Windows must refuse unsupported enforced gate containment");
-    assert!(
-        err.to_string().contains("unsupported on target_os=windows"),
-        "the refusal names the unsupported platform: {err}"
+#[test]
+fn sandbox_preflight_windows_process_backend_is_appcontainer() {
+    assert_eq!(
+        kranz_engine::sandbox::platform_support(kranz_engine::types::SandboxEnforce::Fs, "windows"),
+        kranz_engine::sandbox::SandboxDecision::Enforce(
+            kranz_engine::sandbox::SandboxBackend::AppContainer
+        )
     );
 }
 

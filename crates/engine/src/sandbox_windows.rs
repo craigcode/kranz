@@ -1,16 +1,15 @@
-//! Windows native-containment capability probe and AppContainer fixture.
+//! Windows native-containment capability probe and AppContainer/LPAC receipts.
 //!
 //! Microsoft's `Experimental_CreateProcessInSandbox` contract is experimental
 //! and its required `SandboxSpec.fbs` schema is not publicly available.
 //! Guessing that security-critical wire format would turn API presence into a
 //! false safety claim. The probe therefore records only host/API capability.
 //!
-//! The Windows-only test module also exercises the documented, stable
-//! AppContainer launch path against disposable fixture directories. It is a
-//! hostile-host receipt, not a production launcher: Windows enforcement stays
-//! fail-closed in [`crate::sandbox`] until the same primitive is integrated
-//! with environment construction, authority masks, bounded output, and every
-//! session/gate spawn site.
+//! The Windows-only tests exercise both the regular-AppContainer primitive
+//! fixture and the stable production LPAC launcher against disposable
+//! directories. The production path is integrated with cleared environment
+//! construction, authority masks, bounded output, validator read denial, gate
+//! wrapping, and Job Object supervision.
 //!
 //! DLL discovery follows Microsoft's documented pattern exactly: load
 //! `processmodel.dll` from System32 only, then resolve the experimental export
@@ -74,7 +73,7 @@ pub struct WindowsSandboxProbeReport {
     pub api_status: ExperimentalApiStatus,
     /// HRESULT from the System32-only DLL load, when that load failed.
     pub load_error_hresult: Option<i32>,
-    /// Always false until a real hostile-host receipt proves the launcher.
+    /// True when this build ships a production Windows containment backend.
     pub production_enabled: bool,
     pub decision: &'static str,
 }
@@ -214,8 +213,8 @@ mod platform {
                     experimental_spec_version: EXPERIMENTAL_SPEC_VERSION,
                     api_status: ExperimentalApiStatus::DllUnavailable,
                     load_error_hresult: Some(error.code().0),
-                    production_enabled: false,
-                    decision: "native enforcement remains fail-closed: the experimental System32 DLL is unavailable",
+                    production_enabled: true,
+                    decision: "stable LPAC enforcement is enabled; the experimental System32 DLL is unavailable and unused",
                 };
             }
         };
@@ -228,12 +227,12 @@ mod platform {
         let (api_status, decision) = if export.is_some() {
             (
                 ExperimentalApiStatus::ExperimentalApiAvailable,
-                "experimental API detected; production launch remains disabled until the schema and hostile-host receipt are available",
+                "stable LPAC enforcement is enabled; the experimental API is detected but unused",
             )
         } else {
             (
                 ExperimentalApiStatus::ExportUnavailable,
-                "native enforcement remains fail-closed: processmodel.dll does not export the experimental sandbox API",
+                "stable LPAC enforcement is enabled; processmodel.dll does not export the unused experimental API",
             )
         };
         WindowsSandboxProbeReport {
@@ -245,7 +244,7 @@ mod platform {
             experimental_spec_version: EXPERIMENTAL_SPEC_VERSION,
             api_status,
             load_error_hresult: None,
-            production_enabled: false,
+            production_enabled: true,
             decision,
         }
     }
@@ -277,12 +276,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_never_enables_an_unproved_experimental_api() {
+    fn probe_reports_the_platform_production_posture_independently_of_experimental_api() {
         let report = probe();
-        assert!(!report.production_enabled);
+        assert_eq!(report.production_enabled, cfg!(windows));
         assert_eq!(report.dll_search_scope, "system32-only");
         assert_eq!(report.experimental_spec_version, "0.1.0");
-        assert!(report.render_text().contains("production enabled: false"));
+        assert!(report
+            .render_text()
+            .contains(&format!("production enabled: {}", cfg!(windows))));
     }
 
     #[cfg(windows)]
@@ -296,7 +297,7 @@ mod tests {
         assert_eq!(report.host_os, "windows");
         assert!(report.windows_version.is_some());
         assert_ne!(report.api_status, ExperimentalApiStatus::NotWindows);
-        assert!(!report.production_enabled);
+        assert!(report.production_enabled);
         if report.experimental_api_available() {
             assert_eq!(
                 report.api_status,
