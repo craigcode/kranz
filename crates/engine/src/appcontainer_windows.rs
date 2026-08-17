@@ -91,6 +91,12 @@ struct LaunchPlan {
     args: Vec<String>,
     cwd: PathBuf,
     allow_network: bool,
+    /// Search path for the AppContainer child. `where`/`cmd` fail with
+    /// Access denied if PATH still lists Program Files and other
+    /// ungranted directories, even after the toolchain files themselves
+    /// have exact ACEs.
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -572,12 +578,6 @@ fn find_all_on_path(program: &Path, env: &HashMap<String, String>) -> Vec<PathBu
     found
 }
 
-fn resolve_path_file(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
-    resolve_nonsystem_path_files(program, env)
-        .into_iter()
-        .next()
-}
-
 fn resolve_nonsystem_path_files(program: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for candidate in find_all_on_path(program, env) {
@@ -706,20 +706,45 @@ fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
                 for name in RUST_BINARIES {
                     push_entry_point(&mut files, &bin.join(name));
                 }
-                if let Ok(bin_entries) = std::fs::read_dir(&bin) {
-                    for file in bin_entries.flatten() {
-                        let path = file.path();
-                        if path.is_file() {
-                            push_entry_point(&mut files, &path);
-                        }
-                    }
-                }
             }
         }
     }
     files.sort();
     files.dedup();
     files
+}
+
+fn contained_search_path(
+    inputs: &crate::sandbox::SandboxInputs,
+    executable: &Path,
+    env: &HashMap<String, String>,
+) -> Result<String> {
+    let mut dirs = Vec::new();
+    if let Some(root) = env_value_ci(env, "SystemRoot") {
+        let root = PathBuf::from(root);
+        dirs.push(root.join("System32"));
+        dirs.push(root);
+    }
+    dirs.extend(crate::sandbox::write_allowlist(inputs));
+    dirs.extend(read_roots(
+        executable,
+        &inputs.session_cwd,
+        &inputs.mission_dir,
+        env,
+    )?);
+    for file in toolchain_entry_points(env) {
+        if let Some(parent) = file.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.retain(|dir| dir.is_dir());
+    dirs.sort();
+    dirs.dedup();
+    std::env::join_paths(&dirs)
+        .map(|value| value.to_string_lossy().into_owned())
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to build AppContainer PATH: {error}"))
+        })
 }
 
 const GIT_POINTER_MAX_BYTES: u64 = 4096;
@@ -1217,6 +1242,7 @@ pub(crate) fn prepare_launch(
         apply_acl_change(change, sid.0, snapshot.handle.0)?;
     }
 
+    let path = contained_search_path(inputs, &executable, env)?;
     let plan = LaunchPlan {
         version: PLAN_VERSION,
         profile_name,
@@ -1227,6 +1253,7 @@ pub(crate) fn prepare_launch(
         // AppContainer (no network capabilities). A proxy-only environment is
         // never treated as a boundary.
         allow_network: inputs.enforce == crate::types::SandboxEnforce::Fs,
+        path: Some(path),
     };
     let plan_path = inputs.tmpdir.join(format!(
         "appcontainer-plan-{}.json",
@@ -1511,11 +1538,17 @@ fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> 
     ))
 }
 
-fn environment_block(cwd: &Path) -> Result<Vec<u16>> {
+fn environment_block(cwd: &Path, path: Option<&str>) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
         let folded = key.to_string_lossy().to_ascii_uppercase();
         values.insert(folded, (key, value));
+    }
+    if let Some(path) = path {
+        values.insert(
+            "PATH".to_string(),
+            (OsString::from("PATH"), OsString::from(path)),
+        );
     }
     // When a caller supplies an environment block, CreateProcessW does not
     // propagate the special per-drive current-directory variables (`=C:`,
@@ -1626,7 +1659,7 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     let process_cwd = local_dos_path(&plan.cwd);
     let cwd = wide(process_cwd.as_os_str());
     let mut line = command_line(&plan.executable, &plan.args);
-    let environment = environment_block(&process_cwd)?;
+    let environment = environment_block(&process_cwd, plan.path.as_deref())?;
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -2423,5 +2456,19 @@ mod tests {
         );
         assert!(volume_root(Path::new(r"\\?\C:\")));
         assert!(volume_root(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn environment_block_replaces_path_with_the_contained_search_path() {
+        let encoded = environment_block(
+            Path::new(r"D:\gate\worktree"),
+            Some(r"C:\Windows\System32;D:\node"),
+        )
+        .expect("environment block");
+        let text = String::from_utf16(&encoded).expect("the environment block is valid UTF-16");
+        let path = text
+            .split('\0')
+            .find(|entry| entry.to_ascii_uppercase().starts_with("PATH="));
+        assert_eq!(path, Some(r"PATH=C:\Windows\System32;D:\node"));
     }
 }
