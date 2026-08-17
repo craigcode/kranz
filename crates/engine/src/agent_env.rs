@@ -86,6 +86,29 @@ pub(crate) fn extend_windows_process_env(env: &mut HashMap<String, String>) {
     }
 }
 
+/// Redirect the Windows user-profile variables that AppContainer process
+/// creation consumes to an already-authorized scratch root. Windows rewrites
+/// `LOCALAPPDATA`, `TEMP`, and `TMP` again for the AppContainer profile, but
+/// requires the profile tuple to exist in an explicit environment block.
+#[cfg(windows)]
+pub(crate) fn redirect_windows_profile_env(env: &mut HashMap<String, String>, base_home: &Path) {
+    let tmp = base_home.join("tmp");
+    let appdata_roaming = base_home.join("AppData").join("Roaming");
+    let appdata_local = base_home.join("AppData").join("Local");
+    for path in [&tmp, &appdata_roaming, &appdata_local] {
+        let _ = std::fs::create_dir_all(path);
+    }
+    env.insert("USERPROFILE".to_string(), base_home.display().to_string());
+    env.insert("TMPDIR".to_string(), tmp.display().to_string());
+    env.insert("TEMP".to_string(), tmp.display().to_string());
+    env.insert("TMP".to_string(), tmp.display().to_string());
+    env.insert("APPDATA".to_string(), appdata_roaming.display().to_string());
+    env.insert(
+        "LOCALAPPDATA".to_string(),
+        appdata_local.display().to_string(),
+    );
+}
+
 /// Toolchain locations children may inherit. `CARGO_HOME` is the exception:
 /// [`sanitized_child_env`] always replaces it with a per-invocation
 /// cache-only home (see [`cache_only_cargo_home`]), so neither agent sessions
@@ -463,19 +486,7 @@ pub fn sanitized_child_env(
         // operator's real profile. `cmd` stages pipe temp files in %TEMP%
         // and PowerShell/CLR consult APPDATA/LOCALAPPDATA on startup —
         // leaving them unset hangs children in opaque ways (89f05a1 CI).
-        let tmp = base_home.join("tmp");
-        let appdata_roaming = base_home.join("AppData").join("Roaming");
-        let appdata_local = base_home.join("AppData").join("Local");
-        let _ = std::fs::create_dir_all(&appdata_roaming);
-        let _ = std::fs::create_dir_all(&appdata_local);
-        env.insert("USERPROFILE".to_string(), base_home.display().to_string());
-        env.insert("TEMP".to_string(), tmp.display().to_string());
-        env.insert("TMP".to_string(), tmp.display().to_string());
-        env.insert("APPDATA".to_string(), appdata_roaming.display().to_string());
-        env.insert(
-            "LOCALAPPDATA".to_string(),
-            appdata_local.display().to_string(),
-        );
+        redirect_windows_profile_env(&mut env, base_home);
     }
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());

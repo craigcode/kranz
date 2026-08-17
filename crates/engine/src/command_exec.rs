@@ -1409,6 +1409,9 @@ pub fn run_bounded_gate_command_sandboxed(
     }
     let mut env = sanitized_gate_env();
     env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+    #[cfg(windows)]
+    crate::agent_env::redirect_windows_profile_env(&mut env, &scratch);
+    #[cfg(not(windows))]
     for var in ["TMPDIR", "TMP", "TEMP"] {
         env.insert(var.to_string(), scratch.join("tmp").display().to_string());
     }
@@ -1592,6 +1595,8 @@ mod tests {
                 | "TMPDIR"
                 | "TMP"
                 | "TEMP"
+                | "APPDATA"
+                | "LOCALAPPDATA"
                 | "SystemRoot"
                 | "ComSpec"
                 | "PATHEXT"
