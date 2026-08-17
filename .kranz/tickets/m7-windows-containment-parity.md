@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Accepted plan plus phases 1-3 implemented: Windows enforcement remains fail-closed; CI records the host/API probe, exercises a disposable stable AppContainer hostile fixture, and retains exact session/gate refusal proofs. Production AppContainer integration and the full hostile Windows 11 receipt remain open.
+state-note: Accepted plan plus phases 1-4 implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary and exact DACL restoration while the container provider remains fail-closed. Phase 5 normal Node/Rust gates, overhead, and a dedicated Windows 11 receipt remain open.
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -67,10 +67,43 @@ This proves the stable native primitive on the hosted Windows runner. It does
 not yet integrate agent environment construction, authority masks, bounded
 output, validator read denial, or every production spawn site.
 
+## Phase 4 — production AppContainer integration
+
+- `provider: process` with `fs` or `fs+net` resolves
+  `SandboxBackend::AppContainer`, implemented as a less-privileged
+  AppContainer (LPAC) that opts out of `ALL APPLICATION PACKAGES`; Windows
+  container enforcement remains refused until its distinct mount contract has
+  a hostile receipt.
+- Workers preserve the cleared child environment and bounded stdio path.
+  Validators receive the mandatory AppContainer wrap and real-checkout source
+  read denies. Validation, final, and merge-gate commands use the same launcher.
+- The trusted launcher creates the hostile child suspended and assigns it to a
+  kill-on-close Job Object before resume. `fs` grants internet-client access;
+  `fs+net` supplies no network capability and is hard offline.
+- Each launch uses a disposable profile SID and an ACL lease that retains a
+  no-follow handle for every changed DACL, removes only that SID's ACEs
+  root-first, then deletes the private plan and profile. A bounded host-local
+  mutex serializes ACL read/modify/write batches, so overlapping launches
+  preserve each other's grants. Authority, mission metadata, shared Cargo
+  cache, and validator checkout denies are applied before spawn.
+- Protected Windows CI runs the exact production helper receipt through the
+  built CLI and proves an AppContainer token plus LPAC behavior by denying a
+  sibling root deliberately granted to regular AppContainers, allow/deny
+  behavior, shared-Git read, tampered Git-pointer refusal, network denial, overlap-safe
+  no-follow DACL cleanup, and exact uncontended restoration before checking
+  positive session/gate resolution and continued container refusal.
+- Native `.exe` backends are required; batch shims are refused at preparation
+  to avoid forwarding model arguments through `cmd.exe`.
+
+This closes production integration. It does not yet prove ordinary Node/Rust
+contract gates, representative overhead, per-host `fs` filtering, or the final
+operator-controlled Windows 11 receipt.
+
 ## Acceptance hints
 
-- `provider: process` plus non-off enforcement refuses before any child starts
-  until a proven native boundary exists.
+- `provider: process` plus non-off enforcement resolves only the proven stable
+  AppContainer boundary; unavailable preparation fails before the hostile child
+  starts.
 - The selected provider supports `fs`; `fs+net` is either hard-offline or uses
   a non-bypassable egress boundary. Proxy environment variables alone do not
   count.

@@ -5,8 +5,9 @@ auditing, env hygiene, macOS Seatbelt filesystem enforcement, Linux bubblewrap
 filesystem/network isolation, fail-closed preflight behavior, the container
 provider, a macOS-capable network boundary (the filtering egress proxy, 3.3a),
 and the validator egress-grant flow that consumes its denial signal (3.3b) are
-implemented. Remaining: Windows parity, a hard per-host container egress
-boundary, and live Linux/Windows overhead and hostile-brief proof.
+implemented. Windows now ships the stable AppContainer process boundary; its
+normal-gate/overhead/Windows-11 completion receipt remains open. Also remaining:
+a hard per-host container egress boundary and live Linux overhead proof.
 
 ## Why
 
@@ -98,12 +99,18 @@ All of it asks the agent nicely. None of it constrains the process.
   The egress proxy does NOT cover bwrap in v1: its all-or-nothing netns
   cannot reach a host-side proxy without veth plumbing, so process-provider
   `fs+net` on Linux stays `--unshare-net` with no denial signal.
-- **Windows**: the first pass remains fail-closed rather than silently
-  uncontained. Phase 1 now also rejects the previously target-agnostic
-  container provider on Windows even when `docker.exe` is present: the shipped
-  mounts assume POSIX guest paths and `/dev/null` authority masks. The accepted
-  native AppContainer investigation, exact Windows CI refusal proof, and live
-  hostile-host completion bar are recorded in
+- **Windows**: the process provider now uses a stable less-privileged
+  AppContainer (LPAC) token, path-specific disposable-SID ACL lease, and
+  pre-resume Job Object assignment for `fs`/`fs+net`. Opting out of
+  `ALL APPLICATION PACKAGES` prevents ambient regular-AppContainer grants from
+  widening the path allowlist. `fs` grants internet-client access; `fs+net` is
+  hard offline. The same launcher wraps workers, validators, and engine-run
+  gates, and protected CI proves authority/real-checkout denial plus DACL
+  restoration.
+  The container provider remains fail-closed even when `docker.exe` is present:
+  the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
+  Native `.exe` agent backends are required; batch shims are refused. The open
+  normal-gate/overhead/Windows-11 completion bar is recorded in
   [`m7-windows-containment.md`](m7-windows-containment.md).
 - Config per role:
   `sandbox: { enforce: "off" | "fs" | "fs+net", extraWrite: [...], egress: [...] }`.
@@ -129,7 +136,8 @@ All of it asks the agent nicely. None of it constrains the process.
   loopback, the proxy enforces the hostname allowlist at CONNECT time, and
   denials surface as structured records (`runs/egress-denials.jsonl` →
   `RunOutcome.denied_egress`). The validator grant flow that consumes the
-  signal shipped as 3.3b. Windows support remains open (see Sequencing below).
+  signal shipped as 3.3b. Windows production process containment is shipped;
+  its phase-5 completion receipt remains open (see the Windows scoping doc).
 
 ### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 

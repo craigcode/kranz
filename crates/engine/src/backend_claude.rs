@@ -819,6 +819,8 @@ impl AgentBackend for ClaudeBackend {
         // canonical `/private/var/...` spelling on macOS. Building the profile
         // first left Claude unable to create `$HOME/.claude/session-env`.
         let child_env = claude_child_env(&spec);
+        #[cfg(windows)]
+        let mut appcontainer_lease = None;
 
         let mut command = match &spec.sandbox {
             Some(resolved)
@@ -876,6 +878,19 @@ impl AgentBackend for ClaudeBackend {
                 ));
                 command
             }
+            #[cfg(windows)]
+            Some(resolved) if resolved.backend == crate::sandbox::SandboxBackend::AppContainer => {
+                let prepared = crate::appcontainer_windows::prepare_launch(
+                    &resolved.inputs,
+                    &self.binary,
+                    &args,
+                    &child_env,
+                )?;
+                appcontainer_lease = Some(prepared.lease);
+                let mut command = tokio::process::Command::new(prepared.program);
+                command.args(prepared.args);
+                command
+            }
             Some(resolved) => {
                 return Err(EngineError::Backend(format!(
                     "resolved sandbox backend {:?} is unavailable on target_os={}",
@@ -909,8 +924,10 @@ impl AgentBackend for ClaudeBackend {
         // can kill the whole tree — tool subprocesses (test runners, builds)
         // die with the CLI instead of surviving an interrupt/turn-budget
         // abort. See [`ClaudeSession::kill_child`].
-        // Windows has no process groups; the equivalent (a Job Object with
-        // KILL_ON_JOB_CLOSE) is created *after* spawn, below.
+        // Windows has no process groups. The trusted AppContainer helper owns
+        // the hostile child in a kill-on-close Job before resuming it; the
+        // outer Job below additionally supervises the helper. Unsandboxed
+        // Windows sessions retain the existing post-spawn Job behavior.
         #[cfg(unix)]
         command.process_group(0);
 
@@ -921,8 +938,9 @@ impl AgentBackend for ClaudeBackend {
         // Windows: assign the child to a kill-on-close Job Object so its whole
         // descendant tree (tool children — test runners, builds) dies on
         // abort/turn-budget kill, mirroring the unix process-group behaviour.
-        // Job setup failure is non-fatal: the child still runs, just without
-        // tree-kill (identical to the pre-Job-Object behaviour). Behind
+        // Outer Job setup failure is non-fatal: an AppContainer helper still
+        // owns the hostile descendant tree in its fail-closed inner Job, while
+        // an unsandboxed session retains the pre-Job-Object behavior. Behind
         // cfg(windows); compiled and validated only on windows-latest CI.
         #[cfg(windows)]
         let job = match child.raw_handle() {
@@ -981,6 +999,8 @@ impl AgentBackend for ClaudeBackend {
             child,
             #[cfg(windows)]
             job,
+            #[cfg(windows)]
+            _appcontainer_lease: appcontainer_lease,
             stdin,
             lines: BoundedLines::new(stdout),
             stderr_buf,
@@ -1024,6 +1044,11 @@ pub struct ClaudeSession {
     /// Compiled and validated only on windows-latest CI.
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
+    /// Windows AppContainer profile + retained no-follow DACL handles. Kept
+    /// until the wrapper and its hostile child are gone; dropping it removes
+    /// only this profile SID's ACEs and deletes the disposable profile.
+    #[cfg(windows)]
+    _appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
     /// Held open for streaming-input sessions; dropped to close stdin.
     stdin: Option<ChildStdin>,
     lines: BoundedLines<ChildStdout>,

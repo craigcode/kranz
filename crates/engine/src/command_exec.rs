@@ -15,7 +15,8 @@
 //! the mission's `worker.sandbox.enforce` is not `off`, the gate's `sh -c` is
 //! therefore wrapped in the SAME resolved profile an agent session would get
 //! — [`GateSandbox::Seatbelt`] (`sandbox-exec -f`) on macOS,
-//! [`GateSandbox::Bubblewrap`] on Linux — reusing `crate::sandbox`'s
+//! [`GateSandbox::Bubblewrap`] on Linux, and [`GateSandbox::AppContainer`]
+//! on Windows — reusing `crate::sandbox`'s
 //! writable-root computation, mission-metadata write denies, and authority
 //! read denies. `enforce == off` (and the documented no-op postures below)
 //! keeps the pre-wrap behavior byte-for-byte.
@@ -334,8 +335,9 @@ pub(crate) async fn run_bounded_argv(
 /// [`GateSandbox::Disabled`] is the byte-identical pre-wrap behavior:
 /// `enforce == off` (the operator opted out; the cache-only `CARGO_HOME`
 /// still applies). Every enforced posture wraps: the process provider via
-/// [`GateSandbox::Seatbelt`] (`sandbox-exec -f`) on macOS /
-/// [`GateSandbox::Bubblewrap`] on Linux, reusing `crate::sandbox`'s
+/// [`GateSandbox::Seatbelt`] (`sandbox-exec -f`) on macOS,
+/// [`GateSandbox::Bubblewrap`] on Linux, or [`GateSandbox::AppContainer`] on
+/// Windows, reusing `crate::sandbox`'s
 /// writable-root computation, mission-metadata write denies, and authority
 /// read denies; the container provider via [`GateSandbox::Container`] (the
 /// mission container — ticket container-gate-wrapper). A platform
@@ -358,6 +360,11 @@ pub(crate) enum GateSandbox {
     /// ride along because the argv — including its spawn-time mask-bind
     /// preparation — is built per command.
     Bubblewrap {
+        inputs: Box<crate::sandbox::SandboxInputs>,
+    },
+    /// Windows stable AppContainer launcher. Inputs ride along because each
+    /// command gets a unique profile, ACL lease, and private launch plan.
+    AppContainer {
         inputs: Box<crate::sandbox::SandboxInputs>,
     },
     /// Tier-3 container: `<runtime> run --rm -i --read-only --name <name> …
@@ -386,6 +393,10 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
+    /// Keeps the disposable profile and retained no-follow DACL handles alive
+    /// through the wrapper process. Absent on non-Windows builds.
+    #[cfg(windows)]
+    _appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
 }
 
 impl GateSandbox {
@@ -396,6 +407,7 @@ impl GateSandbox {
             GateSandbox::Disabled => crate::types::SandboxEnforce::Off,
             GateSandbox::Seatbelt { enforce, .. } => *enforce,
             GateSandbox::Bubblewrap { inputs } => inputs.enforce,
+            GateSandbox::AppContainer { inputs } => inputs.enforce,
             GateSandbox::Container { inputs, .. } => inputs.enforce,
         }
     }
@@ -423,6 +435,8 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
             GateSandbox::Seatbelt { profile_path, .. } => {
@@ -435,6 +449,8 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
             GateSandbox::Bubblewrap { inputs } => {
@@ -447,7 +463,30 @@ impl GateSandbox {
                     program: std::path::PathBuf::from("bwrap"),
                     args,
                     timeout_teardown: None,
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
+            }
+            GateSandbox::AppContainer { inputs } => {
+                #[cfg(windows)]
+                {
+                    let (program, args) = shell_argv(command);
+                    let prepared =
+                        crate::appcontainer_windows::prepare_launch(inputs, &program, &args, env)?;
+                    Ok(WrappedCommand {
+                        program: prepared.program,
+                        args: prepared.args,
+                        timeout_teardown: None,
+                        _appcontainer_lease: Some(prepared.lease),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (inputs, command, env);
+                    Err(crate::error::EngineError::Backend(
+                        "AppContainer gate wrapper is unavailable on this host".to_string(),
+                    ))
+                }
             }
             GateSandbox::Container { inputs, spec } => {
                 // Named per command (never per resolve): parallel gate
@@ -464,6 +503,8 @@ impl GateSandbox {
                         std::path::PathBuf::from(spec.runtime.binary()),
                         vec!["rm".to_string(), "-f".to_string(), name],
                     )),
+                    #[cfg(windows)]
+                    _appcontainer_lease: None,
                 })
             }
         }
@@ -838,6 +879,13 @@ fn resolve_gate_sandbox_target(
                 }
                 crate::sandbox::SandboxBackend::Bubblewrap => Ok(GateSandboxResolution {
                     sandbox: GateSandbox::Bubblewrap {
+                        inputs: Box::new(inputs),
+                    },
+                    note: None,
+                    prewarmed_xcrun: false,
+                }),
+                crate::sandbox::SandboxBackend::AppContainer => Ok(GateSandboxResolution {
+                    sandbox: GateSandbox::AppContainer {
                         inputs: Box::new(inputs),
                     },
                     note: None,
@@ -1962,9 +2010,10 @@ mod tests {
     /// note), macOS resolves Seatbelt (profile file written, `/dev/null`
     /// allow appended, NO xcrun write allow — 13th-pass prewarm + deny,
     /// denies + writable roots in shape), linux resolves Bubblewrap and
-    /// fails CLOSED without bwrap, an unsupported platform fails CLOSED, and
-    /// the container provider wraps in the mission container with a runtime
-    /// and fails CLOSED without one (ticket container-gate-wrapper).
+    /// fails CLOSED without bwrap, Windows resolves AppContainer, an unknown
+    /// platform fails CLOSED, and the container provider wraps in the mission
+    /// container with a runtime and fails CLOSED without one (ticket
+    /// container-gate-wrapper).
     #[test]
     fn gate_sandbox_wrap_resolve_matrix() {
         let repo = tempfile::tempdir().unwrap();
@@ -2085,11 +2134,8 @@ mod tests {
         .expect_err("linux without bwrap must fail closed");
         assert!(error.to_string().contains("bwrap"), "{error}");
 
-        // fs on an unsupported platform → FAIL CLOSED (13th-pass review,
-        // P1): agent sessions already refuse to run there, and a standalone
-        // merge gate must fail loudly too — never run unsandboxed under an
-        // enforced config.
-        let error = resolve_gate_sandbox_target(
+        // fs on Windows → stable AppContainer inputs shaped like the gate.
+        let resolution = resolve_gate_sandbox_target(
             &fs,
             repo.path(),
             &mission,
@@ -2099,7 +2145,29 @@ mod tests {
             false,
             None,
         )
-        .expect_err("an unsupported platform must fail closed");
+        .expect("Windows process gates resolve AppContainer");
+        let GateSandbox::AppContainer { inputs } = &resolution.sandbox else {
+            panic!("fs on Windows must resolve AppContainer");
+        };
+        assert_eq!(inputs.session_cwd, repo.path());
+        assert_eq!(inputs.tmpdir, scratch.path());
+        assert_eq!(inputs.mission_dir, mission);
+
+        // fs on an unknown platform → FAIL CLOSED (13th-pass review,
+        // P1): agent sessions already refuse to run there, and a standalone
+        // merge gate must fail loudly too — never run unsandboxed under an
+        // enforced config.
+        let error = resolve_gate_sandbox_target(
+            &fs,
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "solaris",
+            false,
+            None,
+        )
+        .expect_err("an unknown platform must fail closed");
         assert!(error.to_string().contains("unsupported"), "{error}");
         assert!(
             error
@@ -2321,12 +2389,12 @@ mod tests {
         assert!(resolution.note.is_none());
     }
 
-    /// M7 Windows parity, phase 1: engine-run gates must share the session
-    /// resolver's fail-closed posture. Neither a Job Object nor a detected
-    /// `docker.exe` proves filesystem/authority-mask containment, so both
-    /// enforced providers refuse before a gate command is built.
+    /// M7 Windows parity, phase 4: engine-run process gates resolve the stable
+    /// AppContainer wrapper. A detected `docker.exe` still does not prove the
+    /// Windows container mount/authority-mask contract, so that provider
+    /// continues to fail closed.
     #[test]
-    fn windows_enforced_gate_providers_fail_closed_before_spawn() {
+    fn windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed() {
         let repo = tempfile::tempdir().unwrap();
         let mission = repo.path().join(".kranz").join("missions").join("m-x");
         std::fs::create_dir_all(&mission).unwrap();
@@ -2338,7 +2406,7 @@ mod tests {
             crate::types::SandboxEnforce::FsNet,
         ] {
             let process = fs_sandbox_config(enforce);
-            let error = resolve_gate_sandbox_target(
+            let resolution = resolve_gate_sandbox_target(
                 &process,
                 repo.path(),
                 &mission,
@@ -2348,13 +2416,14 @@ mod tests {
                 false,
                 runtime,
             )
-            .expect_err("Windows process gate enforcement must fail closed");
-            assert!(error
-                .to_string()
-                .contains("unsupported on target_os=windows"));
-            assert!(error
-                .to_string()
-                .contains("refusing to run engine-run gates unsandboxed"));
+            .expect("Windows process gate enforcement resolves");
+            assert!(resolution.note.is_none(), "{:?}", resolution.note);
+            let GateSandbox::AppContainer { inputs } = resolution.sandbox else {
+                panic!("Windows process gate must resolve AppContainer");
+            };
+            assert_eq!(inputs.enforce, enforce);
+            assert_eq!(inputs.session_cwd, repo.path());
+            assert_eq!(inputs.mission_dir, mission);
 
             let container = crate::types::SandboxConfig {
                 enforce,

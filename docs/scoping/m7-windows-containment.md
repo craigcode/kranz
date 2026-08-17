@@ -1,27 +1,32 @@
-# M7 Windows containment — accepted plan and phase-1/2 proof
+# M7 Windows containment — accepted plan and production AppContainer boundary
 
-Status: accepted 2026-08-15. Phase 1 (explicit fail-closed safety contract) and
-phase 2 (non-mutating native capability probe) are implemented and exercised by
-the Windows CI leg. Native containment and its hostile live receipt remain
-open; this document deliberately does not call the gap closed.
+Status: accepted 2026-08-15. Phases 1–4 are implemented. A protected hosted
+Windows receipt now proves the production AppContainer launcher before the
+process provider is enabled. Phase 5 — normal Node/Rust gates, overhead, and a
+dedicated Windows 11 receipt — remains open, so this document does not yet call
+the full parity ticket closed.
 
 ## Outcome first
 
-Kranz will not equate Windows process-tree supervision with sandboxing. Job
-Objects remain the correct timeout/kill primitive, but they do not restrict
-filesystem or network access. Until a Windows boundary passes the same hostile
-brief as Seatbelt/bubblewrap, both enforced session paths fail before spawn:
+Kranz does not equate Windows process-tree supervision with sandboxing. Job
+Objects remain the correct timeout/kill primitive, but less-privileged
+AppContainer (LPAC) tokens and SID-scoped ACLs provide the filesystem/network
+boundary. LPAC is required here because it opts out of the broad
+`ALL APPLICATION PACKAGES` principal that would otherwise expose resources
+shared with ordinary AppContainers. The shipped posture is now:
 
-- `provider: process` + `enforce: fs | fs+net` refuses because Windows has no
-  shipped process-sandbox backend;
+- `provider: process` + `enforce: fs | fs+net` resolves the stable
+  `SandboxBackend::AppContainer` launcher;
 - `provider: container` + enforcement also refuses on Windows, even when
   `docker.exe` is present, because the current provider assumes POSIX guest
   paths and `/dev/null` authority masks and has no Windows hostile-host receipt;
 - `enforce: off` remains the explicit unsandboxed operator choice.
 
-The same refusal applies to workers, validators, validation/final commands, and
-merge gates. There is no path where a requested enforced posture silently runs
-native code with the operator's ordinary user privileges.
+The process boundary applies to workers, validators, validation/final commands,
+and merge gates. There is no path where a requested enforced posture silently
+runs native code with the operator's ordinary user privileges. `fs` grants the
+AppContainer internet-client capability; `fs+net` supplies no network
+capability and is hard offline.
 
 ## What parity means
 
@@ -85,25 +90,27 @@ Primary references:
 - [Microsoft Create Process in Sandbox (experimental)](https://learn.microsoft.com/windows/win32/secauthz/createprocessinsandbox)
 - [GitHub Actions container-runner requirement](https://docs.github.com/actions/tutorials/use-containerized-services/use-docker-service-containers)
 
-### D-WIN-4 — CI proves safety now; a dedicated host proves availability later
+### D-WIN-4 — CI proves production safety; a dedicated host closes parity later
 
-The normal Windows CI leg runs two exact named tests:
+The normal Windows CI leg runs the exact production hostile receipt and two
+resolution contracts:
 
 ```text
-sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn
-command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn
+windows_production_appcontainer_helper_enforces_and_restores_boundary
+sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed
+command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed
 ```
 
-They cover process and container providers with enforcement requested and a
-synthetically detected Docker runtime. Both must return the operator-visible
-refusal before a command is constructed. The full Windows workspace suite then
+They prove the exact launcher/ACL lease through the built `kranz.exe`, positive
+process-provider resolution, and continued container-provider refusal with a
+synthetically detected Docker runtime. The full Windows workspace suite then
 keeps consumer behavior and serialization green.
 
-Availability needs an operator-controlled Windows 11 proof host (self-hosted CI
-or an equivalent disposable VM) because the native candidate is Windows 11
-specific and the test must observe real kernel denials. The proof job is added
-only after the launcher exists; adding a permanently queued self-hosted job now
-would be ceremony, not evidence.
+The stable AppContainer path is not tied to the Windows-11-only experimental
+API. Full parity still needs an operator-controlled Windows 11 host (self-hosted
+CI or an equivalent disposable VM) for the normal Node/Rust gate, overhead, and
+host-specific receipt. A permanently queued self-hosted job without a managed
+runner would be ceremony, not evidence.
 
 ## Delivery sequence
 
@@ -120,9 +127,11 @@ would be ceremony, not evidence.
    private scratch, cannot write a sibling root, and cannot connect to a live
    loopback listener because the launch supplies no network capability. No
    real-checkout ACL is changed.
-4. Integrate the winning launcher behind a new `SandboxBackend::AppContainer`.
-   Preserve `env_clear`, bounded output, Job Object tree kill, validator
-   real-checkout read denial, and engine-gate wrapping.
+4. **Shipped:** integrate the stable launcher behind
+   `SandboxBackend::AppContainer`, preserving `env_clear`, bounded output, Job
+   Object tree kill, validator real-checkout read denial, and engine-gate
+   wrapping. The protected receipt proves exact DACL restoration after the
+   child exits.
 5. Run the full hostile brief plus normal Node/Rust gate and overhead
    measurements. Only that receipt may mark the Windows ticket and M7 parity
    complete.
@@ -147,15 +156,57 @@ Windows it asks the loader for `processmodel.dll` with
 `LOAD_LIBRARY_SEARCH_SYSTEM32`, records the OS build, and checks for
 `Experimental_CreateProcessInSandbox`. It intentionally never transmutes or
 calls the export, creates an AppContainer profile, changes an ACL, or launches a
-child. Every report carries `productionEnabled: false`.
+child. The report now carries `productionEnabled: true` on Windows because the
+separate stable AppContainer backend is shipped; experimental API availability
+still never controls that decision.
 
 The exact Windows CI probe prints its structured report and asserts a real
-Windows version while retaining that production-disabled invariant. Each of
-the two phase-1 exact refusal tests is separately captured and checked for a
-nonzero passing-test count, so a renamed or unmatched filter cannot produce a
-vacuous green safety proof.
+Windows version while keeping experimental API availability independent of the
+stable production decision. Each exact containment/resolution test is captured
+and checked for a nonzero passing-test count, so a renamed or unmatched filter
+cannot produce a vacuous green safety proof.
 
 This phase records whether a runner exposes the experimental candidate without
 guessing Microsoft's unpublished FlatBuffer schema or treating an unstable API
-as a production security boundary. The next phase remains a contained fixture
-using a documented serialization contract or the stable AppContainer APIs.
+as a production security boundary.
+
+## Phase-4 production receipt and constraints
+
+The engine launches a trusted copy of its host executable, which creates the
+hostile child suspended with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
+`PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY` set to opt out, assigns
+it to a kill-on-close Job Object, and only then resumes it. A unique disposable
+profile SID receives inherited ACLs for the worktree/private scratch and
+targeted read/execute access for the executable, toolchain, and shared Git
+metadata. The shared Git root is derived from the trusted repository and every
+writable worktree pointer must resolve back to that same common directory.
+Authority files, mission metadata, shared Cargo caches, and validator
+real-checkout sources receive explicit deny entries. Original DACL bytes and
+no-follow object handles are retained before mutation. Cleanup removes only the
+unique launch SID's ACEs, root-first, through those handles; overlapping
+launches therefore keep their live grants. A bounded host-local mutex serializes
+the DACL read/modify/write batches across Kranz processes, while an uncontended
+descriptor returns byte-for-byte to its baseline. The profile and private
+launch plan are then deleted.
+
+Both shipped mission hosts route that private re-entry before ordinary
+initialization: the `kranz` CLI and the embedded-server Tauri desktop binary.
+Other binaries embedding `kranz-engine` must provide the same early dispatch
+before they can host enforced Windows missions.
+
+The protected hosted-Windows receipt verifies an AppContainer token and LPAC
+behavior, toolchain read with write denial, worktree/private-scratch writes,
+sibling-root write denial even after a separate sibling is granted to
+`ALL APPLICATION PACKAGES`, authority and real-checkout read denial, shared-Git
+read access, rejection of a tampered worktree Git pointer, hard-offline
+`fs+net`, safe overlapping leases, and exact uncontended worktree DACL
+restoration. The resolver is enabled only behind that exact production path.
+
+Honest constraints remain. Agent backends must resolve to a native `.exe`;
+batch shims are refused because forwarding model-generated arguments through
+`cmd.exe` would add a command-injection surface. `fs+net` is fully offline,
+while `fs` grants ordinary internet-client access rather than per-host egress
+filtering. Preparation rejects writable roots that overlap authority material,
+mission metadata, or shared Cargo caches. A hard engine crash may leave an
+inert ACE for a unique deleted profile SID; normal exits, errors, and aborts
+restore the captured descriptors.

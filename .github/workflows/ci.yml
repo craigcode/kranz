@@ -68,33 +68,42 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phases 1-3: record the real host/API candidate,
-      # prove the stable AppContainer token/ACL/network boundary in a disposable
-      # hostile fixture, then hold the production negative safety contract.
-      # Neither proof enables the launcher or relaxes either pre-spawn refusal.
-      - name: Probe and prove Windows containment while production fails closed
+      # M7 Windows containment phase 4: exercise the exact production
+      # helper/ACL lease through the built kranz binary, then hold both the
+      # positive process-provider resolution and negative container-provider
+      # refusal contracts before the full workspace suite.
+      - name: Prove production Windows LPAC containment
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
+          run_exact_test() {
+            local log="$1"
+            shift
+            set +e
+            "$@" >"$log" 2>&1
+            local status=$?
+            set -e
+            cat "$log"
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            grep -qE 'test result: ok\. [1-9]' "$log"
+          }
+
           probe_log="$RUNNER_TEMP/kranz-windows-sandbox-probe.log"
-          cargo test -p kranz-engine sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture >"$probe_log" 2>&1
-          cat "$probe_log"
-          grep -qE 'test result: ok\. [1-9]' "$probe_log"
+          run_exact_test "$probe_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture
 
           appcontainer_log="$RUNNER_TEMP/kranz-windows-appcontainer-fixture.log"
-          cargo test -p kranz-engine sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture >"$appcontainer_log" 2>&1
-          cat "$appcontainer_log"
-          grep -qE 'test result: ok\. [1-9]' "$appcontainer_log"
+          run_exact_test "$appcontainer_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture
 
-          session_log="$RUNNER_TEMP/kranz-windows-session-refusal.log"
-          cargo test -p kranz-engine sandbox::tests::windows_enforced_session_providers_fail_closed_before_spawn -- --exact >"$session_log" 2>&1
-          cat "$session_log"
-          grep -qE 'test result: ok\. [1-9]' "$session_log"
+          production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
+          run_exact_test "$production_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture
 
-          gate_log="$RUNNER_TEMP/kranz-windows-gate-refusal.log"
-          cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_providers_fail_closed_before_spawn -- --exact >"$gate_log" 2>&1
-          cat "$gate_log"
-          grep -qE 'test result: ok\. [1-9]' "$gate_log"
+          session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
+          run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
+
+          gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
+          run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,
@@ -212,6 +221,28 @@ jobs:
       - run: cargo audit --deny unsound
         working-directory: apps/dashboard/src-tauri
       - run: cargo audit --deny unsound
+
+  # The Windows desktop binary is also a production mission host: its main
+  # must route the private LPAC launcher re-entry before Tauri initializes.
+  # The root Windows workspace job cannot compile this standalone crate, so
+  # keep a native Windows check beside the macOS desktop gate.
+  tauri-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
 
   dashboard:
     runs-on: ubuntu-latest
