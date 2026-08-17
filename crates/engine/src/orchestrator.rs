@@ -10739,7 +10739,8 @@ pub(crate) mod tests {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
-        let containable = cfg!(target_os = "macos")
+        let containable = cfg!(target_os = "windows")
+            || cfg!(target_os = "macos")
             || (cfg!(target_os = "linux") && crate::sandbox::command_available("bwrap"));
         if !containable {
             // Fail closed by default (ticket
