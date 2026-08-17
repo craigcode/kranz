@@ -1726,11 +1726,17 @@ fn hostile_child() -> Result<()> {
         // exits; neither can be observed from inside the hostile process.
         overlapping_lease_safe: false,
         tampered_git_pointer_refused: false,
-        network_denied: TcpStream::connect_timeout(
-            &manifest.loopback_addr,
-            std::time::Duration::from_secs(2),
-        )
-        .is_err(),
+        // LPAC can deny Winsock initialization itself (WSAStartup returns
+        // WSASYSCALLFAILURE on hosted Windows Server) before std can return an
+        // io::Error from connect_timeout. Both outcomes prove this child
+        // cannot reach even the parent-owned loopback listener; only an
+        // established connection fails the receipt.
+        network_denied: match std::panic::catch_unwind(|| {
+            TcpStream::connect_timeout(&manifest.loopback_addr, std::time::Duration::from_secs(2))
+        }) {
+            Ok(Ok(_)) => false,
+            Ok(Err(_)) | Err(_) => true,
+        },
         // The parent fills this after dropping the ACL/profile lease.
         dacl_restored: false,
     };
