@@ -391,6 +391,22 @@ fn toolchain_var_value(var: &str, default_subdir: &str) -> Option<String> {
     candidate.is_dir().then(|| candidate.display().to_string())
 }
 
+/// Add credential-free toolchain locations to a cleared environment. Cargo's
+/// root is deliberately excluded: every caller substitutes a fresh
+/// cache-only `CARGO_HOME`, while rustup and npm cache locations contain no
+/// authentication configuration and must remain discoverable after HOME /
+/// USERPROFILE is redirected to scratch.
+pub(crate) fn extend_noncredential_toolchain_env(env: &mut HashMap<String, String>) {
+    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if *var == "CARGO_HOME" {
+            continue;
+        }
+        if let Some(value) = toolchain_var_value(var, default_subdir) {
+            env.insert((*var).to_string(), value);
+        }
+    }
+}
+
 /// Env names [`contract_command_env`] manages itself; a `contractEnvPassthrough`
 /// entry naming one of these is refused (loudly, name only) so the escape
 /// hatch cannot silently saw off the isolation it sits on — e.g. passing
@@ -464,14 +480,7 @@ pub fn sanitized_child_env(
     // Non-credential toolchain locations ride for BOTH sessions and contract
     // commands. CARGO_HOME is always replaced with an isolated cache-only
     // root; no prompt-injectable child receives operator Cargo config/tokens.
-    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
-        if *var == "CARGO_HOME" {
-            continue;
-        }
-        if let Some(value) = toolchain_var_value(var, default_subdir) {
-            env.insert((*var).to_string(), value);
-        }
-    }
+    extend_noncredential_toolchain_env(&mut env);
     env.insert(
         "CARGO_HOME".to_string(),
         cache_only_cargo_home(base_home).display().to_string(),
@@ -955,6 +964,28 @@ mod tests {
             Some("/explicit/override".to_string()),
             "an explicit toolchain env var always wins"
         );
+    }
+
+    #[test]
+    fn noncredential_toolchain_extension_never_carries_cargo_home() {
+        let _guard = EnvTestGuard::engage(&[
+            ("CARGO_HOME", "/operator/cargo-with-credentials"),
+            ("RUSTUP_HOME", "/operator/rustup"),
+            ("NPM_CONFIG_CACHE", "/operator/npm-cache"),
+        ]);
+        let mut env = HashMap::new();
+
+        extend_noncredential_toolchain_env(&mut env);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/operator/rustup")
+        );
+        assert_eq!(
+            env.get("NPM_CONFIG_CACHE").map(String::as_str),
+            Some("/operator/npm-cache")
+        );
+        assert!(!env.contains_key("CARGO_HOME"));
     }
 
     /// The agent-session env shape is byte-identical (ticket's "do not weaken

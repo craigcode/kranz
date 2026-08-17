@@ -1468,6 +1468,12 @@ fn sanitized_gate_env() -> HashMap<String, String> {
     let env = {
         let mut env = env;
         crate::agent_env::extend_windows_process_env(&mut env);
+        // USERPROFILE is redirected to gate scratch before the child starts.
+        // Resolve the operator's rustup home now so standard installations
+        // that leave RUSTUP_HOME unset still find their toolchain. CARGO_HOME
+        // remains absent here and is replaced with the cache-only root by the
+        // gate runners.
+        crate::agent_env::extend_noncredential_toolchain_env(&mut env);
         env
     };
     env

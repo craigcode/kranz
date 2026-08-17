@@ -789,6 +789,23 @@ fn read_roots(
                 .flatten()
         }));
     }
+    // Hosted Windows installs Node under C:\hostedtoolcache rather than the
+    // operator profile, so the general caller-owned PATH rule above excludes
+    // it. Resolve only the Node and Cargo entry points required by the normal
+    // gate receipt and grant each installation directory RX; npm.cmd and
+    // node_modules/npm live beside node.exe, while rustup's actual toolchain
+    // root is added separately below. The recursive-root validator still
+    // refuses either grant if it would cover Kranz authority or metadata.
+    for program in ["node", "cargo"] {
+        if let Ok(executable) = resolve_executable(Path::new(program), env) {
+            if let Some(parent) = executable
+                .parent()
+                .filter(|path| !system_managed_path(path))
+            {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
     if let Some(rustup) = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from) {
         if rustup.is_dir() {
             if let Ok(root) = std::fs::canonicalize(rustup) {
