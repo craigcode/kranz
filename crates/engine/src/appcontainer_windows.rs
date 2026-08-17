@@ -139,6 +139,13 @@ struct DaclSnapshot {
     handle: OwnedHandle,
 }
 
+// File handles are kernel-object references whose access rights and lifetime
+// are independent of the thread using them. The snapshot owns its handle and
+// only performs synchronous Get/SetSecurityInfo calls during lease cleanup,
+// so moving the whole snapshot with an async session is sound. Keep the
+// narrower mutex guard non-Send: Win32 mutex ownership is thread-affine.
+unsafe impl Send for DaclSnapshot {}
+
 #[derive(Debug)]
 struct OwnedHandle(HANDLE);
 
