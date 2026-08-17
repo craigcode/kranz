@@ -1,11 +1,16 @@
-//! Windows native-containment capability probe.
+//! Windows native-containment capability probe and AppContainer fixture.
 //!
-//! This module deliberately does not launch a sandboxed process. Microsoft's
-//! `Experimental_CreateProcessInSandbox` contract is experimental and its
-//! required `SandboxSpec.fbs` schema is not publicly available. Guessing that
-//! security-critical wire format would turn API presence into a false safety
-//! claim. The probe therefore records only host/API capability while Windows
-//! enforcement remains fail-closed in [`crate::sandbox`].
+//! Microsoft's `Experimental_CreateProcessInSandbox` contract is experimental
+//! and its required `SandboxSpec.fbs` schema is not publicly available.
+//! Guessing that security-critical wire format would turn API presence into a
+//! false safety claim. The probe therefore records only host/API capability.
+//!
+//! The Windows-only test module also exercises the documented, stable
+//! AppContainer launch path against disposable fixture directories. It is a
+//! hostile-host receipt, not a production launcher: Windows enforcement stays
+//! fail-closed in [`crate::sandbox`] until the same primitive is integrated
+//! with environment construction, authority masks, bounded output, and every
+//! session/gate spawn site.
 //!
 //! DLL discovery follows Microsoft's documented pattern exactly: load
 //! `processmodel.dll` from System32 only, then resolve the experimental export
@@ -265,6 +270,493 @@ mod tests {
                 ExperimentalApiStatus::ExperimentalApiAvailable
             );
             assert!(report.load_error_hresult.is_none());
+        }
+    }
+
+    /// M7 Windows containment, phase 3: prove the stable AppContainer token
+    /// and ACL model on a real Windows host without changing the real checkout.
+    ///
+    /// The parent fixture creates a unique profile and four disposable roots,
+    /// then copies this test executable into a read/execute-only toolchain root.
+    /// The child must read that root, write only the worktree and private
+    /// scratch, fail to write a sibling root, and fail to connect to a live
+    /// loopback listener because no network capability is supplied.
+    #[cfg(windows)]
+    #[test]
+    fn windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network() {
+        appcontainer_fixture::run_parent().expect("AppContainer hostile fixture must pass");
+    }
+
+    /// Re-entered by [`windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network`]
+    /// inside the AppContainer. An ordinary workspace test run has no manifest
+    /// in its current directory, so the standalone instance is an intentional
+    /// no-op; CI gates the parent test above by its collision-free exact name.
+    #[cfg(windows)]
+    #[test]
+    fn windows_appcontainer_hostile_child() {
+        appcontainer_fixture::run_child_if_requested()
+            .expect("AppContainer hostile child must produce its receipt");
+    }
+
+    #[cfg(windows)]
+    mod appcontainer_fixture {
+        use serde::{Deserialize, Serialize};
+        use std::io;
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::{Path, PathBuf};
+        use std::ptr::null_mut;
+        use std::time::Duration;
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{
+            CloseHandle, LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+            GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        };
+        use windows::Win32::Security::Isolation::{
+            CreateAppContainerProfile, DeleteAppContainerProfile,
+        };
+        use windows::Win32::Security::{
+            FreeSid, GetTokenInformation, TokenIsAppContainer, ACL, CONTAINER_INHERIT_ACE,
+            DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
+            PSID, SECURITY_CAPABILITIES, TOKEN_QUERY,
+        };
+        use windows::Win32::Storage::FileSystem::{
+            FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        };
+        use windows::Win32::System::Threading::{
+            CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+            InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
+            UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+            EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW,
+        };
+
+        const MANIFEST_NAME: &str = "kranz-appcontainer-fixture.json";
+        const CHILD_TEST: &str = "sandbox_windows::tests::windows_appcontainer_hostile_child";
+        const CHILD_TIMEOUT_MS: u32 = 30_000;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FixtureManifest {
+            toolchain_marker: PathBuf,
+            toolchain_denied_write: PathBuf,
+            worktree_write: PathBuf,
+            scratch_write: PathBuf,
+            outside_write: PathBuf,
+            loopback_addr: SocketAddr,
+            receipt: PathBuf,
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct HostileReceipt {
+            token_is_appcontainer: bool,
+            toolchain_read: bool,
+            toolchain_write_denied: bool,
+            worktree_write: bool,
+            scratch_write: bool,
+            outside_write_denied: bool,
+            network_denied: bool,
+        }
+
+        struct Profile {
+            name: Vec<u16>,
+            sid: PSID,
+            deleted: bool,
+        }
+
+        impl Profile {
+            fn create() -> anyhow::Result<Self> {
+                let name = format!("kranz.phase3.{}", uuid::Uuid::new_v4());
+                let name = wide(&name);
+                let display_name = wide("Kranz phase 3 fixture");
+                let description = wide("Disposable native-containment proof");
+                // SAFETY: all strings are live, NUL-terminated UTF-16 buffers;
+                // zero capabilities is deliberate so network remains denied.
+                let sid = unsafe {
+                    CreateAppContainerProfile(
+                        PCWSTR(name.as_ptr()),
+                        PCWSTR(display_name.as_ptr()),
+                        PCWSTR(description.as_ptr()),
+                        None,
+                    )?
+                };
+                Ok(Self {
+                    name,
+                    sid,
+                    deleted: false,
+                })
+            }
+
+            fn remove(mut self) -> anyhow::Result<()> {
+                // SAFETY: `name` is the same live profile moniker passed to
+                // CreateAppContainerProfile and no child process remains.
+                unsafe { DeleteAppContainerProfile(PCWSTR(self.name.as_ptr()))? };
+                self.deleted = true;
+                Ok(())
+            }
+        }
+
+        impl Drop for Profile {
+            fn drop(&mut self) {
+                if !self.deleted {
+                    // Best-effort unwind cleanup; the success path calls
+                    // `remove` explicitly so CI also proves profile deletion.
+                    let _ = unsafe { DeleteAppContainerProfile(PCWSTR(self.name.as_ptr())) };
+                }
+                // SAFETY: CreateAppContainerProfile returned this SID and the
+                // contract requires exactly one FreeSid call by the owner.
+                unsafe {
+                    FreeSid(self.sid);
+                }
+            }
+        }
+
+        struct LocalAllocation(HLOCAL);
+
+        impl Drop for LocalAllocation {
+            fn drop(&mut self) {
+                // SAFETY: the wrapped pointer came from GetNamedSecurityInfoW
+                // or SetEntriesInAclW and is freed exactly once with LocalFree.
+                unsafe {
+                    LocalFree(Some(self.0));
+                }
+            }
+        }
+
+        struct AttributeList {
+            list: LPPROC_THREAD_ATTRIBUTE_LIST,
+            _storage: Vec<usize>,
+        }
+
+        impl AttributeList {
+            fn security_capabilities(value: &SECURITY_CAPABILITIES) -> anyhow::Result<Self> {
+                let mut bytes = 0usize;
+                // The sizing call intentionally fails with insufficient buffer
+                // while returning the required byte count.
+                let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut bytes) };
+                anyhow::ensure!(bytes > 0, "attribute-list sizing returned zero bytes");
+                let words = bytes.div_ceil(std::mem::size_of::<usize>());
+                let mut storage = vec![0usize; words];
+                let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
+                // SAFETY: the usize allocation is suitably aligned and holds
+                // at least the byte count returned by the sizing call.
+                unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut bytes)? };
+                let result = Self {
+                    list,
+                    _storage: storage,
+                };
+                // SAFETY: `value` remains live through CreateProcessW and its
+                // exact type/size match the documented attribute contract.
+                unsafe {
+                    UpdateProcThreadAttribute(
+                        result.list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                        Some((value as *const SECURITY_CAPABILITIES).cast()),
+                        std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                        None,
+                        None,
+                    )?
+                };
+                Ok(result)
+            }
+        }
+
+        impl Drop for AttributeList {
+            fn drop(&mut self) {
+                // SAFETY: InitializeProcThreadAttributeList initialized this
+                // allocation and the owner deletes the list exactly once.
+                unsafe { DeleteProcThreadAttributeList(self.list) };
+            }
+        }
+
+        struct ProcessHandles {
+            process: HANDLE,
+            thread: HANDLE,
+        }
+
+        impl Drop for ProcessHandles {
+            fn drop(&mut self) {
+                // SAFETY: CreateProcessW returned both handles; this guard owns
+                // and closes each one exactly once.
+                unsafe {
+                    let _ = CloseHandle(self.thread);
+                    let _ = CloseHandle(self.process);
+                }
+            }
+        }
+
+        struct OwnedHandle(HANDLE);
+
+        impl Drop for OwnedHandle {
+            fn drop(&mut self) {
+                // SAFETY: OpenProcessToken returned this owned token handle.
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+
+        fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+            value.as_ref().encode_wide().chain(Some(0)).collect()
+        }
+
+        fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> anyhow::Result<()> {
+            status.ok().map_err(anyhow::Error::from)
+        }
+
+        fn grant_path(
+            path: &Path,
+            sid: PSID,
+            permissions: u32,
+            inherit: bool,
+        ) -> anyhow::Result<()> {
+            let path = wide(path.as_os_str());
+            let mut old_acl: *mut ACL = null_mut();
+            let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
+            // SAFETY: the path buffer and output pointers are valid. The
+            // returned security descriptor owns `old_acl` and is LocalFree'd.
+            win32(unsafe {
+                GetNamedSecurityInfoW(
+                    PCWSTR(path.as_ptr()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(&mut old_acl),
+                    None,
+                    &mut security_descriptor,
+                )
+            })?;
+            let _security_descriptor = LocalAllocation(HLOCAL(security_descriptor.0));
+
+            let entry = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: permissions,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: if inherit {
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                } else {
+                    NO_INHERITANCE
+                },
+                Trustee: TRUSTEE_W {
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_UNKNOWN,
+                    ptstrName: PWSTR(sid.0.cast()),
+                    ..Default::default()
+                },
+            };
+            let mut new_acl: *mut ACL = null_mut();
+            // SAFETY: `entry` contains the live profile SID; `old_acl` stays
+            // alive through the owning security descriptor above.
+            win32(unsafe { SetEntriesInAclW(Some(&[entry]), Some(old_acl), &mut new_acl) })?;
+            let _new_acl = LocalAllocation(HLOCAL(new_acl.cast()));
+            // SAFETY: all pointers remain live for this call. This merges one
+            // AppContainer ACE into the existing DACL instead of replacing the
+            // user's access, and only disposable fixture paths are modified.
+            win32(unsafe {
+                SetNamedSecurityInfoW(
+                    PCWSTR(path.as_ptr()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(new_acl),
+                    None,
+                )
+            })
+        }
+
+        fn is_appcontainer_process() -> anyhow::Result<bool> {
+            let mut access_handle = HANDLE::default();
+            // SAFETY: GetCurrentProcess is a valid pseudohandle and the output
+            // receives one owned process access-token handle.
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut access_handle)? };
+            let access_handle = OwnedHandle(access_handle);
+            let mut value = 0u32;
+            let mut returned = 0u32;
+            // SAFETY: TokenIsAppContainer returns one u32 into the exact-size
+            // initialized output buffer supplied here.
+            unsafe {
+                GetTokenInformation(
+                    access_handle.0,
+                    TokenIsAppContainer,
+                    Some((&mut value as *mut u32).cast()),
+                    std::mem::size_of::<u32>() as u32,
+                    &mut returned,
+                )?
+            };
+            anyhow::ensure!(returned as usize == std::mem::size_of::<u32>());
+            Ok(value != 0)
+        }
+
+        fn quote_argument(value: &std::ffi::OsStr) -> String {
+            let value = value.to_string_lossy();
+            format!("\"{}\"", value.replace('"', "\\\""))
+        }
+
+        fn launch(executable: &Path, cwd: &Path, sid: PSID) -> anyhow::Result<u32> {
+            let security = SECURITY_CAPABILITIES {
+                AppContainerSid: sid,
+                Capabilities: null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            };
+            let attributes = AttributeList::security_capabilities(&security)?;
+            let mut startup = STARTUPINFOEXW::default();
+            startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            startup.lpAttributeList = attributes.list;
+
+            let application = wide(executable.as_os_str());
+            let cwd = wide(cwd.as_os_str());
+            let command_line = format!(
+                "{} {} --exact --nocapture",
+                quote_argument(executable.as_os_str()),
+                quote_argument(std::ffi::OsStr::new(CHILD_TEST)),
+            );
+            let mut command_line = wide(command_line);
+            let mut process_info = PROCESS_INFORMATION::default();
+            // SAFETY: every buffer and structure remains live through the call;
+            // the mutable command line satisfies CreateProcessW's contract.
+            unsafe {
+                CreateProcessW(
+                    PCWSTR(application.as_ptr()),
+                    Some(PWSTR(command_line.as_mut_ptr())),
+                    None,
+                    None,
+                    false,
+                    CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                    None,
+                    PCWSTR(cwd.as_ptr()),
+                    &startup.StartupInfo,
+                    &mut process_info,
+                )?
+            };
+            let handles = ProcessHandles {
+                process: process_info.hProcess,
+                thread: process_info.hThread,
+            };
+
+            // Fail closed: assigning the still-suspended process closes the
+            // spawn-before-supervision race. No hostile instruction runs until
+            // the kill-on-close Job Object owns the process tree.
+            let job =
+                crate::backend_claude::win_job::JobHandle::create_and_assign(handles.process.0)?;
+            // SAFETY: `handles.thread` is the suspended primary thread.
+            anyhow::ensure!(unsafe { ResumeThread(handles.thread) } != u32::MAX);
+
+            // SAFETY: the process handle remains live in `handles`.
+            let wait = unsafe { WaitForSingleObject(handles.process, CHILD_TIMEOUT_MS) };
+            if wait == WAIT_TIMEOUT {
+                job.kill();
+                anyhow::bail!("AppContainer fixture timed out after {CHILD_TIMEOUT_MS}ms");
+            }
+            anyhow::ensure!(
+                wait == WAIT_OBJECT_0,
+                "WaitForSingleObject returned {wait:?}"
+            );
+            let mut exit_code = 0u32;
+            // SAFETY: the signaled process handle is valid and exit_code is an
+            // exact initialized output buffer.
+            unsafe { GetExitCodeProcess(handles.process, &mut exit_code)? };
+            Ok(exit_code)
+        }
+
+        pub(super) fn run_parent() -> anyhow::Result<()> {
+            let root = tempfile::tempdir()?;
+            let toolchain = root.path().join("toolchain");
+            let worktree = root.path().join("worktree");
+            let scratch = root.path().join("scratch");
+            let outside = root.path().join("outside");
+            for path in [&toolchain, &worktree, &scratch, &outside] {
+                std::fs::create_dir(path)?;
+            }
+
+            let profile = Profile::create()?;
+            let read_execute = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+            let read_write_execute = read_execute | FILE_GENERIC_WRITE.0;
+            // The parent root only needs traversal; non-inheriting read/execute
+            // exposes no child object whose own DACL lacks an AppContainer ACE.
+            grant_path(root.path(), profile.sid, read_execute, false)?;
+            grant_path(&toolchain, profile.sid, read_execute, true)?;
+            grant_path(&worktree, profile.sid, read_write_execute, true)?;
+            grant_path(&scratch, profile.sid, read_write_execute, true)?;
+
+            let current_exe = std::env::current_exe()?;
+            let executable = toolchain.join(
+                current_exe
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("test executable has no file name"))?,
+            );
+            std::fs::copy(&current_exe, &executable)?;
+            let toolchain_marker = toolchain.join("read-only-marker.txt");
+            std::fs::write(&toolchain_marker, "kranz-appcontainer-phase3")?;
+
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let manifest = FixtureManifest {
+                toolchain_marker,
+                toolchain_denied_write: toolchain.join("must-not-write.txt"),
+                worktree_write: worktree.join("allowed-worktree.txt"),
+                scratch_write: scratch.join("allowed-scratch.txt"),
+                outside_write: outside.join("must-not-write.txt"),
+                loopback_addr: listener.local_addr()?,
+                receipt: scratch.join("receipt.json"),
+            };
+            let manifest_path = worktree.join(MANIFEST_NAME);
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+            let exit_code = launch(&executable, &worktree, profile.sid)?;
+            anyhow::ensure!(exit_code == 0, "AppContainer child exited {exit_code}");
+            let receipt: HostileReceipt =
+                serde_json::from_slice(&std::fs::read(&manifest.receipt)?)?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            anyhow::ensure!(
+                receipt.token_is_appcontainer,
+                "child token was not AppContainer"
+            );
+            anyhow::ensure!(receipt.toolchain_read, "read-only toolchain was unreadable");
+            anyhow::ensure!(receipt.toolchain_write_denied, "toolchain write escaped");
+            anyhow::ensure!(receipt.worktree_write, "worktree write was denied");
+            anyhow::ensure!(receipt.scratch_write, "private scratch write was denied");
+            anyhow::ensure!(receipt.outside_write_denied, "out-of-root write escaped");
+            anyhow::ensure!(receipt.network_denied, "network access escaped");
+            anyhow::ensure!(!manifest.toolchain_denied_write.exists());
+            anyhow::ensure!(!manifest.outside_write.exists());
+            profile.remove()?;
+            Ok(())
+        }
+
+        pub(super) fn run_child_if_requested() -> anyhow::Result<()> {
+            let manifest_path = std::env::current_dir()?.join(MANIFEST_NAME);
+            if !manifest_path.is_file() {
+                return Ok(());
+            }
+            let manifest: FixtureManifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+            let toolchain_read = std::fs::read_to_string(&manifest.toolchain_marker)
+                .map(|value| value == "kranz-appcontainer-phase3")
+                .unwrap_or(false);
+            let toolchain_write_denied =
+                std::fs::write(&manifest.toolchain_denied_write, "escape").is_err();
+            let worktree_write = std::fs::write(&manifest.worktree_write, "allowed").is_ok();
+            let scratch_write = std::fs::write(&manifest.scratch_write, "allowed").is_ok();
+            let outside_write_denied = std::fs::write(&manifest.outside_write, "escape").is_err();
+            let network_denied =
+                TcpStream::connect_timeout(&manifest.loopback_addr, Duration::from_secs(2))
+                    .is_err();
+            let receipt = HostileReceipt {
+                token_is_appcontainer: is_appcontainer_process()?,
+                toolchain_read,
+                toolchain_write_denied,
+                worktree_write,
+                scratch_write,
+                outside_write_denied,
+                network_denied,
+            };
+            std::fs::write(&manifest.receipt, serde_json::to_vec_pretty(&receipt)?)
+                .map_err(|error| io::Error::new(error.kind(), format!("write receipt: {error}")))?;
+            Ok(())
         }
     }
 }
