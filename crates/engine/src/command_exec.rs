@@ -1447,11 +1447,6 @@ fn sanitized_gate_env() -> HashMap<String, String> {
         "TMPDIR",
         "TMP",
         "TEMP",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "COMSPEC",
-        "ComSpec",
-        "PATHEXT",
         "RUSTUP_HOME",
         "NPM_CONFIG_CACHE",
         "CI",
@@ -1460,11 +1455,19 @@ fn sanitized_gate_env() -> HashMap<String, String> {
         "LC_ALL",
         "TZ",
     ];
-    SAFE.iter()
+    let env: HashMap<String, String> = SAFE
+        .iter()
         .filter_map(|key| {
             std::env::var_os(key).map(|value| ((*key).to_string(), value.to_string_lossy().into()))
         })
-        .collect()
+        .collect();
+    #[cfg(windows)]
+    let env = {
+        let mut env = env;
+        crate::agent_env::extend_windows_process_env(&mut env);
+        env
+    };
+    env
 }
 
 /// Last `max` characters of `text` (char-safe).
@@ -1589,11 +1592,14 @@ mod tests {
                 | "TMPDIR"
                 | "TMP"
                 | "TEMP"
-                | "SYSTEMROOT"
                 | "SystemRoot"
-                | "COMSPEC"
                 | "ComSpec"
                 | "PATHEXT"
+                | "SystemDrive"
+                | "windir"
+                | "OS"
+                | "PROCESSOR_ARCHITECTURE"
+                | "PSModulePath"
                 | "RUSTUP_HOME"
                 | "NPM_CONFIG_CACHE"
                 | "CI"

@@ -1287,16 +1287,35 @@ fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
 }
 
 fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> {
-    let disk = match cwd.components().next()? {
-        std::path::Component::Prefix(prefix) => match prefix.kind() {
-            std::path::Prefix::Disk(disk) | std::path::Prefix::VerbatimDisk(disk) => disk,
-            _ => return None,
-        },
+    let mut components = cwd.components();
+    let prefix = match components.next()? {
+        std::path::Component::Prefix(prefix) => prefix,
+        _ => return None,
+    };
+    let (disk, value) = match prefix.kind() {
+        std::path::Prefix::Disk(disk) => (disk, cwd.as_os_str().to_owned()),
+        std::path::Prefix::VerbatimDisk(disk) => {
+            // `canonicalize` emits `\\?\D:\...` on Windows, but the hidden
+            // per-drive environment entry consumed by process creation is an
+            // ordinary DOS path (`=D:=D:\...`). Rebuild it without lossy
+            // UTF-16/string conversion.
+            let mut normalized =
+                PathBuf::from(format!("{}:\\", char::from(disk).to_ascii_uppercase()));
+            for component in components {
+                match component {
+                    std::path::Component::RootDir | std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => normalized.push(".."),
+                    std::path::Component::Normal(part) => normalized.push(part),
+                    std::path::Component::Prefix(_) => return None,
+                }
+            }
+            (disk, normalized.into_os_string())
+        }
         _ => return None,
     };
     Some((
         OsString::from(format!("={}:", char::from(disk).to_ascii_uppercase())),
-        cwd.as_os_str().to_owned(),
+        value,
     ))
 }
 
@@ -2040,7 +2059,7 @@ mod tests {
             let (key, value) = drive_current_directory_variable(cwd)
                 .expect("a drive-qualified Windows path has a pseudo environment variable");
             assert_eq!(key, OsString::from("=D:"));
-            assert_eq!(value, cwd.as_os_str());
+            assert_eq!(value, OsString::from(r"D:\gate\worktree"));
         }
         assert!(drive_current_directory_variable(Path::new(r"\\server\share\gate")).is_none());
     }

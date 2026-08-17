@@ -70,6 +70,22 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
     "PSModulePath",
 ];
 
+/// Add the non-secret Windows process bootstrap variables to a cleared child
+/// environment using one canonical spelling per case-insensitive key. Both
+/// agent sessions and engine-run gates need this set: ordinary unsandboxed
+/// commands may limp along without all of it, while AppContainer process
+/// creation fails with `ERROR_ENVVAR_NOT_FOUND` before the child starts.
+#[cfg(windows)]
+pub(crate) fn extend_windows_process_env(env: &mut HashMap<String, String>) {
+    for key in AMBIENT_WINDOWS_VARS {
+        if let Some((_, value)) =
+            std::env::vars_os().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
+        {
+            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+}
+
 /// Toolchain locations children may inherit. `CARGO_HOME` is the exception:
 /// [`sanitized_child_env`] always replaces it with a per-invocation
 /// cache-only home (see [`cache_only_cargo_home`]), so neither agent sessions
@@ -439,18 +455,10 @@ pub fn sanitized_child_env(
     );
     #[cfg(windows)]
     {
-        for key in AMBIENT_WINDOWS_VARS {
-            // Case-insensitive ambient lookup, canonical-cased emission:
-            // Windows env names are case-insensitive, but the child block is
-            // a Rust HashMap keyed case-SENSITIVELY — without this, ambient
-            // `SYSTEMROOT` + canonical `SystemRoot` produce duplicate-case
-            // entries and which one the child sees is undefined.
-            if let Some((_, value)) =
-                std::env::vars_os().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
-            {
-                env.insert((*key).to_string(), value.to_string_lossy().into_owned());
-            }
-        }
+        // Case-insensitive ambient lookup, canonical-cased emission: Windows
+        // env names are case-insensitive, but this map is not. Duplicate-case
+        // entries make the resulting child block ambiguous.
+        extend_windows_process_env(&mut env);
         // Profile/temp locations redirect to scratch (like HOME), never the
         // operator's real profile. `cmd` stages pipe temp files in %TEMP%
         // and PowerShell/CLR consult APPDATA/LOCALAPPDATA on startup —
