@@ -43,11 +43,11 @@ use windows::Win32::Security::Isolation::{
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetTokenInformation, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer,
-    WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
-    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    GetAclInformation, GetTokenInformation, TokenIsAppContainer, WinBuiltinAnyPackageSid,
+    WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -98,6 +98,7 @@ struct SelfTestManifest {
     worktree_write: PathBuf,
     scratch_write: PathBuf,
     outside_write: PathBuf,
+    broad_app_packages_write: PathBuf,
     authority_file: PathBuf,
     real_source: PathBuf,
     shared_git_marker: PathBuf,
@@ -109,7 +110,7 @@ struct SelfTestManifest {
 #[serde(rename_all = "camelCase")]
 pub struct ProductionHostileReceipt {
     pub token_is_appcontainer: bool,
-    pub token_is_lpac: bool,
+    pub all_application_packages_denied: bool,
     pub toolchain_read: bool,
     pub toolchain_write_denied: bool,
     pub worktree_write: bool,
@@ -1427,13 +1428,6 @@ fn is_appcontainer_process() -> Result<bool> {
     token_flag(TokenIsAppContainer, "TokenIsAppContainer")
 }
 
-fn is_lpac_process() -> Result<bool> {
-    token_flag(
-        TokenIsLessPrivilegedAppContainer,
-        "TokenIsLessPrivilegedAppContainer",
-    )
-}
-
 struct SelfTestRoot(PathBuf);
 
 impl SelfTestRoot {
@@ -1475,6 +1469,11 @@ fn production_hostile_self_test() -> Result<String> {
     let scratch = root.0.join("scratch");
     let outside = root.0.join("outside");
     let real_checkout = root.0.join("real-checkout");
+    let toolchain = root.0.join("toolchain");
+    // Keep this under the read-only toolchain root. The disposable profile's
+    // SID therefore permits traversal/read but not write; the extra broad
+    // grant is the only authority a regular AppContainer would have to write.
+    let broad_app_packages = toolchain.join("broad-app-packages");
     let trusted_git = repo.join(".git");
     let worktree_git = trusted_git.join("worktrees").join("self-test");
     for path in [
@@ -1483,6 +1482,8 @@ fn production_hostile_self_test() -> Result<String> {
         &scratch,
         &outside,
         &real_checkout,
+        &toolchain,
+        &broad_app_packages,
         &worktree_git,
         &kranz_dir,
     ] {
@@ -1495,10 +1496,10 @@ fn production_hostile_self_test() -> Result<String> {
     // only if the production child is actually LPAC and opts out of that
     // ambient group; a plain AppContainer must fail this receipt.
     {
-        let outside_acl = snapshot_dacl(&outside)?;
+        let broad_acl = snapshot_dacl(&broad_app_packages)?;
         let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
         let broad_appcontainer_grant = AclChange {
-            path: outside.clone(),
+            path: broad_app_packages.clone(),
             permissions: FILE_GENERIC_READ.0
                 | FILE_GENERIC_WRITE.0
                 | FILE_GENERIC_EXECUTE.0
@@ -1511,7 +1512,7 @@ fn production_hostile_self_test() -> Result<String> {
         apply_acl_change(
             &broad_appcontainer_grant,
             PSID(any_package.as_mut_ptr().cast()),
-            outside_acl.handle.0,
+            broad_acl.handle.0,
         )?;
     }
     let authority_file = kranz_dir.join("serve.token");
@@ -1526,13 +1527,22 @@ fn production_hostile_self_test() -> Result<String> {
     )?;
     std::fs::write(worktree_git.join("commondir"), "../..\n")?;
 
-    let executable = std::env::current_exe().map_err(|error| {
+    let source_executable = std::env::current_exe().map_err(|error| {
         EngineError::Backend(format!("failed to locate self-test executable: {error}"))
     })?;
-    let executable_parent = executable.parent().ok_or_else(|| {
-        EngineError::Backend("self-test executable has no parent directory".to_string())
+    // Exercise the production launcher without recursively changing the ACL
+    // of Cargo's large target directory. Normal Node/Rust toolchain coverage
+    // belongs to the phase-5 gate/overhead receipt; this hostile fixture needs
+    // only a real executable in a small read/execute-only toolchain root.
+    let executable = toolchain.join("kranz-appcontainer-self-test.exe");
+    std::fs::copy(&source_executable, &executable).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to copy self-test executable from {} to {}: {error}",
+            source_executable.display(),
+            executable.display()
+        ))
     })?;
-    let toolchain_denied_write = executable_parent.join(format!(
+    let toolchain_denied_write = toolchain.join(format!(
         "kranz-appcontainer-must-not-write-{}",
         uuid::Uuid::new_v4().simple()
     ));
@@ -1545,6 +1555,7 @@ fn production_hostile_self_test() -> Result<String> {
         worktree_write: worktree.join("allowed-worktree.txt"),
         scratch_write: scratch.join("allowed-scratch.txt"),
         outside_write: outside.join("must-not-write.txt"),
+        broad_app_packages_write: broad_app_packages.join("must-not-write.txt"),
         authority_file,
         real_source,
         shared_git_marker,
@@ -1569,7 +1580,25 @@ fn production_hostile_self_test() -> Result<String> {
         egress: Vec::new(),
         validator_read_deny_roots: vec![real_checkout],
     };
-    let env = crate::agent_env::sanitized_child_env(&scratch.join("home"), &[]);
+    let mut env = crate::agent_env::sanitized_child_env(&scratch.join("home"), &[]);
+    // This phase-4 fixture is not a Cargo contract. Remove the real toolchain
+    // roots from its otherwise production-shaped cleared environment so the
+    // proof changes ACLs only under its disposable root. The phase-5 receipt
+    // separately owns normal Rust/Node gates and their measured overhead.
+    env.remove("CARGO_HOME");
+    env.remove("RUSTUP_HOME");
+    env.remove("NPM_CONFIG_CACHE");
+    if let Some(system_root) = env_value_ci(&env, "SystemRoot").map(ToOwned::to_owned) {
+        env.insert(
+            "PATH".to_string(),
+            PathBuf::from(system_root)
+                .join("System32")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    } else {
+        env.remove("PATH");
+    }
     let before = snapshot_dacl(&worktree)?;
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
@@ -1634,7 +1663,7 @@ fn production_hostile_self_test() -> Result<String> {
     .is_err();
     let _ = std::fs::remove_file(&toolchain_denied_write);
     let all_passed = receipt.token_is_appcontainer
-        && receipt.token_is_lpac
+        && receipt.all_application_packages_denied
         && receipt.toolchain_read
         && receipt.toolchain_write_denied
         && receipt.worktree_write
@@ -1674,7 +1703,16 @@ fn hostile_child() -> Result<()> {
     .map_err(|error| EngineError::Backend(format!("invalid hostile-child manifest: {error}")))?;
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
-        token_is_lpac: is_lpac_process()?,
+        // Windows Server 2025 returns ERROR_INVALID_PARAMETER for the
+        // TokenIsLessPrivilegedAppContainer information class even though it
+        // accepts the process-creation opt-out attribute. Prove the security
+        // property directly: this path grants ALL APPLICATION PACKAGES, so a
+        // regular AppContainer can write it while an LPAC cannot.
+        all_application_packages_denied: std::fs::write(
+            &manifest.broad_app_packages_write,
+            "escape",
+        )
+        .is_err(),
         toolchain_read: std::fs::metadata(&manifest.executable).is_ok(),
         toolchain_write_denied: std::fs::write(&manifest.toolchain_denied_write, "escape").is_err(),
         worktree_write: std::fs::write(&manifest.worktree_write, "allowed").is_ok(),

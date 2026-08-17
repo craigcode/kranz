@@ -87,9 +87,9 @@ output, validator read denial, or every production spawn site.
   preserve each other's grants. Authority, mission metadata, shared Cargo
   cache, and validator checkout denies are applied before spawn.
 - Protected Windows CI runs the exact production helper receipt through the
-  built CLI and proves AppContainer + LPAC token isolation, denial of a sibling
-  root deliberately granted to regular AppContainers, allow/deny behavior,
-  shared-Git read, tampered Git-pointer refusal, network denial, overlap-safe
+  built CLI and proves an AppContainer token plus LPAC behavior by denying a
+  sibling root deliberately granted to regular AppContainers, allow/deny
+  behavior, shared-Git read, tampered Git-pointer refusal, network denial, overlap-safe
   no-follow DACL cleanup, and exact uncontended restoration before checking
   positive session/gate resolution and continued container refusal.
 - Native `.exe` backends are required; batch shims are refused at preparation

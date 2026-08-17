@@ -194,9 +194,9 @@ initialization: the `kranz` CLI and the embedded-server Tauri desktop binary.
 Other binaries embedding `kranz-engine` must provide the same early dispatch
 before they can host enforced Windows missions.
 
-The protected hosted-Windows receipt verifies AppContainer and LPAC token
-identity, toolchain read with write denial, worktree/private-scratch writes,
-sibling-root write denial even after that sibling is granted to
+The protected hosted-Windows receipt verifies an AppContainer token and LPAC
+behavior, toolchain read with write denial, worktree/private-scratch writes,
+sibling-root write denial even after a separate sibling is granted to
 `ALL APPLICATION PACKAGES`, authority and real-checkout read denial, shared-Git
 read access, rejection of a tampered worktree Git pointer, hard-offline
 `fs+net`, safe overlapping leases, and exact uncontended worktree DACL

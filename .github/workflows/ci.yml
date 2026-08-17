@@ -91,19 +91,19 @@ jobs:
           }
 
           probe_log="$RUNNER_TEMP/kranz-windows-sandbox-probe.log"
-          run_exact_test "$probe_log" cargo test -p kranz-engine sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture
+          run_exact_test "$probe_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture
 
           appcontainer_log="$RUNNER_TEMP/kranz-windows-appcontainer-fixture.log"
-          run_exact_test "$appcontainer_log" cargo test -p kranz-engine sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture
+          run_exact_test "$appcontainer_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture
 
           production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
           run_exact_test "$production_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture
 
           session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
-          run_exact_test "$session_log" cargo test -p kranz-engine sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
+          run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
 
           gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
-          run_exact_test "$gate_log" cargo test -p kranz-engine command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
+          run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,
