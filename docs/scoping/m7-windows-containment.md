@@ -113,9 +113,13 @@ would be ceremony, not evidence.
 2. **Shipped in this phase:** probe `processmodel.dll` and the experimental
    export without calling it. Windows CI records the real OS build and API
    availability; absence is a supported result, never a degrade.
-3. Spike one headless fixture under AppContainer: one read-only toolchain root,
-   one read/write worktree, one read/write private scratch, no network. Prove an
-   out-of-root write and outbound connection fail.
+3. **Shipped:** a unique, disposable AppContainer profile launches a copy of
+   the engine test executable from a read/execute-only toolchain root under a
+   kill-on-close Job Object. The child proves its token is an AppContainer,
+   reads but cannot write the toolchain, writes the disposable worktree and
+   private scratch, cannot write a sibling root, and cannot connect to a live
+   loopback listener because the launch supplies no network capability. No
+   real-checkout ACL is changed.
 4. Integrate the winning launcher behind a new `SandboxBackend::AppContainer`.
    Preserve `env_clear`, bounded output, Job Object tree kill, validator
    real-checkout read denial, and engine-gate wrapping.

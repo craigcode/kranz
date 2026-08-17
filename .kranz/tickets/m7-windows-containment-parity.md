@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Accepted plan plus phase-1 refusal and phase-2 native capability probe implemented: Windows process/container enforcement remains fail-closed; Windows CI records the real OS build and System32-only processmodel.dll/export result, then runs exact non-vacuous session/gate refusal tests. Native AppContainer launch and hostile Windows 11 receipt remain open.
+state-note: Accepted plan plus phases 1-3 implemented: Windows enforcement remains fail-closed; CI records the host/API probe, exercises a disposable stable AppContainer hostile fixture, and retains exact session/gate refusal proofs. Production AppContainer integration and the full hostile Windows 11 receipt remain open.
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -48,6 +48,24 @@ This closes the unsafe inference gap; it does not close the availability ticket.
 
 This closes the discovery step in the accepted delivery sequence; it does not
 prove a stable serialization contract, containment, or availability.
+
+## Phase 3 — stable AppContainer hostile fixture
+
+- A unique disposable profile launches a copy of the engine test executable
+  with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and no capabilities.
+- AppContainer-SID ACLs grant the fixture toolchain read/execute and grant only
+  the fixture worktree and private scratch read/write/execute. The real checkout
+  and its ACLs are untouched.
+- The child is created suspended and assigned to the existing kill-on-close Job
+  Object before its primary thread resumes.
+- The receipt verifies the AppContainer token, allowed reads/writes, denied
+  toolchain and sibling writes, and denied access to a live loopback listener.
+- Windows CI runs the parent proof by an exact collision-free test name and
+  keeps production session/gate enforcement fail-closed afterward.
+
+This proves the stable native primitive on the hosted Windows runner. It does
+not yet integrate agent environment construction, authority masks, bounded
+output, validator read denial, or every production spawn site.
 
 ## Acceptance hints
 
