@@ -145,6 +145,16 @@ pub fn run_production_hostile_self_test() -> std::result::Result<String, String>
 }
 
 #[cfg(windows)]
+pub fn internal_gate_self_test_requested() -> bool {
+    crate::appcontainer_windows::internal_gate_self_test_requested()
+}
+
+#[cfg(windows)]
+pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
+    crate::appcontainer_windows::run_production_gate_self_test()
+}
+
+#[cfg(windows)]
 pub fn internal_hostile_child_requested() -> bool {
     crate::appcontainer_windows::internal_hostile_child_requested()
 }

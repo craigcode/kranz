@@ -68,11 +68,13 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phase 4: exercise the exact production
-      # helper/ACL lease through the built kranz binary, then hold both the
-      # positive process-provider resolution and negative container-provider
-      # refusal contracts before the full workspace suite.
-      - name: Prove production Windows LPAC containment
+      # M7 Windows containment phases 4-5: exercise the exact production
+      # helper/ACL lease through the built kranz binary, prove ordinary Node
+      # and Rust gates plus retained overhead samples through the production
+      # merge-gate wrapper, then hold both the positive process-provider
+      # resolution and negative container-provider refusal contracts before
+      # the full workspace suite.
+      - name: Prove production Windows LPAC containment and gates
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -98,6 +100,9 @@ jobs:
 
           production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
           run_exact_test "$production_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture
+
+          gate_log="$RUNNER_TEMP/kranz-windows-appcontainer-gates.log"
+          run_exact_test "$gate_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target -- --exact --nocapture
 
           session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
           run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact

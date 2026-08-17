@@ -48,6 +48,20 @@ async fn main() -> ExitCode {
         };
     }
 
+    #[cfg(windows)]
+    if kranz_engine::sandbox_windows::internal_gate_self_test_requested() {
+        return match kranz_engine::sandbox_windows::run_production_gate_self_test() {
+            Ok(receipt) => {
+                println!("{receipt}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("kranz AppContainer production gate self-test: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     // The dep graph enables BOTH rustls crypto backends (aws-lc-rs via
     // reqwest, ring via the OTLP client), so rustls cannot auto-select and
     // panics at the first TLS connection (found live: the Slack bridge's

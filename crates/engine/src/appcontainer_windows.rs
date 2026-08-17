@@ -72,12 +72,15 @@ use windows::Win32::System::Threading::{
 
 pub(crate) const INTERNAL_LAUNCHER_ARG: &str = "__kranz-appcontainer-launch";
 pub(crate) const INTERNAL_SELF_TEST_ARG: &str = "__kranz-appcontainer-self-test";
+pub(crate) const INTERNAL_GATE_SELF_TEST_ARG: &str = "__kranz-appcontainer-gate-self-test";
 pub(crate) const INTERNAL_HOSTILE_CHILD_ARG: &str = "__kranz-appcontainer-hostile-child";
 const PLAN_VERSION: u32 = 1;
 const SELF_TEST_MANIFEST: &str = "kranz-appcontainer-production-self-test.json";
 const DACL_MUTEX_NAME: &str = "Local\\Kranz.AppContainer.Dacl.v1";
 const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
+const GATE_OVERHEAD_REPETITIONS: usize = 7;
+const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +126,31 @@ pub struct ProductionHostileReceipt {
     pub tampered_git_pointer_refused: bool,
     pub network_denied: bool,
     pub dacl_restored: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GateTimingReceipt {
+    command: String,
+    repetitions: usize,
+    off_samples_ms: Vec<f64>,
+    appcontainer_samples_ms: Vec<f64>,
+    off_median_ms: f64,
+    appcontainer_median_ms: f64,
+    overhead_ms: f64,
+    overhead_percent: f64,
+    within_target: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionGateReceipt {
+    host: crate::sandbox_windows::WindowsSandboxProbeReport,
+    enforcement: &'static str,
+    provider: &'static str,
+    overhead_target_percent: f64,
+    node: GateTimingReceipt,
+    rust: GateTimingReceipt,
 }
 
 /// Prepared wrapper argv plus the lease that keeps its profile and ACL grants
@@ -1684,6 +1712,193 @@ fn production_hostile_self_test() -> Result<String> {
     serde_json::to_string(&receipt).map_err(|error| {
         EngineError::Backend(format!("failed to render production receipt: {error}"))
     })
+}
+
+fn run_gate_sample(
+    worktree: &Path,
+    command: &str,
+    marker: &str,
+    policy: &crate::command_exec::MergeGatePolicy,
+    appcontainer: bool,
+) -> Result<f64> {
+    let started = std::time::Instant::now();
+    let (ok, output) = if appcontainer {
+        crate::command_exec::run_bounded_gate_command_sandboxed(worktree, command, policy)
+    } else {
+        crate::command_exec::run_bounded_gate_command(worktree, command)
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    if !ok || !output.contains(marker) {
+        let posture = if appcontainer {
+            "AppContainer"
+        } else {
+            "unwrapped"
+        };
+        return Err(EngineError::Backend(format!(
+            "{posture} normal gate failed or omitted {marker}: {output}"
+        )));
+    }
+    Ok(elapsed_ms)
+}
+
+fn median_ms(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
+}
+
+fn measure_gate(
+    worktree: &Path,
+    command: &str,
+    marker: &str,
+    policy: &crate::command_exec::MergeGatePolicy,
+) -> Result<GateTimingReceipt> {
+    // Warm both postures before retaining samples. Alternate their order so
+    // runner drift does not systematically favor either side.
+    run_gate_sample(worktree, command, marker, policy, false)?;
+    run_gate_sample(worktree, command, marker, policy, true)?;
+
+    let mut off_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
+    let mut appcontainer_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
+    for index in 0..GATE_OVERHEAD_REPETITIONS {
+        if index % 2 == 0 {
+            off_samples_ms.push(run_gate_sample(worktree, command, marker, policy, false)?);
+            appcontainer_samples_ms.push(run_gate_sample(worktree, command, marker, policy, true)?);
+        } else {
+            appcontainer_samples_ms.push(run_gate_sample(worktree, command, marker, policy, true)?);
+            off_samples_ms.push(run_gate_sample(worktree, command, marker, policy, false)?);
+        }
+    }
+    let off_median_ms = median_ms(&off_samples_ms);
+    let appcontainer_median_ms = median_ms(&appcontainer_samples_ms);
+    let overhead_ms = appcontainer_median_ms - off_median_ms;
+    let overhead_percent = overhead_ms / off_median_ms * 100.0;
+    Ok(GateTimingReceipt {
+        command: command.to_string(),
+        repetitions: GATE_OVERHEAD_REPETITIONS,
+        off_samples_ms,
+        appcontainer_samples_ms,
+        off_median_ms,
+        appcontainer_median_ms,
+        overhead_ms,
+        overhead_percent,
+        within_target: overhead_percent <= GATE_OVERHEAD_TARGET_PERCENT,
+    })
+}
+
+/// Exercise ordinary Node and Rust contract commands through the exact
+/// production merge-gate wrapper, then retain interleaved warm-cache timing
+/// samples against the byte-identical unwrapped runner. This complements the
+/// hostile receipt above: neither proof substitutes for the other.
+pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
+    production_gate_self_test().map_err(|error| error.to_string())
+}
+
+fn production_gate_self_test() -> Result<String> {
+    let root = SelfTestRoot::create()?;
+    let repo = root.0.join("repo");
+    let trusted_git = repo.join(".git");
+    let worktree_git = trusted_git.join("worktrees").join("phase-5-gate");
+    let mission = repo
+        .join(".kranz")
+        .join("missions")
+        .join("m-production-gate-self-test");
+    let worktree = root.0.join("worktree");
+    let rust_src = worktree.join("rust-gate").join("src");
+    for path in [&worktree_git, &mission, &worktree, &rust_src] {
+        std::fs::create_dir_all(path).map_err(|error| {
+            EngineError::Backend(format!("failed to create {}: {error}", path.display()))
+        })?;
+    }
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )?;
+    std::fs::write(worktree_git.join("commondir"), "../..\n")?;
+    std::fs::write(repo.join(".kranz").join("serve.token"), "must-not-cross")?;
+
+    std::fs::write(
+        worktree.join("package.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "kranz-windows-gate-receipt",
+            "private": true,
+            "scripts": { "test": "node node-gate.js" }
+        }))
+        .map_err(|error| EngineError::Backend(format!("failed to render package.json: {error}")))?,
+    )?;
+    std::fs::write(
+        worktree.join("node-gate.js"),
+        r#"const assert = require('node:assert/strict');
+let checksum = 0;
+for (let i = 0; i < 100000; i += 1) checksum = (checksum + i) >>> 0;
+assert.equal(checksum, 704982704);
+setTimeout(() => console.log('kranz-node-gate-ok'), 750);
+"#,
+    )?;
+    std::fs::write(
+        worktree.join("rust-gate").join("Cargo.toml"),
+        "[package]\nname = \"kranz-windows-gate-receipt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        rust_src.join("lib.rs"),
+        r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn normal_rust_gate() {
+        let values: Vec<u64> = (0..100_000).collect();
+        assert_eq!(values.iter().sum::<u64>(), 4_999_950_000);
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        println!("kranz-rust-gate-ok");
+    }
+}
+"#,
+    )?;
+
+    let policy = crate::command_exec::MergeGatePolicy {
+        sandbox: crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+        },
+        mission_dir: mission,
+    };
+    let node = measure_gate(
+        &worktree,
+        "set NPM_CONFIG_CACHE=.npm-cache&& npm test --silent",
+        "kranz-node-gate-ok",
+        &policy,
+    )?;
+    let rust = measure_gate(
+        &worktree,
+        "cargo test --quiet --manifest-path rust-gate/Cargo.toml -- --nocapture",
+        "kranz-rust-gate-ok",
+        &policy,
+    )?;
+    let receipt = ProductionGateReceipt {
+        host: crate::sandbox_windows::probe(),
+        enforcement: "fs+net",
+        provider: "process/AppContainer-LPAC",
+        overhead_target_percent: GATE_OVERHEAD_TARGET_PERCENT,
+        node,
+        rust,
+    };
+    let rendered = serde_json::to_string(&receipt).map_err(|error| {
+        EngineError::Backend(format!("failed to render normal-gate receipt: {error}"))
+    })?;
+    if !receipt.node.within_target || !receipt.rust.within_target {
+        return Err(EngineError::Backend(format!(
+            "AppContainer normal-gate overhead exceeded the {GATE_OVERHEAD_TARGET_PERCENT:.1}% target: {rendered}"
+        )));
+    }
+    Ok(rendered)
+}
+
+pub fn internal_gate_self_test_requested() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == INTERNAL_GATE_SELF_TEST_ARG)
 }
 
 pub fn internal_hostile_child_requested() -> bool {
