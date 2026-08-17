@@ -1286,9 +1286,34 @@ fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
     out
 }
 
-fn environment_block() -> Result<Vec<u16>> {
+fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> {
+    let disk = match cwd.components().next()? {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            std::path::Prefix::Disk(disk) | std::path::Prefix::VerbatimDisk(disk) => disk,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((
+        OsString::from(format!("={}:", char::from(disk).to_ascii_uppercase())),
+        cwd.as_os_str().to_owned(),
+    ))
+}
+
+fn environment_block(cwd: &Path) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
+        let folded = key.to_string_lossy().to_ascii_uppercase();
+        values.insert(folded, (key, value));
+    }
+    // When a caller supplies an environment block, CreateProcessW does not
+    // propagate the special per-drive current-directory variables (`=C:`,
+    // `=D:`, ...). cmd.exe needs the entry for a cross-drive launch (the
+    // hosted runner executes cmd.exe from C: with the gate worktree on D:),
+    // otherwise process creation fails with ERROR_ENVVAR_NOT_FOUND (203).
+    // Microsoft requires these pseudo variables to be added and sorted with
+    // the rest of the explicit block.
+    if let Some((key, value)) = drive_current_directory_variable(cwd) {
         let folded = key.to_string_lossy().to_ascii_uppercase();
         values.insert(folded, (key, value));
     }
@@ -1296,7 +1321,16 @@ fn environment_block() -> Result<Vec<u16>> {
     for (_folded, (key, value)) in values {
         let key: Vec<u16> = key.encode_wide().collect();
         let value: Vec<u16> = value.encode_wide().collect();
-        if key.is_empty() || key.contains(&0) || key.contains(&(b'=' as u16)) || value.contains(&0)
+        let drive_letter = key.get(1).is_some_and(|unit| {
+            (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
+                || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
+        });
+        let drive_current_directory =
+            key.len() == 3 && key[0] == b'=' as u16 && drive_letter && key[2] == b':' as u16;
+        if key.is_empty()
+            || key.contains(&0)
+            || (key.contains(&(b'=' as u16)) && !drive_current_directory)
+            || value.contains(&0)
         {
             return Err(EngineError::Backend(
                 "cleared AppContainer environment contains an invalid key/value".to_string(),
@@ -1375,7 +1409,7 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     let application = wide(plan.executable.as_os_str());
     let cwd = wide(plan.cwd.as_os_str());
     let mut line = command_line(&plan.executable, &plan.args);
-    let environment = environment_block()?;
+    let environment = environment_block(&plan.cwd)?;
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -1991,4 +2025,23 @@ pub fn run_internal_launcher() -> std::result::Result<u32, String> {
     let plan: LaunchPlan = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid AppContainer launch plan: {error}"))?;
     run_plan(plan).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_environment_carries_the_gate_drive_current_directory() {
+        for cwd in [
+            Path::new(r"D:\gate\worktree"),
+            Path::new(r"\\?\D:\gate\worktree"),
+        ] {
+            let (key, value) = drive_current_directory_variable(cwd)
+                .expect("a drive-qualified Windows path has a pseudo environment variable");
+            assert_eq!(key, OsString::from("=D:"));
+            assert_eq!(value, cwd.as_os_str());
+        }
+        assert!(drive_current_directory_variable(Path::new(r"\\server\share\gate")).is_none());
+    }
 }
