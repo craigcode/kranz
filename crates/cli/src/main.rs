@@ -6,8 +6,7 @@ use kranz_cli::cli::Cli;
 use kranz_cli::commands;
 use std::process::ExitCode;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     // Windows AppContainer sessions re-enter this trusted binary as a thin
     // native launcher. Route that private argv before clap, tracing, or TLS
     // initialization so the helper writes only the contained child's bytes to
@@ -62,6 +61,20 @@ async fn main() -> ExitCode {
         };
     }
 
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("kranz: failed to initialize async runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    runtime.block_on(run_cli())
+}
+
+async fn run_cli() -> ExitCode {
     // The dep graph enables BOTH rustls crypto backends (aws-lc-rs via
     // reqwest, ring via the OTLP client), so rustls cannot auto-select and
     // panics at the first TLS connection (found live: the Slack bridge's
