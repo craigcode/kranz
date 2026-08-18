@@ -1498,8 +1498,8 @@ fn require_pending_grant(repo: &Path, mission_id: &str, command: &str) -> Result
 }
 
 /// `kranz knowledge-refresh`: report-only vault drift (slice 3).
-/// Exit 0 when no check-needed verdicts; exit 1 when any path is missing,
-/// drifted, or a non-stale note has an empty `verified_against`.
+/// Exit 0 when no check-needed verdicts; exit 1 when any note is stale-by-drift,
+/// unverifiable, malformed, outside the repo, or blocked by a failed probe.
 pub fn cmd_knowledge_refresh(repo: &Path, json: bool) -> Result<i32> {
     let report = kranz_engine::knowledge::refresh_knowledge(repo);
     if json {
@@ -1515,6 +1515,15 @@ pub fn cmd_knowledge_refresh(repo: &Path, json: bool) -> Result<i32> {
                     kranz_engine::knowledge::RefreshVerdict::Ok => "ok".into(),
                     kranz_engine::knowledge::RefreshVerdict::AlreadyStale => "already-stale".into(),
                     kranz_engine::knowledge::RefreshVerdict::Unverified => "unverified".into(),
+                    kranz_engine::knowledge::RefreshVerdict::InvalidMetadata { field, value } => {
+                        format!(
+                            "invalid-metadata:{field}:{}",
+                            value.as_deref().unwrap_or("missing")
+                        )
+                    }
+                    kranz_engine::knowledge::RefreshVerdict::InvalidCitation { citation } => {
+                        format!("invalid-citation:{citation}")
+                    }
                     kranz_engine::knowledge::RefreshVerdict::PathMissing { path } => {
                         format!("path-missing:{path}")
                     }
@@ -1523,6 +1532,9 @@ pub fn cmd_knowledge_refresh(repo: &Path, json: bool) -> Result<i32> {
                     }
                     kranz_engine::knowledge::RefreshVerdict::CommandSkipped { command } => {
                         format!("command-skipped:{command}")
+                    }
+                    kranz_engine::knowledge::RefreshVerdict::ProbeFailed { target, error } => {
+                        format!("probe-failed:{target}:{error}")
                     }
                 })
                 .collect();

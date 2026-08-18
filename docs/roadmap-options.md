@@ -22,12 +22,6 @@ Format:
   Source: docs/roadmap.md; docs/operator-gates.md; docs/roadmap-options.md
   Ticket: none
 
-- **Repo knowledge store slice 3** - `kranz knowledge refresh` drift report (paths missing or committed after `last_verified`; no note rewrites; no command execution).
-  Why: Slices 1–2 shipped; the vault's freshness model is unenforced until a detector exists. Planning already excludes `stale` / unverified notes.
-  Trigger: Anytime; no GPU, no live city, no host. Independent of M6/M7.
-  Source: docs/scoping/repo-knowledge-store.md
-  Ticket: repo-knowledge-refresh-drift
-
 - **ChatGPT CLI backend (gpt-5.6-sol)** - probe, then a dispatch adapter reusing the Cursor parser/picker path.
   Why: Cursor's half of the old "absorb a CLI" line shipped. This is the remaining sibling, under the retained `AgentBackend` seam.
   Trigger: After a written probe (auth, print-mode events, cost/model). Do not implement from a remembered model id.
@@ -128,6 +122,7 @@ one cycle so `/kranz roadmap` readers are not surprised by the deletion.
 - Headless Cursor (Grok 4.5) backend — `backend-cursor-direct-parser` and probe tickets done.
 - Local-inference trace flywheel — `local-inference-trace-provenance-flywheel` done.
 - Repo knowledge slice 2 — `repo-knowledge-ranked-brief-injection` done.
+- Repo knowledge slice 3 CLI report — `repo-knowledge-refresh-drift` done.
 - Post-complete PR handoff — `post-complete-pr-handoff-no-push` done.
 - Backend readiness preflight — `backend-readiness-quota-preflight` done.
 - Local workspace/sandbox visibility — `workspace-sandbox-visibility` done.
