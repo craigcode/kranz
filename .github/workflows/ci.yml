@@ -129,6 +129,32 @@ jobs:
 
           gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
           run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
+      # M7 Linux live receipt: this is a real bwrap spawn, not argv inspection.
+      # It proves a sibling write and host-network connection are denied,
+      # retains seven interleaved warm Node timings, and verifies the tracked
+      # primary checkout stays byte-clean and on the same commit.
+      - name: Prove Linux bubblewrap hostile boundary and overhead
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          before_head="$(git rev-parse HEAD)"
+          before_status="$(git status --porcelain --untracked-files=no)"
+          test -z "$before_status"
+
+          receipt_log="$RUNNER_TEMP/kranz-linux-bubblewrap-live-receipt.log"
+          set +e
+          cargo test -p kranz-engine --lib command_exec::tests::linux_bubblewrap_hostile_live_receipt -- --exact --ignored --nocapture >"$receipt_log" 2>&1
+          status=$?
+          set -e
+          cat "$receipt_log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$receipt_log"
+          grep -q 'KRANZ_LINUX_LIVE_RECEIPT=' "$receipt_log"
+
+          after_head="$(git rev-parse HEAD)"
+          after_status="$(git status --porcelain --untracked-files=no)"
+          test "$after_head" = "$before_head"
+          test "$after_status" = "$before_status"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,
