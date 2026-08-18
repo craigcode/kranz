@@ -1,13 +1,11 @@
 # Persistent repo knowledge store for agents and humans
 
-Status: **slice 1 shipped 2026-07-08** (commits `ae9084e` vault + `0cfb564`
-research.md). D-A (canonical `docs/knowledge/` shape), D-D (`research.md` beside
-plan artifacts), and D-E's freshness/provenance metadata are accepted and built;
-D-B/D-C/D-F remain recommendations for later slices. Remaining: slice 2
-(ranked/capped knowledge injection into planning + M2 revision) and slice 3
-(`kranz knowledge refresh` drift checks). One slice-1 simplification carried
-forward: `research.md` is soft-prompted over the considered-alternatives
-threshold, not hard-gated at approval — see "Open questions" #1.
+Status: **slices 1–2 shipped**; **slice 3 CLI report landed 2026-08-17**
+(`kranz knowledge-refresh` — path missing/drifted, command-skipped, no note
+rewrites). D-A, D-C (injection), D-D, and D-E's metadata are built. Remaining:
+dashboard/Slack stale-note surface, and the open questions below. `research.md`
+is soft-prompted over the considered-alternatives threshold, not hard-gated at
+approval — see "Open questions" #1.
 
 ## Why
 

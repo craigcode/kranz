@@ -2,10 +2,12 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-07-08
+last_verified: 2026-08-17
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - AGENTS.md
+  - docs/knowledge/decisions/skill-capture-boundary.md
+  - .kranz/tickets/repo-knowledge-refresh-drift.md
 ---
 
 # Kranz knowledge vault
@@ -42,6 +44,10 @@ Operator surfaces.
 Load-bearing invariants and design history.
 - [Inviolable invariants](decisions/inviolable-invariants.md) — never-push,
   pinned base_sha, append-only log, empty-deliverable, worktree isolation.
+- [Positioning — governance and evidence layer](decisions/positioning-governance-evidence-layer.md)
+  — kranz dispatches, gates, records, and proves; it does not write code.
+- [Skill capture stays outside the harness](decisions/skill-capture-boundary.md)
+  — wontfix; no in-harness skill proposal or install.
 
 ### operations/
 How kranz is run — CLI, `kranz serve`, backends, config. _(To populate: no seed
@@ -53,13 +59,15 @@ note in slice 1; add as operational facts accumulate.)_
 
 ## How this vault is used
 
-- **Now (slice 1):** browse and review. Committed Markdown, diffable in the same
-  flow as plans and reports. A per-mission `research.md` evidence artifact is
-  written beside `plan.md`.
-- **Next (slice 2):** a capped, ranked "Knowledge from this repo" block is
-  injected into planning and mid-mission revision — never every worker turn.
-- **Later (slice 3):** `kranz knowledge refresh` runs each note's drift checks,
-  flags notes whose `verified_against` paths changed, and proposes edits.
+- **Now (slices 1–2):** browse and review. Committed Markdown, diffable in the
+  same flow as plans and reports. A per-mission `research.md` evidence
+  artifact is written beside `plan.md`. A capped, ranked "Knowledge from this
+  repo" block is injected into planning and mid-mission revision — never
+  every worker turn. Stale and unverified notes are excluded.
+- **Slice 3 (CLI):** `kranz knowledge-refresh` reports notes whose
+  `verified_against` paths are missing or have commits after `last_verified`.
+  It does not rewrite notes. Dashboard/Slack surface is still later.
+  Ticket: [`repo-knowledge-refresh-drift`](../../.kranz/tickets/repo-knowledge-refresh-drift.md).
 
 Freshness legend: **live** = verified/invariant · **check-on-touch** = trusted
 until a `verified_against` path changes · **stale** = browseable, not

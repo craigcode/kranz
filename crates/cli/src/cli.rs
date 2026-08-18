@@ -361,6 +361,13 @@ pub enum Command {
     /// Show the per-repo execution queue
     Queue,
 
+    /// Report docs/knowledge notes whose verified_against paths drifted.
+    KnowledgeRefresh {
+        /// Print the report as JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Scan a git diff for unwaived secret findings.
     Scan {
         /// Scan staged changes (`git diff --cached`)
@@ -1130,6 +1137,20 @@ mod tests {
         match cli.command {
             Command::Decompose { yes, .. } => assert!(!yes),
             other => panic!("expected Decompose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn knowledge_refresh_parses_json_flag() {
+        let cli = Cli::try_parse_from(["kranz", "knowledge-refresh"]).unwrap();
+        match cli.command {
+            Command::KnowledgeRefresh { json } => assert!(!json),
+            other => panic!("expected KnowledgeRefresh, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["kranz", "knowledge-refresh", "--json"]).unwrap();
+        match cli.command {
+            Command::KnowledgeRefresh { json } => assert!(json),
+            other => panic!("expected KnowledgeRefresh, got {other:?}"),
         }
     }
 

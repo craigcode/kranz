@@ -1030,6 +1030,39 @@ impl GitRepo {
         Ok(Some(AddedCommit { sha, subject, body }))
     }
 
+    /// Whether `path` has a commit at or after `since_ymd` (`YYYY-MM-DD`).
+    ///
+    /// Used by knowledge-refresh drift checks: a note whose `verified_against`
+    /// path has history after `last_verified` is check-needed. Empty history
+    /// (unknown path, or no commits in the window) is `false`, not an error.
+    /// Flag-shaped paths and non-date `since` values are refused before git
+    /// runs.
+    pub fn path_changed_since(&self, path: &str, since_ymd: &str) -> Result<bool> {
+        if path.starts_with('-') || path.contains('\0') {
+            return Err(EngineError::Git(format!(
+                "refusing path_changed_since with flag-shaped path {path:?}"
+            )));
+        }
+        if since_ymd.len() != 10
+            || !since_ymd.as_bytes().get(4).is_some_and(|c| *c == b'-')
+            || !since_ymd.as_bytes().get(7).is_some_and(|c| *c == b'-')
+            || !since_ymd.chars().all(|c| c.is_ascii_digit() || c == '-')
+        {
+            return Err(EngineError::Git(format!(
+                "refusing path_changed_since with non YYYY-MM-DD date {since_ymd:?}"
+            )));
+        }
+        // Exclusive of the verification calendar day: `--since=YYYY-MM-DD`
+        // includes that midnight, so a note verified the same day it was
+        // committed would false-drift. End-of-day keeps date granularity.
+        let since = format!("--since={since_ymd}T23:59:59");
+        let out = self.probe(&["log", "-1", &since, "--format=%H", "--", path])?;
+        if !out.status.success() {
+            return Ok(false);
+        }
+        Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    }
+
     /// Create an annotated tag at `HEAD` (`git tag -a <name> -m <message>`).
     pub fn tag(&self, name: &str, message: &str) -> Result<()> {
         self.run(&["tag", "-a", name, "-m", message])?;

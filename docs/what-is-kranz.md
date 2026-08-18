@@ -182,7 +182,9 @@ pools beyond the shipped M3 machinery, prompt routing sophistication,
 context-management features, or anything else whose purpose is to make an
 agent write better code (plus the standing non-goals: terminal replacement,
 editor/LSP shells, a general agentic IDE). Heterogeneous dispatch is the one
-carve-out, as an evidence primitive with three properties. The retained-vs-
+carve-out, as an evidence primitive with three properties. Consumer skill
+files are the same freeze: kranz does not propose or install them
+(`docs/knowledge/decisions/skill-capture-boundary.md`). The retained-vs-
 frozen split and its rationale:
 `docs/knowledge/decisions/positioning-governance-evidence-layer.md`.
 
