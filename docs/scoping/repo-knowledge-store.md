@@ -1,11 +1,12 @@
 # Persistent repo knowledge store for agents and humans
 
-Status: **slices 1–2 shipped**; **slice 3 CLI report landed 2026-08-17**
-(`kranz knowledge-refresh` — path missing/drifted, command-skipped, no note
-rewrites). D-A, D-C (injection), D-D, and D-E's metadata are built. Remaining:
-dashboard/Slack stale-note surface, and the open questions below. `research.md`
-is soft-prompted over the considered-alternatives threshold, not hard-gated at
-approval — see "Open questions" #1.
+Status: **slices 1–3 shipped**; **slice 3 CLI report landed 2026-08-17**
+(`kranz knowledge-refresh` — path missing/drifted, command-skipped, fail-closed
+metadata/citation/probe handling, no note rewrites). D-A, D-C (injection), D-D,
+and D-E's metadata are built. Remaining: dashboard/Slack stale-note surface,
+and the open questions below. `research.md` is soft-prompted over the
+considered-alternatives threshold, not hard-gated at approval — see "Open
+questions" #1.
 
 ## Why
 

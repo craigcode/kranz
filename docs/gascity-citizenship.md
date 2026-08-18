@@ -1061,9 +1061,10 @@ point, whichever fits the existing crate's command conventions) provides
 enqueue, oldest-first dequeue, and serial single-consumer drain; a new
 automated test suite covers oldest-first ordering, empty-queue behavior,
 and that a second concurrent drain attempt does not double-process an
-entry. Running that suite's own runner command piped through
-`grep -qE 'result: ok\. [1-9][0-9]* passed'` (never a bare test-name
-filter, which exits 0 on zero matches) confirms at least one test passed;
+entry. Run its uniquely named contract test through
+`cargo test --workspace <unique-filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+(after confirming the filter matches no pre-existing test) to prove at least
+one test passed rather than accepting a vacuous filter;
 the existing `packaging/gascity/` spool mechanism and its scripts are
 untouched by this brief's diff.
 
@@ -1096,9 +1097,9 @@ register`, or any other state-mutating `gc` command). No new dependencies.
 update`/`comment`/`gc mail send human --notify` calls; on worker pickup of
 a spool entry (before the mission runs), `kranz.mission.started` is
 emitted; on exit 1 or 3, no `kranz.mission.complete` event is emitted. If
-the suite is a cargo test, its invocation is piped through
-`grep -qE 'result: ok\. [1-9][0-9]* passed'` (never a bare `cargo test
-<name>` filter, which exits 0 on zero matches); `gc lint
+the suite is a cargo test, run its uniquely named contract test through
+`cargo test --workspace <unique-filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+after confirming the filter matches no pre-existing test; `gc lint
 packaging/gascity` still passes after the change.
 
 ## Open follow-on tickets

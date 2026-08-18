@@ -36,9 +36,12 @@ verified_against:
     changes; the default for notes describing code.
   - `stale` — still browseable, but **excluded from automatic prompt injection**
     (slice 2) unless explicitly requested.
-- **`last_verified`** — the date the claims were last checked against the code.
+- **`last_verified`** — the `YYYY-MM-DD` date the claims were last checked
+  against the code. Missing or malformed dates are check-needed.
 - **`verified_against`** — the real repo paths and/or commands the note's claims
-  depend on. These drive the drift checks in slice 3, so every entry must exist.
+  depend on. Paths must stay inside the repo. Commands are reported but never
+  executed. Missing paths, invalid citations, and failed Git/filesystem probes
+  are check-needed rather than silently treated as current.
 
 ## Body
 
@@ -62,15 +65,16 @@ verified_against:
 | `lessons.md` | curated index into `.kranz/lessons/` (see below) |
 | `glossary.md` | project vocabulary |
 
-## What this is *not* (yet)
+## What this is not
 
 Slice 1 established the vault and its conventions, plus a per-mission
 `research.md` evidence artifact beside `plan.md`. Slice 2 injects a ranked,
 ≤4 KiB "Knowledge from this repo" block into **planning and revised-planning**
 seeds only (stale/unverified notes excluded; separate from the lessons budget).
-Slice 3 (`kranz knowledge refresh` drift checks) is ticketed as
-[`repo-knowledge-refresh-drift`](../../.kranz/tickets/repo-knowledge-refresh-drift.md).
-See the scoping doc's build slicing.
+Slice 3 ships `kranz knowledge-refresh`, a report-only, fail-closed freshness
+check. It never rewrites notes or executes cited commands; an operator must
+refresh or mark a reported note stale. Dashboard/Slack surfacing remains a
+later slice. See the scoping doc's build slicing.
 
 ## Relationship to lessons
 

@@ -11,8 +11,9 @@
 //! (docs/knowledge/decisions/positioning-governance-evidence-layer.md).
 
 use crate::git_ops::GitRepo;
+use chrono::NaiveDate;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Hard cap (bytes) on the rendered knowledge block — D-C / ticket.
 pub const KNOWLEDGE_INJECT_MAX_BYTES: usize = 4096;
@@ -111,9 +112,26 @@ pub enum RefreshVerdict {
     Ok,
     AlreadyStale,
     Unverified,
-    PathMissing { path: String },
-    PathDrifted { path: String },
-    CommandSkipped { command: String },
+    InvalidMetadata {
+        field: String,
+        value: Option<String>,
+    },
+    InvalidCitation {
+        citation: String,
+    },
+    PathMissing {
+        path: String,
+    },
+    PathDrifted {
+        path: String,
+    },
+    CommandSkipped {
+        command: String,
+    },
+    ProbeFailed {
+        target: String,
+        error: String,
+    },
 }
 
 impl RefreshVerdict {
@@ -122,7 +140,12 @@ impl RefreshVerdict {
     pub fn is_check_needed(&self) -> bool {
         matches!(
             self,
-            Self::Unverified | Self::PathMissing { .. } | Self::PathDrifted { .. }
+            Self::Unverified
+                | Self::InvalidMetadata { .. }
+                | Self::InvalidCitation { .. }
+                | Self::PathMissing { .. }
+                | Self::PathDrifted { .. }
+                | Self::ProbeFailed { .. }
         )
     }
 }
@@ -160,27 +183,29 @@ impl RefreshReport {
 /// `last_verified`.
 pub fn refresh_knowledge(repo_root: &Path) -> RefreshReport {
     let vault = repo_root.join("docs").join("knowledge");
-    let git = GitRepo::open(repo_root).ok();
+    let git = GitRepo::open(repo_root).map_err(|err| err.to_string());
     let mut findings = Vec::new();
     if !vault.is_dir() {
         return RefreshReport { findings };
     }
-    for note in collect_notes_for_refresh(repo_root, &vault) {
-        findings.push(refresh_one(&note, repo_root, git.as_ref()));
+    for source in collect_notes_for_refresh(repo_root, &vault) {
+        match source {
+            RefreshSource::Note(note) => findings.push(refresh_one(&note, repo_root, &git)),
+            RefreshSource::Finding(finding) => findings.push(finding),
+        }
     }
     findings.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     RefreshReport { findings }
 }
 
-fn refresh_one(note: &KnowledgeNote, repo_root: &Path, git: Option<&GitRepo>) -> RefreshFinding {
+fn refresh_one(
+    note: &KnowledgeNote,
+    repo_root: &Path,
+    git: &std::result::Result<GitRepo, String>,
+) -> RefreshFinding {
     let mut verdicts = Vec::new();
     if note.freshness.eq_ignore_ascii_case("stale") {
         verdicts.push(RefreshVerdict::AlreadyStale);
-    }
-    if note.verified_against.is_empty() {
-        if !note.freshness.eq_ignore_ascii_case("stale") {
-            verdicts.push(RefreshVerdict::Unverified);
-        }
         return RefreshFinding {
             rel_path: note.rel_path.clone(),
             title: note.title.clone(),
@@ -188,8 +213,25 @@ fn refresh_one(note: &KnowledgeNote, repo_root: &Path, git: Option<&GitRepo>) ->
             verdicts,
         };
     }
+    if note.verified_against.is_empty() {
+        verdicts.push(RefreshVerdict::Unverified);
+        return RefreshFinding {
+            rel_path: note.rel_path.clone(),
+            title: note.title.clone(),
+            freshness: note.freshness.clone(),
+            verdicts,
+        };
+    }
+    let Some(since) = validated_last_verified(note, &mut verdicts) else {
+        return RefreshFinding {
+            rel_path: note.rel_path.clone(),
+            title: note.title.clone(),
+            freshness: note.freshness.clone(),
+            verdicts,
+        };
+    };
     for citation in &note.verified_against {
-        verdicts.push(refresh_citation(citation, note, repo_root, git));
+        verdicts.push(refresh_citation(citation, &since, repo_root, git));
     }
     RefreshFinding {
         rel_path: note.rel_path.clone(),
@@ -199,36 +241,126 @@ fn refresh_one(note: &KnowledgeNote, repo_root: &Path, git: Option<&GitRepo>) ->
     }
 }
 
+fn validated_last_verified(
+    note: &KnowledgeNote,
+    verdicts: &mut Vec<RefreshVerdict>,
+) -> Option<String> {
+    let Some(value) = note.last_verified.as_deref() else {
+        verdicts.push(RefreshVerdict::InvalidMetadata {
+            field: "last_verified".into(),
+            value: None,
+        });
+        return None;
+    };
+    let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
+        verdicts.push(RefreshVerdict::InvalidMetadata {
+            field: "last_verified".into(),
+            value: Some(value.to_string()),
+        });
+        return None;
+    };
+    Some(date.format("%Y-%m-%d").to_string())
+}
+
 fn refresh_citation(
     citation: &str,
-    note: &KnowledgeNote,
+    since: &str,
     repo_root: &Path,
-    git: Option<&GitRepo>,
+    git: &std::result::Result<GitRepo, String>,
 ) -> RefreshVerdict {
+    if !citation_is_repo_relative(citation) {
+        return RefreshVerdict::InvalidCitation {
+            citation: citation.to_string(),
+        };
+    }
+    let joined = repo_root.join(citation);
     if citation.chars().any(char::is_whitespace) {
-        return RefreshVerdict::CommandSkipped {
-            command: citation.to_string(),
-        };
+        match std::fs::symlink_metadata(&joined) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return RefreshVerdict::CommandSkipped {
+                    command: citation.to_string(),
+                };
+            }
+            Err(err) => {
+                return RefreshVerdict::ProbeFailed {
+                    target: citation.to_string(),
+                    error: err.to_string(),
+                };
+            }
+        }
     }
-    let path = repo_root.join(citation);
-    let exists = path.is_file() || path.is_dir();
-    if !exists {
-        return RefreshVerdict::PathMissing {
-            path: citation.to_string(),
-        };
-    }
-    if let (Some(git), Some(since)) = (git, note.last_verified.as_deref()) {
-        if git
-            .path_changed_since(citation, since)
-            .ok()
-            .unwrap_or(false)
-        {
-            return RefreshVerdict::PathDrifted {
+
+    match citation_exists_inside_repo(repo_root, citation) {
+        Ok(false) => {
+            return RefreshVerdict::PathMissing {
                 path: citation.to_string(),
             };
         }
+        Ok(true) => {}
+        Err(verdict) => return verdict,
     }
-    RefreshVerdict::Ok
+
+    let git = match git {
+        Ok(git) => git,
+        Err(error) => {
+            return RefreshVerdict::ProbeFailed {
+                target: citation.to_string(),
+                error: error.clone(),
+            };
+        }
+    };
+    match git.path_changed_since(citation, since) {
+        Ok(true) => RefreshVerdict::PathDrifted {
+            path: citation.to_string(),
+        },
+        Ok(false) => RefreshVerdict::Ok,
+        Err(error) => RefreshVerdict::ProbeFailed {
+            target: citation.to_string(),
+            error: error.to_string(),
+        },
+    }
+}
+
+fn citation_is_repo_relative(citation: &str) -> bool {
+    !citation.is_empty()
+        && Path::new(citation)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+fn citation_exists_inside_repo(
+    repo_root: &Path,
+    citation: &str,
+) -> std::result::Result<bool, RefreshVerdict> {
+    let path = repo_root.join(citation);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(RefreshVerdict::ProbeFailed {
+                target: citation.to_string(),
+                error: err.to_string(),
+            });
+        }
+    }
+
+    let canonical_root =
+        std::fs::canonicalize(repo_root).map_err(|err| RefreshVerdict::ProbeFailed {
+            target: citation.to_string(),
+            error: err.to_string(),
+        })?;
+    let canonical_path =
+        std::fs::canonicalize(&path).map_err(|err| RefreshVerdict::ProbeFailed {
+            target: citation.to_string(),
+            error: err.to_string(),
+        })?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(RefreshVerdict::InvalidCitation {
+            citation: citation.to_string(),
+        });
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone)]
@@ -270,12 +402,28 @@ fn collect_notes(repo_root: &Path, vault: &Path) -> Vec<KnowledgeNote> {
     out
 }
 
-/// All parseable notes, including stale and unverified (refresh must see them).
-/// Still skips `CONVENTIONS.md` (format doc, not a fact note).
-fn collect_notes_for_refresh(repo_root: &Path, vault: &Path) -> Vec<KnowledgeNote> {
+enum RefreshSource {
+    Note(KnowledgeNote),
+    Finding(RefreshFinding),
+}
+
+/// All notes, including stale, unverified, and malformed sources (refresh must
+/// report anything it cannot inspect). Still skips `CONVENTIONS.md` (format
+/// doc, not a fact note).
+fn collect_notes_for_refresh(repo_root: &Path, vault: &Path) -> Vec<RefreshSource> {
     let mut out = Vec::new();
-    let Ok(walker) = walkdir_md(vault) else {
-        return out;
+    let walker = match walkdir_md(vault) {
+        Ok(walker) => walker,
+        Err(err) => {
+            return vec![RefreshSource::Finding(refresh_problem(
+                "docs/knowledge".into(),
+                "Knowledge vault".into(),
+                RefreshVerdict::ProbeFailed {
+                    target: "docs/knowledge".into(),
+                    error: err.to_string(),
+                },
+            ))];
+        }
     };
     for path in walker {
         let name = path
@@ -285,15 +433,53 @@ fn collect_notes_for_refresh(repo_root: &Path, vault: &Path) -> Vec<KnowledgeNot
         if name.eq_ignore_ascii_case("CONVENTIONS.md") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let rel_path = path
+            .strip_prefix(repo_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let title = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("knowledge note")
+            .to_string();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                out.push(RefreshSource::Finding(refresh_problem(
+                    rel_path.clone(),
+                    title,
+                    RefreshVerdict::ProbeFailed {
+                        target: rel_path,
+                        error: err.to_string(),
+                    },
+                )));
+                continue;
+            }
         };
         let Some(note) = parse_note(&path, repo_root, &text) else {
+            out.push(RefreshSource::Finding(refresh_problem(
+                rel_path,
+                title,
+                RefreshVerdict::InvalidMetadata {
+                    field: "frontmatter".into(),
+                    value: None,
+                },
+            )));
             continue;
         };
-        out.push(note);
+        out.push(RefreshSource::Note(note));
     }
     out
+}
+
+fn refresh_problem(rel_path: String, title: String, verdict: RefreshVerdict) -> RefreshFinding {
+    RefreshFinding {
+        rel_path,
+        title,
+        freshness: "unknown".into(),
+        verdicts: vec![verdict],
+    }
 }
 
 fn walkdir_md(vault: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -604,7 +790,7 @@ mod tests {
             va.push_str(&format!("  - {v}\n"));
         }
         let text = format!(
-            "---\ntitle: {rel}\nowner: agent\nfreshness: {freshness}\nlast_verified: 2026-07-08\n{va}---\n\n{body}\n"
+            "---\ntitle: {rel}\nowner: agent\nfreshness: {freshness}\nlast_verified: 2099-01-01\n{va}---\n\n{body}\n"
         );
         fs::write(path, text).unwrap();
     }
@@ -614,7 +800,7 @@ mod tests {
         fs::create_dir_all(v.join("architecture")).unwrap();
         fs::write(
             v.join("index.md"),
-            "---\ntitle: index\nfreshness: live\nverified_against:\n  - AGENTS.md\n---\n\n# Vault\n\n## Map\n\n### architecture/\n- [Pipe](architecture/pipe.md)\n",
+            "---\ntitle: index\nfreshness: live\nlast_verified: 2099-01-01\nverified_against:\n  - AGENTS.md\n---\n\n# Vault\n\n## Map\n\n### architecture/\n- [Pipe](architecture/pipe.md)\n",
         )
         .unwrap();
         fs::write(v.join("CONVENTIONS.md"), "# conventions\n").unwrap();
@@ -751,6 +937,36 @@ mod tests {
         );
     }
 
+    fn git_commit_all_at(root: &Path, msg: &str, timestamp: &str) {
+        assert!(git(root, &["add", "-A"]).status.success());
+        assert!(std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", msg])
+            .current_dir(root)
+            .env("GIT_AUTHOR_DATE", timestamp)
+            .env("GIT_COMMITTER_DATE", timestamp)
+            .output()
+            .expect("git commit")
+            .status
+            .success());
+    }
+
+    fn replace_note_date(root: &Path, rel: &str, replacement: Option<&str>) {
+        let path = root.join("docs/knowledge").join(rel);
+        let text = fs::read_to_string(&path).unwrap();
+        let text = match replacement {
+            Some(date) => text.replace(
+                "last_verified: 2099-01-01",
+                &format!("last_verified: {date}"),
+            ),
+            None => text
+                .lines()
+                .filter(|line| !line.starts_with("last_verified:"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        fs::write(path, format!("{text}\n")).unwrap();
+    }
+
     #[test]
     fn knowledge_refresh_reports_missing_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -785,6 +1001,7 @@ mod tests {
     #[test]
     fn knowledge_refresh_skips_commands_and_does_not_fail() {
         let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
         fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
         vault(tmp.path());
         write_note(
@@ -794,6 +1011,7 @@ mod tests {
             &["AGENTS.md", "cargo test -p kranz-engine lessons"],
             "Path plus a command.",
         );
+        git_commit_all(tmp.path(), "seed");
         let report = refresh_knowledge(tmp.path());
         let finding = report
             .findings
@@ -819,6 +1037,7 @@ mod tests {
     #[test]
     fn knowledge_refresh_already_stale_does_not_fail() {
         let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
         fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
         vault(tmp.path());
         write_note(
@@ -828,6 +1047,7 @@ mod tests {
             &[],
             "Old news.",
         );
+        git_commit_all(tmp.path(), "seed");
         let report = refresh_knowledge(tmp.path());
         let finding = report
             .findings
@@ -865,7 +1085,7 @@ mod tests {
         let text = fs::read_to_string(&note_path).unwrap();
         fs::write(
             &note_path,
-            text.replace("last_verified: 2026-07-08", "last_verified: 2020-01-01"),
+            text.replace("last_verified: 2099-01-01", "last_verified: 2020-01-01"),
         )
         .unwrap();
         git_commit_all(tmp.path(), "seed");
@@ -885,5 +1105,264 @@ mod tests {
             }),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn knowledge_refresh_reports_unverified_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/unverified.md",
+            "check-on-touch",
+            &[],
+            "No citations.",
+        );
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("unverified.md"))
+            .expect("unverified finding");
+        assert_eq!(finding.verdicts, [RefreshVerdict::Unverified]);
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_reports_missing_and_invalid_last_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        for (name, replacement, verified) in [
+            (
+                "missing-date.md",
+                None,
+                "cargo test -p kranz-engine knowledge_refresh",
+            ),
+            ("bad-date.md", Some("2026-99-99"), "AGENTS.md"),
+        ] {
+            write_note(
+                &tmp.path().join("docs/knowledge"),
+                &format!("architecture/{name}"),
+                "check-on-touch",
+                &[verified],
+                "Date metadata matters.",
+            );
+            replace_note_date(tmp.path(), &format!("architecture/{name}"), replacement);
+        }
+
+        let report = refresh_knowledge(tmp.path());
+        for name in ["missing-date.md", "bad-date.md"] {
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.rel_path.ends_with(name))
+                .expect("date finding");
+            assert!(finding.verdicts.iter().any(|verdict| matches!(
+                verdict,
+                RefreshVerdict::InvalidMetadata { field, .. } if field == "last_verified"
+            )));
+        }
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_reports_git_open_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/no-git.md",
+            "check-on-touch",
+            &["AGENTS.md"],
+            "Requires Git history.",
+        );
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("no-git.md"))
+            .expect("git-open finding");
+        assert!(finding.verdicts.iter().any(|verdict| matches!(
+            verdict,
+            RefreshVerdict::ProbeFailed { target, .. } if target == "AGENTS.md"
+        )));
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_reports_git_log_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/unborn.md",
+            "check-on-touch",
+            &["AGENTS.md"],
+            "An unborn repository has no log to inspect.",
+        );
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("unborn.md"))
+            .expect("git-log finding");
+        assert!(finding.verdicts.iter().any(|verdict| matches!(
+            verdict,
+            RefreshVerdict::ProbeFailed { target, .. } if target == "AGENTS.md"
+        )));
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_reports_malformed_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        vault(tmp.path());
+        fs::write(
+            tmp.path().join("docs/knowledge/architecture/broken.md"),
+            "# Missing frontmatter\n",
+        )
+        .unwrap();
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("broken.md"))
+            .expect("malformed finding");
+        assert!(finding.verdicts.iter().any(|verdict| matches!(
+            verdict,
+            RefreshVerdict::InvalidMetadata { field, .. } if field == "frontmatter"
+        )));
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_all_ok_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/clean.md",
+            "check-on-touch",
+            &["AGENTS.md"],
+            "No changes after verification.",
+        );
+        git_commit_all(tmp.path(), "seed");
+
+        let report = refresh_knowledge(tmp.path());
+        assert!(!report.check_needed(), "{report:?}");
+        assert!(report
+            .findings
+            .iter()
+            .flat_map(|finding| &finding.verdicts)
+            .all(|verdict| matches!(verdict, RefreshVerdict::Ok)));
+    }
+
+    #[test]
+    fn knowledge_refresh_checks_existing_path_with_spaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        fs::write(tmp.path().join("path with spaces.md"), "evidence\n").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/spaces.md",
+            "check-on-touch",
+            &["path with spaces.md"],
+            "Spaces do not imply a command.",
+        );
+        git_commit_all(tmp.path(), "seed");
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("spaces.md"))
+            .expect("spaces finding");
+        assert_eq!(finding.verdicts, [RefreshVerdict::Ok]);
+    }
+
+    #[test]
+    fn knowledge_refresh_rejects_outside_repo_citation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        fs::write(tmp.path().join("outside file.md"), "private\n").unwrap();
+        vault(&root);
+        write_note(
+            &root.join("docs/knowledge"),
+            "architecture/outside.md",
+            "check-on-touch",
+            &["../outside file.md"],
+            "Must stay inside the repository.",
+        );
+
+        let report = refresh_knowledge(&root);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("outside.md"))
+            .expect("outside finding");
+        assert!(finding.verdicts.iter().any(|verdict| matches!(
+            verdict,
+            RefreshVerdict::InvalidCitation { citation } if citation == "../outside file.md"
+        )));
+        assert!(report.check_needed());
+    }
+
+    #[test]
+    fn knowledge_refresh_already_stale_skips_broken_citations() {
+        let tmp = tempfile::tempdir().unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/stale-broken.md",
+            "stale",
+            &["missing.rs"],
+            "Already excluded from injection.",
+        );
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("stale-broken.md"))
+            .expect("stale finding");
+        assert_eq!(finding.verdicts, [RefreshVerdict::AlreadyStale]);
+    }
+
+    #[test]
+    fn knowledge_refresh_same_day_commit_is_not_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/same-day.md",
+            "check-on-touch",
+            &["AGENTS.md"],
+            "Verified after the same-day change.",
+        );
+        replace_note_date(tmp.path(), "architecture/same-day.md", Some("2026-07-08"));
+        git_commit_all_at(tmp.path(), "seed", "2026-07-08T12:00:00Z");
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("same-day.md"))
+            .expect("same-day finding");
+        assert_eq!(finding.verdicts, [RefreshVerdict::Ok]);
     }
 }

@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-08-17
+last_verified: 2026-08-18
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - AGENTS.md
@@ -59,14 +59,16 @@ note in slice 1; add as operational facts accumulate.)_
 
 ## How this vault is used
 
-- **Now (slices 1–2):** browse and review. Committed Markdown, diffable in the
+- **Now (slices 1–3):** browse and review. Committed Markdown, diffable in the
   same flow as plans and reports. A per-mission `research.md` evidence
   artifact is written beside `plan.md`. A capped, ranked "Knowledge from this
   repo" block is injected into planning and mid-mission revision — never
   every worker turn. Stale and unverified notes are excluded.
 - **Slice 3 (CLI):** `kranz knowledge-refresh` reports notes whose
-  `verified_against` paths are missing or have commits after `last_verified`.
-  It does not rewrite notes. Dashboard/Slack surface is still later.
+  `verified_against` paths are missing or have commits after `last_verified`,
+  and fails closed when metadata, citations, or Git/filesystem probes cannot
+  establish freshness. It does not rewrite notes. Dashboard/Slack surface is
+  still later.
   Ticket: [`repo-knowledge-refresh-drift`](../../.kranz/tickets/repo-knowledge-refresh-drift.md).
 
 Freshness legend: **live** = verified/invariant · **check-on-touch** = trusted
