@@ -2156,15 +2156,50 @@ fn production_gate_self_test() -> Result<String> {
     std::fs::write(worktree_git.join("commondir"), "../..\n")?;
     std::fs::write(repo.join(".kranz").join("serve.token"), "must-not-cross")?;
 
-    std::fs::write(
-        worktree.join("package.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "name": "kranz-windows-gate-receipt",
-            "private": true,
-            "scripts": { "test": "node node-gate.js" }
-        }))
-        .map_err(|error| EngineError::Backend(format!("failed to render package.json: {error}")))?,
-    )?;
+    // GitHub's hosted Node image lives under a host-owned protected toolcache.
+    // The hostile receipt above intentionally proves that LPAC cannot execute
+    // arbitrary host resources merely because the operator can. Stage the
+    // exact runtime once inside this disposable worktree so phase 5 measures
+    // the production wrapper around an ordinary Node command without widening
+    // the runner's host-toolcache ACLs. A real mission can make the same
+    // workspace-contract choice for a tool whose host ACL is not LPAC-ready.
+    let ambient: HashMap<String, String> = std::env::vars().collect();
+    let node_source = find_on_path(Path::new("node"), &ambient).ok_or_else(|| {
+        EngineError::Backend("normal-gate receipt could not resolve node on PATH".to_string())
+    })?;
+    let node = worktree.join("node.exe");
+    let mut source = std::fs::File::open(&node_source).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to open Node runtime {} for staging: {error}",
+            node_source.display()
+        ))
+    })?;
+    // Create and stream rather than CopyFile: the new file must inherit the
+    // disposable worktree DACL, never preserve a protected host-toolcache
+    // descriptor that the LPAC token cannot satisfy.
+    let mut staged = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&node)
+        .map_err(|error| {
+            EngineError::Backend(format!(
+                "failed to create staged Node runtime {}: {error}",
+                node.display()
+            ))
+        })?;
+    std::io::copy(&mut source, &mut staged).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to stream Node runtime {} into {}: {error}",
+            node_source.display(),
+            node.display()
+        ))
+    })?;
+    staged.flush().map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to flush staged Node runtime {}: {error}",
+            node.display()
+        ))
+    })?;
     std::fs::write(
         worktree.join("node-gate.js"),
         r#"const assert = require('node:assert/strict');
@@ -2205,7 +2240,7 @@ mod tests {
     };
     let node = measure_gate(
         &worktree,
-        "set NPM_CONFIG_CACHE=.npm-cache&& npm test --silent",
+        r#".\node.exe node-gate.js"#,
         "kranz-node-gate-ok",
         &policy,
     )?;
