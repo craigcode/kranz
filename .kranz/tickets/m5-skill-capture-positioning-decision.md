@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Decided 2026-08-17 — wontfix. In-harness skill proposal/generation is frozen prompt-optimization. Recorded in docs/knowledge/decisions/skill-capture-boundary.md. Adapter-export is a revisit, not a retained contract; no implementation ticket filed.
 title: Decide whether repeated-pattern skill capture belongs inside Kranz's evidence boundary
 priority: 3
 schedule: once

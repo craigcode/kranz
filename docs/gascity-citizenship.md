@@ -14,6 +14,7 @@ builds on.
 4. [Staged roadmap](#staged-roadmap)
 5. [Design decisions](#design-decisions)
 6. [Ticket-ready briefs](#ticket-ready-briefs)
+7. [Open follow-on tickets](#open-follow-on-tickets)
 
 ## Current state
 
@@ -799,6 +800,10 @@ operator and no other city to fetch from. Not worth doing until that demand
 is concrete; publishing a pack nobody fetches only exports Stage-0/1 risk for
 no benefit.
 
+Ticket: [`.kranz/tickets/gascity-pack-publish.md`](../.kranz/tickets/gascity-pack-publish.md).
+The CI-wired `gc lint` slice is the only Stage 4 item a mission may land
+without a city.
+
 ### Stage 5 — fleets and cross-machine execution (speculative)
 
 Scope: the two remaining named futures from the spike verdict —
@@ -830,6 +835,9 @@ type, e.g. codex/gemini) is actually assembled under one City router, for
 behind an `AgentBackend` implementation, for cross-machine execution.
 Neither condition holds today, and this document does not predict when
 either would. Not until the trigger fires.
+
+Ticket: [`.kranz/tickets/gascity-fleets.md`](../.kranz/tickets/gascity-fleets.md)
+(parked; do not queue until a trigger is real).
 
 ## Design decisions
 
@@ -939,7 +947,8 @@ a kranz-owned mechanism, independent of whether the worker later claims via
 the current `.env`-file spool as a permanent design — it is understood, per
 docs/gascity.md, as the spike-era stand-in, and `kranz work` should absorb
 its function whenever kranz-side queue work is next scoped (not scheduled by
-this document).
+this document). The pack-side swap is
+[`.kranz/tickets/gascity-native-queue-swap.md`](../.kranz/tickets/gascity-native-queue-swap.md).
 
 ### D6 — verification strategy for city-coupled behavior
 
@@ -1024,7 +1033,9 @@ host). All that remains of the original idea is the part this brief
 explicitly deferred — pointing the Gas City pack at the kranz-native queue
 instead of its private spool — and that swap should be re-scoped when City
 Stage 2+ work is actually scheduled (Stage 1 is human-gated and has never
-run). The brief below is kept as the historical record of D5's scoping.
+run). That remaining swap is now ticketed as
+[`.kranz/tickets/gascity-native-queue-swap.md`](../.kranz/tickets/gascity-native-queue-swap.md).
+The brief below is kept as the historical record of D5's scoping.
 
 **Goal:** Implement a `kranz work` queue dispatcher inside kranz itself —
 enqueue, dequeue-oldest-first, and single-consumer drain semantics
@@ -1089,3 +1100,14 @@ the suite is a cargo test, its invocation is piped through
 `grep -qE 'result: ok\. [1-9][0-9]* passed'` (never a bare `cargo test
 <name>` filter, which exits 0 on zero matches); `gc lint
 packaging/gascity` still passes after the change.
+
+## Open follow-on tickets
+
+The unpublished remainder of this plan, now ticketed so it is not only
+named here:
+
+| Ticket | What | Start when |
+|--------|------|------------|
+| [gascity-native-queue-swap](../.kranz/tickets/gascity-native-queue-swap.md) | Re-scope, then point the pack at `.kranz/queue/` + `kranz work` instead of `KRANZ_SPOOL` | After a written re-scope; do not cut over on a demo night |
+| [gascity-pack-publish](../.kranz/tickets/gascity-pack-publish.md) | Stage 4: CI lint (autonomous), publish metadata, human `gc pack release` | CI lint anytime; publish only after Stage 1 receipt + a second consumer |
+| [gascity-fleets](../.kranz/tickets/gascity-fleets.md) | Stage 5 fleets / cross-machine | A heterogeneous City fleet or a real `AgentBackend` cross-machine runtime exists |

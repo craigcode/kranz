@@ -359,6 +359,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", backlog::cmd_queue(&repo));
             Ok(0)
         }
+        Command::KnowledgeRefresh { json } => cmd_knowledge_refresh(&repo, json),
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
         Command::DomainLint { seed_config, json } => {
             cmd_domain_lint(&repo, seed_config.as_deref(), json)
@@ -1494,6 +1495,52 @@ fn require_pending_grant(repo: &Path, mission_id: &str, command: &str) -> Result
         ),
         None => bail!("mission {mission_id} has no pending grant request"),
     }
+}
+
+/// `kranz knowledge-refresh`: report-only vault drift (slice 3).
+/// Exit 0 when no check-needed verdicts; exit 1 when any path is missing,
+/// drifted, or a non-stale note has an empty `verified_against`.
+pub fn cmd_knowledge_refresh(repo: &Path, json: bool) -> Result<i32> {
+    let report = kranz_engine::knowledge::refresh_knowledge(repo);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.findings.is_empty() {
+        println!("knowledge refresh: no notes");
+    } else {
+        for finding in &report.findings {
+            let labels: Vec<String> = finding
+                .verdicts
+                .iter()
+                .map(|v| match v {
+                    kranz_engine::knowledge::RefreshVerdict::Ok => "ok".into(),
+                    kranz_engine::knowledge::RefreshVerdict::AlreadyStale => "already-stale".into(),
+                    kranz_engine::knowledge::RefreshVerdict::Unverified => "unverified".into(),
+                    kranz_engine::knowledge::RefreshVerdict::PathMissing { path } => {
+                        format!("path-missing:{path}")
+                    }
+                    kranz_engine::knowledge::RefreshVerdict::PathDrifted { path } => {
+                        format!("path-drifted:{path}")
+                    }
+                    kranz_engine::knowledge::RefreshVerdict::CommandSkipped { command } => {
+                        format!("command-skipped:{command}")
+                    }
+                })
+                .collect();
+            println!(
+                "{} ({}) [{}] {}",
+                finding.rel_path,
+                finding.title,
+                finding.freshness,
+                labels.join(", ")
+            );
+        }
+        if report.check_needed() {
+            println!("knowledge refresh: check-needed");
+        } else {
+            println!("knowledge refresh: ok");
+        }
+    }
+    Ok(if report.check_needed() { 1 } else { 0 })
 }
 
 pub fn cmd_scan(repo: &Path, staged: bool, range: Option<&str>) -> Result<i32> {

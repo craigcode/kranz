@@ -136,3 +136,25 @@ only as the backstop for lease-less (ambiguous) claims, which closes the
 failure mode that got the heuristic reverted. Residual window, documented
 rather than hidden: a claim between spool-write and a worker's first
 heartbeat is TTL-only.
+
+## Distribution
+
+This directory is a Gas City pack (`pack.toml` `name = "kranz"`, `schema = 2`).
+`gc lint packaging/gascity` is the pre-merge / pre-publish gate. GitHub CI
+installs a pinned `gc` 1.3.2 and runs that lint plus the stub-safe tests in
+`scripts/ci-gascity-pack.sh`.
+
+**Schema versioning.** `schema = 2` is the City pack manifest Gas City's
+loader understands (orders, agents, no `[[named_session]]`). Bump it only
+when the manifest shape this pack ships would fail `gc lint` on the pinned
+`gc` — never as a marketing version. Kranz's own pack-contract (`schema` 3
+in `docs/pack-contract.md`: gates, prompts, checklists) is a different
+document; this pack does not declare that contract.
+
+**Registry listing (when a human publishes).** One-line description:
+"Dispatch Gas City beads as headless kranz missions; the city routes and
+escalates, kranz plans/validates/reports, no City-side LLM session."
+Publish is `gc pack registry` / `gc pack release` by a human after Stage 1
+(live supervisor+worker) has a receipt and a second operator wants to
+`gc pack fetch` it. Ticket: `.kranz/tickets/gascity-pack-publish.md`. Do
+not publish from CI or a mission.
