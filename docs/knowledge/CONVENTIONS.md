@@ -68,8 +68,9 @@ Slice 1 established the vault and its conventions, plus a per-mission
 `research.md` evidence artifact beside `plan.md`. Slice 2 injects a ranked,
 ≤4 KiB "Knowledge from this repo" block into **planning and revised-planning**
 seeds only (stale/unverified notes excluded; separate from the lessons budget).
-Slice 3 (`kranz knowledge refresh` drift checks) is still outstanding. See the
-scoping doc's build slicing.
+Slice 3 (`kranz knowledge refresh` drift checks) is ticketed as
+[`repo-knowledge-refresh-drift`](../../.kranz/tickets/repo-knowledge-refresh-drift.md).
+See the scoping doc's build slicing.
 
 ## Relationship to lessons
 

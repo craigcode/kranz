@@ -142,16 +142,16 @@ and use one version-aligned release rather than reviving v0.1.0. See the
 Done when: the supported source-install path and cross-platform CI are green;
 public package installation is outside the active private-product scope.
 
-## M5 — Deeper validation & automation ◑ (exec, functional QA, OTEL, and secret scanning shipped; skill-capture boundary decision remains)
+## M5 — Deeper validation & automation ✅ (exec, functional QA, OTEL, secret scanning shipped; skill-capture decided wontfix 2026-08-17)
 
 - [x] Functional QA via browser/computer-use driven by the validator, for target
   repos with a scriptable run harness (same prerequisite Factory imposes).
 - [x] `kranz exec -f mission.md` — fully headless missions for CI (plan file in,
   exit code out; no interactive approval, contract gates only).
-- Skill capture: the lessons loop records reusable mission knowledge, but
-  whether Kranz should propose consumer-specific skill files is now an explicit
-  positioning decision rather than unowned implementation work. Tracked by
-  [`m5-skill-capture-positioning-decision`](../.kranz/tickets/m5-skill-capture-positioning-decision.md).
+- [x] Skill capture: **wontfix** inside the harness (2026-08-17). Lessons,
+  knowledge, packs, Flight Rules, and corpus export stay; proposing or
+  installing consumer skill files is frozen prompt-optimization. Decision:
+  [`docs/knowledge/decisions/skill-capture-boundary.md`](knowledge/decisions/skill-capture-boundary.md).
 - [x] OTEL export of engine events (opt-in `kranz otel` sidecar shipped).
 - [x] Real secret scanning replacing the regex scrub — shipped 2026-07-07
   (`0b731d0`): curated + entropy detectors, redact-at-write ingest gate with
