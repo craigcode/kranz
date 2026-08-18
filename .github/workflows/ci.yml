@@ -68,6 +68,15 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      - name: Record Windows gate toolchain ACLs
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          foreach ($tool in @('node', 'npm', 'cargo', 'rustc')) {
+            $resolved = (Get-Command $tool -ErrorAction Stop).Source
+            Write-Host "${tool}=${resolved}"
+            (Get-Acl -LiteralPath $resolved).Sddl
+          }
       # M7 Windows containment phases 4-5: exercise the exact production
       # helper/ACL lease through the built kranz binary, prove ordinary Node
       # and Rust gates plus retained overhead samples through the production
@@ -77,6 +86,7 @@ jobs:
       - name: Prove production Windows LPAC containment and gates
         if: matrix.os == 'windows-latest'
         shell: bash
+        timeout-minutes: 30
         run: |
           run_exact_test() {
             local log="$1"
