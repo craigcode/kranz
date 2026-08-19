@@ -2014,12 +2014,19 @@ fn run_gate_sample(
         (Some(i32::from(!ok)), output)
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let posture = if appcontainer {
+        "AppContainer"
+    } else {
+        "unwrapped"
+    };
+    // Progress goes to stderr as each sample retires. The receipt itself is
+    // the child's stdout, so a caller can still parse it; without this line a
+    // slow or wedged sample is invisible until the whole self test returns,
+    // which is exactly when a CI step timeout has already killed it.
+    eprintln!(
+        "gate sample: posture={posture} {sample} elapsed_ms={elapsed_ms:.0} command={command}"
+    );
     if code != Some(0) || !output.contains(marker) {
-        let posture = if appcontainer {
-            "AppContainer"
-        } else {
-            "unwrapped"
-        };
         let diagnostics = appcontainer
             .then(|| gate_failure_diagnostics(worktree, policy))
             .unwrap_or_default();
@@ -2245,12 +2252,17 @@ mod tests {
         },
         mission_dir: mission,
     };
+    eprintln!(
+        "gate self test: staged runtime at {}; measuring the node gate",
+        node.display()
+    );
     let node = measure_gate(
         &worktree,
         r#".\node.exe node-gate.js"#,
         "kranz-node-gate-ok",
         &policy,
     )?;
+    eprintln!("gate self test: node gate retired; measuring the rust gate");
     let rust = measure_gate(
         &worktree,
         "cargo test --quiet --manifest-path rust-gate/Cargo.toml -- --nocapture",

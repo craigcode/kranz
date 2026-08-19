@@ -102,16 +102,21 @@ jobs:
       - name: Prove production Windows LPAC containment and gates
         if: matrix.os == 'windows-latest'
         shell: bash
-        timeout-minutes: 30
+        # Thirty minutes covered the hostile receipt but not the phase-5
+        # timing receipt, which retires thirty-two wrapped and unwrapped
+        # samples, each rebuilding a cache-only Cargo home.
+        timeout-minutes: 60
         run: |
+          # tee rather than redirect-then-cat: the AppContainer gate receipt
+          # streams per-sample progress, and a buffered log is lost entirely
+          # when the step timeout kills a run that has not returned yet.
           run_exact_test() {
             local log="$1"
             shift
             set +e
-            "$@" >"$log" 2>&1
-            local status=$?
+            "$@" 2>&1 | tee "$log"
+            local status=${PIPESTATUS[0]}
             set -e
-            cat "$log"
             if [ "$status" -ne 0 ]; then
               return "$status"
             fi

@@ -48,15 +48,19 @@ fn windows_production_appcontainer_helper_enforces_and_restores_boundary() {
 #[cfg(windows)]
 #[test]
 fn windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target() {
+    // Stderr is INHERITED, not captured: the self test reports each retired
+    // timing sample there, and thirty-two samples across two gates run long
+    // enough that a buffered stream only surfaces after a CI step timeout
+    // has already killed the run. The receipt stays on stdout.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_kranz"))
         .arg("__kranz-appcontainer-gate-self-test")
+        .stderr(std::process::Stdio::inherit())
         .output()
         .expect("production AppContainer normal-gate self-test binary must spawn");
     assert!(
         output.status.success(),
-        "production AppContainer normal-gate self-test failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "production AppContainer normal-gate self-test failed (its stderr streamed above): stdout={}",
+        String::from_utf8_lossy(&output.stdout)
     );
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("production AppContainer normal-gate receipt must be JSON");
