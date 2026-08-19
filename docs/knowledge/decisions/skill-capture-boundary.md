@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-08-17
+last_verified: 2026-08-18
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
