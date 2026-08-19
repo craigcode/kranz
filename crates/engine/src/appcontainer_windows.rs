@@ -2200,6 +2200,13 @@ fn production_gate_self_test() -> Result<String> {
             node.display()
         ))
     })?;
+    // Windows maps an executable image with FILE_SHARE_READ | FILE_SHARE_DELETE,
+    // so a surviving write handle makes the loader fail the spawn with
+    // ERROR_SHARING_VIOLATION ("the process cannot access the file because it
+    // is being used by another process") instead of running the gate. Close
+    // both staging handles before the first sample executes the staged runtime.
+    drop(staged);
+    drop(source);
     std::fs::write(
         worktree.join("node-gate.js"),
         r#"const assert = require('node:assert/strict');
