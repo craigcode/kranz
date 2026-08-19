@@ -1129,6 +1129,39 @@ mod tests {
         assert!(report.check_needed());
     }
 
+    /// `kranz knowledge refresh --json` prints this report verbatim, so a field
+    /// rename here is a CLI contract break. Pin the wire shape.
+    #[test]
+    fn knowledge_refresh_report_serializes_verdicts_for_json_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/unverified.md",
+            "check-on-touch",
+            &[],
+            "No citations.",
+        );
+
+        let json = serde_json::to_value(refresh_knowledge(tmp.path())).unwrap();
+        let finding = json["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .find(|finding| {
+                finding["relPath"]
+                    .as_str()
+                    .is_some_and(|rel| rel.ends_with("unverified.md"))
+            })
+            .expect("unverified finding");
+        assert_eq!(finding["freshness"], "check-on-touch");
+        assert_eq!(
+            finding["verdicts"],
+            serde_json::json!([{"verdict": "unverified"}]),
+            "{json:#}"
+        );
+    }
+
     #[test]
     fn knowledge_refresh_reports_missing_and_invalid_last_verified() {
         let tmp = tempfile::tempdir().unwrap();
