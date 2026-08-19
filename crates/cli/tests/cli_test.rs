@@ -142,8 +142,10 @@ fn kranz_init_parses_detection_and_registration_answers() {
     assert!(Cli::try_parse_from(["kranz", "init", "--id", "alpha"]).is_err());
 }
 
+/// Exit code only; the `--json` payload shape is pinned by
+/// `knowledge_refresh_report_serializes_verdicts_for_json_output` in the engine.
 #[test]
-fn knowledge_refresh_cli_returns_one_and_serializes_json_for_unverified_note() {
+fn knowledge_refresh_cli_returns_one_for_unverified_note() {
     let repo = tempfile::tempdir().unwrap();
     let vault = repo.path().join("docs/knowledge");
     fs::create_dir_all(&vault).unwrap();
