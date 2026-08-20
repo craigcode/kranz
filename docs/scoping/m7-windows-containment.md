@@ -175,19 +175,22 @@ as a production security boundary.
 The engine launches a trusted copy of its host executable, which creates the
 hostile child suspended with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY` set to opt out, assigns
-it to a kill-on-close Job Object, and only then resumes it. A unique disposable
-profile SID receives inherited ACLs for the worktree/private scratch and
-targeted read/execute access for the executable, toolchain, and shared Git
-metadata. The shared Git root is derived from the trusted repository and every
-writable worktree pointer must resolve back to that same common directory.
+it to a kill-on-close Job Object, and only then resumes it. Agent sessions use
+one unique disposable profile SID per launch; a resolved engine-gate posture
+uses one SID across its validation/final-gate command batch, matching the other
+providers' once-per-resolution setup contract. That SID receives inherited
+ACLs for the worktree/private scratch and targeted read/execute access for the
+executable, toolchain, and shared Git metadata. The shared Git root is derived
+from the trusted repository and every writable worktree pointer must resolve
+back to that same common directory.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the
-unique launch SID's ACEs, root-first, through those handles; overlapping
-launches therefore keep their live grants. A bounded host-local mutex serializes
-the DACL read/modify/write batches across Kranz processes, while an uncontended
-descriptor returns byte-for-byte to its baseline. The profile and private
-launch plan are then deleted.
+unique profile SID's ACEs, root-first, through those handles; overlapping
+launches therefore keep their live grants. A bounded host-local mutex
+serializes the DACL read/modify/write batches across Kranz processes, while an
+uncontended descriptor returns byte-for-byte to its baseline. The profile and
+all private per-command launch plans are then deleted.
 
 Both shipped mission hosts route that private re-entry before ordinary
 initialization: the `kranz` CLI and the embedded-server Tauri desktop binary.

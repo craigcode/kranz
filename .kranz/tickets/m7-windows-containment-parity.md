@@ -80,12 +80,15 @@ output, validator read denial, or every production spawn site.
 - The trusted launcher creates the hostile child suspended and assigns it to a
   kill-on-close Job Object before resume. `fs` grants internet-client access;
   `fs+net` supplies no network capability and is hard offline.
-- Each launch uses a disposable profile SID and an ACL lease that retains a
-  no-follow handle for every changed DACL, removes only that SID's ACEs
-  root-first, then deletes the private plan and profile. A bounded host-local
-  mutex serializes ACL read/modify/write batches, so overlapping launches
-  preserve each other's grants. Authority, mission metadata, shared Cargo
-  cache, and validator checkout denies are applied before spawn.
+- Each agent launch uses a disposable profile SID; each resolved engine-gate
+  posture owns one disposable SID across its validation/final-gate command
+  batch, so expensive ACL preparation is once per posture rather than once per
+  assertion. The ACL lease retains a no-follow handle for every changed DACL,
+  removes only that SID's ACEs root-first, then deletes every private plan and
+  the profile. A bounded host-local mutex serializes ACL read/modify/write
+  batches, so overlapping launches preserve each other's grants. Authority,
+  mission metadata, shared Cargo cache, and validator checkout denies are
+  applied before spawn.
 - Protected Windows CI runs the exact production helper receipt through the
   built CLI and proves an AppContainer token plus LPAC behavior by denying a
   sibling root deliberately granted to regular AppContainers, allow/deny

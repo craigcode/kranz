@@ -8,10 +8,12 @@
 //! and stdio pipes, so the existing async stream bounds and timeout machinery do
 //! not need a second Windows-only implementation.
 //!
-//! Filesystem authority is granted to a unique per-launch AppContainer SID. The
-//! parent retains a no-follow handle for every DACL it changes and removes only
-//! that SID's ACEs when the wrapped process is reaped or aborted; removing an
-//! inheritable parent ACE also removes its inherited copies from descendants.
+//! Filesystem authority is granted to a unique AppContainer SID: per agent
+//! session launch, or per resolved engine-gate posture across that posture's
+//! contract commands. The parent retains a no-follow handle for every DACL it
+//! changes and removes only that SID's ACEs when the launch/posture is reaped
+//! or aborted; removing an inheritable parent ACE also removes its inherited
+//! copies from descendants.
 //! A bounded host-local mutex serializes those DACL read/modify/write batches,
 //! so this composes safely across overlapping launches that share Git/toolchain
 //! roots and restores the original descriptor exactly when no unrelated ACL
@@ -21,7 +23,7 @@
 
 use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -29,6 +31,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use std::sync::{Arc, Mutex};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, GENERIC_READ, HANDLE, HLOCAL,
@@ -167,6 +170,17 @@ pub(crate) struct PreparedLaunch {
     pub lease: AppContainerLease,
 }
 
+pub(crate) struct PreparedCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// One resolved Windows gate posture owns one disposable profile and its ACL
+/// lease across all commands in that validation/final-gate context. Clones
+/// held by in-flight wrapped commands keep cleanup from racing their child.
+#[derive(Clone, Debug)]
+pub(crate) struct AppContainerLaunchContext(Arc<Mutex<Option<AppContainerLease>>>);
+
 #[derive(Debug)]
 struct DaclSnapshot {
     path: PathBuf,
@@ -226,10 +240,13 @@ impl Drop for DaclMutationGuard {
 
 /// Parent-owned cleanup guard. It deliberately carries no SID pointer, so it
 /// is safe to move with an async session across executor threads.
+#[derive(Debug)]
 pub(crate) struct AppContainerLease {
     profile_name: String,
     original_dacls: Vec<DaclSnapshot>,
-    plan_path: Option<PathBuf>,
+    snapshot_indices: BTreeMap<PathBuf, usize>,
+    applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
+    plan_paths: Vec<PathBuf>,
 }
 
 impl Drop for AppContainerLease {
@@ -262,7 +279,7 @@ impl Drop for AppContainerLease {
                     "failed to derive AppContainer SID for DACL cleanup");
             }
         }
-        if let Some(path) = self.plan_path.take() {
+        for path in self.plan_paths.drain(..) {
             let _ = std::fs::remove_file(path);
         }
         let name = wide(&self.profile_name);
@@ -293,7 +310,7 @@ impl Drop for LocalAllocation {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
     Deny,
@@ -1229,13 +1246,74 @@ fn acl_changes(
     Ok(changes)
 }
 
-/// Build the trusted helper command and apply the profile's temporary ACLs.
+fn new_lease(profile_name: String) -> AppContainerLease {
+    AppContainerLease {
+        profile_name,
+        original_dacls: Vec::new(),
+        snapshot_indices: BTreeMap::new(),
+        applied_changes: HashSet::new(),
+        plan_paths: Vec::new(),
+    }
+}
+
+pub(crate) fn new_launch_context() -> AppContainerLaunchContext {
+    AppContainerLaunchContext(Arc::new(Mutex::new(None)))
+}
+
+/// Build the trusted helper command using the profile/ACL lease owned by one
+/// resolved gate posture. The first command creates the disposable profile;
+/// later commands reuse its SID and skip ACL mutations already held by the
+/// lease. This makes setup once-per-resolution, matching the other process
+/// providers and the measurement contract in `command_exec`.
+pub(crate) fn prepare_launch_in_context(
+    context: &AppContainerLaunchContext,
+    inputs: &crate::sandbox::SandboxInputs,
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<PreparedCommand> {
+    let mut slot = context.0.lock().map_err(|_| {
+        EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
+    })?;
+    if slot.is_none() {
+        let (profile_name, _sid) = create_profile()?;
+        *slot = Some(new_lease(profile_name));
+    }
+    let lease = slot
+        .as_mut()
+        .expect("AppContainer gate lease was initialized above");
+    let sid = derive_profile_sid(&lease.profile_name)?;
+    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env)
+}
+
+/// Build the trusted helper command and apply a unique session launch's
+/// temporary ACLs. Agent sessions retain their one-launch lease unchanged;
+/// engine-run gates use [`prepare_launch_in_context`] to share one profile
+/// only inside a single already-resolved gate posture.
 pub(crate) fn prepare_launch(
     inputs: &crate::sandbox::SandboxInputs,
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<PreparedLaunch> {
+    let (profile_name, sid) = create_profile()?;
+    let mut lease = new_lease(profile_name);
+    let prepared = prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env)?;
+    Ok(PreparedLaunch {
+        program: prepared.program,
+        args: prepared.args,
+        lease,
+    })
+}
+
+fn prepare_launch_for_lease(
+    lease: &mut AppContainerLease,
+    sid: PSID,
+    inputs: &crate::sandbox::SandboxInputs,
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<PreparedCommand> {
     std::fs::create_dir_all(&inputs.tmpdir).map_err(|error| {
         EngineError::Backend(format!(
             "failed to create AppContainer private scratch {}: {error}",
@@ -1243,12 +1321,6 @@ pub(crate) fn prepare_launch(
         ))
     })?;
     let executable = resolve_executable(program, env)?;
-    let (profile_name, sid) = create_profile()?;
-    let mut lease = AppContainerLease {
-        profile_name: profile_name.clone(),
-        original_dacls: Vec::new(),
-        plan_path: None,
-    };
     // The child PATH is narrower than the host PATH and deliberately includes
     // declared workspace roots. Use that SAME path while discovering exact
     // Node/npm/Cargo entry points for ACL grants: a workspace-staged runtime
@@ -1270,12 +1342,11 @@ pub(crate) fn prepare_launch(
     // keeps both operations. They must still share ONE cleanup capability:
     // removing the profile ACE repeatedly through alias handles can republish
     // a stale inherited DACL and make the next launch lose execute access.
-    let mut seen = BTreeMap::new();
     // One ancestor directory is shared by many toolchain entry points, and a
     // read root can arrive in both verbatim and plain form. Applying the same
     // ACE twice is a no-op the OS still charges full price for, so collapse
     // exact repeats before touching a single descriptor.
-    let mut applied = std::collections::HashSet::new();
+    let mut applied = HashSet::new();
     changes.retain(|change| {
         applied.insert((
             comparable_path(&change.path),
@@ -1286,17 +1357,22 @@ pub(crate) fn prepare_launch(
     });
     for change in &changes {
         let key = comparable_path(&change.path);
-        if !seen.contains_key(&key) {
+        if !lease.snapshot_indices.contains_key(&key) {
             let index = lease.original_dacls.len();
             lease.original_dacls.push(snapshot_dacl(&change.path)?);
-            seen.insert(key, index);
+            lease.snapshot_indices.insert(key, index);
         }
     }
     for change in &changes {
         let key = comparable_path(&change.path);
-        let snapshot = &lease.original_dacls[seen[&key]];
+        let applied_key = (key.clone(), change.permissions, change.inherit, change.mode);
+        if lease.applied_changes.contains(&applied_key) {
+            continue;
+        }
+        let handle = lease.original_dacls[lease.snapshot_indices[&key]].handle.0;
         let started = std::time::Instant::now();
-        apply_acl_change(change, sid.0, snapshot.handle.0)?;
+        apply_acl_change(change, sid, handle)?;
+        lease.applied_changes.insert(applied_key);
         // An inheritable ACE on a directory makes Windows propagate it to
         // every existing descendant, so one grant costs a full tree rewrite.
         // Name any root where that dominates the launch instead of letting a
@@ -1321,7 +1397,7 @@ pub(crate) fn prepare_launch(
 
     let plan = LaunchPlan {
         version: PLAN_VERSION,
-        profile_name,
+        profile_name: lease.profile_name.clone(),
         executable,
         args: args.to_vec(),
         cwd: crate::sandbox::absolutize(&inputs.session_cwd),
@@ -1345,6 +1421,7 @@ pub(crate) fn prepare_launch(
                 plan_path.display()
             ))
         })?;
+    lease.plan_paths.push(plan_path.clone());
     serde_json::to_writer(&mut file, &plan).map_err(|error| {
         EngineError::Backend(format!(
             "failed to serialize AppContainer launch plan: {error}"
@@ -1353,19 +1430,17 @@ pub(crate) fn prepare_launch(
     file.flush().map_err(|error| {
         EngineError::Backend(format!("failed to flush AppContainer launch plan: {error}"))
     })?;
-    lease.plan_path = Some(plan_path.clone());
     let helper = std::env::current_exe().map_err(|error| {
         EngineError::Backend(format!(
             "failed to locate Kranz AppContainer helper: {error}"
         ))
     })?;
-    Ok(PreparedLaunch {
+    Ok(PreparedCommand {
         program: helper,
         args: vec![
             INTERNAL_LAUNCHER_ARG.to_string(),
             plan_path.to_string_lossy().into_owned(),
         ],
-        lease,
     })
 }
 
@@ -2078,16 +2153,23 @@ fn run_gate_sample(
     worktree: &Path,
     command: &str,
     marker: &str,
-    policy: &crate::command_exec::MergeGatePolicy,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
     appcontainer: bool,
     sample: &str,
 ) -> Result<f64> {
     let started = std::time::Instant::now();
     let (code, output) = if appcontainer {
-        crate::command_exec::run_bounded_gate_command_sandboxed_with_code(worktree, command, policy)
+        crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree, command, env, sandbox,
+        )
     } else {
-        let (ok, output) = crate::command_exec::run_bounded_gate_command(worktree, command);
-        (Some(i32::from(!ok)), output)
+        crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree,
+            command,
+            env,
+            &crate::command_exec::GateSandbox::Disabled,
+        )
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let posture = if appcontainer {
@@ -2103,9 +2185,11 @@ fn run_gate_sample(
         "gate sample: posture={posture} {sample} elapsed_ms={elapsed_ms:.0} command={command}"
     );
     if code != Some(0) || !output.contains(marker) {
-        let diagnostics = appcontainer
-            .then(|| gate_failure_diagnostics(worktree, policy))
-            .unwrap_or_default();
+        let diagnostics = if appcontainer {
+            gate_failure_diagnostics(worktree, env, sandbox)
+        } else {
+            String::new()
+        };
         return Err(EngineError::Backend(format!(
             "{posture} normal gate {sample} failed with exit {code:?} or omitted {marker}: \
              {output:?}{diagnostics}"
@@ -2116,7 +2200,8 @@ fn run_gate_sample(
 
 fn gate_failure_diagnostics(
     worktree: &Path,
-    policy: &crate::command_exec::MergeGatePolicy,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
 ) -> String {
     let mut diagnostics = String::from("; bounded AppContainer diagnostics:");
     for (label, command) in [
@@ -2127,8 +2212,8 @@ fn gate_failure_diagnostics(
         ("npm-version", "npm --version"),
         ("node-script", "node node-gate.js"),
     ] {
-        let (code, output) = crate::command_exec::run_bounded_gate_command_sandboxed_with_code(
-            worktree, command, policy,
+        let (code, output) = crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree, command, env, sandbox,
         );
         diagnostics.push_str(&format!(" {label}=({code:?}, {output:?})"));
     }
@@ -2145,12 +2230,13 @@ fn measure_gate(
     worktree: &Path,
     command: &str,
     marker: &str,
-    policy: &crate::command_exec::MergeGatePolicy,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
 ) -> Result<GateTimingReceipt> {
     // Warm both postures before retaining samples. Alternate their order so
     // runner drift does not systematically favor either side.
-    run_gate_sample(worktree, command, marker, policy, false, "warm-up")?;
-    run_gate_sample(worktree, command, marker, policy, true, "warm-up")?;
+    run_gate_sample(worktree, command, marker, env, sandbox, false, "warm-up")?;
+    run_gate_sample(worktree, command, marker, env, sandbox, true, "warm-up")?;
 
     let mut off_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
     let mut appcontainer_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
@@ -2160,7 +2246,8 @@ fn measure_gate(
                 worktree,
                 command,
                 marker,
-                policy,
+                env,
+                sandbox,
                 false,
                 &format!("sample {}", index + 1),
             )?);
@@ -2168,7 +2255,8 @@ fn measure_gate(
                 worktree,
                 command,
                 marker,
-                policy,
+                env,
+                sandbox,
                 true,
                 &format!("sample {}", index + 1),
             )?);
@@ -2177,7 +2265,8 @@ fn measure_gate(
                 worktree,
                 command,
                 marker,
-                policy,
+                env,
+                sandbox,
                 true,
                 &format!("sample {}", index + 1),
             )?);
@@ -2185,7 +2274,8 @@ fn measure_gate(
                 worktree,
                 command,
                 marker,
-                policy,
+                env,
+                sandbox,
                 false,
                 &format!("sample {}", index + 1),
             )?);
@@ -2208,10 +2298,11 @@ fn measure_gate(
     })
 }
 
-/// Exercise ordinary Node and Rust contract commands through the exact
-/// production merge-gate wrapper, then retain interleaved warm-cache timing
-/// samples against the byte-identical unwrapped runner. This complements the
-/// hostile receipt above: neither proof substitutes for the other.
+/// Exercise ordinary Node and Rust contract commands through the exact bounded
+/// gate executor and one resolved validation/final-gate posture, then retain
+/// interleaved warm-cache timing samples against the byte-identical unwrapped
+/// runner. This complements the hostile receipt above: neither proof
+/// substitutes for the other.
 pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
     production_gate_self_test().map_err(|error| error.to_string())
 }
@@ -2318,16 +2409,37 @@ mod tests {
 "#,
     )?;
 
-    let policy = crate::command_exec::MergeGatePolicy {
-        sandbox: crate::types::SandboxConfig {
-            enforce: crate::types::SandboxEnforce::FsNet,
-            provider: crate::types::SandboxProvider::Process,
-            image: None,
-            extra_write: Vec::new(),
-            egress: Vec::new(),
-        },
-        mission_dir: mission,
+    let sandbox_config = crate::types::SandboxConfig {
+        enforce: crate::types::SandboxEnforce::FsNet,
+        provider: crate::types::SandboxProvider::Process,
+        image: None,
+        extra_write: Vec::new(),
+        egress: Vec::new(),
     };
+    // Production validation and final-gate batches resolve one posture and
+    // run all contract assertions through it. Keep the same stable scratch,
+    // cleared env, profile, and ACL lease here: the first wrapped warm-up owns
+    // one-time preparation; retained samples measure per-command overhead.
+    let gate_home = root.0.join("gate-home");
+    std::fs::create_dir_all(gate_home.join("tmp"))?;
+    let cargo_home = crate::agent_env::cache_only_cargo_home(&gate_home);
+    if !cargo_home.is_dir() {
+        return Err(EngineError::Backend(format!(
+            "normal-gate receipt could not create cache-only Cargo home {}",
+            cargo_home.display()
+        )));
+    }
+    let mut gate_env = crate::command_exec::sanitized_gate_env();
+    gate_env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+    crate::agent_env::redirect_windows_profile_env(&mut gate_env, &gate_home);
+    let sandbox = crate::command_exec::resolve_gate_sandbox(
+        &sandbox_config,
+        &worktree,
+        &mission,
+        &gate_home,
+        &gate_home,
+    )?
+    .sandbox;
     eprintln!(
         "gate self test: staged runtime at {}; measuring the node gate",
         node.display()
@@ -2336,14 +2448,16 @@ mod tests {
         &worktree,
         r#".\node.exe node-gate.js"#,
         "kranz-node-gate-ok",
-        &policy,
+        &gate_env,
+        &sandbox,
     )?;
     eprintln!("gate self test: node gate retired; measuring the rust gate");
     let rust = measure_gate(
         &worktree,
         "cargo test --quiet --manifest-path rust-gate/Cargo.toml -- --nocapture",
         "kranz-rust-gate-ok",
-        &policy,
+        &gate_env,
+        &sandbox,
     )?;
     let receipt = ProductionGateReceipt {
         host: crate::sandbox_windows::probe(),

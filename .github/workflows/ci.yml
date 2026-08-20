@@ -109,10 +109,10 @@ jobs:
           git config --global user.email ci@kranz.local
       # M7 Windows containment phases 4-5: exercise the exact production
       # helper/ACL lease through the built kranz binary, prove ordinary Node
-      # and Rust gates plus retained overhead samples through the production
-      # merge-gate wrapper, then hold both the positive process-provider
-      # resolution and negative container-provider refusal contracts before
-      # the full workspace suite.
+      # and Rust gates plus retained overhead samples through one production
+      # validation/final-gate posture, then hold both the positive
+      # process-provider resolution and negative container-provider refusal
+      # contracts before the full workspace suite.
       - name: Prove production Windows LPAC containment and gates
         if: matrix.os == 'windows-latest'
         shell: bash
