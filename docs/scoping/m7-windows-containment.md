@@ -183,11 +183,14 @@ ACLs for the worktree/private scratch and targeted read/execute access for the
 executable, toolchain, and shared Git metadata. The shared Git root is derived
 from the trusted repository and every writable worktree pointer must resolve
 back to that same common directory.
-Node, Cargo, and cmd also probe their local drive root during startup. The
-lease therefore adds the SID-scoped, non-inheriting `0x00120088` metadata mask
-(`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) to each
+Node, Cargo, and cmd also probe their local drive root during startup. LPAC's
+dual-principal access check means the package SID alone is insufficient, so the
+lease derives and carries a capability SID unique to the disposable profile.
+Only that capability receives the non-inheriting `0x00120088` metadata mask
+(`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) on each
 relevant local drive root; it grants no root content access and is removed with
-the profile. Hosts that cannot write that DACL fail closed during preparation.
+the profile. This avoids a persistent broad AppContainer-group grant. Hosts
+that cannot write the root DACL fail closed during preparation.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the

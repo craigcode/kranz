@@ -84,11 +84,12 @@ output, validator read denial, or every production spawn site.
   posture owns one disposable SID across its validation/final-gate command
   batch, so expensive ACL preparation is once per posture rather than once per
   assertion. Because ordinary Windows tools probe the local drive root during
-  startup, the same SID receives only the non-inheriting `0x00120088` root
-  metadata mask; no root contents are granted. The ACL lease retains a
-  no-follow handle for every changed DACL,
-  removes only that SID's ACEs root-first, then deletes every private plan and
-  the profile. A bounded host-local mutex serializes ACL read/modify/write
+  startup, LPAC carries a capability SID unique to that disposable profile;
+  only that capability receives the non-inheriting `0x00120088` root metadata
+  mask, and no root contents are granted. The ACL lease retains a no-follow
+  handle for every changed DACL, removes only the unique package and capability
+  SIDs' ACEs root-first, then deletes every private plan and the profile. A
+  bounded host-local mutex serializes ACL read/modify/write
   batches, so overlapping launches preserve each other's grants. Authority,
   mission metadata, shared Cargo cache, and validator checkout denies are
   applied before spawn.

@@ -8,12 +8,13 @@
 //! and stdio pipes, so the existing async stream bounds and timeout machinery do
 //! not need a second Windows-only implementation.
 //!
-//! Filesystem authority is granted to a unique AppContainer SID: per agent
-//! session launch, or per resolved engine-gate posture across that posture's
-//! contract commands. The parent retains a no-follow handle for every DACL it
-//! changes and removes only that SID's ACEs when the launch/posture is reaped
-//! or aborted; removing an inheritable parent ACE also removes its inherited
-//! copies from descendants.
+//! Filesystem authority is granted to a unique AppContainer package SID and a
+//! profile-scoped root-metadata capability: per agent session launch, or per
+//! resolved engine-gate posture across that posture's contract commands. The
+//! parent retains a no-follow handle for every DACL it changes and removes only
+//! those unique SIDs' ACEs when the launch/posture is reaped or aborted;
+//! removing an inheritable parent ACE also removes its inherited copies from
+//! descendants.
 //! A bounded host-local mutex serializes those DACL read/modify/write batches,
 //! so this composes safely across overlapping launches that share Git/toolchain
 //! roots and restores the original descriptor exactly when no unrelated ACL
@@ -45,12 +46,12 @@ use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetTokenInformation, TokenIsAppContainer, WinBuiltinAnyPackageSid,
-    WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
-    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
+    FreeSid, GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, TokenIsAppContainer,
+    WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -246,7 +247,7 @@ pub(crate) struct AppContainerLease {
     profile_name: String,
     original_dacls: Vec<DaclSnapshot>,
     snapshot_indices: BTreeMap<PathBuf, usize>,
-    applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
+    applied_changes: HashSet<(PathBuf, u32, bool, AclMode, AclTrustee)>,
     plan_paths: Vec<PathBuf>,
 }
 
@@ -255,29 +256,41 @@ impl Drop for AppContainerLease {
         match (
             DaclMutationGuard::acquire(),
             derive_profile_sid(&self.profile_name),
+            root_metadata_capability(&self.profile_name),
         ) {
-            (Ok(_guard), Ok(sid)) => {
+            (Ok(_guard), Ok(sid), Ok(mut root_capability)) => {
                 // Parent directories first: removing their inheritable
                 // AppContainer ACEs makes Windows retract inherited copies
                 // from existing children. Remove ONLY this random profile's
-                // ACEs; replacing whole snapshots would race overlapping
-                // launches that legitimately touch shared Git/toolchain roots.
+                // package and root-metadata capability ACEs; replacing whole
+                // snapshots would race overlapping launches that legitimately
+                // touch shared Git/toolchain roots.
                 self.original_dacls
                     .sort_by_key(|entry| entry.path.components().count());
                 for snapshot in &self.original_dacls {
-                    if let Err(error) = remove_profile_aces(snapshot, sid.0) {
+                    if let Err(error) = remove_sid_aces(snapshot, sid.0) {
                         tracing::error!(path = %snapshot.path.display(), error = %error,
                             "failed to remove AppContainer ACEs from a DACL");
                     }
+                    if let Err(error) =
+                        remove_sid_aces(snapshot, PSID(root_capability.as_mut_ptr().cast()))
+                    {
+                        tracing::error!(path = %snapshot.path.display(), error = %error,
+                            "failed to remove AppContainer root-metadata capability ACEs from a DACL");
+                    }
                 }
             }
-            (Err(error), _) => {
+            (Err(error), _, _) => {
                 tracing::error!(profile = %self.profile_name, error = %error,
                     "failed to lock AppContainer DACL cleanup");
             }
-            (_, Err(error)) => {
+            (_, Err(error), _) => {
                 tracing::error!(profile = %self.profile_name, error = %error,
                     "failed to derive AppContainer SID for DACL cleanup");
+            }
+            (_, _, Err(error)) => {
+                tracing::error!(profile = %self.profile_name, error = %error,
+                    "failed to derive AppContainer root-metadata capability for DACL cleanup");
             }
         }
         for path in self.plan_paths.drain(..) {
@@ -311,10 +324,38 @@ impl Drop for LocalAllocation {
     }
 }
 
+struct LocalSidArray {
+    values: *mut PSID,
+    count: u32,
+}
+
+impl Drop for LocalSidArray {
+    fn drop(&mut self) {
+        if self.values.is_null() {
+            return;
+        }
+        let values = unsafe { std::slice::from_raw_parts(self.values, self.count as usize) };
+        for sid in values {
+            unsafe {
+                LocalFree(Some(HLOCAL(sid.0)));
+            }
+        }
+        unsafe {
+            LocalFree(Some(HLOCAL(self.values.cast())));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
     Deny,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AclTrustee {
+    Profile,
+    RootMetadataCapability,
 }
 
 struct AclChange {
@@ -322,6 +363,7 @@ struct AclChange {
     permissions: u32,
     inherit: bool,
     mode: AclMode,
+    trustee: AclTrustee,
 }
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -334,17 +376,75 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<()> {
         .map_err(|error| EngineError::Backend(format!("Windows ACL operation failed: {error}")))
 }
 
+fn root_metadata_capability_name(profile_name: &str) -> String {
+    format!("{profile_name}.root-metadata")
+}
+
+/// Derive one capability SID unique to the disposable profile. LPAC opts out
+/// of broad AppContainer groups and therefore needs an explicit capability for
+/// resources such as the system-drive metadata probe. Keeping this capability
+/// profile-scoped avoids the persistent `ALL RESTRICTED APPLICATION PACKAGES`
+/// root ACE used by host-wide AppContainer preparation.
+fn root_metadata_capability(profile_name: &str) -> Result<Vec<u8>> {
+    let name = wide(root_metadata_capability_name(profile_name));
+    let mut group_values: *mut PSID = null_mut();
+    let mut group_count = 0u32;
+    let mut capability_values: *mut PSID = null_mut();
+    let mut capability_count = 0u32;
+    unsafe {
+        DeriveCapabilitySidsFromName(
+            PCWSTR(name.as_ptr()),
+            &mut group_values,
+            &mut group_count,
+            &mut capability_values,
+            &mut capability_count,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to derive the AppContainer root-metadata capability: {error}"
+        ))
+    })?;
+    let _groups = LocalSidArray {
+        values: group_values,
+        count: group_count,
+    };
+    let capabilities = LocalSidArray {
+        values: capability_values,
+        count: capability_count,
+    };
+    if capabilities.count != 1 || capabilities.values.is_null() {
+        return Err(EngineError::Backend(format!(
+            "AppContainer root-metadata capability derivation returned {} SIDs instead of one",
+            capabilities.count
+        )));
+    }
+    let sid = unsafe { *capabilities.values };
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    if len == 0 {
+        return Err(EngineError::Backend(
+            "AppContainer root-metadata capability SID had zero length".to_string(),
+        ));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec())
+}
+
 fn create_profile() -> Result<(String, OwnedSid)> {
     let profile_name = format!("kranz.production.{}", uuid::Uuid::new_v4().simple());
     let name = wide(&profile_name);
     let display = wide("Kranz contained process");
     let description = wide("Disposable Kranz AppContainer profile");
+    let mut root_capability = root_metadata_capability(&profile_name)?;
+    let capabilities = [SID_AND_ATTRIBUTES {
+        Sid: PSID(root_capability.as_mut_ptr().cast()),
+        Attributes: SE_GROUP_ENABLED as u32,
+    }];
     let sid = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(description.as_ptr()),
-            None,
+            Some(&capabilities),
         )
     }
     .map_err(|error| {
@@ -401,7 +501,7 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     })
 }
 
-fn remove_profile_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
+fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
     let mut current_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
@@ -1150,11 +1250,13 @@ fn acl_changes(
     // LPAC opts out of the broad ALL APPLICATION PACKAGES grants. Ordinary
     // Windows tools still probe the system-drive root during startup, so a
     // package SID with access only to its executable can fail with
-    // ERROR_ACCESS_DENIED before user code runs. Grant this random profile
-    // only the non-inheriting metadata mask Microsoft prescribes for that
-    // probe (0x00120088), retain the root's no-follow DACL handle, and remove
-    // the SID with the rest of the lease. A host on which the operator cannot
-    // write that DACL fails closed during preparation.
+    // ERROR_ACCESS_DENIED before user code runs. Grant the random profile's
+    // explicit root-metadata capability only the non-inheriting mask Microsoft
+    // prescribes for that probe (0x00120088), retain the root's no-follow DACL
+    // handle, and remove the capability ACE with the rest of the lease. A host
+    // on which the operator cannot write that DACL fails closed during
+    // preparation. This avoids a persistent broad ALL RESTRICTED APPLICATION
+    // PACKAGES grant while satisfying LPAC's dual-principal access check.
     let root_metadata = FILE_READ_ATTRIBUTES.0 | FILE_READ_EA.0 | READ_CONTROL.0 | SYNCHRONIZE.0;
     let mut volume_roots = std::iter::once(executable)
         .chain(toolchain_entries.iter().map(PathBuf::as_path))
@@ -1168,6 +1270,7 @@ fn acl_changes(
             permissions: root_metadata,
             inherit: false,
             mode: AclMode::Grant,
+            trustee: AclTrustee::RootMetadataCapability,
         });
     }
     for root in &write_roots {
@@ -1176,6 +1279,7 @@ fn acl_changes(
             permissions: rwx,
             inherit: true,
             mode: AclMode::Grant,
+            trustee: AclTrustee::Profile,
         });
     }
     for root in &read_roots {
@@ -1184,6 +1288,7 @@ fn acl_changes(
             permissions: rx,
             inherit: root.is_dir(),
             mode: AclMode::Grant,
+            trustee: AclTrustee::Profile,
         });
     }
     let traverse = FILE_GENERIC_EXECUTE.0;
@@ -1193,6 +1298,7 @@ fn acl_changes(
             permissions: rx,
             inherit: false,
             mode: AclMode::Grant,
+            trustee: AclTrustee::Profile,
         });
         for ancestor in ancestor_directories(&path) {
             changes.push(AclChange {
@@ -1200,6 +1306,7 @@ fn acl_changes(
                 permissions: traverse,
                 inherit: false,
                 mode: AclMode::Grant,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1217,6 +1324,7 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: false,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1227,6 +1335,7 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: true,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1238,6 +1347,7 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: false,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1248,6 +1358,7 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: true,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1265,6 +1376,7 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: false,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1275,6 +1387,7 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: true,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1285,6 +1398,7 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: entry.is_dir,
                 mode: AclMode::Deny,
+                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1377,6 +1491,7 @@ fn prepare_launch_for_lease(
     let mut acl_env = env.clone();
     acl_env.insert("PATH".to_string(), path.clone());
     let mut changes = acl_changes(inputs, &executable, &acl_env)?;
+    let mut root_capability = root_metadata_capability(&lease.profile_name)?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
@@ -1398,6 +1513,7 @@ fn prepare_launch_for_lease(
             change.permissions,
             change.inherit,
             change.mode,
+            change.trustee,
         ))
     });
     for change in &changes {
@@ -1410,13 +1526,23 @@ fn prepare_launch_for_lease(
     }
     for change in &changes {
         let key = comparable_path(&change.path);
-        let applied_key = (key.clone(), change.permissions, change.inherit, change.mode);
+        let applied_key = (
+            key.clone(),
+            change.permissions,
+            change.inherit,
+            change.mode,
+            change.trustee,
+        );
         if lease.applied_changes.contains(&applied_key) {
             continue;
         }
         let handle = lease.original_dacls[lease.snapshot_indices[&key]].handle.0;
         let started = std::time::Instant::now();
-        apply_acl_change(change, sid, handle)?;
+        let trustee = match change.trustee {
+            AclTrustee::Profile => sid,
+            AclTrustee::RootMetadataCapability => PSID(root_capability.as_mut_ptr().cast()),
+        };
+        apply_acl_change(change, trustee, handle)?;
         lease.applied_changes.insert(applied_key);
         // An inheritable ACE on a directory makes Windows propagate it to
         // every existing descendant, so one grant costs a full tree rewrite.
@@ -1809,16 +1935,18 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
         ));
     }
     let sid = derive_profile_sid(&plan.profile_name)?;
+    let mut root_capability = root_metadata_capability(&plan.profile_name)?;
     let mut internet_sid = plan.allow_network.then(internet_capability).transpose()?;
-    let mut capabilities = internet_sid
-        .as_mut()
-        .map(|storage| {
-            vec![SID_AND_ATTRIBUTES {
-                Sid: PSID(storage.as_mut_ptr().cast()),
-                Attributes: SE_GROUP_ENABLED as u32,
-            }]
-        })
-        .unwrap_or_default();
+    let mut capabilities = vec![SID_AND_ATTRIBUTES {
+        Sid: PSID(root_capability.as_mut_ptr().cast()),
+        Attributes: SE_GROUP_ENABLED as u32,
+    }];
+    if let Some(storage) = internet_sid.as_mut() {
+        capabilities.push(SID_AND_ATTRIBUTES {
+            Sid: PSID(storage.as_mut_ptr().cast()),
+            Attributes: SE_GROUP_ENABLED as u32,
+        });
+    }
     let security = SECURITY_CAPABILITIES {
         AppContainerSid: sid.0,
         Capabilities: if capabilities.is_empty() {
@@ -2015,6 +2143,7 @@ fn production_hostile_self_test() -> Result<String> {
                 | DELETE.0,
             inherit: true,
             mode: AclMode::Grant,
+            trustee: AclTrustee::Profile,
         };
         let _guard = DaclMutationGuard::acquire()?;
         apply_acl_change(
@@ -2803,6 +2932,18 @@ mod tests {
             local_volume_root(Path::new(r"\\server\share\node.exe")),
             None
         );
+    }
+
+    #[test]
+    fn root_metadata_capability_is_stable_and_profile_scoped() {
+        let first =
+            root_metadata_capability("kranz.production.first").expect("first capability derives");
+        let first_again = root_metadata_capability("kranz.production.first")
+            .expect("first capability derives again");
+        let second =
+            root_metadata_capability("kranz.production.second").expect("second capability derives");
+        assert_eq!(first, first_again);
+        assert_ne!(first, second);
     }
 
     #[test]
