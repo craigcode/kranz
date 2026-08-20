@@ -83,6 +83,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap mold
+          # ubuntu-latest currently restricts unprivileged user namespaces
+          # through AppArmor. This is an ephemeral hosted runner dedicated to
+          # the proof; enable the kernel primitive bubblewrap needs, then make
+          # capability failure loud here instead of letting the receipt skip.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true
       # mold as the linker: the a3 plan-contract regression runs a nested
       # `cargo test -p kranz-engine` inside the suite, which feature-plan
       # thrashes against the outer --workspace build and RELINKS the big
