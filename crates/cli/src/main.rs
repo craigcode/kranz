@@ -6,7 +6,43 @@ use kranz_cli::cli::Cli;
 use kranz_cli::commands;
 use std::process::ExitCode;
 
+#[cfg(windows)]
+const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(windows)]
 fn main() -> ExitCode {
+    // The debug MSVC build can reserve a large entry frame before the first
+    // statement executes (the command dispatcher carries many async states).
+    // Windows' default executable stack is smaller than the explicit stacks
+    // used by Tokio workers, so enter all CLI and private launcher modes on a
+    // deliberately sized thread instead of failing before private argv can be
+    // routed. Stack reserve is virtual; pages commit only as they are used.
+    let thread = match std::thread::Builder::new()
+        .name("kranz-main".to_string())
+        .stack_size(WINDOWS_MAIN_STACK_BYTES)
+        .spawn(main_inner)
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            eprintln!("kranz: failed to start the Windows main thread: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match thread.join() {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("kranz: Windows main thread panicked");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    main_inner()
+}
+
+fn main_inner() -> ExitCode {
     // Windows AppContainer sessions re-enter this trusted binary as a thin
     // native launcher. Route that private argv before clap, tracing, or TLS
     // initialization so the helper writes only the contained child's bytes to
