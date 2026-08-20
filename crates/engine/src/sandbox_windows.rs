@@ -17,6 +17,7 @@
 //! on the current directory or `PATH` from spoofing capability evidence.
 
 use serde::Serialize;
+use std::path::Path;
 
 pub const PROCESS_MODEL_DLL: &str = "processmodel.dll";
 pub const PROCESS_SANDBOX_EXPORT: &str = "Experimental_CreateProcessInSandbox";
@@ -119,6 +120,19 @@ impl WindowsSandboxProbeReport {
 /// ACLs, or spawning a child. Absence is a supported result.
 pub fn probe() -> WindowsSandboxProbeReport {
     platform::probe()
+}
+
+/// Apply and verify the persistent metadata-only AppContainer host ACEs on a
+/// literal local drive root. This mutation is Windows-only and requires an
+/// elevated token; ordinary launch paths never call it.
+#[cfg(windows)]
+pub fn prepare_appcontainer_host(root: &Path) -> std::result::Result<bool, String> {
+    crate::appcontainer_windows::prepare_appcontainer_host(root).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn prepare_appcontainer_host(_root: &Path) -> std::result::Result<bool, String> {
+    Err("AppContainer host preparation is available only on Windows".to_string())
 }
 
 /// Private production-launcher dispatch used by the `kranz` binary before

@@ -278,6 +278,25 @@ fn parses_sandbox_probe() {
 }
 
 #[test]
+fn parses_sandbox_prepare_targets() {
+    assert!(Cli::try_parse_from(["kranz", "sandbox-prepare"]).is_err());
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "sandbox-prepare",
+        "--target",
+        "C:\\",
+        "--target",
+        "D:\\",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::SandboxPrepare { targets }
+            if targets == vec![PathBuf::from("C:\\"), PathBuf::from("D:\\")]
+    ));
+}
+
+#[test]
 fn parses_export_traces() {
     let cli = Cli::try_parse_from(["kranz", "export-traces"]).unwrap();
     assert!(matches!(

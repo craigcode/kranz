@@ -1,10 +1,10 @@
 # M7 Windows containment — accepted plan and production AppContainer boundary
 
-Status: accepted 2026-08-15. Phases 1–4 are implemented. A protected hosted
-Windows receipt now proves the production AppContainer launcher before the
-process provider is enabled. Phase 5 — normal Node/Rust gates, overhead, and a
-dedicated Windows 11 receipt — remains open, so this document does not yet call
-the full parity ticket closed.
+Status: accepted 2026-08-15. Phases 1–4 and the hosted part of phase 5 are
+implemented. Protected Windows CI proves the production AppContainer launcher,
+ordinary Node/Rust gates, and retained-posture overhead before the process
+provider is enabled. The dedicated operator-controlled Windows 11 receipt
+remains open, so this document does not yet call the full parity ticket closed.
 
 ## Outcome first
 
@@ -110,10 +110,11 @@ synthetically detected Docker runtime. The full Windows workspace suite then
 keeps consumer behavior and serialization green.
 
 The stable AppContainer path is not tied to the Windows-11-only experimental
-API. Full parity still needs an operator-controlled Windows 11 host (self-hosted
-CI or an equivalent disposable VM) for the normal Node/Rust gate, overhead, and
-host-specific receipt. A permanently queued self-hosted job without a managed
-runner would be ceremony, not evidence.
+API. Protected hosted CI proves the normal Node/Rust gate and overhead on
+Windows Server; full parity still needs an operator-controlled Windows 11 host
+(self-hosted CI or an equivalent disposable VM) to repeat the hostile and
+normal-gate brief as a host-specific receipt. A permanently queued self-hosted
+job without a managed runner would be ceremony, not evidence.
 
 ## Delivery sequence
 
@@ -135,9 +136,10 @@ runner would be ceremony, not evidence.
    Object tree kill, validator real-checkout read denial, and engine-gate
    wrapping. The protected receipt proves exact DACL restoration after the
    child exits.
-5. Run the full hostile brief plus normal Node/Rust gate and overhead
-   measurements. Only that receipt may mark the Windows ticket and M7 parity
-   complete.
+5. **Shipped on protected hosted Windows:** run the full hostile brief plus
+   normal Node/Rust gate and retained-posture overhead measurements. Repeat
+   that receipt on the operator-controlled Windows 11 host before marking the
+   Windows ticket and M7 parity complete.
 
 ## Phase-1 receipt
 
@@ -173,7 +175,7 @@ This phase records whether a runner exposes the experimental candidate without
 guessing Microsoft's unpublished FlatBuffer schema or treating an unstable API
 as a production security boundary.
 
-## Phase-4 production receipt and constraints
+## Phase-4 production receipt, phase-5 hosted gates, and constraints
 
 The engine launches a trusted copy of its host executable, which creates the
 hostile child suspended with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
@@ -196,6 +198,10 @@ drive root it installs the exact non-inheriting `0x00120088` metadata mask
 `ALL RESTRICTED APPLICATION PACKAGES` (`S-1-15-2-2`). It refuses conflicting
 explicit ACEs instead of merging rights. The mask grants no root listing,
 content read, or write access, and does not propagate below the root. The
+script invokes the public `kranz sandbox-prepare --target <drive-root>` command;
+that compiled path follows Microsoft's `GetNamedSecurityInfoW` →
+`SetEntriesInAclW` → `SetNamedSecurityInfoW` sequence and verifies the resulting
+tuples instead of using the managed `Set-Acl` path. The
 ordinary Kranz launcher only verifies those exact tuples with `READ_CONTROL`;
 missing preparation fails before the hostile child starts and names the
 elevated command to run. This follows Microsoft's AppContainer host-preparation

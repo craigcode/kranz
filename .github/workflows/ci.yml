@@ -114,6 +114,7 @@ jobs:
       - name: Prepare Windows AppContainer host
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        timeout-minutes: 15
         run: |
           $targets = @(
             [System.IO.Path]::GetPathRoot($env:SystemRoot)

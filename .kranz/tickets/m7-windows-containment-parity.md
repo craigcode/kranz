@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Accepted plan plus phases 1-4 implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary and exact DACL restoration while the container provider remains fail-closed. Phase 5 normal Node/Rust gates, overhead, and a dedicated Windows 11 receipt remain open.
+state-note: Accepted plan plus phases 1-4 and the hosted phase-5 gate receipt are implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary, exact DACL restoration, ordinary Node/Rust gates, and retained overhead samples while the container provider remains fail-closed. Only the dedicated operator-controlled Windows 11 receipt remains open.
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -107,9 +107,10 @@ output, validator read denial, or every production spawn site.
 - Native `.exe` backends are required; batch shims are refused at preparation
   to avoid forwarding model arguments through `cmd.exe`.
 
-This closes production integration. It does not yet prove ordinary Node/Rust
-contract gates, representative overhead, per-host `fs` filtering, or the final
-operator-controlled Windows 11 receipt.
+This closes production integration. Protected hosted CI also proves ordinary
+Node/Rust contract gates and representative retained-posture overhead. It does
+not yet prove per-host `fs` filtering or the final operator-controlled Windows
+11 receipt.
 
 ## Acceptance hints
 

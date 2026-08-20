@@ -89,6 +89,22 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::SandboxPrepare { targets } => {
+            for target in targets {
+                let changed = kranz_engine::sandbox_windows::prepare_appcontainer_host(&target)
+                    .map_err(anyhow::Error::msg)?;
+                let result = if changed {
+                    "applied"
+                } else {
+                    "already prepared"
+                };
+                println!(
+                    "AppContainer host preparation {result}: target={} mask=0x00120088 inheritance=none",
+                    target.display()
+                );
+            }
+            Ok(0)
+        }
         Command::Outcomes {
             json,
             all,

@@ -42,19 +42,21 @@ use windows::Win32::Foundation::{
     WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, DENY_ACCESS,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetLengthSid, GetTokenInformation, TokenIsAppContainer,
+    GetAclInformation, GetLengthSid, GetTokenInformation, TokenElevation, TokenIsAppContainer,
     WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    INHERITED_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+    WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -428,11 +430,12 @@ fn dacl_has_root_metadata_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
         unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
             EngineError::Backend(format!("failed to read drive-root DACL ACE: {error}"))
         })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0 {
+            continue;
+        }
         let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
-        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
-            || ace.Header.AceFlags != 0
-            || ace.Mask != ROOT_METADATA_ACCESS_MASK
-        {
+        if ace.Mask != ROOT_METADATA_ACCESS_MASK {
             continue;
         }
         let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
@@ -441,6 +444,169 @@ fn dacl_has_root_metadata_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RootMetadataAceState {
+    Missing,
+    Exact,
+    Conflicting { mask: u32, flags: u8 },
+}
+
+fn root_metadata_ace_state(acl: *mut ACL, sid: PSID) -> Result<RootMetadataAceState> {
+    if acl.is_null() {
+        return Err(EngineError::Backend(
+            "refusing AppContainer host preparation on a drive root with a null DACL".to_string(),
+        ));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to inspect drive-root DACL: {error}")))?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    let mut found_exact = false;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read drive-root DACL ACE: {error}"))
+        })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags & INHERITED_ACE.0 as u8 != 0
+        {
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if unsafe { EqualSid(trustee, sid) }.is_err() {
+            continue;
+        }
+        if ace.Mask == ROOT_METADATA_ACCESS_MASK && ace.Header.AceFlags == 0 {
+            found_exact = true;
+        } else {
+            return Ok(RootMetadataAceState::Conflicting {
+                mask: ace.Mask,
+                flags: ace.Header.AceFlags,
+            });
+        }
+    }
+    Ok(if found_exact {
+        RootMetadataAceState::Exact
+    } else {
+        RootMetadataAceState::Missing
+    })
+}
+
+fn validate_host_preparation_root(root: &Path) -> Result<()> {
+    let rendered = root.to_string_lossy();
+    let bytes = rendered.as_bytes();
+    if bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        Ok(())
+    } else {
+        Err(EngineError::Backend(format!(
+            "AppContainer host preparation target must be a literal local drive root (X:\\): {}",
+            root.display()
+        )))
+    }
+}
+
+fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<bool> {
+    let root_wide = wide(root.as_os_str());
+    let mut old_acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(root_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_acl),
+            None,
+            &mut descriptor,
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    match root_metadata_ace_state(old_acl, sid)? {
+        RootMetadataAceState::Exact => return Ok(false),
+        RootMetadataAceState::Conflicting { mask, flags } => {
+            return Err(EngineError::Backend(format!(
+                "{} already has a conflicting explicit allow ACE for {label}: mask=0x{mask:08x}, flags=0x{flags:02x}; refusing to merge rights",
+                root.display()
+            )));
+        }
+        RootMetadataAceState::Missing => {}
+    }
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: ROOT_METADATA_ACCESS_MASK,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast()),
+            ..Default::default()
+        },
+    };
+    let mut new_acl: *mut ACL = null_mut();
+    win32(unsafe { SetEntriesInAclW(Some(&[entry]), Some(old_acl), &mut new_acl) })?;
+    if new_acl.is_null() {
+        return Err(EngineError::Backend(
+            "SetEntriesInAclW returned a null drive-root DACL".to_string(),
+        ));
+    }
+    let _new_acl = LocalAllocation(HLOCAL(new_acl.cast()));
+    win32(unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(root_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    })?;
+    Ok(true)
+}
+
+/// Persistent, elevated host setup for one local drive root. This deliberately
+/// uses Microsoft's `GetNamedSecurityInfoW` -> `SetEntriesInAclW` ->
+/// `SetNamedSecurityInfoW` sequence rather than the managed `Set-Acl` path,
+/// which can walk the drive's descendant tree even for non-inheriting ACEs.
+pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
+    validate_host_preparation_root(root)?;
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer host preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    let _guard = DaclMutationGuard::acquire()?;
+    let mut any_package = string_sid("S-1-15-2-1", "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let changed_any = apply_named_root_metadata_ace(
+        root,
+        PSID(any_package.as_mut_ptr().cast()),
+        "ALL APPLICATION PACKAGES (S-1-15-2-1)",
+    )?;
+    let changed_restricted = apply_named_root_metadata_ace(
+        root,
+        PSID(restricted.as_mut_ptr().cast()),
+        "ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)",
+    )?;
+    verify_volume_root_prepared(root)?;
+    Ok(changed_any || changed_restricted)
 }
 
 /// Common Windows tools inspect the local drive root before user code starts.
@@ -2021,7 +2187,7 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
 fn token_flag(class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<bool> {
     let mut access_handle = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut access_handle) }
-        .map_err(|error| EngineError::Backend(format!("failed to open child token: {error}")))?;
+        .map_err(|error| EngineError::Backend(format!("failed to open process token: {error}")))?;
     let access_handle = OwnedHandle(access_handle);
     let mut value = 0u32;
     let mut returned = 0u32;
@@ -2034,7 +2200,7 @@ fn token_flag(class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<bool> {
             &mut returned,
         )
     }
-    .map_err(|error| EngineError::Backend(format!("failed to inspect child {label}: {error}")))?;
+    .map_err(|error| EngineError::Backend(format!("failed to inspect process {label}: {error}")))?;
     if returned as usize != std::mem::size_of::<u32>() {
         return Err(EngineError::Backend(format!(
             "{label} returned an unexpected byte count"
@@ -2746,6 +2912,16 @@ pub fn run_internal_launcher() -> std::result::Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_preparation_accepts_only_literal_local_drive_roots() {
+        for root in [r"C:\", r"d:\"] {
+            validate_host_preparation_root(Path::new(root)).unwrap();
+        }
+        for rejected in [r"C:", r"C:\Windows", r"\\server\share", r"C:\\", ""] {
+            assert!(validate_host_preparation_root(Path::new(rejected)).is_err());
+        }
+    }
 
     #[test]
     fn explicit_environment_carries_the_gate_drive_current_directory() {

@@ -5,26 +5,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$metadataMask = [uint32] 0x00120088
-$trustees = @(
-    @{ Name = 'ALL APPLICATION PACKAGES'; Sid = 'S-1-15-2-1' },
-    @{ Name = 'ALL RESTRICTED APPLICATION PACKAGES'; Sid = 'S-1-15-2-2' }
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$manifest = Join-Path $repoRoot 'Cargo.toml'
+$cargoArgs = @(
+    'run'
+    '--locked'
+    '--manifest-path'
+    $manifest
+    '--package'
+    'kranz'
+    '--'
+    'sandbox-prepare'
 )
-
-function Get-RuleSid {
-    param([System.Security.AccessControl.FileSystemAccessRule] $Rule)
-
-    try {
-        return $Rule.IdentityReference.Translate(
-            [System.Security.Principal.SecurityIdentifier]
-        ).Value
-    }
-    catch {
-        # An unrelated orphan SID must not make an otherwise inspectable DACL
-        # unverifiable. Its raw value cannot equal either well-known target.
-        return $Rule.IdentityReference.Value
-    }
-}
 
 foreach ($requestedRoot in ($Target | Sort-Object -Unique)) {
     if ([string]::IsNullOrWhiteSpace($requestedRoot)) {
@@ -34,55 +26,14 @@ foreach ($requestedRoot in ($Target | Sort-Object -Unique)) {
     if ($root -notmatch '^[A-Za-z]:\\$') {
         throw "AppContainer host preparation target must be a local drive root (X:\): $requestedRoot"
     }
+    $cargoArgs += @('--target', $root)
+}
 
-    $acl = Get-Acl -LiteralPath $root
-    $changed = $false
-    foreach ($trustee in $trustees) {
-        $sid = [System.Security.Principal.SecurityIdentifier]::new($trustee.Sid)
-        $explicitRules = @($acl.Access | Where-Object {
-            -not $_.IsInherited -and (Get-RuleSid $_) -eq $trustee.Sid
-        })
-        $exactRules = @($explicitRules | Where-Object {
-            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-            [uint32]([int32]$_.FileSystemRights) -eq $metadataMask -and
-            $_.InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and
-            $_.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None
-        })
-        if ($exactRules.Count -gt 0) {
-            continue
-        }
-        if ($explicitRules.Count -gt 0) {
-            throw "$root already has a conflicting explicit ACE for $($trustee.Name) ($($trustee.Sid)); refusing to merge rights"
-        }
-
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $sid,
-            [System.Security.AccessControl.FileSystemRights] $metadataMask,
-            [System.Security.AccessControl.InheritanceFlags]::None,
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $null = $acl.AddAccessRule($rule)
-        $changed = $true
-    }
-
-    if ($changed) {
-        Set-Acl -LiteralPath $root -AclObject $acl
-    }
-
-    $verifiedAcl = Get-Acl -LiteralPath $root
-    foreach ($trustee in $trustees) {
-        $verified = @($verifiedAcl.Access | Where-Object {
-            -not $_.IsInherited -and
-            (Get-RuleSid $_) -eq $trustee.Sid -and
-            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-            [uint32]([int32]$_.FileSystemRights) -eq $metadataMask -and
-            $_.InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and
-            $_.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None
-        })
-        if ($verified.Count -eq 0) {
-            throw "AppContainer host preparation did not produce the exact metadata ACE for $($trustee.Name) on $root"
-        }
-    }
-    Write-Host "AppContainer host preparation verified: target=$root mask=0x$($metadataMask.ToString('x8')) inheritance=none"
+# The Rust command owns the security-sensitive operation so the same exact
+# GetNamedSecurityInfoW -> SetEntriesInAclW -> SetNamedSecurityInfoW path is
+# compiled, cross-checked, and used by both operators and protected CI. This
+# script is only the elevated source-checkout convenience wrapper.
+& cargo @cargoArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "kranz sandbox-prepare failed with exit code $LASTEXITCODE"
 }
