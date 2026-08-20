@@ -2,17 +2,18 @@
 title: Slice 3 — kranz knowledge refresh reports drifted notes
 priority: 2
 schedule: once
-state: open
-state-note: CLI + engine report landed 2026-08-17 (kranz knowledge-refresh, path-missing/path-drifted/command-skipped/already-stale; no note rewrites; commands not executed). Dashboard/Slack surface still out of scope.
+state: done
+state-note: CLI + engine report landed 2026-08-17 and was hardened fail-closed 2026-08-18 (invalid metadata/citations and failed read/parse/Git probes are check-needed; no note rewrites or command execution). Dashboard/Slack surface remains out of scope.
 ---
 
 ## Goal
 
 Add `kranz knowledge refresh`: a report-only drift check over
-`docs/knowledge/`. When a path in a note's `verified_against` is missing
-or has commits after `last_verified`, the note is reported as
-check-needed. The command never rewrites a note and never injects a
-stale fact.
+`docs/knowledge/`. When a path in a note's `verified_against` is missing or
+has commits after `last_verified`, the note is reported as check-needed. An
+unusable date, outside-repo citation, unreadable/malformed note, or failed
+filesystem/Git probe is also check-needed: inability to prove freshness is
+never `ok`. The command never rewrites a note or changes planning injection.
 
 ## Context
 
@@ -53,13 +54,16 @@ ticket may allowlist specific gate commands; do not invent that here.
 - `kranz knowledge refresh` exits 0 when every injectable note's path
   citations exist and have no commits after `last_verified`; exits 1
   when any note is check-needed (so CI can gate it later).
-- Report names note path, title, and one verdict per citation
-  (`ok` / `already-stale` / `unverified` / `path-missing` /
-  `path-drifted` / `command-skipped`).
+- Report names note path, title, and actionable verdicts
+  (`ok` / `already-stale` / `unverified` / `invalid-metadata` /
+  `invalid-citation` / `path-missing` / `path-drifted` /
+  `command-skipped` / `probe-failed`).
 - A fixture note whose `verified_against` path was edited after
   `last_verified` is `path-drifted`. A fixture whose path was deleted
   is `path-missing`. A `freshness: stale` note is reported
   `already-stale` and does not fail the run by itself.
-- No note file is rewritten. Planning injection is unchanged.
+- No note file is rewritten. Planning injection is unchanged; after a
+  `path-drifted` report, the operator refreshes the note or marks it `stale`
+  before relying on a later plan.
 - Anti-vacuity: new tests match a unique filter (`knowledge_refresh`),
   not a substring that already passes.

@@ -2,8 +2,9 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-07-12
+last_verified: 2026-08-18
 verified_against:
+  - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
   - crates/slack/src/bridge.rs
   - crates/slack/src/format.rs
@@ -13,11 +14,14 @@ verified_against:
 
 # Slack /kranz command surface
 
-The Slack bridge speaks Socket Mode. Every inbound interaction arrives as a JSON
-*envelope* which the bridge must ack within Slack's 3 s budget. Routing is split
-from side effects on purpose: `crate::inbound` is a **pure decision layer** (no
-I/O, no clock) that maps an envelope to an [`Action`], and `crate::bridge`
-applies it.
+The single Slack bridge speaks Socket Mode for every repository in the host
+catalog. Every inbound interaction arrives as a JSON *envelope* which the
+bridge must ack within Slack's 3 s budget. `crate::catalog` first resolves an
+explicit `repo:<id>` selector, modal/thread affinity, channel mapping, or the
+only/default healthy repository and fails closed on ambiguity. Routing is then
+split from side effects: `crate::inbound` is a **pure decision layer** (no I/O,
+no clock) that maps the resolved envelope to an [`Action`], and
+`crate::bridge` applies it.
 
 ## Routing
 
@@ -65,7 +69,7 @@ the `dispatch_action` arm itself or a gate helper it calls (`approve_flow`,
 fixed `:no_entry:` ephemeral; the fail-closed-empty variant says how an admin
 opens spend deliberately) on refusal before touching the host.
 
-**Ungated (read-only):** `status [<id>]`, `todo`, `roadmap`, `ticket list`,
+**Ungated (read-only):** `status [<id>]`, `todo`, `roadmap`, `outcomes`, `ticket list`,
 `ticket show <slug>`, `work`
 (report-only — never drains on the socket loop), `help`, and `app_home_opened`.
 
