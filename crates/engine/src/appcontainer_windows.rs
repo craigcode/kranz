@@ -56,8 +56,8 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -135,6 +135,7 @@ pub struct ProductionHostileReceipt {
     pub tampered_git_pointer_refused: bool,
     pub network_denied: bool,
     pub dacl_restored: bool,
+    pub volume_root_dacl_restored: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -659,6 +660,26 @@ fn volume_root(path: &Path) -> bool {
     })
 }
 
+/// Local drive root that a Windows tool can probe during startup. Node,
+/// Cargo, and cmd all ask for root metadata even when every executable and
+/// input lives below an explicitly granted directory. Keep this narrower
+/// than `volume_root`: mutating a UNC/share root is outside Kranz's local
+/// process-provider contract.
+fn local_volume_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| {
+            let mut components = ancestor.components();
+            let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+                return false;
+            };
+            matches!(
+                prefix.kind(),
+                std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+            ) && components.all(|component| matches!(component, std::path::Component::RootDir))
+        })
+        .map(local_dos_path)
+}
+
 /// Parent directories CreateProcess must traverse to reach an entry-point
 /// file. LPAC is not Users/Everyone/ALL APPLICATION PACKAGES, so a file ACE
 /// is useless unless each ancestor also allows FILE_TRAVERSE.
@@ -1118,6 +1139,7 @@ fn acl_changes(
     let read_roots = read_roots(executable, &inputs.session_cwd, &inputs.mission_dir, env)?;
     validate_recursive_roots(inputs, &write_roots, &read_roots)?;
 
+    let toolchain_entries = toolchain_entry_points(env);
     let mut changes = Vec::new();
     let rwx = FILE_GENERIC_READ.0
         | FILE_GENERIC_WRITE.0
@@ -1125,6 +1147,29 @@ fn acl_changes(
         | FILE_DELETE_CHILD.0
         | DELETE.0;
     let rx = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
+    // LPAC opts out of the broad ALL APPLICATION PACKAGES grants. Ordinary
+    // Windows tools still probe the system-drive root during startup, so a
+    // package SID with access only to its executable can fail with
+    // ERROR_ACCESS_DENIED before user code runs. Grant this random profile
+    // only the non-inheriting metadata mask Microsoft prescribes for that
+    // probe (0x00120088), retain the root's no-follow DACL handle, and remove
+    // the SID with the rest of the lease. A host on which the operator cannot
+    // write that DACL fails closed during preparation.
+    let root_metadata = FILE_READ_ATTRIBUTES.0 | FILE_READ_EA.0 | READ_CONTROL.0 | SYNCHRONIZE.0;
+    let mut volume_roots = std::iter::once(executable)
+        .chain(toolchain_entries.iter().map(PathBuf::as_path))
+        .filter_map(local_volume_root)
+        .collect::<Vec<_>>();
+    volume_roots.sort();
+    volume_roots.dedup();
+    for root in volume_roots {
+        changes.push(AclChange {
+            path: root,
+            permissions: root_metadata,
+            inherit: false,
+            mode: AclMode::Grant,
+        });
+    }
     for root in &write_roots {
         changes.push(AclChange {
             path: root.clone(),
@@ -1142,7 +1187,7 @@ fn acl_changes(
         });
     }
     let traverse = FILE_GENERIC_EXECUTE.0;
-    for path in toolchain_entry_points(env) {
+    for path in toolchain_entries {
         changes.push(AclChange {
             path: path.clone(),
             permissions: rx,
@@ -2063,6 +2108,13 @@ fn production_hostile_self_test() -> Result<String> {
         env.remove("PATH");
     }
     let before = snapshot_dacl(&worktree)?;
+    let volume_root = local_volume_root(&executable).ok_or_else(|| {
+        EngineError::Backend(format!(
+            "self-test executable {} is not on a local Windows volume",
+            executable.display()
+        ))
+    })?;
+    let volume_root_before = snapshot_dacl(&volume_root)?;
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
     // launch functional; dropping the second must recover the exact baseline.
@@ -2098,6 +2150,7 @@ fn production_hostile_self_test() -> Result<String> {
         })?;
     drop(lease);
     let after = snapshot_dacl(&worktree)?;
+    let volume_root_after = snapshot_dacl(&volume_root)?;
     if !output.status.success() {
         return Err(EngineError::Backend(format!(
             "production AppContainer helper failed with {:?}: stdout={} stderr={}",
@@ -2113,6 +2166,7 @@ fn production_hostile_self_test() -> Result<String> {
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
     receipt.dacl_restored = before.acl == after.acl;
+    receipt.volume_root_dacl_restored = volume_root_before.acl == volume_root_after.acl;
     std::fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", outside.display()),
@@ -2138,7 +2192,8 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.overlapping_lease_safe
         && receipt.tampered_git_pointer_refused
         && receipt.network_denied
-        && receipt.dacl_restored;
+        && receipt.dacl_restored
+        && receipt.volume_root_dacl_restored;
     if !all_passed {
         return Err(EngineError::Backend(format!(
             "production hostile receipt contained a failed assertion: {receipt:?}"
@@ -2537,6 +2592,7 @@ fn hostile_child() -> Result<()> {
         },
         // The parent fills this after dropping the ACL/profile lease.
         dacl_restored: false,
+        volume_root_dacl_restored: false,
     };
     std::fs::write(
         &manifest.receipt,
@@ -2731,6 +2787,22 @@ mod tests {
         );
         assert!(volume_root(Path::new(r"\\?\C:\")));
         assert!(volume_root(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn local_volume_root_normalizes_disk_paths_and_refuses_unc_shares() {
+        assert_eq!(
+            local_volume_root(Path::new(r"\\?\C:\hostedtoolcache\windows\node\node.exe")),
+            Some(PathBuf::from(r"C:\"))
+        );
+        assert_eq!(
+            local_volume_root(Path::new(r"D:\gate\worktree\node.exe")),
+            Some(PathBuf::from(r"D:\"))
+        );
+        assert_eq!(
+            local_volume_root(Path::new(r"\\server\share\node.exe")),
+            None
+        );
     }
 
     #[test]

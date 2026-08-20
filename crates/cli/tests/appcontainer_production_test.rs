@@ -31,6 +31,7 @@ fn windows_production_appcontainer_helper_enforces_and_restores_boundary() {
         "tamperedGitPointerRefused",
         "networkDenied",
         "daclRestored",
+        "volumeRootDaclRestored",
     ] {
         assert_eq!(
             receipt.get(field),
