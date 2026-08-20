@@ -1264,6 +1264,12 @@ pub(crate) fn prepare_launch(
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
     let _guard = DaclMutationGuard::acquire()?;
+    // Key retained handles by physical Windows spelling too. A worktree can
+    // be present as both `C:\...` and canonical `\\?\C:\...` changes with
+    // different permissions, so the exact-change collapse below deliberately
+    // keeps both operations. They must still share ONE cleanup capability:
+    // removing the profile ACE repeatedly through alias handles can republish
+    // a stale inherited DACL and make the next launch lose execute access.
     let mut seen = BTreeMap::new();
     // One ancestor directory is shared by many toolchain entry points, and a
     // read root can arrive in both verbatim and plain form. Applying the same
@@ -1279,14 +1285,16 @@ pub(crate) fn prepare_launch(
         ))
     });
     for change in &changes {
-        if !seen.contains_key(&change.path) {
+        let key = comparable_path(&change.path);
+        if !seen.contains_key(&key) {
             let index = lease.original_dacls.len();
             lease.original_dacls.push(snapshot_dacl(&change.path)?);
-            seen.insert(change.path.clone(), index);
+            seen.insert(key, index);
         }
     }
     for change in &changes {
-        let snapshot = &lease.original_dacls[seen[&change.path]];
+        let key = comparable_path(&change.path);
+        let snapshot = &lease.original_dacls[seen[&key]];
         let started = std::time::Instant::now();
         apply_acl_change(change, sid.0, snapshot.handle.0)?;
         // An inheritable ACE on a directory makes Windows propagate it to
@@ -2493,6 +2501,14 @@ mod tests {
             Path::new(r"C:\Program Files"),
             Path::new(r"C:\Program Files Extra\tool.exe")
         ));
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(comparable_path(Path::new(r"C:\Gate\worktree")), 1);
+        snapshots.insert(comparable_path(Path::new(r"\\?\c:\gate\worktree")), 2);
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "one physical DACL must have one cleanup capability"
+        );
     }
 
     #[test]
