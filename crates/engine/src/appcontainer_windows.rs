@@ -293,7 +293,7 @@ impl Drop for LocalAllocation {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
     Deny,
@@ -1018,8 +1018,28 @@ fn caller_owned_path(path: &Path, cwd: &Path) -> bool {
         || path_contains(&std::env::temp_dir(), path)
 }
 
+/// The spelling every containment comparison is made in.
+/// [`std::fs::canonicalize`] returns VERBATIM paths (`\\?\C:\Program
+/// Files\...`) while environment values, operator config, and mission paths
+/// never carry that prefix, and Windows path comparison is case-insensitive
+/// besides. Both differences answered containment questions WRONG: a
+/// canonicalized entry point under `%PROGRAMFILES%` tested NO against
+/// [`system_managed_path`], so every ancestor of a hosted toolchain took a
+/// DACL change the OS charged ~90 seconds each, ten per launch (measured on
+/// windows-latest, run 32322660181).
+fn comparable_path(path: &Path) -> PathBuf {
+    PathBuf::from(
+        local_dos_path(path)
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase(),
+    )
+}
+
 fn path_contains(root: &Path, child: &Path) -> bool {
-    child == root || child.starts_with(root)
+    let root = comparable_path(root);
+    let child = comparable_path(child);
+    child == root || child.starts_with(&root)
 }
 
 fn validate_recursive_roots(
@@ -1229,12 +1249,25 @@ pub(crate) fn prepare_launch(
         original_dacls: Vec::new(),
         plan_path: None,
     };
-    let changes = acl_changes(inputs, &executable, env)?;
+    let mut changes = acl_changes(inputs, &executable, env)?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
     let _guard = DaclMutationGuard::acquire()?;
     let mut seen = BTreeMap::new();
+    // One ancestor directory is shared by many toolchain entry points, and a
+    // read root can arrive in both verbatim and plain form. Applying the same
+    // ACE twice is a no-op the OS still charges full price for, so collapse
+    // exact repeats before touching a single descriptor.
+    let mut applied = std::collections::HashSet::new();
+    changes.retain(|change| {
+        applied.insert((
+            comparable_path(&change.path),
+            change.permissions,
+            change.inherit,
+            change.mode,
+        ))
+    });
     for change in &changes {
         if !seen.contains_key(&change.path) {
             let index = lease.original_dacls.len();
@@ -2428,6 +2461,29 @@ mod tests {
             assert_eq!(value, OsString::from(r"D:\gate\worktree"));
         }
         assert!(drive_current_directory_variable(Path::new(r"\\server\share\gate")).is_none());
+    }
+
+    #[test]
+    fn containment_comparisons_see_through_verbatim_prefixes_and_case() {
+        let program_files =
+            PathBuf::from(std::env::var_os("PROGRAMFILES").expect("Windows sets PROGRAMFILES"));
+        let canonical = std::fs::canonicalize(&program_files)
+            .expect("the Program Files root canonicalizes")
+            .join("nodejs")
+            .join("node.exe");
+        // The canonical form is what push_entry_point actually tests, and it
+        // is the form that used to answer NO here.
+        assert!(system_managed_path(&canonical));
+        assert!(system_managed_path(&program_files.join("nodejs")));
+        assert!(path_contains(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"c:\program files\nodejs")
+        ));
+        // A sibling that merely shares a name prefix is still outside.
+        assert!(!path_contains(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"C:\Program Files Extra\tool.exe")
+        ));
     }
 
     #[test]
