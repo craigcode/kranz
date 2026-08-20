@@ -91,6 +91,10 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         }
         Command::SandboxPrepare { targets } => {
             for target in targets {
+                eprintln!(
+                    "Preparing AppContainer host metadata: target={}",
+                    target.display()
+                );
                 let changed = kranz_engine::sandbox_windows::prepare_appcontainer_host(&target)
                     .map_err(anyhow::Error::msg)?;
                 let result = if changed {

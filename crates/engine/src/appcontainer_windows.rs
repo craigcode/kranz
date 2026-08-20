@@ -517,6 +517,10 @@ fn validate_host_preparation_root(root: &Path) -> Result<()> {
 }
 
 fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<bool> {
+    eprintln!(
+        "AppContainer host preparation: inspecting {label} on {}",
+        root.display()
+    );
     let root_wide = wide(root.as_os_str());
     let mut old_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -533,8 +537,18 @@ fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<
         )
     })?;
     let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    eprintln!(
+        "AppContainer host preparation: inspected {label} on {}",
+        root.display()
+    );
     match root_metadata_ace_state(old_acl, sid)? {
-        RootMetadataAceState::Exact => return Ok(false),
+        RootMetadataAceState::Exact => {
+            eprintln!(
+                "AppContainer host preparation: {label} is already exact on {}",
+                root.display()
+            );
+            return Ok(false);
+        }
         RootMetadataAceState::Conflicting { mask, flags } => {
             return Err(EngineError::Backend(format!(
                 "{} already has a conflicting explicit allow ACE for {label}: mask=0x{mask:08x}, flags=0x{flags:02x}; refusing to merge rights",
@@ -563,6 +577,10 @@ fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<
         ));
     }
     let _new_acl = LocalAllocation(HLOCAL(new_acl.cast()));
+    eprintln!(
+        "AppContainer host preparation: applying {label} on {}",
+        root.display()
+    );
     win32(unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(root_wide.as_ptr()),
@@ -574,6 +592,10 @@ fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<
             None,
         )
     })?;
+    eprintln!(
+        "AppContainer host preparation: applied {label} on {}",
+        root.display()
+    );
     Ok(true)
 }
 
@@ -583,18 +605,34 @@ fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<
 /// which can walk the drive's descendant tree even for non-inheriting ACEs.
 pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
     validate_host_preparation_root(root)?;
+    eprintln!(
+        "AppContainer host preparation: validated {}",
+        root.display()
+    );
     if !token_flag(TokenElevation, "TokenElevation")? {
         return Err(EngineError::Backend(
             "AppContainer host preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
                 .to_string(),
         ));
     }
+    eprintln!(
+        "AppContainer host preparation: elevation verified for {}",
+        root.display()
+    );
     let _guard = DaclMutationGuard::acquire()?;
+    eprintln!(
+        "AppContainer host preparation: mutation lock acquired for {}",
+        root.display()
+    );
     let mut any_package = string_sid("S-1-15-2-1", "ALL APPLICATION PACKAGES")?;
     let mut restricted = string_sid(
         ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
         "ALL RESTRICTED APPLICATION PACKAGES",
     )?;
+    eprintln!(
+        "AppContainer host preparation: package SIDs built for {}",
+        root.display()
+    );
     let changed_any = apply_named_root_metadata_ace(
         root,
         PSID(any_package.as_mut_ptr().cast()),
@@ -605,6 +643,10 @@ pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
         PSID(restricted.as_mut_ptr().cast()),
         "ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)",
     )?;
+    eprintln!(
+        "AppContainer host preparation: verifying {}",
+        root.display()
+    );
     verify_volume_root_prepared(root)?;
     Ok(changed_any || changed_restricted)
 }
