@@ -107,6 +107,22 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      # AppContainer tools probe each local drive root before user code starts.
+      # The disposable runner is elevated once here to install Microsoft's
+      # exact, non-inheriting metadata-only host ACEs; the Kranz launcher only
+      # verifies them read-only and never mutates a drive root.
+      - name: Prepare Windows AppContainer host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $targets = @(
+            [System.IO.Path]::GetPathRoot($env:SystemRoot)
+            [System.IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+            [System.IO.Path]::GetPathRoot($env:RUNNER_TEMP)
+            [System.IO.Path]::GetPathRoot((Get-Command node).Source)
+            [System.IO.Path]::GetPathRoot((Get-Command cargo).Source)
+          ) | Sort-Object -Unique
+          ./scripts/prepare-windows-appcontainer.ps1 -Target $targets
       # M7 Windows containment phases 4-5: exercise the exact production
       # helper/ACL lease through the built kranz binary, prove ordinary Node
       # and Rust gates plus retained overhead samples through one production

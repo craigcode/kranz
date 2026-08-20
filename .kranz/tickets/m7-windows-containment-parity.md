@@ -84,20 +84,25 @@ output, validator read denial, or every production spawn site.
   posture owns one disposable SID across its validation/final-gate command
   batch, so expensive ACL preparation is once per posture rather than once per
   assertion. Because ordinary Windows tools probe the local drive root during
-  startup, LPAC carries a capability SID unique to that disposable profile;
-  only that capability receives the non-inheriting `0x00120088` root metadata
-  mask, and no root contents are granted. The ACL lease retains a no-follow
-  handle for every changed DACL, removes only the unique package and capability
-  SIDs' ACEs root-first, then deletes every private plan and the profile. A
-  bounded host-local mutex serializes ACL read/modify/write
+  startup, an elevated one-time host-preparation script installs Microsoft's
+  exact non-inheriting `0x00120088` metadata ACE for `S-1-15-2-1` and
+  `S-1-15-2-2` on each relevant local drive. Those ACEs grant no root listing,
+  content read, or write rights. The ordinary launcher checks them read-only
+  and fails closed with the preparation command when either exact tuple is
+  absent. The ACL lease retains a no-follow handle for every path-specific DACL
+  it changes, removes only the unique package SID's ACEs root-first, then
+  deletes every private plan and the profile. A bounded host-local mutex
+  serializes ACL read/modify/write
   batches, so overlapping launches preserve each other's grants. Authority,
   mission metadata, shared Cargo cache, and validator checkout denies are
   applied before spawn.
-- Protected Windows CI runs the exact production helper receipt through the
-  built CLI and proves an AppContainer token plus LPAC behavior by denying a
+- Protected Windows CI performs the same explicit host-preparation step, then
+  runs the exact production helper receipt through the built CLI and proves an
+  AppContainer token plus LPAC behavior by denying a
   sibling root deliberately granted to regular AppContainers, allow/deny
   behavior, shared-Git read, tampered Git-pointer refusal, network denial, overlap-safe
-  no-follow DACL cleanup, and exact uncontended restoration before checking
+  no-follow DACL cleanup, an unchanged prepared drive-root DACL, and exact
+  uncontended restoration before checking
   positive session/gate resolution and continued container refusal.
 - Native `.exe` backends are required; batch shims are refused at preparation
   to avoid forwarding model arguments through `cmd.exe`.

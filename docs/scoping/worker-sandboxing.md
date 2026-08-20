@@ -103,10 +103,12 @@ All of it asks the agent nicely. None of it constrains the process.
   AppContainer (LPAC) token, path-specific disposable-SID ACL lease, and
   pre-resume Job Object assignment for `fs`/`fs+net`. Opting out of
   `ALL APPLICATION PACKAGES` prevents ambient regular-AppContainer grants from
-  widening the path allowlist. `fs` grants internet-client access; `fs+net` is
-  hard offline. The same launcher wraps workers, validators, and engine-run
-  gates, and protected CI proves authority/real-checkout denial plus DACL
-  restoration.
+  widening the path allowlist. A one-time elevated host-preparation script adds
+  only Microsoft's non-inheriting drive-root metadata ACEs; the launcher
+  verifies the exact tuples read-only and otherwise fails closed. `fs` grants
+  internet-client access; `fs+net` is hard offline. The same launcher wraps
+  workers, validators, and engine-run gates, and protected CI proves
+  authority/real-checkout denial plus DACL restoration.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open

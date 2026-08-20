@@ -8,13 +8,16 @@
 //! and stdio pipes, so the existing async stream bounds and timeout machinery do
 //! not need a second Windows-only implementation.
 //!
-//! Filesystem authority is granted to a unique AppContainer package SID and a
-//! profile-scoped root-metadata capability: per agent session launch, or per
-//! resolved engine-gate posture across that posture's contract commands. The
-//! parent retains a no-follow handle for every DACL it changes and removes only
-//! those unique SIDs' ACEs when the launch/posture is reaped or aborted;
+//! Filesystem authority is granted to a unique AppContainer package SID: per
+//! agent session launch, or per resolved engine-gate posture across that
+//! posture's contract commands. The parent retains a no-follow handle for every
+//! DACL it changes and removes only that SID's ACEs when the launch/posture is
+//! reaped or aborted;
 //! removing an inheritable parent ACE also removes its inherited copies from
 //! descendants.
+//! An elevated one-time host step owns the two well-known, non-inheriting
+//! drive-root metadata ACEs Windows tools require; the launcher verifies those
+//! exact tuples read-only and never mutates a drive root.
 //! A bounded host-local mutex serializes those DACL read/modify/write batches,
 //! so this composes safely across overlapping launches that share Git/toolchain
 //! roots and restores the original descriptor exactly when no unrelated ACL
@@ -39,15 +42,15 @@ use windows::Win32::Foundation::{
     WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, DENY_ACCESS,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
-    FreeSid, GetAce, GetAclInformation, GetLengthSid, GetTokenInformation, TokenIsAppContainer,
+    AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
+    GetAclInformation, GetLengthSid, GetTokenInformation, TokenIsAppContainer,
     WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
     NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
@@ -57,8 +60,8 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -83,6 +86,8 @@ const SELF_TEST_MANIFEST: &str = "kranz-appcontainer-production-self-test.json";
 const DACL_MUTEX_NAME: &str = "Local\\Kranz.AppContainer.Dacl.v1";
 const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
+const ROOT_METADATA_ACCESS_MASK: u32 = 0x0012_0088;
+const ALL_RESTRICTED_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-2";
 const GATE_OVERHEAD_REPETITIONS: usize = 7;
 const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
 
@@ -247,7 +252,7 @@ pub(crate) struct AppContainerLease {
     profile_name: String,
     original_dacls: Vec<DaclSnapshot>,
     snapshot_indices: BTreeMap<PathBuf, usize>,
-    applied_changes: HashSet<(PathBuf, u32, bool, AclMode, AclTrustee)>,
+    applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
     plan_paths: Vec<PathBuf>,
 }
 
@@ -256,15 +261,13 @@ impl Drop for AppContainerLease {
         match (
             DaclMutationGuard::acquire(),
             derive_profile_sid(&self.profile_name),
-            root_metadata_capability(&self.profile_name),
         ) {
-            (Ok(_guard), Ok(sid), Ok(mut root_capability)) => {
+            (Ok(_guard), Ok(sid)) => {
                 // Parent directories first: removing their inheritable
                 // AppContainer ACEs makes Windows retract inherited copies
                 // from existing children. Remove ONLY this random profile's
-                // package and root-metadata capability ACEs; replacing whole
-                // snapshots would race overlapping launches that legitimately
-                // touch shared Git/toolchain roots.
+                // ACEs; replacing whole snapshots would race overlapping
+                // launches that legitimately touch shared Git/toolchain roots.
                 self.original_dacls
                     .sort_by_key(|entry| entry.path.components().count());
                 for snapshot in &self.original_dacls {
@@ -272,25 +275,15 @@ impl Drop for AppContainerLease {
                         tracing::error!(path = %snapshot.path.display(), error = %error,
                             "failed to remove AppContainer ACEs from a DACL");
                     }
-                    if let Err(error) =
-                        remove_sid_aces(snapshot, PSID(root_capability.as_mut_ptr().cast()))
-                    {
-                        tracing::error!(path = %snapshot.path.display(), error = %error,
-                            "failed to remove AppContainer root-metadata capability ACEs from a DACL");
-                    }
                 }
             }
-            (Err(error), _, _) => {
+            (Err(error), _) => {
                 tracing::error!(profile = %self.profile_name, error = %error,
                     "failed to lock AppContainer DACL cleanup");
             }
-            (_, Err(error), _) => {
+            (_, Err(error)) => {
                 tracing::error!(profile = %self.profile_name, error = %error,
                     "failed to derive AppContainer SID for DACL cleanup");
-            }
-            (_, _, Err(error)) => {
-                tracing::error!(profile = %self.profile_name, error = %error,
-                    "failed to derive AppContainer root-metadata capability for DACL cleanup");
             }
         }
         for path in self.plan_paths.drain(..) {
@@ -324,38 +317,10 @@ impl Drop for LocalAllocation {
     }
 }
 
-struct LocalSidArray {
-    values: *mut PSID,
-    count: u32,
-}
-
-impl Drop for LocalSidArray {
-    fn drop(&mut self) {
-        if self.values.is_null() {
-            return;
-        }
-        let values = unsafe { std::slice::from_raw_parts(self.values, self.count as usize) };
-        for sid in values {
-            unsafe {
-                LocalFree(Some(HLOCAL(sid.0)));
-            }
-        }
-        unsafe {
-            LocalFree(Some(HLOCAL(self.values.cast())));
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
     Deny,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum AclTrustee {
-    Profile,
-    RootMetadataCapability,
 }
 
 struct AclChange {
@@ -363,7 +328,6 @@ struct AclChange {
     permissions: u32,
     inherit: bool,
     mode: AclMode,
-    trustee: AclTrustee,
 }
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -376,75 +340,17 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<()> {
         .map_err(|error| EngineError::Backend(format!("Windows ACL operation failed: {error}")))
 }
 
-fn root_metadata_capability_name(profile_name: &str) -> String {
-    format!("{profile_name}.root-metadata")
-}
-
-/// Derive one capability SID unique to the disposable profile. LPAC opts out
-/// of broad AppContainer groups and therefore needs an explicit capability for
-/// resources such as the system-drive metadata probe. Keeping this capability
-/// profile-scoped avoids the persistent `ALL RESTRICTED APPLICATION PACKAGES`
-/// root ACE used by host-wide AppContainer preparation.
-fn root_metadata_capability(profile_name: &str) -> Result<Vec<u8>> {
-    let name = wide(root_metadata_capability_name(profile_name));
-    let mut group_values: *mut PSID = null_mut();
-    let mut group_count = 0u32;
-    let mut capability_values: *mut PSID = null_mut();
-    let mut capability_count = 0u32;
-    unsafe {
-        DeriveCapabilitySidsFromName(
-            PCWSTR(name.as_ptr()),
-            &mut group_values,
-            &mut group_count,
-            &mut capability_values,
-            &mut capability_count,
-        )
-    }
-    .map_err(|error| {
-        EngineError::Backend(format!(
-            "failed to derive the AppContainer root-metadata capability: {error}"
-        ))
-    })?;
-    let _groups = LocalSidArray {
-        values: group_values,
-        count: group_count,
-    };
-    let capabilities = LocalSidArray {
-        values: capability_values,
-        count: capability_count,
-    };
-    if capabilities.count != 1 || capabilities.values.is_null() {
-        return Err(EngineError::Backend(format!(
-            "AppContainer root-metadata capability derivation returned {} SIDs instead of one",
-            capabilities.count
-        )));
-    }
-    let sid = unsafe { *capabilities.values };
-    let len = unsafe { GetLengthSid(sid) } as usize;
-    if len == 0 {
-        return Err(EngineError::Backend(
-            "AppContainer root-metadata capability SID had zero length".to_string(),
-        ));
-    }
-    Ok(unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec())
-}
-
 fn create_profile() -> Result<(String, OwnedSid)> {
     let profile_name = format!("kranz.production.{}", uuid::Uuid::new_v4().simple());
     let name = wide(&profile_name);
     let display = wide("Kranz contained process");
     let description = wide("Disposable Kranz AppContainer profile");
-    let mut root_capability = root_metadata_capability(&profile_name)?;
-    let capabilities = [SID_AND_ATTRIBUTES {
-        Sid: PSID(root_capability.as_mut_ptr().cast()),
-        Attributes: SE_GROUP_ENABLED as u32,
-    }];
     let sid = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(description.as_ptr()),
-            Some(&capabilities),
+            None,
         )
     }
     .map_err(|error| {
@@ -499,6 +405,109 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
         acl,
         handle,
     })
+}
+
+fn dacl_has_root_metadata_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
+    if acl.is_null() {
+        return Ok(false);
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to inspect drive-root DACL: {error}")))?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read drive-root DACL ACE: {error}"))
+        })?;
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+            || ace.Header.AceFlags != 0
+            || ace.Mask != ROOT_METADATA_ACCESS_MASK
+        {
+            continue;
+        }
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if unsafe { EqualSid(trustee, sid) }.is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Common Windows tools inspect the local drive root before user code starts.
+/// LPAC's restricted-package group must already have Microsoft's minimal,
+/// non-inheriting metadata ACE there. This check is read-only and deliberately
+/// separate from the unprivileged launcher; host-wide preparation belongs to
+/// an elevated, auditable operator step.
+fn verify_volume_root_prepared(root: &Path) -> Result<()> {
+    let root_wide = wide(root.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(root_wide.as_ptr()),
+            READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to inspect AppContainer host preparation on {}: {error}",
+            root.display()
+        ))
+    })?;
+    let mut acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut acl),
+            None,
+            Some(&mut descriptor),
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let any_package_present =
+        dacl_has_root_metadata_ace(acl, PSID(any_package.as_mut_ptr().cast()))?;
+    let restricted_present = dacl_has_root_metadata_ace(acl, PSID(restricted.as_mut_ptr().cast()))?;
+    if any_package_present && restricted_present {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !any_package_present {
+        missing.push("S-1-15-2-1");
+    }
+    if !restricted_present {
+        missing.push(ALL_RESTRICTED_APPLICATION_PACKAGES_SID);
+    }
+    Err(EngineError::Backend(format!(
+        "AppContainer host preparation is missing the exact non-inheriting 0x{ROOT_METADATA_ACCESS_MASK:08x} metadata ACE for {} on {}; run scripts/prepare-windows-appcontainer.ps1 -Target '{}' once from elevated PowerShell",
+        missing.join(" and "),
+        root.display(),
+        root.display()
+    )))
 }
 
 fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
@@ -1247,39 +1256,12 @@ fn acl_changes(
         | FILE_DELETE_CHILD.0
         | DELETE.0;
     let rx = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
-    // LPAC opts out of the broad ALL APPLICATION PACKAGES grants. Ordinary
-    // Windows tools still probe the system-drive root during startup, so a
-    // package SID with access only to its executable can fail with
-    // ERROR_ACCESS_DENIED before user code runs. Grant the random profile's
-    // explicit root-metadata capability only the non-inheriting mask Microsoft
-    // prescribes for that probe (0x00120088), retain the root's no-follow DACL
-    // handle, and remove the capability ACE with the rest of the lease. A host
-    // on which the operator cannot write that DACL fails closed during
-    // preparation. This avoids a persistent broad ALL RESTRICTED APPLICATION
-    // PACKAGES grant while satisfying LPAC's dual-principal access check.
-    let root_metadata = FILE_READ_ATTRIBUTES.0 | FILE_READ_EA.0 | READ_CONTROL.0 | SYNCHRONIZE.0;
-    let mut volume_roots = std::iter::once(executable)
-        .chain(toolchain_entries.iter().map(PathBuf::as_path))
-        .filter_map(local_volume_root)
-        .collect::<Vec<_>>();
-    volume_roots.sort();
-    volume_roots.dedup();
-    for root in volume_roots {
-        changes.push(AclChange {
-            path: root,
-            permissions: root_metadata,
-            inherit: false,
-            mode: AclMode::Grant,
-            trustee: AclTrustee::RootMetadataCapability,
-        });
-    }
     for root in &write_roots {
         changes.push(AclChange {
             path: root.clone(),
             permissions: rwx,
             inherit: true,
             mode: AclMode::Grant,
-            trustee: AclTrustee::Profile,
         });
     }
     for root in &read_roots {
@@ -1288,7 +1270,6 @@ fn acl_changes(
             permissions: rx,
             inherit: root.is_dir(),
             mode: AclMode::Grant,
-            trustee: AclTrustee::Profile,
         });
     }
     let traverse = FILE_GENERIC_EXECUTE.0;
@@ -1298,7 +1279,6 @@ fn acl_changes(
             permissions: rx,
             inherit: false,
             mode: AclMode::Grant,
-            trustee: AclTrustee::Profile,
         });
         for ancestor in ancestor_directories(&path) {
             changes.push(AclChange {
@@ -1306,7 +1286,6 @@ fn acl_changes(
                 permissions: traverse,
                 inherit: false,
                 mode: AclMode::Grant,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1324,7 +1303,6 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: false,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1335,7 +1313,6 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: true,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1347,7 +1324,6 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: false,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1358,7 +1334,6 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: true,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1376,7 +1351,6 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: false,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1387,7 +1361,6 @@ fn acl_changes(
                 permissions: deny_write,
                 inherit: true,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1398,7 +1371,6 @@ fn acl_changes(
                 permissions: deny_all,
                 inherit: entry.is_dir,
                 mode: AclMode::Deny,
-                trustee: AclTrustee::Profile,
             });
         }
     }
@@ -1490,8 +1462,17 @@ fn prepare_launch_for_lease(
     let path = contained_search_path(inputs, &executable, env)?;
     let mut acl_env = env.clone();
     acl_env.insert("PATH".to_string(), path.clone());
+    let toolchain_entries = toolchain_entry_points(&acl_env);
+    let mut volume_roots = std::iter::once(executable.as_path())
+        .chain(toolchain_entries.iter().map(PathBuf::as_path))
+        .filter_map(local_volume_root)
+        .collect::<Vec<_>>();
+    volume_roots.sort();
+    volume_roots.dedup();
+    for root in &volume_roots {
+        verify_volume_root_prepared(root)?;
+    }
     let mut changes = acl_changes(inputs, &executable, &acl_env)?;
-    let mut root_capability = root_metadata_capability(&lease.profile_name)?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
@@ -1499,7 +1480,7 @@ fn prepare_launch_for_lease(
     // Key retained handles by physical Windows spelling too. A worktree can
     // be present as both `C:\...` and canonical `\\?\C:\...` changes with
     // different permissions, so the exact-change collapse below deliberately
-    // keeps both operations. They must still share ONE cleanup capability:
+    // keeps both operations. They must still share ONE retained handle:
     // removing the profile ACE repeatedly through alias handles can republish
     // a stale inherited DACL and make the next launch lose execute access.
     // One ancestor directory is shared by many toolchain entry points, and a
@@ -1513,7 +1494,6 @@ fn prepare_launch_for_lease(
             change.permissions,
             change.inherit,
             change.mode,
-            change.trustee,
         ))
     });
     for change in &changes {
@@ -1526,23 +1506,13 @@ fn prepare_launch_for_lease(
     }
     for change in &changes {
         let key = comparable_path(&change.path);
-        let applied_key = (
-            key.clone(),
-            change.permissions,
-            change.inherit,
-            change.mode,
-            change.trustee,
-        );
+        let applied_key = (key.clone(), change.permissions, change.inherit, change.mode);
         if lease.applied_changes.contains(&applied_key) {
             continue;
         }
         let handle = lease.original_dacls[lease.snapshot_indices[&key]].handle.0;
         let started = std::time::Instant::now();
-        let trustee = match change.trustee {
-            AclTrustee::Profile => sid,
-            AclTrustee::RootMetadataCapability => PSID(root_capability.as_mut_ptr().cast()),
-        };
-        apply_acl_change(change, trustee, handle)?;
+        apply_acl_change(change, sid, handle)?;
         lease.applied_changes.insert(applied_key);
         // An inheritable ACE on a directory makes Windows propagate it to
         // every existing descendant, so one grant costs a full tree rewrite.
@@ -1766,6 +1736,21 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE, label: &str) -> Result<Vec<u8>> {
     Ok(storage)
 }
 
+fn string_sid(value: &str, label: &str) -> Result<Vec<u8>> {
+    let value = wide(value);
+    let mut sid = PSID::default();
+    unsafe { ConvertStringSidToSidW(PCWSTR(value.as_ptr()), &mut sid) }
+        .map_err(|error| EngineError::Backend(format!("failed to build {label} SID: {error}")))?;
+    let allocation = LocalAllocation(HLOCAL(sid.0));
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    if len == 0 {
+        return Err(EngineError::Backend(format!("{label} SID had zero length")));
+    }
+    let storage = unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec();
+    drop(allocation);
+    Ok(storage)
+}
+
 fn internet_capability() -> Result<Vec<u8>> {
     well_known_sid(WinCapabilityInternetClientSid, "internetClient capability")
 }
@@ -1935,18 +1920,16 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
         ));
     }
     let sid = derive_profile_sid(&plan.profile_name)?;
-    let mut root_capability = root_metadata_capability(&plan.profile_name)?;
     let mut internet_sid = plan.allow_network.then(internet_capability).transpose()?;
-    let mut capabilities = vec![SID_AND_ATTRIBUTES {
-        Sid: PSID(root_capability.as_mut_ptr().cast()),
-        Attributes: SE_GROUP_ENABLED as u32,
-    }];
-    if let Some(storage) = internet_sid.as_mut() {
-        capabilities.push(SID_AND_ATTRIBUTES {
-            Sid: PSID(storage.as_mut_ptr().cast()),
-            Attributes: SE_GROUP_ENABLED as u32,
-        });
-    }
+    let mut capabilities = internet_sid
+        .as_mut()
+        .map(|storage| {
+            vec![SID_AND_ATTRIBUTES {
+                Sid: PSID(storage.as_mut_ptr().cast()),
+                Attributes: SE_GROUP_ENABLED as u32,
+            }]
+        })
+        .unwrap_or_default();
     let security = SECURITY_CAPABILITIES {
         AppContainerSid: sid.0,
         Capabilities: if capabilities.is_empty() {
@@ -2143,7 +2126,6 @@ fn production_hostile_self_test() -> Result<String> {
                 | DELETE.0,
             inherit: true,
             mode: AclMode::Grant,
-            trustee: AclTrustee::Profile,
         };
         let _guard = DaclMutationGuard::acquire()?;
         apply_acl_change(
@@ -2932,18 +2914,6 @@ mod tests {
             local_volume_root(Path::new(r"\\server\share\node.exe")),
             None
         );
-    }
-
-    #[test]
-    fn root_metadata_capability_is_stable_and_profile_scoped() {
-        let first =
-            root_metadata_capability("kranz.production.first").expect("first capability derives");
-        let first_again = root_metadata_capability("kranz.production.first")
-            .expect("first capability derives again");
-        let second =
-            root_metadata_capability("kranz.production.second").expect("second capability derives");
-        assert_eq!(first, first_again);
-        assert_ne!(first, second);
     }
 
     #[test]

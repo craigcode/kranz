@@ -79,14 +79,17 @@ experimental FlatBuffer contract.
 
 If the experimental API cannot meet the support bar, the fallback is a direct
 AppContainer/LPAC launcher using stable Win32 APIs. That route must solve
-toolchain executable/read access and path-specific ACL grants without leaving
-persistent broad ACEs behind. A full-trust MSIX package or restricted token is
-not an acceptable fallback.
+toolchain executable/read access and path-specific ACL grants without broad
+inherited or content-access ACEs. A minimal host-wide, non-inheriting drive-root
+metadata grant is acceptable only when it matches Microsoft's documented tuple
+and is installed by a separate elevated preparation step. A full-trust MSIX
+package or restricted token is not an acceptable fallback.
 
 Primary references:
 
 - [Microsoft AppContainer isolation](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation)
 - [Microsoft Launch an AppContainer](https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer)
+- [Microsoft MXC AppContainer host preparation](https://github.com/microsoft/mxc/blob/main/docs/host-prep.md)
 - [Microsoft Create Process in Sandbox (experimental)](https://learn.microsoft.com/windows/win32/secauthz/createprocessinsandbox)
 - [GitHub Actions container-runner requirement](https://docs.github.com/actions/tutorials/use-containerized-services/use-docker-service-containers)
 
@@ -184,13 +187,20 @@ executable, toolchain, and shared Git metadata. The shared Git root is derived
 from the trusted repository and every writable worktree pointer must resolve
 back to that same common directory.
 Node, Cargo, and cmd also probe their local drive root during startup. LPAC's
-dual-principal access check means the package SID alone is insufficient, so the
-lease derives and carries a capability SID unique to the disposable profile.
-Only that capability receives the non-inheriting `0x00120088` metadata mask
-(`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) on each
-relevant local drive root; it grants no root content access and is removed with
-the profile. This avoids a persistent broad AppContainer-group grant. Hosts
-that cannot write the root DACL fail closed during preparation.
+dual-principal access check means the package SID alone is insufficient.
+[`scripts/prepare-windows-appcontainer.ps1`](../../scripts/prepare-windows-appcontainer.ps1)
+is therefore a separate, elevated, one-time host step: on every relevant local
+drive root it installs the exact non-inheriting `0x00120088` metadata mask
+(`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) for
+`ALL APPLICATION PACKAGES` (`S-1-15-2-1`) and
+`ALL RESTRICTED APPLICATION PACKAGES` (`S-1-15-2-2`). It refuses conflicting
+explicit ACEs instead of merging rights. The mask grants no root listing,
+content read, or write access, and does not propagate below the root. The
+ordinary Kranz launcher only verifies those exact tuples with `READ_CONTROL`;
+missing preparation fails before the hostile child starts and names the
+elevated command to run. This follows Microsoft's AppContainer host-preparation
+contract instead of trying to substitute a per-profile capability for a
+well-known restricted-package principal.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the
@@ -211,8 +221,8 @@ sibling-root write denial even after a separate sibling is granted to
 `ALL APPLICATION PACKAGES`, authority and real-checkout read denial, shared-Git
 read access, rejection of a tampered worktree Git pointer, hard-offline
 `fs+net`, safe overlapping leases, and exact uncontended worktree plus local
-drive-root DACL restoration. The resolver is enabled only behind that exact
-production path.
+drive-root DACL stability after the explicit host-preparation baseline. The
+resolver is enabled only behind that exact production path.
 
 Honest constraints remain. Agent backends must resolve to a native `.exe`;
 batch shims are refused because forwarding model-generated arguments through
