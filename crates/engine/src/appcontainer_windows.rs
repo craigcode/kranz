@@ -747,6 +747,11 @@ fn contained_search_path(
         })
 }
 
+/// A single ACL grant slower than this is reported by path: it means the
+/// root carries enough existing descendants that inheritance propagation,
+/// not the launch itself, is the cost.
+const SLOW_ACL_GRANT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const GIT_POINTER_MAX_BYTES: u64 = 4096;
 
 fn read_small_regular_file(path: &Path, label: &str) -> Result<String> {
@@ -1239,7 +1244,28 @@ pub(crate) fn prepare_launch(
     }
     for change in &changes {
         let snapshot = &lease.original_dacls[seen[&change.path]];
+        let started = std::time::Instant::now();
         apply_acl_change(change, sid.0, snapshot.handle.0)?;
+        // An inheritable ACE on a directory makes Windows propagate it to
+        // every existing descendant, so one grant costs a full tree rewrite.
+        // Name any root where that dominates the launch instead of letting a
+        // wrapped command look mysteriously slow.
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_ACL_GRANT {
+            tracing::warn!(
+                path = %change.path.display(),
+                inherit = change.inherit,
+                elapsed_ms = elapsed.as_millis(),
+                "AppContainer ACL grant propagated slowly; an inheritable ACE rewrites every \
+                 descendant of this root"
+            );
+            eprintln!(
+                "slow AppContainer ACL grant: path={} inherit={} elapsed_ms={}",
+                change.path.display(),
+                change.inherit,
+                elapsed.as_millis()
+            );
+        }
     }
 
     let path = contained_search_path(inputs, &executable, env)?;
