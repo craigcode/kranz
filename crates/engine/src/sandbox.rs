@@ -2859,8 +2859,10 @@ mod tests {
         std::fs::write(&public, "public").unwrap();
         let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
 
-        // The /dev/null mask hides the content rather than failing the open:
-        // cat "succeeds" with empty output.
+        // A /dev/null mask can surface as an empty successful read or EACCES,
+        // depending on the host's user-namespace/AppArmor policy. Both are a
+        // valid read-deny boundary; the public-file control below proves the
+        // child itself can still read ordinary repository content.
         let masked = Command::new("bwrap")
             .args(
                 bubblewrap_args(
@@ -2873,13 +2875,9 @@ mod tests {
             .output()
             .expect("failed to run bwrap");
         assert!(
-            masked.status.success(),
-            "reading the masked path must not fail the session: {}",
-            String::from_utf8_lossy(&masked.stderr)
-        );
-        assert!(
-            !String::from_utf8_lossy(&masked.stdout).contains("secret"),
-            "serve.token content must be masked inside the sandbox"
+            masked.stdout.is_empty(),
+            "serve.token content must be masked inside the sandbox: {}",
+            String::from_utf8_lossy(&masked.stdout)
         );
 
         let control = Command::new("bwrap")
