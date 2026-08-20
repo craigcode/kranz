@@ -1035,19 +1035,34 @@ impl GitRepo {
     /// Used by knowledge-refresh drift checks: a note whose `verified_against`
     /// path has history after `last_verified` is check-needed. Empty history
     /// (unknown path, or no commits in the window) is `false`, not an error.
-    /// Flag-shaped paths and non-date `since` values are refused before git
-    /// runs.
+    /// Flag-shaped/non-repository paths and invalid dates are refused before
+    /// git runs. A non-zero `git log` is an error, never "unchanged".
     pub fn path_changed_since(&self, path: &str, since_ymd: &str) -> Result<bool> {
-        if path.starts_with('-') || path.contains('\0') {
+        let candidate = Path::new(path);
+        if path.starts_with('-')
+            || path.contains('\0')
+            || path.is_empty()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
             return Err(EngineError::Git(format!(
-                "refusing path_changed_since with flag-shaped path {path:?}"
+                "refusing path_changed_since with non-repository path {path:?}"
             )));
         }
-        if since_ymd.len() != 10
-            || !since_ymd.as_bytes().get(4).is_some_and(|c| *c == b'-')
-            || !since_ymd.as_bytes().get(7).is_some_and(|c| *c == b'-')
-            || !since_ymd.chars().all(|c| c.is_ascii_digit() || c == '-')
-        {
+        let since_date =
+            chrono::NaiveDate::parse_from_str(since_ymd, "%Y-%m-%d").map_err(|_| {
+                EngineError::Git(format!(
+                    "refusing path_changed_since with non YYYY-MM-DD date {since_ymd:?}"
+                ))
+            })?;
+        let normalized_since = since_date.format("%Y-%m-%d");
+        if normalized_since.to_string() != since_ymd {
             return Err(EngineError::Git(format!(
                 "refusing path_changed_since with non YYYY-MM-DD date {since_ymd:?}"
             )));
@@ -1055,10 +1070,13 @@ impl GitRepo {
         // Exclusive of the verification calendar day: `--since=YYYY-MM-DD`
         // includes that midnight, so a note verified the same day it was
         // committed would false-drift. End-of-day keeps date granularity.
-        let since = format!("--since={since_ymd}T23:59:59");
+        let since = format!("--since={normalized_since}T23:59:59");
         let out = self.probe(&["log", "-1", &since, "--format=%H", "--", path])?;
         if !out.status.success() {
-            return Ok(false);
+            return Err(EngineError::Git(format!(
+                "path_changed_since probe failed for {path:?}: {}",
+                failure_detail(&out)
+            )));
         }
         Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
     }
@@ -1679,6 +1697,80 @@ fn failure_detail(out: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_git(root: &Path, args: &[&str]) -> Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("spawn git")
+    }
+
+    fn init_test_repo(root: &Path) {
+        if !test_git(root, &["init", "-b", "main"]).status.success() {
+            assert!(test_git(root, &["init"]).status.success());
+        }
+        assert!(test_git(root, &["config", "user.name", "kranz-test"])
+            .status
+            .success());
+        assert!(
+            test_git(root, &["config", "user.email", "test@kranz.local"])
+                .status
+                .success()
+        );
+    }
+
+    fn commit_test_repo_at(root: &Path, message: &str, timestamp: &str) {
+        assert!(test_git(root, &["add", "-A"]).status.success());
+        let output = Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", message])
+            .current_dir(root)
+            .env("GIT_AUTHOR_DATE", timestamp)
+            .env("GIT_COMMITTER_DATE", timestamp)
+            .output()
+            .expect("spawn git commit");
+        assert!(output.status.success(), "git commit failed: {output:?}");
+    }
+
+    #[test]
+    fn path_changed_since_excludes_verification_day_and_detects_later_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        std::fs::write(dir.path().join("evidence.md"), "v1\n").unwrap();
+        commit_test_repo_at(dir.path(), "seed", "2026-07-08T12:00:00Z");
+        let repo = GitRepo::open(dir.path()).unwrap();
+
+        assert!(!repo
+            .path_changed_since("evidence.md", "2026-07-08")
+            .unwrap());
+
+        std::fs::write(dir.path().join("evidence.md"), "v2\n").unwrap();
+        commit_test_repo_at(dir.path(), "later", "2026-07-09T12:00:00Z");
+        assert!(repo
+            .path_changed_since("evidence.md", "2026-07-08")
+            .unwrap());
+        assert!(!repo
+            .path_changed_since("evidence.md", "2026-07-09")
+            .unwrap());
+    }
+
+    #[test]
+    fn path_changed_since_refuses_invalid_inputs_and_propagates_git_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        std::fs::write(dir.path().join("evidence.md"), "uncommitted\n").unwrap();
+        let repo = GitRepo::open(dir.path()).unwrap();
+
+        assert!(repo
+            .path_changed_since("../outside.md", "2026-07-08")
+            .is_err());
+        assert!(repo
+            .path_changed_since("evidence.md", "not-a-date")
+            .is_err());
+        assert!(repo
+            .path_changed_since("evidence.md", "2026-07-08")
+            .is_err());
+    }
 
     /// git on Windows cannot parse verbatim (`\\?\C:\...`) paths — the
     /// prefix is stripped for git arguments (worktree add/remove). On all

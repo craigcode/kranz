@@ -85,6 +85,14 @@ fn write_events(repo: &Path, mission_id: &str, kinds: Vec<EventKind>) -> PathBuf
     path
 }
 
+fn git(repo: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git")
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing (every subcommand, incl. flags)
 // ---------------------------------------------------------------------------
@@ -132,6 +140,69 @@ fn kranz_init_parses_detection_and_registration_answers() {
         other => panic!("expected init, got {other:?}"),
     }
     assert!(Cli::try_parse_from(["kranz", "init", "--id", "alpha"]).is_err());
+}
+
+/// Exit code only; the `--json` payload shape is pinned by
+/// `knowledge_refresh_report_serializes_verdicts_for_json_output` in the engine.
+#[test]
+fn knowledge_refresh_cli_returns_one_for_unverified_note() {
+    let repo = tempfile::tempdir().unwrap();
+    let vault = repo.path().join("docs/knowledge");
+    fs::create_dir_all(&vault).unwrap();
+    fs::write(
+        vault.join("unverified.md"),
+        "---\ntitle: Unverified\nowner: agent\nfreshness: check-on-touch\nlast_verified: 2026-08-18\nverified_against:\n---\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        commands::cmd_knowledge_refresh(repo.path(), false).unwrap(),
+        1
+    );
+    assert_eq!(
+        commands::cmd_knowledge_refresh(repo.path(), true).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn knowledge_refresh_cli_returns_zero_for_verified_note() {
+    let repo = tempfile::tempdir().unwrap();
+    if !git(repo.path(), &["init", "-b", "main"]).status.success() {
+        assert!(git(repo.path(), &["init"]).status.success());
+    }
+    assert!(git(repo.path(), &["config", "user.name", "kranz-test"])
+        .status
+        .success());
+    assert!(
+        git(repo.path(), &["config", "user.email", "test@kranz.local"])
+            .status
+            .success()
+    );
+    fs::write(repo.path().join("AGENTS.md"), "rules\n").unwrap();
+    let vault = repo.path().join("docs/knowledge");
+    fs::create_dir_all(&vault).unwrap();
+    fs::write(
+        vault.join("verified.md"),
+        "---\ntitle: Verified\nowner: agent\nfreshness: check-on-touch\nlast_verified: 2099-01-01\nverified_against:\n  - AGENTS.md\n---\n",
+    )
+    .unwrap();
+    assert!(git(repo.path(), &["add", "-A"]).status.success());
+    assert!(git(
+        repo.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-m", "seed"]
+    )
+    .status
+    .success());
+
+    assert_eq!(
+        commands::cmd_knowledge_refresh(repo.path(), false).unwrap(),
+        0
+    );
+    assert_eq!(
+        commands::cmd_knowledge_refresh(repo.path(), true).unwrap(),
+        0
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-07-09
+last_verified: 2026-08-18
 verified_against:
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
@@ -13,6 +13,7 @@ verified_against:
   - crates/engine/src/event_log.rs
   - crates/engine/src/runner.rs
   - crates/cli/src/commands.rs
+  - crates/engine/src/knowledge.rs
   - .github/workflows/ci.yml
   - docs/tickets.md
 ---
@@ -29,11 +30,20 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-`.github/workflows/ci.yml` runs the same fmt/clippy/test gates on
-ubuntu+windows (no standalone `build` job — `cargo test` covers it), plus an
-Ubuntu `cargo check --workspace --locked` job on the declared Rust 1.88 MSRV.
-Its dashboard job runs `npm ci`, `npx tsc -b`, `npm run build`, `npm run test`,
-`npm run lint` under `apps/dashboard`.
+`.github/workflows/ci.yml` runs fmt/clippy/workspace tests on Ubuntu and
+Windows (no standalone `build` job — `cargo test` covers it), a separate macOS
+workspace suite, and a wrapped macOS dogfood suite. The Windows lane begins
+with the production LPAC/AppContainer containment receipts. The MSRV lane runs
+`cargo check --workspace --locked` on Rust 1.88. Dedicated jobs cover the
+full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
+dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
+`npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
+tests, and lint.
+
+The `knowledge-refresh` job checks out full history, then runs
+`cargo run --locked --package kranz -- knowledge-refresh`. Full history is
+required: a shallow clone cannot prove whether a cited path changed after a
+note's `last_verified` date. Any stale or unverifiable note fails the job.
 
 **Why not `-p kranz-engine`?** A crate-scoped pass hides breakage in the
 crate's consumers (cli, server, slack). `--workspace` is the only trustworthy
@@ -50,8 +60,8 @@ it as ([AGENTS.md](../../../AGENTS.md) rule 5):
 cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'
 ```
 
-The `[1-9]` forces at least one passing test. Docs prefer the stricter
-`grep -qE 'result: ok\. [1-9][0-9]* passed'` ([docs/tickets.md](../../tickets.md)).
+The `[1-9]` forces at least one passing test. Before shipping the filter, also
+confirm it does not collide with a pre-existing test name.
 
 ## Empty-deliverable safety net
 

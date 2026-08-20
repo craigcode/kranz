@@ -10,6 +10,20 @@ permissions:
   contents: read
 
 jobs:
+  # Dogfood the tracked knowledge vault as an honesty gate. Full history is
+  # load-bearing: the detector asks whether cited paths changed after each
+  # note's last_verified date, which a shallow checkout cannot answer.
+  knowledge-refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fail on stale or unverifiable knowledge
+        run: cargo run --locked --package kranz -- knowledge-refresh
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:

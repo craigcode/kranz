@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-07-08
+last_verified: 2026-08-18
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -65,9 +65,10 @@ snapshot) right after each run.
 
 `MissionState` (types.rs) holds `mission` (goal, pinned `base_sha`, milestones,
 status), a `runs` BTreeMap (deterministic serialization), token/cost totals,
-`pending_user_messages`, capped `recent_decisions`, live `config`,
-`pending_revision`, and `last_seq`. Mission → milestones → features is the work
-tree; full `WorkerRun` records live in `runs` (features hold run-id refs).
+pending messages/revisions/grants/questions, capped `recent_decisions`, live
+`config`, workspace/provenance projections, and `last_seq`. Mission →
+milestones → features is the work tree; full `WorkerRun` records live in
+`runs` (features hold run-id refs).
 `types.rs` and `events.rs` are marked CONTRACT FILEs: report needed changes,
 don't edit them in an implementation phase.
 
@@ -94,14 +95,15 @@ Conceptual stages and where they live:
 
 ## The run loop (orchestrator.rs `run_loop`)
 
-Each iteration: (a) `drain_control` (pause/resume/msg/config/revision inbox);
-return on Complete/Failed; idle-poll while Paused or a `pending_revision` gate is
-open. Then (d) find the first incomplete milestone — none ⇒ `final_gate`; (e) a
-Blocked milestone waits for a user message (`handle_blocked`); (c) queued user
-messages ⇒ `consult_user_messages`; (f) a Pending milestone emits
-`milestone.started` (recording `start_sha` for start..HEAD validator diffs),
-then `run_feature` for the `next_feature`, else `validation_round`. Parallel
-batches only when `max_parallel_workers > 1`.
+Before the loop, preflight and routing/standards ownership checks are surfaced,
+then the pinned workspace provider provisions and runs bootstrap/readiness.
+Each iteration drains control; returns on Complete/Failed; parks while Paused
+or while a revision/capability grant awaits a human decision; then finds the
+first incomplete milestone (none ⇒ `final_gate`). A Blocked milestone waits
+for guidance; queued messages consult the orchestrator; a Pending milestone
+records `start_sha`; then the next feature runs or the milestone enters
+`validation_round`. Parallel batches remain opt-in via
+`max_parallel_workers > 1`.
 
 So the loop walks **milestones → features → workers → validators → judgement**:
 `run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
