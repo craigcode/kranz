@@ -25,6 +25,7 @@ use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -110,7 +111,18 @@ fn seed_codex_scratch_home(
             let src = source.join(entry);
             let dst = codex_dir.join(entry);
             if src.is_file() {
-                std::fs::copy(&src, &dst)?;
+                // Create and stream instead of CopyFile: the scratch copy must
+                // inherit the destination directory's ACL rather than any
+                // protected descriptor attached to operator credentials.
+                // This also avoids CopyFile's intermittent ERROR_PATH_NOT_FOUND
+                // on hosted Windows runners after AppContainer ACL exercises.
+                let mut source = std::fs::File::open(&src)?;
+                let mut target = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dst)?;
+                std::io::copy(&mut source, &mut target)?;
+                target.flush()?;
             }
         }
     }
