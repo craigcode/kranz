@@ -14,9 +14,16 @@ $trustees = @(
 function Get-RuleSid {
     param([System.Security.AccessControl.FileSystemAccessRule] $Rule)
 
-    return $Rule.IdentityReference.Translate(
-        [System.Security.Principal.SecurityIdentifier]
-    ).Value
+    try {
+        return $Rule.IdentityReference.Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+    catch {
+        # An unrelated orphan SID must not make an otherwise inspectable DACL
+        # unverifiable. Its raw value cannot equal either well-known target.
+        return $Rule.IdentityReference.Value
+    }
 }
 
 foreach ($requestedRoot in ($Target | Sort-Object -Unique)) {
