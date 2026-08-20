@@ -244,7 +244,7 @@ The exact remaining provider, secret, volume, containment, and smoke-test
 decisions are captured in the
 [M4/M6 operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-## M7 — Worker sandboxing ◑ (macOS live proof complete; cross-platform proof remains)
+## M7 — Worker sandboxing ◑ (macOS and Linux live proofs complete; Windows proof remains)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
@@ -252,10 +252,9 @@ environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
 tier-3 container provider, and per-host egress enforcement via the filtering
 egress proxy (`fs+net` on macOS routes loopback-only Seatbelt egress through
 it; structured denials surface on `RunOutcome` for the 3.3b grant flow).
-Windows parity, Linux live proof, and the container per-host egress boundary
-remain open and are now tracked by
+Windows parity and the container per-host egress boundary remain open and are
+tracked by
 [`m7-windows-containment-parity`](../.kranz/tickets/m7-windows-containment-parity.md),
-[`m7-linux-hostile-live-proof`](../.kranz/tickets/m7-linux-hostile-live-proof.md),
 and
 [`m7-container-per-host-egress-boundary`](../.kranz/tickets/m7-container-per-host-egress-boundary.md).
 The sandbox still
@@ -265,6 +264,12 @@ CONNECT, landed the legitimate change through its real merge gate without the
 primary checkout leaving `main`, and measured +4.33% Node / +5.01% Rust median
 wrapper overhead on representative warm commands. See
 [the live-proof receipt](reviews/m7-hostile-fsnet-live-proof.md).
+
+The 2026-08-20 protected Ubuntu proof used the real bubblewrap process
+provider, blocked a sibling write and a host-loopback connection with a live
+unwrapped anti-vacuity control, kept the primary checkout byte-clean at the
+same HEAD, and measured +1.11% median overhead for a representative warm Node
+gate. See [the Linux live-proof receipt](reviews/m7-linux-bubblewrap-live-proof.md).
 
 Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
 writes outside its worktree + mission dir with blocked attempts surfaced as

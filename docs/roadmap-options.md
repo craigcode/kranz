@@ -54,12 +54,6 @@ Format:
   Source: docs/scoping/m7-windows-containment.md
   Ticket: m7-windows-containment-parity
 
-- **M7 Linux hostile live proof** - repeat the macOS receipt on a real bubblewrap host.
-  Why: Linux `fs+net` is implemented; the live receipt is not.
-  Trigger: A Linux host with bubblewrap; do not substitute mocked construction.
-  Source: docs/reviews/m7-hostile-fsnet-live-proof.md
-  Ticket: m7-linux-hostile-live-proof
-
 ## Later / gated
 
 - **Gas City pack publish remainder** - human `gc pack registry` / `gc pack release` after Stage 1 receipt and a second consumer.
@@ -127,6 +121,7 @@ one cycle so `/kranz roadmap` readers are not surprised by the deletion.
 - Backend readiness preflight — `backend-readiness-quota-preflight` done.
 - Local workspace/sandbox visibility — `workspace-sandbox-visibility` done.
 - M8 multi-root host design + project picker — both done.
+- M7 Linux hostile live proof — real bubblewrap receipt committed; `m7-linux-hostile-live-proof` done.
 - Gas City event dispatch + `kranz.mission.*` emits — `revive-gascity-demo` done.
 - Structured human-question events, agent hook status signals — both done.
 - Workspace provider pin at approval — done.
