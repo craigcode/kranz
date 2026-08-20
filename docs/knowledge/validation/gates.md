@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-18
+last_verified: 2026-08-20
 verified_against:
   - AGENTS.md
   - crates/engine/src/orchestrator.rs

@@ -1249,7 +1249,17 @@ pub(crate) fn prepare_launch(
         original_dacls: Vec::new(),
         plan_path: None,
     };
-    let mut changes = acl_changes(inputs, &executable, env)?;
+    // The child PATH is narrower than the host PATH and deliberately includes
+    // declared workspace roots. Use that SAME path while discovering exact
+    // Node/npm/Cargo entry points for ACL grants: a workspace-staged runtime
+    // can carry a protected DACL, so an inheritable grant on its parent is not
+    // proof that LPAC can execute the existing file. This does not grant a new
+    // root; it only adds a direct RX ACE to a known tool name already inside
+    // the contained search path.
+    let path = contained_search_path(inputs, &executable, env)?;
+    let mut acl_env = env.clone();
+    acl_env.insert("PATH".to_string(), path.clone());
+    let mut changes = acl_changes(inputs, &executable, &acl_env)?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
@@ -1301,7 +1311,6 @@ pub(crate) fn prepare_launch(
         }
     }
 
-    let path = contained_search_path(inputs, &executable, env)?;
     let plan = LaunchPlan {
         version: PLAN_VERSION,
         profile_name,
