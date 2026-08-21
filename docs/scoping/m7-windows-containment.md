@@ -1,10 +1,10 @@
 # M7 Windows containment — accepted plan and production AppContainer boundary
 
-Status: accepted 2026-08-15. Phases 1–4 are implemented. A protected hosted
-Windows receipt now proves the production AppContainer launcher before the
-process provider is enabled. Phase 5 — normal Node/Rust gates, overhead, and a
-dedicated Windows 11 receipt — remains open, so this document does not yet call
-the full parity ticket closed.
+Status: accepted 2026-08-15. Phases 1–4 and the hosted part of phase 5 are
+implemented. Protected Windows CI proves the production AppContainer launcher,
+ordinary Node/Rust gates, and retained-posture overhead before the process
+provider is enabled. The dedicated operator-controlled Windows 11 receipt
+remains open, so this document does not yet call the full parity ticket closed.
 
 ## Outcome first
 
@@ -26,7 +26,10 @@ The process boundary applies to workers, validators, validation/final commands,
 and merge gates. There is no path where a requested enforced posture silently
 runs native code with the operator's ordinary user privileges. `fs` grants the
 AppContainer internet-client capability; `fs+net` supplies no network
-capability and is hard offline.
+capability and is hard offline. Both postures carry only the explicit
+read-only `registryRead` capability that LPAC requires for ordinary Windows
+tools to create descendant processes; the same capability list is fixed at
+profile creation and supplied again at each launch.
 
 ## What parity means
 
@@ -79,14 +82,17 @@ experimental FlatBuffer contract.
 
 If the experimental API cannot meet the support bar, the fallback is a direct
 AppContainer/LPAC launcher using stable Win32 APIs. That route must solve
-toolchain executable/read access and path-specific ACL grants without leaving
-persistent broad ACEs behind. A full-trust MSIX package or restricted token is
-not an acceptable fallback.
+toolchain executable/read access and path-specific ACL grants without broad
+inherited or content-access ACEs. A minimal host-wide, non-inheriting drive-root
+metadata grant is acceptable only when it matches Microsoft's documented tuple
+and is installed by a separate elevated preparation step. A full-trust MSIX
+package or restricted token is not an acceptable fallback.
 
 Primary references:
 
 - [Microsoft AppContainer isolation](https://learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation)
 - [Microsoft Launch an AppContainer](https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer)
+- [Microsoft MXC AppContainer host preparation](https://github.com/microsoft/mxc/blob/main/docs/host-prep.md)
 - [Microsoft Create Process in Sandbox (experimental)](https://learn.microsoft.com/windows/win32/secauthz/createprocessinsandbox)
 - [GitHub Actions container-runner requirement](https://docs.github.com/actions/tutorials/use-containerized-services/use-docker-service-containers)
 
@@ -107,10 +113,11 @@ synthetically detected Docker runtime. The full Windows workspace suite then
 keeps consumer behavior and serialization green.
 
 The stable AppContainer path is not tied to the Windows-11-only experimental
-API. Full parity still needs an operator-controlled Windows 11 host (self-hosted
-CI or an equivalent disposable VM) for the normal Node/Rust gate, overhead, and
-host-specific receipt. A permanently queued self-hosted job without a managed
-runner would be ceremony, not evidence.
+API. Protected hosted CI proves the normal Node/Rust gate and overhead on
+Windows Server; full parity still needs an operator-controlled Windows 11 host
+(self-hosted CI or an equivalent disposable VM) to repeat the hostile and
+normal-gate brief as a host-specific receipt. A permanently queued self-hosted
+job without a managed runner would be ceremony, not evidence.
 
 ## Delivery sequence
 
@@ -132,9 +139,11 @@ runner would be ceremony, not evidence.
    Object tree kill, validator real-checkout read denial, and engine-gate
    wrapping. The protected receipt proves exact DACL restoration after the
    child exits.
-5. Run the full hostile brief plus normal Node/Rust gate and overhead
-   measurements. Only that receipt may mark the Windows ticket and M7 parity
-   complete.
+5. **Shipped on protected hosted Windows:** run the full hostile brief plus
+   normal Node/Rust gate and retained-posture overhead measurements against a
+   five-second minimum representative gate payload, retaining the `10%` target.
+   Repeat that receipt on the operator-controlled Windows 11 host before
+   marking the Windows ticket and M7 parity complete.
 
 ## Phase-1 receipt
 
@@ -170,24 +179,68 @@ This phase records whether a runner exposes the experimental candidate without
 guessing Microsoft's unpublished FlatBuffer schema or treating an unstable API
 as a production security boundary.
 
-## Phase-4 production receipt and constraints
+## Phase-4 production receipt, phase-5 hosted gates, and constraints
 
 The engine launches a trusted copy of its host executable, which creates the
 hostile child suspended with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY` set to opt out, assigns
-it to a kill-on-close Job Object, and only then resumes it. A unique disposable
-profile SID receives inherited ACLs for the worktree/private scratch and
-targeted read/execute access for the executable, toolchain, and shared Git
-metadata. The shared Git root is derived from the trusted repository and every
-writable worktree pointer must resolve back to that same common directory.
+it to a kill-on-close Job Object, and only then resumes it. Agent sessions use
+one unique disposable profile SID per launch; a resolved engine-gate posture
+uses one SID across its validation/final-gate command batch, matching the other
+providers' once-per-resolution setup contract. That SID receives inherited
+ACLs for the worktree/private scratch and targeted read/execute access for the
+executable, toolchain, and shared Git metadata. The shared Git root is derived
+from the trusted repository and every writable worktree pointer must resolve
+back to that same common directory.
+Node, Cargo, and cmd also probe their local drive root and open `NUL` during
+startup. LPAC's dual-principal access check means the package SID alone is
+insufficient.
+[`scripts/prepare-windows-appcontainer.ps1`](../../scripts/prepare-windows-appcontainer.ps1)
+is therefore a separate, elevated host step: on every relevant local drive
+root it installs the exact non-inheriting `0x00120088` metadata mask
+(`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) for
+`ALL APPLICATION PACKAGES` (`S-1-15-2-1`) and
+`ALL RESTRICTED APPLICATION PACKAGES` (`S-1-15-2-2`). It refuses conflicting
+explicit ACEs instead of merging rights. The mask grants no root listing,
+content read, or write access, and does not propagate below the root. The
+same command reapplies Microsoft's documented `\Device\Null` security
+descriptor once per boot; Windows resets it at restart, and without both
+package ACEs ordinary redirected tools fail during startup with access denied.
+The script invokes the public
+`kranz sandbox-prepare --target <drive-root>` command; that compiled path
+follows Microsoft's `GetNamedSecurityInfoW` →
+`SetEntriesInAclW` → `SetNamedSecurityInfoW` sequence and verifies the resulting
+tuples instead of using the managed `Set-Acl` path. The
+ordinary Kranz launcher verifies the root tuples and null-device package ACEs
+read-only; missing preparation fails before the hostile child starts and names
+the elevated command to run. This follows Microsoft's AppContainer
+host-preparation contract instead of trying to substitute a per-profile
+capability for a well-known restricted-package principal.
+Rustup's multiplexing proxy is also treated as read-only toolchain state. At
+lease creation the trusted parent runs `rustup which cargo` with automatic
+installation disabled, accepts only an already-installed standard toolchain
+under `RUSTUP_HOME/toolchains`, and supplies its absolute root as
+`RUSTUP_TOOLCHAIN` to contained descendants. Hosted toolchain roots can carry
+a protected DACL that does not inherit the `RUSTUP_HOME` grant, so the selected
+root receives a direct recursive read/execute grant and its real `bin`
+directory leads the contained `PATH`. That bypasses the rustup proxy and
+prevents a floating channel refresh from attempting to write the operator's
+`RUSTUP_HOME`; it does not add a writable root or permit installation from the
+network.
+Windows additionally rewrites `TEMP` and `TMP` beneath the AppContainer profile
+location. Since Kranz redirects `LOCALAPPDATA` into the session-private scratch
+after the trusted parent creates the profile, the launcher materializes the
+documented `<LOCALAPPDATA>/Packages/<profile>/AC/Temp` tree before launch and
+refuses unless the canonical redirected root is already inside the sandbox's
+writable set.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the
-unique launch SID's ACEs, root-first, through those handles; overlapping
-launches therefore keep their live grants. A bounded host-local mutex serializes
-the DACL read/modify/write batches across Kranz processes, while an uncontended
-descriptor returns byte-for-byte to its baseline. The profile and private
-launch plan are then deleted.
+unique profile SID's ACEs, root-first, through those handles; overlapping
+launches therefore keep their live grants. A bounded host-local mutex
+serializes the DACL read/modify/write batches across Kranz processes, while an
+uncontended descriptor returns byte-for-byte to its baseline. The profile and
+all private per-command launch plans are then deleted.
 
 Both shipped mission hosts route that private re-entry before ordinary
 initialization: the `kranz` CLI and the embedded-server Tauri desktop binary.
@@ -199,8 +252,9 @@ behavior, toolchain read with write denial, worktree/private-scratch writes,
 sibling-root write denial even after a separate sibling is granted to
 `ALL APPLICATION PACKAGES`, authority and real-checkout read denial, shared-Git
 read access, rejection of a tampered worktree Git pointer, hard-offline
-`fs+net`, safe overlapping leases, and exact uncontended worktree DACL
-restoration. The resolver is enabled only behind that exact production path.
+`fs+net`, safe overlapping leases, and exact uncontended worktree plus local
+drive-root DACL stability after the explicit host-preparation baseline. The
+resolver is enabled only behind that exact production path.
 
 Honest constraints remain. Agent backends must resolve to a native `.exe`;
 batch shims are refused because forwarding model-generated arguments through

@@ -70,6 +70,45 @@ const AMBIENT_WINDOWS_VARS: &[&str] = &[
     "PSModulePath",
 ];
 
+/// Add the non-secret Windows process bootstrap variables to a cleared child
+/// environment using one canonical spelling per case-insensitive key. Both
+/// agent sessions and engine-run gates need this set: ordinary unsandboxed
+/// commands may limp along without all of it, while AppContainer process
+/// creation fails with `ERROR_ENVVAR_NOT_FOUND` before the child starts.
+#[cfg(windows)]
+pub(crate) fn extend_windows_process_env(env: &mut HashMap<String, String>) {
+    for key in AMBIENT_WINDOWS_VARS {
+        if let Some((_, value)) =
+            std::env::vars_os().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
+        {
+            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Redirect the Windows user-profile variables that AppContainer process
+/// creation consumes to an already-authorized scratch root. Windows rewrites
+/// `LOCALAPPDATA`, `TEMP`, and `TMP` again for the AppContainer profile, but
+/// requires the profile tuple to exist in an explicit environment block.
+#[cfg(windows)]
+pub(crate) fn redirect_windows_profile_env(env: &mut HashMap<String, String>, base_home: &Path) {
+    let tmp = base_home.join("tmp");
+    let appdata_roaming = base_home.join("AppData").join("Roaming");
+    let appdata_local = base_home.join("AppData").join("Local");
+    for path in [&tmp, &appdata_roaming, &appdata_local] {
+        let _ = std::fs::create_dir_all(path);
+    }
+    env.insert("USERPROFILE".to_string(), base_home.display().to_string());
+    env.insert("TMPDIR".to_string(), tmp.display().to_string());
+    env.insert("TEMP".to_string(), tmp.display().to_string());
+    env.insert("TMP".to_string(), tmp.display().to_string());
+    env.insert("APPDATA".to_string(), appdata_roaming.display().to_string());
+    env.insert(
+        "LOCALAPPDATA".to_string(),
+        appdata_local.display().to_string(),
+    );
+}
+
 /// Toolchain locations children may inherit. `CARGO_HOME` is the exception:
 /// [`sanitized_child_env`] always replaces it with a per-invocation
 /// cache-only home (see [`cache_only_cargo_home`]), so neither agent sessions
@@ -352,6 +391,22 @@ fn toolchain_var_value(var: &str, default_subdir: &str) -> Option<String> {
     candidate.is_dir().then(|| candidate.display().to_string())
 }
 
+/// Add credential-free toolchain locations to a cleared environment. Cargo's
+/// root is deliberately excluded: every caller substitutes a fresh
+/// cache-only `CARGO_HOME`, while rustup and npm cache locations contain no
+/// authentication configuration and must remain discoverable after HOME /
+/// USERPROFILE is redirected to scratch.
+pub(crate) fn extend_noncredential_toolchain_env(env: &mut HashMap<String, String>) {
+    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
+        if *var == "CARGO_HOME" {
+            continue;
+        }
+        if let Some(value) = toolchain_var_value(var, default_subdir) {
+            env.insert((*var).to_string(), value);
+        }
+    }
+}
+
 /// Env names [`contract_command_env`] manages itself; a `contractEnvPassthrough`
 /// entry naming one of these is refused (loudly, name only) so the escape
 /// hatch cannot silently saw off the isolation it sits on — e.g. passing
@@ -425,49 +480,22 @@ pub fn sanitized_child_env(
     // Non-credential toolchain locations ride for BOTH sessions and contract
     // commands. CARGO_HOME is always replaced with an isolated cache-only
     // root; no prompt-injectable child receives operator Cargo config/tokens.
-    for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
-        if *var == "CARGO_HOME" {
-            continue;
-        }
-        if let Some(value) = toolchain_var_value(var, default_subdir) {
-            env.insert((*var).to_string(), value);
-        }
-    }
+    extend_noncredential_toolchain_env(&mut env);
     env.insert(
         "CARGO_HOME".to_string(),
         cache_only_cargo_home(base_home).display().to_string(),
     );
     #[cfg(windows)]
     {
-        for key in AMBIENT_WINDOWS_VARS {
-            // Case-insensitive ambient lookup, canonical-cased emission:
-            // Windows env names are case-insensitive, but the child block is
-            // a Rust HashMap keyed case-SENSITIVELY — without this, ambient
-            // `SYSTEMROOT` + canonical `SystemRoot` produce duplicate-case
-            // entries and which one the child sees is undefined.
-            if let Some((_, value)) =
-                std::env::vars_os().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(key))
-            {
-                env.insert((*key).to_string(), value.to_string_lossy().into_owned());
-            }
-        }
+        // Case-insensitive ambient lookup, canonical-cased emission: Windows
+        // env names are case-insensitive, but this map is not. Duplicate-case
+        // entries make the resulting child block ambiguous.
+        extend_windows_process_env(&mut env);
         // Profile/temp locations redirect to scratch (like HOME), never the
         // operator's real profile. `cmd` stages pipe temp files in %TEMP%
         // and PowerShell/CLR consult APPDATA/LOCALAPPDATA on startup —
         // leaving them unset hangs children in opaque ways (89f05a1 CI).
-        let tmp = base_home.join("tmp");
-        let appdata_roaming = base_home.join("AppData").join("Roaming");
-        let appdata_local = base_home.join("AppData").join("Local");
-        let _ = std::fs::create_dir_all(&appdata_roaming);
-        let _ = std::fs::create_dir_all(&appdata_local);
-        env.insert("USERPROFILE".to_string(), base_home.display().to_string());
-        env.insert("TEMP".to_string(), tmp.display().to_string());
-        env.insert("TMP".to_string(), tmp.display().to_string());
-        env.insert("APPDATA".to_string(), appdata_roaming.display().to_string());
-        env.insert(
-            "LOCALAPPDATA".to_string(),
-            appdata_local.display().to_string(),
-        );
+        redirect_windows_profile_env(&mut env, base_home);
     }
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());
@@ -936,6 +964,28 @@ mod tests {
             Some("/explicit/override".to_string()),
             "an explicit toolchain env var always wins"
         );
+    }
+
+    #[test]
+    fn noncredential_toolchain_extension_never_carries_cargo_home() {
+        let _guard = EnvTestGuard::engage(&[
+            ("CARGO_HOME", "/operator/cargo-with-credentials"),
+            ("RUSTUP_HOME", "/operator/rustup"),
+            ("NPM_CONFIG_CACHE", "/operator/npm-cache"),
+        ]);
+        let mut env = HashMap::new();
+
+        extend_noncredential_toolchain_env(&mut env);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/operator/rustup")
+        );
+        assert_eq!(
+            env.get("NPM_CONFIG_CACHE").map(String::as_str),
+            Some("/operator/npm-cache")
+        );
+        assert!(!env.contains_key("CARGO_HOME"));
     }
 
     /// The agent-session env shape is byte-identical (ticket's "do not weaken

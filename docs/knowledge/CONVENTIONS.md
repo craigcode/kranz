@@ -36,7 +36,7 @@ verified_against:
     changes; the default for notes describing code.
   - `stale` — still browseable, but **excluded from automatic prompt injection**
     (slice 2) unless explicitly requested.
-- **`last_verified`** — the `YYYY-MM-DD` date the claims were last checked
+- **`last_verified`** — the UTC `YYYY-MM-DD` date the claims were last checked
   against the code. Missing or malformed dates are check-needed.
 - **`verified_against`** — the real repo paths and/or commands the note's claims
   depend on. Paths must stay inside the repo. Commands are reported but never

@@ -362,10 +362,13 @@ pub(crate) enum GateSandbox {
     Bubblewrap {
         inputs: Box<crate::sandbox::SandboxInputs>,
     },
-    /// Windows stable AppContainer launcher. Inputs ride along because each
-    /// command gets a unique profile, ACL lease, and private launch plan.
+    /// Windows stable AppContainer launcher. One resolved posture owns one
+    /// disposable profile/ACL lease across its commands; every command still
+    /// gets a private launch plan and an independently supervised process.
     AppContainer {
         inputs: Box<crate::sandbox::SandboxInputs>,
+        #[cfg(windows)]
+        context: crate::appcontainer_windows::AppContainerLaunchContext,
     },
     /// Tier-3 container: `<runtime> run --rm -i --read-only --name <name> …
     /// <image> sh -c <command>` (ticket container-gate-wrapper). Inputs and
@@ -393,10 +396,11 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
-    /// Keeps the disposable profile and retained no-follow DACL handles alive
-    /// through the wrapper process. Absent on non-Windows builds.
+    /// Keeps the resolved posture's disposable profile and retained no-follow
+    /// DACL handles alive through the wrapper process, even if its caller
+    /// drops the `GateSandbox` first. Absent on non-Windows builds.
     #[cfg(windows)]
-    _appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
+    _appcontainer_context: Option<crate::appcontainer_windows::AppContainerLaunchContext>,
 }
 
 impl GateSandbox {
@@ -407,7 +411,7 @@ impl GateSandbox {
             GateSandbox::Disabled => crate::types::SandboxEnforce::Off,
             GateSandbox::Seatbelt { enforce, .. } => *enforce,
             GateSandbox::Bubblewrap { inputs } => inputs.enforce,
-            GateSandbox::AppContainer { inputs } => inputs.enforce,
+            GateSandbox::AppContainer { inputs, .. } => inputs.enforce,
             GateSandbox::Container { inputs, .. } => inputs.enforce,
         }
     }
@@ -436,7 +440,7 @@ impl GateSandbox {
                     args,
                     timeout_teardown: None,
                     #[cfg(windows)]
-                    _appcontainer_lease: None,
+                    _appcontainer_context: None,
                 })
             }
             GateSandbox::Seatbelt { profile_path, .. } => {
@@ -450,7 +454,7 @@ impl GateSandbox {
                     args,
                     timeout_teardown: None,
                     #[cfg(windows)]
-                    _appcontainer_lease: None,
+                    _appcontainer_context: None,
                 })
             }
             GateSandbox::Bubblewrap { inputs } => {
@@ -464,20 +468,25 @@ impl GateSandbox {
                     args,
                     timeout_teardown: None,
                     #[cfg(windows)]
-                    _appcontainer_lease: None,
+                    _appcontainer_context: None,
                 })
             }
-            GateSandbox::AppContainer { inputs } => {
+            GateSandbox::AppContainer {
+                inputs,
+                #[cfg(windows)]
+                context,
+            } => {
                 #[cfg(windows)]
                 {
                     let (program, args) = shell_argv(command);
-                    let prepared =
-                        crate::appcontainer_windows::prepare_launch(inputs, &program, &args, env)?;
+                    let prepared = crate::appcontainer_windows::prepare_launch_in_context(
+                        context, inputs, &program, &args, env,
+                    )?;
                     Ok(WrappedCommand {
                         program: prepared.program,
                         args: prepared.args,
                         timeout_teardown: None,
-                        _appcontainer_lease: Some(prepared.lease),
+                        _appcontainer_context: Some(context.clone()),
                     })
                 }
                 #[cfg(not(windows))]
@@ -504,7 +513,7 @@ impl GateSandbox {
                         vec!["rm".to_string(), "-f".to_string(), name],
                     )),
                     #[cfg(windows)]
-                    _appcontainer_lease: None,
+                    _appcontainer_context: None,
                 })
             }
         }
@@ -887,6 +896,8 @@ fn resolve_gate_sandbox_target(
                 crate::sandbox::SandboxBackend::AppContainer => Ok(GateSandboxResolution {
                     sandbox: GateSandbox::AppContainer {
                         inputs: Box::new(inputs),
+                        #[cfg(windows)]
+                        context: crate::appcontainer_windows::new_launch_context(),
                     },
                     note: None,
                     prewarmed_xcrun: false,
@@ -998,6 +1009,34 @@ async fn run_shell_command_sandboxed_with_code(
         }
     }
     (code, output)
+}
+
+/// Synchronous bounded runner for an already-resolved gate posture and its
+/// complete cleared environment. Production validation/final-gate batches
+/// resolve once and run several assertions through that same posture; the
+/// native Windows normal-gate receipt uses this seam so its retained samples
+/// measure per-command wrapping after the posture's one-time ACL preparation.
+#[cfg(windows)]
+pub(crate) fn run_bounded_gate_command_resolved_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+) -> (Option<i32>, String) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return (None, format!("failed to create gate runtime: {error}")),
+    };
+    runtime.block_on(run_shell_command_sandboxed_with_code(
+        cwd,
+        command,
+        COMMAND_TIMEOUT,
+        env,
+        sandbox,
+    ))
 }
 
 /// Synchronous bridge for gate execution from approval-time code that runs
@@ -1361,14 +1400,28 @@ pub fn run_bounded_gate_command_sandboxed(
     command: &str,
     policy: &MergeGatePolicy,
 ) -> (bool, String) {
+    let (code, output) = run_bounded_gate_command_sandboxed_with_code(cwd, command, policy);
+    (code == Some(0), output)
+}
+
+/// The production sandboxed merge-gate runner with its exact child exit
+/// status retained. Normal callers need only the stable bool/output API
+/// above; the Windows production receipt keeps the status so a native CI
+/// failure can distinguish a missing output marker from a process failure.
+pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+    policy: &MergeGatePolicy,
+) -> (Option<i32>, String) {
     if !policy.enforces_on_this_host() {
-        return run_bounded_gate_command(cwd, command);
+        let (ok, output) = run_bounded_gate_command(cwd, command);
+        return (Some(i32::from(!ok)), output);
     }
     let scratch =
         std::env::temp_dir().join(format!("kranz-gate-{}", uuid::Uuid::new_v4().simple()));
     if std::fs::create_dir_all(scratch.join("tmp")).is_err() {
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's sandbox scratch at {}",
                 scratch.display()
@@ -1379,7 +1432,7 @@ pub fn run_bounded_gate_command_sandboxed(
     if !cargo_home.is_dir() {
         let _ = std::fs::remove_dir_all(&scratch);
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's cache-only Cargo home at {}",
                 cargo_home.display()
@@ -1397,7 +1450,7 @@ pub fn run_bounded_gate_command_sandboxed(
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch);
             return (
-                false,
+                None,
                 format!("could not resolve the gate sandbox (failing closed): {error}"),
             );
         }
@@ -1409,6 +1462,9 @@ pub fn run_bounded_gate_command_sandboxed(
     }
     let mut env = sanitized_gate_env();
     env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+    #[cfg(windows)]
+    crate::agent_env::redirect_windows_profile_env(&mut env, &scratch);
+    #[cfg(not(windows))]
     for var in ["TMPDIR", "TMP", "TEMP"] {
         env.insert(var.to_string(), scratch.join("tmp").display().to_string());
     }
@@ -1419,7 +1475,7 @@ pub fn run_bounded_gate_command_sandboxed(
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch);
-            return (false, format!("failed to create gate runtime: {error}"));
+            return (None, format!("failed to create gate runtime: {error}"));
         }
     };
     let (code, output) = runtime.block_on(run_shell_command_sandboxed_with_code(
@@ -1430,10 +1486,10 @@ pub fn run_bounded_gate_command_sandboxed(
         &resolution.sandbox,
     ));
     let _ = std::fs::remove_dir_all(&scratch);
-    (code == Some(0), output)
+    (code, output)
 }
 
-fn sanitized_gate_env() -> HashMap<String, String> {
+pub(crate) fn sanitized_gate_env() -> HashMap<String, String> {
     // Keep only process/toolchain location and locale values. In particular,
     // API keys, GitHub/Slack tokens, cloud credentials, SSH agent sockets and
     // arbitrary server configuration never cross into mission-authored tests.
@@ -1447,11 +1503,6 @@ fn sanitized_gate_env() -> HashMap<String, String> {
         "TMPDIR",
         "TMP",
         "TEMP",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "COMSPEC",
-        "ComSpec",
-        "PATHEXT",
         "RUSTUP_HOME",
         "NPM_CONFIG_CACHE",
         "CI",
@@ -1460,11 +1511,25 @@ fn sanitized_gate_env() -> HashMap<String, String> {
         "LC_ALL",
         "TZ",
     ];
-    SAFE.iter()
+    let env: HashMap<String, String> = SAFE
+        .iter()
         .filter_map(|key| {
             std::env::var_os(key).map(|value| ((*key).to_string(), value.to_string_lossy().into()))
         })
-        .collect()
+        .collect();
+    #[cfg(windows)]
+    let env = {
+        let mut env = env;
+        crate::agent_env::extend_windows_process_env(&mut env);
+        // USERPROFILE is redirected to gate scratch before the child starts.
+        // Resolve the operator's rustup home now so standard installations
+        // that leave RUSTUP_HOME unset still find their toolchain. CARGO_HOME
+        // remains absent here and is replaced with the cache-only root by the
+        // gate runners.
+        crate::agent_env::extend_noncredential_toolchain_env(&mut env);
+        env
+    };
+    env
 }
 
 /// Last `max` characters of `text` (char-safe).
@@ -1589,11 +1654,16 @@ mod tests {
                 | "TMPDIR"
                 | "TMP"
                 | "TEMP"
-                | "SYSTEMROOT"
+                | "APPDATA"
+                | "LOCALAPPDATA"
                 | "SystemRoot"
-                | "COMSPEC"
                 | "ComSpec"
                 | "PATHEXT"
+                | "SystemDrive"
+                | "windir"
+                | "OS"
+                | "PROCESSOR_ARCHITECTURE"
+                | "PSModulePath"
                 | "RUSTUP_HOME"
                 | "NPM_CONFIG_CACHE"
                 | "CI"
@@ -2146,7 +2216,7 @@ mod tests {
             None,
         )
         .expect("Windows process gates resolve AppContainer");
-        let GateSandbox::AppContainer { inputs } = &resolution.sandbox else {
+        let GateSandbox::AppContainer { inputs, .. } = &resolution.sandbox else {
             panic!("fs on Windows must resolve AppContainer");
         };
         assert_eq!(inputs.session_cwd, repo.path());
@@ -2418,7 +2488,7 @@ mod tests {
             )
             .expect("Windows process gate enforcement resolves");
             assert!(resolution.note.is_none(), "{:?}", resolution.note);
-            let GateSandbox::AppContainer { inputs } = resolution.sandbox else {
+            let GateSandbox::AppContainer { inputs, .. } = resolution.sandbox else {
                 panic!("Windows process gate must resolve AppContainer");
             };
             assert_eq!(inputs.enforce, enforce);
