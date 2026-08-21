@@ -93,6 +93,10 @@ output, validator read denial, or every production spawn site.
   `\Device\Null` descriptor once per boot. The root ACEs grant no listing,
   content read, or write rights. The ordinary launcher checks both prerequisites
   read-only and fails closed with the preparation command when either is absent.
+  Before entering LPAC it also resolves rustup's active, already-installed
+  standard toolchain with auto-install disabled and pins that absolute root in
+  `RUSTUP_TOOLCHAIN`; Rust gates therefore use the read-only toolchain without
+  refreshing a channel or writing the operator's `RUSTUP_HOME`.
   The ACL lease retains a no-follow handle for every path-specific DACL
   it changes, removes only the unique package SID's ACEs root-first, then
   deletes every private plan and the profile. A bounded host-local mutex

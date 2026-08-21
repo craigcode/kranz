@@ -110,6 +110,9 @@ All of it asks the agent nicely. None of it constrains the process.
   prerequisites read-only and otherwise fails closed. Both postures explicitly
   grant read-only `registryRead` so LPAC tools can create descendants; `fs`
   additionally grants internet-client access, while `fs+net` is hard offline.
+  Rust commands pin the already-installed active standard rustup toolchain by
+  absolute path, with auto-install disabled, so the operator's `RUSTUP_HOME`
+  remains read-only.
   The same launcher wraps workers, validators, and engine-run gates, and
   protected CI proves authority/real-checkout denial plus DACL restoration.
   The container provider remains fail-closed even when `docker.exe` is present:

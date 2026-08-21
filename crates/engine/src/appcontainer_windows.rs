@@ -118,6 +118,11 @@ struct LaunchPlan {
     /// have exact ACEs.
     #[serde(default)]
     path: Option<String>,
+    /// Absolute root of the already-installed active rustup toolchain. Rustup
+    /// accepts this as `RUSTUP_TOOLCHAIN`, bypassing channel refresh and writes
+    /// to the operator-owned, read-only `RUSTUP_HOME` inside LPAC.
+    #[serde(default)]
+    rustup_toolchain: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -262,6 +267,7 @@ impl Drop for DaclMutationGuard {
 #[derive(Debug)]
 pub(crate) struct AppContainerLease {
     profile_name: String,
+    rustup_toolchain: Option<PathBuf>,
     original_dacls: Vec<DaclSnapshot>,
     snapshot_indices: BTreeMap<PathBuf, usize>,
     applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
@@ -1163,6 +1169,57 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
     })
 }
 
+/// Resolve rustup's active Cargo to an already-installed standard toolchain
+/// before entering LPAC. The contained child receives the resulting absolute
+/// toolchain root through `RUSTUP_TOOLCHAIN`; rustup then multiplexes without
+/// refreshing a channel or writing its operator-owned home. A missing/custom
+/// toolchain leaves the environment unchanged and lets the eventual Rust
+/// command fail normally rather than blocking unrelated Node-only launches.
+fn resolve_installed_rustup_toolchain(
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    find_on_path(Path::new("cargo"), env)?;
+    let rustup = find_on_path(Path::new("rustup"), env)?;
+    let rustup_home = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from)?;
+    let output = std::process::Command::new(&rustup)
+        .args(["which", "cargo"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        tracing::warn!(
+            rustup = %rustup.display(),
+            status = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "could not pin the active installed rustup toolchain for AppContainer"
+        );
+        return None;
+    }
+    let cargo = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let cargo = std::fs::canonicalize(&cargo).ok()?;
+    let toolchains = std::fs::canonicalize(rustup_home.join("toolchains")).ok()?;
+    if !path_contains(&toolchains, &cargo) {
+        tracing::warn!(
+            cargo = %cargo.display(),
+            toolchains = %toolchains.display(),
+            "active rustup Cargo is a custom toolchain outside RUSTUP_HOME; leaving it unpinned"
+        );
+        return None;
+    }
+    let bin = cargo.parent()?;
+    if !bin
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("bin"))
+    {
+        return None;
+    }
+    bin.parent().map(local_dos_path)
+}
+
 fn push_entry_point(files: &mut Vec<PathBuf>, path: &Path) {
     if !path.is_file() {
         return;
@@ -1800,9 +1857,10 @@ fn acl_changes(
     Ok(changes)
 }
 
-fn new_lease(profile_name: String) -> AppContainerLease {
+fn new_lease(profile_name: String, rustup_toolchain: Option<PathBuf>) -> AppContainerLease {
     AppContainerLease {
         profile_name,
+        rustup_toolchain,
         original_dacls: Vec::new(),
         snapshot_indices: BTreeMap::new(),
         applied_changes: HashSet::new(),
@@ -1830,9 +1888,10 @@ pub(crate) fn prepare_launch_in_context(
         EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
     })?;
     if slot.is_none() {
+        let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
         let (profile_name, _sid) =
             create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
-        *slot = Some(new_lease(profile_name));
+        *slot = Some(new_lease(profile_name, rustup_toolchain));
     }
     let lease = slot
         .as_mut()
@@ -1851,8 +1910,9 @@ pub(crate) fn prepare_launch(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<PreparedLaunch> {
+    let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
     let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
-    let mut lease = new_lease(profile_name);
+    let mut lease = new_lease(profile_name, rustup_toolchain);
     let prepared = prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env)?;
     Ok(PreparedLaunch {
         program: prepared.program,
@@ -1972,6 +2032,7 @@ fn prepare_launch_for_lease(
         // never treated as a boundary.
         allow_network: inputs.enforce == crate::types::SandboxEnforce::Fs,
         path: Some(path),
+        rustup_toolchain: lease.rustup_toolchain.clone(),
     };
     let plan_path = inputs.tmpdir.join(format!(
         "appcontainer-plan-{}.json",
@@ -2340,7 +2401,11 @@ fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> 
     ))
 }
 
-fn environment_block(cwd: &Path, path: Option<&str>) -> Result<Vec<u16>> {
+fn environment_block(
+    cwd: &Path,
+    path: Option<&str>,
+    rustup_toolchain: Option<&Path>,
+) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
         let folded = key.to_string_lossy().to_ascii_uppercase();
@@ -2350,6 +2415,19 @@ fn environment_block(cwd: &Path, path: Option<&str>) -> Result<Vec<u16>> {
         values.insert(
             "PATH".to_string(),
             (OsString::from("PATH"), OsString::from(path)),
+        );
+    }
+    if let Some(toolchain) = rustup_toolchain {
+        values.insert(
+            "RUSTUP_TOOLCHAIN".to_string(),
+            (
+                OsString::from("RUSTUP_TOOLCHAIN"),
+                toolchain.as_os_str().to_os_string(),
+            ),
+        );
+        values.insert(
+            "RUSTUP_AUTO_INSTALL".to_string(),
+            (OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0")),
         );
     }
     // When a caller supplies an environment block, CreateProcessW does not
@@ -2453,7 +2531,11 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     let process_cwd = local_dos_path(&plan.cwd);
     let cwd = wide(process_cwd.as_os_str());
     let mut line = command_line(&plan.executable, &plan.args);
-    let environment = environment_block(&process_cwd, plan.path.as_deref())?;
+    let environment = environment_block(
+        &process_cwd,
+        plan.path.as_deref(),
+        plan.rustup_toolchain.as_deref(),
+    )?;
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -3440,6 +3522,9 @@ mod tests {
         let encoded = environment_block(
             Path::new(r"D:\gate\worktree"),
             Some(r"C:\Windows\System32;D:\node"),
+            Some(Path::new(
+                r"C:\Users\runner\.rustup\toolchains\stable-x86_64-pc-windows-msvc",
+            )),
         )
         .expect("environment block");
         let text = String::from_utf16(&encoded).expect("the environment block is valid UTF-16");
@@ -3447,5 +3532,10 @@ mod tests {
             .split('\0')
             .find(|entry| entry.to_ascii_uppercase().starts_with("PATH="));
         assert_eq!(path, Some(r"PATH=C:\Windows\System32;D:\node"));
+        assert!(text.split('\0').any(|entry| entry
+            == r"RUSTUP_TOOLCHAIN=C:\Users\runner\.rustup\toolchains\stable-x86_64-pc-windows-msvc"));
+        assert!(text
+            .split('\0')
+            .any(|entry| entry == "RUSTUP_AUTO_INSTALL=0"));
     }
 }

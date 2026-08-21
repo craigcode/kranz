@@ -215,6 +215,13 @@ read-only; missing preparation fails before the hostile child starts and names
 the elevated command to run. This follows Microsoft's AppContainer
 host-preparation contract instead of trying to substitute a per-profile
 capability for a well-known restricted-package principal.
+Rustup's multiplexing proxy is also treated as read-only toolchain state. At
+lease creation the trusted parent runs `rustup which cargo` with automatic
+installation disabled, accepts only an already-installed standard toolchain
+under `RUSTUP_HOME/toolchains`, and supplies its absolute root as
+`RUSTUP_TOOLCHAIN` to contained descendants. That prevents a floating channel
+refresh from attempting to write the operator's `RUSTUP_HOME`; it does not add
+a writable root or permit installation from the network.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the
