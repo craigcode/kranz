@@ -575,30 +575,6 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 role_cfg.sandbox.enforce.as_str()
             )));
         }
-        // Fail closed on an advisory-only network boundary, the same posture
-        // as the backend check above: container `fs+net` with a non-empty
-        // egress list keeps the runtime's default bridge and routes egress by
-        // proxy env vars only, so a process that ignores them opens a direct
-        // socket past the "enforced" allowlist. Reject the pair until the
-        // internal-network/sidecar boundary exists; an empty egress list
-        // (`--network none`) stays accepted because that boundary is hard.
-        if role_cfg.sandbox.enforce == SandboxEnforce::FsNet
-            && !role_cfg
-                .sandbox
-                .provider
-                .enforces_hard_net_boundary(&role_cfg.sandbox.egress)
-        {
-            return Err(EngineError::Config(format!(
-                "{name}.sandbox provider {:?} with sandbox.enforce={:?} and a non-empty egress \
-                 list is advisory-only: the runtime's default bridge lets a process that ignores \
-                 the proxy env vars open a direct socket past the egress filter; use an empty \
-                 egress list (the hard `--network none` boundary), sandbox.provider \"process\", \
-                 or sandbox.enforce=off until the internal-network/sidecar boundary lands \
-                 (docs/scoping/worker-sandboxing.md tier 3)",
-                role_cfg.sandbox.provider.as_str(),
-                role_cfg.sandbox.enforce.as_str()
-            )));
-        }
         let effective = effective_model(role, kind, &role_cfg.model);
         let tier = model_tier(kind, &effective).ok_or_else(|| {
             EngineError::Config(format!(
@@ -1376,32 +1352,23 @@ mod tests {
         // the proxy hop is the only reachable way out regardless of the list.
         assert!(crate::types::SandboxProvider::Process
             .enforces_hard_net_boundary(&["crates.io:443".to_string()]));
-        // The container provider's only hard net boundary today is
-        // `--network none` (empty egress); a non-empty list is proxy-env
-        // advisory on the runtime bridge.
+        // This static helper remains false for container + non-empty egress
+        // because only session runtime provisioning supplies that boundary;
+        // engine-run gates use the helper to keep refusing the pair.
         assert!(crate::types::SandboxProvider::Container.enforces_hard_net_boundary(&[]));
         assert!(!crate::types::SandboxProvider::Container
             .enforces_hard_net_boundary(&["crates.io:443".to_string()]));
     }
 
     #[test]
-    fn validate_rejects_container_fs_net_with_egress_list() {
-        // Container fs+net with a non-empty egress list is proxy-env advisory
-        // on the default bridge — fail closed until the sidecar boundary.
+    fn validate_accepts_container_fs_net_with_egress_list_for_runtime_resolution() {
+        // The role config can now request the hard internal-network relay.
+        // Runtime resolution still fails closed unless Docker is available.
         let mut cfg = MissionConfig::default();
         cfg.worker.sandbox.enforce = crate::types::SandboxEnforce::FsNet;
         cfg.worker.sandbox.provider = crate::types::SandboxProvider::Container;
         cfg.worker.sandbox.egress = vec!["crates.io:443".into()];
-        let err = validate(&cfg).unwrap_err().to_string();
-        // The error must name the role, the provider, the enforce mode, the
-        // remedies, and point at the boundary work.
-        assert!(err.contains("worker"), "{err}");
-        assert!(err.contains("container"), "{err}");
-        assert!(err.contains("fs+net"), "{err}");
-        assert!(err.contains("--network none"), "{err}");
-        assert!(err.contains("\"process\""), "{err}");
-        assert!(err.contains("sandbox.enforce=off"), "{err}");
-        assert!(err.contains("sidecar"), "{err}");
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod backend_readiness;
 pub mod command_exec;
 pub mod comparison_metrics;
 pub mod config;
+pub mod container_egress;
 pub mod contract_gates;
 pub mod contract_health;
 pub mod contract_lint;

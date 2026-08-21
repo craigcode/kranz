@@ -246,12 +246,10 @@ fn resolve_for_session_target(
 
 /// Resolve the tier-3 container provider: `enforce: off` stays unsandboxed;
 /// `fs+net` with an empty egress list keeps the `--network none` hard egress
-/// boundary; `fs+net` with a non-empty egress list resolves — the run routes
-/// the session through the filtering egress proxy (`crate::egress_proxy`) over
-/// the runtime bridge. That proxy-routed posture is advisory-only, so
-/// `config::validate` refuses it (fail closed) before a mission can reach
-/// this point; the resolution remains for the internal-network sidecar
-/// follow-up. A requested container with no runtime on PATH is refused.
+/// boundary. A non-empty list is supported only by Docker: the runner creates
+/// a unique internal network and authenticated filtering relay before spawn.
+/// Other runtimes refuse rather than silently falling back to their bridge.
+/// A requested container with no runtime on PATH is refused.
 fn resolve_container_target(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
@@ -288,6 +286,18 @@ fn resolve_container_target(
             ),
         );
     };
+    if role_sandbox.enforce == crate::types::SandboxEnforce::FsNet
+        && !role_sandbox.egress.is_empty()
+        && runtime != crate::sandbox_container::ContainerRuntime::Docker
+    {
+        return (
+            None,
+            Some(format!(
+                "sandbox provider:container with enforce:fs+net and a non-empty egress list requires Docker's internal-network boundary; runtime {} is not live-proven for that posture — refusing to run",
+                runtime.binary()
+            )),
+        );
+    }
     (
         Some(ResolvedSandbox {
             backend: SandboxBackend::Container,
@@ -298,6 +308,8 @@ fn resolve_container_target(
                     .image
                     .clone()
                     .unwrap_or_else(|| crate::sandbox_container::DEFAULT_IMAGE.to_string()),
+                network: None,
+                name: None,
             }),
         }),
         None,
@@ -2266,12 +2278,8 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        // fs+net with a per-host egress list still RESOLVES — the run routes
-        // the session through the filtering egress proxy over the runtime
-        // bridge (crate::egress_proxy) — but that posture is advisory-only,
-        // so `config::validate` refuses it (fail closed) before a mission can
-        // reach this point. The resolution remains for the internal-network
-        // sidecar follow-up.
+        // Docker resolves the posture; the runner provisions the unique
+        // internal network + authenticated relay before session spawn.
         let (resolved, warn) = resolve_for_session_target(
             &cfg,
             session.path(),
@@ -2284,6 +2292,28 @@ mod tests {
         let resolved = resolved.expect("container fs+net with egress must resolve");
         assert_eq!(resolved.backend, SandboxBackend::Container);
         assert_eq!(resolved.inputs.egress, vec!["crates.io:443".to_string()]);
+    }
+
+    #[test]
+    fn container_provider_fs_net_with_egress_refuses_non_docker_runtime() {
+        let cfg = container_cfg(
+            crate::types::SandboxEnforce::FsNet,
+            vec!["crates.io:443".to_string()],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let (resolved, warning) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Podman),
+        );
+        assert!(resolved.is_none());
+        let warning = warning.expect("unproved runtime must fail closed");
+        assert!(warning.contains("requires Docker"), "{warning}");
+        assert!(warning.contains("podman"), "{warning}");
     }
 
     #[test]

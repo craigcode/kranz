@@ -829,6 +829,8 @@ fn resolve_gate_sandbox_target(
                         .image
                         .clone()
                         .unwrap_or_else(|| crate::sandbox_container::DEFAULT_IMAGE.to_string()),
+                    network: None,
+                    name: None,
                 },
             },
             note: None,
@@ -3413,6 +3415,8 @@ mod tests {
             spec: crate::sandbox_container::ContainerSpec {
                 runtime: crate::sandbox_container::ContainerRuntime::Docker,
                 image: crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+                network: None,
+                name: None,
             },
         };
         assert_eq!(
@@ -3452,6 +3456,8 @@ mod tests {
             spec: crate::sandbox_container::ContainerSpec {
                 runtime: crate::sandbox_container::ContainerRuntime::Docker,
                 image: crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+                network: None,
+                name: None,
             },
         };
         let env: HashMap<String, String> = [("KRANZ_BASE_SHA".to_string(), "deadbeef".to_string())]

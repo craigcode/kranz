@@ -6,16 +6,14 @@
 //! An EMPTY `egress` list runs `--network none` — a hard egress boundary that
 //! works identically on macOS and Linux. Note the honest tradeoff: `none`
 //! also blocks the agent's API egress, so it suits offline gates/validation.
-//! A NON-EMPTY `egress` list keeps the runtime default bridge and points the
-//! session env at the run's host-side filtering egress proxy
-//! (`crate::egress_proxy`) via `host.docker.internal` — the proxy enforces
-//! the per-host allowlist at CONNECT time and records structured denials.
-//! The proxy hop is env-based (advisory on the bridge: a process that ignores
-//! the proxy vars bypasses the filter), so `config::validate` REFUSES
-//! `provider = "container"` with `enforce = "fs+net"` and a non-empty egress
-//! list (fail closed — [`crate::types::SandboxProvider::enforces_hard_net_boundary`])
-//! until a hard per-host container boundary (internal-network sidecar)
-//! lands; the builder below keeps the proxy-routed argv for that follow-up.
+//! A NON-EMPTY `egress` list runs the worker on a unique Docker `--internal`
+//! network. A trusted dual-homed relay is the only other container on that
+//! network; it injects a run-secret authorization header before forwarding
+//! CONNECT to the host-side filtering proxy (`crate::egress_proxy`). The
+//! worker never receives that credential and has no default route, so
+//! ignoring the proxy env cannot bypass the per-host filter. See
+//! `crate::container_egress` for provisioning, teardown, and stale-resource
+//! recovery. Runtimes other than Docker refuse this posture before spawn.
 //! API-driven workers that need
 //! no egress list use `fs` (runtime default bridge/NAT, the same
 //! permissiveness as the tier-2 fs tier).
@@ -109,22 +107,26 @@ pub fn detect_with(lookup: impl Fn(&str) -> bool) -> Option<ContainerRuntime> {
 pub struct ContainerSpec {
     pub runtime: ContainerRuntime,
     pub image: String,
+    /// Unique internal network provisioned for one `fs+net` session with a
+    /// non-empty egress list. `None` for every other posture. The runner sets
+    /// this only after the relay and authenticated host proxy are ready.
+    pub network: Option<String>,
+    /// Daemon-owned worker container name paired with `network`. Naming lets
+    /// boundary teardown force-remove the worker after a killed runtime
+    /// client or timeout; `None` for postures without the per-run boundary.
+    pub name: Option<String>,
 }
 
 /// Build the `<runtime> run` argv (excluding the runtime binary itself) for
 /// running `binary args` under the resolved container sandbox.
 ///
 /// Network: `fs+net` with an empty egress list maps to `--network none` (the
-/// hard boundary); `fs+net` with a non-empty egress list keeps the runtime
-/// default bridge and forwards the run's egress-proxy endpoint into the
-/// container env (`proxy_url`, reaching the host-side proxy via
-/// `host.docker.internal`; Linux docker additionally gets the `host-gateway`
-/// hosts entry). That proxy-routed posture is advisory-only, so
-/// `config::validate` refuses it (fail closed) until the internal-network
-/// sidecar boundary lands — this branch remains for that follow-up. The
-/// runner guarantees `proxy_url` is `Some` whenever a
-/// proxy-routed container session spawns — a proxy start failure fails the
-/// run closed before this point. `fs` passes no network flag, keeping the
+/// hard boundary); `fs+net` with a non-empty egress list joins the unique
+/// internal network provisioned in `ContainerSpec::network` and forwards the
+/// trusted relay endpoint into the container env. If either value is absent,
+/// the builder falls back to `--network none`: a wiring bug bricks egress
+/// rather than silently reopening the runtime bridge. `fs` passes no network
+/// flag, keeping the
 /// runtime's default bridge/NAT — the same permissiveness as the tier-2 fs
 /// tier.
 /// One mount spec `host:host[:ro]` — the single format both the builder and
@@ -278,24 +280,16 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
 
 /// The network posture: `fs+net` with an empty egress list maps to
 /// `--network none` (the hard boundary); `fs+net` with a non-empty egress
-/// list keeps the runtime default bridge and forwards the egress-proxy
-/// endpoint (`proxy_url` — sessions only; engine-run gates are never wired
-/// through the proxy and their resolution FAILS CLOSED on that pair instead,
-/// so a gate never silently bridges). `fs` passes no network flag.
+/// list forwards the relay endpoint after `container_run_args` has attached
+/// the unique internal network. Engine-run gates are never wired through the
+/// relay and their resolution FAILS CLOSED on that pair. `fs` passes no
+/// network flag.
 fn push_network(out: &mut Vec<String>, inputs: &SandboxInputs, proxy_url: Option<&str>) {
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
         if inputs.egress.is_empty() {
             out.push("--network".to_string());
             out.push("none".to_string());
         } else if let Some(proxy_url) = proxy_url {
-            // Proxy-routed fs+net: the session's HTTPS egress goes to the
-            // host-side filtering proxy. Linux docker has no built-in
-            // host.docker.internal mapping, so give it the gateway entry.
-            #[cfg(target_os = "linux")]
-            {
-                out.push("--add-host".to_string());
-                out.push("host.docker.internal:host-gateway".to_string());
-            }
             out.push("-e".to_string());
             out.push(format!(
                 "{}={proxy_url}",
@@ -324,11 +318,28 @@ pub fn container_run_args(
     proxy_url: Option<&str>,
 ) -> Vec<String> {
     let mut out = run_prologue();
+    if let Some(name) = &spec.name {
+        out.push("--name".to_string());
+        out.push(name.clone());
+    }
     push_policy_mounts(&mut out, inputs);
     push_authority_masks(&mut out, inputs);
     push_workdir_and_scratch_env(&mut out, inputs);
     push_toolchain_caches(&mut out, ToolchainMount::Session);
-    push_network(&mut out, inputs, proxy_url);
+    if inputs.enforce == crate::types::SandboxEnforce::FsNet && !inputs.egress.is_empty() {
+        if let (Some(network), Some(_)) = (&spec.network, proxy_url) {
+            out.push("--network".to_string());
+            out.push(network.clone());
+            push_network(&mut out, inputs, proxy_url);
+        } else {
+            // Defense in depth: a non-empty allowlist without a fully
+            // provisioned boundary gets no network, never the default bridge.
+            out.push("--network".to_string());
+            out.push("none".to_string());
+        }
+    } else {
+        push_network(&mut out, inputs, proxy_url);
+    }
     out.push(spec.image.clone());
     out.push(binary.display().to_string());
     out.extend(args.iter().cloned());
@@ -460,6 +471,8 @@ mod tests {
         ContainerSpec {
             runtime: ContainerRuntime::Docker,
             image: DEFAULT_IMAGE.to_string(),
+            network: None,
+            name: None,
         }
     }
 
@@ -480,26 +493,34 @@ mod tests {
     }
 
     #[test]
-    fn container_run_args_fs_net_with_egress_bridges_and_forwards_proxy_env() {
+    fn container_run_args_fs_net_with_egress_uses_internal_network_and_relay_env() {
         let mut inputs = inputs(SandboxEnforce::FsNet);
         inputs.egress = vec!["crates.io:443".to_string()];
+        let mut spec = spec();
+        spec.network = Some("kranz-egress-test".to_string());
+        spec.name = Some("kranz-egress-worker-test".to_string());
         let args = container_run_args(
             &inputs,
-            &spec(),
+            &spec,
             Path::new("claude"),
             &["-p".to_string(), "hi".to_string()],
-            Some("http://host.docker.internal:8123"),
+            Some("http://kranz-egress:3128"),
         );
 
         assert!(
-            !args.iter().any(|a| a == "--network"),
-            "proxy-routed fs+net keeps the runtime default bridge: {args:?}"
+            args.windows(2)
+                .any(|w| w[0] == "--network" && w[1] == "kranz-egress-test"),
+            "proxy-routed fs+net must use the per-run internal network: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "kranz-egress-worker-test"),
+            "the daemon-owned worker must be named for timeout teardown: {args:?}"
         );
         for var in ["HTTPS_PROXY", "HTTP_PROXY"] {
             assert!(
                 args.windows(2)
-                    .any(|w| w[0] == "-e"
-                        && w[1] == format!("{var}=http://host.docker.internal:8123")),
+                    .any(|w| w[0] == "-e" && w[1] == format!("{var}=http://kranz-egress:3128")),
                 "missing -e {var}=…: {args:?}"
             );
         }
@@ -508,11 +529,27 @@ mod tests {
                 .any(|w| w[0] == "-e" && w[1] == "NO_PROXY=localhost,127.0.0.1"),
             "missing -e NO_PROXY…: {args:?}"
         );
-        #[cfg(target_os = "linux")]
+    }
+
+    #[test]
+    fn container_run_args_fs_net_with_egress_fails_closed_without_boundary() {
+        let mut inputs = inputs(SandboxEnforce::FsNet);
+        inputs.egress = vec!["crates.io:443".to_string()];
+        let args = container_run_args(
+            &inputs,
+            &spec(),
+            Path::new("claude"),
+            &[],
+            Some("http://kranz-egress:3128"),
+        );
         assert!(
             args.windows(2)
-                .any(|w| w[0] == "--add-host" && w[1] == "host.docker.internal:host-gateway"),
-            "linux docker needs the host-gateway entry: {args:?}"
+                .any(|w| w[0] == "--network" && w[1] == "none"),
+            "missing boundary state must disable networking: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("HTTPS_PROXY=")),
+            "a relay env must not be emitted without its internal network: {args:?}"
         );
     }
 
@@ -815,6 +852,8 @@ mod tests {
         let spec = ContainerSpec {
             runtime: ContainerRuntime::Podman,
             image: "ghcr.io/example/kranz-worker:1".to_string(),
+            network: None,
+            name: None,
         };
         let args = container_run_args(
             &inputs(SandboxEnforce::Fs),
@@ -863,6 +902,8 @@ mod tests {
         let spec = ContainerSpec {
             runtime,
             image: DEFAULT_IMAGE.to_string(),
+            network: None,
+            name: None,
         };
         let ok_file = session.path().join("ok.txt");
         let args = container_run_args(
