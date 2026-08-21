@@ -171,24 +171,34 @@ All of it asks the agent nicely. None of it constrains the process.
   the scratch tmpdir (rw, also `HOME`/`TMPDIR` inside), and each
   `extraWrite` entry (rw). The container analogue of the tier-2 write
   allowlist.
-- **Network policy, honest v1**: `fs` keeps the runtime default bridge/NAT
+- **Network policy**: `fs` keeps the runtime default bridge/NAT
   (same permissiveness as the tier-2 fs tier). `fs+net` with an EMPTY
   egress list maps to `--network none` — a hard egress boundary that works
   identically on macOS and Linux. Windows refuses this provider until a real
   guest-path/authority-mask containment receipt exists. The tradeoff is
   honest: `none` also blocks the agent's API egress, so `fs+net` suits offline gates/validation
-  while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list
-  keeps the bridge and points the session env at the run's host-side
-  filtering egress proxy (`host.docker.internal`, forwarded with `-e`; the
-  `--add-host … host-gateway` entry is added on Linux docker): the proxy
-  enforces the per-host allowlist and records denials. Env-based routing is
-  advisory on the bridge — a process that ignores the proxy vars bypasses
-  the filter — so `config::validate` REFUSES `provider: "container"` with
-  `enforce: "fs+net"` and a non-empty egress list (fail closed, same
-  posture as the non-claude-backend sandbox rejection; ticket
-  container-fsnet-advisory-label) until a hard per-host container boundary
-  (internal-network sidecar) lands; Seatbelt is the hard boundary on macOS
-  hosts.
+  while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list is
+  now Docker-only and non-bypassable: the worker joins a unique
+  [`--internal` network](https://docs.docker.com/engine/network/), with no
+  default route. Its only peer is a trusted relay that Docker also attaches
+  to the ordinary bridge. The relay injects a random per-run bearer token and
+  forwards CONNECT to the host-side filtering proxy; the worker receives the
+  relay URL but never the token. Removing `HTTP(S)_PROXY` therefore removes
+  its only usable path instead of reopening NAT. The proxy keeps the existing
+  extend-only allowlist and per-run structured denial records; requests that
+  do not carry the relay credential get 407 and cannot forge a grant signal.
+  Podman, nerdctl, and Apple `container` refuse this non-empty-list posture
+  until their network primitives have a separate live proof.
+- Boundary lifecycle is owned by the run. The worker container, relay,
+  internal network, and private credential directory all have unique names;
+  explicit shutdown verifies their removal. The same bounded removal runs
+  from `Drop` after backend failure/cancellation/timeout, including a forced
+  remove of the daemon-owned worker whose runtime client may already be
+  dead. Docker labels carry the owner PID plus an immutable process-identity
+  hash; the next boundary start reaps only mismatched/dead owners, providing
+  kill-9 recovery without touching a live sibling run. The pinned relay image
+  and live proof are recorded in
+  [the M7 container egress receipt](../reviews/m7-container-per-host-egress-live-proof.md).
 - Worker image: the default `alpine:3` proves the isolation boundary but
   cannot run an agent. A production worker image needs the agent CLI + Node
   on PATH plus the mission toolchain — the same layering the repo's

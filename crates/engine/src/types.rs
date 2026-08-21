@@ -1115,13 +1115,11 @@ impl SandboxProvider {
     /// process provider qualifies on both supported platforms (macOS Seatbelt
     /// cuts outbound TCP to loopback; Linux bwrap `--unshare-net` removes the
     /// network entirely), so its proxy hop is the only reachable way out. The
-    /// container provider qualifies only on its supported macOS/Linux hosts
-    /// and with an EMPTY egress list
-    /// (`--network none`); a non-empty list keeps the runtime's default
-    /// bridge, where the proxy env vars are advisory and a direct socket
-    /// bypasses the filter — `config::validate` rejects that pair (fail
-    /// closed) until the internal-network/sidecar boundary exists
-    /// (docs/scoping/worker-sandboxing.md tier 3). The match is deliberately
+    /// container provider has a static hard boundary with an EMPTY egress
+    /// list (`--network none`). A non-empty list is provisioned dynamically
+    /// for sessions by `crate::container_egress`; this helper remains false
+    /// for that pair because engine-run gates do not own that lifecycle and
+    /// must continue to refuse it. The match is deliberately
     /// exhaustive: a future provider must declare itself here.
     pub fn enforces_hard_net_boundary(self, egress: &[String]) -> bool {
         match self {

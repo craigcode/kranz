@@ -25,14 +25,12 @@
 //!   the proxy is the ONLY way out — a hard boundary. (Seatbelt accepts only
 //!   `*`/`localhost` network hosts, which is why per-host filtering lives
 //!   here instead of in the profile.)
-//! - Tier-3 containers (`provider: container`, `fs+net` with a non-empty
-//!   egress list): the runtime bridge can reach the host-side proxy via
-//!   `host.docker.internal`, and the session env is forwarded into the
-//!   container. Env-based routing is advisory there — a process that ignores
-//!   the proxy vars bypasses the filter on the bridge. A hard container
-//!   boundary (internal-network sidecar) is follow-up work; `fs+net` with an
-//!   EMPTY egress list keeps the `--network none` hard boundary and runs no
-//!   proxy.
+//! - Tier-3 Docker containers (`provider: container`, `fs+net` with a
+//!   non-empty egress list): the worker has only a per-run internal network.
+//!   A dual-homed trusted relay injects a run-secret authorization header and
+//!   forwards CONNECT here; the worker has neither the token nor another
+//!   route. See `crate::container_egress`. An EMPTY egress list keeps the
+//!   simpler `--network none` boundary and runs no proxy.
 //! - Linux bubblewrap: OUT OF SCOPE for v1 — bwrap's all-or-nothing netns
 //!   cannot reach a host-side proxy without veth plumbing, so `fs+net` there
 //!   stays `--unshare-net` with no proxy and no denial signal. The macOS
@@ -44,12 +42,12 @@
 //! same discipline as `resolve_sandbox_or_refuse`. A denied host always
 //! produces a denial record, never a silent timeout.
 //!
-//! v1 denial correlation is mission-level: each run's proxy appends to the
+//! Denial correlation is mission-level: each run's proxy appends to the
 //! shared mission file (one line per denied CONNECT, fsynced), and
 //! `RunOutcome.denied_egress` carries exactly the records this run's proxy
 //! wrote (kept in memory alongside the file, so concurrent M3 runs never
-//! cross-attribute). Per-run attribution inside the shared file via a
-//! Proxy-Authorization token is documented later work, not built.
+//! cross-attribute). The authenticated container relay also prevents another
+//! container from forging requests into this run's proxy.
 
 use crate::backend::SessionSpec;
 use crate::error::{EngineError, Result};
@@ -60,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -241,6 +240,16 @@ pub struct EgressProxy {
     conn_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
 }
 
+impl Drop for EgressProxy {
+    fn drop(&mut self) {
+        // Runner error paths can leave before explicit shutdown (backend
+        // start failure, stream error, cancellation failure). Aborting both
+        // task sets makes that path fail closed and leak-free.
+        self.accept_task.abort();
+        self.conn_tasks.lock().expect("conn tasks lock").abort_all();
+    }
+}
+
 impl std::fmt::Debug for EgressProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EgressProxy")
@@ -268,6 +277,28 @@ impl EgressProxy {
         addr: SocketAddr,
         allowlist: Vec<String>,
         denial_file: PathBuf,
+    ) -> Result<EgressProxy> {
+        Self::start_bound_with_auth(addr, allowlist, denial_file, None).await
+    }
+
+    /// Bind an explicit address and require `Proxy-Authorization: Bearer …`
+    /// on every CONNECT. The Docker relay owns the token; the worker never
+    /// sees it. Authentication failure returns 407 and never records a host
+    /// denial, so an unauthenticated peer cannot forge grant requests.
+    pub async fn start_authenticated_bound(
+        addr: SocketAddr,
+        allowlist: Vec<String>,
+        denial_file: PathBuf,
+        token: String,
+    ) -> Result<EgressProxy> {
+        Self::start_bound_with_auth(addr, allowlist, denial_file, Some(token)).await
+    }
+
+    async fn start_bound_with_auth(
+        addr: SocketAddr,
+        allowlist: Vec<String>,
+        denial_file: PathBuf,
+        auth_token: Option<String>,
     ) -> Result<EgressProxy> {
         let entries = parse_allowlist(&allowlist)?;
         let listener = TcpListener::bind(addr).await.map_err(|e| {
@@ -307,8 +338,9 @@ impl EgressProxy {
                         Ok((stream, _peer)) => {
                             let sink = Arc::clone(&sink);
                             let entries = entries.clone();
+                            let auth_token = auth_token.clone();
                             let mut tasks = conn_tasks.lock().expect("conn tasks lock");
-                            tasks.spawn(handle_connection(stream, entries, sink));
+                            tasks.spawn(handle_connection(stream, entries, sink, auth_token));
                             // Reap finished tunnels so the set cannot grow
                             // unboundedly over a long session.
                             while tasks.try_join_next().is_some() {}
@@ -359,8 +391,14 @@ impl EgressProxy {
     }
 }
 
-async fn handle_connection(stream: TcpStream, allowlist: Vec<AllowEntry>, sink: Arc<DenialSink>) {
-    if let Err(e) = handle_connection_inner(stream, &allowlist, &sink).await {
+async fn handle_connection(
+    stream: TcpStream,
+    allowlist: Vec<AllowEntry>,
+    sink: Arc<DenialSink>,
+    auth_token: Option<String>,
+) {
+    if let Err(e) = handle_connection_inner(stream, &allowlist, &sink, auth_token.as_deref()).await
+    {
         tracing::debug!(error = %e, "egress proxy connection closed with an error");
     }
 }
@@ -369,6 +407,7 @@ async fn handle_connection_inner(
     stream: TcpStream,
     allowlist: &[AllowEntry],
     sink: &DenialSink,
+    auth_token: Option<&str>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let head = read_request_head(&mut reader).await?;
@@ -381,6 +420,20 @@ async fn handle_connection_inner(
         .await?;
         return Ok(());
     };
+    if let Some(token) = auth_token {
+        let authorized = proxy_authorization(&head)
+            .map(|candidate| candidate.as_bytes().ct_eq(token.as_bytes()).into())
+            .unwrap_or(false);
+        if !authorized {
+            write_response(
+                reader.get_mut(),
+                "407 Proxy Authentication Required",
+                b"kranz egress proxy: relay authorization required\r\n",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     if !allowlist
         .iter()
         .any(|entry| entry.matches(&target.host, target.port))
@@ -420,6 +473,16 @@ async fn handle_connection_inner(
     }
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+fn proxy_authorization(head: &str) -> Option<&str> {
+    head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("proxy-authorization") {
+            return None;
+        }
+        value.trim().strip_prefix("Bearer ")
+    })
 }
 
 /// Read lines until the CRLF terminator, bounded by [`MAX_HEAD_BYTES`] and
@@ -479,11 +542,47 @@ async fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> st
 pub async fn maybe_start_for_session(
     spec: &mut SessionSpec,
     paths: &MissionPaths,
-) -> Result<Option<EgressProxy>> {
+) -> Result<Option<SessionEgress>> {
+    if matches!(
+        spec.sandbox.as_ref(),
+        Some(sandbox)
+            if sandbox.backend == SandboxBackend::Container
+                && sandbox.inputs.enforce == SandboxEnforce::FsNet
+                && !sandbox.inputs.egress.is_empty()
+    ) {
+        return crate::container_egress::ContainerEgressBoundary::start(spec, paths)
+            .await
+            .map(|boundary| Some(SessionEgress::Container(boundary)));
+    }
     maybe_start_for_session_with(spec, paths, |allowlist, denial_file| {
         Box::pin(EgressProxy::start(allowlist, denial_file))
     })
     .await
+    .map(|proxy| proxy.map(SessionEgress::Proxy))
+}
+
+/// Enforcement resource tied to one session. Both variants expose the same
+/// denial stream; the container variant additionally owns Docker resources
+/// and verifies their teardown.
+pub enum SessionEgress {
+    Proxy(EgressProxy),
+    Container(crate::container_egress::ContainerEgressBoundary),
+}
+
+impl SessionEgress {
+    pub fn port(&self) -> u16 {
+        match self {
+            SessionEgress::Proxy(proxy) => proxy.port(),
+            SessionEgress::Container(boundary) => boundary.proxy_port(),
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<Vec<EgressDenial>> {
+        match self {
+            SessionEgress::Proxy(proxy) => Ok(proxy.shutdown().await),
+            SessionEgress::Container(boundary) => boundary.shutdown().await,
+        }
+    }
 }
 
 /// [`maybe_start_for_session`] with the proxy-start step injected, so tests
@@ -504,13 +603,11 @@ async fn maybe_start_for_session_with(
     if sandbox.inputs.enforce != SandboxEnforce::FsNet {
         return Ok(None);
     }
-    // Where the SESSION reaches the proxy: Seatbelt sessions run on the host
-    // (loopback); container sessions cross the runtime bridge via
-    // host.docker.internal (reachable from Docker Desktop's VM to the host's
-    // loopback-bound listener; Linux-docker gateway plumbing is follow-up).
+    // Seatbelt sessions reach their run proxy on host loopback. Container
+    // sessions took the authenticated internal-network path above; the other
+    // backends have no reachable host-proxy route.
     let route_host = match sandbox.backend {
         SandboxBackend::Seatbelt => "127.0.0.1",
-        SandboxBackend::Container if !sandbox.inputs.egress.is_empty() => "host.docker.internal",
         SandboxBackend::Bubblewrap | SandboxBackend::AppContainer | SandboxBackend::Container => {
             return Ok(None)
         }
@@ -796,6 +893,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn egress_proxy_authenticated_listener_rejects_forgery_without_denial_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let denial_file = dir.path().join("denials.jsonl");
+        let proxy = EgressProxy::start_authenticated_bound(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            vec!["allowed.example:443".to_string()],
+            denial_file.clone(),
+            "run-secret".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut unauthenticated = TcpStream::connect(proxy.addr()).await.unwrap();
+        unauthenticated
+            .write_all(b"CONNECT forged.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_response_head(&mut unauthenticated).await;
+        assert!(
+            response.starts_with("HTTP/1.1 407"),
+            "missing relay credential must be rejected: {response}"
+        );
+
+        let mut authenticated = TcpStream::connect(proxy.addr()).await.unwrap();
+        authenticated
+            .write_all(
+                b"CONNECT denied.example:443 HTTP/1.1\r\nProxy-Authorization: Bearer run-secret\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_response_head(&mut authenticated).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "authenticated disallowed host reaches policy: {response}"
+        );
+
+        let denials = proxy.shutdown().await;
+        assert_eq!(
+            denials,
+            vec![EgressDenial {
+                host: "denied.example".to_string(),
+                port: 443,
+            }],
+            "the unauthenticated forged host must not become a grant signal"
+        );
+        let content = std::fs::read_to_string(denial_file).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert!(!content.contains("forged.example"));
+    }
+
+    #[tokio::test]
     async fn egress_proxy_malformed_connect_gets_400_and_no_record() {
         let dir = tempfile::tempdir().unwrap();
         let denial_file = dir.path().join("denials.jsonl");
@@ -908,39 +1056,7 @@ mod tests {
             spec.env.get(NO_PROXY_ENV).map(String::as_str),
             Some(NO_PROXY_VALUE)
         );
-        assert!(proxy.shutdown().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn egress_proxy_maybe_start_routes_container_via_host_internal() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = temp_paths(&dir);
-        // Container fs+net with a non-empty egress list: bridge + proxy env
-        // pointing at the host-side proxy (empty egress stays --network none).
-        let mut spec = fs_net_spec(
-            SandboxBackend::Container,
-            vec!["crates.io:443".to_string()],
-            dir.path(),
-        );
-
-        let proxy = maybe_start_for_session(&mut spec, &paths)
-            .await
-            .unwrap()
-            .expect("container fs+net with egress spawns a proxy");
-        let url = spec
-            .env
-            .get(HTTPS_PROXY_ENV)
-            .expect("proxy env wired")
-            .clone();
-        assert!(
-            url.starts_with("http://host.docker.internal:"),
-            "container sessions reach the proxy via host.docker.internal: {url}"
-        );
-        assert_eq!(
-            spec.env.get(NO_PROXY_ENV).map(String::as_str),
-            Some(NO_PROXY_VALUE)
-        );
-        proxy.shutdown().await;
+        assert!(proxy.shutdown().await.unwrap().is_empty());
     }
 
     #[tokio::test]

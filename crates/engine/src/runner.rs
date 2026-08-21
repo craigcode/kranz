@@ -413,7 +413,7 @@ pub async fn run_session_to(
     // (the shared mission JSONL may interleave concurrent M3 runs; the
     // in-memory records attribute exactly).
     let denied_egress = match egress_proxy {
-        Some(proxy) => proxy.shutdown().await,
+        Some(proxy) => proxy.shutdown().await?,
         None => Vec::new(),
     };
 

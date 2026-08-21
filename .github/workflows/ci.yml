@@ -192,6 +192,30 @@ jobs:
           git config --global user.email ci@kranz.local
       - run: cargo test --workspace --no-fail-fast
 
+  # M7 tier-3 live proof: exercise the real Docker daemon, not an argv-only
+  # mock. The worker gets an internal-only network; the fixture proves an
+  # allowed CONNECT through the authenticated relay, a structured denied
+  # CONNECT, a failed direct-socket bypass with proxy env absent, and cleanup
+  # after normal shutdown, error-path Drop, and stale-owner crash recovery.
+  rust-linux-container-egress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Prove non-bypassable per-host container egress
+        run: |
+          log="$RUNNER_TEMP/kranz-container-egress-live-proof.log"
+          set +e
+          cargo test -p kranz-engine --lib container_egress::tests::container_per_host_egress_live_proof -- --exact --ignored --nocapture 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 1 passed' "$log"
+
   # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
   # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A
   # WRAPPED CONTRACT COMMAND through the gate sandbox wrap, proving a kranz
