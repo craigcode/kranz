@@ -107,10 +107,10 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # AppContainer tools probe each local drive root before user code starts.
-      # The disposable runner is elevated once here to install Microsoft's
-      # exact, non-inheriting metadata-only host ACEs; the Kranz launcher only
-      # verifies them read-only and never mutates a drive root.
+      # AppContainer tools probe each local drive root and open NUL during
+      # startup. The disposable runner is elevated once here to install
+      # Microsoft's exact drive-root metadata ACEs and null-device descriptor;
+      # the ordinary Kranz launcher verifies both prerequisites read-only.
       - name: Prepare Windows AppContainer host
         if: matrix.os == 'windows-latest'
         shell: pwsh

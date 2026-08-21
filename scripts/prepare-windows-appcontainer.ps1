@@ -30,9 +30,10 @@ foreach ($requestedRoot in ($Target | Sort-Object -Unique)) {
 }
 
 # The Rust command owns the security-sensitive operation so the same exact
-# GetNamedSecurityInfoW -> SetEntriesInAclW -> SetNamedSecurityInfoW path is
-# compiled, cross-checked, and used by both operators and protected CI. This
-# script is only the elevated source-checkout convenience wrapper.
+# drive-root DACL path and null-device descriptor path are compiled,
+# cross-checked, and used by both operators and protected CI. This script is
+# only the elevated source-checkout convenience wrapper; rerun it after boot
+# because Windows resets \Device\Null's descriptor.
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) {
     throw "kranz sandbox-prepare failed with exit code $LASTEXITCODE"

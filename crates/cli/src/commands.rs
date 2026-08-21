@@ -107,6 +107,12 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                     target.display()
                 );
             }
+            eprintln!("Preparing AppContainer null-device metadata: target=\\Device\\Null");
+            kranz_engine::sandbox_windows::prepare_appcontainer_null_device()
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "AppContainer null-device preparation applied: target=\\Device\\Null inheritance=none"
+            );
             Ok(0)
         }
         Command::Outcomes {

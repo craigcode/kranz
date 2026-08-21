@@ -188,25 +188,30 @@ ACLs for the worktree/private scratch and targeted read/execute access for the
 executable, toolchain, and shared Git metadata. The shared Git root is derived
 from the trusted repository and every writable worktree pointer must resolve
 back to that same common directory.
-Node, Cargo, and cmd also probe their local drive root during startup. LPAC's
-dual-principal access check means the package SID alone is insufficient.
+Node, Cargo, and cmd also probe their local drive root and open `NUL` during
+startup. LPAC's dual-principal access check means the package SID alone is
+insufficient.
 [`scripts/prepare-windows-appcontainer.ps1`](../../scripts/prepare-windows-appcontainer.ps1)
-is therefore a separate, elevated, one-time host step: on every relevant local
-drive root it installs the exact non-inheriting `0x00120088` metadata mask
+is therefore a separate, elevated host step: on every relevant local drive
+root it installs the exact non-inheriting `0x00120088` metadata mask
 (`FILE_READ_ATTRIBUTES | FILE_READ_EA | READ_CONTROL | SYNCHRONIZE`) for
 `ALL APPLICATION PACKAGES` (`S-1-15-2-1`) and
 `ALL RESTRICTED APPLICATION PACKAGES` (`S-1-15-2-2`). It refuses conflicting
 explicit ACEs instead of merging rights. The mask grants no root listing,
 content read, or write access, and does not propagate below the root. The
-script invokes the public `kranz sandbox-prepare --target <drive-root>` command;
-that compiled path follows Microsoft's `GetNamedSecurityInfoW` →
+same command reapplies Microsoft's documented `\Device\Null` security
+descriptor once per boot; Windows resets it at restart, and without both
+package ACEs ordinary redirected tools fail during startup with access denied.
+The script invokes the public
+`kranz sandbox-prepare --target <drive-root>` command; that compiled path
+follows Microsoft's `GetNamedSecurityInfoW` →
 `SetEntriesInAclW` → `SetNamedSecurityInfoW` sequence and verifies the resulting
 tuples instead of using the managed `Set-Acl` path. The
-ordinary Kranz launcher only verifies those exact tuples with `READ_CONTROL`;
-missing preparation fails before the hostile child starts and names the
-elevated command to run. This follows Microsoft's AppContainer host-preparation
-contract instead of trying to substitute a per-profile capability for a
-well-known restricted-package principal.
+ordinary Kranz launcher verifies the root tuples and null-device package ACEs
+read-only; missing preparation fails before the hostile child starts and names
+the elevated command to run. This follows Microsoft's AppContainer
+host-preparation contract instead of trying to substitute a per-profile
+capability for a well-known restricted-package principal.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the

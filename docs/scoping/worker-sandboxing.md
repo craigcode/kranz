@@ -104,9 +104,10 @@ All of it asks the agent nicely. None of it constrains the process.
   AppContainer (LPAC) token, path-specific disposable-SID ACL lease, and
   pre-resume Job Object assignment for `fs`/`fs+net`. Opting out of
   `ALL APPLICATION PACKAGES` prevents ambient regular-AppContainer grants from
-  widening the path allowlist. A one-time elevated host-preparation script adds
-  only Microsoft's non-inheriting drive-root metadata ACEs; the launcher
-  verifies the exact tuples read-only and otherwise fails closed. `fs` grants
+  widening the path allowlist. An elevated host-preparation script adds only
+  Microsoft's non-inheriting drive-root metadata ACEs and reapplies the
+  documented null-device descriptor once per boot; the launcher verifies both
+  prerequisites read-only and otherwise fails closed. `fs` grants
   internet-client access; `fs+net` is hard offline. The same launcher wraps
   workers, validators, and engine-run gates, and protected CI proves
   authority/real-checkout denial plus DACL restoration.

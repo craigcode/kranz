@@ -33,8 +33,9 @@ cargo build --workspace
 `.github/workflows/ci.yml` runs fmt/clippy/workspace tests on Ubuntu and
 Windows (no standalone `build` job — `cargo test` covers it), a separate macOS
 workspace suite, and a wrapped macOS dogfood suite. The Windows lane begins
-with the explicit minimal drive-root host-preparation step and the production
-LPAC/AppContainer containment receipts. The MSRV lane runs
+with the explicit minimal drive-root and per-boot null-device host-preparation
+step, then runs the production LPAC/AppContainer containment receipts. The
+MSRV lane runs
 `cargo check --workspace --locked` on Rust 1.88. Dedicated jobs cover the
 full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs

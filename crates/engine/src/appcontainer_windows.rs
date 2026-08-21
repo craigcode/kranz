@@ -15,9 +15,10 @@
 //! reaped or aborted;
 //! removing an inheritable parent ACE also removes its inherited copies from
 //! descendants.
-//! An elevated one-time host step owns the two well-known, non-inheriting
-//! drive-root metadata ACEs Windows tools require; the launcher verifies those
-//! exact tuples read-only and never mutates a drive root.
+//! An elevated host step owns the two well-known, non-inheriting drive-root
+//! metadata ACEs Windows tools require and reapplies the documented
+//! AppContainer descriptor to `\Device\Null` once per boot; the launcher
+//! verifies both prerequisites read-only.
 //! A bounded host-local mutex serializes those DACL read/modify/write batches,
 //! so this composes safely across overlapping launches that share Git/toolchain
 //! roots and restores the original descriptor exactly when no unrelated ACL
@@ -36,34 +37,38 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, GENERIC_READ, HANDLE, HLOCAL,
-    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE, HLOCAL, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW,
-    SetNamedSecurityInfoW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetLengthSid, GetTokenInformation, TokenElevation, TokenIsAppContainer,
+    GetAclInformation, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorDacl,
+    GetTokenInformation, SetKernelObjectSecurity, TokenElevation, TokenIsAppContainer,
     WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    INHERITED_ACE, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    GROUP_SECURITY_INFORMATION, INHERITED_ACE, LABEL_SECURITY_INFORMATION, NO_INHERITANCE,
+    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
     WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -89,6 +94,10 @@ const DACL_MUTEX_NAME: &str = "Local\\Kranz.AppContainer.Dacl.v1";
 const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
 const ROOT_METADATA_ACCESS_MASK: u32 = 0x0012_0088;
+const NULL_DEVICE_ACCESS_MASK: u32 = 0x0012_01bf;
+// Source: Microsoft's current AppContainer host-preparation contract.
+// https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
+const NULL_DEVICE_TARGET_SDDL: &str = "O:BAG:SYD:(A;;GRGWGX;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;RC)(A;;GRGWGX;;;AC)(A;;GRGWGX;;;S-1-15-2-2)S:(ML;;NW;;;LW)";
 const ALL_RESTRICTED_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-2";
 const GATE_OVERHEAD_REPETITIONS: usize = 7;
 const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
@@ -649,6 +658,182 @@ pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
     );
     verify_volume_root_prepared(root)?;
     Ok(changed_any || changed_restricted)
+}
+
+fn open_null_device(write: bool) -> Result<OwnedHandle> {
+    let mut desired_access = GENERIC_READ.0 | READ_CONTROL.0;
+    if write {
+        desired_access |= WRITE_DAC.0 | WRITE_OWNER.0;
+    }
+    let path = wide(r"\\.\NUL");
+    unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to open \\Device\\Null for AppContainer host {}: {error}",
+            if write { "preparation" } else { "verification" }
+        ))
+    })
+}
+
+fn read_kernel_dacl(handle: HANDLE) -> Result<Vec<u8>> {
+    let mut needed = 0u32;
+    if unsafe { GetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION.0, None, 0, &mut needed) }
+        .is_err()
+    {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(EngineError::Backend(format!(
+                "failed to size \\Device\\Null security descriptor: {error:?}"
+            )));
+        }
+    }
+    if needed == 0 {
+        return Err(EngineError::Backend(
+            "\\Device\\Null returned an empty security descriptor".to_string(),
+        ));
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    let mut written = 0u32;
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            Some(PSECURITY_DESCRIPTOR(bytes.as_mut_ptr().cast())),
+            needed,
+            &mut written,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to read \\Device\\Null security descriptor: {error}"
+        ))
+    })?;
+    bytes.truncate(written as usize);
+    Ok(bytes)
+}
+
+fn dacl_has_null_device_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
+    if acl.is_null() {
+        return Ok(false);
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!("failed to inspect \\Device\\Null DACL: {error}"))
+    })?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read \\Device\\Null DACL ACE: {error}"))
+        })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0 {
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if ace.Mask == NULL_DEVICE_ACCESS_MASK && unsafe { EqualSid(trustee, sid) }.is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_null_device_prepared() -> Result<()> {
+    let handle = open_null_device(false)?;
+    let mut descriptor = read_kernel_dacl(handle.0)?;
+    let descriptor = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast());
+    let mut present = BOOL(0);
+    let mut defaulted = BOOL(0);
+    let mut acl: *mut ACL = null_mut();
+    unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to locate \\Device\\Null DACL: {error}"))
+        })?;
+    if !present.as_bool() {
+        return Err(EngineError::Backend(
+            "\\Device\\Null has no DACL; refusing AppContainer launch".to_string(),
+        ));
+    }
+    let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let any_package_present = dacl_has_null_device_ace(acl, PSID(any_package.as_mut_ptr().cast()))?;
+    let restricted_present = dacl_has_null_device_ace(acl, PSID(restricted.as_mut_ptr().cast()))?;
+    if any_package_present && restricted_present {
+        return Ok(());
+    }
+
+    Err(EngineError::Backend(
+        "AppContainer host preparation is missing the required \\Device\\Null package ACEs; run scripts/prepare-windows-appcontainer.ps1 once from elevated PowerShell after each reboot"
+            .to_string(),
+    ))
+}
+
+/// Reapply the Windows AppContainer null-device descriptor once per boot.
+/// The kernel resets this object at restart; without the two package ACEs,
+/// ordinary tools that open `NUL` during startup fail with access denied.
+pub(crate) fn prepare_appcontainer_null_device() -> Result<()> {
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer null-device preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    let handle = open_null_device(true)?;
+    let sddl = wide(NULL_DEVICE_TARGET_SDDL);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to parse the trusted \\Device\\Null security descriptor: {error}"
+        ))
+    })?;
+    if descriptor.0.is_null() {
+        return Err(EngineError::Backend(
+            "Windows returned a null parsed \\Device\\Null security descriptor".to_string(),
+        ));
+    }
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    let info = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION;
+    unsafe { SetKernelObjectSecurity(handle.0, info, descriptor) }.map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to prepare \\Device\\Null for AppContainer tools: {error}"
+        ))
+    })?;
+    verify_null_device_prepared()
 }
 
 /// Common Windows tools inspect the local drive root before user code starts.
@@ -1677,6 +1862,7 @@ fn prepare_launch_for_lease(
         .collect::<Vec<_>>();
     volume_roots.sort();
     volume_roots.dedup();
+    verify_null_device_prepared()?;
     for root in &volume_roots {
         verify_volume_root_prepared(root)?;
     }
@@ -2963,6 +3149,13 @@ mod tests {
         for rejected in [r"C:", r"C:\Windows", r"\\server\share", r"C:\\", ""] {
             assert!(validate_host_preparation_root(Path::new(rejected)).is_err());
         }
+    }
+
+    #[test]
+    fn null_device_descriptor_grants_both_appcontainer_package_groups() {
+        assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;AC)"));
+        assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;S-1-15-2-2)"));
+        assert_eq!(NULL_DEVICE_ACCESS_MASK, 0x0012_01bf);
     }
 
     #[test]

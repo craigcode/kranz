@@ -123,11 +123,12 @@ pub enum Command {
         json: bool,
     },
 
-    /// Prepare local drive roots for Windows AppContainer enforcement.
+    /// Prepare the Windows host for AppContainer enforcement.
     ///
     /// Adds only the two persistent, non-inheriting metadata ACEs required by
-    /// Windows tools. Run once from an elevated PowerShell; ordinary Kranz
-    /// launches verify the tuples read-only and never mutate drive roots.
+    /// Windows tools on each drive root and reapplies the documented null-device
+    /// descriptor that resets at boot. Run from an elevated PowerShell;
+    /// ordinary Kranz launches verify both prerequisites read-only.
     SandboxPrepare {
         /// Literal local drive root to prepare (repeat for multiple drives).
         #[arg(long = "target", value_name = "DRIVE-ROOT", required = true)]

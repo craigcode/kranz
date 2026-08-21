@@ -83,13 +83,14 @@ output, validator read denial, or every production spawn site.
 - Each agent launch uses a disposable profile SID; each resolved engine-gate
   posture owns one disposable SID across its validation/final-gate command
   batch, so expensive ACL preparation is once per posture rather than once per
-  assertion. Because ordinary Windows tools probe the local drive root during
-  startup, an elevated one-time host-preparation script installs Microsoft's
-  exact non-inheriting `0x00120088` metadata ACE for `S-1-15-2-1` and
-  `S-1-15-2-2` on each relevant local drive. Those ACEs grant no root listing,
-  content read, or write rights. The ordinary launcher checks them read-only
-  and fails closed with the preparation command when either exact tuple is
-  absent. The ACL lease retains a no-follow handle for every path-specific DACL
+  assertion. Because ordinary Windows tools probe the local drive root and
+  open `NUL` during startup, an elevated host-preparation script installs
+  Microsoft's exact non-inheriting `0x00120088` metadata ACE for `S-1-15-2-1`
+  and `S-1-15-2-2` on each relevant local drive and reapplies the documented
+  `\Device\Null` descriptor once per boot. The root ACEs grant no listing,
+  content read, or write rights. The ordinary launcher checks both prerequisites
+  read-only and fails closed with the preparation command when either is absent.
+  The ACL lease retains a no-follow handle for every path-specific DACL
   it changes, removes only the unique package SID's ACEs root-first, then
   deletes every private plan and the profile. A bounded host-local mutex
   serializes ACL read/modify/write
