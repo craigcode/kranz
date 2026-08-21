@@ -123,9 +123,11 @@ output, validator read denial, or every production spawn site.
   to avoid forwarding model arguments through `cmd.exe`.
 
 This closes production integration. Protected hosted CI also proves ordinary
-Node/Rust contract gates and representative retained-posture overhead. It does
-not yet prove per-host `fs` filtering or the final operator-controlled Windows
-11 receipt.
+Node/Rust contract gates and representative retained-posture overhead against
+a one-second minimum gate payload, keeping the `10%` limit while preventing a
+sub-second timer from standing in for the stated `npm build`/`cargo test`
+workload. It does not yet prove per-host `fs` filtering or the final
+operator-controlled Windows 11 receipt.
 
 ## Acceptance hints
 

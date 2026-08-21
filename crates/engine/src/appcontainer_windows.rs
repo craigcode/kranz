@@ -101,6 +101,7 @@ const REGISTRY_READ_CAPABILITY: &str = "registryRead";
 const NULL_DEVICE_TARGET_SDDL: &str = "O:BAG:SYD:(A;;GRGWGX;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;RC)(A;;GRGWGX;;;AC)(A;;GRGWGX;;;S-1-15-2-2)S:(ML;;NW;;;LW)";
 const ALL_RESTRICTED_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-2";
 const GATE_OVERHEAD_REPETITIONS: usize = 7;
+const GATE_WORKLOAD_MILLIS: u64 = 1_000;
 const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3219,12 +3220,14 @@ fn production_gate_self_test() -> Result<String> {
     drop(source);
     std::fs::write(
         worktree.join("node-gate.js"),
-        r#"const assert = require('node:assert/strict');
+        format!(
+            r#"const assert = require('node:assert/strict');
 let checksum = 0;
 for (let i = 0; i < 100000; i += 1) checksum = (checksum + i) >>> 0;
 assert.equal(checksum, 704982704);
-setTimeout(() => console.log('kranz-node-gate-ok'), 750);
-"#,
+setTimeout(() => console.log('kranz-node-gate-ok'), {GATE_WORKLOAD_MILLIS});
+"#
+        ),
     )?;
     std::fs::write(
         worktree.join("rust-gate").join("Cargo.toml"),
@@ -3232,17 +3235,19 @@ setTimeout(() => console.log('kranz-node-gate-ok'), 750);
     )?;
     std::fs::write(
         rust_src.join("lib.rs"),
-        r#"#[cfg(test)]
-mod tests {
+        format!(
+            r#"#[cfg(test)]
+mod tests {{
     #[test]
-    fn normal_rust_gate() {
+    fn normal_rust_gate() {{
         let values: Vec<u64> = (0..100_000).collect();
         assert_eq!(values.iter().sum::<u64>(), 4_999_950_000);
-        std::thread::sleep(std::time::Duration::from_millis(750));
+        std::thread::sleep(std::time::Duration::from_millis({GATE_WORKLOAD_MILLIS}));
         println!("kranz-rust-gate-ok");
-    }
-}
-"#,
+    }}
+}}
+"#
+        ),
     )?;
 
     let sandbox_config = crate::types::SandboxConfig {

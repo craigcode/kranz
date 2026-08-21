@@ -140,9 +140,10 @@ job without a managed runner would be ceremony, not evidence.
    wrapping. The protected receipt proves exact DACL restoration after the
    child exits.
 5. **Shipped on protected hosted Windows:** run the full hostile brief plus
-   normal Node/Rust gate and retained-posture overhead measurements. Repeat
-   that receipt on the operator-controlled Windows 11 host before marking the
-   Windows ticket and M7 parity complete.
+   normal Node/Rust gate and retained-posture overhead measurements against a
+   one-second minimum representative gate payload, retaining the `10%` target.
+   Repeat that receipt on the operator-controlled Windows 11 host before
+   marking the Windows ticket and M7 parity complete.
 
 ## Phase-1 receipt
 
