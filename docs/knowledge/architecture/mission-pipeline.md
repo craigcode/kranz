@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-18
+last_verified: 2026-08-21
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs

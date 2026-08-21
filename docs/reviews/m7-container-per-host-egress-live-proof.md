@@ -13,8 +13,10 @@ claim equivalent Podman/nerdctl/Apple-container networking.
   Linux capabilities dropped, no-new-privileges, read-only root.
 - Filter: one host-side Kranz CONNECT proxy with the existing effective
   allowlist and structured per-run denial sink.
-- Attribution: 256-bit per-run bearer token mounted only into the relay. The
-  relay injects it; unauthenticated CONNECT gets 407 and creates no denial.
+- Attribution: 256-bit per-run bearer token copied through an offline pinned
+  helper into a private Docker volume mounted read-only only by the relay.
+  Host copies are deleted before worker spawn. The relay injects the token;
+  unauthenticated CONNECT gets 407 and creates no denial.
 - Supply chain: relay manifest pinned to
   `python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d`.
 
@@ -43,13 +45,15 @@ The fixture proved, against the live daemon:
 3. An ordinary bridge control container reached a live external peer. A
    worker on the internal network, with no proxy involvement, could not open
    the same direct socket. This is the anti-vacuity control for the bypass.
-4. Normal shutdown removed the worker name, relay, network, and private
-   credential directory.
+4. Host credential staging was absent before the first worker spawn. Normal
+   shutdown removed the worker name, relay, network, private credential
+   volume, and staging directory.
 5. Error/timeout-shaped Drop force-removed a still-running daemon-owned worker
-   before removing the relay, network, and credential directory.
+   before removing the relay, network, credential volume, and staging
+   directory.
 6. A seeded stale owner (dead PID/token) plus live stale relay/network and
-   credential was removed by recovery; a live owner is retained by the same
-   identity comparison.
+   credential volume and staging directory were removed by recovery; a live
+   owner is retained by the same identity comparison.
 
 Post-proof `docker ps -a --filter name=kranz-egress` and
 `docker network ls --filter label=com.kranz.egress-boundary=true` both

@@ -190,7 +190,9 @@ All of it asks the agent nicely. None of it constrains the process.
   Podman, nerdctl, and Apple `container` refuse this non-empty-list posture
   until their network primitives have a separate live proof.
 - Boundary lifecycle is owned by the run. The worker container, relay,
-  internal network, and private credential directory all have unique names;
+  internal network, private credential volume, and transient staging
+  directory all have unique names. The staging directory is deleted before
+  worker spawn and only the relay mounts the credential volume, read-only;
   explicit shutdown verifies their removal. The same bounded removal runs
   from `Drop` after backend failure/cancellation/timeout, including a forced
   remove of the daemon-owned worker whose runtime client may already be
