@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Docker internal-network enforcement shipped with an authenticated dual-homed relay, private no-bind credential volume, structured per-run denials, verified teardown and stale-owner recovery; protected Ubuntu job 96861680799 proved allowed and denied CONNECT behavior plus a failed direct-socket bypass on SHA 95a87357.
 title: Enforce container per-host egress with a non-bypassable network boundary
 priority: 2
 schedule: once
@@ -29,3 +30,5 @@ variables.
   success, failure, timeout, and crash recovery.
 - Linux live proof is mandatory; Windows support follows the provider decision
   in `m7-windows-containment-parity`.
+
+See [the committed Docker live-proof receipt](../../docs/reviews/m7-container-per-host-egress-live-proof.md).

@@ -60,12 +60,21 @@ The fixture proved, against the live daemon:
 
 Post-proof `docker ps -a --filter name=kranz-egress` and
 `docker network ls --filter label=com.kranz.egress-boundary=true` both
-returned empty output.
+returned empty output, as did the corresponding labeled volume query.
 
 ## Linux CI receipt
 
-The dedicated `rust-linux-container-egress` job runs the same exact ignored
-fixture on `ubuntu-latest` and enforces `test result: ok. 1 passed` as an
-anti-vacuity check. Its first trusted run URL and SHA are intentionally filled
-only after the proposed implementation executes green on Linux; until then
-the ticket remains open.
+The dedicated `rust-linux-container-egress` job ran the same exact ignored
+fixture on an `ubuntu-latest` x86_64 host and enforced
+`test result: ok. 1 passed` as an anti-vacuity check.
+
+- Pull request: `#16`, `codex/m7-completion`
+- Proof branch SHA: `95a87357c55bd19e7e7f85b4bfb119316d85dcab`
+- Workflow run: `32510944102`
+- Ubuntu job: [`96861680799`](https://github.com/craigcode/kranz/actions/runs/32510944102/job/96861680799)
+- Result: passed on 2026-08-21
+
+The native job exercised the no-bind stopped-loader credential path that
+replaced the user-namespace-sensitive host bind caught by the two preceding
+failed proof runs. This closes the container per-host egress ticket for Docker;
+other runtimes remain fail-closed as scoped above.
