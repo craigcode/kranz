@@ -3678,6 +3678,208 @@ mod tests {
         let _ = std::fs::remove_file(&outside_file);
     }
 
+    /// Real-host M7 receipt for Linux. The dedicated CI invocation installs
+    /// bubblewrap, then runs this exact ignored test with `--nocapture` so the
+    /// retained timing and containment evidence is visible in the job log.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live bubblewrap receipt — run by the protected Linux CI leg"]
+    #[allow(clippy::await_holding_lock)]
+    async fn linux_bubblewrap_hostile_live_receipt() {
+        let _guard = GATE_SANDBOX_WRAP_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            gate_wrap_bwrap_can_apply(),
+            "the live-proof host must provide a working bubblewrap boundary"
+        );
+
+        let primary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/engine has a repository root");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(primary)
+                .output()
+                .expect("git must run on the live-proof checkout");
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let head_before = git(&["rev-parse", "HEAD"]);
+        let status_before = git(&["status", "--porcelain", "--untracked-files=no"]);
+        assert!(
+            status_before.is_empty(),
+            "the live proof requires a clean tracked primary checkout: {status_before}"
+        );
+
+        let (repo, mission) = gate_wrap_layout();
+        let scratch = tempfile::tempdir().expect("private proof scratch");
+        let outside = tempfile::tempdir().expect("sibling canary root");
+        let resolution = resolve_gate_sandbox(
+            &fs_sandbox_config(crate::types::SandboxEnforce::FsNet),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+        )
+        .expect("fs+net must resolve to bubblewrap on the proof host");
+        assert!(resolution.note.is_none());
+        assert!(matches!(resolution.sandbox, GateSandbox::Bubblewrap { .. }));
+        let sandbox = resolution.sandbox;
+        let env = crate::agent_env::contract_command_env(scratch.path(), None, &[]);
+
+        let canary = outside.path().join("kranz-linux-hostile-canary");
+        let (write_ok, write_output) = run_shell_command_sandboxed(
+            repo.path(),
+            &format!("printf escaped > '{}'", canary.display()),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert!(
+            !write_ok,
+            "sibling write escaped bubblewrap: {write_output}"
+        );
+        assert!(
+            !canary.exists(),
+            "the denied sibling canary must stay absent"
+        );
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("host loopback proof listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking proof listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let acceptor = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut accepted = 0usize;
+            while started.elapsed() < Duration::from_secs(10) {
+                match listener.accept() {
+                    Ok(_) => accepted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("proof listener failed: {error}"),
+                }
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            accepted
+        });
+        let connect = format!(
+            "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {port}), 2).close()'"
+        );
+        let (off_connect_ok, off_connect_output) =
+            run_shell_command_sandboxed(repo.path(), &connect, &env, &GateSandbox::Disabled).await;
+        assert!(
+            off_connect_ok,
+            "the network anti-vacuity probe must reach the host listener without enforcement: {off_connect_output}"
+        );
+        let (wrapped_connect_ok, wrapped_connect_output) =
+            run_shell_command_sandboxed(repo.path(), &connect, &env, &sandbox).await;
+        assert!(
+            !wrapped_connect_ok,
+            "the fs+net namespace reached the host listener: {wrapped_connect_output}"
+        );
+        let _ = stop_tx.send(());
+        assert_eq!(
+            acceptor.join().expect("proof listener thread"),
+            1,
+            "only the unwrapped anti-vacuity connection may reach the host"
+        );
+
+        let gate = "node -e \"let n=0; for(let i=0;i<100000;i++)n=(n+i)>>>0; if(n!==704982704)process.exit(2); setTimeout(()=>console.log('kranz-linux-node-ok'),750)\"";
+        for (label, posture) in [
+            ("unwrapped warm-up", &GateSandbox::Disabled),
+            ("bubblewrap warm-up", &sandbox),
+        ] {
+            let (ok, output) = run_shell_command_sandboxed(repo.path(), gate, &env, posture).await;
+            assert!(
+                ok && output.contains("kranz-linux-node-ok"),
+                "{label} failed: {output}"
+            );
+        }
+
+        let mut off_samples_ms = Vec::with_capacity(7);
+        let mut wrapped_samples_ms = Vec::with_capacity(7);
+        for index in 0..7 {
+            for wrapped in [index % 2 == 1, index % 2 == 0] {
+                let started = std::time::Instant::now();
+                let posture = if wrapped {
+                    &sandbox
+                } else {
+                    &GateSandbox::Disabled
+                };
+                let (ok, output) =
+                    run_shell_command_sandboxed(repo.path(), gate, &env, posture).await;
+                assert!(
+                    ok && output.contains("kranz-linux-node-ok"),
+                    "timed gate failed: {output}"
+                );
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                if wrapped {
+                    wrapped_samples_ms.push(elapsed);
+                } else {
+                    off_samples_ms.push(elapsed);
+                }
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        let off_median_ms = median(&off_samples_ms);
+        let wrapped_median_ms = median(&wrapped_samples_ms);
+        let overhead_percent = (wrapped_median_ms / off_median_ms - 1.0) * 100.0;
+
+        let head_after = git(&["rev-parse", "HEAD"]);
+        let status_after = git(&["status", "--porcelain", "--untracked-files=no"]);
+        assert_eq!(head_after, head_before, "the primary checkout HEAD moved");
+        assert_eq!(
+            status_after, status_before,
+            "the primary checkout's tracked bytes changed"
+        );
+
+        let host = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_else(|| "unavailable".to_string())
+        };
+        let receipt = serde_json::json!({
+            "hostOs": std::env::consts::OS,
+            "hostArch": std::env::consts::ARCH,
+            "kernel": host("uname", &["-sr"]),
+            "bubblewrap": host("bwrap", &["--version"]),
+            "node": host("node", &["--version"]),
+            "enforcement": "fs+net",
+            "provider": "process/bubblewrap",
+            "siblingWriteDenied": !write_ok && !canary.exists(),
+            "networkDenied": !wrapped_connect_ok,
+            "networkAntiVacuityPassed": off_connect_ok,
+            "normalGatePassed": true,
+            "primaryCheckoutUntouched": head_after == head_before && status_after == status_before,
+            "repetitions": 7,
+            "offSamplesMs": off_samples_ms,
+            "bubblewrapSamplesMs": wrapped_samples_ms,
+            "offMedianMs": off_median_ms,
+            "bubblewrapMedianMs": wrapped_median_ms,
+            "overheadPercent": overhead_percent,
+            "overheadTargetPercent": 10.0,
+            "withinTarget": overhead_percent <= 10.0,
+            "head": head_before,
+        });
+        println!("KRANZ_LINUX_LIVE_RECEIPT={receipt}");
+    }
+
     /// MEASUREMENT HARNESS, not a CI gate (ticket
     /// engine-gates-sandbox-wrapped named a >~20% overhead as the opt-in
     /// threshold): times a real gate command through the merge-gate path,

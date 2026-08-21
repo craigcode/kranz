@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-08-18
+last_verified: 2026-08-20
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md

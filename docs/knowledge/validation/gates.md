@@ -35,6 +35,8 @@ Windows (no standalone `build` job — `cargo test` covers it), a separate macOS
 workspace suite, and a wrapped macOS dogfood suite. The Windows lane begins
 with the explicit minimal drive-root and per-boot null-device host-preparation
 step, then runs the production LPAC/AppContainer containment receipts. The
+Ubuntu lane enables unprivileged user namespaces on its ephemeral runner and
+executes the real bubblewrap hostile-boundary and warm-overhead receipt. The
 MSRV lane runs
 `cargo check --workspace --locked` on Rust 1.88. Dedicated jobs cover the
 full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
