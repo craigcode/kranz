@@ -1221,6 +1221,65 @@ fn resolve_installed_rustup_toolchain(
     bin.parent().map(local_dos_path)
 }
 
+/// Materialize the package-private temp path Windows substitutes for an
+/// AppContainer child. Kranz redirects LOCALAPPDATA into the writable session
+/// scratch, while `CreateAppContainerProfile` runs in the trusted parent's
+/// ambient profile and therefore cannot create this redirected tree itself.
+///
+/// Source: https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer
+/// (`TEMP`/`TMP` become `<LOCALAPPDATA>/Packages/<profile>/AC/Temp`).
+fn prepare_redirected_profile_temp(
+    profile_name: &str,
+    write_roots: &[PathBuf],
+    env: &HashMap<String, String>,
+) -> Result<PathBuf> {
+    let profile = Path::new(profile_name);
+    if profile.components().count() != 1
+        || !matches!(
+            profile.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(EngineError::Backend(format!(
+            "invalid AppContainer profile name {profile_name:?}"
+        )));
+    }
+    let local_app_data = env_value_ci(env, "LOCALAPPDATA").ok_or_else(|| {
+        EngineError::Backend(
+            "AppContainer launch requires redirected LOCALAPPDATA inside a writable root"
+                .to_string(),
+        )
+    })?;
+    let local_app_data = std::fs::canonicalize(local_app_data).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to canonicalize redirected AppContainer LOCALAPPDATA {local_app_data}: {error}"
+        ))
+    })?;
+    let allowed = write_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .ok()
+            .is_some_and(|root| path_contains(&root, &local_app_data))
+    });
+    if !allowed {
+        return Err(EngineError::Backend(format!(
+            "redirected AppContainer LOCALAPPDATA {} is outside the writable sandbox roots",
+            local_app_data.display()
+        )));
+    }
+    let temp = local_app_data
+        .join("Packages")
+        .join(profile_name)
+        .join("AC")
+        .join("Temp");
+    std::fs::create_dir_all(&temp).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to create redirected AppContainer temp {}: {error}",
+            temp.display()
+        ))
+    })?;
+    Ok(temp)
+}
+
 fn push_entry_point(files: &mut Vec<PathBuf>, path: &Path) {
     if !path.is_file() {
         return;
@@ -1970,6 +2029,8 @@ fn prepare_launch_for_lease(
             inputs.tmpdir.display()
         ))
     })?;
+    let write_roots = crate::sandbox::write_allowlist(inputs);
+    prepare_redirected_profile_temp(&lease.profile_name, &write_roots, env)?;
     let executable = resolve_executable(program, env)?;
     // The child PATH is narrower than the host PATH and deliberately includes
     // declared workspace roots. Use that SAME path while discovering exact
@@ -3541,6 +3602,53 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn redirected_appcontainer_temp_is_materialized_only_under_a_writable_root() {
+        let root = tempfile::tempdir().expect("temp profile root");
+        let scratch = root.path().join("scratch");
+        let local_app_data = scratch.join("home").join("AppData").join("Local");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&local_app_data).expect("scratch LOCALAPPDATA");
+        std::fs::create_dir_all(&outside).expect("outside LOCALAPPDATA");
+
+        let mut env = HashMap::new();
+        env.insert(
+            "localappdata".to_string(),
+            local_app_data.to_string_lossy().into_owned(),
+        );
+        let temp = prepare_redirected_profile_temp(
+            "kranz.production.receipt",
+            std::slice::from_ref(&scratch),
+            &env,
+        )
+        .expect("redirected AppContainer temp");
+        assert_eq!(
+            temp,
+            std::fs::canonicalize(&local_app_data)
+                .expect("canonical LOCALAPPDATA")
+                .join("Packages")
+                .join("kranz.production.receipt")
+                .join("AC")
+                .join("Temp")
+        );
+        assert!(temp.is_dir());
+
+        env.insert(
+            "LOCALAPPDATA".to_string(),
+            outside.to_string_lossy().into_owned(),
+        );
+        env.remove("localappdata");
+        let error = prepare_redirected_profile_temp(
+            "kranz.production.receipt",
+            std::slice::from_ref(&scratch),
+            &env,
+        )
+        .expect_err("outside LOCALAPPDATA must fail closed");
+        assert!(error
+            .to_string()
+            .contains("outside the writable sandbox roots"));
     }
 
     #[test]

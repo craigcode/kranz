@@ -113,7 +113,9 @@ All of it asks the agent nicely. None of it constrains the process.
   Rust commands pin the already-installed active standard rustup toolchain by
   absolute path, grant that protected root read/execute directly, and prefer
   its real binaries over the rustup proxy, with auto-install disabled; the
-  operator's `RUSTUP_HOME` remains read-only.
+  operator's `RUSTUP_HOME` remains read-only. The launcher also pre-creates
+  Windows' package-private `AC/Temp` under the redirected, scratch-owned
+  `LOCALAPPDATA`, refusing any redirect outside the writable roots.
   The same launcher wraps workers, validators, and engine-run gates, and
   protected CI proves authority/real-checkout denial plus DACL restoration.
   The container provider remains fail-closed even when `docker.exe` is present:

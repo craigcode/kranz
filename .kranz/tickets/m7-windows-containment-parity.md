@@ -99,7 +99,11 @@ output, validator read denial, or every production spawn site.
   from parent inheritance, that selected root receives its own recursive
   read/execute grant and its real `bin` directory leads the contained `PATH`;
   Rust gates therefore avoid the rustup proxy without refreshing a channel or
-  writing the operator's `RUSTUP_HOME`.
+  writing the operator's `RUSTUP_HOME`. Windows also rewrites `TEMP`/`TMP` to
+  `<LOCALAPPDATA>/Packages/<profile>/AC/Temp`; because Kranz redirects
+  `LOCALAPPDATA` into private scratch after profile creation, the launcher
+  materializes that exact tree only after proving it remains under a writable
+  sandbox root.
   The ACL lease retains a no-follow handle for every path-specific DACL
   it changes, removes only the unique package SID's ACEs root-first, then
   deletes every private plan and the profile. A bounded host-local mutex

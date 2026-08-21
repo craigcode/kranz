@@ -226,6 +226,12 @@ directory leads the contained `PATH`. That bypasses the rustup proxy and
 prevents a floating channel refresh from attempting to write the operator's
 `RUSTUP_HOME`; it does not add a writable root or permit installation from the
 network.
+Windows additionally rewrites `TEMP` and `TMP` beneath the AppContainer profile
+location. Since Kranz redirects `LOCALAPPDATA` into the session-private scratch
+after the trusted parent creates the profile, the launcher materializes the
+documented `<LOCALAPPDATA>/Packages/<profile>/AC/Temp` tree before launch and
+refuses unless the canonical redirected root is already inside the sandbox's
+writable set.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the
