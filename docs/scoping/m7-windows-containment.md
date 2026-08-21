@@ -219,9 +219,13 @@ Rustup's multiplexing proxy is also treated as read-only toolchain state. At
 lease creation the trusted parent runs `rustup which cargo` with automatic
 installation disabled, accepts only an already-installed standard toolchain
 under `RUSTUP_HOME/toolchains`, and supplies its absolute root as
-`RUSTUP_TOOLCHAIN` to contained descendants. That prevents a floating channel
-refresh from attempting to write the operator's `RUSTUP_HOME`; it does not add
-a writable root or permit installation from the network.
+`RUSTUP_TOOLCHAIN` to contained descendants. Hosted toolchain roots can carry
+a protected DACL that does not inherit the `RUSTUP_HOME` grant, so the selected
+root receives a direct recursive read/execute grant and its real `bin`
+directory leads the contained `PATH`. That bypasses the rustup proxy and
+prevents a floating channel refresh from attempting to write the operator's
+`RUSTUP_HOME`; it does not add a writable root or permit installation from the
+network.
 Authority files, mission metadata, shared Cargo caches, and validator
 real-checkout sources receive explicit deny entries. Original DACL bytes and
 no-follow object handles are retained before mutation. Cleanup removes only the

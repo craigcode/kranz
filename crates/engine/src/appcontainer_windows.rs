@@ -118,9 +118,10 @@ struct LaunchPlan {
     /// have exact ACEs.
     #[serde(default)]
     path: Option<String>,
-    /// Absolute root of the already-installed active rustup toolchain. Rustup
-    /// accepts this as `RUSTUP_TOOLCHAIN`, bypassing channel refresh and writes
-    /// to the operator-owned, read-only `RUSTUP_HOME` inside LPAC.
+    /// Absolute root of the already-installed active rustup toolchain. The
+    /// contained PATH prefers its real binaries over rustup's protected proxy,
+    /// while `RUSTUP_TOOLCHAIN` prevents a fallback proxy launch from refreshing
+    /// the operator-owned, read-only `RUSTUP_HOME`.
     #[serde(default)]
     rustup_toolchain: Option<PathBuf>,
 }
@@ -1341,11 +1342,29 @@ fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
     files
 }
 
+fn ordered_search_path_dirs(
+    mut dirs: Vec<PathBuf>,
+    preferred_rust_bin: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    dirs.retain(|dir| dir.is_dir());
+    dirs.sort();
+    dirs.dedup();
+    if let Some(preferred) = preferred_rust_bin.filter(|bin| bin.is_dir()) {
+        let preferred_key = comparable_path(&preferred);
+        dirs.retain(|dir| comparable_path(dir) != preferred_key);
+        dirs.insert(0, preferred);
+    }
+    dirs
+}
+
 fn contained_search_path(
     inputs: &crate::sandbox::SandboxInputs,
     executable: &Path,
     env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
 ) -> Result<String> {
+    let preferred_rust_bin =
+        rustup_toolchain.map(|toolchain| local_dos_path(&toolchain.join("bin")));
     let mut dirs = Vec::new();
     if let Some(root) = env_value_ci(env, "SystemRoot") {
         let root = PathBuf::from(root);
@@ -1358,15 +1377,14 @@ fn contained_search_path(
         &inputs.session_cwd,
         &inputs.mission_dir,
         env,
+        rustup_toolchain,
     )?);
     for file in toolchain_entry_points(env) {
         if let Some(parent) = file.parent() {
             dirs.push(parent.to_path_buf());
         }
     }
-    dirs.retain(|dir| dir.is_dir());
-    dirs.sort();
-    dirs.dedup();
+    let dirs = ordered_search_path_dirs(dirs, preferred_rust_bin);
     std::env::join_paths(&dirs)
         .map(|value| value.to_string_lossy().into_owned())
         .map_err(|error| {
@@ -1570,6 +1588,7 @@ fn read_roots(
     cwd: &Path,
     mission_dir: &Path,
     env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(parent) = executable.parent() {
@@ -1604,6 +1623,15 @@ fn read_roots(
                 roots.push(root);
             }
         }
+    }
+    // Hosted rustup toolchain roots can protect their DACL from inheriting the
+    // grant on RUSTUP_HOME. Add the already-selected root itself so its
+    // existing descendants receive an explicit read/execute-only grant.
+    if let Some(root) = rustup_toolchain
+        .filter(|toolchain| toolchain.is_dir())
+        .and_then(|toolchain| std::fs::canonicalize(toolchain).ok())
+    {
+        roots.push(root);
     }
     if let Some(cargo) = env_value_ci(env, "CARGO_HOME").map(PathBuf::from) {
         for name in ["bin", "registry", "git"] {
@@ -1715,6 +1743,7 @@ fn acl_changes(
     inputs: &crate::sandbox::SandboxInputs,
     executable: &Path,
     env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
 ) -> Result<Vec<AclChange>> {
     let write_roots = crate::sandbox::write_allowlist(inputs);
     for root in &write_roots {
@@ -1725,7 +1754,13 @@ fn acl_changes(
             )));
         }
     }
-    let read_roots = read_roots(executable, &inputs.session_cwd, &inputs.mission_dir, env)?;
+    let read_roots = read_roots(
+        executable,
+        &inputs.session_cwd,
+        &inputs.mission_dir,
+        env,
+        rustup_toolchain,
+    )?;
     validate_recursive_roots(inputs, &write_roots, &read_roots)?;
 
     let toolchain_entries = toolchain_entry_points(env);
@@ -1943,7 +1978,7 @@ fn prepare_launch_for_lease(
     // proof that LPAC can execute the existing file. This does not grant a new
     // root; it only adds a direct RX ACE to a known tool name already inside
     // the contained search path.
-    let path = contained_search_path(inputs, &executable, env)?;
+    let path = contained_search_path(inputs, &executable, env, lease.rustup_toolchain.as_deref())?;
     let mut acl_env = env.clone();
     acl_env.insert("PATH".to_string(), path.clone());
     let toolchain_entries = toolchain_entry_points(&acl_env);
@@ -1957,7 +1992,12 @@ fn prepare_launch_for_lease(
     for root in &volume_roots {
         verify_volume_root_prepared(root)?;
     }
-    let mut changes = acl_changes(inputs, &executable, &acl_env)?;
+    let mut changes = acl_changes(
+        inputs,
+        &executable,
+        &acl_env,
+        lease.rustup_toolchain.as_deref(),
+    )?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
@@ -3475,6 +3515,32 @@ mod tests {
                 "missing {expected} in {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn installed_rust_toolchain_bin_leads_the_contained_search_path() {
+        let root = tempfile::tempdir().expect("temp toolchain root");
+        let proxy_bin = root.path().join("cargo-home").join("bin");
+        let toolchain = root.path().join("rustup").join("toolchains").join("stable");
+        let toolchain_bin = toolchain.join("bin");
+        std::fs::create_dir_all(&proxy_bin).expect("proxy bin");
+        std::fs::create_dir_all(&toolchain_bin).expect("toolchain bin");
+
+        let dirs = ordered_search_path_dirs(
+            vec![proxy_bin.clone(), toolchain_bin.clone(), proxy_bin],
+            Some(toolchain_bin.clone()),
+        );
+
+        assert_eq!(
+            comparable_path(dirs.first().expect("preferred bin")),
+            comparable_path(&toolchain_bin)
+        );
+        assert_eq!(
+            dirs.iter()
+                .filter(|dir| comparable_path(dir) == comparable_path(&toolchain_bin))
+                .count(),
+            1
+        );
     }
 
     #[test]

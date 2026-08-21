@@ -95,8 +95,11 @@ output, validator read denial, or every production spawn site.
   read-only and fails closed with the preparation command when either is absent.
   Before entering LPAC it also resolves rustup's active, already-installed
   standard toolchain with auto-install disabled and pins that absolute root in
-  `RUSTUP_TOOLCHAIN`; Rust gates therefore use the read-only toolchain without
-  refreshing a channel or writing the operator's `RUSTUP_HOME`.
+  `RUSTUP_TOOLCHAIN`. Because hosted toolchain roots can protect their DACL
+  from parent inheritance, that selected root receives its own recursive
+  read/execute grant and its real `bin` directory leads the contained `PATH`;
+  Rust gates therefore avoid the rustup proxy without refreshing a channel or
+  writing the operator's `RUSTUP_HOME`.
   The ACL lease retains a no-follow handle for every path-specific DACL
   it changes, removes only the unique package SID's ACEs root-first, then
   deletes every private plan and the profile. A bounded host-local mutex
