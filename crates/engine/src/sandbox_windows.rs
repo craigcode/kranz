@@ -17,6 +17,7 @@
 //! on the current directory or `PATH` from spoofing capability evidence.
 
 use serde::Serialize;
+use std::path::Path;
 
 pub const PROCESS_MODEL_DLL: &str = "processmodel.dll";
 pub const PROCESS_SANDBOX_EXPORT: &str = "Experimental_CreateProcessInSandbox";
@@ -121,6 +122,33 @@ pub fn probe() -> WindowsSandboxProbeReport {
     platform::probe()
 }
 
+/// Apply and verify the persistent metadata-only AppContainer host ACEs on a
+/// literal local drive root. This mutation is Windows-only and requires an
+/// elevated token; ordinary launch paths never call it.
+#[cfg(windows)]
+pub fn prepare_appcontainer_host(root: &Path) -> std::result::Result<bool, String> {
+    crate::appcontainer_windows::prepare_appcontainer_host(root).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn prepare_appcontainer_host(_root: &Path) -> std::result::Result<bool, String> {
+    Err("AppContainer host preparation is available only on Windows".to_string())
+}
+
+/// Reapply and verify the documented AppContainer security descriptor on the
+/// Windows null device. The kernel resets it at boot, so host preparation runs
+/// this elevated mutation alongside the persistent drive-root ACEs.
+#[cfg(windows)]
+pub fn prepare_appcontainer_null_device() -> std::result::Result<(), String> {
+    crate::appcontainer_windows::prepare_appcontainer_null_device()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn prepare_appcontainer_null_device() -> std::result::Result<(), String> {
+    Err("AppContainer null-device preparation is available only on Windows".to_string())
+}
+
 /// Private production-launcher dispatch used by the `kranz` binary before
 /// ordinary CLI initialization. Kept on this public platform module so the
 /// engine's Windows-only unsafe implementation remains crate-private.
@@ -142,6 +170,16 @@ pub fn internal_self_test_requested() -> bool {
 #[cfg(windows)]
 pub fn run_production_hostile_self_test() -> std::result::Result<String, String> {
     crate::appcontainer_windows::run_production_hostile_self_test()
+}
+
+#[cfg(windows)]
+pub fn internal_gate_self_test_requested() -> bool {
+    crate::appcontainer_windows::internal_gate_self_test_requested()
+}
+
+#[cfg(windows)]
+pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
+    crate::appcontainer_windows::run_production_gate_self_test()
 }
 
 #[cfg(windows)]

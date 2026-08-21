@@ -5,9 +5,10 @@ auditing, env hygiene, macOS Seatbelt filesystem enforcement, Linux bubblewrap
 filesystem/network isolation, fail-closed preflight behavior, the container
 provider, a macOS-capable network boundary (the filtering egress proxy, 3.3a),
 and the validator egress-grant flow that consumes its denial signal (3.3b) are
-implemented. Windows now ships the stable AppContainer process boundary; its
-normal-gate/overhead/Windows-11 completion receipt remains open. Also remaining:
-a hard per-host container egress boundary and live Linux overhead proof.
+implemented. Windows now ships the stable AppContainer process boundary and a
+protected hosted normal-gate/overhead receipt; its operator-controlled Windows
+11 completion receipt remains open. Also remaining: a hard per-host container
+egress boundary and live Linux overhead proof.
 
 ## Why
 
@@ -103,10 +104,20 @@ All of it asks the agent nicely. None of it constrains the process.
   AppContainer (LPAC) token, path-specific disposable-SID ACL lease, and
   pre-resume Job Object assignment for `fs`/`fs+net`. Opting out of
   `ALL APPLICATION PACKAGES` prevents ambient regular-AppContainer grants from
-  widening the path allowlist. `fs` grants internet-client access; `fs+net` is
-  hard offline. The same launcher wraps workers, validators, and engine-run
-  gates, and protected CI proves authority/real-checkout denial plus DACL
-  restoration.
+  widening the path allowlist. An elevated host-preparation script adds only
+  Microsoft's non-inheriting drive-root metadata ACEs and reapplies the
+  documented null-device descriptor once per boot; the launcher verifies both
+  prerequisites read-only and otherwise fails closed. Both postures explicitly
+  grant read-only `registryRead` so LPAC tools can create descendants; `fs`
+  additionally grants internet-client access, while `fs+net` is hard offline.
+  Rust commands pin the already-installed active standard rustup toolchain by
+  absolute path, grant that protected root read/execute directly, and prefer
+  its real binaries over the rustup proxy, with auto-install disabled; the
+  operator's `RUSTUP_HOME` remains read-only. The launcher also pre-creates
+  Windows' package-private `AC/Temp` under the redirected, scratch-owned
+  `LOCALAPPDATA`, refusing any redirect outside the writable roots.
+  The same launcher wraps workers, validators, and engine-run gates, and
+  protected CI proves authority/real-checkout denial plus DACL restoration.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open
@@ -136,8 +147,9 @@ All of it asks the agent nicely. None of it constrains the process.
   loopback, the proxy enforces the hostname allowlist at CONNECT time, and
   denials surface as structured records (`runs/egress-denials.jsonl` →
   `RunOutcome.denied_egress`). The validator grant flow that consumes the
-  signal shipped as 3.3b. Windows production process containment is shipped;
-  its phase-5 completion receipt remains open (see the Windows scoping doc).
+  signal shipped as 3.3b. Windows production process containment and its hosted
+  phase-5 gate receipt are shipped; the operator-controlled Windows 11 receipt
+  remains open (see the Windows scoping doc).
 
 ### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 

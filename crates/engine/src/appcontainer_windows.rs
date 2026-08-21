@@ -8,10 +8,17 @@
 //! and stdio pipes, so the existing async stream bounds and timeout machinery do
 //! not need a second Windows-only implementation.
 //!
-//! Filesystem authority is granted to a unique per-launch AppContainer SID. The
-//! parent retains a no-follow handle for every DACL it changes and removes only
-//! that SID's ACEs when the wrapped process is reaped or aborted; removing an
-//! inheritable parent ACE also removes its inherited copies from descendants.
+//! Filesystem authority is granted to a unique AppContainer package SID: per
+//! agent session launch, or per resolved engine-gate posture across that
+//! posture's contract commands. The parent retains a no-follow handle for every
+//! DACL it changes and removes only that SID's ACEs when the launch/posture is
+//! reaped or aborted;
+//! removing an inheritable parent ACE also removes its inherited copies from
+//! descendants.
+//! An elevated host step owns the two well-known, non-inheriting drive-root
+//! metadata ACEs Windows tools require and reapplies the documented
+//! AppContainer descriptor to `\Device\Null` once per boot; the launcher
+//! verifies both prerequisites read-only.
 //! A bounded host-local mutex serializes those DACL read/modify/write batches,
 //! so this composes safely across overlapping launches that share Git/toolchain
 //! roots and restores the original descriptor exactly when no unrelated ACL
@@ -21,7 +28,7 @@
 
 use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -29,32 +36,39 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use windows::core::{PCWSTR, PWSTR};
+use std::sync::{Arc, Mutex};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, GENERIC_READ, HANDLE, HLOCAL,
-    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE, HLOCAL, WAIT_ABANDONED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetTokenInformation, TokenIsAppContainer, WinBuiltinAnyPackageSid,
-    WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
-    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
+    FreeSid, GetAce, GetAclInformation, GetKernelObjectSecurity, GetLengthSid,
+    GetSecurityDescriptorDacl, GetTokenInformation, SetKernelObjectSecurity, TokenElevation,
+    TokenIsAppContainer, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE,
+    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+    TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -72,12 +86,23 @@ use windows::Win32::System::Threading::{
 
 pub(crate) const INTERNAL_LAUNCHER_ARG: &str = "__kranz-appcontainer-launch";
 pub(crate) const INTERNAL_SELF_TEST_ARG: &str = "__kranz-appcontainer-self-test";
+pub(crate) const INTERNAL_GATE_SELF_TEST_ARG: &str = "__kranz-appcontainer-gate-self-test";
 pub(crate) const INTERNAL_HOSTILE_CHILD_ARG: &str = "__kranz-appcontainer-hostile-child";
 const PLAN_VERSION: u32 = 1;
 const SELF_TEST_MANIFEST: &str = "kranz-appcontainer-production-self-test.json";
 const DACL_MUTEX_NAME: &str = "Local\\Kranz.AppContainer.Dacl.v1";
 const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
+const ROOT_METADATA_ACCESS_MASK: u32 = 0x0012_0088;
+const NULL_DEVICE_ACCESS_MASK: u32 = 0x0012_01bf;
+const REGISTRY_READ_CAPABILITY: &str = "registryRead";
+// Source: Microsoft's current AppContainer host-preparation contract.
+// https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
+const NULL_DEVICE_TARGET_SDDL: &str = "O:BAG:SYD:(A;;GRGWGX;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;RC)(A;;GRGWGX;;;AC)(A;;GRGWGX;;;S-1-15-2-2)S:(ML;;NW;;;LW)";
+const ALL_RESTRICTED_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-2";
+const GATE_OVERHEAD_REPETITIONS: usize = 7;
+const GATE_WORKLOAD_MILLIS: u64 = 5_000;
+const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +113,18 @@ struct LaunchPlan {
     args: Vec<String>,
     cwd: PathBuf,
     allow_network: bool,
+    /// Search path for the AppContainer child. `where`/`cmd` fail with
+    /// Access denied if PATH still lists Program Files and other
+    /// ungranted directories, even after the toolchain files themselves
+    /// have exact ACEs.
+    #[serde(default)]
+    path: Option<String>,
+    /// Absolute root of the already-installed active rustup toolchain. The
+    /// contained PATH prefers its real binaries over rustup's protected proxy,
+    /// while `RUSTUP_TOOLCHAIN` prevents a fallback proxy launch from refreshing
+    /// the operator-owned, read-only `RUSTUP_HOME`.
+    #[serde(default)]
+    rustup_toolchain: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +160,32 @@ pub struct ProductionHostileReceipt {
     pub tampered_git_pointer_refused: bool,
     pub network_denied: bool,
     pub dacl_restored: bool,
+    pub volume_root_dacl_restored: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GateTimingReceipt {
+    command: String,
+    repetitions: usize,
+    off_samples_ms: Vec<f64>,
+    appcontainer_samples_ms: Vec<f64>,
+    off_median_ms: f64,
+    appcontainer_median_ms: f64,
+    overhead_ms: f64,
+    overhead_percent: f64,
+    within_target: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionGateReceipt {
+    host: crate::sandbox_windows::WindowsSandboxProbeReport,
+    enforcement: &'static str,
+    provider: &'static str,
+    overhead_target_percent: f64,
+    node: GateTimingReceipt,
+    rust: GateTimingReceipt,
 }
 
 /// Prepared wrapper argv plus the lease that keeps its profile and ACL grants
@@ -132,6 +195,17 @@ pub(crate) struct PreparedLaunch {
     pub args: Vec<String>,
     pub lease: AppContainerLease,
 }
+
+pub(crate) struct PreparedCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// One resolved Windows gate posture owns one disposable profile and its ACL
+/// lease across all commands in that validation/final-gate context. Clones
+/// held by in-flight wrapped commands keep cleanup from racing their child.
+#[derive(Clone, Debug)]
+pub(crate) struct AppContainerLaunchContext(Arc<Mutex<Option<AppContainerLease>>>);
 
 #[derive(Debug)]
 struct DaclSnapshot {
@@ -192,10 +266,14 @@ impl Drop for DaclMutationGuard {
 
 /// Parent-owned cleanup guard. It deliberately carries no SID pointer, so it
 /// is safe to move with an async session across executor threads.
+#[derive(Debug)]
 pub(crate) struct AppContainerLease {
     profile_name: String,
+    rustup_toolchain: Option<PathBuf>,
     original_dacls: Vec<DaclSnapshot>,
-    plan_path: Option<PathBuf>,
+    snapshot_indices: BTreeMap<PathBuf, usize>,
+    applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
+    plan_paths: Vec<PathBuf>,
 }
 
 impl Drop for AppContainerLease {
@@ -213,7 +291,7 @@ impl Drop for AppContainerLease {
                 self.original_dacls
                     .sort_by_key(|entry| entry.path.components().count());
                 for snapshot in &self.original_dacls {
-                    if let Err(error) = remove_profile_aces(snapshot, sid.0) {
+                    if let Err(error) = remove_sid_aces(snapshot, sid.0) {
                         tracing::error!(path = %snapshot.path.display(), error = %error,
                             "failed to remove AppContainer ACEs from a DACL");
                     }
@@ -228,7 +306,7 @@ impl Drop for AppContainerLease {
                     "failed to derive AppContainer SID for DACL cleanup");
             }
         }
-        if let Some(path) = self.plan_path.take() {
+        for path in self.plan_paths.drain(..) {
             let _ = std::fs::remove_file(path);
         }
         let name = wide(&self.profile_name);
@@ -259,7 +337,34 @@ impl Drop for LocalAllocation {
     }
 }
 
-#[derive(Clone, Copy)]
+struct LocalSidArray {
+    sids: *mut PSID,
+    count: u32,
+}
+
+impl Drop for LocalSidArray {
+    fn drop(&mut self) {
+        if self.sids.is_null() {
+            return;
+        }
+        unsafe {
+            for sid in std::slice::from_raw_parts(self.sids, self.count as usize) {
+                if !sid.0.is_null() {
+                    LocalFree(Some(HLOCAL(sid.0)));
+                }
+            }
+            LocalFree(Some(HLOCAL(self.sids.cast())));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchCapability {
+    RegistryRead,
+    InternetClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
     Deny,
@@ -282,17 +387,19 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<()> {
         .map_err(|error| EngineError::Backend(format!("Windows ACL operation failed: {error}")))
 }
 
-fn create_profile() -> Result<(String, OwnedSid)> {
+fn create_profile(allow_network: bool) -> Result<(String, OwnedSid)> {
     let profile_name = format!("kranz.production.{}", uuid::Uuid::new_v4().simple());
     let name = wide(&profile_name);
     let display = wide("Kranz contained process");
     let description = wide("Disposable Kranz AppContainer profile");
+    let mut capability_storage = launch_capability_storage(allow_network)?;
+    let capabilities = capability_attributes(&mut capability_storage);
     let sid = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(description.as_ptr()),
-            None,
+            Some(&capabilities),
         )
     }
     .map_err(|error| {
@@ -349,7 +456,492 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     })
 }
 
-fn remove_profile_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
+fn dacl_has_root_metadata_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
+    if acl.is_null() {
+        return Ok(false);
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to inspect drive-root DACL: {error}")))?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read drive-root DACL ACE: {error}"))
+        })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0 {
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        if ace.Mask != ROOT_METADATA_ACCESS_MASK {
+            continue;
+        }
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if unsafe { EqualSid(trustee, sid) }.is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RootMetadataAceState {
+    Missing,
+    Exact,
+    Conflicting { mask: u32, flags: u8 },
+}
+
+fn root_metadata_ace_state(acl: *mut ACL, sid: PSID) -> Result<RootMetadataAceState> {
+    if acl.is_null() {
+        return Err(EngineError::Backend(
+            "refusing AppContainer host preparation on a drive root with a null DACL".to_string(),
+        ));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| EngineError::Backend(format!("failed to inspect drive-root DACL: {error}")))?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    let mut found_exact = false;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read drive-root DACL ACE: {error}"))
+        })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags & INHERITED_ACE.0 as u8 != 0
+        {
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if unsafe { EqualSid(trustee, sid) }.is_err() {
+            continue;
+        }
+        if ace.Mask == ROOT_METADATA_ACCESS_MASK && ace.Header.AceFlags == 0 {
+            found_exact = true;
+        } else {
+            return Ok(RootMetadataAceState::Conflicting {
+                mask: ace.Mask,
+                flags: ace.Header.AceFlags,
+            });
+        }
+    }
+    Ok(if found_exact {
+        RootMetadataAceState::Exact
+    } else {
+        RootMetadataAceState::Missing
+    })
+}
+
+fn validate_host_preparation_root(root: &Path) -> Result<()> {
+    let rendered = root.to_string_lossy();
+    let bytes = rendered.as_bytes();
+    if bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        Ok(())
+    } else {
+        Err(EngineError::Backend(format!(
+            "AppContainer host preparation target must be a literal local drive root (X:\\): {}",
+            root.display()
+        )))
+    }
+}
+
+fn apply_named_root_metadata_ace(root: &Path, sid: PSID, label: &str) -> Result<bool> {
+    eprintln!(
+        "AppContainer host preparation: inspecting {label} on {}",
+        root.display()
+    );
+    let root_wide = wide(root.as_os_str());
+    let mut old_acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(root_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_acl),
+            None,
+            &mut descriptor,
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    eprintln!(
+        "AppContainer host preparation: inspected {label} on {}",
+        root.display()
+    );
+    match root_metadata_ace_state(old_acl, sid)? {
+        RootMetadataAceState::Exact => {
+            eprintln!(
+                "AppContainer host preparation: {label} is already exact on {}",
+                root.display()
+            );
+            return Ok(false);
+        }
+        RootMetadataAceState::Conflicting { mask, flags } => {
+            return Err(EngineError::Backend(format!(
+                "{} already has a conflicting explicit allow ACE for {label}: mask=0x{mask:08x}, flags=0x{flags:02x}; refusing to merge rights",
+                root.display()
+            )));
+        }
+        RootMetadataAceState::Missing => {}
+    }
+
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: ROOT_METADATA_ACCESS_MASK,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast()),
+            ..Default::default()
+        },
+    };
+    let mut new_acl: *mut ACL = null_mut();
+    win32(unsafe { SetEntriesInAclW(Some(&[entry]), Some(old_acl), &mut new_acl) })?;
+    if new_acl.is_null() {
+        return Err(EngineError::Backend(
+            "SetEntriesInAclW returned a null drive-root DACL".to_string(),
+        ));
+    }
+    let _new_acl = LocalAllocation(HLOCAL(new_acl.cast()));
+    eprintln!(
+        "AppContainer host preparation: applying {label} on {}",
+        root.display()
+    );
+    win32(unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(root_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    })?;
+    eprintln!(
+        "AppContainer host preparation: applied {label} on {}",
+        root.display()
+    );
+    Ok(true)
+}
+
+/// Persistent, elevated host setup for one local drive root. This deliberately
+/// uses Microsoft's `GetNamedSecurityInfoW` -> `SetEntriesInAclW` ->
+/// `SetNamedSecurityInfoW` sequence rather than the managed `Set-Acl` path,
+/// which can walk the drive's descendant tree even for non-inheriting ACEs.
+pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
+    validate_host_preparation_root(root)?;
+    eprintln!(
+        "AppContainer host preparation: validated {}",
+        root.display()
+    );
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer host preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    eprintln!(
+        "AppContainer host preparation: elevation verified for {}",
+        root.display()
+    );
+    let _guard = DaclMutationGuard::acquire()?;
+    eprintln!(
+        "AppContainer host preparation: mutation lock acquired for {}",
+        root.display()
+    );
+    let mut any_package = string_sid("S-1-15-2-1", "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    eprintln!(
+        "AppContainer host preparation: package SIDs built for {}",
+        root.display()
+    );
+    let changed_any = apply_named_root_metadata_ace(
+        root,
+        PSID(any_package.as_mut_ptr().cast()),
+        "ALL APPLICATION PACKAGES (S-1-15-2-1)",
+    )?;
+    let changed_restricted = apply_named_root_metadata_ace(
+        root,
+        PSID(restricted.as_mut_ptr().cast()),
+        "ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)",
+    )?;
+    eprintln!(
+        "AppContainer host preparation: verifying {}",
+        root.display()
+    );
+    verify_volume_root_prepared(root)?;
+    Ok(changed_any || changed_restricted)
+}
+
+fn open_null_device(write: bool) -> Result<OwnedHandle> {
+    let mut desired_access = GENERIC_READ.0 | READ_CONTROL.0;
+    if write {
+        desired_access |= WRITE_DAC.0 | WRITE_OWNER.0;
+    }
+    let path = wide(r"\\.\NUL");
+    unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to open \\Device\\Null for AppContainer host {}: {error}",
+            if write { "preparation" } else { "verification" }
+        ))
+    })
+}
+
+fn read_kernel_dacl(handle: HANDLE) -> Result<Vec<u8>> {
+    let mut needed = 0u32;
+    if unsafe { GetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION.0, None, 0, &mut needed) }
+        .is_err()
+    {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(EngineError::Backend(format!(
+                "failed to size \\Device\\Null security descriptor: {error:?}"
+            )));
+        }
+    }
+    if needed == 0 {
+        return Err(EngineError::Backend(
+            "\\Device\\Null returned an empty security descriptor".to_string(),
+        ));
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    let mut written = 0u32;
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            Some(PSECURITY_DESCRIPTOR(bytes.as_mut_ptr().cast())),
+            needed,
+            &mut written,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to read \\Device\\Null security descriptor: {error}"
+        ))
+    })?;
+    bytes.truncate(written as usize);
+    Ok(bytes)
+}
+
+fn dacl_has_null_device_ace(acl: *mut ACL, sid: PSID) -> Result<bool> {
+    if acl.is_null() {
+        return Ok(false);
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!("failed to inspect \\Device\\Null DACL: {error}"))
+    })?;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        unsafe { GetAce(acl, index, &mut raw) }.map_err(|error| {
+            EngineError::Backend(format!("failed to read \\Device\\Null DACL ACE: {error}"))
+        })?;
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0 {
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let trustee = PSID((&ace.SidStart as *const u32).cast_mut().cast());
+        if ace.Mask == NULL_DEVICE_ACCESS_MASK && unsafe { EqualSid(trustee, sid) }.is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_null_device_prepared() -> Result<()> {
+    let handle = open_null_device(false)?;
+    let mut descriptor = read_kernel_dacl(handle.0)?;
+    let descriptor = PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast());
+    let mut present = BOOL(0);
+    let mut defaulted = BOOL(0);
+    let mut acl: *mut ACL = null_mut();
+    unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to locate \\Device\\Null DACL: {error}"))
+        })?;
+    if !present.as_bool() {
+        return Err(EngineError::Backend(
+            "\\Device\\Null has no DACL; refusing AppContainer launch".to_string(),
+        ));
+    }
+    let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let any_package_present = dacl_has_null_device_ace(acl, PSID(any_package.as_mut_ptr().cast()))?;
+    let restricted_present = dacl_has_null_device_ace(acl, PSID(restricted.as_mut_ptr().cast()))?;
+    if any_package_present && restricted_present {
+        return Ok(());
+    }
+
+    Err(EngineError::Backend(
+        "AppContainer host preparation is missing the required \\Device\\Null package ACEs; run scripts/prepare-windows-appcontainer.ps1 once from elevated PowerShell after each reboot"
+            .to_string(),
+    ))
+}
+
+/// Reapply the Windows AppContainer null-device descriptor once per boot.
+/// The kernel resets this object at restart; without the two package ACEs,
+/// ordinary tools that open `NUL` during startup fail with access denied.
+pub(crate) fn prepare_appcontainer_null_device() -> Result<()> {
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer null-device preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    let handle = open_null_device(true)?;
+    let sddl = wide(NULL_DEVICE_TARGET_SDDL);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to parse the trusted \\Device\\Null security descriptor: {error}"
+        ))
+    })?;
+    if descriptor.0.is_null() {
+        return Err(EngineError::Backend(
+            "Windows returned a null parsed \\Device\\Null security descriptor".to_string(),
+        ));
+    }
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    let info = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION;
+    unsafe { SetKernelObjectSecurity(handle.0, info, descriptor) }.map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to prepare \\Device\\Null for AppContainer tools: {error}"
+        ))
+    })?;
+    verify_null_device_prepared()
+}
+
+/// Common Windows tools inspect the local drive root before user code starts.
+/// LPAC's restricted-package group must already have Microsoft's minimal,
+/// non-inheriting metadata ACE there. This check is read-only and deliberately
+/// separate from the unprivileged launcher; host-wide preparation belongs to
+/// an elevated, auditable operator step.
+fn verify_volume_root_prepared(root: &Path) -> Result<()> {
+    let root_wide = wide(root.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(root_wide.as_ptr()),
+            READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to inspect AppContainer host preparation on {}: {error}",
+            root.display()
+        ))
+    })?;
+    let mut acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut acl),
+            None,
+            Some(&mut descriptor),
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    let mut any_package = well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let any_package_present =
+        dacl_has_root_metadata_ace(acl, PSID(any_package.as_mut_ptr().cast()))?;
+    let restricted_present = dacl_has_root_metadata_ace(acl, PSID(restricted.as_mut_ptr().cast()))?;
+    if any_package_present && restricted_present {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !any_package_present {
+        missing.push("S-1-15-2-1");
+    }
+    if !restricted_present {
+        missing.push(ALL_RESTRICTED_APPLICATION_PACKAGES_SID);
+    }
+    Err(EngineError::Backend(format!(
+        "AppContainer host preparation is missing the exact non-inheriting 0x{ROOT_METADATA_ACCESS_MASK:08x} metadata ACE for {} on {}; run scripts/prepare-windows-appcontainer.ps1 -Target '{}' once from elevated PowerShell",
+        missing.join(" and "),
+        root.display(),
+        root.display()
+    )))
+}
+
+fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
     let mut current_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
@@ -495,10 +1087,8 @@ fn env_value_ci<'a>(env: &'a HashMap<String, String>, name: &str) -> Option<&'a 
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
 }
 
-fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
-    let has_path = program.components().count() > 1;
-    let mut candidates = Vec::new();
-    let extensions: Vec<String> = if program.extension().is_some() {
+fn path_extensions(program: &Path, env: &HashMap<String, String>) -> Vec<String> {
+    if program.extension().is_some() {
         vec![String::new()]
     } else {
         env_value_ci(env, "PATHEXT")
@@ -507,7 +1097,16 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .collect()
-    };
+    }
+}
+
+fn find_on_path(program: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
+    find_all_on_path(program, env).into_iter().next()
+}
+
+fn find_all_on_path(program: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+    let has_path = program.components().count() > 1;
+    let extensions = path_extensions(program, env);
     let bases: Vec<PathBuf> = if has_path {
         vec![program.to_path_buf()]
     } else {
@@ -518,6 +1117,7 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
             .map(|dir| dir.join(program))
             .collect()
     };
+    let mut found = Vec::new();
     for base in bases {
         for extension in &extensions {
             let candidate = if extension.is_empty() {
@@ -528,11 +1128,26 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
                 PathBuf::from(value)
             };
             if candidate.is_file() {
-                candidates.push(candidate);
+                found.push(candidate);
+                break;
             }
         }
     }
-    let candidate = candidates.into_iter().next().ok_or_else(|| {
+    found
+}
+
+fn resolve_nonsystem_path_files(program: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for candidate in find_all_on_path(program, env) {
+        push_entry_point(&mut files, &candidate);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<PathBuf> {
+    let candidate = find_on_path(program, env).ok_or_else(|| {
         EngineError::Backend(format!(
             "AppContainer child executable {:?} could not be resolved from the cleared PATH",
             program
@@ -555,6 +1170,292 @@ fn resolve_executable(program: &Path, env: &HashMap<String, String>) -> Result<P
         ))
     })
 }
+
+/// Resolve rustup's active Cargo to an already-installed standard toolchain
+/// before entering LPAC. The contained child receives the resulting absolute
+/// toolchain root through `RUSTUP_TOOLCHAIN`; rustup then multiplexes without
+/// refreshing a channel or writing its operator-owned home. A missing/custom
+/// toolchain leaves the environment unchanged and lets the eventual Rust
+/// command fail normally rather than blocking unrelated Node-only launches.
+fn resolve_installed_rustup_toolchain(
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    find_on_path(Path::new("cargo"), env)?;
+    let rustup = find_on_path(Path::new("rustup"), env)?;
+    let rustup_home = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from)?;
+    let output = std::process::Command::new(&rustup)
+        .args(["which", "cargo"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        tracing::warn!(
+            rustup = %rustup.display(),
+            status = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "could not pin the active installed rustup toolchain for AppContainer"
+        );
+        return None;
+    }
+    let cargo = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let cargo = std::fs::canonicalize(&cargo).ok()?;
+    let toolchains = std::fs::canonicalize(rustup_home.join("toolchains")).ok()?;
+    if !path_contains(&toolchains, &cargo) {
+        tracing::warn!(
+            cargo = %cargo.display(),
+            toolchains = %toolchains.display(),
+            "active rustup Cargo is a custom toolchain outside RUSTUP_HOME; leaving it unpinned"
+        );
+        return None;
+    }
+    let bin = cargo.parent()?;
+    if !bin
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("bin"))
+    {
+        return None;
+    }
+    bin.parent().map(local_dos_path)
+}
+
+/// Materialize the package-private temp path Windows substitutes for an
+/// AppContainer child. Kranz redirects LOCALAPPDATA into the writable session
+/// scratch, while `CreateAppContainerProfile` runs in the trusted parent's
+/// ambient profile and therefore cannot create this redirected tree itself.
+///
+/// Source: https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer
+/// (`TEMP`/`TMP` become `<LOCALAPPDATA>/Packages/<profile>/AC/Temp`).
+fn prepare_redirected_profile_temp(
+    profile_name: &str,
+    write_roots: &[PathBuf],
+    env: &HashMap<String, String>,
+) -> Result<PathBuf> {
+    let profile = Path::new(profile_name);
+    if profile.components().count() != 1
+        || !matches!(
+            profile.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(EngineError::Backend(format!(
+            "invalid AppContainer profile name {profile_name:?}"
+        )));
+    }
+    let local_app_data = env_value_ci(env, "LOCALAPPDATA").ok_or_else(|| {
+        EngineError::Backend(
+            "AppContainer launch requires redirected LOCALAPPDATA inside a writable root"
+                .to_string(),
+        )
+    })?;
+    let local_app_data = std::fs::canonicalize(local_app_data).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to canonicalize redirected AppContainer LOCALAPPDATA {local_app_data}: {error}"
+        ))
+    })?;
+    let allowed = write_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .ok()
+            .is_some_and(|root| path_contains(&root, &local_app_data))
+    });
+    if !allowed {
+        return Err(EngineError::Backend(format!(
+            "redirected AppContainer LOCALAPPDATA {} is outside the writable sandbox roots",
+            local_app_data.display()
+        )));
+    }
+    let temp = local_app_data
+        .join("Packages")
+        .join(profile_name)
+        .join("AC")
+        .join("Temp");
+    std::fs::create_dir_all(&temp).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to create redirected AppContainer temp {}: {error}",
+            temp.display()
+        ))
+    })?;
+    Ok(temp)
+}
+
+fn push_entry_point(files: &mut Vec<PathBuf>, path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return;
+    };
+    if system_managed_path(&canon) {
+        return;
+    }
+    files.push(canon);
+}
+
+fn push_npm_scripts(files: &mut Vec<PathBuf>, dir: &Path) {
+    let npm_bin = dir.join("node_modules").join("npm").join("bin");
+    for name in ["npm-cli.js", "npx-cli.js", "npm-prefix.js"] {
+        push_entry_point(files, &npm_bin.join(name));
+    }
+}
+
+fn volume_root(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        )
+    })
+}
+
+/// Local drive root that a Windows tool can probe during startup. Node,
+/// Cargo, and cmd all ask for root metadata even when every executable and
+/// input lives below an explicitly granted directory. Keep this narrower
+/// than `volume_root`: mutating a UNC/share root is outside Kranz's local
+/// process-provider contract.
+fn local_volume_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| {
+            let mut components = ancestor.components();
+            let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+                return false;
+            };
+            matches!(
+                prefix.kind(),
+                std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+            ) && components.all(|component| matches!(component, std::path::Component::RootDir))
+        })
+        .map(local_dos_path)
+}
+
+/// Parent directories CreateProcess must traverse to reach an entry-point
+/// file. LPAC is not Users/Everyone/ALL APPLICATION PACKAGES, so a file ACE
+/// is useless unless each ancestor also allows FILE_TRAVERSE.
+fn ancestor_directories(path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if volume_root(dir) || system_managed_path(dir) {
+            break;
+        }
+        out.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    out
+}
+
+/// Exact Node/npm/Cargo files that must receive a direct (non-inheriting) RX
+/// ACE. Hosted Windows toolchains mark `node.exe`, `npm.cmd`, npm CLI scripts,
+/// and rustup proxies with `SE_DACL_PROTECTED`, so a parent-directory grant
+/// never reaches them.
+///
+/// Source: https://learn.microsoft.com/windows/win32/secauthz/ace-inheritance
+/// (`SE_DACL_PROTECTED` prevents a DACL from inheriting parent ACEs).
+fn toolchain_entry_points(env: &HashMap<String, String>) -> Vec<PathBuf> {
+    const NODE_SHIMS: &[&str] = &["npm.cmd", "npm", "npm.ps1", "npx.cmd", "npx", "npx.ps1"];
+    const RUST_BINARIES: &[&str] = &[
+        "cargo.exe",
+        "rustc.exe",
+        "rustdoc.exe",
+        "rustup.exe",
+        "cargo",
+        "rustc",
+        "rustdoc",
+        "rustup",
+    ];
+
+    let mut files = Vec::new();
+    for node in resolve_nonsystem_path_files(Path::new("node"), env) {
+        push_entry_point(&mut files, &node);
+        if let Some(dir) = node.parent() {
+            for name in NODE_SHIMS {
+                push_entry_point(&mut files, &dir.join(name));
+            }
+            push_npm_scripts(&mut files, dir);
+        }
+    }
+    for npm in resolve_nonsystem_path_files(Path::new("npm"), env) {
+        push_entry_point(&mut files, &npm);
+        if let Some(dir) = npm.parent() {
+            push_npm_scripts(&mut files, dir);
+        }
+    }
+    for program in ["cargo", "rustc", "rustup"] {
+        for exe in resolve_nonsystem_path_files(Path::new(program), env) {
+            push_entry_point(&mut files, &exe);
+        }
+    }
+    if let Some(rustup) = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from) {
+        if let Ok(toolchains) = std::fs::read_dir(rustup.join("toolchains")) {
+            for entry in toolchains.flatten() {
+                let bin = entry.path().join("bin");
+                for name in RUST_BINARIES {
+                    push_entry_point(&mut files, &bin.join(name));
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn ordered_search_path_dirs(
+    mut dirs: Vec<PathBuf>,
+    preferred_rust_bin: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    dirs.retain(|dir| dir.is_dir());
+    dirs.sort();
+    dirs.dedup();
+    if let Some(preferred) = preferred_rust_bin.filter(|bin| bin.is_dir()) {
+        let preferred_key = comparable_path(&preferred);
+        dirs.retain(|dir| comparable_path(dir) != preferred_key);
+        dirs.insert(0, preferred);
+    }
+    dirs
+}
+
+fn contained_search_path(
+    inputs: &crate::sandbox::SandboxInputs,
+    executable: &Path,
+    env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
+) -> Result<String> {
+    let preferred_rust_bin =
+        rustup_toolchain.map(|toolchain| local_dos_path(&toolchain.join("bin")));
+    let mut dirs = Vec::new();
+    if let Some(root) = env_value_ci(env, "SystemRoot") {
+        let root = PathBuf::from(root);
+        dirs.push(root.join("System32"));
+        dirs.push(root);
+    }
+    dirs.extend(crate::sandbox::write_allowlist(inputs));
+    dirs.extend(read_roots(
+        executable,
+        &inputs.session_cwd,
+        &inputs.mission_dir,
+        env,
+        rustup_toolchain,
+    )?);
+    for file in toolchain_entry_points(env) {
+        if let Some(parent) = file.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    let dirs = ordered_search_path_dirs(dirs, preferred_rust_bin);
+    std::env::join_paths(&dirs)
+        .map(|value| value.to_string_lossy().into_owned())
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to build AppContainer PATH: {error}"))
+        })
+}
+
+/// A single ACL grant slower than this is reported by path: it means the
+/// root carries enough existing descendants that inheritance propagation,
+/// not the launch itself, is the cost.
+const SLOW_ACL_GRANT: std::time::Duration = std::time::Duration::from_secs(2);
 
 const GIT_POINTER_MAX_BYTES: u64 = 4096;
 
@@ -747,6 +1648,7 @@ fn read_roots(
     cwd: &Path,
     mission_dir: &Path,
     env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     if let Some(parent) = executable.parent() {
@@ -761,12 +1663,35 @@ fn read_roots(
                 .flatten()
         }));
     }
+    // Hosted Windows installs Node under C:\hostedtoolcache rather than the
+    // operator profile, so the general caller-owned PATH rule above excludes
+    // it. Grant each installation directory RX for inheriting children, then
+    // add exact-file ACEs for node/npm/cargo entry points whose protected
+    // DACLs do not inherit that directory grant. rustup's toolchain root is
+    // added separately below. The recursive-root validator still refuses
+    // either directory grant if it would cover Kranz authority or metadata.
+    for program in ["node", "cargo"] {
+        for executable in resolve_nonsystem_path_files(Path::new(program), env) {
+            if let Some(parent) = executable.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
     if let Some(rustup) = env_value_ci(env, "RUSTUP_HOME").map(PathBuf::from) {
         if rustup.is_dir() {
             if let Ok(root) = std::fs::canonicalize(rustup) {
                 roots.push(root);
             }
         }
+    }
+    // Hosted rustup toolchain roots can protect their DACL from inheriting the
+    // grant on RUSTUP_HOME. Add the already-selected root itself so its
+    // existing descendants receive an explicit read/execute-only grant.
+    if let Some(root) = rustup_toolchain
+        .filter(|toolchain| toolchain.is_dir())
+        .and_then(|toolchain| std::fs::canonicalize(toolchain).ok())
+    {
+        roots.push(root);
     }
     if let Some(cargo) = env_value_ci(env, "CARGO_HOME").map(PathBuf::from) {
         for name in ["bin", "registry", "git"] {
@@ -808,8 +1733,28 @@ fn caller_owned_path(path: &Path, cwd: &Path) -> bool {
         || path_contains(&std::env::temp_dir(), path)
 }
 
+/// The spelling every containment comparison is made in.
+/// [`std::fs::canonicalize`] returns VERBATIM paths (`\\?\C:\Program
+/// Files\...`) while environment values, operator config, and mission paths
+/// never carry that prefix, and Windows path comparison is case-insensitive
+/// besides. Both differences answered containment questions WRONG: a
+/// canonicalized entry point under `%PROGRAMFILES%` tested NO against
+/// [`system_managed_path`], so every ancestor of a hosted toolchain took a
+/// DACL change the OS charged ~90 seconds each, ten per launch (measured on
+/// windows-latest, run 32322660181).
+fn comparable_path(path: &Path) -> PathBuf {
+    PathBuf::from(
+        local_dos_path(path)
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase(),
+    )
+}
+
 fn path_contains(root: &Path, child: &Path) -> bool {
-    child == root || child.starts_with(root)
+    let root = comparable_path(root);
+    let child = comparable_path(child);
+    child == root || child.starts_with(&root)
 }
 
 fn validate_recursive_roots(
@@ -858,6 +1803,7 @@ fn acl_changes(
     inputs: &crate::sandbox::SandboxInputs,
     executable: &Path,
     env: &HashMap<String, String>,
+    rustup_toolchain: Option<&Path>,
 ) -> Result<Vec<AclChange>> {
     let write_roots = crate::sandbox::write_allowlist(inputs);
     for root in &write_roots {
@@ -868,9 +1814,16 @@ fn acl_changes(
             )));
         }
     }
-    let read_roots = read_roots(executable, &inputs.session_cwd, &inputs.mission_dir, env)?;
+    let read_roots = read_roots(
+        executable,
+        &inputs.session_cwd,
+        &inputs.mission_dir,
+        env,
+        rustup_toolchain,
+    )?;
     validate_recursive_roots(inputs, &write_roots, &read_roots)?;
 
+    let toolchain_entries = toolchain_entry_points(env);
     let mut changes = Vec::new();
     let rwx = FILE_GENERIC_READ.0
         | FILE_GENERIC_WRITE.0
@@ -893,6 +1846,23 @@ fn acl_changes(
             inherit: root.is_dir(),
             mode: AclMode::Grant,
         });
+    }
+    let traverse = FILE_GENERIC_EXECUTE.0;
+    for path in toolchain_entries {
+        changes.push(AclChange {
+            path: path.clone(),
+            permissions: rx,
+            inherit: false,
+            mode: AclMode::Grant,
+        });
+        for ancestor in ancestor_directories(&path) {
+            changes.push(AclChange {
+                path: ancestor,
+                permissions: traverse,
+                inherit: false,
+                mode: AclMode::Grant,
+            });
+        }
     }
 
     let deny_all = FILE_GENERIC_READ.0
@@ -982,47 +1952,180 @@ fn acl_changes(
     Ok(changes)
 }
 
-/// Build the trusted helper command and apply the profile's temporary ACLs.
+fn new_lease(profile_name: String, rustup_toolchain: Option<PathBuf>) -> AppContainerLease {
+    AppContainerLease {
+        profile_name,
+        rustup_toolchain,
+        original_dacls: Vec::new(),
+        snapshot_indices: BTreeMap::new(),
+        applied_changes: HashSet::new(),
+        plan_paths: Vec::new(),
+    }
+}
+
+pub(crate) fn new_launch_context() -> AppContainerLaunchContext {
+    AppContainerLaunchContext(Arc::new(Mutex::new(None)))
+}
+
+/// Build the trusted helper command using the profile/ACL lease owned by one
+/// resolved gate posture. The first command creates the disposable profile;
+/// later commands reuse its SID and skip ACL mutations already held by the
+/// lease. This makes setup once-per-resolution, matching the other process
+/// providers and the measurement contract in `command_exec`.
+pub(crate) fn prepare_launch_in_context(
+    context: &AppContainerLaunchContext,
+    inputs: &crate::sandbox::SandboxInputs,
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<PreparedCommand> {
+    let mut slot = context.0.lock().map_err(|_| {
+        EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
+    })?;
+    if slot.is_none() {
+        let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
+        let (profile_name, _sid) =
+            create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
+        *slot = Some(new_lease(profile_name, rustup_toolchain));
+    }
+    let lease = slot
+        .as_mut()
+        .expect("AppContainer gate lease was initialized above");
+    let sid = derive_profile_sid(&lease.profile_name)?;
+    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env)
+}
+
+/// Build the trusted helper command and apply a unique session launch's
+/// temporary ACLs. Agent sessions retain their one-launch lease unchanged;
+/// engine-run gates use [`prepare_launch_in_context`] to share one profile
+/// only inside a single already-resolved gate posture.
 pub(crate) fn prepare_launch(
     inputs: &crate::sandbox::SandboxInputs,
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<PreparedLaunch> {
+    let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
+    let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
+    let mut lease = new_lease(profile_name, rustup_toolchain);
+    let prepared = prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env)?;
+    Ok(PreparedLaunch {
+        program: prepared.program,
+        args: prepared.args,
+        lease,
+    })
+}
+
+fn prepare_launch_for_lease(
+    lease: &mut AppContainerLease,
+    sid: PSID,
+    inputs: &crate::sandbox::SandboxInputs,
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<PreparedCommand> {
     std::fs::create_dir_all(&inputs.tmpdir).map_err(|error| {
         EngineError::Backend(format!(
             "failed to create AppContainer private scratch {}: {error}",
             inputs.tmpdir.display()
         ))
     })?;
+    let write_roots = crate::sandbox::write_allowlist(inputs);
+    prepare_redirected_profile_temp(&lease.profile_name, &write_roots, env)?;
     let executable = resolve_executable(program, env)?;
-    let (profile_name, sid) = create_profile()?;
-    let mut lease = AppContainerLease {
-        profile_name: profile_name.clone(),
-        original_dacls: Vec::new(),
-        plan_path: None,
-    };
-    let changes = acl_changes(inputs, &executable, env)?;
+    // The child PATH is narrower than the host PATH and deliberately includes
+    // declared workspace roots. Use that SAME path while discovering exact
+    // Node/npm/Cargo entry points for ACL grants: a workspace-staged runtime
+    // can carry a protected DACL, so an inheritable grant on its parent is not
+    // proof that LPAC can execute the existing file. This does not grant a new
+    // root; it only adds a direct RX ACE to a known tool name already inside
+    // the contained search path.
+    let path = contained_search_path(inputs, &executable, env, lease.rustup_toolchain.as_deref())?;
+    let mut acl_env = env.clone();
+    acl_env.insert("PATH".to_string(), path.clone());
+    let toolchain_entries = toolchain_entry_points(&acl_env);
+    let mut volume_roots = std::iter::once(executable.as_path())
+        .chain(toolchain_entries.iter().map(PathBuf::as_path))
+        .filter_map(local_volume_root)
+        .collect::<Vec<_>>();
+    volume_roots.sort();
+    volume_roots.dedup();
+    verify_null_device_prepared()?;
+    for root in &volume_roots {
+        verify_volume_root_prepared(root)?;
+    }
+    let mut changes = acl_changes(
+        inputs,
+        &executable,
+        &acl_env,
+        lease.rustup_toolchain.as_deref(),
+    )?;
     // All DACL updates are read/modify/write operations. Serialize the batch
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
     let _guard = DaclMutationGuard::acquire()?;
-    let mut seen = BTreeMap::new();
+    // Key retained handles by physical Windows spelling too. A worktree can
+    // be present as both `C:\...` and canonical `\\?\C:\...` changes with
+    // different permissions, so the exact-change collapse below deliberately
+    // keeps both operations. They must still share ONE retained handle:
+    // removing the profile ACE repeatedly through alias handles can republish
+    // a stale inherited DACL and make the next launch lose execute access.
+    // One ancestor directory is shared by many toolchain entry points, and a
+    // read root can arrive in both verbatim and plain form. Applying the same
+    // ACE twice is a no-op the OS still charges full price for, so collapse
+    // exact repeats before touching a single descriptor.
+    let mut applied = HashSet::new();
+    changes.retain(|change| {
+        applied.insert((
+            comparable_path(&change.path),
+            change.permissions,
+            change.inherit,
+            change.mode,
+        ))
+    });
     for change in &changes {
-        if !seen.contains_key(&change.path) {
+        let key = comparable_path(&change.path);
+        if !lease.snapshot_indices.contains_key(&key) {
             let index = lease.original_dacls.len();
             lease.original_dacls.push(snapshot_dacl(&change.path)?);
-            seen.insert(change.path.clone(), index);
+            lease.snapshot_indices.insert(key, index);
         }
     }
     for change in &changes {
-        let snapshot = &lease.original_dacls[seen[&change.path]];
-        apply_acl_change(change, sid.0, snapshot.handle.0)?;
+        let key = comparable_path(&change.path);
+        let applied_key = (key.clone(), change.permissions, change.inherit, change.mode);
+        if lease.applied_changes.contains(&applied_key) {
+            continue;
+        }
+        let handle = lease.original_dacls[lease.snapshot_indices[&key]].handle.0;
+        let started = std::time::Instant::now();
+        apply_acl_change(change, sid, handle)?;
+        lease.applied_changes.insert(applied_key);
+        // An inheritable ACE on a directory makes Windows propagate it to
+        // every existing descendant, so one grant costs a full tree rewrite.
+        // Name any root where that dominates the launch instead of letting a
+        // wrapped command look mysteriously slow.
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_ACL_GRANT {
+            tracing::warn!(
+                path = %change.path.display(),
+                inherit = change.inherit,
+                elapsed_ms = elapsed.as_millis(),
+                "AppContainer ACL grant propagated slowly; an inheritable ACE rewrites every \
+                 descendant of this root"
+            );
+            eprintln!(
+                "slow AppContainer ACL grant: path={} inherit={} elapsed_ms={}",
+                change.path.display(),
+                change.inherit,
+                elapsed.as_millis()
+            );
+        }
     }
 
     let plan = LaunchPlan {
         version: PLAN_VERSION,
-        profile_name,
+        profile_name: lease.profile_name.clone(),
         executable,
         args: args.to_vec(),
         cwd: crate::sandbox::absolutize(&inputs.session_cwd),
@@ -1030,6 +2133,8 @@ pub(crate) fn prepare_launch(
         // AppContainer (no network capabilities). A proxy-only environment is
         // never treated as a boundary.
         allow_network: inputs.enforce == crate::types::SandboxEnforce::Fs,
+        path: Some(path),
+        rustup_toolchain: lease.rustup_toolchain.clone(),
     };
     let plan_path = inputs.tmpdir.join(format!(
         "appcontainer-plan-{}.json",
@@ -1045,6 +2150,7 @@ pub(crate) fn prepare_launch(
                 plan_path.display()
             ))
         })?;
+    lease.plan_paths.push(plan_path.clone());
     serde_json::to_writer(&mut file, &plan).map_err(|error| {
         EngineError::Backend(format!(
             "failed to serialize AppContainer launch plan: {error}"
@@ -1053,19 +2159,17 @@ pub(crate) fn prepare_launch(
     file.flush().map_err(|error| {
         EngineError::Backend(format!("failed to flush AppContainer launch plan: {error}"))
     })?;
-    lease.plan_path = Some(plan_path.clone());
     let helper = std::env::current_exe().map_err(|error| {
         EngineError::Backend(format!(
             "failed to locate Kranz AppContainer helper: {error}"
         ))
     })?;
-    Ok(PreparedLaunch {
+    Ok(PreparedCommand {
         program: helper,
         args: vec![
             INTERNAL_LAUNCHER_ARG.to_string(),
             plan_path.to_string_lossy().into_owned(),
         ],
-        lease,
     })
 }
 
@@ -1220,14 +2324,110 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE, label: &str) -> Result<Vec<u8>> {
     Ok(storage)
 }
 
+fn string_sid(value: &str, label: &str) -> Result<Vec<u8>> {
+    let value = wide(value);
+    let mut sid = PSID::default();
+    unsafe { ConvertStringSidToSidW(PCWSTR(value.as_ptr()), &mut sid) }
+        .map_err(|error| EngineError::Backend(format!("failed to build {label} SID: {error}")))?;
+    let allocation = LocalAllocation(HLOCAL(sid.0));
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    if len == 0 {
+        return Err(EngineError::Backend(format!("{label} SID had zero length")));
+    }
+    let storage = unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec();
+    drop(allocation);
+    Ok(storage)
+}
+
 fn internet_capability() -> Result<Vec<u8>> {
     well_known_sid(WinCapabilityInternetClientSid, "internetClient capability")
 }
 
-fn quote_arg(value: &OsStr) -> Vec<u16> {
+fn named_capability(name: &str) -> Result<Vec<u8>> {
+    let name_wide = wide(name);
+    let mut group_sids = null_mut();
+    let mut group_count = 0u32;
+    let mut capability_sids = null_mut();
+    let mut capability_count = 0u32;
+    let derived = unsafe {
+        DeriveCapabilitySidsFromName(
+            PCWSTR(name_wide.as_ptr()),
+            &mut group_sids,
+            &mut group_count,
+            &mut capability_sids,
+            &mut capability_count,
+        )
+    };
+    let _group_sids = LocalSidArray {
+        sids: group_sids,
+        count: group_count,
+    };
+    let capability_sids = LocalSidArray {
+        sids: capability_sids,
+        count: capability_count,
+    };
+    derived.map_err(|error| {
+        EngineError::Backend(format!("failed to derive {name} capability SID: {error}"))
+    })?;
+    if capability_sids.count != 1 || capability_sids.sids.is_null() {
+        return Err(EngineError::Backend(format!(
+            "{name} capability derivation returned {} SIDs; expected exactly one",
+            capability_sids.count
+        )));
+    }
+    let sid = unsafe { *capability_sids.sids };
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    if len == 0 {
+        return Err(EngineError::Backend(format!(
+            "{name} capability SID had zero length"
+        )));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec())
+}
+
+fn launch_capability_policy(allow_network: bool) -> Vec<LaunchCapability> {
+    let mut capabilities = vec![LaunchCapability::RegistryRead];
+    if allow_network {
+        capabilities.push(LaunchCapability::InternetClient);
+    }
+    capabilities
+}
+
+fn launch_capability_storage(allow_network: bool) -> Result<Vec<Vec<u8>>> {
+    launch_capability_policy(allow_network)
+        .into_iter()
+        .map(|capability| match capability {
+            LaunchCapability::RegistryRead => named_capability(REGISTRY_READ_CAPABILITY),
+            LaunchCapability::InternetClient => internet_capability(),
+        })
+        .collect()
+}
+
+fn capability_attributes(storage: &mut [Vec<u8>]) -> Vec<SID_AND_ATTRIBUTES> {
+    storage
+        .iter_mut()
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: PSID(sid.as_mut_ptr().cast()),
+            Attributes: SE_GROUP_ENABLED as u32,
+        })
+        .collect()
+}
+
+fn quote_arg(value: &OsStr, force_quotes: bool) -> Vec<u16> {
     let source: Vec<u16> = value.encode_wide().collect();
-    let mut out = Vec::with_capacity(source.len() + 2);
-    out.push(b'"' as u16);
+    // Match std::process::Command's CreateProcessW encoding: arguments only
+    // need outer quotes when empty or containing whitespace. Always quoting
+    // switches such as `/C` changes cmd.exe's special parsing of the command
+    // tail (`"/C" "set ...&& ..."` retains the tail's opening quote).
+    let quote = force_quotes
+        || source.is_empty()
+        || source
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16);
+    let mut out = Vec::with_capacity(source.len() + usize::from(quote) * 2);
+    if quote {
+        out.push(b'"' as u16);
+    }
     let mut slashes = 0usize;
     for unit in source {
         if unit == b'\\' as u16 {
@@ -1243,24 +2443,103 @@ fn quote_arg(value: &OsStr) -> Vec<u16> {
         }
         slashes = 0;
     }
-    out.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
-    out.push(b'"' as u16);
+    out.extend(std::iter::repeat_n(
+        b'\\' as u16,
+        slashes * if quote { 2 } else { 1 },
+    ));
+    if quote {
+        out.push(b'"' as u16);
+    }
     out
 }
 
 fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
-    let mut out = quote_arg(executable.as_os_str());
+    let mut out = quote_arg(executable.as_os_str(), true);
     for arg in args {
         out.push(b' ' as u16);
-        out.extend(quote_arg(OsStr::new(arg)));
+        out.extend(quote_arg(OsStr::new(arg), false));
     }
     out.push(0);
     out
 }
 
-fn environment_block() -> Result<Vec<u16>> {
+/// Convert a canonical local-drive path (`\\?\D:\...`) into the ordinary DOS
+/// spelling accepted by cmd.exe as a current directory. Keep UNC/device paths
+/// untouched: collapsing `\\?\UNC\...` would change their meaning.
+fn local_dos_path(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let std::path::Prefix::VerbatimDisk(disk) = prefix.kind() else {
+        return path.to_path_buf();
+    };
+    let mut normalized = PathBuf::from(format!("{}:\\", char::from(disk).to_ascii_uppercase()));
+    for component in components {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => normalized.push(".."),
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::Prefix(_) => return path.to_path_buf(),
+        }
+    }
+    normalized
+}
+
+fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> {
+    let cwd = local_dos_path(cwd);
+    let mut components = cwd.components();
+    let prefix = match components.next()? {
+        std::path::Component::Prefix(prefix) => prefix,
+        _ => return None,
+    };
+    let disk = match prefix.kind() {
+        std::path::Prefix::Disk(disk) => disk,
+        _ => return None,
+    };
+    Some((
+        OsString::from(format!("={}:", char::from(disk).to_ascii_uppercase())),
+        cwd.into_os_string(),
+    ))
+}
+
+fn environment_block(
+    cwd: &Path,
+    path: Option<&str>,
+    rustup_toolchain: Option<&Path>,
+) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
+        let folded = key.to_string_lossy().to_ascii_uppercase();
+        values.insert(folded, (key, value));
+    }
+    if let Some(path) = path {
+        values.insert(
+            "PATH".to_string(),
+            (OsString::from("PATH"), OsString::from(path)),
+        );
+    }
+    if let Some(toolchain) = rustup_toolchain {
+        values.insert(
+            "RUSTUP_TOOLCHAIN".to_string(),
+            (
+                OsString::from("RUSTUP_TOOLCHAIN"),
+                toolchain.as_os_str().to_os_string(),
+            ),
+        );
+        values.insert(
+            "RUSTUP_AUTO_INSTALL".to_string(),
+            (OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0")),
+        );
+    }
+    // When a caller supplies an environment block, CreateProcessW does not
+    // propagate the special per-drive current-directory variables (`=C:`,
+    // `=D:`, ...). cmd.exe needs the entry for a cross-drive launch (the
+    // hosted runner executes cmd.exe from C: with the gate worktree on D:),
+    // otherwise process creation fails with ERROR_ENVVAR_NOT_FOUND (203).
+    // Microsoft requires these pseudo variables to be added and sorted with
+    // the rest of the explicit block.
+    if let Some((key, value)) = drive_current_directory_variable(cwd) {
         let folded = key.to_string_lossy().to_ascii_uppercase();
         values.insert(folded, (key, value));
     }
@@ -1268,7 +2547,16 @@ fn environment_block() -> Result<Vec<u16>> {
     for (_folded, (key, value)) in values {
         let key: Vec<u16> = key.encode_wide().collect();
         let value: Vec<u16> = value.encode_wide().collect();
-        if key.is_empty() || key.contains(&0) || key.contains(&(b'=' as u16)) || value.contains(&0)
+        let drive_letter = key.get(1).is_some_and(|unit| {
+            (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
+                || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
+        });
+        let drive_current_directory =
+            key.len() == 3 && key[0] == b'=' as u16 && drive_letter && key[2] == b':' as u16;
+        if key.is_empty()
+            || key.contains(&0)
+            || (key.contains(&(b'=' as u16)) && !drive_current_directory)
+            || value.contains(&0)
         {
             return Err(EngineError::Backend(
                 "cleared AppContainer environment contains an invalid key/value".to_string(),
@@ -1307,16 +2595,8 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
         ));
     }
     let sid = derive_profile_sid(&plan.profile_name)?;
-    let mut internet_sid = plan.allow_network.then(internet_capability).transpose()?;
-    let mut capabilities = internet_sid
-        .as_mut()
-        .map(|storage| {
-            vec![SID_AND_ATTRIBUTES {
-                Sid: PSID(storage.as_mut_ptr().cast()),
-                Attributes: SE_GROUP_ENABLED as u32,
-            }]
-        })
-        .unwrap_or_default();
+    let mut capability_storage = launch_capability_storage(plan.allow_network)?;
+    let mut capabilities = capability_attributes(&mut capability_storage);
     let security = SECURITY_CAPABILITIES {
         AppContainerSid: sid.0,
         Capabilities: if capabilities.is_empty() {
@@ -1345,9 +2625,19 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     startup.StartupInfo.hStdError = stderr.0;
     startup.lpAttributeList = attributes.list;
     let application = wide(plan.executable.as_os_str());
-    let cwd = wide(plan.cwd.as_os_str());
+    // `canonicalize` yields a verbatim local-drive path on Windows. The Win32
+    // API accepts that spelling, but cmd.exe classifies `\\?\C:\...` as a UNC
+    // current directory, falls back to the Windows directory, and runs the
+    // gate in the wrong place. Normalize only the local-drive prefix at this
+    // final process boundary.
+    let process_cwd = local_dos_path(&plan.cwd);
+    let cwd = wide(process_cwd.as_os_str());
     let mut line = command_line(&plan.executable, &plan.args);
-    let environment = environment_block()?;
+    let environment = environment_block(
+        &process_cwd,
+        plan.path.as_deref(),
+        plan.rustup_toolchain.as_deref(),
+    )?;
     let mut process_info = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(
@@ -1402,7 +2692,7 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
 fn token_flag(class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<bool> {
     let mut access_handle = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut access_handle) }
-        .map_err(|error| EngineError::Backend(format!("failed to open child token: {error}")))?;
+        .map_err(|error| EngineError::Backend(format!("failed to open process token: {error}")))?;
     let access_handle = OwnedHandle(access_handle);
     let mut value = 0u32;
     let mut returned = 0u32;
@@ -1415,7 +2705,7 @@ fn token_flag(class: TOKEN_INFORMATION_CLASS, label: &str) -> Result<bool> {
             &mut returned,
         )
     }
-    .map_err(|error| EngineError::Backend(format!("failed to inspect child {label}: {error}")))?;
+    .map_err(|error| EngineError::Backend(format!("failed to inspect process {label}: {error}")))?;
     if returned as usize != std::mem::size_of::<u32>() {
         return Err(EngineError::Backend(format!(
             "{label} returned an unexpected byte count"
@@ -1600,6 +2890,13 @@ fn production_hostile_self_test() -> Result<String> {
         env.remove("PATH");
     }
     let before = snapshot_dacl(&worktree)?;
+    let volume_root = local_volume_root(&executable).ok_or_else(|| {
+        EngineError::Backend(format!(
+            "self-test executable {} is not on a local Windows volume",
+            executable.display()
+        ))
+    })?;
+    let volume_root_before = snapshot_dacl(&volume_root)?;
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
     // launch functional; dropping the second must recover the exact baseline.
@@ -1635,6 +2932,7 @@ fn production_hostile_self_test() -> Result<String> {
         })?;
     drop(lease);
     let after = snapshot_dacl(&worktree)?;
+    let volume_root_after = snapshot_dacl(&volume_root)?;
     if !output.status.success() {
         return Err(EngineError::Backend(format!(
             "production AppContainer helper failed with {:?}: stdout={} stderr={}",
@@ -1650,6 +2948,7 @@ fn production_hostile_self_test() -> Result<String> {
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
     receipt.dacl_restored = before.acl == after.acl;
+    receipt.volume_root_dacl_restored = volume_root_before.acl == volume_root_after.acl;
     std::fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", outside.display()),
@@ -1675,7 +2974,8 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.overlapping_lease_safe
         && receipt.tampered_git_pointer_refused
         && receipt.network_denied
-        && receipt.dacl_restored;
+        && receipt.dacl_restored
+        && receipt.volume_root_dacl_restored;
     if !all_passed {
         return Err(EngineError::Backend(format!(
             "production hostile receipt contained a failed assertion: {receipt:?}"
@@ -1684,6 +2984,345 @@ fn production_hostile_self_test() -> Result<String> {
     serde_json::to_string(&receipt).map_err(|error| {
         EngineError::Backend(format!("failed to render production receipt: {error}"))
     })
+}
+
+fn run_gate_sample(
+    worktree: &Path,
+    command: &str,
+    marker: &str,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
+    appcontainer: bool,
+    sample: &str,
+) -> Result<f64> {
+    let started = std::time::Instant::now();
+    let (code, output) = if appcontainer {
+        crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree, command, env, sandbox,
+        )
+    } else {
+        crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree,
+            command,
+            env,
+            &crate::command_exec::GateSandbox::Disabled,
+        )
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let posture = if appcontainer {
+        "AppContainer"
+    } else {
+        "unwrapped"
+    };
+    // Progress goes to stderr as each sample retires. The receipt itself is
+    // the child's stdout, so a caller can still parse it; without this line a
+    // slow or wedged sample is invisible until the whole self test returns,
+    // which is exactly when a CI step timeout has already killed it.
+    eprintln!(
+        "gate sample: posture={posture} {sample} elapsed_ms={elapsed_ms:.0} command={command}"
+    );
+    if code != Some(0) || !output.contains(marker) {
+        let diagnostics = if appcontainer {
+            gate_failure_diagnostics(worktree, env, sandbox)
+        } else {
+            String::new()
+        };
+        return Err(EngineError::Backend(format!(
+            "{posture} normal gate {sample} failed with exit {code:?} or omitted {marker}: \
+             {output:?}{diagnostics}"
+        )));
+    }
+    Ok(elapsed_ms)
+}
+
+fn gate_failure_diagnostics(
+    worktree: &Path,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> String {
+    let mut diagnostics = String::from("; bounded AppContainer diagnostics:");
+    for (label, command) in [
+        ("cmd", "echo kranz-cmd-probe"),
+        ("where-node", "where node"),
+        ("node-version", "node --version"),
+        ("where-npm", "where npm"),
+        ("npm-version", "npm --version"),
+        ("node-script", "node node-gate.js"),
+    ] {
+        let (code, output) = crate::command_exec::run_bounded_gate_command_resolved_with_code(
+            worktree, command, env, sandbox,
+        );
+        diagnostics.push_str(&format!(" {label}=({code:?}, {output:?})"));
+    }
+    diagnostics
+}
+
+fn median_ms(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
+}
+
+fn measure_gate(
+    worktree: &Path,
+    command: &str,
+    marker: &str,
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> Result<GateTimingReceipt> {
+    // Warm both postures before retaining samples. Alternate their order so
+    // runner drift does not systematically favor either side.
+    run_gate_sample(worktree, command, marker, env, sandbox, false, "warm-up")?;
+    run_gate_sample(worktree, command, marker, env, sandbox, true, "warm-up")?;
+
+    let mut off_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
+    let mut appcontainer_samples_ms = Vec::with_capacity(GATE_OVERHEAD_REPETITIONS);
+    for index in 0..GATE_OVERHEAD_REPETITIONS {
+        if index % 2 == 0 {
+            off_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                env,
+                sandbox,
+                false,
+                &format!("sample {}", index + 1),
+            )?);
+            appcontainer_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                env,
+                sandbox,
+                true,
+                &format!("sample {}", index + 1),
+            )?);
+        } else {
+            appcontainer_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                env,
+                sandbox,
+                true,
+                &format!("sample {}", index + 1),
+            )?);
+            off_samples_ms.push(run_gate_sample(
+                worktree,
+                command,
+                marker,
+                env,
+                sandbox,
+                false,
+                &format!("sample {}", index + 1),
+            )?);
+        }
+    }
+    let off_median_ms = median_ms(&off_samples_ms);
+    let appcontainer_median_ms = median_ms(&appcontainer_samples_ms);
+    let overhead_ms = appcontainer_median_ms - off_median_ms;
+    let overhead_percent = overhead_ms / off_median_ms * 100.0;
+    Ok(GateTimingReceipt {
+        command: command.to_string(),
+        repetitions: GATE_OVERHEAD_REPETITIONS,
+        off_samples_ms,
+        appcontainer_samples_ms,
+        off_median_ms,
+        appcontainer_median_ms,
+        overhead_ms,
+        overhead_percent,
+        within_target: overhead_percent <= GATE_OVERHEAD_TARGET_PERCENT,
+    })
+}
+
+/// Exercise ordinary Node and Rust contract commands through the exact bounded
+/// gate executor and one resolved validation/final-gate posture, then retain
+/// interleaved warm-cache timing samples against the byte-identical unwrapped
+/// runner. This complements the hostile receipt above: neither proof
+/// substitutes for the other.
+pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
+    production_gate_self_test().map_err(|error| error.to_string())
+}
+
+fn production_gate_self_test() -> Result<String> {
+    let root = SelfTestRoot::create()?;
+    let repo = root.0.join("repo");
+    let trusted_git = repo.join(".git");
+    let worktree_git = trusted_git.join("worktrees").join("phase-5-gate");
+    let mission = repo
+        .join(".kranz")
+        .join("missions")
+        .join("m-production-gate-self-test");
+    let worktree = root.0.join("worktree");
+    let rust_src = worktree.join("rust-gate").join("src");
+    for path in [&worktree_git, &mission, &worktree, &rust_src] {
+        std::fs::create_dir_all(path).map_err(|error| {
+            EngineError::Backend(format!("failed to create {}: {error}", path.display()))
+        })?;
+    }
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )?;
+    std::fs::write(worktree_git.join("commondir"), "../..\n")?;
+    std::fs::write(repo.join(".kranz").join("serve.token"), "must-not-cross")?;
+
+    // GitHub's hosted Node image lives under a host-owned protected toolcache.
+    // The hostile receipt above intentionally proves that LPAC cannot execute
+    // arbitrary host resources merely because the operator can. Stage the
+    // exact runtime once inside this disposable worktree so phase 5 measures
+    // the production wrapper around an ordinary Node command without widening
+    // the runner's host-toolcache ACLs. A real mission can make the same
+    // workspace-contract choice for a tool whose host ACL is not LPAC-ready.
+    let ambient: HashMap<String, String> = std::env::vars().collect();
+    let node_source = find_on_path(Path::new("node"), &ambient).ok_or_else(|| {
+        EngineError::Backend("normal-gate receipt could not resolve node on PATH".to_string())
+    })?;
+    let node = worktree.join("node.exe");
+    let mut source = std::fs::File::open(&node_source).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to open Node runtime {} for staging: {error}",
+            node_source.display()
+        ))
+    })?;
+    // Create and stream rather than CopyFile: the new file must inherit the
+    // disposable worktree DACL, never preserve a protected host-toolcache
+    // descriptor that the LPAC token cannot satisfy.
+    let mut staged = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&node)
+        .map_err(|error| {
+            EngineError::Backend(format!(
+                "failed to create staged Node runtime {}: {error}",
+                node.display()
+            ))
+        })?;
+    std::io::copy(&mut source, &mut staged).map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to stream Node runtime {} into {}: {error}",
+            node_source.display(),
+            node.display()
+        ))
+    })?;
+    staged.flush().map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to flush staged Node runtime {}: {error}",
+            node.display()
+        ))
+    })?;
+    // Windows maps an executable image with FILE_SHARE_READ | FILE_SHARE_DELETE,
+    // so a surviving write handle makes the loader fail the spawn with
+    // ERROR_SHARING_VIOLATION ("the process cannot access the file because it
+    // is being used by another process") instead of running the gate. Close
+    // both staging handles before the first sample executes the staged runtime.
+    drop(staged);
+    drop(source);
+    std::fs::write(
+        worktree.join("node-gate.js"),
+        format!(
+            r#"const assert = require('node:assert/strict');
+let checksum = 0;
+for (let i = 0; i < 100000; i += 1) checksum = (checksum + i) >>> 0;
+assert.equal(checksum, 704982704);
+setTimeout(() => console.log('kranz-node-gate-ok'), {GATE_WORKLOAD_MILLIS});
+"#
+        ),
+    )?;
+    std::fs::write(
+        worktree.join("rust-gate").join("Cargo.toml"),
+        "[package]\nname = \"kranz-windows-gate-receipt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        rust_src.join("lib.rs"),
+        format!(
+            r#"#[cfg(test)]
+mod tests {{
+    #[test]
+    fn normal_rust_gate() {{
+        let values: Vec<u64> = (0..100_000).collect();
+        assert_eq!(values.iter().sum::<u64>(), 4_999_950_000);
+        std::thread::sleep(std::time::Duration::from_millis({GATE_WORKLOAD_MILLIS}));
+        println!("kranz-rust-gate-ok");
+    }}
+}}
+"#
+        ),
+    )?;
+
+    let sandbox_config = crate::types::SandboxConfig {
+        enforce: crate::types::SandboxEnforce::FsNet,
+        provider: crate::types::SandboxProvider::Process,
+        image: None,
+        extra_write: Vec::new(),
+        egress: Vec::new(),
+    };
+    // Production validation and final-gate batches resolve one posture and
+    // run all contract assertions through it. Keep the same stable scratch,
+    // cleared env, profile, and ACL lease here: the first wrapped warm-up owns
+    // one-time preparation; retained samples measure per-command overhead.
+    let gate_home = root.0.join("gate-home");
+    std::fs::create_dir_all(gate_home.join("tmp"))?;
+    let cargo_home = crate::agent_env::cache_only_cargo_home(&gate_home);
+    if !cargo_home.is_dir() {
+        return Err(EngineError::Backend(format!(
+            "normal-gate receipt could not create cache-only Cargo home {}",
+            cargo_home.display()
+        )));
+    }
+    let mut gate_env = crate::command_exec::sanitized_gate_env();
+    gate_env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+    crate::agent_env::redirect_windows_profile_env(&mut gate_env, &gate_home);
+    let sandbox = crate::command_exec::resolve_gate_sandbox(
+        &sandbox_config,
+        &worktree,
+        &mission,
+        &gate_home,
+        &gate_home,
+    )?
+    .sandbox;
+    eprintln!(
+        "gate self test: staged runtime at {}; measuring the node gate",
+        node.display()
+    );
+    let node = measure_gate(
+        &worktree,
+        r#".\node.exe node-gate.js"#,
+        "kranz-node-gate-ok",
+        &gate_env,
+        &sandbox,
+    )?;
+    eprintln!("gate self test: node gate retired; measuring the rust gate");
+    let rust = measure_gate(
+        &worktree,
+        "cargo test --quiet --manifest-path rust-gate/Cargo.toml -- --nocapture",
+        "kranz-rust-gate-ok",
+        &gate_env,
+        &sandbox,
+    )?;
+    let receipt = ProductionGateReceipt {
+        host: crate::sandbox_windows::probe(),
+        enforcement: "fs+net",
+        provider: "process/AppContainer-LPAC",
+        overhead_target_percent: GATE_OVERHEAD_TARGET_PERCENT,
+        node,
+        rust,
+    };
+    let rendered = serde_json::to_string(&receipt).map_err(|error| {
+        EngineError::Backend(format!("failed to render normal-gate receipt: {error}"))
+    })?;
+    if !receipt.node.within_target || !receipt.rust.within_target {
+        return Err(EngineError::Backend(format!(
+            "AppContainer normal-gate overhead exceeded the {GATE_OVERHEAD_TARGET_PERCENT:.1}% target: {rendered}"
+        )));
+    }
+    Ok(rendered)
+}
+
+pub fn internal_gate_self_test_requested() -> bool {
+    std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == INTERNAL_GATE_SELF_TEST_ARG)
 }
 
 pub fn internal_hostile_child_requested() -> bool {
@@ -1739,6 +3378,7 @@ fn hostile_child() -> Result<()> {
         },
         // The parent fills this after dropping the ACL/profile lease.
         dacl_restored: false,
+        volume_root_dacl_restored: false,
     };
     std::fs::write(
         &manifest.receipt,
@@ -1776,4 +3416,305 @@ pub fn run_internal_launcher() -> std::result::Result<u32, String> {
     let plan: LaunchPlan = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid AppContainer launch plan: {error}"))?;
     run_plan(plan).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_preparation_accepts_only_literal_local_drive_roots() {
+        for root in [r"C:\", r"d:\"] {
+            validate_host_preparation_root(Path::new(root)).unwrap();
+        }
+        for rejected in [r"C:", r"C:\Windows", r"\\server\share", r"C:\\", ""] {
+            assert!(validate_host_preparation_root(Path::new(rejected)).is_err());
+        }
+    }
+
+    #[test]
+    fn null_device_descriptor_grants_both_appcontainer_package_groups() {
+        assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;AC)"));
+        assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;S-1-15-2-2)"));
+        assert_eq!(NULL_DEVICE_ACCESS_MASK, 0x0012_01bf);
+    }
+
+    #[test]
+    fn lpac_capability_policy_keeps_registry_read_and_network_explicit() {
+        assert_eq!(
+            launch_capability_policy(false),
+            vec![LaunchCapability::RegistryRead]
+        );
+        assert_eq!(
+            launch_capability_policy(true),
+            vec![
+                LaunchCapability::RegistryRead,
+                LaunchCapability::InternetClient
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_environment_carries_the_gate_drive_current_directory() {
+        for cwd in [
+            Path::new(r"D:\gate\worktree"),
+            Path::new(r"\\?\D:\gate\worktree"),
+        ] {
+            let (key, value) = drive_current_directory_variable(cwd)
+                .expect("a drive-qualified Windows path has a pseudo environment variable");
+            assert_eq!(key, OsString::from("=D:"));
+            assert_eq!(value, OsString::from(r"D:\gate\worktree"));
+        }
+        assert!(drive_current_directory_variable(Path::new(r"\\server\share\gate")).is_none());
+    }
+
+    #[test]
+    fn containment_comparisons_see_through_verbatim_prefixes_and_case() {
+        let program_files =
+            PathBuf::from(std::env::var_os("PROGRAMFILES").expect("Windows sets PROGRAMFILES"));
+        let canonical = std::fs::canonicalize(&program_files)
+            .expect("the Program Files root canonicalizes")
+            .join("nodejs")
+            .join("node.exe");
+        // The canonical form is what push_entry_point actually tests, and it
+        // is the form that used to answer NO here.
+        assert!(system_managed_path(&canonical));
+        assert!(system_managed_path(&program_files.join("nodejs")));
+        assert!(path_contains(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"c:\program files\nodejs")
+        ));
+        // A sibling that merely shares a name prefix is still outside.
+        assert!(!path_contains(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"C:\Program Files Extra\tool.exe")
+        ));
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(comparable_path(Path::new(r"C:\Gate\worktree")), 1);
+        snapshots.insert(comparable_path(Path::new(r"\\?\c:\gate\worktree")), 2);
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "one physical DACL must have one cleanup capability"
+        );
+    }
+
+    #[test]
+    fn process_current_directory_strips_only_a_verbatim_disk_prefix() {
+        assert_eq!(
+            local_dos_path(Path::new(r"\\?\D:\gate\worktree")),
+            Path::new(r"D:\gate\worktree")
+        );
+        assert_eq!(
+            local_dos_path(Path::new(r"\\?\UNC\server\share\gate")),
+            Path::new(r"\\?\UNC\server\share\gate")
+        );
+    }
+
+    #[test]
+    fn command_line_leaves_cmd_switch_unquoted_and_quotes_command_tail() {
+        let encoded = command_line(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            &["/C".to_string(), "set X=1&& echo ok".to_string()],
+        );
+        let rendered = String::from_utf16(&encoded[..encoded.len() - 1])
+            .expect("the command line is valid UTF-16");
+        assert_eq!(
+            rendered,
+            r#""C:\Windows\System32\cmd.exe" /C "set X=1&& echo ok""#
+        );
+    }
+
+    #[test]
+    fn toolchain_entry_points_include_protected_node_npm_and_cargo_files() {
+        let root = tempfile::tempdir().expect("temp toolchain root");
+        let node_dir = root.path().join("node");
+        let npm_bin = node_dir.join("node_modules").join("npm").join("bin");
+        let cargo_dir = root.path().join("cargo");
+        let rustc_bin = root
+            .path()
+            .join("rustup")
+            .join("toolchains")
+            .join("stable-x86_64-pc-windows-msvc")
+            .join("bin");
+        std::fs::create_dir_all(&npm_bin).expect("npm bin");
+        std::fs::create_dir_all(&cargo_dir).expect("cargo dir");
+        std::fs::create_dir_all(&rustc_bin).expect("rustc bin");
+        for name in ["node.exe", "npm.cmd", "npx.cmd"] {
+            std::fs::write(node_dir.join(name), "").expect("node shim");
+        }
+        std::fs::write(npm_bin.join("npm-cli.js"), "").expect("npm-cli.js");
+        std::fs::write(cargo_dir.join("cargo.exe"), "").expect("cargo.exe");
+        std::fs::write(rustc_bin.join("rustc.exe"), "").expect("rustc.exe");
+
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::join_paths([&node_dir, &cargo_dir])
+                .expect("PATH")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        env.insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
+        env.insert(
+            "RUSTUP_HOME".to_string(),
+            root.path().join("rustup").to_string_lossy().into_owned(),
+        );
+
+        let names: Vec<String> = toolchain_entry_points(&env)
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        for expected in [
+            "node.exe",
+            "npm.cmd",
+            "npx.cmd",
+            "npm-cli.js",
+            "cargo.exe",
+            "rustc.exe",
+        ] {
+            assert!(
+                names.iter().any(|name| name.eq_ignore_ascii_case(expected)),
+                "missing {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_rust_toolchain_bin_leads_the_contained_search_path() {
+        let root = tempfile::tempdir().expect("temp toolchain root");
+        let proxy_bin = root.path().join("cargo-home").join("bin");
+        let toolchain = root.path().join("rustup").join("toolchains").join("stable");
+        let toolchain_bin = toolchain.join("bin");
+        std::fs::create_dir_all(&proxy_bin).expect("proxy bin");
+        std::fs::create_dir_all(&toolchain_bin).expect("toolchain bin");
+
+        let dirs = ordered_search_path_dirs(
+            vec![proxy_bin.clone(), toolchain_bin.clone(), proxy_bin],
+            Some(toolchain_bin.clone()),
+        );
+
+        assert_eq!(
+            comparable_path(dirs.first().expect("preferred bin")),
+            comparable_path(&toolchain_bin)
+        );
+        assert_eq!(
+            dirs.iter()
+                .filter(|dir| comparable_path(dir) == comparable_path(&toolchain_bin))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn redirected_appcontainer_temp_is_materialized_only_under_a_writable_root() {
+        let root = tempfile::tempdir().expect("temp profile root");
+        let scratch = root.path().join("scratch");
+        let local_app_data = scratch.join("home").join("AppData").join("Local");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&local_app_data).expect("scratch LOCALAPPDATA");
+        std::fs::create_dir_all(&outside).expect("outside LOCALAPPDATA");
+
+        let mut env = HashMap::new();
+        env.insert(
+            "localappdata".to_string(),
+            local_app_data.to_string_lossy().into_owned(),
+        );
+        let temp = prepare_redirected_profile_temp(
+            "kranz.production.receipt",
+            std::slice::from_ref(&scratch),
+            &env,
+        )
+        .expect("redirected AppContainer temp");
+        assert_eq!(
+            temp,
+            std::fs::canonicalize(&local_app_data)
+                .expect("canonical LOCALAPPDATA")
+                .join("Packages")
+                .join("kranz.production.receipt")
+                .join("AC")
+                .join("Temp")
+        );
+        assert!(temp.is_dir());
+
+        env.insert(
+            "LOCALAPPDATA".to_string(),
+            outside.to_string_lossy().into_owned(),
+        );
+        env.remove("localappdata");
+        let error = prepare_redirected_profile_temp(
+            "kranz.production.receipt",
+            std::slice::from_ref(&scratch),
+            &env,
+        )
+        .expect_err("outside LOCALAPPDATA must fail closed");
+        assert!(error
+            .to_string()
+            .contains("outside the writable sandbox roots"));
+    }
+
+    #[test]
+    fn ancestor_directories_stop_before_the_volume_root() {
+        let file = Path::new(r"\\?\C:\hostedtoolcache\windows\node\20.0.0\x64\node.exe");
+        let ancestors = ancestor_directories(file);
+        assert!(
+            ancestors
+                .iter()
+                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("x64"))),
+            "{ancestors:?}"
+        );
+        assert!(
+            ancestors
+                .iter()
+                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("hostedtoolcache"))),
+            "{ancestors:?}"
+        );
+        assert!(
+            ancestors.iter().all(|path| !volume_root(path)),
+            "{ancestors:?}"
+        );
+        assert!(volume_root(Path::new(r"\\?\C:\")));
+        assert!(volume_root(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn local_volume_root_normalizes_disk_paths_and_refuses_unc_shares() {
+        assert_eq!(
+            local_volume_root(Path::new(r"\\?\C:\hostedtoolcache\windows\node\node.exe")),
+            Some(PathBuf::from(r"C:\"))
+        );
+        assert_eq!(
+            local_volume_root(Path::new(r"D:\gate\worktree\node.exe")),
+            Some(PathBuf::from(r"D:\"))
+        );
+        assert_eq!(
+            local_volume_root(Path::new(r"\\server\share\node.exe")),
+            None
+        );
+    }
+
+    #[test]
+    fn environment_block_replaces_path_with_the_contained_search_path() {
+        let encoded = environment_block(
+            Path::new(r"D:\gate\worktree"),
+            Some(r"C:\Windows\System32;D:\node"),
+            Some(Path::new(
+                r"C:\Users\runner\.rustup\toolchains\stable-x86_64-pc-windows-msvc",
+            )),
+        )
+        .expect("environment block");
+        let text = String::from_utf16(&encoded).expect("the environment block is valid UTF-16");
+        let path = text
+            .split('\0')
+            .find(|entry| entry.to_ascii_uppercase().starts_with("PATH="));
+        assert_eq!(path, Some(r"PATH=C:\Windows\System32;D:\node"));
+        assert!(text.split('\0').any(|entry| entry
+            == r"RUSTUP_TOOLCHAIN=C:\Users\runner\.rustup\toolchains\stable-x86_64-pc-windows-msvc"));
+        assert!(text
+            .split('\0')
+            .any(|entry| entry == "RUSTUP_AUTO_INSTALL=0"));
+    }
 }

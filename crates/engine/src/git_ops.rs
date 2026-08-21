@@ -1030,7 +1030,7 @@ impl GitRepo {
         Ok(Some(AddedCommit { sha, subject, body }))
     }
 
-    /// Whether `path` has a commit at or after `since_ymd` (`YYYY-MM-DD`).
+    /// Whether `path` has a commit after the UTC `since_ymd` calendar day.
     ///
     /// Used by knowledge-refresh drift checks: a note whose `verified_against`
     /// path has history after `last_verified` is check-needed. Empty history
@@ -1070,7 +1070,9 @@ impl GitRepo {
         // Exclusive of the verification calendar day: `--since=YYYY-MM-DD`
         // includes that midnight, so a note verified the same day it was
         // committed would false-drift. End-of-day keeps date granularity.
-        let since = format!("--since={normalized_since}T23:59:59");
+        // Frontmatter dates are UTC calendar dates. Pin the offset so a note
+        // checked near midnight cannot be current locally and drifted in CI.
+        let since = format!("--since={normalized_since}T23:59:59Z");
         let out = self.probe(&["log", "-1", &since, "--format=%H", "--", path])?;
         if !out.status.success() {
             return Err(EngineError::Git(format!(
@@ -1745,7 +1747,10 @@ mod tests {
             .unwrap());
 
         std::fs::write(dir.path().join("evidence.md"), "v2\n").unwrap();
-        commit_test_repo_at(dir.path(), "later", "2026-07-09T12:00:00Z");
+        // One hour into the next UTC day is deliberately still the previous
+        // calendar day in American timezones. The probe must not inherit the
+        // host timezone when it interprets the verification date.
+        commit_test_repo_at(dir.path(), "later", "2026-07-09T01:00:00Z");
         assert!(repo
             .path_changed_since("evidence.md", "2026-07-08")
             .unwrap());

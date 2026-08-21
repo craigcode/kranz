@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Accepted plan plus phases 1-4 implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary and exact DACL restoration while the container provider remains fail-closed. Phase 5 normal Node/Rust gates, overhead, and a dedicated Windows 11 receipt remain open.
+state-note: Accepted plan plus phases 1-4 and the hosted phase-5 gate receipt are implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary, exact DACL restoration, ordinary Node/Rust gates, and retained overhead samples while the container provider remains fail-closed. Only the dedicated operator-controlled Windows 11 receipt remains open.
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -78,25 +78,55 @@ output, validator read denial, or every production spawn site.
   Validators receive the mandatory AppContainer wrap and real-checkout source
   read denies. Validation, final, and merge-gate commands use the same launcher.
 - The trusted launcher creates the hostile child suspended and assigns it to a
-  kill-on-close Job Object before resume. `fs` grants internet-client access;
-  `fs+net` supplies no network capability and is hard offline.
-- Each launch uses a disposable profile SID and an ACL lease that retains a
-  no-follow handle for every changed DACL, removes only that SID's ACEs
-  root-first, then deletes the private plan and profile. A bounded host-local
-  mutex serializes ACL read/modify/write batches, so overlapping launches
-  preserve each other's grants. Authority, mission metadata, shared Cargo
-  cache, and validator checkout denies are applied before spawn.
-- Protected Windows CI runs the exact production helper receipt through the
-  built CLI and proves an AppContainer token plus LPAC behavior by denying a
+  kill-on-close Job Object before resume. Both postures explicitly grant
+  read-only `registryRead`, required for ordinary LPAC tools to create child
+  processes; `fs` additionally grants internet-client access, while `fs+net`
+  supplies no network capability and is hard offline. The profile and launch
+  use the same capability list.
+- Each agent launch uses a disposable profile SID; each resolved engine-gate
+  posture owns one disposable SID across its validation/final-gate command
+  batch, so expensive ACL preparation is once per posture rather than once per
+  assertion. Because ordinary Windows tools probe the local drive root and
+  open `NUL` during startup, an elevated host-preparation script installs
+  Microsoft's exact non-inheriting `0x00120088` metadata ACE for `S-1-15-2-1`
+  and `S-1-15-2-2` on each relevant local drive and reapplies the documented
+  `\Device\Null` descriptor once per boot. The root ACEs grant no listing,
+  content read, or write rights. The ordinary launcher checks both prerequisites
+  read-only and fails closed with the preparation command when either is absent.
+  Before entering LPAC it also resolves rustup's active, already-installed
+  standard toolchain with auto-install disabled and pins that absolute root in
+  `RUSTUP_TOOLCHAIN`. Because hosted toolchain roots can protect their DACL
+  from parent inheritance, that selected root receives its own recursive
+  read/execute grant and its real `bin` directory leads the contained `PATH`;
+  Rust gates therefore avoid the rustup proxy without refreshing a channel or
+  writing the operator's `RUSTUP_HOME`. Windows also rewrites `TEMP`/`TMP` to
+  `<LOCALAPPDATA>/Packages/<profile>/AC/Temp`; because Kranz redirects
+  `LOCALAPPDATA` into private scratch after profile creation, the launcher
+  materializes that exact tree only after proving it remains under a writable
+  sandbox root.
+  The ACL lease retains a no-follow handle for every path-specific DACL
+  it changes, removes only the unique package SID's ACEs root-first, then
+  deletes every private plan and the profile. A bounded host-local mutex
+  serializes ACL read/modify/write
+  batches, so overlapping launches preserve each other's grants. Authority,
+  mission metadata, shared Cargo cache, and validator checkout denies are
+  applied before spawn.
+- Protected Windows CI performs the same explicit host-preparation step, then
+  runs the exact production helper receipt through the built CLI and proves an
+  AppContainer token plus LPAC behavior by denying a
   sibling root deliberately granted to regular AppContainers, allow/deny
   behavior, shared-Git read, tampered Git-pointer refusal, network denial, overlap-safe
-  no-follow DACL cleanup, and exact uncontended restoration before checking
+  no-follow DACL cleanup, an unchanged prepared drive-root DACL, and exact
+  uncontended restoration before checking
   positive session/gate resolution and continued container refusal.
 - Native `.exe` backends are required; batch shims are refused at preparation
   to avoid forwarding model arguments through `cmd.exe`.
 
-This closes production integration. It does not yet prove ordinary Node/Rust
-contract gates, representative overhead, per-host `fs` filtering, or the final
+This closes production integration. Protected hosted CI also proves ordinary
+Node/Rust contract gates and representative retained-posture overhead against
+a five-second minimum gate payload, keeping the `10%` limit while preventing
+hosted-runner scheduling jitter from dominating the stated `npm build`/`cargo
+test` workload. It does not yet prove per-host `fs` filtering or the final
 operator-controlled Windows 11 receipt.
 
 ## Acceptance hints

@@ -89,6 +89,32 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::SandboxPrepare { targets } => {
+            for target in targets {
+                eprintln!(
+                    "Preparing AppContainer host metadata: target={}",
+                    target.display()
+                );
+                let changed = kranz_engine::sandbox_windows::prepare_appcontainer_host(&target)
+                    .map_err(anyhow::Error::msg)?;
+                let result = if changed {
+                    "applied"
+                } else {
+                    "already prepared"
+                };
+                println!(
+                    "AppContainer host preparation {result}: target={} mask=0x00120088 inheritance=none",
+                    target.display()
+                );
+            }
+            eprintln!("Preparing AppContainer null-device metadata: target=\\Device\\Null");
+            kranz_engine::sandbox_windows::prepare_appcontainer_null_device()
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "AppContainer null-device preparation applied: target=\\Device\\Null inheritance=none"
+            );
+            Ok(0)
+        }
         Command::Outcomes {
             json,
             all,

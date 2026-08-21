@@ -123,6 +123,18 @@ pub enum Command {
         json: bool,
     },
 
+    /// Prepare the Windows host for AppContainer enforcement.
+    ///
+    /// Adds only the two persistent, non-inheriting metadata ACEs required by
+    /// Windows tools on each drive root and reapplies the documented null-device
+    /// descriptor that resets at boot. Run from an elevated PowerShell;
+    /// ordinary Kranz launches verify both prerequisites read-only.
+    SandboxPrepare {
+        /// Literal local drive root to prepare (repeat for multiple drives).
+        #[arg(long = "target", value_name = "DRIVE-ROOT", required = true)]
+        targets: Vec<PathBuf>,
+    },
+
     /// Show the flight-surgeon outcomes fold: autonomy ratio, grant-latency
     /// distribution, per-task-class rows, context reuse, the rubber-stamp
     /// flag, and the escalation ledger (read-only, no lock)

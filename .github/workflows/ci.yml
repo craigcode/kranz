@@ -116,22 +116,47 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # M7 Windows containment phase 4: exercise the exact production
-      # helper/ACL lease through the built kranz binary, then hold both the
-      # positive process-provider resolution and negative container-provider
-      # refusal contracts before the full workspace suite.
-      - name: Prove production Windows LPAC containment
+      # AppContainer tools probe each local drive root and open NUL during
+      # startup. The disposable runner is elevated once here to install
+      # Microsoft's exact drive-root metadata ACEs and null-device descriptor;
+      # the ordinary Kranz launcher verifies both prerequisites read-only.
+      - name: Prepare Windows AppContainer host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $targets = @(
+            [System.IO.Path]::GetPathRoot($env:SystemRoot)
+            [System.IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+            [System.IO.Path]::GetPathRoot($env:RUNNER_TEMP)
+            [System.IO.Path]::GetPathRoot((Get-Command node).Source)
+            [System.IO.Path]::GetPathRoot((Get-Command cargo).Source)
+          ) | Sort-Object -Unique
+          ./scripts/prepare-windows-appcontainer.ps1 -Target $targets
+      # M7 Windows containment phases 4-5: exercise the exact production
+      # helper/ACL lease through the built kranz binary, prove ordinary Node
+      # and Rust gates plus retained overhead samples through one production
+      # validation/final-gate posture, then hold both the positive
+      # process-provider resolution and negative container-provider refusal
+      # contracts before the full workspace suite.
+      - name: Prove production Windows LPAC containment and gates
         if: matrix.os == 'windows-latest'
         shell: bash
+        # Thirty minutes covered the hostile receipt but not the phase-5
+        # timing receipt, which retires thirty-two wrapped and unwrapped
+        # samples, each rebuilding a cache-only Cargo home.
+        timeout-minutes: 60
         run: |
+          # tee rather than redirect-then-cat: the AppContainer gate receipt
+          # streams per-sample progress, and a buffered log is lost entirely
+          # when the step timeout kills a run that has not returned yet.
           run_exact_test() {
             local log="$1"
             shift
             set +e
-            "$@" >"$log" 2>&1
-            local status=$?
+            "$@" 2>&1 | tee "$log"
+            local status=${PIPESTATUS[0]}
             set -e
-            cat "$log"
             if [ "$status" -ne 0 ]; then
               return "$status"
             fi
@@ -146,6 +171,9 @@ jobs:
 
           production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
           run_exact_test "$production_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture
+
+          gate_log="$RUNNER_TEMP/kranz-windows-appcontainer-gates.log"
+          run_exact_test "$gate_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target -- --exact --nocapture
 
           session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
           run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
