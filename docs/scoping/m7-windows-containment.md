@@ -26,7 +26,10 @@ The process boundary applies to workers, validators, validation/final commands,
 and merge gates. There is no path where a requested enforced posture silently
 runs native code with the operator's ordinary user privileges. `fs` grants the
 AppContainer internet-client capability; `fs+net` supplies no network
-capability and is hard offline.
+capability and is hard offline. Both postures carry only the explicit
+read-only `registryRead` capability that LPAC requires for ordinary Windows
+tools to create descendant processes; the same capability list is fixed at
+profile creation and supplied again at each launch.
 
 ## What parity means
 

@@ -53,15 +53,15 @@ use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    AclSizeInformation, CreateWellKnownSid, DeleteAce, EqualSid, FreeSid, GetAce,
-    GetAclInformation, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorDacl,
-    GetTokenInformation, SetKernelObjectSecurity, TokenElevation, TokenIsAppContainer,
-    WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE,
-    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    GROUP_SECURITY_INFORMATION, INHERITED_ACE, LABEL_SECURITY_INFORMATION, NO_INHERITANCE,
-    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
-    WELL_KNOWN_SID_TYPE,
+    AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
+    FreeSid, GetAce, GetAclInformation, GetKernelObjectSecurity, GetLengthSid,
+    GetSecurityDescriptorDacl, GetTokenInformation, SetKernelObjectSecurity, TokenElevation,
+    TokenIsAppContainer, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE,
+    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+    TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -95,6 +95,7 @@ const DACL_MUTEX_TIMEOUT_MS: u32 = 30_000;
 const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
 const ROOT_METADATA_ACCESS_MASK: u32 = 0x0012_0088;
 const NULL_DEVICE_ACCESS_MASK: u32 = 0x0012_01bf;
+const REGISTRY_READ_CAPABILITY: &str = "registryRead";
 // Source: Microsoft's current AppContainer host-preparation contract.
 // https://github.com/microsoft/mxc/blob/main/docs/host-prep.md
 const NULL_DEVICE_TARGET_SDDL: &str = "O:BAG:SYD:(A;;GRGWGX;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;RC)(A;;GRGWGX;;;AC)(A;;GRGWGX;;;S-1-15-2-2)S:(ML;;NW;;;LW)";
@@ -328,6 +329,33 @@ impl Drop for LocalAllocation {
     }
 }
 
+struct LocalSidArray {
+    sids: *mut PSID,
+    count: u32,
+}
+
+impl Drop for LocalSidArray {
+    fn drop(&mut self) {
+        if self.sids.is_null() {
+            return;
+        }
+        unsafe {
+            for sid in std::slice::from_raw_parts(self.sids, self.count as usize) {
+                if !sid.0.is_null() {
+                    LocalFree(Some(HLOCAL(sid.0)));
+                }
+            }
+            LocalFree(Some(HLOCAL(self.sids.cast())));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchCapability {
+    RegistryRead,
+    InternetClient,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AclMode {
     Grant,
@@ -351,17 +379,19 @@ fn win32(status: windows::Win32::Foundation::WIN32_ERROR) -> Result<()> {
         .map_err(|error| EngineError::Backend(format!("Windows ACL operation failed: {error}")))
 }
 
-fn create_profile() -> Result<(String, OwnedSid)> {
+fn create_profile(allow_network: bool) -> Result<(String, OwnedSid)> {
     let profile_name = format!("kranz.production.{}", uuid::Uuid::new_v4().simple());
     let name = wide(&profile_name);
     let display = wide("Kranz contained process");
     let description = wide("Disposable Kranz AppContainer profile");
+    let mut capability_storage = launch_capability_storage(allow_network)?;
+    let capabilities = capability_attributes(&mut capability_storage);
     let sid = unsafe {
         CreateAppContainerProfile(
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(description.as_ptr()),
-            None,
+            Some(&capabilities),
         )
     }
     .map_err(|error| {
@@ -1800,7 +1830,8 @@ pub(crate) fn prepare_launch_in_context(
         EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
     })?;
     if slot.is_none() {
-        let (profile_name, _sid) = create_profile()?;
+        let (profile_name, _sid) =
+            create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
         *slot = Some(new_lease(profile_name));
     }
     let lease = slot
@@ -1820,7 +1851,7 @@ pub(crate) fn prepare_launch(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<PreparedLaunch> {
-    let (profile_name, sid) = create_profile()?;
+    let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
     let mut lease = new_lease(profile_name);
     let prepared = prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env)?;
     Ok(PreparedLaunch {
@@ -2149,6 +2180,76 @@ fn internet_capability() -> Result<Vec<u8>> {
     well_known_sid(WinCapabilityInternetClientSid, "internetClient capability")
 }
 
+fn named_capability(name: &str) -> Result<Vec<u8>> {
+    let name_wide = wide(name);
+    let mut group_sids = null_mut();
+    let mut group_count = 0u32;
+    let mut capability_sids = null_mut();
+    let mut capability_count = 0u32;
+    let derived = unsafe {
+        DeriveCapabilitySidsFromName(
+            PCWSTR(name_wide.as_ptr()),
+            &mut group_sids,
+            &mut group_count,
+            &mut capability_sids,
+            &mut capability_count,
+        )
+    };
+    let _group_sids = LocalSidArray {
+        sids: group_sids,
+        count: group_count,
+    };
+    let capability_sids = LocalSidArray {
+        sids: capability_sids,
+        count: capability_count,
+    };
+    derived.map_err(|error| {
+        EngineError::Backend(format!("failed to derive {name} capability SID: {error}"))
+    })?;
+    if capability_sids.count != 1 || capability_sids.sids.is_null() {
+        return Err(EngineError::Backend(format!(
+            "{name} capability derivation returned {} SIDs; expected exactly one",
+            capability_sids.count
+        )));
+    }
+    let sid = unsafe { *capability_sids.sids };
+    let len = unsafe { GetLengthSid(sid) } as usize;
+    if len == 0 {
+        return Err(EngineError::Backend(format!(
+            "{name} capability SID had zero length"
+        )));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), len) }.to_vec())
+}
+
+fn launch_capability_policy(allow_network: bool) -> Vec<LaunchCapability> {
+    let mut capabilities = vec![LaunchCapability::RegistryRead];
+    if allow_network {
+        capabilities.push(LaunchCapability::InternetClient);
+    }
+    capabilities
+}
+
+fn launch_capability_storage(allow_network: bool) -> Result<Vec<Vec<u8>>> {
+    launch_capability_policy(allow_network)
+        .into_iter()
+        .map(|capability| match capability {
+            LaunchCapability::RegistryRead => named_capability(REGISTRY_READ_CAPABILITY),
+            LaunchCapability::InternetClient => internet_capability(),
+        })
+        .collect()
+}
+
+fn capability_attributes(storage: &mut [Vec<u8>]) -> Vec<SID_AND_ATTRIBUTES> {
+    storage
+        .iter_mut()
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: PSID(sid.as_mut_ptr().cast()),
+            Attributes: SE_GROUP_ENABLED as u32,
+        })
+        .collect()
+}
+
 fn quote_arg(value: &OsStr, force_quotes: bool) -> Vec<u16> {
     let source: Vec<u16> = value.encode_wide().collect();
     // Match std::process::Command's CreateProcessW encoding: arguments only
@@ -2314,16 +2415,8 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
         ));
     }
     let sid = derive_profile_sid(&plan.profile_name)?;
-    let mut internet_sid = plan.allow_network.then(internet_capability).transpose()?;
-    let mut capabilities = internet_sid
-        .as_mut()
-        .map(|storage| {
-            vec![SID_AND_ATTRIBUTES {
-                Sid: PSID(storage.as_mut_ptr().cast()),
-                Attributes: SE_GROUP_ENABLED as u32,
-            }]
-        })
-        .unwrap_or_default();
+    let mut capability_storage = launch_capability_storage(plan.allow_network)?;
+    let mut capabilities = capability_attributes(&mut capability_storage);
     let security = SECURITY_CAPABILITIES {
         AppContainerSid: sid.0,
         Capabilities: if capabilities.is_empty() {
@@ -3156,6 +3249,21 @@ mod tests {
         assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;AC)"));
         assert!(NULL_DEVICE_TARGET_SDDL.contains(";;;S-1-15-2-2)"));
         assert_eq!(NULL_DEVICE_ACCESS_MASK, 0x0012_01bf);
+    }
+
+    #[test]
+    fn lpac_capability_policy_keeps_registry_read_and_network_explicit() {
+        assert_eq!(
+            launch_capability_policy(false),
+            vec![LaunchCapability::RegistryRead]
+        );
+        assert_eq!(
+            launch_capability_policy(true),
+            vec![
+                LaunchCapability::RegistryRead,
+                LaunchCapability::InternetClient
+            ]
+        );
     }
 
     #[test]

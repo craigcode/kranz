@@ -107,10 +107,11 @@ All of it asks the agent nicely. None of it constrains the process.
   widening the path allowlist. An elevated host-preparation script adds only
   Microsoft's non-inheriting drive-root metadata ACEs and reapplies the
   documented null-device descriptor once per boot; the launcher verifies both
-  prerequisites read-only and otherwise fails closed. `fs` grants
-  internet-client access; `fs+net` is hard offline. The same launcher wraps
-  workers, validators, and engine-run gates, and protected CI proves
-  authority/real-checkout denial plus DACL restoration.
+  prerequisites read-only and otherwise fails closed. Both postures explicitly
+  grant read-only `registryRead` so LPAC tools can create descendants; `fs`
+  additionally grants internet-client access, while `fs+net` is hard offline.
+  The same launcher wraps workers, validators, and engine-run gates, and
+  protected CI proves authority/real-checkout denial plus DACL restoration.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open

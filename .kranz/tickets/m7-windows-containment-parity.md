@@ -78,8 +78,11 @@ output, validator read denial, or every production spawn site.
   Validators receive the mandatory AppContainer wrap and real-checkout source
   read denies. Validation, final, and merge-gate commands use the same launcher.
 - The trusted launcher creates the hostile child suspended and assigns it to a
-  kill-on-close Job Object before resume. `fs` grants internet-client access;
-  `fs+net` supplies no network capability and is hard offline.
+  kill-on-close Job Object before resume. Both postures explicitly grant
+  read-only `registryRead`, required for ordinary LPAC tools to create child
+  processes; `fs` additionally grants internet-client access, while `fs+net`
+  supplies no network capability and is hard offline. The profile and launch
+  use the same capability list.
 - Each agent launch uses a disposable profile SID; each resolved engine-gate
   posture owns one disposable SID across its validation/final-gate command
   batch, so expensive ACL preparation is once per posture rather than once per
