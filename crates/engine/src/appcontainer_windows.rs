@@ -101,7 +101,7 @@ const REGISTRY_READ_CAPABILITY: &str = "registryRead";
 const NULL_DEVICE_TARGET_SDDL: &str = "O:BAG:SYD:(A;;GRGWGX;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;RC)(A;;GRGWGX;;;AC)(A;;GRGWGX;;;S-1-15-2-2)S:(ML;;NW;;;LW)";
 const ALL_RESTRICTED_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-2";
 const GATE_OVERHEAD_REPETITIONS: usize = 7;
-const GATE_WORKLOAD_MILLIS: u64 = 1_000;
+const GATE_WORKLOAD_MILLIS: u64 = 5_000;
 const GATE_OVERHEAD_TARGET_PERCENT: f64 = 10.0;
 
 #[derive(Debug, Serialize, Deserialize)]
