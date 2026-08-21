@@ -8,9 +8,11 @@
 //! URL, never the token. Removing proxy variables therefore removes the only
 //! usable route instead of reopening unrestricted NAT.
 //!
-//! The boundary owns its network, relay, private credential volume, transient
-//! host staging directory, and proxy. Host copies are deleted before a worker
-//! starts; only the relay mounts the volume, read-only.
+//! The boundary owns its network, relay, stopped credential loader, private
+//! credential volume, transient host staging directory, and proxy. Docker's
+//! local copy API moves the files into the volume without a host bind; the
+//! loader and host copies are deleted before a worker starts, and only the
+//! relay later mounts the volume, read-only.
 //! Explicit shutdown verifies teardown. `Drop` repeats bounded best-effort
 //! teardown on backend/session errors. Every start also reaps resources whose
 //! recorded owner PID + immutable process identity is no longer live, closing
@@ -106,6 +108,7 @@ pub struct ContainerEgressBoundary {
     runtime: ContainerRuntime,
     network: String,
     relay: String,
+    loader: String,
     worker: String,
     credential_volume: String,
     credential_dir: PathBuf,
@@ -118,6 +121,7 @@ impl std::fmt::Debug for ContainerEgressBoundary {
         f.debug_struct("ContainerEgressBoundary")
             .field("network", &self.network)
             .field("relay", &self.relay)
+            .field("loader", &self.loader)
             .field("worker", &self.worker)
             .field("credential_volume", &self.credential_volume)
             .field("credential_dir", &self.credential_dir)
@@ -168,6 +172,7 @@ impl ContainerEgressBoundary {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let network = format!("kranz-egress-{id}");
         let relay = format!("kranz-egress-relay-{id}");
+        let loader = format!("kranz-egress-loader-{id}");
         let worker = format!("kranz-egress-worker-{id}");
         let credential_volume = format!("kranz-egress-secret-{id}");
         let credential_dir = credential_root()?.join(format!("kranz-container-egress-{id}"));
@@ -187,6 +192,7 @@ impl ContainerEgressBoundary {
             runtime,
             network,
             relay,
+            loader,
             worker,
             credential_volume,
             credential_dir,
@@ -231,43 +237,50 @@ impl ContainerEgressBoundary {
             &boundary.credential_dir.join("relay.py"),
             RELAY_SCRIPT.as_bytes(),
         )?;
+        let credential_owner = credential_owner(&boundary.credential_dir)?;
 
-        // Populate a private Docker volume through a short-lived, offline,
-        // pinned helper, then erase the host copies before a worker exists.
-        // The relay later mounts the volume read-only; the worker never does.
-        // This avoids any persistent host bind whose source could overlap an
-        // unusually broad session mount (for example a repo rooted at HOME).
-        let credential_source = format!("{}:/src:ro", canonical_display(&boundary.credential_dir)?);
-        let credential_target = format!("{}:/opt/kranz", boundary.credential_volume);
+        // Attach the private volume to a STOPPED, networkless loader and use
+        // Docker's local copy API. No image code runs and the 0700/0600 host
+        // source is never bind-mounted, avoiding both user-namespace mapping
+        // failures and overlap with an unusually broad worker mount.
+        let mut create_loader = vec![
+            "create".to_string(),
+            "--name".to_string(),
+            boundary.loader.clone(),
+            "--network".to_string(),
+            "none".to_string(),
+            "--read-only".to_string(),
+            "--user".to_string(),
+            credential_owner.clone(),
+            "--cap-drop".to_string(),
+            "ALL".to_string(),
+            "--security-opt".to_string(),
+            "no-new-privileges".to_string(),
+            "--mount".to_string(),
+            format!(
+                "type=volume,src={},dst=/opt/kranz",
+                boundary.credential_volume
+            ),
+        ];
+        push_labels(&mut create_loader, &labels);
+        create_loader.extend([
+            RELAY_IMAGE.to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "true".to_string(),
+        ]);
+        docker_checked(runtime, &create_loader, "create stopped credential loader")?;
+        let credential_source = format!("{}/.", canonical_display(&boundary.credential_dir)?);
+        let credential_target = format!("{}:/opt/kranz", boundary.loader);
         docker_checked(
             runtime,
-            &[
-                "run".to_string(),
-                "--rm".to_string(),
-                "--read-only".to_string(),
-                "--network".to_string(),
-                "none".to_string(),
-                // Docker hosts with user-namespace remapping otherwise map
-                // container root away from the operator UID and cannot read
-                // the deliberately 0700/0600 staging tree. This helper is
-                // offline, capability-free, short-lived, and mounts only the
-                // exact staging directory plus its private destination.
-                "--userns".to_string(),
-                "host".to_string(),
-                "--cap-drop".to_string(),
-                "ALL".to_string(),
-                "--security-opt".to_string(),
-                "no-new-privileges".to_string(),
-                "-v".to_string(),
-                credential_source,
-                "-v".to_string(),
-                credential_target,
-                RELAY_IMAGE.to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                "cp /src/relay.py /src/authority /opt/kranz/ && chmod 600 /opt/kranz/relay.py /opt/kranz/authority".to_string(),
-            ],
+            &["cp".to_string(), credential_source, credential_target],
             "copy private enforcement files into the relay volume",
+        )?;
+        docker_checked(
+            runtime,
+            &["rm".to_string(), boundary.loader.clone()],
+            "remove stopped credential loader before worker spawn",
         )?;
         std::fs::remove_dir_all(&boundary.credential_dir).map_err(|error| {
             EngineError::Backend(format!(
@@ -289,6 +302,8 @@ impl ContainerEgressBoundary {
             "--add-host".to_string(),
             "host.docker.internal:host-gateway".to_string(),
             "--read-only".to_string(),
+            "--user".to_string(),
+            credential_owner,
             "--cap-drop".to_string(),
             "ALL".to_string(),
             "--security-opt".to_string(),
@@ -422,6 +437,12 @@ impl ContainerEgressBoundary {
         }
         if let Err(error) = docker_remove_if_present(
             self.runtime,
+            &["rm".to_string(), "-f".to_string(), self.loader.clone()],
+        ) {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = docker_remove_if_present(
+            self.runtime,
             &[
                 "volume".to_string(),
                 "rm".to_string(),
@@ -459,10 +480,11 @@ impl ContainerEgressBoundary {
     }
 
     #[cfg(test)]
-    fn resource_names(&self) -> (&str, &str, &str, &str, &Path) {
+    fn resource_names(&self) -> (&str, &str, &str, &str, &str, &Path) {
         (
             &self.network,
             &self.relay,
+            &self.loader,
             &self.worker,
             &self.credential_volume,
             &self.credential_dir,
@@ -546,6 +568,25 @@ fn canonical_display(path: &Path) -> Result<String> {
     path.canonicalize()
         .map(|path| path.display().to_string())
         .map_err(|error| EngineError::Backend(format!("canonicalize {}: {error}", path.display())))
+}
+
+#[cfg(unix)]
+fn credential_owner(path: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        EngineError::Backend(format!(
+            "inspect container egress credential owner {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(format!("{}:{}", metadata.uid(), metadata.gid()))
+}
+
+#[cfg(not(unix))]
+fn credential_owner(_path: &Path) -> Result<String> {
+    Err(EngineError::Backend(
+        "container per-host egress requires a Unix credential owner mapping".to_string(),
+    ))
 }
 
 fn docker_output(runtime: ContainerRuntime, args: &[String]) -> Result<Output> {
@@ -665,6 +706,14 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
                     "rm".to_string(),
                     "-f".to_string(),
                     format!("kranz-egress-relay-{id}"),
+                ],
+            )?;
+            docker_remove_if_present(
+                runtime,
+                &[
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    format!("kranz-egress-loader-{id}"),
                 ],
             )?;
         }
@@ -825,9 +874,11 @@ mod tests {
         let boundary = ContainerEgressBoundary::start(&mut spec, &paths)
             .await
             .unwrap();
-        let (network, relay, worker, credential_volume, credential_dir) = boundary.resource_names();
+        let (network, relay, loader, worker, credential_volume, credential_dir) =
+            boundary.resource_names();
         let network = network.to_string();
         let relay = relay.to_string();
+        let loader = loader.to_string();
         let worker = worker.to_string();
         let credential_volume = credential_volume.to_string();
         let credential_dir = credential_dir.to_path_buf();
@@ -969,6 +1020,7 @@ mod tests {
         );
         assert!(!inspect_exists("network", &network));
         assert!(!inspect_exists("container", &relay));
+        assert!(!inspect_exists("container", &loader));
         assert!(!inspect_exists("container", &worker));
         assert!(!inspect_exists("volume", &credential_volume));
         assert!(!credential_dir.exists());
@@ -979,10 +1031,17 @@ mod tests {
         let dropped = ContainerEgressBoundary::start(&mut dropped_spec, &paths)
             .await
             .unwrap();
-        let (dropped_network, dropped_relay, dropped_worker, dropped_volume, dropped_dir) =
-            dropped.resource_names();
+        let (
+            dropped_network,
+            dropped_relay,
+            dropped_loader,
+            dropped_worker,
+            dropped_volume,
+            dropped_dir,
+        ) = dropped.resource_names();
         let dropped_network = dropped_network.to_string();
         let dropped_relay = dropped_relay.to_string();
+        let dropped_loader = dropped_loader.to_string();
         let dropped_worker = dropped_worker.to_string();
         let dropped_volume = dropped_volume.to_string();
         let dropped_dir = dropped_dir.to_path_buf();
@@ -1006,6 +1065,7 @@ mod tests {
         drop(dropped);
         assert!(!inspect_exists("network", &dropped_network));
         assert!(!inspect_exists("container", &dropped_relay));
+        assert!(!inspect_exists("container", &dropped_loader));
         assert!(!inspect_exists("container", &dropped_worker));
         assert!(!inspect_exists("volume", &dropped_volume));
         assert!(!dropped_dir.exists());
@@ -1016,6 +1076,7 @@ mod tests {
         let stale_id = uuid::Uuid::new_v4().simple().to_string();
         let stale_network = format!("kranz-egress-{stale_id}");
         let stale_relay = format!("kranz-egress-relay-{stale_id}");
+        let stale_loader = format!("kranz-egress-loader-{stale_id}");
         let stale_volume = format!("kranz-egress-secret-{stale_id}");
         let stale_dir = credential_root()
             .unwrap()
@@ -1066,9 +1127,30 @@ mod tests {
             "600".to_string(),
         ]);
         docker_checked(ContainerRuntime::Docker, &run, "seed stale relay").unwrap();
+        let mut create_loader = vec![
+            "create".to_string(),
+            "--name".to_string(),
+            stale_loader.clone(),
+            "--network".to_string(),
+            "none".to_string(),
+            "--mount".to_string(),
+            format!("type=volume,src={stale_volume},dst=/opt/kranz"),
+        ];
+        push_labels(&mut create_loader, &stale_labels);
+        create_loader.extend([
+            crate::sandbox_container::DEFAULT_IMAGE.to_string(),
+            "true".to_string(),
+        ]);
+        docker_checked(
+            ContainerRuntime::Docker,
+            &create_loader,
+            "seed stale credential loader",
+        )
+        .unwrap();
         recover_stale_boundaries(ContainerRuntime::Docker).unwrap();
         assert!(!inspect_exists("network", &stale_network));
         assert!(!inspect_exists("container", &stale_relay));
+        assert!(!inspect_exists("container", &stale_loader));
         assert!(!inspect_exists("volume", &stale_volume));
         assert!(!stale_dir.exists());
     }

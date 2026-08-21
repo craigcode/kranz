@@ -9,18 +9,17 @@ claim equivalent Podman/nerdctl/Apple-container networking.
 ## Boundary under test
 
 - Worker: unique Docker internal network, read-only root, no default route.
-- Relay: unique dual-homed container, internal alias `kranz-egress`, all
-  Linux capabilities dropped, no-new-privileges, read-only root.
+- Relay: unique dual-homed container, internal alias `kranz-egress`, running
+  as the private files' exact numeric owner with all Linux capabilities
+  dropped, no-new-privileges, and a read-only root.
 - Filter: one host-side Kranz CONNECT proxy with the existing effective
   allowlist and structured per-run denial sink.
-- Attribution: 256-bit per-run bearer token copied through an offline pinned
-  helper into a private Docker volume mounted read-only only by the relay.
-  On user-namespace-remapped daemons, that helper alone uses Docker's host
-  user namespace so it can read the operator-owned 0700/0600 staging tree;
-  it has no network, no capabilities, no-new-privileges, and only the exact
-  staging and destination mounts. Host copies are deleted before worker
-  spawn. The relay injects the token; unauthenticated CONNECT gets 407 and
-  creates no denial.
+- Attribution: 256-bit per-run bearer token copied through Docker's local copy
+  API into a private volume attached to a stopped, networkless loader
+  container. No image code runs and no host credential path is bind-mounted.
+  The loader and 0700/0600 host copies are deleted before worker spawn; only
+  the relay later mounts the volume, read-only. The relay injects the token;
+  unauthenticated CONNECT gets 407 and creates no denial.
 - Supply chain: relay manifest pinned to
   `python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d`.
 
@@ -49,15 +48,15 @@ The fixture proved, against the live daemon:
 3. An ordinary bridge control container reached a live external peer. A
    worker on the internal network, with no proxy involvement, could not open
    the same direct socket. This is the anti-vacuity control for the bypass.
-4. Host credential staging was absent before the first worker spawn. Normal
-   shutdown removed the worker name, relay, network, private credential
-   volume, and staging directory.
+4. Host credential staging and the stopped loader were absent before the
+   first worker spawn. Normal shutdown removed the worker name, relay,
+   network, private credential volume, and staging directory.
 5. Error/timeout-shaped Drop force-removed a still-running daemon-owned worker
    before removing the relay, network, credential volume, and staging
    directory.
-6. A seeded stale owner (dead PID/token) plus live stale relay/network and
-   credential volume and staging directory were removed by recovery; a live
-   owner is retained by the same identity comparison.
+6. A seeded stale owner (dead PID/token) plus live stale relay, stopped loader,
+   network, credential volume, and staging directory were removed by recovery;
+   a live owner is retained by the same identity comparison.
 
 Post-proof `docker ps -a --filter name=kranz-egress` and
 `docker network ls --filter label=com.kranz.egress-boundary=true` both
