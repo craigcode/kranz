@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Protected Ubuntu CI run 32411486438 used real bubblewrap 0.9.0, denied the sibling write and host-network connection with anti-vacuity controls, passed the normal Node gate, preserved the checkout, and measured 1.11% median overhead.
 title: Run the M7 hostile and overhead proof on a real Linux bubblewrap host
 priority: 2
 schedule: once
@@ -21,3 +22,5 @@ measured rather than inferred from unit tests.
 - A normal Node and/or Rust contract command passes under the wrapper.
 - Record median wrapped/unwrapped warm timings and flag overhead above ~10%.
 - Commit a receipt with host/runtime versions, commands, results, and cleanup.
+
+See [the committed Linux live-proof receipt](../../docs/reviews/m7-linux-bubblewrap-live-proof.md).
