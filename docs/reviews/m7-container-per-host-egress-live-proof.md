@@ -15,8 +15,12 @@ claim equivalent Podman/nerdctl/Apple-container networking.
   allowlist and structured per-run denial sink.
 - Attribution: 256-bit per-run bearer token copied through an offline pinned
   helper into a private Docker volume mounted read-only only by the relay.
-  Host copies are deleted before worker spawn. The relay injects the token;
-  unauthenticated CONNECT gets 407 and creates no denial.
+  On user-namespace-remapped daemons, that helper alone uses Docker's host
+  user namespace so it can read the operator-owned 0700/0600 staging tree;
+  it has no network, no capabilities, no-new-privileges, and only the exact
+  staging and destination mounts. Host copies are deleted before worker
+  spawn. The relay injects the token; unauthenticated CONNECT gets 407 and
+  creates no denial.
 - Supply chain: relay manifest pinned to
   `python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d`.
 

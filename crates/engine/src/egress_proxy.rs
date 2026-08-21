@@ -289,16 +289,16 @@ impl EgressProxy {
         addr: SocketAddr,
         allowlist: Vec<String>,
         denial_file: PathBuf,
-        token: String,
+        relay_authority: String,
     ) -> Result<EgressProxy> {
-        Self::start_bound_with_auth(addr, allowlist, denial_file, Some(token)).await
+        Self::start_bound_with_auth(addr, allowlist, denial_file, Some(relay_authority)).await
     }
 
     async fn start_bound_with_auth(
         addr: SocketAddr,
         allowlist: Vec<String>,
         denial_file: PathBuf,
-        auth_token: Option<String>,
+        relay_authority: Option<String>,
     ) -> Result<EgressProxy> {
         let entries = parse_allowlist(&allowlist)?;
         let listener = TcpListener::bind(addr).await.map_err(|e| {
@@ -338,9 +338,9 @@ impl EgressProxy {
                         Ok((stream, _peer)) => {
                             let sink = Arc::clone(&sink);
                             let entries = entries.clone();
-                            let auth_token = auth_token.clone();
+                            let relay_authority = relay_authority.clone();
                             let mut tasks = conn_tasks.lock().expect("conn tasks lock");
-                            tasks.spawn(handle_connection(stream, entries, sink, auth_token));
+                            tasks.spawn(handle_connection(stream, entries, sink, relay_authority));
                             // Reap finished tunnels so the set cannot grow
                             // unboundedly over a long session.
                             while tasks.try_join_next().is_some() {}
@@ -395,9 +395,10 @@ async fn handle_connection(
     stream: TcpStream,
     allowlist: Vec<AllowEntry>,
     sink: Arc<DenialSink>,
-    auth_token: Option<String>,
+    relay_authority: Option<String>,
 ) {
-    if let Err(e) = handle_connection_inner(stream, &allowlist, &sink, auth_token.as_deref()).await
+    if let Err(e) =
+        handle_connection_inner(stream, &allowlist, &sink, relay_authority.as_deref()).await
     {
         tracing::debug!(error = %e, "egress proxy connection closed with an error");
     }
@@ -407,7 +408,7 @@ async fn handle_connection_inner(
     stream: TcpStream,
     allowlist: &[AllowEntry],
     sink: &DenialSink,
-    auth_token: Option<&str>,
+    relay_authority: Option<&str>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let head = read_request_head(&mut reader).await?;
@@ -420,9 +421,9 @@ async fn handle_connection_inner(
         .await?;
         return Ok(());
     };
-    if let Some(token) = auth_token {
+    if let Some(authority) = relay_authority {
         let authorized = proxy_authorization(&head)
-            .map(|candidate| candidate.as_bytes().ct_eq(token.as_bytes()).into())
+            .map(|candidate| candidate.as_bytes().ct_eq(authority.as_bytes()).into())
             .unwrap_or(false);
         if !authorized {
             write_response(

@@ -193,7 +193,10 @@ All of it asks the agent nicely. None of it constrains the process.
   internal network, private credential volume, and transient staging
   directory all have unique names. The staging directory is deleted before
   worker spawn and only the relay mounts the credential volume, read-only;
-  explicit shutdown verifies their removal. The same bounded removal runs
+  an offline, capability-free pinned helper alone uses `--userns host` to
+  bridge 0700/0600 staging into the volume on user-namespace-remapped Docker
+  hosts. It mounts only those two roots and exits before the worker exists.
+  Explicit shutdown verifies their removal. The same bounded removal runs
   from `Drop` after backend failure/cancellation/timeout, including a forced
   remove of the daemon-owned worker whose runtime client may already be
   dead. Docker labels carry the owner PID plus an immutable process-identity

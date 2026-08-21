@@ -51,7 +51,7 @@ import sys
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
-TOKEN = open(sys.argv[3], "rb").read().strip()
+AUTHORITY = open(sys.argv[3], "rb").read().strip()
 MAX_HEAD = 8192
 
 async def pump(reader, writer):
@@ -75,7 +75,7 @@ async def relay(client_reader, client_writer):
         if len(head) > MAX_HEAD:
             raise ValueError("CONNECT head exceeds 8 KiB")
         upstream_reader, upstream_writer = await asyncio.open_connection(HOST, PORT)
-        authenticated = head[:-2] + b"Proxy-Authorization: Bearer " + TOKEN + b"\r\n\r\n"
+        authenticated = head[:-2] + b"Proxy-Authorization: Bearer " + AUTHORITY + b"\r\n\r\n"
         upstream_writer.write(authenticated)
         await upstream_writer.drain()
         tasks = [
@@ -158,7 +158,7 @@ impl ContainerEgressBoundary {
 
         recover_stale_boundaries(runtime)?;
         let owner_pid = std::process::id().to_string();
-        let owner_token = owner_token_hash(std::process::id() as i32).ok_or_else(|| {
+        let owner_identity = owner_identity_hash(std::process::id() as i32).ok_or_else(|| {
             EngineError::Backend(
                 "cannot obtain an immutable process identity for container egress cleanup"
                     .to_string(),
@@ -171,7 +171,7 @@ impl ContainerEgressBoundary {
         let worker = format!("kranz-egress-worker-{id}");
         let credential_volume = format!("kranz-egress-secret-{id}");
         let credential_dir = credential_root()?.join(format!("kranz-container-egress-{id}"));
-        let token = format!(
+        let relay_authority = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
@@ -180,7 +180,7 @@ impl ContainerEgressBoundary {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             allowlist,
             paths.egress_denials_file(),
-            token.clone(),
+            relay_authority.clone(),
         )
         .await?;
         let boundary = Self {
@@ -197,7 +197,7 @@ impl ContainerEgressBoundary {
         let labels = [
             (RESOURCE_LABEL, "true".to_string()),
             (OWNER_PID_LABEL, owner_pid),
-            (OWNER_TOKEN_LABEL, owner_token),
+            (OWNER_TOKEN_LABEL, owner_identity),
             (BOUNDARY_ID_LABEL, id),
             (
                 CREDENTIAL_DIR_LABEL,
@@ -223,7 +223,10 @@ impl ContainerEgressBoundary {
         )?;
 
         create_secure_credential_dir(&boundary.credential_dir)?;
-        write_private(&boundary.credential_dir.join("token"), token.as_bytes())?;
+        write_private(
+            &boundary.credential_dir.join("authority"),
+            relay_authority.as_bytes(),
+        )?;
         write_private(
             &boundary.credential_dir.join("relay.py"),
             RELAY_SCRIPT.as_bytes(),
@@ -244,6 +247,13 @@ impl ContainerEgressBoundary {
                 "--read-only".to_string(),
                 "--network".to_string(),
                 "none".to_string(),
+                // Docker hosts with user-namespace remapping otherwise map
+                // container root away from the operator UID and cannot read
+                // the deliberately 0700/0600 staging tree. This helper is
+                // offline, capability-free, short-lived, and mounts only the
+                // exact staging directory plus its private destination.
+                "--userns".to_string(),
+                "host".to_string(),
                 "--cap-drop".to_string(),
                 "ALL".to_string(),
                 "--security-opt".to_string(),
@@ -255,7 +265,7 @@ impl ContainerEgressBoundary {
                 RELAY_IMAGE.to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
-                "cp /src/relay.py /src/token /opt/kranz/ && chmod 600 /opt/kranz/relay.py /opt/kranz/token".to_string(),
+                "cp /src/relay.py /src/authority /opt/kranz/ && chmod 600 /opt/kranz/relay.py /opt/kranz/authority".to_string(),
             ],
             "copy private enforcement files into the relay volume",
         )?;
@@ -302,7 +312,7 @@ impl ContainerEgressBoundary {
             "/opt/kranz/relay.py".to_string(),
             "host.docker.internal".to_string(),
             boundary.proxy_port().to_string(),
-            "/opt/kranz/token".to_string(),
+            "/opt/kranz/authority".to_string(),
         ]);
         docker_checked(runtime, &create_relay, "create trusted egress relay")?;
         if let Err(error) = docker_checked(
@@ -590,9 +600,9 @@ fn output_text(output: &Output) -> String {
     crate::command_exec::last_chars_local(text.trim(), 1200)
 }
 
-fn owner_token_hash(pid: i32) -> Option<String> {
-    crate::event_log::process_identity_token(pid).map(|token| {
-        let digest = Sha256::digest(token.as_bytes());
+fn owner_identity_hash(pid: i32) -> Option<String> {
+    crate::event_log::process_identity_token(pid).map(|identity| {
+        let digest = Sha256::digest(identity.as_bytes());
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     })
 }
@@ -631,12 +641,12 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
         let fields = String::from_utf8_lossy(&inspect.stdout);
         let mut fields = fields.trim().splitn(4, '|');
         let pid = fields.next().and_then(|value| value.parse::<i32>().ok());
-        let recorded_token = fields.next().unwrap_or_default();
+        let recorded_identity = fields.next().unwrap_or_default();
         let id = fields.next().unwrap_or_default();
         let credential_dir = fields.next().unwrap_or_default();
         let live = pid
-            .and_then(owner_token_hash)
-            .is_some_and(|current| current == recorded_token);
+            .and_then(owner_identity_hash)
+            .is_some_and(|current| current == recorded_identity);
         if live {
             continue;
         }
@@ -776,10 +786,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a live Docker daemon and pulled pinned relay image"]
     async fn container_per_host_egress_live_proof() {
-        if !docker_available() {
-            eprintln!("SKIP: Docker daemon unavailable");
-            return;
-        }
+        assert!(
+            docker_available(),
+            "Docker daemon unavailable for required live proof"
+        );
         docker_checked(
             ContainerRuntime::Docker,
             &["pull".to_string(), RELAY_IMAGE.to_string()],
@@ -1011,7 +1021,7 @@ mod tests {
             .unwrap()
             .join(format!("kranz-container-egress-{stale_id}"));
         create_secure_credential_dir(&stale_dir).unwrap();
-        write_private(&stale_dir.join("token"), b"stale").unwrap();
+        write_private(&stale_dir.join("authority"), b"stale").unwrap();
         let stale_labels = [
             (RESOURCE_LABEL, "true".to_string()),
             (OWNER_PID_LABEL, i32::MAX.to_string()),
