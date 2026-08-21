@@ -49,8 +49,8 @@ Format:
   Ticket: m6-railway-live-deployment
 
 - **M7 Windows production receipt** - hosted Windows green on the AppContainer path, then a dedicated Windows 11 hostile+overhead receipt.
-  Why: macOS live proof is done; Windows is the remaining M7 done-when hole. Draft PR #6.
-  Trigger: Windows CI green on the latest production-launcher SHA, then an operator Windows 11 run.
+  Why: macOS, Linux, and Docker live proofs are done and the hosted Windows production path is green; the dedicated operator receipt is the remaining M7 done-when hole.
+  Trigger: An operator-controlled Windows 11 endpoint is available for the hostile+overhead run.
   Source: docs/scoping/m7-windows-containment.md
   Ticket: m7-windows-containment-parity
 
@@ -67,12 +67,6 @@ Format:
   Trigger: A city actually routes kranz plus at least one other agent type, or a cross-machine runtime is offered.
   Source: docs/gascity-citizenship.md Stage 5
   Ticket: gascity-fleets
-
-- **M7 container per-host egress** - replace the refused container `fs+net` + non-empty-egress mode with a non-bypassable boundary.
-  Why: Env-proxy allowlists are bypassable from inside the container.
-  Trigger: A design that is demonstrably non-bypassable; keep the refusal until then.
-  Source: docs/scoping/worker-sandboxing.md
-  Ticket: m7-container-per-host-egress-boundary
 
 - **Local-inference executor tier** - route bounded execution-class work to a local OpenAI-compatible endpoint; validator stays frontier until miss-rate is measured.
   Why: The trace flywheel and backend_local slices shipped. Mixed local+frontier still loses to solo Opus while frontier calls are free at the margin.
@@ -122,6 +116,7 @@ one cycle so `/kranz roadmap` readers are not surprised by the deletion.
 - Local workspace/sandbox visibility — `workspace-sandbox-visibility` done.
 - M8 multi-root host design + project picker — both done.
 - M7 Linux hostile live proof — real bubblewrap receipt committed; `m7-linux-hostile-live-proof` done.
+- M7 container per-host egress — Docker internal-network boundary and native Ubuntu receipt committed; `m7-container-per-host-egress-boundary` done.
 - Gas City event dispatch + `kranz.mission.*` emits — `revive-gascity-demo` done.
 - Structured human-question events, agent hook status signals — both done.
 - Workspace provider pin at approval — done.

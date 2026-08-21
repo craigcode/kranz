@@ -244,19 +244,17 @@ The exact remaining provider, secret, volume, containment, and smoke-test
 decisions are captured in the
 [M4/M6 operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-## M7 — Worker sandboxing ◑ (macOS and Linux live proofs complete; Windows proof remains)
+## M7 — Worker sandboxing ◑ (macOS/Linux and Docker proofs complete; Windows operator receipt remains)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
 `enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior, the
-tier-3 container provider, and per-host egress enforcement via the filtering
-egress proxy (`fs+net` on macOS routes loopback-only Seatbelt egress through
-it; structured denials surface on `RunOutcome` for the 3.3b grant flow).
-Windows parity and the container per-host egress boundary remain open and are
-tracked by
-[`m7-windows-containment-parity`](../.kranz/tickets/m7-windows-containment-parity.md),
-and
-[`m7-container-per-host-egress-boundary`](../.kranz/tickets/m7-container-per-host-egress-boundary.md).
+Docker tier-3 container provider with a non-bypassable per-host egress
+boundary, and per-host egress enforcement via the filtering egress proxy
+(`fs+net` on macOS routes loopback-only Seatbelt egress through it; structured
+denials surface on `RunOutcome` for the 3.3b grant flow). The dedicated
+operator-controlled Windows 11 receipt is the remaining item, tracked by
+[`m7-windows-containment-parity`](../.kranz/tickets/m7-windows-containment-parity.md).
 The sandbox still
 complements scrutiny: it bounds what CAN happen; validators judge what DID.
 The 2026-08-12 macOS hostile proof blocked a sibling write and disallowed
@@ -271,18 +269,27 @@ unwrapped anti-vacuity control, kept the primary checkout byte-clean at the
 same HEAD, and measured +1.11% median overhead for a representative warm Node
 gate. See [the Linux live-proof receipt](reviews/m7-linux-bubblewrap-live-proof.md).
 
+The 2026-08-21 Docker proof put the worker on an internal network with no
+default route, kept relay authority outside worker mounts, allowed only the
+listed CONNECT target, surfaced an exact structured denial for an unlisted
+target, and used an ordinary bridge container as the direct-socket
+anti-vacuity control. Normal, error-path, and stale-owner cleanup left no
+owned resources; the exact fixture passed locally and on native Ubuntu CI.
+See [the container live-proof receipt](reviews/m7-container-per-host-egress-live-proof.md).
+
 Done when: a deliberately hostile brief under `enforce: "fs+net"` leaves zero
 writes outside its worktree + mission dir with blocked attempts surfaced as
 findings; a normal mission's contract commands still pass under the sandbox
 at <~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included.
 
-Windows phases 1-2 now have an accepted plan, a named CI proof that both process
-and unproved container enforcement fail before spawn, and a System32-only
-native capability probe that records the Windows build and experimental API
-availability without invoking it. A production AppContainer launcher and its
-hostile Windows 11 receipt remain the completion bar. See [the Windows
-containment decision](scoping/m7-windows-containment.md).
+Windows phases 1-5 have landed: the production stable LPAC AppContainer
+launcher covers sessions, validators, and gates, while the protected hosted
+Windows matrix proves the hostile boundary, exact ACL restoration, ordinary
+Node/Rust gates, and retained overhead samples. That hosted production path is
+green; only the dedicated operator-controlled Windows 11 hostile-and-overhead
+receipt remains before M7 can close. See [the Windows containment
+decision](scoping/m7-windows-containment.md).
 
 ## M8 — Multi-repo operation ✅ (live inbound Slack routing proof complete 2026-08-15)
 
