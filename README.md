@@ -39,7 +39,7 @@ configuration. Other backends have role and sandbox restrictions; run
 `kranz ready` before the first mission.
 
 ```sh
-cargo install --path crates/cli   # puts `kranz` on your PATH (~/.cargo/bin)
+cargo install kranz --locked      # puts `kranz` on your PATH (~/.cargo/bin)
 cd /path/to/your/repo             # must be a git repo
 
 # 0. Onboard the repo. This detects common Rust/Node/Python gates, adds the
@@ -79,28 +79,54 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 
 ## Install
 
-**From source (available today).** With a Rust toolchain on your machine:
+**With Cargo.** Install the supported CLI crate; Cargo builds its three library
+dependencies automatically:
 
 ```sh
-cargo install --path crates/cli   # builds and installs the `kranz` binary
+cargo install kranz --locked
 ```
 
-**Prebuilt binaries.** The current private origin has no supported tagged
-binary distribution. The historical v0.1.0 preview remains only in the private
-archive and predates the current security posture.
+**Prebuilt binaries.** Download the binary for your platform plus `SHA256SUMS`
+from the [latest GitHub release](https://github.com/craigcode/kranz/releases/latest).
+Release assets carry GitHub build-provenance attestations and include macOS
+Apple silicon/Intel, Linux x86-64, and Windows x86-64 builds.
 
-**Public package distribution (parked).**
+**From a source checkout.** This is useful for contributors and unreleased
+development snapshots:
 
 ```sh
-cargo install kranz            # from crates.io
-
-brew tap craigcode/kranz               # Homebrew (from-source formula)
-brew install kranz
+cargo install --path crates/cli --locked
 ```
 
-The crates.io and Homebrew paths are not live. The repository owner has chosen
-to keep Kranz private; a future public release requires a new explicit decision
-and the complete [release gate](docs/releasing.md).
+Homebrew distribution is intentionally deferred until the v0.2.0 Cargo and
+GitHub installations have been proven on clean hosts.
+
+### Agent runtime and authentication
+
+Kranz orchestrates agent CLIs; it does not install them or sign into their
+accounts. Install at least one supported runtime from its vendor, authenticate
+it outside Kranz, and leave its native executable discoverable on `PATH`.
+Claude Code is the default. Codex, Factory Droid, Kimi Code, Cursor, ACP peers,
+and OpenAI-compatible local endpoints can be selected per role. API-key
+authentication is passed only through each backend's sanctioned variable, not
+through the ambient environment. See [Agent backends](docs/agent-backends.md),
+then run `kranz ready` before the first mission.
+
+### Crates and API stability
+
+Most users install only `kranz`. Cargo fetches the other crates because they
+are reusable components of the product:
+
+| Crate | Provides |
+|---|---|
+| `kranz` | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
+| `kranz-engine` | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
+| `kranz-server` | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
+| `kranz-slack` | The Slack Socket Mode bridge for operating and observing missions. |
+
+The three library crates are public for reuse, but their Rust APIs are early
+and evolving in the v0.2 line. Pin exact versions if embedding them; semantic
+compatibility is not yet promised beyond Cargo's normal pre-1.0 rules.
 
 ## The four roles
 
