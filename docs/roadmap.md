@@ -123,24 +123,23 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class ✅; public distribution parked (private-repository decision 2026-08-13)
+## M4 — Windows first-class ✅; v0.2.0 public distribution in progress
 
 The code is path-safe and lock-file based per §9 and is proven on Windows CI,
 including kill/resume. The historical v0.1.0 preview remains only in the
-private archive and is not a supported distribution. The active clean origin
-is private and has no release or tag. The owner explicitly parked public
-distribution; the reserved 0.0.1 crates.io names and Homebrew template remain
-dormant. Any future public-release proposal must be a new operator decision
-and use one version-aligned release rather than reviving v0.1.0. See the
+private archive and is not a supported distribution. On 2026-08-22 the owner
+approved a version-aligned v0.2.0 public release from the clean origin. The
+repository stays private and the release switch stays locked until the
+[public-readiness gate](public-readiness.md) passes. See the
 [operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
 - [x] Run the CI matrix on Ubuntu, Windows, and macOS.
 - [x] Prove the Windows kill/resume path.
 - [x] Preserve release automation and packaging templates without publishing.
-- [x] Close the public-distribution ticket under the private-repository policy.
+- [ ] Publish one version-aligned v0.2.0 release after the public-readiness gate.
 
-Done when: the supported source-install path and cross-platform CI are green;
-public package installation is outside the active private-product scope.
+Done when: the supported source-install path and cross-platform CI are green,
+and clean-host Cargo and GitHub binary installs agree on v0.2.0.
 
 ## M5 — Deeper validation & automation ✅ (exec, functional QA, OTEL, secret scanning shipped; skill-capture decided wontfix 2026-08-17)
 

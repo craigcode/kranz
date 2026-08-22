@@ -51,11 +51,14 @@ vibe.
 
 ## Quickstart
 
-Build and install from this repo:
+Install the supported CLI crate:
 
 ```sh
-cargo install --path crates/cli   # installs the `kranz` binary
+cargo install kranz --locked
 ```
+
+Contributors can instead install an unreleased source checkout with
+`cargo install --path crates/cli --locked`.
 
 Run your first mission from any git repo:
 

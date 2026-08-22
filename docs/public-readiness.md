@@ -1,8 +1,9 @@
 # Public-readiness gate
 
-Status (2026-08-13): **parked**. The clean-origin migration is complete, but
-the active repository remains private by explicit owner decision. This file is
-a dormant fail-closed checklist, not authorization to change visibility.
+Status (2026-08-22): **release preparation authorized; gate in progress**. The
+owner explicitly approved the v0.2.0 public-release sequence. The clean-origin
+migration is complete, while the active repository remains private until the
+exact release candidate passes every gate below.
 
 Making Kranz public exposes every reachable Git object and every existing
 GitHub release asset. It is an operator action, separate from merging ordinary

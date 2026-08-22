@@ -18,10 +18,10 @@ for remediation before public disclosure.
 
 ## Supported versions
 
-Security fixes are made on the latest released minor line. Historical preview
-artifacts, development snapshots, and source builds from unmaintained commits
-are not supported. Until the first version-aligned public release, install from
-the current reviewed source rather than the historical v0.1.0 binaries.
+Security fixes are made on the latest released minor line. The supported public
+line begins at v0.2.0. Historical preview artifacts, development snapshots, and
+source builds from unmaintained commits are not supported; the private v0.1.0
+preview must not be treated as a supported release.
 
 ## Operational boundary
 

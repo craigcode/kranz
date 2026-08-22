@@ -1,9 +1,11 @@
 # Cutting a release
 
-Kranz distributes a CLI through GitHub release binaries, crates.io, and a
-Homebrew tap. The Tauri shell is build-checked but is not currently a supported
-release artifact. Do not advertise or attach desktop bundles until a separate
-signed, platform-specific bundle/notarization pipeline exists.
+Kranz v0.2.0 distributes a CLI through GitHub release binaries and crates.io.
+A Homebrew tap is a follow-on after those two paths are proven on clean hosts,
+not a condition of the first public release. The Tauri shell is build-checked
+but is not currently a supported release artifact. Do not advertise or attach
+desktop bundles until a separate signed, platform-specific bundle/notarization
+pipeline exists.
 
 The historical v0.1.0 GitHub release is a private preview. It is 1,000+ commits
 behind the current source and predates substantial security hardening. Never
@@ -144,7 +146,11 @@ the CLI must be last because it depends on all three. Confirm ownership,
 package contents, repository URL, license, README rendering, and installability
 on crates.io after every step.
 
-## 6. Render and publish the Homebrew formula
+## 6. Optional follow-on: render and publish the Homebrew formula
+
+Do this only after the v0.2.0 Cargo and GitHub installations are proven. A
+Homebrew failure does not invalidate those published artifacts and does not
+block closing the first public release.
 
 Download GitHub's tagged source tarball, compute its SHA-256 digest, and render
 `packaging/homebrew/kranz.rb.in` into the `craigcode/homebrew-kranz` tap by
@@ -167,5 +173,6 @@ clean `cargo install kranz --locked` without a Kranz source checkout.
 - Update the changelog comparison links if adopted.
 - Record clean-install evidence and artifact digests in the release notes.
 - Verify GitHub still reports every required security and branch rule.
-- Mark the M4 operator-release ticket done only after GitHub, crates.io,
-  Homebrew, and clean-host smoke tests all agree on the same version.
+- Mark the M4 operator-release ticket done after GitHub, crates.io, and
+  clean-host smoke tests all agree on the same version. Track Homebrew as a
+  separate post-v0.2.0 distribution follow-on.
