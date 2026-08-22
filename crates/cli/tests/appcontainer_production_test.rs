@@ -2,8 +2,22 @@
 //! the real AppContainer token/ACL/Job boundary, never a mocked syscall test.
 
 #[cfg(windows)]
+static PRODUCTION_RECEIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn production_receipt_guard() -> std::sync::MutexGuard<'static, ()> {
+    // Both receipts grant ACLs on shared Cargo/toolchain parents. Keep the
+    // outer fixtures from observing each other's live lease; the hostile
+    // self-test still proves overlapping leases inside its own process.
+    PRODUCTION_RECEIPT_LOCK
+        .lock()
+        .expect("production receipt lock must not be poisoned")
+}
+
+#[cfg(windows)]
 #[test]
 fn windows_production_appcontainer_helper_enforces_and_restores_boundary() {
+    let _guard = production_receipt_guard();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_kranz"))
         .arg("__kranz-appcontainer-self-test")
         .output()
@@ -49,6 +63,7 @@ fn windows_production_appcontainer_helper_enforces_and_restores_boundary() {
 #[cfg(windows)]
 #[test]
 fn windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target() {
+    let _guard = production_receipt_guard();
     // Stderr is INHERITED, not captured: the self test reports each retired
     // timing sample there, and thirty-two samples across two gates run long
     // enough that a buffered stream only surfaces after a CI step timeout
