@@ -3525,6 +3525,47 @@ mod tests {
         );
     }
 
+    fn populate_toolchain_fixture(
+        node_dir: &Path,
+        npm_bin: &Path,
+        cargo_dir: &Path,
+        rustc_bin: &Path,
+    ) {
+        const ATTEMPTS: u32 = 4;
+        for attempt in 1..=ATTEMPTS {
+            let populate = || -> std::io::Result<()> {
+                std::fs::create_dir_all(npm_bin)?;
+                std::fs::create_dir_all(cargo_dir)?;
+                std::fs::create_dir_all(rustc_bin)?;
+                for name in ["node.exe", "npm.cmd", "npx.cmd"] {
+                    std::fs::write(node_dir.join(name), "")?;
+                }
+                std::fs::write(npm_bin.join("npm-cli.js"), "")?;
+                std::fs::write(cargo_dir.join("cargo.exe"), "")?;
+                std::fs::write(rustc_bin.join("rustc.exe"), "")?;
+                Ok(())
+            };
+            match populate() {
+                Ok(()) => return,
+                // Two hosted Windows full-suite runs returned
+                // ERROR_PATH_NOT_FOUND while building this mock tree after
+                // the live LPAC receipt, while identical runs passed. Fixture
+                // setup is not the contract under test, so rebuild the whole
+                // fixture only for that transient shape; all other errors
+                // remain immediate.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && attempt < ATTEMPTS =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+                }
+                Err(error) => panic!(
+                    "failed to populate toolchain fixture on attempt {attempt}/{ATTEMPTS}: {error}"
+                ),
+            }
+        }
+        unreachable!("the final fixture attempt returns or panics");
+    }
+
     #[test]
     fn toolchain_entry_points_include_protected_node_npm_and_cargo_files() {
         let root = tempfile::tempdir().expect("temp toolchain root");
@@ -3537,15 +3578,7 @@ mod tests {
             .join("toolchains")
             .join("stable-x86_64-pc-windows-msvc")
             .join("bin");
-        std::fs::create_dir_all(&npm_bin).expect("npm bin");
-        std::fs::create_dir_all(&cargo_dir).expect("cargo dir");
-        std::fs::create_dir_all(&rustc_bin).expect("rustc bin");
-        for name in ["node.exe", "npm.cmd", "npx.cmd"] {
-            std::fs::write(node_dir.join(name), "").expect("node shim");
-        }
-        std::fs::write(npm_bin.join("npm-cli.js"), "").expect("npm-cli.js");
-        std::fs::write(cargo_dir.join("cargo.exe"), "").expect("cargo.exe");
-        std::fs::write(rustc_bin.join("rustc.exe"), "").expect("rustc.exe");
+        populate_toolchain_fixture(&node_dir, &npm_bin, &cargo_dir, &rustc_bin);
 
         let mut env = HashMap::new();
         env.insert(
