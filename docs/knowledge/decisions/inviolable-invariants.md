@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-21
+last_verified: 2026-08-23
 verified_against:
   - AGENTS.md
   - docs/design.md

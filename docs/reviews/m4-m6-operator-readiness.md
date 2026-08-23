@@ -1,13 +1,17 @@
 # M4 distribution and M6 cloud operator readiness
 
-Date: 2026-08-13
+Date: 2026-08-13 (status note 2026-08-23)
 
 ## Outcome
 
-M4 public distribution is parked by explicit owner decision: the active clean
-origin remains private and no package publication is authorized. M6 is the
-only remaining operator-gated milestone; it needs a Railway account/project,
-bounded spend, and runtime credentials.
+**Superseded for M4 (2026-08-22):** the owner authorized the v0.2.0
+public-release sequence. Live cut tracking is
+[v0.2.0-cut-checklist.md](v0.2.0-cut-checklist.md) and ticket
+[`v0.2.0-public-cut`](../../.kranz/tickets/v0.2.0-public-cut.md). The text
+below is retained as the 2026-08-13 parked-state receipt.
+
+M6 remains operator-gated (Railway account/project, bounded spend, runtime
+credentials) and is not part of the v0.2.0 cut.
 
 ## M4 — public distribution
 
