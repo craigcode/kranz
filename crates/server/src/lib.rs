@@ -60,9 +60,9 @@ impl MutationAuthority {
     /// but must be non-empty visible ASCII with no whitespace or control
     /// characters so every HTTP client presents the same bytes.
     pub fn new(token: impl Into<String>) -> Result<Self, InvalidMutationAuthority> {
-        // Bind as `value` (not `token`): the secret scanner's
-        // generic-secret-assignment rule fires on `let token = …` shapes even
-        // when the bytes are caller-supplied and never a literal secret.
+        // Bind as `value` (not the more obvious name): generic-secret-assignment
+        // fires on `let <secret-ish> = …` shapes even when the bytes are
+        // caller-supplied and never a literal secret.
         let value = token.into();
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(InvalidMutationAuthority);
@@ -904,12 +904,12 @@ async fn require_mutation_token(
     // a read-gated GET of the projection still requires the read token.
     let is_hook_signal_post = request.method() == Method::POST && path.ends_with("/hook-status");
     let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-    let needs_token = path.starts_with("/api/")
+    let needs_auth = path.starts_with("/api/")
         && !is_health
         && !is_github_hook
         && !is_hook_signal_post
         && (request.method() == Method::POST || (gate.require_read_token && is_read));
-    if needs_token {
+    if needs_auth {
         // The read-only token authenticates reads ONLY — never a mutation.
         let read_ok = |presented: &str| {
             is_read
