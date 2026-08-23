@@ -33,6 +33,10 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "sesame-1234";
 
+fn authority(token: &str) -> kranz_server::MutationAuthority {
+    kranz_server::MutationAuthority::new(token).unwrap()
+}
+
 /// Generous bound proving the hosted run cannot hang the test.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -171,7 +175,7 @@ fn plan_json() -> Value {
 fn hosted_app(root: &Path, backend: Arc<MockBackend>) -> axum::Router {
     let backend: Arc<dyn AgentBackend> = backend;
     let host = kranz_server::MissionHost::with_backend(root.to_path_buf(), backend);
-    kranz_server::router_with_host(host, None, Some(TOKEN.to_string()))
+    kranz_server::router_with_host(host, None, authority(TOKEN))
 }
 
 async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -416,7 +420,7 @@ async fn abandon_then_delete_lifecycle_over_rest() {
     seed_mission_log(&root, "m-husk");
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
-    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_host(host, None, authority(TOKEN));
 
     // Abandon: 200, reason recorded, state folds terminal.
     let (status, body) = post_json(
@@ -460,7 +464,7 @@ async fn delete_guards_live_and_complete_missions() {
     let root = tmp.path().to_path_buf();
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
-    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_host(host, None, authority(TOKEN));
 
     // Approved (Running-status, plan committed) = live work → never deleted.
     seed_mission_log(&root, "m-live");
@@ -516,7 +520,7 @@ async fn delete_prunes_missions_index() {
     let root = tmp.path().to_path_buf();
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
-    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_host(host, None, authority(TOKEN));
 
     seed_mission_log(&root, "m-husk");
     seed_mission_log(&root, "m-other");
@@ -742,12 +746,43 @@ fn seed_pending_revision_log(repo_root: &Path, id: &str) {
     std::fs::write(paths.plan_md_file(), "# Mission plan\n\nold plan\n").unwrap();
 }
 
+#[test]
+fn mutation_authority_rejects_empty_or_non_header_safe_tokens_and_redacts_debug() {
+    for invalid in ["", "   ", "line\nbreak", "non-ascii-é"] {
+        assert!(
+            kranz_server::MutationAuthority::new(invalid).is_err(),
+            "invalid authority accepted: {invalid:?}"
+        );
+    }
+    let valid = kranz_server::MutationAuthority::new(TOKEN).unwrap();
+    assert_eq!(valid.as_str(), TOKEN);
+    assert!(!format!("{valid:?}").contains(TOKEN));
+}
+
+#[tokio::test]
+async fn read_only_convenience_router_never_accepts_a_tokenless_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    seed_mission_log(&root, "m-01");
+    let app = kranz_server::router(root, None);
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-01/control",
+        None,
+        json!({ "kind": "pause" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "missing or invalid token");
+}
+
 #[tokio::test]
 async fn mutation_token_gates_every_post_and_no_get() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     seed_mission_log(&root, "m-01");
-    let app = kranz_server::router_with_token(root, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_token(root, None, authority(TOKEN));
 
     let control = "/api/missions/m-01/control";
     let pause = json!({ "kind": "pause" });
@@ -808,7 +843,7 @@ async fn non_loopback_bind_requires_token_on_gets() {
     let app = kranz_server::router_with_shared_host_and_bind(
         host,
         None,
-        Some(TOKEN.to_string()),
+        authority(TOKEN),
         Some(4560),
         false, // bind_is_loopback — as if bind were non-loopback
         true,  // require_read_token
@@ -855,7 +890,7 @@ async fn lan_host_header_reaches_token_gate_off_loopback() {
     let lan_app = kranz_server::router_with_shared_host_and_bind(
         host.clone(),
         None,
-        Some(TOKEN.to_string()),
+        authority(TOKEN),
         Some(4560),
         false, // non-loopback bind
         true,
@@ -889,7 +924,7 @@ async fn lan_host_header_reaches_token_gate_off_loopback() {
     let loopback_app = kranz_server::router_with_shared_host_and_bind(
         host,
         None,
-        Some(TOKEN.to_string()),
+        authority(TOKEN),
         Some(4560),
         true,
         false,
@@ -914,7 +949,7 @@ async fn query_token_is_rejected_on_posts() {
     let app = kranz_server::router_with_shared_host_and_bind(
         host,
         None,
-        Some(TOKEN.to_string()),
+        authority(TOKEN),
         Some(4560),
         false,
         true,
@@ -959,7 +994,7 @@ async fn read_token_authenticates_reads_but_never_mutations() {
     let app = kranz_server::router_with_read_authority_and_addr(
         Arc::new(kranz_server::MultiRepoHost::with_host(host)),
         None,
-        Some(TOKEN.to_string()),
+        authority(TOKEN),
         Some(READ_TOKEN.to_string()),
         None,
         true, // bind_is_loopback
@@ -1048,7 +1083,7 @@ async fn revision_routes_expose_diff_and_enqueue_decisions() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     seed_pending_revision_log(&root, "m-rev");
-    let app = kranz_server::router_with_token(root.clone(), None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
 
     let (status, body) = get_json(&app, "/api/missions/m-rev/revision-diff").await;
     assert_eq!(status, StatusCode::OK);
@@ -1152,7 +1187,7 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
     let root = tmp.path().to_path_buf();
     let command = "gc audit --deep";
     seed_pending_grant_log(&root, "m-grant", command);
-    let app = kranz_server::router_with_token(root.clone(), None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
 
     // A command that doesn't match the parked request is refused.
     let (status, body) = post_json(
@@ -1525,7 +1560,7 @@ async fn planning_endpoints_attach_non_hosted_missions_and_404_unknown() {
     .responding(vec![turn("resumed and listening")]);
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![orch]));
     let host = kranz_server::MissionHost::with_backend(root.clone(), backend);
-    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_host(host, None, authority(TOKEN));
 
     let (status, body) = post_json(
         &app,
@@ -1785,7 +1820,7 @@ async fn real_gate_executor_hides_server_env_and_passes_whitelisted_vars() {
     // A real host: no with_gate_executor, no injected backend — the merge
     // path never touches the agent backend, so lazy discovery stays unused.
     let host = kranz_server::MissionHost::new(root.clone());
-    let app = kranz_server::router_with_host(host, None, Some(TOKEN.to_string()));
+    let app = kranz_server::router_with_host(host, None, authority(TOKEN));
 
     let (status, body) =
         post_json(&app, "/api/missions/m-canary/merge", Some(TOKEN), json!({})).await;

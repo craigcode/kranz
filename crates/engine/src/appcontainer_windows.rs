@@ -202,8 +202,10 @@ pub(crate) struct PreparedCommand {
 }
 
 /// One resolved Windows gate posture owns one disposable profile and its ACL
-/// lease across all commands in that validation/final-gate context. Clones
-/// held by in-flight wrapped commands keep cleanup from racing their child.
+/// lease across all commands in that validation/final-gate context. Wrapped
+/// commands retain a clone so dropping the original posture cannot discard
+/// the lease; callers still explicitly clean the posture only after every
+/// child command has been reaped.
 #[derive(Clone, Debug)]
 pub(crate) struct AppContainerLaunchContext(Arc<Mutex<Option<AppContainerLease>>>);
 
@@ -274,46 +276,70 @@ pub(crate) struct AppContainerLease {
     snapshot_indices: BTreeMap<PathBuf, usize>,
     applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
     plan_paths: Vec<PathBuf>,
+    cleaned: bool,
+}
+
+impl AppContainerLease {
+    /// Remove every temporary ACE, launch plan, and disposable profile. Normal
+    /// session and gate completion call this explicitly so cleanup failure is
+    /// a mission failure rather than a line that can disappear in host logs.
+    pub(crate) fn cleanup(&mut self) -> Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+
+        let _guard = DaclMutationGuard::acquire()?;
+        let sid = derive_profile_sid(&self.profile_name)?;
+        // Parent directories first: removing their inheritable AppContainer
+        // ACEs makes Windows retract inherited copies from existing children.
+        // Remove only this random profile's SID so overlapping leases compose.
+        self.original_dacls
+            .sort_by_key(|entry| entry.path.components().count());
+        let mut failures = Vec::new();
+        for snapshot in &self.original_dacls {
+            if let Err(error) = remove_sid_aces(snapshot, sid.0) {
+                failures.push(format!("{}: {error}", snapshot.path.display()));
+            }
+        }
+        for path in &self.plan_paths {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(EngineError::Backend(format!(
+                "AppContainer cleanup for {} left temporary host state: {}",
+                self.profile_name,
+                failures.join("; ")
+            )));
+        }
+
+        let name = wide(&self.profile_name);
+        unsafe { DeleteAppContainerProfile(PCWSTR(name.as_ptr())) }.map_err(|error| {
+            EngineError::Backend(format!(
+                "failed to delete AppContainer profile {} after ACL cleanup: {error}",
+                self.profile_name
+            ))
+        })?;
+        self.original_dacls.clear();
+        self.snapshot_indices.clear();
+        self.applied_changes.clear();
+        self.plan_paths.clear();
+        self.cleaned = true;
+        Ok(())
+    }
 }
 
 impl Drop for AppContainerLease {
     fn drop(&mut self) {
-        match (
-            DaclMutationGuard::acquire(),
-            derive_profile_sid(&self.profile_name),
-        ) {
-            (Ok(_guard), Ok(sid)) => {
-                // Parent directories first: removing their inheritable
-                // AppContainer ACEs makes Windows retract inherited copies
-                // from existing children. Remove ONLY this random profile's
-                // ACEs; replacing whole snapshots would race overlapping
-                // launches that legitimately touch shared Git/toolchain roots.
-                self.original_dacls
-                    .sort_by_key(|entry| entry.path.components().count());
-                for snapshot in &self.original_dacls {
-                    if let Err(error) = remove_sid_aces(snapshot, sid.0) {
-                        tracing::error!(path = %snapshot.path.display(), error = %error,
-                            "failed to remove AppContainer ACEs from a DACL");
-                    }
-                }
-            }
-            (Err(error), _) => {
+        if !self.cleaned {
+            if let Err(error) = self.cleanup() {
                 tracing::error!(profile = %self.profile_name, error = %error,
-                    "failed to lock AppContainer DACL cleanup");
-            }
-            (_, Err(error)) => {
-                tracing::error!(profile = %self.profile_name, error = %error,
-                    "failed to derive AppContainer SID for DACL cleanup");
+                    "best-effort AppContainer cleanup failed after explicit teardown was skipped or failed");
             }
         }
-        for path in self.plan_paths.drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
-        let name = wide(&self.profile_name);
-        // Deletion is idempotent for our cleanup purposes: the helper may have
-        // exited normally, while an earlier preparation error may never have
-        // made the profile visible to a child.
-        let _ = unsafe { DeleteAppContainerProfile(PCWSTR(name.as_ptr())) };
     }
 }
 
@@ -1960,11 +1986,27 @@ fn new_lease(profile_name: String, rustup_toolchain: Option<PathBuf>) -> AppCont
         snapshot_indices: BTreeMap::new(),
         applied_changes: HashSet::new(),
         plan_paths: Vec::new(),
+        cleaned: false,
     }
 }
 
 pub(crate) fn new_launch_context() -> AppContainerLaunchContext {
     AppContainerLaunchContext(Arc::new(Mutex::new(None)))
+}
+
+impl AppContainerLaunchContext {
+    /// Explicitly retire a resolved gate posture. A failed cleanup keeps the
+    /// lease in the context so its Drop fallback can retry during unwinding.
+    pub(crate) fn cleanup(&self) -> Result<()> {
+        let mut slot = self.0.lock().map_err(|_| {
+            EngineError::Backend("AppContainer gate cleanup context mutex was poisoned".to_string())
+        })?;
+        if let Some(lease) = slot.as_mut() {
+            lease.cleanup()?;
+        }
+        *slot = None;
+        Ok(())
+    }
 }
 
 /// Build the trusted helper command using the profile/ACL lease owned by one
@@ -2008,7 +2050,16 @@ pub(crate) fn prepare_launch(
     let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
     let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
     let mut lease = new_lease(profile_name, rustup_toolchain);
-    let prepared = prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env)?;
+    let prepared = match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Setup already created a disposable profile and may have applied
+            // some ACLs. The spawn is failing either way, but teardown still
+            // must be attempted explicitly rather than disappearing into Drop.
+            lease.cleanup()?;
+            return Err(error);
+        }
+    };
     Ok(PreparedLaunch {
         program: prepared.program,
         args: prepared.args,
@@ -2900,7 +2951,7 @@ fn production_hostile_self_test() -> Result<String> {
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
     // launch functional; dropping the second must recover the exact baseline.
-    let overlapping = prepare_launch(
+    let mut overlapping = prepare_launch(
         &inputs,
         &executable,
         &[INTERNAL_HOSTILE_CHILD_ARG.to_string()],
@@ -2915,9 +2966,9 @@ fn production_hostile_self_test() -> Result<String> {
     let PreparedLaunch {
         program,
         args,
-        lease,
+        lease: mut lease,
     } = prepared;
-    drop(overlapping.lease);
+    overlapping.lease.cleanup()?;
     let output = std::process::Command::new(program)
         .args(args)
         .current_dir(&worktree)
@@ -2930,7 +2981,7 @@ fn production_hostile_self_test() -> Result<String> {
         .map_err(|error| {
             EngineError::Backend(format!("failed to spawn production helper: {error}"))
         })?;
-    drop(lease);
+    lease.cleanup()?;
     let after = snapshot_dacl(&worktree)?;
     let volume_root_after = snapshot_dacl(&volume_root)?;
     if !output.status.success() {
@@ -3273,7 +3324,7 @@ mod tests {{
     let mut gate_env = crate::command_exec::sanitized_gate_env();
     gate_env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
     crate::agent_env::redirect_windows_profile_env(&mut gate_env, &gate_home);
-    let sandbox = crate::command_exec::resolve_gate_sandbox(
+    let mut sandbox = crate::command_exec::resolve_gate_sandbox(
         &sandbox_config,
         &worktree,
         &mission,
@@ -3300,6 +3351,7 @@ mod tests {{
         &gate_env,
         &sandbox,
     )?;
+    sandbox.cleanup()?;
     let receipt = ProductionGateReceipt {
         host: crate::sandbox_windows::probe(),
         enforcement: "fs+net",
@@ -3421,6 +3473,36 @@ pub fn run_internal_launcher() -> std::result::Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_sandbox_cleanup_failure_is_a_non_success_result() {
+        let context = new_launch_context();
+        let poison = context.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.0.lock().unwrap();
+            panic!("inject AppContainer cleanup mutex failure");
+        })
+        .join();
+
+        let mut sandbox = crate::command_exec::GateSandbox::AppContainer {
+            inputs: Box::new(crate::sandbox::SandboxInputs {
+                enforce: crate::types::SandboxEnforce::FsNet,
+                session_cwd: PathBuf::from(r"C:\worktree"),
+                mission_dir: PathBuf::from(r"C:\mission"),
+                tmpdir: PathBuf::from(r"C:\scratch"),
+                extra_write: Vec::new(),
+                egress: Vec::new(),
+                validator_read_deny_roots: Vec::new(),
+            }),
+            context,
+        };
+        let error = sandbox
+            .cleanup()
+            .expect_err("a poisoned cleanup context must make the gate teardown non-successful");
+        assert!(error
+            .to_string()
+            .contains("cleanup context mutex was poisoned"));
+    }
 
     #[test]
     fn host_preparation_accepts_only_literal_local_drive_roots() {

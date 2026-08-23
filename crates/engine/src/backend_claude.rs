@@ -1000,7 +1000,7 @@ impl AgentBackend for ClaudeBackend {
             #[cfg(windows)]
             job,
             #[cfg(windows)]
-            _appcontainer_lease: appcontainer_lease,
+            appcontainer_lease,
             stdin,
             lines: BoundedLines::new(stdout),
             stderr_buf,
@@ -1045,10 +1045,11 @@ pub struct ClaudeSession {
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
     /// Windows AppContainer profile + retained no-follow DACL handles. Kept
-    /// until the wrapper and its hostile child are gone; dropping it removes
-    /// only this profile SID's ACEs and deletes the disposable profile.
+    /// until the wrapper and its hostile child are gone; normal completion or
+    /// abort explicitly removes this profile SID's ACEs and deletes the
+    /// disposable profile. Drop remains a best-effort crash fallback.
     #[cfg(windows)]
-    _appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
+    appcontainer_lease: Option<crate::appcontainer_windows::AppContainerLease>,
     /// Held open for streaming-input sessions; dropped to close stdin.
     stdin: Option<ChildStdin>,
     lines: BoundedLines<ChildStdout>,
@@ -1064,6 +1065,20 @@ pub struct ClaudeSession {
 }
 
 impl ClaudeSession {
+    /// Explicit Windows host-state teardown after the helper and hostile child
+    /// are reaped. On other platforms this is a no-op, keeping the event-loop
+    /// call sites uniform.
+    fn cleanup_appcontainer(&mut self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            if let Some(lease) = self.appcontainer_lease.as_mut() {
+                lease.cleanup()?;
+            }
+            self.appcontainer_lease = None;
+        }
+        Ok(())
+    }
+
     /// Record bookkeeping the session derives from its own event stream.
     fn observe(&mut self, event: &AgentEvent) {
         match event {
@@ -1175,7 +1190,7 @@ impl ClaudeSession {
         if let Some(task) = self.stderr_task.take() {
             let _ = task.await;
         }
-        let exit = match status {
+        let mut exit = match status {
             Ok(status) if status.success() && self.saw_result => SessionExit::Completed,
             Ok(status) => SessionExit::Failed(format!(
                 "claude exited with {status}{}; stderr tail: {}",
@@ -1191,6 +1206,11 @@ impl ClaudeSession {
                 self.stderr_tail(),
             )),
         };
+        if let Err(error) = self.cleanup_appcontainer() {
+            exit = SessionExit::Failed(format!(
+                "claude process exited but AppContainer host-state cleanup failed: {error}"
+            ));
+        }
         self.exit = Some(exit);
     }
 
@@ -1228,8 +1248,13 @@ impl AgentSession for ClaudeSession {
                 }
                 Err(e) => {
                     self.kill_child().await;
+                    let cleanup = self
+                        .cleanup_appcontainer()
+                        .err()
+                        .map(|error| format!("; AppContainer cleanup failed: {error}"))
+                        .unwrap_or_default();
                     self.exit = Some(SessionExit::Failed(format!(
-                        "error reading claude stdout: {e}; stderr tail: {}",
+                        "error reading claude stdout: {e}; stderr tail: {}{cleanup}",
                         self.stderr_tail(),
                     )));
                     return Ok(None);
@@ -1251,7 +1276,12 @@ impl AgentSession for ClaudeSession {
                 // Engine-enforced turn budget (the CLI has no --max-turns):
                 // abort internally; the over-budget message is not emitted.
                 self.kill_child().await;
-                self.exit = Some(SessionExit::Aborted);
+                self.exit = Some(match self.cleanup_appcontainer() {
+                    Ok(()) => SessionExit::Aborted,
+                    Err(error) => SessionExit::Failed(format!(
+                        "turn-budget abort could not clean AppContainer host state: {error}"
+                    )),
+                });
                 continue; // queue is empty here → next iteration returns None
             }
             let events = parse_stream_value(value);
@@ -1283,6 +1313,7 @@ impl AgentSession for ClaudeSession {
         // it (an abort after natural completion keeps Completed).
         let already_exited = matches!(self.child.try_wait(), Ok(Some(_)));
         self.kill_child().await;
+        self.cleanup_appcontainer()?;
         if self.saw_success_result && already_exited {
             self.exit = Some(SessionExit::Completed);
         } else {

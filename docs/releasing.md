@@ -27,8 +27,10 @@ Complete `docs/public-readiness.md`. In particular:
   and
 - no release tag already exists for the chosen version.
 
-These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
-branches, tags, crates, formulas, or releases.
+These are human/operator gates. The release workflow never invokes Kranz's
+sole cloud exception (`kranz exec --push <configured-remote>`); neither Kranz
+nor a coding-agent mission pushes release branches, tags, crates, formulas, or
+releases.
 
 ## 1. Prepare the version pull request
 
@@ -68,7 +70,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 scripts/audit-public-tree.sh
 scripts/audit-public-history.sh
+scripts/check-package-licenses.sh
 ```
+
+For the two audit commands, point `KRANZ_PUBLIC_AUDIT_MARKERS_FILE` at the
+reviewed newline-delimited marker file outside the checkout and set
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1`. Routine public CI runs Gitleaks over full
+history without those private strings; the tag workflow requires the matching
+masked repository secret and fails closed if it is absent.
 
 Run the full dashboard gate from `apps/dashboard` and the locked Tauri check
 from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull

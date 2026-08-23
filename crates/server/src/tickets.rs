@@ -363,7 +363,11 @@ Ship the thing.
     #[tokio::test]
     async fn pipeline_create_ticket_succeeds_and_appears_in_list_as_new() {
         let tmp = TempDir::new().unwrap();
-        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            crate::MutationAuthority::new("tok").unwrap(),
+        );
 
         let response = app
             .clone()
@@ -402,7 +406,11 @@ Ship the thing.
     #[tokio::test]
     async fn pipeline_create_ticket_invalid_slug_returns_400() {
         let tmp = TempDir::new().unwrap();
-        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            crate::MutationAuthority::new("tok").unwrap(),
+        );
 
         let response = app
             .oneshot(post(
@@ -418,7 +426,11 @@ Ship the thing.
     async fn pipeline_create_ticket_duplicate_slug_returns_409() {
         let tmp = TempDir::new().unwrap();
         write_ticket(tmp.path(), "dup");
-        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            crate::MutationAuthority::new("tok").unwrap(),
+        );
 
         let response = app
             .oneshot(post(
@@ -433,7 +445,11 @@ Ship the thing.
     #[tokio::test]
     async fn pipeline_create_ticket_goal_and_context_round_trip_through_get() {
         let tmp = TempDir::new().unwrap();
-        let app = crate::router_with_token(tmp.path().to_path_buf(), None, Some("tok".into()));
+        let app = crate::router_with_token(
+            tmp.path().to_path_buf(),
+            None,
+            crate::MutationAuthority::new("tok").unwrap(),
+        );
 
         let response = app
             .clone()

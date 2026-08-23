@@ -177,8 +177,10 @@ impl RefreshReport {
 
 /// Walk the vault and report drifted / missing / unverified citations.
 ///
-/// Never rewrites a note. Never runs a `verified_against` command (whitespace
-/// citations are `command-skipped`). Path drift uses
+/// Never rewrites a note. Never runs a `verified_against` entry prefixed with
+/// `command:`; commands are reported as `command-skipped`. Every other entry
+/// is a path (an optional `path:` prefix is accepted), including paths with
+/// spaces. Path drift uses
 /// [`GitRepo::path_changed_since`] when the repo is git and the note has
 /// `last_verified`.
 pub fn refresh_knowledge(repo_root: &Path) -> RefreshReport {
@@ -268,33 +270,33 @@ fn refresh_citation(
     repo_root: &Path,
     git: &std::result::Result<GitRepo, String>,
 ) -> RefreshVerdict {
-    if !citation_is_repo_relative(citation) {
+    let citation = citation.trim();
+    if let Some(command) = citation.strip_prefix("command:") {
+        let command = command.trim();
+        return if command.is_empty() {
+            RefreshVerdict::InvalidCitation {
+                citation: citation.to_string(),
+            }
+        } else {
+            RefreshVerdict::CommandSkipped {
+                command: command.to_string(),
+            }
+        };
+    }
+    let path = citation
+        .strip_prefix("path:")
+        .map(str::trim)
+        .unwrap_or(citation);
+    if !citation_is_repo_relative(path) {
         return RefreshVerdict::InvalidCitation {
             citation: citation.to_string(),
         };
     }
-    let joined = repo_root.join(citation);
-    if citation.chars().any(char::is_whitespace) {
-        match std::fs::symlink_metadata(&joined) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return RefreshVerdict::CommandSkipped {
-                    command: citation.to_string(),
-                };
-            }
-            Err(err) => {
-                return RefreshVerdict::ProbeFailed {
-                    target: citation.to_string(),
-                    error: err.to_string(),
-                };
-            }
-        }
-    }
 
-    match citation_exists_inside_repo(repo_root, citation) {
+    match citation_exists_inside_repo(repo_root, path) {
         Ok(false) => {
             return RefreshVerdict::PathMissing {
-                path: citation.to_string(),
+                path: path.to_string(),
             };
         }
         Ok(true) => {}
@@ -305,18 +307,18 @@ fn refresh_citation(
         Ok(git) => git,
         Err(error) => {
             return RefreshVerdict::ProbeFailed {
-                target: citation.to_string(),
+                target: path.to_string(),
                 error: error.clone(),
             };
         }
     };
-    match git.path_changed_since(citation, since) {
+    match git.path_changed_since(path, since) {
         Ok(true) => RefreshVerdict::PathDrifted {
-            path: citation.to_string(),
+            path: path.to_string(),
         },
         Ok(false) => RefreshVerdict::Ok,
         Err(error) => RefreshVerdict::ProbeFailed {
-            target: citation.to_string(),
+            target: path.to_string(),
             error: error.to_string(),
         },
     }
@@ -708,7 +710,15 @@ fn note_overlaps_paths(note: &KnowledgeNote, hints: &[String]) -> bool {
         return false;
     }
     for v in &note.verified_against {
-        let v_norm = v.replace('\\', "/");
+        if v.trim_start().starts_with("command:") {
+            continue;
+        }
+        let v_norm = v
+            .trim()
+            .strip_prefix("path:")
+            .map(str::trim)
+            .unwrap_or(v.trim())
+            .replace('\\', "/");
         for h in hints {
             if v_norm == *h || v_norm.ends_with(h) || h.ends_with(&v_norm) || h.contains(&v_norm) {
                 return true;
@@ -1008,7 +1018,7 @@ mod tests {
             &tmp.path().join("docs/knowledge"),
             "architecture/cmd.md",
             "check-on-touch",
-            &["AGENTS.md", "cargo test -p kranz-engine lessons"],
+            &["AGENTS.md", "command: cargo test -p kranz-engine lessons"],
             "Path plus a command.",
         );
         git_commit_all(tmp.path(), "seed");
@@ -1323,6 +1333,36 @@ mod tests {
             .find(|finding| finding.rel_path.ends_with("spaces.md"))
             .expect("spaces finding");
         assert_eq!(finding.verdicts, [RefreshVerdict::Ok]);
+    }
+
+    #[test]
+    fn knowledge_refresh_missing_path_with_spaces_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
+        vault(tmp.path());
+        write_note(
+            &tmp.path().join("docs/knowledge"),
+            "architecture/missing-spaces.md",
+            "check-on-touch",
+            &["deleted path with spaces.md"],
+            "A deleted path stays a path.",
+        );
+        git_commit_all(tmp.path(), "seed");
+
+        let report = refresh_knowledge(tmp.path());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rel_path.ends_with("missing-spaces.md"))
+            .expect("spaces finding");
+        assert!(report.check_needed(), "{report:?}");
+        assert_eq!(
+            finding.verdicts,
+            [RefreshVerdict::PathMissing {
+                path: "deleted path with spaces.md".to_string()
+            }]
+        );
     }
 
     #[test]

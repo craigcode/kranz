@@ -1535,10 +1535,9 @@ impl GitRepo {
     ///
     /// Git is the source of truth, but on a local host Kranz writes only to the
     /// working tree and local refs — it never contacts a remote. No mission
-    /// loop, no CLI verb, and nothing in the server calls this method today; it
-    /// exists as the primitive that M6 cloud-mission wiring will call
-    /// explicitly. Nothing about the local default changes by this method
-    /// merely existing (roadmap M6, "Scoped push").
+    /// loop or server route calls this method. The sole caller is the explicit
+    /// `kranz exec --push <REMOTE>` M6 cloud handoff; nothing about the local
+    /// default changes unless a human or cloud job supplies that flag.
     ///
     /// ## Guard rails (why this is safe to expose)
     ///
@@ -1547,9 +1546,10 @@ impl GitRepo {
     ///   Anything else (`main`, `master`, `HEAD`, a bare sha, `--force`, or a
     ///   refspec smuggling a second ref) is rejected with
     ///   [`EngineError::Git`] **before any git process runs** — no network.
-    /// - The push is a plain `git push <remote> <branch>`: never `--force`,
-    ///   never a `src:dst` refspec, never `main`, never a merge. The human
-    ///   still reviews the `kranz/*` branch and opens the PR (roadmap M6).
+    /// - `remote` must be an already-configured, non-flag-shaped remote name.
+    ///   The push is a plain `git push <remote> <branch>`: never `--force`,
+    ///   `--mirror`, a custom receive-pack, a `src:dst` refspec, `main`, or a
+    ///   merge. The human still reviews the `kranz/*` branch and opens the PR.
     /// - On failure git's stderr is surfaced verbatim via [`EngineError::Git`],
     ///   so a bad deploy key or a rejected non-fast-forward shows up in the
     ///   mission log with git's own words.
@@ -1558,6 +1558,20 @@ impl GitRepo {
     /// `kranz/*` refs (see docs/deploy.md); this guard is defence in depth, not
     /// the only line of defence.
     pub fn push_mission_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        // `remote` occupies an option-parsed argv slot before `branch`; a
+        // flag-shaped value could otherwise turn this method's supposedly
+        // plain push into `--force`, `--mirror`, or a custom receive-pack.
+        // Cloud handoff accepts configured remote NAMES only, never an
+        // arbitrary URL or path supplied at the CLI boundary.
+        if remote.is_empty()
+            || remote.starts_with('-')
+            || remote.contains(':')
+            || remote.chars().any(char::is_whitespace)
+        {
+            return Err(EngineError::Git(format!(
+                "refusing to push to malformed remote {remote:?}: --push accepts a plain configured remote name"
+            )));
+        }
         // Defence in depth: refuse anything that is not a mission ref *before*
         // spawning git, so a mis-wired caller can never push main or a merge.
         // `kranz/` (with the slash) is required so a branch literally named
@@ -1577,10 +1591,16 @@ impl GitRepo {
         {
             return Err(EngineError::Git(format!(
                 "refusing to push malformed ref {branch:?}: a mission branch is \
-                 a plain kranz/* name with no refspec, flags, or whitespace"
+                a plain kranz/* name with no refspec, flags, or whitespace"
             )));
         }
-        // Plain push of one local branch to the same-named remote branch.
+        if self.remote_url(remote)?.is_none() {
+            return Err(EngineError::Git(format!(
+                "refusing to push to unconfigured remote {remote:?}: add and review the remote before cloud handoff"
+            )));
+        }
+        // Plain push to one already-configured remote of one local branch to
+        // the same-named remote branch.
         // Never --force; never a refspec; never main.
         self.run(&["push", remote, branch])?;
         Ok(())

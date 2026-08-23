@@ -9,7 +9,7 @@ verified_against:
   - crates/slack/src/bridge.rs
   - crates/slack/src/format.rs
   - crates/slack/src/config.rs
-  - cargo test -p kranz-slack
+  - 'command: cargo test -p kranz-slack'
 ---
 
 # Slack /kranz command surface

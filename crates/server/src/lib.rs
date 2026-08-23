@@ -38,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,49 @@ use tower_http::services::{ServeDir, ServeFile};
 /// Header carrying the per-serve mutation token (docs/protocol.md
 /// "Authority: mutation token").
 pub const TOKEN_HEADER: &str = "x-kranz-token";
+
+/// Validated mutation authority required by every published router and serve
+/// constructor. Keeping the unauthenticated state unrepresentable prevents an
+/// embedder from accidentally exposing money-spending `POST /api/...` routes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MutationAuthority(String);
+
+impl MutationAuthority {
+    /// Validate a token for transport in [`TOKEN_HEADER`]. Tokens are opaque,
+    /// but must be non-empty visible ASCII with no whitespace or control
+    /// characters so every HTTP client presents the same bytes.
+    pub fn new(token: impl Into<String>) -> Result<Self, InvalidMutationAuthority> {
+        let token = token.into();
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(InvalidMutationAuthority);
+        }
+        Ok(Self(token))
+    }
+
+    /// Borrow the token for operator storage or an authenticated client.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MutationAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MutationAuthority([REDACTED])")
+    }
+}
+
+/// Error returned when a mutation token cannot be represented safely in an
+/// HTTP header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidMutationAuthority;
+
+impl fmt::Display for InvalidMutationAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mutation authority must be non-empty visible ASCII without whitespace")
+    }
+}
+
+impl std::error::Error for InvalidMutationAuthority {}
 
 /// A fresh mutation token: uuid v4 as simple hex. Exposed so embedding
 /// shells (the CLI, the Tauri app) mint tokens without their own uuid dep.
@@ -86,11 +130,10 @@ pub struct ServerState {
     pub bind_is_loopback: bool,
 }
 
-/// Build the full router (public so tests can drive it with
-/// `tower::ServiceExt::oneshot` without binding a port).
-///
-/// Back-compat wrapper: NO mutation token gate (tests only — the real
-/// `kranz serve` / Tauri paths always pass a token).
+/// Build a read-only convenience router with a fresh, undisclosed mutation
+/// authority. GETs work normally; every mutation is refused because callers
+/// cannot present that authority. Embedders that need mutations must call
+/// [`router_with_token`] with an explicit [`MutationAuthority`].
 ///
 /// When `static_dir` is `Some`, non-`/api` paths are served from it with an
 /// SPA fallback to its `index.html`; otherwise `/` returns a minimal
@@ -99,35 +142,34 @@ pub fn router(repo_root: PathBuf, static_dir: Option<PathBuf>) -> Router {
     router_with_static(repo_root, static_dir.map(DashboardStatic::Dir))
 }
 
-/// Build the full router with either filesystem or embedded dashboard assets.
-/// Back-compat wrapper: NO mutation token gate (tests only).
+/// Build the read-only convenience router with either filesystem or embedded
+/// dashboard assets. Use [`router_with_token`] for authenticated mutations.
 pub fn router_with_static(repo_root: PathBuf, static_assets: Option<DashboardStatic>) -> Router {
-    router_with_token(repo_root, static_assets, None)
+    let authority = MutationAuthority::new(generate_token())
+        .expect("generated UUID mutation authority is valid");
+    router_with_token(repo_root, static_assets, authority)
 }
 
-/// Build the full router with an optional mutation token gating every
-/// `POST /api/...` (`None` disables the gate — back-compat test wrappers
-/// only; real serving always passes `Some`).
-///
-/// Test/back-compat path: CORS allows any localhost/127.0.0.1 port (and
-/// Tauri), and GETs stay tokenless.
+/// Build the full router with mutation authority gating every `POST /api/...`.
+/// CORS allows any localhost/127.0.0.1 port (and Tauri), and GETs stay
+/// tokenless.
 pub fn router_with_token(
     repo_root: PathBuf,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> Router {
-    router_with_host(MissionHost::new(repo_root), static_assets, token)
+    router_with_host(MissionHost::new(repo_root), static_assets, authority)
 }
 
 /// The real router constructor: an explicit [`MissionHost`] (tests inject a
-/// mock agent backend via [`MissionHost::with_backend`]) plus the optional
-/// mutation token.
+/// mock agent backend via [`MissionHost::with_backend`]) plus mandatory
+/// mutation authority.
 pub fn router_with_host(
     host: MissionHost,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> Router {
-    router_with_shared_host(Arc::new(host), static_assets, token)
+    router_with_shared_host(Arc::new(host), static_assets, authority)
 }
 
 /// [`router_with_host`] over an already-shared registry — the `kranz serve
@@ -139,9 +181,9 @@ pub fn router_with_host(
 pub fn router_with_shared_host(
     host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> Router {
-    router_with_shared_host_and_bind(host, static_assets, token, None, true, false)
+    router_with_shared_host_and_bind(host, static_assets, authority, None, true, false)
 }
 
 /// Router constructor that threads the serve bind port into CORS / WS origin
@@ -156,7 +198,7 @@ pub fn router_with_shared_host(
 pub fn router_with_shared_host_and_bind(
     host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
     bind_port: Option<u16>,
     bind_is_loopback: bool,
     require_read_token: bool,
@@ -164,7 +206,7 @@ pub fn router_with_shared_host_and_bind(
     router_with_shared_host_and_addr(
         host,
         static_assets,
-        token,
+        authority,
         bind_port.map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
         bind_is_loopback,
         require_read_token,
@@ -179,7 +221,7 @@ pub fn router_with_shared_host_and_bind(
 pub fn router_with_shared_host_and_addr(
     host: Arc<MissionHost>,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
     require_read_token: bool,
@@ -187,7 +229,7 @@ pub fn router_with_shared_host_and_addr(
     router_with_multi_repo_host_and_addr(
         Arc::new(MultiRepoHost::with_host(host)),
         static_assets,
-        token,
+        authority,
         bind_addr,
         bind_is_loopback,
         require_read_token,
@@ -201,7 +243,7 @@ pub fn router_with_shared_host_and_addr(
 pub fn router_with_multi_repo_host_and_addr(
     multi_host: Arc<MultiRepoHost>,
     static_assets: Option<DashboardStatic>,
-    authority: Option<String>,
+    authority: MutationAuthority,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
     require_read_token: bool,
@@ -226,7 +268,7 @@ pub fn router_with_multi_repo_host_and_addr(
 pub fn router_with_read_authority_and_addr(
     multi_host: Arc<MultiRepoHost>,
     static_assets: Option<DashboardStatic>,
-    authority: Option<String>,
+    authority: MutationAuthority,
     read_authority: Option<String>,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
@@ -807,12 +849,12 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// Token gate state: the optional mutation token plus whether non-loopback
-/// binds also require it on GET / WS upgrade, and the optional read-only
-/// token accepted on gated reads only.
+/// Token gate state: mandatory mutation authority plus whether non-loopback
+/// binds also require it on GET / WS upgrade, and the optional read-only token
+/// accepted on gated reads only.
 #[derive(Clone)]
 struct TokenGate {
-    authority: Option<String>,
+    authority: MutationAuthority,
     read_authority: Option<String>,
     require_read_token: bool,
 }
@@ -832,9 +874,6 @@ struct HostGate {
 /// set headers on `new WebSocket`) and is honored solely on token-gated
 /// reads: POSTs are header-only, so mutation authority never rides in a URL
 /// that can land in shell history or an intermediary's access log.
-/// `token: None` (back-compat test wrappers only) disables the gate
-/// entirely.
-///
 /// A configured [`TokenGate::read_authority`] authenticates those same gated
 /// READS (header or query) but is never accepted on a mutating route: it is
 /// the token safe to hand to dashboards and agents, while the mutation token
@@ -849,63 +888,60 @@ async fn require_mutation_token(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = gate.authority.as_deref() {
-        let path = request.uri().path();
-        let is_health = path == "/api/health";
-        // The GitHub webhook route authenticates with its own per-repo HMAC
-        // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
-        // when unconfigured — GitHub cannot present the mutation token.
-        let is_github_hook = path.ends_with("/hooks/github");
-        // The hook-status signal POST authenticates with its own per-RUN
-        // capability token (validated against the registration in the
-        // handler — worker-readable files never carry the serve token).
-        // Scoped to POSTs so a read-gated GET of the projection still
-        // requires the read token.
-        let is_hook_signal_post =
-            request.method() == Method::POST && path.ends_with("/hook-status");
-        let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-        let needs_token = path.starts_with("/api/")
-            && !is_health
-            && !is_github_hook
-            && !is_hook_signal_post
-            && (request.method() == Method::POST || (gate.require_read_token && is_read));
-        if needs_token {
-            // The read-only token authenticates reads ONLY — never a mutation.
-            let read_ok = |presented: &str| {
-                is_read
-                    && gate
-                        .read_authority
-                        .as_deref()
-                        .is_some_and(|read| token_matches(presented, read))
-            };
-            let header_ok = request
-                .headers()
-                .get(TOKEN_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|presented| token_matches(presented, expected) || read_ok(presented));
-            let query_ok = gate.require_read_token
-                && is_read
-                && request
-                    .uri()
-                    .query()
-                    .map(|q| {
-                        q.split('&').any(|pair| {
-                            let mut parts = pair.splitn(2, '=');
-                            matches!(parts.next(), Some("token"))
-                                && parts.next().is_some_and(|v| {
-                                    let decoded = percent_decode_token(v);
-                                    token_matches(&decoded, expected) || read_ok(&decoded)
-                                })
-                        })
+    let expected = gate.authority.as_str();
+    let path = request.uri().path();
+    let is_health = path == "/api/health";
+    // The GitHub webhook route authenticates with its own per-repo HMAC
+    // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
+    // when unconfigured — GitHub cannot present the mutation token.
+    let is_github_hook = path.ends_with("/hooks/github");
+    // The hook-status signal POST authenticates with its own per-RUN
+    // capability token (validated against the registration in the handler —
+    // worker-readable files never carry the serve token). Scoped to POSTs so
+    // a read-gated GET of the projection still requires the read token.
+    let is_hook_signal_post = request.method() == Method::POST && path.ends_with("/hook-status");
+    let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
+    let needs_token = path.starts_with("/api/")
+        && !is_health
+        && !is_github_hook
+        && !is_hook_signal_post
+        && (request.method() == Method::POST || (gate.require_read_token && is_read));
+    if needs_token {
+        // The read-only token authenticates reads ONLY — never a mutation.
+        let read_ok = |presented: &str| {
+            is_read
+                && gate
+                    .read_authority
+                    .as_deref()
+                    .is_some_and(|read| token_matches(presented, read))
+        };
+        let header_ok = request
+            .headers()
+            .get(TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|presented| token_matches(presented, expected) || read_ok(presented));
+        let query_ok = gate.require_read_token
+            && is_read
+            && request
+                .uri()
+                .query()
+                .map(|q| {
+                    q.split('&').any(|pair| {
+                        let mut parts = pair.splitn(2, '=');
+                        matches!(parts.next(), Some("token"))
+                            && parts.next().is_some_and(|v| {
+                                let decoded = percent_decode_token(v);
+                                token_matches(&decoded, expected) || read_ok(&decoded)
+                            })
                     })
-                    .unwrap_or(false);
-            if !header_ok && !query_ok {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "missing or invalid token" })),
-                )
-                    .into_response();
-            }
+                })
+                .unwrap_or(false);
+        if !header_ok && !query_ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "missing or invalid token" })),
+            )
+                .into_response();
         }
     }
     next.run(request).await
@@ -955,15 +991,20 @@ async fn root_info() -> &'static str {
 }
 
 /// Bind `127.0.0.1:<port>` and serve the router until the process exits.
-/// `token` gates every `POST /api/...` — real callers (the CLI, the Tauri
-/// shell) always pass `Some`.
+/// `authority` gates every `POST /api/...`.
 pub async fn serve(
     repo_root: PathBuf,
     port: u16,
     static_dir: Option<PathBuf>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> anyhow::Result<()> {
-    serve_with_static(repo_root, port, static_dir.map(DashboardStatic::Dir), token).await
+    serve_with_static(
+        repo_root,
+        port,
+        static_dir.map(DashboardStatic::Dir),
+        authority,
+    )
+    .await
 }
 
 /// Bind `127.0.0.1:<port>` and serve the router until the process exits.
@@ -971,14 +1012,14 @@ pub async fn serve_with_static(
     repo_root: PathBuf,
     port: u16,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> anyhow::Result<()> {
     serve_with_shared_host(
         Arc::new(MissionHost::new(repo_root)),
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         port,
         static_assets,
-        token,
+        authority,
     )
     .await
 }
@@ -994,14 +1035,14 @@ pub async fn serve_with_shared_host(
     bind: IpAddr,
     port: u16,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
 ) -> anyhow::Result<()> {
     let shutdown = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %e, "failed to install ctrl-c handler");
         }
     };
-    serve_with_shutdown(host, bind, port, static_assets, token, shutdown).await
+    serve_with_shutdown(host, bind, port, static_assets, authority, shutdown).await
 }
 
 /// Same as [`serve_with_shared_host`], but takes an explicit shutdown
@@ -1012,11 +1053,11 @@ pub async fn serve_with_shutdown(
     bind: IpAddr,
     port: u16,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = bind_listener(bind, port).await?;
-    serve_on_listener(host, listener, static_assets, token, shutdown).await
+    serve_on_listener(host, listener, static_assets, authority, shutdown).await
 }
 
 /// Bind `bind:port` and return the listener. Callers that need the REAL
@@ -1035,14 +1076,14 @@ pub async fn serve_on_listener(
     host: Arc<MissionHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
-    token: Option<String>,
+    authority: MutationAuthority,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     serve_multi_on_listener(
         Arc::new(MultiRepoHost::with_host(host)),
         listener,
         static_assets,
-        token,
+        authority,
         None,
         false,
         shutdown,
@@ -1060,7 +1101,7 @@ pub async fn serve_multi_on_listener(
     multi_host: Arc<MultiRepoHost>,
     listener: tokio::net::TcpListener,
     static_assets: Option<DashboardStatic>,
-    authority: Option<String>,
+    authority: MutationAuthority,
     read_authority: Option<String>,
     read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -1101,6 +1142,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    fn authority() -> super::MutationAuthority {
+        super::MutationAuthority::new("tok").unwrap()
+    }
 
     fn seed_planning_mission(root: &Path, goal: &str) {
         std::fs::create_dir_all(root).unwrap();
@@ -1147,14 +1192,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let app = router_with_multi_repo_host_and_addr(
-            multi,
-            None,
-            Some("tok".to_string()),
-            None,
-            true,
-            false,
-        );
+        let app = router_with_multi_repo_host_and_addr(multi, None, authority(), None, true, false);
 
         // Bare prefix and deep path both 503 with the reason (explicit routes
         // beat the `/api/{*path}` catch-all; a nested fallback would not).
@@ -1215,14 +1253,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let app = router_with_multi_repo_host_and_addr(
-            multi,
-            None,
-            Some("tok".to_string()),
-            None,
-            true,
-            false,
-        );
+        let app = router_with_multi_repo_host_and_addr(multi, None, authority(), None, true, false);
 
         // Every unscoped route addresses the default repo; its unavailability
         // is reported instead of a generic "scope required" 404.
@@ -1290,7 +1321,7 @@ mod tests {
         let app = router_with_multi_repo_host_and_addr(
             multi,
             Some(super::DashboardStatic::Embedded(EMBEDDED)),
-            Some("tok".to_string()),
+            authority(),
             None,
             true,
             false,

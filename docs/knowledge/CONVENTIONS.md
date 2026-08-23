@@ -23,7 +23,7 @@ freshness: live | check-on-touch | stale
 last_verified: 2026-07-08
 verified_against:
   - crates/engine/src/orchestrator.rs
-  - cargo test -p kranz-engine lessons
+  - 'command: cargo test -p kranz-engine lessons'
 ---
 ```
 
@@ -39,9 +39,11 @@ verified_against:
 - **`last_verified`** — the UTC `YYYY-MM-DD` date the claims were last checked
   against the code. Missing or malformed dates are check-needed.
 - **`verified_against`** — the real repo paths and/or commands the note's claims
-  depend on. Paths must stay inside the repo. Commands are reported but never
-  executed. Missing paths, invalid citations, and failed Git/filesystem probes
-  are check-needed rather than silently treated as current.
+  depend on. An entry is a repo-relative path by default (spaces are allowed);
+  `path:` may make that type explicit. Commands must use the explicit
+  `command:` prefix, are reported, and are never executed. Missing paths,
+  invalid citations, and failed Git/filesystem probes are check-needed rather
+  than silently treated as current.
 
 ## Body
 

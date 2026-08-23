@@ -51,8 +51,12 @@ kranz work                      # drain the queue (run missions)
    its raw exit code.
 3. **Run `cargo fmt --all` before finishing.** A skipped fmt has cost full
    respawns; CI gates `cargo fmt --check`.
-4. **kranz never pushes.** The engine only advances refs locally / merges
-   `--no-ff`. A human runs `git push`. This is inviolable.
+4. **kranz never pushes by default.** Mission execution and gated merge only
+   advance local refs / merge `--no-ff`; a human pushes reviewed work. The sole
+   exception is the human-invoked cloud handoff `kranz exec --push <REMOTE>`:
+   it may push one completed `kranz/*` branch to an already-configured remote,
+   never a base branch, tag, refspec, force, or merge. No other push path is
+   permitted.
 5. **When committing alongside in-flight subagents, stage by exact file
    list.** Three times in one week a scoped fix swept a subagent's
    uncommitted edits into a commit WITHOUT the rest of its feature
@@ -166,4 +170,3 @@ primitive with three properties). If a change drifts toward a frozen
 surface, stop and check the boundary first; `docs/what-is-kranz.md` and
 the frozen modules' doc headers (`prompts.rs`, `knowledge.rs`) carry the
 same pointer.
-

@@ -396,9 +396,10 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
-    /// Keeps the resolved posture's disposable profile and retained no-follow
-    /// DACL handles alive through the wrapper process, even if its caller
-    /// drops the `GateSandbox` first. Absent on non-Windows builds.
+    /// Retains ownership of the resolved posture's disposable profile and
+    /// no-follow DACL handles through the wrapper process. Callers still must
+    /// await/reap the command before explicitly cleaning the posture. Absent
+    /// on non-Windows builds.
     #[cfg(windows)]
     _appcontainer_context: Option<crate::appcontainer_windows::AppContainerLaunchContext>,
 }
@@ -414,6 +415,17 @@ impl GateSandbox {
             GateSandbox::AppContainer { inputs, .. } => inputs.enforce,
             GateSandbox::Container { inputs, .. } => inputs.enforce,
         }
+    }
+
+    /// Explicitly retire host state owned by a resolved posture. Most
+    /// providers have nothing to release; Windows AppContainer must surface
+    /// temporary ACL/profile cleanup failures before a mission can pass.
+    pub(crate) fn cleanup(&mut self) -> crate::error::Result<()> {
+        #[cfg(windows)]
+        if let GateSandbox::AppContainer { context, .. } = self {
+            return context.cleanup();
+        }
+        Ok(())
     }
 
     /// Build the [`WrappedCommand`] that runs `command` under this posture.
@@ -1441,7 +1453,17 @@ pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
             ),
         );
     }
-    let resolution = match resolve_gate_sandbox(
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return (None, format!("failed to create gate runtime: {error}"));
+        }
+    };
+    let mut resolution = match resolve_gate_sandbox(
         &policy.sandbox,
         cwd,
         &policy.mission_dir,
@@ -1470,16 +1492,6 @@ pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
     for var in ["TMPDIR", "TMP", "TEMP"] {
         env.insert(var.to_string(), scratch.join("tmp").display().to_string());
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&scratch);
-            return (None, format!("failed to create gate runtime: {error}"));
-        }
-    };
     let (code, output) = runtime.block_on(run_shell_command_sandboxed_with_code(
         cwd,
         command,
@@ -1487,6 +1499,13 @@ pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
         &env,
         &resolution.sandbox,
     ));
+    if let Err(error) = resolution.sandbox.cleanup() {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return (
+            None,
+            format!("gate sandbox cleanup failed closed after command execution: {error}"),
+        );
+    }
     let _ = std::fs::remove_dir_all(&scratch);
     (code, output)
 }

@@ -2495,7 +2495,7 @@ async fn serve_multi_with_token_cleanup(
         multi_host,
         listener,
         static_assets,
-        Some(token),
+        kranz_server::MutationAuthority::new(token)?,
         Some(read_token),
         read_auth,
         shutdown,
@@ -2527,8 +2527,14 @@ async fn serve_with_token_cleanup(
     let token_file = write_serve_token(repo, &token)?;
     let read_token_file = write_serve_read_token(repo, &read_token)?;
 
-    let result =
-        kranz_server::serve_on_listener(host, listener, static_assets, Some(token), shutdown).await;
+    let result = kranz_server::serve_on_listener(
+        host,
+        listener,
+        static_assets,
+        kranz_server::MutationAuthority::new(token)?,
+        shutdown,
+    )
+    .await;
 
     remove_token_file(&token_file);
     remove_token_file(&read_token_file);
@@ -3704,7 +3710,7 @@ mod tests {
         let app = kranz_server::router_with_multi_repo_host_and_addr(
             catalog,
             None,
-            Some("catalog-token".to_string()),
+            kranz_server::MutationAuthority::new("catalog-token").unwrap(),
             Some(address),
             true,
             false,
@@ -3748,7 +3754,7 @@ mod tests {
         let app = kranz_server::router_with_multi_repo_host_and_addr(
             catalog,
             None,
-            Some("catalog-token".to_string()),
+            kranz_server::MutationAuthority::new("catalog-token").unwrap(),
             Some(address),
             false,
             true,

@@ -29,7 +29,12 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::ServiceExt;
 
 const MISSION_ID: &str = "m-01";
+const TEST_TOKEN: &str = "server-test-token";
 const WAIT: Duration = Duration::from_secs(10);
+
+fn authority(token: &str) -> kranz_server::MutationAuthority {
+    kranz_server::MutationAuthority::new(token).unwrap()
+}
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -303,7 +308,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, MissionPaths, axum::Router) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().to_path_buf();
     let paths = seed_mission(&repo_root);
-    let app = kranz_server::router(repo_root.clone(), None);
+    let app = kranz_server::router_with_token(repo_root.clone(), None, authority(TEST_TOKEN));
     (tmp, repo_root, paths, app)
 }
 
@@ -967,6 +972,7 @@ async fn control_post_enqueues_a_drainable_command() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(
                     r#"{"kind":"msg","text":"focus on tests","interrupt":false}"#,
                 ))
@@ -997,6 +1003,7 @@ async fn control_post_enqueues_a_drainable_command() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(r#"{"kind":"bogus"}"#))
                 .unwrap(),
         )
@@ -1050,6 +1057,7 @@ async fn question_events_answer_route_enqueues_and_validates() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(
                     r#"{"questionId":"q-1","answer":"sqlite","option":0}"#,
                 ))
@@ -1083,6 +1091,7 @@ async fn question_events_answer_route_enqueues_and_validates() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(
                     r#"{"questionId":"q-1","answer":"use postgres"}"#,
                 ))
@@ -1110,6 +1119,7 @@ async fn question_events_answer_route_enqueues_and_validates() {
                     .method("POST")
                     .uri(&uri)
                     .header("content-type", "application/json")
+                    .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1134,6 +1144,7 @@ async fn control_post_rejects_an_invalid_config_change_before_enqueueing() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(
                     r#"{"kind":"config-change","patch":{"worker":{"backend":"droid","model":"accounts/fireworks/models/glm-5p2"}}}"#,
                 ))
@@ -1169,6 +1180,7 @@ async fn control_post_enqueues_a_valid_backend_selection() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(
                     r#"{"kind":"config-change","patch":{"worker":{"backend":"codex","model":"gpt-5-codex"}}}"#,
                 ))
@@ -1207,6 +1219,7 @@ async fn control_post_rejects_terminal_mission() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(r#"{"kind":"pause"}"#))
                 .unwrap(),
         )
@@ -1237,6 +1250,7 @@ async fn control_post_terminal_probe_survives_logs_larger_than_the_tail_window()
             .method("POST")
             .uri(&uri)
             .header("content-type", "application/json")
+            .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
             .body(Body::from(body))
             .unwrap()
     };
@@ -1416,6 +1430,7 @@ async fn control_post_without_origin_is_unaffected_by_cors() {
                 .method("POST")
                 .uri(format!("/api/missions/{MISSION_ID}/control"))
                 .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(r#"{"kind":"pause"}"#))
                 .unwrap(),
         )
@@ -1486,6 +1501,7 @@ async fn control_post_rejects_non_json_content_types() {
             .method("POST")
             .uri(&uri)
             .header("origin", "https://evil.example")
+            .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
             .header("content-length", body.len().to_string());
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
@@ -1517,6 +1533,7 @@ async fn control_post_rejects_non_json_content_types() {
                 .method("POST")
                 .uri(&uri)
                 .header("content-type", "application/json; charset=utf-8")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -1875,7 +1892,7 @@ async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
     let app = kranz_server::router_with_shared_host_and_bind(
         host,
         None,
-        Some(token.to_string()),
+        authority(token),
         Some(4560),
         false, // non-loopback bind: LAN origins allowed
         true,  // read token required
@@ -1944,7 +1961,7 @@ fn read_auth_app(
     let app = kranz_server::router_with_shared_host_and_bind(
         host,
         None,
-        Some(READ_AUTH_TOKEN.to_string()),
+        authority(READ_AUTH_TOKEN),
         None,
         bind_is_loopback,
         require_read_token,
@@ -2131,7 +2148,7 @@ where
 {
     let host =
         kranz_server::MissionHost::with_gate_executor(repo_root.to_path_buf(), gate_executor);
-    kranz_server::router_with_host(host, None, Some(MERGE_TOKEN.to_string()))
+    kranz_server::router_with_host(host, None, authority(MERGE_TOKEN))
 }
 
 async fn post_json(

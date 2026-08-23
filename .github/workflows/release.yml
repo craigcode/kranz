@@ -50,9 +50,6 @@ jobs:
             exit 1
           fi
 
-      - name: Audit current public tree
-        run: scripts/audit-public-tree.sh
-
       # Keep the scanner version and archive checksum explicit. The generic
       # event-oriented action scans a push/PR range; a public release must
       # inspect every fetched head, tag, and pull ref via the history audit's
@@ -72,8 +69,23 @@ jobs:
           tar -xzf "$archive" -C "$bin_dir" gitleaks
           echo "$bin_dir" >> "$GITHUB_PATH"
 
-      - name: Scan all reachable history for secrets and operator metadata
-        run: scripts/audit-public-history.sh
+      - name: Audit source and history with private operator markers
+        env:
+          KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
+        run: |
+          if [ -z "$KRANZ_PUBLIC_AUDIT_MARKERS" ]; then
+            echo "release is locked: repository secret KRANZ_PUBLIC_AUDIT_MARKERS is required" >&2
+            exit 1
+          fi
+          marker_file="$RUNNER_TEMP/kranz-public-audit-markers"
+          trap 'rm -f "$marker_file"' EXIT
+          umask 077
+          printf '%s\n' "$KRANZ_PUBLIC_AUDIT_MARKERS" > "$marker_file"
+          unset KRANZ_PUBLIC_AUDIT_MARKERS
+          export KRANZ_PUBLIC_AUDIT_MARKERS_FILE="$marker_file"
+          export KRANZ_REQUIRE_OPERATOR_MARKERS=1
+          scripts/audit-public-tree.sh
+          scripts/audit-public-history.sh
 
       - run: cargo fmt --all --check
 
@@ -82,6 +94,8 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
 
       - run: cargo build --workspace --locked
+
+      - run: scripts/check-package-licenses.sh
 
       - name: Build strict public API documentation
         env:
@@ -127,15 +141,7 @@ jobs:
           - os: ubuntu-latest
             asset: kranz-linux-x86_64
             bin: kranz
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            asset: kranz-macos-aarch64
-            bin: kranz
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            asset: kranz-macos-x86_64
-            bin: kranz
-            target: x86_64-apple-darwin
+            target: x86_64-unknown-linux-musl
           - os: windows-latest
             asset: kranz-windows-x86_64
             bin: kranz.exe
@@ -150,32 +156,51 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Install static Linux linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Build kranz CLI
         run: cargo build --release --locked -p kranz --bin kranz --target "${{ matrix.target }}"
 
-      - name: Stage asset (Unix)
-        if: runner.os != 'Windows'
+      - name: Package and smoke-test Linux archive
+        if: runner.os == 'Linux'
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          package_dir="stage/${{ matrix.asset }}"
+          mkdir -p "$package_dir" dist smoke
+          install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$package_dir/kranz"
+          install -m 0644 LICENSE "$package_dir/LICENSE"
+          install -m 0644 packaging/release/README.txt "$package_dir/README.txt"
+          tar -C stage -czf "dist/${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+          tar -C smoke -xzf "dist/${{ matrix.asset }}.tar.gz"
+          test -x "smoke/${{ matrix.asset }}/kranz"
+          "smoke/${{ matrix.asset }}/kranz" --version
 
-      - name: Stage asset (Windows)
+      - name: Package and smoke-test Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}.exe"
+          $packageDir = "stage/${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force -Path $packageDir, dist, smoke | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$packageDir/kranz.exe"
+          Copy-Item LICENSE "$packageDir/LICENSE"
+          Copy-Item packaging/release/README.txt "$packageDir/README.txt"
+          Compress-Archive -Path $packageDir -DestinationPath "dist/${{ matrix.asset }}.zip"
+          Expand-Archive "dist/${{ matrix.asset }}.zip" -DestinationPath smoke
+          & "smoke/${{ matrix.asset }}/kranz.exe" --version
 
       - name: Attest binary build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/${{ matrix.asset }}*
+          subject-path: dist/${{ matrix.asset }}.*
 
       - name: Upload staged binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}*
+          path: dist/${{ matrix.asset }}.*
           if-no-files-found: error
           retention-days: 1
 
@@ -218,6 +243,30 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify release archive set and installability
+        run: |
+          expected=(
+            kranz-linux-x86_64.tar.gz
+            kranz-windows-x86_64.zip
+            kranz-sbom.spdx.json
+          )
+          for asset in "${expected[@]}"; do
+            test -f "dist/$asset" || {
+              echo "missing release asset: $asset" >&2
+              exit 1
+            }
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
+          mkdir -p smoke
+          tar -C smoke -xzf dist/kranz-linux-x86_64.tar.gz
+          test -x smoke/kranz-linux-x86_64/kranz
+          smoke/kranz-linux-x86_64/kranz --version
+          unzip -t dist/kranz-windows-x86_64.zip
+          unzip -l dist/kranz-windows-x86_64.zip > "$RUNNER_TEMP/windows-archive.txt"
+          grep -q 'kranz-windows-x86_64/kranz.exe' "$RUNNER_TEMP/windows-archive.txt"
+          grep -q 'kranz-windows-x86_64/LICENSE' "$RUNNER_TEMP/windows-archive.txt"
+          grep -q 'kranz-windows-x86_64/README.txt' "$RUNNER_TEMP/windows-archive.txt"
 
       - name: Generate checksum manifest
         working-directory: dist

@@ -18,6 +18,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::Path;
 
 /// Which classes of mission event get posted to Slack. All default on — the
@@ -48,7 +49,7 @@ impl Default for NotifyFlags {
 }
 
 /// Resolved Slack bridge configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SlackConfig {
     /// Bot token (`xoxb-…`) for Web API calls.
     pub bot_token: String,
@@ -86,6 +87,21 @@ pub struct SlackConfig {
     /// winning. User-supplied text: rendered via mrkdwn escaping (see
     /// [`crate::format::escape_mrkdwn`]), never interpreted.
     pub instance_name: Option<String>,
+}
+
+impl fmt::Debug for SlackConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackConfig")
+            .field("bot_token", &"[REDACTED]")
+            .field("app_token", &"[REDACTED]")
+            .field("channel", &self.channel)
+            .field("notify", &self.notify)
+            .field("allow_users", &self.allow_users)
+            .field("allow_all_users", &self.allow_all_users)
+            .field("dashboard_url", &self.dashboard_url)
+            .field("instance_name", &self.instance_name)
+            .finish()
+    }
 }
 
 impl SlackConfig {
@@ -304,6 +320,26 @@ fn non_blank(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_slack_tokens() {
+        let cfg = SlackConfig {
+            bot_token: "xoxb-super-secret".into(),
+            app_token: "xapp-super-secret".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U1".into()],
+            allow_all_users: false,
+            dashboard_url: None,
+            instance_name: Some("studio".into()),
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("xoxb-super-secret"), "{rendered}");
+        assert!(!rendered.contains("xapp-super-secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("studio"), "{rendered}");
+    }
 
     #[test]
     fn env_only_resolves() {

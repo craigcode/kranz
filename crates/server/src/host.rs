@@ -2503,7 +2503,8 @@ mod tests {
         let cell = host.planning_cell(&id).expect("hosted planning cell");
         let _guard = cell.try_lock().expect("uncontended lock");
 
-        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let app =
+            crate::router_with_host(host, None, crate::MutationAuthority::new("tok").unwrap());
         let response = app
             .oneshot(
                 Request::builder()
@@ -2532,7 +2533,8 @@ mod tests {
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
 
-        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let app =
+            crate::router_with_host(host, None, crate::MutationAuthority::new("tok").unwrap());
         let response = app
             .oneshot(
                 Request::builder()
@@ -2567,7 +2569,8 @@ mod tests {
         let host = MissionHost::with_backend(root, backend);
         let id = host.create("ship it", None).await.expect("create mission");
 
-        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let app =
+            crate::router_with_host(host, None, crate::MutationAuthority::new("tok").unwrap());
         let payload = "not json";
         let response = app
             .oneshot(
@@ -3176,7 +3179,8 @@ mod tests {
         };
         let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
         let host = MissionHost::with_backend(root, backend);
-        let app = crate::router_with_host(host, None, Some("tok".to_string()));
+        let app =
+            crate::router_with_host(host, None, crate::MutationAuthority::new("tok").unwrap());
 
         let response = app
             .clone()

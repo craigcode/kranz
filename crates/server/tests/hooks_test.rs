@@ -170,7 +170,11 @@ fn hook_app(root: &Path, drafts: usize) -> Router {
         .collect();
     let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(scripts));
     let host = MissionHost::with_backend(root.to_path_buf(), backend);
-    kranz_server::router_with_host(host, None, Some("tok".to_string()))
+    kranz_server::router_with_host(
+        host,
+        None,
+        kranz_server::MutationAuthority::new("tok").unwrap(),
+    )
 }
 
 // ---------------------------------------------------------------------------

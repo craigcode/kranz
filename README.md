@@ -86,10 +86,27 @@ dependencies automatically:
 cargo install kranz --locked
 ```
 
-**Prebuilt binaries.** Download the binary for your platform plus `SHA256SUMS`
-from the [latest GitHub release](https://github.com/craigcode/kranz/releases/latest).
-Release assets carry GitHub build-provenance attestations and include macOS
-Apple silicon/Intel, Linux x86-64, and Windows x86-64 builds.
+**Prebuilt archives.** Download the archive for your platform plus
+`SHA256SUMS` from the
+[latest GitHub release](https://github.com/craigcode/kranz/releases/latest),
+verify its checksum, extract it, and run `kranz --version`. Archives contain
+the executable, installation notes, and `LICENSE`; they carry GitHub
+build-provenance attestations. Linux x86-64 is a static musl build and Windows
+x86-64 is a zip. On macOS, `cargo install kranz --locked` is the supported path
+until signed and notarized archives are available—Kranz does not publish an
+unsigned macOS binary as though it were ready for ordinary Gatekeeper use.
+
+For example, on Linux after downloading both release files:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf kranz-linux-x86_64.tar.gz
+./kranz-linux-x86_64/kranz --version
+```
+
+On Windows, compare `Get-FileHash .\kranz-windows-x86_64.zip -Algorithm SHA256`
+with its `SHA256SUMS` entry before expanding the zip, then run
+`.\kranz-windows-x86_64\kranz.exe --version`.
 
 **From a source checkout.** This is useful for contributors and unreleased
 development snapshots:
@@ -159,8 +176,10 @@ between features.
   read-only + the contract's commands. Denials surface as events (the
   dashboard shows guardrails firing). `--dangerously-allow-all` exists, is
   loud, and is never the default.
-- **Kranz never pushes.** The mission branch is the deliverable; you review
-  and open the PR.
+- **Kranz never pushes by default.** The mission branch is the deliverable;
+  you review and open the PR. The sole exception is an explicit cloud handoff:
+  `kranz exec --push <configured-remote>` may publish one completed `kranz/*`
+  branch for human review, never a base branch, tag, force-push, or merge.
 
 ## Layout
 
@@ -211,8 +230,9 @@ reporting channel described by [`SECURITY.md`](SECURITY.md), not a public issue.
 
 ## Cloud (preview)
 
-Kranz is local-first and **never pushes** on your machine. Cloud missions (M6,
-preview — not yet exercised end-to-end) run the same binary in a container and
-publish the mission branch as a reviewable `kranz/*` ref only — never `main`,
-never a merge. See the [`Dockerfile`](Dockerfile) and the
+Kranz is local-first and never pushes during ordinary local missions or gated
+merge. Cloud missions (M6, preview — not yet exercised end-to-end) may use the
+explicit `kranz exec --push <configured-remote>` handoff to publish the
+completed mission branch as a reviewable `kranz/*` ref only — never `main`, a
+tag, force-push, or merge. See the [`Dockerfile`](Dockerfile) and the
 [cloud deploy runbook](docs/deploy.md).

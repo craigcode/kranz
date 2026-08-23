@@ -1,5 +1,5 @@
 //! `GET /api/tickets` and `GET /api/tickets/:slug` (roadmap f-3-1) driven
-//! over the tokenless test router (`kranz_server::router`), against a plain
+//! over the read-only convenience router (`kranz_server::router`), against a plain
 //! tempdir repo with hand-written ticket `.md` + `.status` fixtures — no
 //! git, no engine, no mock backend needed since these are pure reads.
 
@@ -316,7 +316,11 @@ fn hosted_app(repo: &Path, token: &str) -> axum::Router {
     let backend: std::sync::Arc<dyn kranz_engine::backend::AgentBackend> =
         std::sync::Arc::new(kranz_engine::backend_mock::MockBackend::new());
     let host = kranz_server::MissionHost::with_backend(repo.to_path_buf(), backend);
-    kranz_server::router_with_host(host, None, Some(token.to_string()))
+    kranz_server::router_with_host(
+        host,
+        None,
+        kranz_server::MutationAuthority::new(token).unwrap(),
+    )
 }
 
 #[tokio::test]

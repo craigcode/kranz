@@ -866,6 +866,40 @@ fn push_mission_branch_rejects_refspec_and_flag_smuggling() {
 }
 
 #[test]
+fn push_mission_branch_rejects_malformed_or_unconfigured_remote_without_network() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _) = seeded_repo();
+    repo.create_branch("kranz/mission-1", None).unwrap();
+
+    for bad in [
+        "",
+        "--force",
+        "--mirror",
+        "--exec=upload-pack",
+        "origin other",
+        "https://example.invalid/repo.git",
+    ] {
+        let err = repo
+            .push_mission_branch(bad, "kranz/mission-1")
+            .expect_err("malformed remote must be refused before git push");
+        assert!(
+            matches!(&err, EngineError::Git(message) if message.contains("refusing to push")),
+            "guard message expected for {bad:?}, got: {err:?}"
+        );
+    }
+
+    let err = repo
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect_err("an absent but well-shaped remote must be refused");
+    assert!(
+        matches!(&err, EngineError::Git(message) if message.contains("unconfigured remote")),
+        "configured-remote guard expected, got: {err:?}"
+    );
+}
+
+#[test]
 fn push_mission_branch_attempts_push_and_surfaces_git_error() {
     if !setup() {
         return;

@@ -1605,7 +1605,7 @@ mod tests {
         let app = crate::router_with_token(
             tmp.path().to_path_buf(),
             None,
-            Some("serve-secret".to_string()),
+            crate::MutationAuthority::new("serve-secret").unwrap(),
         );
 
         let response = app

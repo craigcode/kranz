@@ -40,9 +40,11 @@ The **sole** exception is the explicit, ref-restricted `kranz exec --push
 and its sole non-test caller is [exec.rs](../../../crates/cli/src/exec.rs)
 `cmd_exec`, gated to a `MissionStatus::Complete` run. The guard in
 [git_ops.rs](../../../crates/engine/src/git_ops.rs) `push_mission_branch`
-refuses anything that is not a `kranz/*` ref, and rejects a `:`, leading `-`,
-or whitespace (no `--force`, no `src:dst` refspec, no `main`, no merge) **before
-any git process runs**. [merge.rs](../../../crates/engine/src/merge.rs) states
+requires an already-configured, non-flag-shaped remote name, refuses anything
+that is not a `kranz/*` ref, and rejects a `:`, leading `-`, or whitespace (no
+`--force`, no `--mirror`, no custom receive-pack, no `src:dst` refspec, no
+`main`, no merge) **before any push process runs**.
+[merge.rs](../../../crates/engine/src/merge.rs) states
 in its module doc that the gated merge never calls push — the base branch is
 only ever advanced locally.
 

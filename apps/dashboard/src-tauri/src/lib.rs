@@ -83,7 +83,7 @@ async fn embedded_serve(
         std::sync::Arc::new(kranz_server::MultiRepoHost::with_host(host)),
         listener,
         None,
-        Some(token),
+        kranz_server::MutationAuthority::new(token)?,
         None,
         true,
         std::future::pending::<()>(),

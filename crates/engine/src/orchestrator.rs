@@ -1335,7 +1335,7 @@ impl MissionEngine {
                 .join("approval-contract-lint-worktree");
             let _lint_worktree = ApprovalLintWorktree::create(&self.repo, &lint_root, &base_sha)?;
             let scratch = self.paths.runs_dir().join("approval-contract-home");
-            let sandbox = crate::command_exec::resolve_gate_sandbox(
+            let mut sandbox = crate::command_exec::resolve_gate_sandbox(
                 &self.state.config.worker.sandbox,
                 &lint_root,
                 &self.paths.mission_dir(),
@@ -1343,7 +1343,7 @@ impl MissionEngine {
                 &self.paths.runs_dir(),
             )?
             .sandbox;
-            contract_lint::run_contract_lint(
+            let report = contract_lint::run_contract_lint(
                 &lint_root,
                 &scratch,
                 Some(&base_sha),
@@ -1351,7 +1351,9 @@ impl MissionEngine {
                 true,
                 &self.state.config.contract_env_passthrough,
                 &sandbox,
-            )
+            );
+            sandbox.cleanup()?;
+            report
         } else {
             contract_lint::ContractLintReport {
                 results: Vec::new(),
@@ -5138,7 +5140,7 @@ impl MissionEngine {
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
-            let gate_sandbox = self.gate_sandbox(&root)?;
+            let mut gate_sandbox = self.gate_sandbox(&root)?;
             let rendered =
                 Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox)
                     .await;
@@ -5158,7 +5160,7 @@ impl MissionEngine {
             )
             .await;
             for artifact in &pty_run.artifacts {
-                self.emit(EventKind::ValidationPtyTranscript {
+                if let Err(error) = self.emit(EventKind::ValidationPtyTranscript {
                     milestone_id: milestone_id.clone(),
                     assertion_id: artifact.assertion_id.clone(),
                     verdict: if artifact.pass {
@@ -5168,7 +5170,10 @@ impl MissionEngine {
                     },
                     artefact_ref: crate::gate_results::file_artefact_ref(&artifact.transcript_rel),
                     detail: Some(artifact.detail.clone()),
-                })?;
+                }) {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
             }
             // A DECLARED pty-script that SKIPPED never executed (ticket
             // pty-script-skip-vacuous-green): the FAIL evidence line above
@@ -5188,7 +5193,7 @@ impl MissionEngine {
                     .map(|s| format!("- [{}]: {}", s.assertion_id, s.note))
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.emit_decision(
+                if let Err(error) = self.emit_decision(
                     &format!(
                         "declared pty-script assertion(s) {} did not execute (harness skip) — \
                          rendered as FAIL evidence",
@@ -5197,18 +5202,23 @@ impl MissionEngine {
                     Some(format!(
                         "{detail}\nA declared pty-script that never executes cannot green the \
                          mission: the final gate fails any declared pty assertion with no \
-                         validation.pty.transcript verdict."
+                        validation.pty.transcript verdict."
                     )),
-                )?;
+                ) {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
             }
-            match (rendered, pty_run.rendered) {
+            let combined = match (rendered, pty_run.rendered) {
                 (Some(mut base), Some(pty)) => {
                     base.push_str(&pty);
                     Some(base)
                 }
                 (base, None) => base,
                 (None, pty) => pty,
-            }
+            };
+            gate_sandbox.cleanup()?;
+            combined
         } else {
             None
         };
@@ -6322,7 +6332,7 @@ impl MissionEngine {
         // enforce == off). Resolved ONCE for the whole final gate — every
         // assertion below shares the gate tree + contract scratch shape.
         let gate_root = self.active_root().to_path_buf();
-        let gate_sandbox = self.gate_sandbox(&gate_root)?;
+        let mut gate_sandbox = self.gate_sandbox(&gate_root)?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -6399,8 +6409,17 @@ impl MissionEngine {
         let mut contextual_rules = Vec::new();
         let mut prepared_standard_reports = Vec::new();
         let enforcement_events = if standards_pin.is_some() {
-            self.log.flush()?;
-            EventLog::read_events(self.log.events_path())?
+            if let Err(error) = self.log.flush() {
+                gate_sandbox.cleanup()?;
+                return Err(error);
+            }
+            match EventLog::read_events(self.log.events_path()) {
+                Ok(events) => events,
+                Err(error) => {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
+            }
         } else {
             Vec::new()
         };
@@ -6417,7 +6436,7 @@ impl MissionEngine {
                         contextual_rules.push(rule.clone());
                     }
                     crate::standards_enforcement::CheckerBinding::ManualAttestation => {
-                        let attestation = crate::standards_attestation::active_attestation(
+                        let attestation = match crate::standards_attestation::active_attestation(
                             self.active_repo(),
                             &enforcement_events,
                             &self.state.mission.id,
@@ -6425,7 +6444,13 @@ impl MissionEngine {
                             rule,
                             &base,
                             "HEAD",
-                        )?;
+                        ) {
+                            Ok(attestation) => attestation,
+                            Err(error) => {
+                                gate_sandbox.cleanup()?;
+                                return Err(error);
+                            }
+                        };
                         let artefact = crate::gate::ArtefactRef::new(format!(
                             "manual attestation for {} r{}",
                             rule.id, rule.revision
@@ -6471,8 +6496,15 @@ impl MissionEngine {
         let (pack_name, pinned_gate_decls) = if let Some(pin) = standards_pin.as_ref() {
             (Some(pin.pack_name.clone()), pin.gates.clone())
         } else {
-            let pack = crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
-                .map_err(EngineError::Config)?;
+            let pack = match crate::pack::load_for_config(&self.state.config, &self.paths.repo_root)
+                .map_err(EngineError::Config)
+            {
+                Ok(pack) => pack,
+                Err(error) => {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
+            };
             let name = pack.as_ref().map(|pack| pack.name.clone());
             let gates = pack
                 .as_ref()
@@ -6508,6 +6540,7 @@ impl MissionEngine {
                     .with_rule_ids(rule_ids),
             );
         }
+        gate_sandbox.cleanup()?;
         // A valid pin cannot leave a gate id unresolved (checker_binding
         // resolved against this same list). Treat any corrupt duplicate or
         // hand-edited pin conservatively anyway.

@@ -14,6 +14,10 @@ hardening changes. Keep the repository private until every item below is true.
 - `scripts/audit-public-tree.sh` passes on the exact proposed public commit.
 - `scripts/audit-public-history.sh` passes with every branch, tag, and GitHub
   pull-request ref fetched.
+- Operator-specific audit strings live only in an untracked newline-delimited
+  file. Run both scripts with `KRANZ_PUBLIC_AUDIT_MARKERS_FILE` pointing to it
+  and `KRANZ_REQUIRE_OPERATOR_MARKERS=1`; the public repository must not encode
+  or obfuscate the strings it is intended to exclude.
 - Mission records, tickets, fixtures, and review documents have received a
   human confidentiality/licensing review; automated secret scans do not detect
   external-party identifiers, private prompts, or proprietary prose reliably.
@@ -80,6 +84,9 @@ release. They must never silently become the supported distribution.
 - The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` remains
   `false` until every item in this document is complete; set it to `true` only
   after the protected release environment is verified.
+- The masked repository secret `KRANZ_PUBLIC_AUDIT_MARKERS` contains the same
+  newline-delimited operator markers used for the local release audit. The tag
+  workflow fails closed when it is missing or empty.
 - Private vulnerability reporting, Dependabot alerts/security updates, secret
   scanning, push protection, and code scanning are enabled where the current
   visibility/plan permits them.
