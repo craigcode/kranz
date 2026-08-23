@@ -2966,7 +2966,7 @@ fn production_hostile_self_test() -> Result<String> {
     let PreparedLaunch {
         program,
         args,
-        lease: mut lease,
+        mut lease,
     } = prepared;
     overlapping.lease.cleanup()?;
     let output = std::process::Command::new(program)
