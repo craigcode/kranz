@@ -295,10 +295,30 @@ jobs:
       # than asserted. `KRANZ_REQUIRED_CAPABILITIES` below then makes a future
       # runtime regression FAIL instead of silently reverting to skips.
       - name: Provision a container runtime (Colima)
+        id: colima
         run: |
           brew install colima docker
-          colima start --cpu 2 --memory 4
+          colima start --cpu 2 --memory 4 --verbose
           docker version
+      # `colima start` reports `level=fatal ... Errors:[]` and points at a Lima
+      # log the runner never prints, so a failure here is undiagnosable from
+      # the job output alone — which is how this cost a round trip. Surface the
+      # logs it names, on failure only.
+      - name: Show Lima/Colima logs when provisioning failed
+        if: failure() && steps.colima.outcome == 'failure'
+        run: |
+          for log in ~/.colima/_lima/colima/ha.stderr.log \
+                     ~/.colima/_lima/colima/ha.stdout.log \
+                     ~/.colima/_lima/colima/serial.log; do
+            if [ -s "$log" ]; then
+              echo "===== $log ====="
+              tail -100 "$log"
+            else
+              echo "===== $log (absent or empty) ====="
+            fi
+          done
+          colima status || true
+          colima version || true
       - run: cargo test --workspace --no-fail-fast
         env:
           KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec,container

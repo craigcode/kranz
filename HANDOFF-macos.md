@@ -35,8 +35,12 @@ disk resized 3.5→20GiB, the hostagent socket appeared, VZ launched — then Li
 exited during disk mount with an **empty `Errors:[]`**. The real detail is in
 `~/.colima/_lima/colima/ha.stderr.log`, which CI never captures.
 
-Fetch the full log (note `--allow-escape-sequences`, without it gh writes 0 bytes,
-and `gh run view --log` refuses while any job in the run is still going):
+The workflow now prints `ha.stderr.log`, `ha.stdout.log` and `serial.log` on
+failure, and passes `--verbose` to `colima start`, so the NEXT CI run should
+show the real error without needing a Mac at all. Check that run first.
+
+Fetch a full job log (note `--allow-escape-sequences`, without it gh writes 0
+bytes, and `gh run view --log` refuses while any job in the run is still going):
 
 ```bash
 gh api repos/craigcode/kranz/actions/jobs/97586122026/logs --allow-escape-sequences > colima.log
