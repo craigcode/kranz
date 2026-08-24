@@ -954,6 +954,63 @@ fn verify_volume_root_prepared(root: &Path) -> Result<()> {
     )))
 }
 
+/// Read a path's DACL bytes WITHOUT asking for `WRITE_DAC`.
+///
+/// [`snapshot_dacl`] requests `READ_CONTROL | WRITE_DAC` because a lease will
+/// later restore what it changed. The volume root is never one of those paths:
+/// [`ancestor_directories`] deliberately stops before it, and the ordinary
+/// launcher only calls [`verify_volume_root_prepared`], which is read-only.
+/// The self-test's before/after volume-root comparison is likewise pure
+/// evidence — it never restores — so asking for `WRITE_DAC` there demanded an
+/// elevated token for a read, and that alone made the M7 receipt unobtainable
+/// without elevation on an otherwise correctly prepared host.
+fn read_dacl_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    let path_wide = wide(path.as_os_str());
+    // SAFETY: `path_wide` is a live NUL-terminated UTF-16 buffer. READ_CONTROL
+    // alone is enough to read a security descriptor; the backup/reparse flags
+    // match the mutating path so both observe the same object.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to read the DACL of {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut acl),
+            None,
+            Some(&mut descriptor),
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    if acl.is_null() {
+        return Ok(None);
+    }
+    let len = unsafe { (*acl).AclSize as usize };
+    Ok(Some(
+        unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), len) }.to_vec(),
+    ))
+}
+
 fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
     let mut current_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -2936,7 +2993,8 @@ fn production_hostile_self_test() -> Result<String> {
             executable.display()
         ))
     })?;
-    let volume_root_before = snapshot_dacl(&volume_root)?;
+    // Read-only: this pair is evidence, never restored (see read_dacl_bytes).
+    let volume_root_before = read_dacl_bytes(&volume_root)?;
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
     // launch functional; dropping the second must recover the exact baseline.
@@ -2972,7 +3030,7 @@ fn production_hostile_self_test() -> Result<String> {
         })?;
     drop(lease);
     let after = snapshot_dacl(&worktree)?;
-    let volume_root_after = snapshot_dacl(&volume_root)?;
+    let volume_root_after = read_dacl_bytes(&volume_root)?;
     if !output.status.success() {
         return Err(EngineError::Backend(format!(
             "production AppContainer helper failed with {:?}: stdout={} stderr={}",
@@ -2988,7 +3046,7 @@ fn production_hostile_self_test() -> Result<String> {
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
     receipt.dacl_restored = before.acl == after.acl;
-    receipt.volume_root_dacl_restored = volume_root_before.acl == volume_root_after.acl;
+    receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", outside.display()),
