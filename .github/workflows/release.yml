@@ -140,6 +140,13 @@ jobs:
             asset: kranz-windows-x86_64
             bin: kranz.exe
             target: x86_64-pc-windows-msvc
+          # Native Windows-on-ARM. Without it, ARM users run the x86_64 asset
+          # under emulation — correct, but it makes the M7 operator overhead
+          # receipt (measured on aarch64) attest no shipped artifact.
+          - os: windows-11-arm
+            asset: kranz-windows-aarch64
+            bin: kranz.exe
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,6 +156,22 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # `aws-lc-sys` cannot assemble its ARM64 crypto with MSVC alone: cl.exe
+      # will not build the .S sources and the link dies on a missing
+      # chacha-armv8.o. clang is REQUIRED on this leg, not merely nice to
+      # have. (aws-lc is pulled in by rustls feature unification even though
+      # main() installs the ring provider — see crates/cli/src/main.rs.)
+      - name: Install clang for aws-lc-sys (Windows ARM64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (Get-Command clang -ErrorAction SilentlyContinue) {
+            "clang already present: $((Get-Command clang).Source)"
+          } else {
+            choco install llvm --no-progress -y
+            "$env:ProgramFiles\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
 
       - name: Build kranz CLI
         run: cargo build --release --locked -p kranz --bin kranz --target "${{ matrix.target }}"

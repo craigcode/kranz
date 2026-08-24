@@ -89,7 +89,7 @@ cargo install kranz --locked
 **Prebuilt binaries.** Download the binary for your platform plus `SHA256SUMS`
 from the [latest GitHub release](https://github.com/craigcode/kranz/releases/latest).
 Release assets carry GitHub build-provenance attestations and include macOS
-Apple silicon/Intel, Linux x86-64, and Windows x86-64 builds.
+Apple silicon/Intel, Linux x86-64, and Windows x86-64/ARM64 builds.
 
 **From a source checkout.** This is useful for contributors and unreleased
 development snapshots:
