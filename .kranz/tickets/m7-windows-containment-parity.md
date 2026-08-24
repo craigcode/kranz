@@ -1,6 +1,6 @@
 ---
-state: open
-state-note: Accepted plan plus phases 1-4 and the hosted phase-5 gate receipt are implemented: process enforcement resolves the production stable AppContainer launcher for sessions, validators, and gates; protected Windows CI proves the hostile boundary, exact DACL restoration, ordinary Node/Rust gates, and retained overhead samples while the container provider remains fail-closed. Only the dedicated operator-controlled Windows 11 receipt remains open.
+state: done
+state-note: "Done: the dedicated operator-controlled Windows 11 receipt is captured on a non-CI endpoint (Windows 11 build 26200, aarch64), closing the last hole. Phase 4 production LPAC hostile receipt returned all fifteen fields true (tokenIsAppcontainer, allApplicationPackagesDenied, toolchainRead, toolchainWriteDenied, worktreeWrite, scratchWrite, outsideWriteDenied, authorityReadDenied, realCheckoutReadDenied, sharedGitRead, overlappingLeaseSafe, tamperedGitPointerRefused, networkDenied, daclRestored, volumeRootDaclRestored). Phase 5 gate receipt: enforcement fs+net, provider process/AppContainer-LPAC, seven retained interleaved pairs per gate against a five-second payload - node 5148.40ms off vs 5234.27ms contained = 1.67%, rust 5233.45ms off vs 5291.00ms contained = 1.10%, both withinTarget against the 10% ceiling. Capturing it required three real fixes, none observable from hosted CI: the lease walk climbed into SYSTEM-owned C:/Users so the gate wrap failed closed for any profile-hosted repository; host preparation now also grants the derived profile parent the same non-inheriting 0x00120088 metadata ACE because Node realpathSync lstats every ancestor (bypass-traverse permits passing through a directory, not stat-ing it); and the self-test asked for WRITE_DAC merely to read a DACL, which forced needless elevation and masked the accurate preparation message. CAVEAT for the release record: the boundary assertions are OS mechanisms and hold for x86_64, but the 1.67%/1.10% overhead figures are aarch64 measurements while the shipped Windows artifact is x86_64-pc-windows-msvc only."
 title: Define and prove a fail-closed Windows containment path for enforced sessions
 priority: 1
 schedule: once
@@ -143,3 +143,25 @@ operator-controlled Windows 11 receipt.
   write and network egress, records both denials, and verifies the allowed
   worktree change still passes its contract gate.
 - No completion claim is made from cross-compilation or mocked Win32 calls.
+
+## Operator receipt (Windows 11 build 26200, aarch64, non-CI endpoint)
+
+Captured with `kranz sandbox-prepare --target C:\` applied once from an
+elevated shell. Phase 4, production LPAC hostile boundary and exact DACL
+restoration:
+
+```json
+{"tokenIsAppcontainer":true,"allApplicationPackagesDenied":true,"toolchainRead":true,"toolchainWriteDenied":true,"worktreeWrite":true,"scratchWrite":true,"outsideWriteDenied":true,"authorityReadDenied":true,"realCheckoutReadDenied":true,"sharedGitRead":true,"overlappingLeaseSafe":true,"tamperedGitPointerRefused":true,"networkDenied":true,"daclRestored":true,"volumeRootDaclRestored":true}
+```
+
+Phase 5, ordinary Node and Rust gates through the production wrap with
+seven retained interleaved warm-cache pairs each:
+
+```json
+{"host":{"hostOs":"windows","windowsVersion":{"major":10,"minor":0,"build":26200},"dll":"processmodel.dll","export":"Experimental_CreateProcessInSandbox","dllSearchScope":"system32-only","experimentalSpecVersion":"0.1.0","apiStatus":"experimental-api-available","loadErrorHresult":null,"productionEnabled":true,"decision":"stable LPAC enforcement is enabled; the experimental API is detected but unused"},"enforcement":"fs+net","provider":"process/AppContainer-LPAC","overheadTargetPercent":10.0,"node":{"command":".\\node.exe node-gate.js","repetitions":7,"offSamplesMs":[5146.588333000001,5150.902875,5148.40275,5144.506417,5146.772708,5153.18375,5148.963959],"appcontainerSamplesMs":[5234.9183330000005,5234.26825,5253.132291,5225.501584,5234.97275,5219.784125,5225.992749999999],"offMedianMs":5148.40275,"appcontainerMedianMs":5234.26825,"overheadMs":85.86549999999988,"overheadPercent":1.6678085256636124,"withinTarget":true},"rust":{"command":"cargo test --quiet --manifest-path rust-gate/Cargo.toml -- --nocapture","repetitions":7,"offSamplesMs":[5280.574374999999,5233.449125,5209.941041,5264.922624999999,5147.6565,5249.109417,5173.5374170000005],"appcontainerSamplesMs":[5314.417708999999,5227.378416,5308.610667,5226.75775,5294.339833,5222.246166999999,5291.003833999999],"offMedianMs":5233.449125,"appcontainerMedianMs":5291.003833999999,"overheadMs":57.55470899999909,"overheadPercent":1.0997471767722418,"withinTarget":true}}
+```
+
+The overhead figures are aarch64 measurements. The boundary assertions are
+OS mechanisms and hold for x86_64, but the released Windows artifact is
+`x86_64-pc-windows-msvc` only, so the performance half of this receipt does
+not attest the shipped binary's architecture.

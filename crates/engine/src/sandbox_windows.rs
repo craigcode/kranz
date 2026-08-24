@@ -135,6 +135,24 @@ pub fn prepare_appcontainer_host(_root: &Path) -> std::result::Result<bool, Stri
     Err("AppContainer host preparation is available only on Windows".to_string())
 }
 
+/// Apply the persistent metadata-only ACEs to the profile parent (`C:\Users`),
+/// derived from `USERPROFILE` rather than supplied by the operator. Returns
+/// the prepared path and whether anything changed. Windows tools `lstat` every
+/// ancestor during module resolution, so without this a contained Node gate
+/// fails `EPERM` on `C:\Users` for any repository under a user profile.
+#[cfg(windows)]
+pub fn prepare_appcontainer_profile_parent(
+) -> std::result::Result<(std::path::PathBuf, bool), String> {
+    crate::appcontainer_windows::prepare_appcontainer_profile_parent()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn prepare_appcontainer_profile_parent(
+) -> std::result::Result<(std::path::PathBuf, bool), String> {
+    Err("AppContainer profile-parent preparation is available only on Windows".to_string())
+}
+
 /// Reapply and verify the documented AppContainer security descriptor on the
 /// Windows null device. The kernel resets it at boot, so host preparation runs
 /// this elevated mutation alongside the persistent drive-root ACEs.

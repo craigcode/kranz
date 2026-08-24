@@ -148,13 +148,28 @@ pub struct ResolvedSandbox {
     pub container: Option<crate::sandbox_container::ContainerSpec>,
 }
 
-/// Expand a leading `~/` in `raw` using the `HOME` env var; otherwise return
-/// `raw` unchanged as a `PathBuf`. `pub(crate)` so the engine-run gate wrap
-/// (`crate::command_exec::resolve_gate_sandbox`) builds `extra_write` inputs
-/// with the SAME expansion sessions get — never a second hand-rolled rule.
+/// Expand a leading `~/` (or `~\` on Windows) in `raw` using the platform home
+/// variable; otherwise return `raw` unchanged as a `PathBuf`. `pub(crate)` so
+/// the engine-run gate wrap (`crate::command_exec::resolve_gate_sandbox`)
+/// builds `extra_write` inputs with the SAME expansion sessions get — never a
+/// second hand-rolled rule.
+///
+/// Windows reads `USERPROFILE`, matching [`crate::paths::global_config`]. A
+/// natively launched `kranz.exe` has no `HOME` (only shells like Git Bash
+/// inject one), so keying solely off `HOME` silently left `~/...` literal and
+/// the sandbox grant then pointed at a directory named `~`.
 pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    let rest = raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix("~\\")
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = rest {
+        if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|value| !value.is_empty())
+        {
             return PathBuf::from(home).join(rest);
         }
     }
@@ -594,7 +609,21 @@ pub(crate) fn command_available(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+    // Windows PATH entries carry no extension; the executable suffixes live in
+    // PATHEXT. Probing the bare name alone reports every Windows executable as
+    // missing (`grep` vs `grep.exe`).
+    let mut candidates = vec![name.to_string()];
+    if cfg!(windows) {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        candidates.extend(
+            pathext
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| format!("{name}{ext}")),
+        );
+    }
+    std::env::split_paths(&path).any(|dir| candidates.iter().any(|name| dir.join(name).is_file()))
 }
 
 /// Absolutize a path without requiring it to exist: canonicalize if possible,
@@ -1386,6 +1415,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use std::sync::Mutex;
+
+    /// `extra_write: ["~/cache"]` must resolve against the platform home.
+    /// Regression: this read `HOME` only, which a natively launched
+    /// `kranz.exe` does not have (Git Bash injects one; cmd/PowerShell/
+    /// Explorer do not), so the entry stayed the literal `~/cache` and the
+    /// sandbox grant silently targeted a directory named `~`.
+    #[test]
+    fn expand_tilde_uses_the_platform_home_variable() {
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
+        assert_eq!(expand_tilde("~notatilde"), PathBuf::from("~notatilde"));
+
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("the platform home variable is always set on a real host");
+        let expanded = expand_tilde("~/cache");
+        assert_eq!(expanded, PathBuf::from(&home).join("cache"));
+        assert!(
+            expanded.is_absolute(),
+            "an expanded home path must be absolute: {expanded:?}"
+        );
+
+        #[cfg(windows)]
+        assert_eq!(expand_tilde(r"~\cache"), PathBuf::from(&home).join("cache"));
+    }
 
     #[cfg(target_os = "macos")]
     static SANDBOX_EXEC_TEST_LOCK: Mutex<()> = Mutex::new(());

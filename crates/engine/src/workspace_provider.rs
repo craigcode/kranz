@@ -817,6 +817,7 @@ impl MissionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_shell::{file_exists, if_file_exists, write_line};
     use crate::workspace_contract::parse_workspace_contract;
 
     fn ws_config(provider: Option<&str>) -> WorkspaceConfig {
@@ -1090,7 +1091,7 @@ mod tests {
     /// exactly like run-start resolution.
     #[test]
     fn pin_records_isolation_mode_and_contract_version() {
-        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
 
         let pinned =
             pin(&ws_config(None), WorkerIsolation::Worktree, Some(&contract)).expect("pin");
@@ -1143,7 +1144,7 @@ mod tests {
     /// refuses approval with the missing key named.
     #[test]
     fn remote_workspace_pin_populates_provider_template_and_adapter_version() {
-        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+        let contract = contract(br#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
         let config = WorkspaceConfig {
             provider: Some("remote".to_string()),
             remote: Some(remote_block()),
@@ -1409,21 +1410,32 @@ mod tests {
 
     /// Lifecycle order (D-D), proven by markers each step asserts before
     /// writing its own: clone → migrate → bootstrap → readiness → skewCheck.
-    /// Shell lines stay sh/cmd portable (echo / > / && / test -f only).
+    /// Shell lines come from [`crate::test_shell`] so they parse under BOTH
+    /// `sh -c` and `cmd /C`; `test -f` was previously inlined here as though
+    /// portable, but cmd.exe has no such builtin and Windows ships no
+    /// `test.exe`, so this only passed where Git's `usr/bin` was on PATH.
     #[tokio::test]
     async fn readiness_runs_data_hooks_in_lifecycle_order() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let clone_cmd = write_line("cloned", ".clone-marker");
+        let migrate_cmd = if_file_exists(".clone-marker", &write_line("mig", ".migrate-marker"));
+        let skew_cmd = if_file_exists(".boot-marker", &write_line("checked", ".skew-marker"));
+        let bootstrap_cmd = if_file_exists(".migrate-marker", &write_line("boot", ".boot-marker"));
+        let readiness_cmd = file_exists(".boot-marker");
         let contract = contract(
-            br#"{
+            format!(
+                r#"{{
                 "schemaVersion": 1,
-                "data": {
-                    "clone": "echo cloned > .clone-marker",
-                    "migrate": "test -f .clone-marker && echo mig > .migrate-marker",
-                    "skewCheck": "test -f .boot-marker && echo checked > .skew-marker"
-                },
-                "bootstrap": ["test -f .migrate-marker && echo boot > .boot-marker"],
-                "readiness": ["test -f .boot-marker"]
-            }"#,
+                "data": {{
+                    "clone": "{clone_cmd}",
+                    "migrate": "{migrate_cmd}",
+                    "skewCheck": "{skew_cmd}"
+                }},
+                "bootstrap": ["{bootstrap_cmd}"],
+                "readiness": ["{readiness_cmd}"]
+            }}"#
+            )
+            .as_bytes(),
         );
         let handle = LocalWorktreeProvider
             .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
@@ -1445,13 +1457,13 @@ mod tests {
         assert_eq!(
             progress.summaries(),
             vec![
-                "workspace data: clone `echo cloned > .clone-marker` → ok (exit code 0)",
-                "workspace data: migrate `test -f .clone-marker && echo mig > .migrate-marker` → ok (exit code 0)",
-                "workspace bootstrap: running 1 commands",
-                "workspace bootstrap: 1/1 commands ok",
-                "workspace readiness: running 1 checks",
-                "workspace readiness: 1/1 checks ok",
-                "workspace data: skewCheck `test -f .boot-marker && echo checked > .skew-marker` → ok (exit code 0)",
+                format!("workspace data: clone `{clone_cmd}` → ok (exit code 0)"),
+                format!("workspace data: migrate `{migrate_cmd}` → ok (exit code 0)"),
+                "workspace bootstrap: running 1 commands".to_string(),
+                "workspace bootstrap: 1/1 commands ok".to_string(),
+                "workspace readiness: running 1 checks".to_string(),
+                "workspace readiness: 1/1 checks ok".to_string(),
+                format!("workspace data: skewCheck `{skew_cmd}` → ok (exit code 0)"),
             ]
         );
     }
@@ -1461,16 +1473,20 @@ mod tests {
     #[tokio::test]
     async fn readiness_data_clone_failure_stops_before_migrate_and_bootstrap() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let readiness_cmd = file_exists(".boot-marker");
         let contract = contract(
-            br#"{
+            format!(
+                r#"{{
                 "schemaVersion": 1,
-                "data": {
+                "data": {{
                     "clone": "exit 42",
                     "migrate": "echo mig > .migrate-marker"
-                },
+                }},
                 "bootstrap": ["echo boot > .boot-marker"],
-                "readiness": ["test -f .boot-marker"]
-            }"#,
+                "readiness": ["{readiness_cmd}"]
+            }}"#
+            )
+            .as_bytes(),
         );
         let handle = LocalWorktreeProvider
             .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
@@ -1508,16 +1524,20 @@ mod tests {
     #[tokio::test]
     async fn readiness_skew_failure_is_the_distinct_skew_outcome() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let readiness_cmd = file_exists(".boot-marker");
         let contract = contract(
-            br#"{
+            format!(
+                r#"{{
                 "schemaVersion": 1,
-                "data": {
+                "data": {{
                     "migrate": "echo mig > .migrate-marker",
                     "skewCheck": "exit 1"
-                },
+                }},
                 "bootstrap": ["echo boot > .boot-marker"],
-                "readiness": ["test -f .boot-marker"]
-            }"#,
+                "readiness": ["{readiness_cmd}"]
+            }}"#
+            )
+            .as_bytes(),
         );
         let handle = LocalWorktreeProvider
             .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))

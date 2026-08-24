@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-21
+last_verified: 2026-08-24
 verified_against:
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
@@ -33,8 +33,13 @@ cargo build --workspace
 `.github/workflows/ci.yml` runs fmt/clippy/workspace tests on Ubuntu and
 Windows (no standalone `build` job — `cargo test` covers it), a separate macOS
 workspace suite, and a wrapped macOS dogfood suite. The Windows lane begins
-with the explicit minimal drive-root and per-boot null-device host-preparation
-step, then runs the production LPAC/AppContainer containment receipts. The
+with the explicit minimal host-preparation step — drive-root and derived
+profile-parent metadata ACEs plus the per-boot null-device descriptor — then
+runs the production LPAC/AppContainer containment receipts. It ends with a
+stock-developer-box regression guard that re-runs the exposed targets from
+`cmd.exe` with Git's `usr/bin` stripped from PATH, because the ordinary lane
+runs under `pwsh` (which never sets the `=ExitCode` pseudo variable) and with
+POSIX coreutils present, and so cannot observe either failure class. The
 Ubuntu lane enables unprivileged user namespaces on its ephemeral runner and
 executes the real bubblewrap hostile-boundary and warm-overhead receipt. The
 MSRV lane runs

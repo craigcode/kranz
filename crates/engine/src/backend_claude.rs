@@ -64,27 +64,13 @@ const STDERR_TAIL_CHARS: usize = 500;
 #[cfg(windows)]
 pub(crate) mod win_job {
     use std::os::windows::io::RawHandle;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-        TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-
-    // `windows` 0.58 gates its `CreateJobObjectW` wrapper behind the
-    // `Win32_Security` feature (its signature names `SECURITY_ATTRIBUTES`),
-    // and this crate's manifest deliberately does not enable that feature. We
-    // only ever pass a null security descriptor and null name, so we declare
-    // the raw kernel32 import ourselves — no `SECURITY_ATTRIBUTES` type is
-    // needed. The ungated `SetInformationJobObject`/`AssignProcessToJobObject`/
-    // `TerminateJobObject`/`CloseHandle` wrappers are used as-is above.
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateJobObjectW(
-            lpjobattributes: *const core::ffi::c_void,
-            lpname: *const u16,
-        ) -> *mut core::ffi::c_void;
-    }
 
     /// RAII owner of a Job Object `HANDLE`. `Drop` calls `CloseHandle` exactly
     /// once, which (because the job was created with
@@ -117,16 +103,17 @@ pub(crate) mod win_job {
         /// the caller treats a job-setup failure as non-fatal (the child still
         /// runs, just without tree-kill — same as the pre-job behaviour).
         pub(crate) fn create_and_assign(child_handle: RawHandle) -> windows::core::Result<Self> {
-            // SAFETY: CreateJobObjectW with a null SECURITY_ATTRIBUTES pointer
-            // and a null name creates an unnamed, default-security job. It
-            // returns a null handle on failure (GetLastError set), which we map
-            // to a windows Error via `from_thread` (the last-OS-error
-            // constructor; `from_win32` was removed in windows 0.62).
-            let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if raw_job.is_null() {
-                return Err(windows::core::Error::from_thread());
-            }
-            let job = HANDLE(raw_job);
+            // SAFETY: `None` security attributes plus a null name creates an
+            // unnamed, default-security job. The crate's own wrapper maps a
+            // null return to the thread's last OS error, so no manual
+            // GetLastError handling is needed here.
+            //
+            // This used a hand-declared `extern "system"` kernel32 import,
+            // justified by a comment claiming the manifest does not enable the
+            // `Win32_Security` feature that gates this wrapper. It does enable
+            // it (crates/engine/Cargo.toml), so the raw import was only
+            // discarding the crate's type checking.
+            let job = unsafe { CreateJobObjectW(None, PCWSTR::null())? };
             // Wrap immediately so any early return below still closes the job.
             let guard = JobHandle { job };
 

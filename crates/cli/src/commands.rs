@@ -107,6 +107,22 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                     target.display()
                 );
             }
+            // Derived from USERPROFILE, never operator-supplied. Windows tools
+            // lstat every ancestor during module resolution, so a contained
+            // Node gate fails EPERM on the profile parent without this.
+            eprintln!("Preparing AppContainer profile-parent metadata (derived from USERPROFILE)");
+            let (profile_parent, profile_changed) =
+                kranz_engine::sandbox_windows::prepare_appcontainer_profile_parent()
+                    .map_err(anyhow::Error::msg)?;
+            let profile_result = if profile_changed {
+                "applied"
+            } else {
+                "already prepared"
+            };
+            println!(
+                "AppContainer profile-parent preparation {profile_result}: target={} mask=0x00120088 inheritance=none",
+                profile_parent.display()
+            );
             eprintln!("Preparing AppContainer null-device metadata: target=\\Device\\Null");
             kranz_engine::sandbox_windows::prepare_appcontainer_null_device()
                 .map_err(anyhow::Error::msg)?;

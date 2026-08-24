@@ -508,19 +508,40 @@ fn is_env_assignment(token: &str) -> bool {
 /// - A program containing a path separator is checked as a filesystem path
 ///   (it names its own location; PATH does not apply).
 /// - A bare name is looked up across every `PATH` entry.
-/// - Common POSIX shell builtins that have no on-disk binary (`cd`, `:`,
-///   `true`, `false`, `echo`, `test`, `[`) always resolve — a contract line
-///   like `cd . && …` must never warn.
+/// - Common shell builtins that have no on-disk binary (`cd`, `:`, `true`,
+///   `false`, `echo`, `test`, `[`, `exit`) always resolve — a contract line
+///   like `cd . && …` must never warn. On Windows the shell is `cmd`, so its
+///   own builtins (`if`, `for`, `call`, …) resolve too: a portable contract
+///   line like `if exist X (exit 0) else (exit 1)` names no program at all.
 ///
 /// On non-unix hosts the executable-bit check is skipped (mere existence in a
 /// PATH dir counts), and `.exe`/`.bat`/`.cmd` variants are also accepted.
 fn program_resolves(program: &str) -> bool {
     // Shell builtins with no backing binary — never a missing prerequisite.
+    // `exit` belongs here for both shells: it is the portable way to write a
+    // deterministic success/failure assertion and has no binary anywhere.
     const BUILTINS: &[&str] = &[
-        "cd", ":", "true", "false", "echo", "test", "[", "set", "export", "unset",
+        "cd", ":", "true", "false", "echo", "test", "[", "set", "export", "unset", "exit",
+    ];
+    // cmd.exe control-flow builtins. Deliberately excludes names that DO have
+    // a real Windows binary (`find`, `sort`, `more`), so a genuinely missing
+    // prerequisite is still flagged.
+    #[cfg(windows)]
+    const CMD_BUILTINS: &[&str] = &[
+        "if", "for", "call", "goto", "rem", "pushd", "popd", "ver", "type", "del", "copy", "move",
+        "md", "mkdir", "rd", "rmdir",
     ];
     if BUILTINS.contains(&program) {
         return true;
+    }
+    // cmd resolves builtins case-insensitively; `sh` does not, so fold only
+    // where the shell actually would.
+    #[cfg(windows)]
+    {
+        let folded = program.to_ascii_lowercase();
+        if BUILTINS.contains(&folded.as_str()) || CMD_BUILTINS.contains(&folded.as_str()) {
+            return true;
+        }
     }
 
     // A path-bearing program names its own location; PATH does not apply.

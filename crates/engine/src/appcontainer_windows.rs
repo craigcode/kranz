@@ -423,8 +423,21 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     }
     .map(OwnedHandle)
     .map_err(|error| {
+        // A drive root is the one path here an operator cannot fix by editing
+        // a config: it needs the one-time elevated host preparation. Name that
+        // command, otherwise the first Windows operator sees only
+        // "Access is denied. (0x80070005)" and has nowhere to go.
+        let remedy = if path.parent().is_none() {
+            format!(
+                "; run the one-time elevated host preparation first: \
+                 kranz sandbox-prepare --target {}",
+                path.display()
+            )
+        } else {
+            String::new()
+        };
         EngineError::Backend(format!(
-            "failed to retain no-follow DACL capability for {}: {error}",
+            "failed to retain no-follow DACL capability for {}: {error}{remedy}",
             path.display()
         ))
     })?;
@@ -698,6 +711,66 @@ pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
     Ok(changed_any || changed_restricted)
 }
 
+/// Apply the same metadata-only ACEs to the PROFILE PARENT (`C:\Users`).
+///
+/// The target is DERIVED from `USERPROFILE`, never operator-supplied: this
+/// grants on a SYSTEM-owned directory shared by every AppContainer on the
+/// machine, so the only reachable target is the one Windows itself defines.
+///
+/// Needed because module resolution `lstat`s each ancestor. Node's
+/// `realpathSync` walks up to `C:\Users` and fails `EPERM` without
+/// `FILE_READ_ATTRIBUTES` there, so every Rust/Node merge gate under a normal
+/// profile-hosted repository failed closed. Bypass-traverse is not enough: it
+/// permits passing THROUGH a directory, not stat-ing the directory itself.
+///
+/// The mask is the same non-inheriting `0x00120088` used on the drive root —
+/// read attributes, read EA, read control, synchronize. It confers no
+/// directory listing, no file content, and no write.
+#[cfg(windows)]
+pub(crate) fn prepare_appcontainer_profile_parent() -> Result<(PathBuf, bool)> {
+    let parent = profile_parent().ok_or_else(|| {
+        EngineError::Backend(
+            "USERPROFILE is unset or has no parent, so the AppContainer profile parent cannot be derived"
+                .to_string(),
+        )
+    })?;
+    if volume_root(&parent) {
+        // A profile at `C:\craig` would make the parent the drive root, which
+        // the drive-root path already covers. Never double-apply.
+        return Ok((parent, false));
+    }
+    if !parent.is_dir() {
+        return Err(EngineError::Backend(format!(
+            "derived AppContainer profile parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer profile-parent preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    let _guard = DaclMutationGuard::acquire()?;
+    let mut any_package = string_sid("S-1-15-2-1", "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let changed_any = apply_named_root_metadata_ace(
+        &parent,
+        PSID(any_package.as_mut_ptr().cast()),
+        "ALL APPLICATION PACKAGES (S-1-15-2-1)",
+    )?;
+    let changed_restricted = apply_named_root_metadata_ace(
+        &parent,
+        PSID(restricted.as_mut_ptr().cast()),
+        "ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)",
+    )?;
+    verify_volume_root_prepared(&parent)?;
+    Ok((parent, changed_any || changed_restricted))
+}
+
 fn open_null_device(write: bool) -> Result<OwnedHandle> {
     let mut desired_access = GENERIC_READ.0 | READ_CONTROL.0;
     if write {
@@ -939,6 +1012,63 @@ fn verify_volume_root_prepared(root: &Path) -> Result<()> {
         root.display(),
         root.display()
     )))
+}
+
+/// Read a path's DACL bytes WITHOUT asking for `WRITE_DAC`.
+///
+/// [`snapshot_dacl`] requests `READ_CONTROL | WRITE_DAC` because a lease will
+/// later restore what it changed. The volume root is never one of those paths:
+/// [`ancestor_directories`] deliberately stops before it, and the ordinary
+/// launcher only calls [`verify_volume_root_prepared`], which is read-only.
+/// The self-test's before/after volume-root comparison is likewise pure
+/// evidence — it never restores — so asking for `WRITE_DAC` there demanded an
+/// elevated token for a read, and that alone made the M7 receipt unobtainable
+/// without elevation on an otherwise correctly prepared host.
+fn read_dacl_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    let path_wide = wide(path.as_os_str());
+    // SAFETY: `path_wide` is a live NUL-terminated UTF-16 buffer. READ_CONTROL
+    // alone is enough to read a security descriptor; the backup/reparse flags
+    // match the mutating path so both observe the same object.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| {
+        EngineError::Backend(format!(
+            "failed to read the DACL of {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut acl: *mut ACL = null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32(unsafe {
+        GetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut acl),
+            None,
+            Some(&mut descriptor),
+        )
+    })?;
+    let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    if acl.is_null() {
+        return Ok(None);
+    }
+    let len = unsafe { (*acl).AclSize as usize };
+    Ok(Some(
+        unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), len) }.to_vec(),
+    ))
 }
 
 fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
@@ -1716,7 +1846,7 @@ fn path_under_env(path: &Path, name: &str) -> bool {
 }
 
 fn system_managed_path(path: &Path) -> bool {
-    [
+    if [
         "SystemRoot",
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
@@ -1724,6 +1854,33 @@ fn system_managed_path(path: &Path) -> bool {
     ]
     .iter()
     .any(|name| path_under_env(path, name))
+    {
+        return true;
+    }
+    // The PROFILE PARENT (`C:\Users`) belongs in this list too. It is
+    // SYSTEM-owned and carries no app-package ACE, exactly like
+    // `%PROGRAMFILES%`, so an unelevated operator cannot lease it — and every
+    // Windows developer keeps repositories, `CARGO_HOME` and `RUSTUP_HOME`
+    // beneath it. Walking into it made `ancestor_directories` demand
+    // WRITE_DAC on `C:\Users` and the production GATE WRAP fail closed with
+    // "Access is denied. (0x80070005)" for any non-elevated run.
+    //
+    // The traverse grant it was reaching for is not needed: bypass-traverse
+    // (SeChangeNotifyPrivilege, held by Everyone including AppContainers)
+    // already lets the child reach paths underneath. The phase-4 hostile
+    // receipt demonstrates this directly — it reads and writes under
+    // `%TEMP%`, i.e. below `C:\Users`, with no ACE anywhere on `C:\Users`.
+    //
+    // Hosted CI never reached this: its workspace and temp live on `D:\a\...`,
+    // whose walk stops at the volume root, and its runner is elevated anyway.
+    profile_parent().is_some_and(|parent| comparable_path(path) == comparable_path(&parent))
+}
+
+/// `C:\Users` — the directory holding every user profile, not the profile.
+fn profile_parent() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .and_then(|profile| profile.parent().map(Path::to_path_buf))
 }
 
 fn caller_owned_path(path: &Path, cwd: &Path) -> bool {
@@ -2503,6 +2660,35 @@ fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> 
     ))
 }
 
+/// True for the documented per-drive current-directory pseudo variable (`=C:`),
+/// the ONE `=`-prefixed name an explicit environment block may carry.
+fn is_drive_current_directory_key(key: &OsStr) -> bool {
+    let units: Vec<u16> = key.encode_wide().collect();
+    is_drive_current_directory_units(&units)
+}
+
+fn is_drive_current_directory_units(units: &[u16]) -> bool {
+    let drive_letter = units.get(1).is_some_and(|unit| {
+        (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
+            || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
+    });
+    units.len() == 3 && units[0] == b'=' as u16 && drive_letter && units[2] == b':' as u16
+}
+
+/// Windows exposes pseudo variables whose names contain `=`: the per-drive
+/// current-directory entries (`=C:`) and cmd.exe's `=ExitCode` /
+/// `=ExitCodeAscii`, which it sets after the first command of a session.
+/// A name containing `=` cannot be encoded in an explicit environment block,
+/// and `CreateProcessW` never propagates these into one anyway — so DROP them
+/// while inheriting rather than refusing the whole launch. Before this filter,
+/// running `kranz` from any cmd.exe prompt made every enforced Windows session
+/// fail closed on `=ExitCode`; pwsh does not set it, so CI never saw it.
+/// The per-drive entry is kept, and the one for `cwd` is re-added deliberately
+/// below.
+fn inheritable_environment_key(key: &OsStr) -> bool {
+    !key.encode_wide().any(|unit| unit == b'=' as u16) || is_drive_current_directory_key(key)
+}
+
 fn environment_block(
     cwd: &Path,
     path: Option<&str>,
@@ -2510,6 +2696,9 @@ fn environment_block(
 ) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
+        if !inheritable_environment_key(&key) {
+            continue;
+        }
         let folded = key.to_string_lossy().to_ascii_uppercase();
         values.insert(folded, (key, value));
     }
@@ -2547,12 +2736,7 @@ fn environment_block(
     for (_folded, (key, value)) in values {
         let key: Vec<u16> = key.encode_wide().collect();
         let value: Vec<u16> = value.encode_wide().collect();
-        let drive_letter = key.get(1).is_some_and(|unit| {
-            (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
-                || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
-        });
-        let drive_current_directory =
-            key.len() == 3 && key[0] == b'=' as u16 && drive_letter && key[2] == b':' as u16;
+        let drive_current_directory = is_drive_current_directory_units(&key);
         if key.is_empty()
             || key.contains(&0)
             || (key.contains(&(b'=' as u16)) && !drive_current_directory)
@@ -2896,7 +3080,8 @@ fn production_hostile_self_test() -> Result<String> {
             executable.display()
         ))
     })?;
-    let volume_root_before = snapshot_dacl(&volume_root)?;
+    // Read-only: this pair is evidence, never restored (see read_dacl_bytes).
+    let volume_root_before = read_dacl_bytes(&volume_root)?;
     // Both leases touch the same worktree, toolchain, scratch, and Git roots.
     // Dropping the first must remove only its own SID, leaving the second
     // launch functional; dropping the second must recover the exact baseline.
@@ -2932,7 +3117,7 @@ fn production_hostile_self_test() -> Result<String> {
         })?;
     drop(lease);
     let after = snapshot_dacl(&worktree)?;
-    let volume_root_after = snapshot_dacl(&volume_root)?;
+    let volume_root_after = read_dacl_bytes(&volume_root)?;
     if !output.status.success() {
         return Err(EngineError::Backend(format!(
             "production AppContainer helper failed with {:?}: stdout={} stderr={}",
@@ -2948,7 +3133,7 @@ fn production_hostile_self_test() -> Result<String> {
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
     receipt.dacl_restored = before.acl == after.acl;
-    receipt.volume_root_dacl_restored = volume_root_before.acl == volume_root_after.acl;
+    receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
         format!("gitdir: {}\n", outside.display()),
@@ -3727,6 +3912,29 @@ mod tests {
             local_volume_root(Path::new(r"\\server\share\node.exe")),
             None
         );
+    }
+
+    /// Regression: cmd.exe sets `=ExitCode` after its first command, so every
+    /// enforced Windows session launched from a cmd prompt used to fail closed
+    /// with "cleared AppContainer environment contains an invalid key/value".
+    /// pwsh does not set it, which is why hosted CI never reproduced this.
+    #[test]
+    fn cmd_exe_pseudo_variables_are_dropped_while_drive_entries_survive() {
+        for dropped in ["=ExitCode", "=ExitCodeAscii", "=::", "a=b"] {
+            assert!(
+                !inheritable_environment_key(OsStr::new(dropped)),
+                "{dropped} must not be inherited into an explicit block"
+            );
+        }
+        for kept in ["=C:", "=d:", "PATH", "USERPROFILE", ""] {
+            assert!(
+                inheritable_environment_key(OsStr::new(kept)),
+                "{kept} must survive inheritance"
+            );
+        }
+        assert!(is_drive_current_directory_key(OsStr::new("=Z:")));
+        assert!(!is_drive_current_directory_key(OsStr::new("=ExitCode")));
+        assert!(!is_drive_current_directory_key(OsStr::new("=1:")));
     }
 
     #[test]

@@ -215,6 +215,33 @@ jobs:
       # --no-fail-fast: report every failing test target, not just the first,
       # so a cross-platform break surfaces in one run instead of one per push.
       - run: cargo test --workspace --no-fail-fast
+      # Regression guard for two Windows failure classes the step above
+      # STRUCTURALLY CANNOT see, both found only by building on a real
+      # workstation:
+      #
+      #   1. `run:` defaults to pwsh on Windows, which never sets the
+      #      `=ExitCode` pseudo variable. cmd.exe sets it after its first
+      #      command, and it used to make every enforced AppContainer session
+      #      fail closed while constructing the child environment block.
+      #   2. Hosted runners carry Git's `usr/bin` on PATH, supplying the POSIX
+      #      `true`/`false`/`test` that fixtures must not depend on. A stock
+      #      Windows box has only `Git\cmd`, so those fixtures failed there
+      #      while CI stayed green.
+      #
+      # Re-run only the exposed targets (compilation is already warm, so this
+      # is test execution, ~7 min) the way a stock developer box looks:
+      # launched from cmd.exe, with those coreutils removed.
+      - name: Windows stock-box regression guard (cmd.exe, no POSIX coreutils)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set "PATH=%PATH:C:\Program Files\Git\usr\bin;=%"
+          set "PATH=%PATH:;C:\Program Files\Git\usr\bin=%"
+          rem Fail loudly rather than guard nothing if the image moves Git.
+          where true >nul 2>&1 && (echo GUARD VACUOUS: POSIX coreutils still on PATH & exit /b 1) || echo coreutils absent as intended
+          where git >nul 2>&1 || (echo git must stay on PATH & exit /b 1)
+          cargo test -p kranz-engine --lib --no-fail-fast
+          cargo test -p kranz-engine --test mission_test --test worktree_isolation --no-fail-fast
 
   # Dedicated macOS job (not folded into the matrix above) so the Seatbelt
   # sandbox and unix process-group/kill paths run in CI. macOS runs tests

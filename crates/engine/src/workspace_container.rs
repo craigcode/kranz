@@ -1590,6 +1590,12 @@ mod tests {
     /// assertion mid-test may leave a project behind.
     #[tokio::test]
     async fn container_workspace_smoke_provisions_isolates_and_destroys() {
+        if !sandbox_container::host_supports_container_contract() {
+            eprintln!(
+                "container provider is macOS/Linux only; skipping container workspace smoke test on this host"
+            );
+            return;
+        }
         let Some(runtime) = sandbox_container::detect() else {
             eprintln!(
                 "no container runtime (docker/podman/nerdctl/container) on PATH; \
