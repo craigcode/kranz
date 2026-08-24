@@ -143,6 +143,11 @@ jobs:
           # Native Windows-on-ARM. Without it, ARM users run the x86_64 asset
           # under emulation — correct, but it makes the M7 operator overhead
           # receipt (measured on aarch64) attest no shipped artifact.
+          #
+          # This leg was proven before v0.2.0 shipped rather than discovered
+          # mid-release: a branch probe built this exact target on this exact
+          # runner, confirmed the PE machine word is 0xAA64, and ran the
+          # binary (run 32764000460, 10m17s).
           - os: windows-11-arm
             asset: kranz-windows-aarch64
             bin: kranz.exe
@@ -162,6 +167,11 @@ jobs:
       # chacha-armv8.o. clang is REQUIRED on this leg, not merely nice to
       # have. (aws-lc is pulled in by rustls feature unification even though
       # main() installs the ring provider — see crates/cli/src/main.rs.)
+      #
+      # NOTE: as of the 2026-08 image the runner already ships clang, so the
+      # guard below short-circuits and the `choco install` path is UNPROVEN.
+      # It is kept as insurance against a future image dropping it, which is
+      # precisely the failure that blocks an ARM64 build.
       - name: Install clang for aws-lc-sys (Windows ARM64)
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
