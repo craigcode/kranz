@@ -94,6 +94,25 @@ pub fn detect() -> Option<ContainerRuntime> {
     detect_with(crate::sandbox::command_available)
 }
 
+/// Whether this host can actually honor the shipped container contract, as
+/// opposed to merely having a runtime binary on PATH.
+///
+/// Detection answers "is there a `docker`?"; this answers "can it run what we
+/// ship?". They diverge on Windows: `docker.exe` is present, but the contract
+/// uses POSIX guest paths and the daemon defaults to Windows-container mode,
+/// where the Linux images cannot even be pulled —
+/// `no matching manifest for windows(10.0.26100)/amd64`. Session and gate
+/// resolution already fail closed there (see the module docs), so live
+/// container tests must SKIP on Windows rather than exercise a path the
+/// provider refuses.
+///
+/// This was masked until now: `command_available` did not consult `PATHEXT`,
+/// so `detect()` never saw `docker.exe` and the Windows container tests took
+/// their silent skip path and reported `ok` without running.
+pub fn host_supports_container_contract() -> bool {
+    !cfg!(windows)
+}
+
 /// Detection with an injectable PATH lookup so tests control availability.
 pub fn detect_with(lookup: impl Fn(&str) -> bool) -> Option<ContainerRuntime> {
     ContainerRuntime::PREFERENCE_ORDER
@@ -139,6 +158,32 @@ fn mount_arg(host_abs: &str, read_only: bool) -> String {
     )
 }
 
+/// The host spelling a `-v` spec may carry.
+///
+/// Mount specs are colon-delimited, and a Windows VERBATIM path
+/// (`\\?\C:\...`) makes the runtime's parser count too many colons:
+///
+/// ```text
+/// docker: invalid spec: \\?\C:\...:\\?\C:\...: too many colons
+/// ```
+///
+/// [`crate::sandbox::absolutize`] canonicalizes, and Windows canonicalization
+/// ALWAYS returns the verbatim form, so every container mount on Windows hit
+/// this. Strip the prefix exactly as `GitRepo::git_path_arg` does for git.
+/// A verbatim UNC path (`\\?\UNC\server\share`) is left untouched — it has no
+/// plain DOS spelling to fall back to.
+fn container_host_path(path: &Path) -> String {
+    let absolute = crate::sandbox::absolutize(path);
+    let rendered = absolute.as_os_str().to_string_lossy();
+    #[cfg(windows)]
+    if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        if !rest.starts_with("UNC") {
+            return rest.to_string();
+        }
+    }
+    rendered.into_owned()
+}
+
 /// `run --rm -i --read-only` — the shared prologue: the writable set is
 /// exactly the declared mounts; everything else is denied by the runtime.
 fn run_prologue() -> Vec<String> {
@@ -162,7 +207,7 @@ fn run_prologue() -> Vec<String> {
 fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
     let mut mounts: Vec<(String, bool)> = Vec::new();
     let mut add_mount = |path: &Path, ro: bool| {
-        let host = crate::sandbox::absolutize(path).display().to_string();
+        let host = container_host_path(path);
         if !mounts.iter().any(|(existing, _)| existing == &host) {
             mounts.push((host, ro));
         }
@@ -193,8 +238,9 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
     for name in ["serve.token", "serve.read.token", "config.json"] {
         let authority = session_root.join(".kranz").join(name);
         if authority.exists() {
+            // Same colon hazard as a `-v` spec: normalize the verbatim form.
             out.push("-v".to_string());
-            out.push(format!("/dev/null:{}:ro", authority.display()));
+            out.push(format!("/dev/null:{}:ro", container_host_path(&authority)));
         }
     }
 }
@@ -203,15 +249,12 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
 /// env: the session-private scratch doubles as the container's HOME/TMPDIR,
 /// so it is mounted at the identical host path and named in the env.
 fn push_workdir_and_scratch_env(out: &mut Vec<String>, inputs: &SandboxInputs) {
+    // `-w` and the HOME/TMPDIR values must name the SAME spelling the mounts
+    // used, or the working directory and scratch env point at paths the
+    // runtime never mounted.
     out.push("-w".to_string());
-    out.push(
-        crate::sandbox::absolutize(&inputs.session_cwd)
-            .display()
-            .to_string(),
-    );
-    let scratch = crate::sandbox::absolutize(&inputs.tmpdir)
-        .display()
-        .to_string();
+    out.push(container_host_path(&inputs.session_cwd));
+    let scratch = container_host_path(&inputs.tmpdir);
     out.push("-e".to_string());
     out.push(format!("HOME={scratch}"));
     out.push("-e".to_string());
@@ -261,14 +304,14 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
                 // the gate env's cache-only CARGO_HOME is forwarded instead.
                 let bin = host.join("bin");
                 if bin.is_dir() {
-                    let mounted = crate::sandbox::absolutize(&bin).display().to_string();
+                    let mounted = container_host_path(&bin);
                     out.push("-v".to_string());
                     out.push(mount_arg(&mounted, true));
                 }
                 continue;
             }
             if host.is_dir() {
-                let mounted = crate::sandbox::absolutize(&host).display().to_string();
+                let mounted = container_host_path(&host);
                 out.push("-v".to_string());
                 out.push(mount_arg(&mounted, true));
                 out.push("-e".to_string());
@@ -595,7 +638,7 @@ mod tests {
             None,
         );
         let joined = args.join(" ");
-        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+        let abs = |p: &std::path::Path| container_host_path(p);
 
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--read-only".to_string()));
@@ -632,7 +675,7 @@ mod tests {
             None,
         );
         let joined = args.join(" ");
-        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+        let abs = |p: &std::path::Path| container_host_path(p);
 
         for masked in [&masked_token_file, &config] {
             assert!(
@@ -702,7 +745,7 @@ mod tests {
             "kranz-gate-test",
         );
         let joined = args.join(" ");
-        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+        let abs = |p: &std::path::Path| container_host_path(p);
 
         // The session mount policy, unchanged.
         assert!(args.contains(&"--read-only".to_string()));
@@ -786,7 +829,7 @@ mod tests {
                 .collect();
         let args = container_gate_run_args(&inputs, &spec(), "true", &env, "kranz-gate-test");
         let joined = args.join(" ");
-        let abs = |p: &std::path::Path| crate::sandbox::absolutize(p).display().to_string();
+        let abs = |p: &std::path::Path| container_host_path(p);
 
         let root = abs(cargo.path());
         let bin = abs(&cargo.path().join("bin"));
@@ -877,6 +920,12 @@ mod tests {
     /// ubuntu-latest has docker.
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
+        if !host_supports_container_contract() {
+            eprintln!(
+                "container provider is macOS/Linux only; skipping live container smoke test on this host"
+            );
+            return;
+        }
         let Some(runtime) = detect() else {
             eprintln!(
                 "no container runtime (docker/podman/nerdctl/container) on PATH; skipping container smoke test"

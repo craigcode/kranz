@@ -719,6 +719,12 @@ async fn workspace_provider_provisions_the_integration_worktree() {
 /// host); CI ubuntu-latest has docker.
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_events_land_for_a_full_mission_run() {
+    if !kranz_engine::sandbox_container::host_supports_container_contract() {
+        eprintln!(
+            "container provider is macOS/Linux only; skipping container workspace engine test on this host"
+        );
+        return;
+    }
     let Some(runtime) = kranz_engine::sandbox_container::detect() else {
         eprintln!(
             "no container runtime (docker/podman/nerdctl/container) on PATH; \
@@ -855,6 +861,12 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
 /// (skips without a runtime; CI ubuntu-latest has docker).
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_terminal_teardown_hibernates_and_destroys() {
+    if !kranz_engine::sandbox_container::host_supports_container_contract() {
+        eprintln!(
+            "container provider is macOS/Linux only; skipping container terminal-teardown test on this host"
+        );
+        return;
+    }
     let Some(runtime) = kranz_engine::sandbox_container::detect() else {
         eprintln!(
             "no container runtime (docker/podman/nerdctl/container) on PATH; \
