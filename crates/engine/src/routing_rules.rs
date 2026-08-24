@@ -257,7 +257,10 @@ mod tests {
     #[test]
     fn routing_rules_config_reads_committed_base_bytes_only() {
         let Some((dir, repo)) = git_repo() else {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         };
         commit_rules(dir.path(), "main", VALID);
@@ -285,7 +288,10 @@ mod tests {
     #[test]
     fn routing_rules_config_mission_branch_edit_is_ignored_at_read() {
         let Some((dir, repo)) = git_repo() else {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         };
         commit_rules(dir.path(), "main", VALID);
@@ -330,7 +336,10 @@ mod tests {
     #[test]
     fn routing_rules_config_invalid_at_ref_fails_closed_owner_repo_setup() {
         let Some((dir, repo)) = git_repo() else {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         };
         commit_rules(
@@ -372,7 +381,10 @@ mod tests {
     #[test]
     fn routing_rules_config_empty_table_at_ref_fails_closed_missing_stays_none() {
         let Some((dir, repo)) = git_repo() else {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         };
         commit_rules(dir.path(), "main", "{}");

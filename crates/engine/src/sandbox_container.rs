@@ -921,14 +921,16 @@ mod tests {
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
         if !host_supports_container_contract() {
-            eprintln!(
-                "container provider is macOS/Linux only; skipping live container smoke test on this host"
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "container provider is macOS/Linux only",
             );
             return;
         }
         let Some(runtime) = detect() else {
-            eprintln!(
-                "no container runtime (docker/podman/nerdctl/container) on PATH; skipping container smoke test"
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "no docker/podman/nerdctl/container on PATH",
             );
             return;
         };

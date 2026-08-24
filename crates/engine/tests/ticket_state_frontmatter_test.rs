@@ -313,7 +313,10 @@ fn git_available() -> bool {
 fn init_repo() -> Option<(TempDir, std::path::PathBuf)> {
     isolate_git_env();
     if !git_available() {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         return None;
     }
     let dir = tempfile::tempdir().unwrap();

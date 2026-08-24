@@ -117,7 +117,10 @@ fn setup() -> bool {
     if git_available() {
         true
     } else {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         false
     }
 }
@@ -8364,7 +8367,10 @@ async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
         .map(|o| !o.status.success())
         .unwrap_or(true)
     {
-        eprintln!("sandbox-exec not found on this host; skipping");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::SANDBOX_EXEC,
+            "sandbox-exec not found on this host",
+        );
         return;
     }
     match std::process::Command::new("sandbox-exec")

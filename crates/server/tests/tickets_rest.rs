@@ -64,7 +64,10 @@ fn raw_git(dir: &Path, args: &[&str]) {
 fn init_git_repo() -> Option<TempDir> {
     isolate_git_env();
     if !git_available() {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         return None;
     }
     let dir = tempfile::tempdir().expect("tempdir");

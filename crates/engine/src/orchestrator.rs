@@ -10154,7 +10154,10 @@ pub(crate) mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         }
 
@@ -10256,7 +10259,10 @@ pub(crate) mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !git_ok {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return None;
         }
         let dir = tempfile::tempdir().expect("tempdir");

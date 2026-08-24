@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Done: the rust-macos job provisions Colima (brew install colima docker; colima start) so the live container tests execute instead of skipping, and declares KRANZ_REQUIRED_CAPABILITIES=git,sandbox-exec,container so a future runtime regression FAILS the job rather than silently reverting to skips - the anti-vacuity guard this ticket asked for, delivered by the mechanism from skipped-gates-are-indistinguishable-from-passes. NOT VERIFIED LOCALLY: no macOS host was available, so the Colima step, its runtime cost, and any macOS-specific container bug it surfaces are proven only by CI. Expect it to surface something - the equivalent Windows change did, immediately, and those bugs were real."
 title: The macOS container path is claimed-supported but never exercised in CI
 priority: 2
 schedule: once

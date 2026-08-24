@@ -1970,7 +1970,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !found {
-            eprintln!("sandbox-exec not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
             return false;
         }
         let smoke = std::process::Command::new("sandbox-exec")
@@ -1997,7 +2000,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn gate_wrap_bwrap_can_apply() -> bool {
         if !crate::sandbox::command_available("bwrap") {
-            eprintln!("bwrap not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::BWRAP,
+                "bwrap not found on this host",
+            );
             return false;
         }
         let smoke = std::process::Command::new("bwrap")

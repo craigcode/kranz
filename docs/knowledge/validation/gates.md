@@ -14,6 +14,7 @@ verified_against:
   - crates/engine/src/runner.rs
   - crates/cli/src/commands.rs
   - crates/engine/src/knowledge.rs
+  - crates/engine/src/test_capability.rs
   - .github/workflows/ci.yml
   - docs/tickets.md
 ---
@@ -71,6 +72,42 @@ cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'
 
 The `[1-9]` forces at least one passing test. Before shipping the filter, also
 confirm it does not collide with a pre-existing test name.
+
+## Runtime-gated tests: skip loudly, fail where required
+
+The rule above catches a filter matching zero tests. It does not catch the
+neighbouring shape: a test that RUNS, returns early because a tool is missing,
+and prints `ok`. libtest reports that identically to a test that did the work,
+and the explanatory `eprintln!` is captured and never shown — a passing test's
+output is swallowed, and a skipping test passes. So a capability can quietly
+stop being exercised while CI keeps reporting success.
+
+That is not hypothetical. `command_available` did not consult `PATHEXT`, so
+`sandbox_container::detect()` never found `docker.exe` and the Windows
+container tests skipped for the life of that lane. Fixing the lookup ran them
+for the first time and they immediately failed on two real bugs.
+
+Gate on [`test_capability`](../../../crates/engine/src/test_capability.rs)
+rather than a bare `eprintln!` + `return`:
+
+```rust
+let Some(runtime) = detect() else {
+    test_capability::skip(capability::CONTAINER, "no runtime on PATH");
+    return;
+};
+```
+
+Two mechanisms, because printing alone is not enough:
+
+- **`KRANZ_REQUIRED_CAPABILITIES`** names what a platform must actually
+  exercise. `skip` PANICS when a listed capability is missing, so a lane that
+  starts skipping goes red instead of quietly green. CI declares expectations
+  up front — ubuntu `git,bwrap,container,grep`; macOS `git,sandbox-exec,
+  container`; Windows only `git`, since the container provider is macOS/Linux
+  only and already fails closed there.
+- **`KRANZ_SKIP_LOG`** receives a ledger line per skip. A file survives
+  libtest's capture where stdout does not, and each lane prints the ledger
+  after the suite, so a green run still shows what it did not exercise.
 
 ## Empty-deliverable safety net
 

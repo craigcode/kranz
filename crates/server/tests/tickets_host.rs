@@ -53,7 +53,10 @@ fn setup() -> bool {
     if git_available() {
         true
     } else {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         false
     }
 }

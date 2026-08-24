@@ -214,7 +214,38 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: report every failing test target, not just the first,
       # so a cross-platform break surfaces in one run instead of one per push.
+      #
+      # KRANZ_REQUIRED_CAPABILITIES names what this platform must actually
+      # exercise. A runtime-gated test that returns early still prints `ok`, so
+      # without this a capability can quietly stop being tested while CI stays
+      # green — which is exactly how the Windows container tests hid two real
+      # bugs for the life of this lane. `test_capability::skip` panics instead
+      # of skipping when the missing capability is listed here.
+      #
+      # Windows deliberately omits `container`: the provider is macOS/Linux
+      # only and session and gate resolution already fail closed there. It also
+      # omits `bwrap` (Linux-only) and `sandbox-exec` (macOS-only).
       - run: cargo test --workspace --no-fail-fast
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: >-
+            ${{ matrix.os == 'ubuntu-latest'
+                && 'git,bwrap,container,grep'
+                || 'git' }}
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      # What the run did NOT exercise. libtest captures a passing test's
+      # output, and a skipping test passes, so without this ledger the skips
+      # are invisible in exactly the case that matters.
+      - name: Report capabilities this platform skipped
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/kranz-test-skips.log"
+          if [ -s "$log" ]; then
+            echo "Capability gates skipped on ${{ matrix.os }}:"
+            sort -u "$log"
+          else
+            echo "No capability gate skipped on ${{ matrix.os }}."
+          fi
       # Regression guard for two Windows failure classes the step above
       # STRUCTURALLY CANNOT see, both found only by building on a real
       # workstation:
@@ -256,7 +287,32 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      # macOS is a CLAIMED-supported container host (sandbox_container.rs:
+      # "Host support is deliberately macOS/Linux only"), but hosted macOS
+      # runners ship no container runtime, so every live container test took
+      # its skip path and the job reported `ok` for work it never did. Colima
+      # provides a Linux VM + Docker socket so the claim is exercised rather
+      # than asserted. `KRANZ_REQUIRED_CAPABILITIES` below then makes a future
+      # runtime regression FAIL instead of silently reverting to skips.
+      - name: Provision a container runtime (Colima)
+        run: |
+          brew install colima docker
+          colima start --cpu 2 --memory 4
+          docker version
       - run: cargo test --workspace --no-fail-fast
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec,container
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Report capabilities macOS skipped
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/kranz-test-skips.log"
+          if [ -s "$log" ]; then
+            echo "Capability gates skipped on macos-latest:"
+            sort -u "$log"
+          else
+            echo "No capability gate skipped on macos-latest."
+          fi
 
   # M7 tier-3 live proof: exercise the real Docker daemon, not an argv-only
   # mock. The worker gets an internal-only network; the fixture proves an

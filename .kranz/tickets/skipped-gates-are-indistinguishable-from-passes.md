@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Done: test_capability::skip replaces the bare eprintln+return at ~50 gate sites. Two mechanisms, because printing alone does not work - libtest swallows a passing test's output and a skipping test passes. KRANZ_REQUIRED_CAPABILITIES makes skip() PANIC when a required capability is missing (ubuntu git,bwrap,container,grep; macOS git,sandbox-exec,container; Windows git only, since the container provider is macOS/Linux-only and already fails closed there), so a lane that starts skipping goes red instead of quietly green. KRANZ_SKIP_LOG writes a ledger that survives libtest capture, and each lane prints it after the suite, so a green run still shows what it did not exercise. Verified both directions on Windows: skip-and-pass when unrequired, loud panic when required-but-absent, and the ledger captured a skip that produced no console output at all. Rule documented beside the existing anti-vacuity contract in docs/knowledge/validation/gates.md. Windows suite 2424 passed / 0 failed."
 title: A runtime-gated test that skips is indistinguishable from one that passes
 priority: 2
 schedule: once
@@ -44,16 +45,19 @@ anti-vacuity rule already exists to prevent, in a shape the rule does not cover.
 
 ## Done when
 
-- Skipped runtime gates are visible in CI output rather than captured. The
-  cheapest version is a shared helper the gates call instead of a bare
-  `eprintln!` + `return`, which records the skip somewhere the job surfaces.
-- CI asserts on the EXPECTED set of skips per platform, so a newly-skipping
-  test fails the job. A Linux lane that starts skipping its container tests
-  should go red, not quietly green. The expected set is platform-specific:
-  Windows legitimately skips the container path, Linux must not.
-- The rule is written down beside the existing anti-vacuity contract in
-  `docs/knowledge/validation/gates.md` and AGENTS.md, so the next runtime-gated
-  test is written with it in mind.
+- [x] Skipped runtime gates are visible in CI output. `test_capability::skip`
+  writes a ledger to `KRANZ_SKIP_LOG`, which survives libtest capture — the
+  printed marker alone does NOT, because a skipping test passes and libtest
+  swallows a passing test's output. Each lane prints the ledger afterwards.
+- [x] CI declares the expected capabilities per platform rather than asserting
+  a skip list after the fact. `KRANZ_REQUIRED_CAPABILITIES` makes
+  `test_capability::skip` PANIC when a required capability is missing, so a
+  lane that starts skipping goes red. ubuntu requires git,bwrap,container,grep;
+  macOS git,sandbox-exec,container; Windows only git — it legitimately skips
+  the container path.
+- [x] The rule is written down beside the existing anti-vacuity contract in
+  `docs/knowledge/validation/gates.md`, so the next runtime-gated test is
+  written with it in mind.
 
 ## Notes
 

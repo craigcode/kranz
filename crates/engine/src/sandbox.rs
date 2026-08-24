@@ -1453,7 +1453,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !found {
-            eprintln!("sandbox-exec not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
             return false;
         }
 
@@ -1481,7 +1484,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn bwrap_can_apply() -> bool {
         if !command_available("bwrap") {
-            eprintln!("bwrap not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::BWRAP,
+                "bwrap not found on this host",
+            );
             return false;
         }
 
@@ -3039,7 +3045,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !git_ok {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return None;
         }
         let dir = tempfile::tempdir().unwrap();

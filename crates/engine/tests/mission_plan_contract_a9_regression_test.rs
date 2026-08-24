@@ -59,7 +59,10 @@ fn plan_md_a9_command_matches_plan_json() {
 #[test]
 fn a9_command_runs_successfully_verbatim() {
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("skipping: git not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         return;
     }
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
