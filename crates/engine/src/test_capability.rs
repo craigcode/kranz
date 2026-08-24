@@ -12,20 +12,20 @@
 //! fixed they ran for the first time and immediately failed on two real bugs.
 //! The lane had been green throughout.
 //!
-//! [`AGENTS.md`] rule 5 already guards the neighbouring shape — a test FILTER
+//! `AGENTS.md` rule 5 already guards the neighbouring shape — a test FILTER
 //! matching zero tests — with `grep -qE 'test result: ok\. [1-9]'`. This module
 //! guards the other one.
 //!
 //! # Contract
 //!
-//! Call [`skip`] instead of a bare `eprintln!` + `return`. It emits a stable,
+//! Call `skip` instead of a bare `eprintln!` + `return`. It emits a stable,
 //! greppable marker, and PANICS when the capability appears in
 //! `KRANZ_REQUIRED_CAPABILITIES` — so a platform that is supposed to have a
 //! tool fails loudly the moment it stops having one, instead of silently
 //! reverting to skips.
 //!
 //! CI declares per-platform expectations rather than asserting a skip list
-//! after the fact: ubuntu requires `git,bwrap,container`, macOS requires
+//! after the fact: ubuntu requires `git,bwrap,container,grep`, macOS requires
 //! `git,sandbox-exec,container`, Windows requires `git`. Windows deliberately
 //! omits `container` — the provider is macOS/Linux only and session and gate
 //! resolution already fail closed there.
