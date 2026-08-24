@@ -423,8 +423,21 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     }
     .map(OwnedHandle)
     .map_err(|error| {
+        // A drive root is the one path here an operator cannot fix by editing
+        // a config: it needs the one-time elevated host preparation. Name that
+        // command, otherwise the first Windows operator sees only
+        // "Access is denied. (0x80070005)" and has nowhere to go.
+        let remedy = if path.parent().is_none() {
+            format!(
+                "; run the one-time elevated host preparation first: \
+                 kranz sandbox-prepare --target {}",
+                path.display()
+            )
+        } else {
+            String::new()
+        };
         EngineError::Backend(format!(
-            "failed to retain no-follow DACL capability for {}: {error}",
+            "failed to retain no-follow DACL capability for {}: {error}{remedy}",
             path.display()
         ))
     })?;
@@ -2503,6 +2516,35 @@ fn drive_current_directory_variable(cwd: &Path) -> Option<(OsString, OsString)> 
     ))
 }
 
+/// True for the documented per-drive current-directory pseudo variable (`=C:`),
+/// the ONE `=`-prefixed name an explicit environment block may carry.
+fn is_drive_current_directory_key(key: &OsStr) -> bool {
+    let units: Vec<u16> = key.encode_wide().collect();
+    is_drive_current_directory_units(&units)
+}
+
+fn is_drive_current_directory_units(units: &[u16]) -> bool {
+    let drive_letter = units.get(1).is_some_and(|unit| {
+        (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
+            || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
+    });
+    units.len() == 3 && units[0] == b'=' as u16 && drive_letter && units[2] == b':' as u16
+}
+
+/// Windows exposes pseudo variables whose names contain `=`: the per-drive
+/// current-directory entries (`=C:`) and cmd.exe's `=ExitCode` /
+/// `=ExitCodeAscii`, which it sets after the first command of a session.
+/// A name containing `=` cannot be encoded in an explicit environment block,
+/// and `CreateProcessW` never propagates these into one anyway — so DROP them
+/// while inheriting rather than refusing the whole launch. Before this filter,
+/// running `kranz` from any cmd.exe prompt made every enforced Windows session
+/// fail closed on `=ExitCode`; pwsh does not set it, so CI never saw it.
+/// The per-drive entry is kept, and the one for `cwd` is re-added deliberately
+/// below.
+fn inheritable_environment_key(key: &OsStr) -> bool {
+    !key.encode_wide().any(|unit| unit == b'=' as u16) || is_drive_current_directory_key(key)
+}
+
 fn environment_block(
     cwd: &Path,
     path: Option<&str>,
@@ -2510,6 +2552,9 @@ fn environment_block(
 ) -> Result<Vec<u16>> {
     let mut values = BTreeMap::<String, (OsString, OsString)>::new();
     for (key, value) in std::env::vars_os() {
+        if !inheritable_environment_key(&key) {
+            continue;
+        }
         let folded = key.to_string_lossy().to_ascii_uppercase();
         values.insert(folded, (key, value));
     }
@@ -2547,12 +2592,7 @@ fn environment_block(
     for (_folded, (key, value)) in values {
         let key: Vec<u16> = key.encode_wide().collect();
         let value: Vec<u16> = value.encode_wide().collect();
-        let drive_letter = key.get(1).is_some_and(|unit| {
-            (*unit >= b'A' as u16 && *unit <= b'Z' as u16)
-                || (*unit >= b'a' as u16 && *unit <= b'z' as u16)
-        });
-        let drive_current_directory =
-            key.len() == 3 && key[0] == b'=' as u16 && drive_letter && key[2] == b':' as u16;
+        let drive_current_directory = is_drive_current_directory_units(&key);
         if key.is_empty()
             || key.contains(&0)
             || (key.contains(&(b'=' as u16)) && !drive_current_directory)
@@ -3727,6 +3767,29 @@ mod tests {
             local_volume_root(Path::new(r"\\server\share\node.exe")),
             None
         );
+    }
+
+    /// Regression: cmd.exe sets `=ExitCode` after its first command, so every
+    /// enforced Windows session launched from a cmd prompt used to fail closed
+    /// with "cleared AppContainer environment contains an invalid key/value".
+    /// pwsh does not set it, which is why hosted CI never reproduced this.
+    #[test]
+    fn cmd_exe_pseudo_variables_are_dropped_while_drive_entries_survive() {
+        for dropped in ["=ExitCode", "=ExitCodeAscii", "=::", "a=b"] {
+            assert!(
+                !inheritable_environment_key(OsStr::new(dropped)),
+                "{dropped} must not be inherited into an explicit block"
+            );
+        }
+        for kept in ["=C:", "=d:", "PATH", "USERPROFILE", ""] {
+            assert!(
+                inheritable_environment_key(OsStr::new(kept)),
+                "{kept} must survive inheritance"
+            );
+        }
+        assert!(is_drive_current_directory_key(OsStr::new("=Z:")));
+        assert!(!is_drive_current_directory_key(OsStr::new("=ExitCode")));
+        assert!(!is_drive_current_directory_key(OsStr::new("=1:")));
     }
 
     #[test]
