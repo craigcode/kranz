@@ -9,9 +9,16 @@ fn production_receipt_guard() -> std::sync::MutexGuard<'static, ()> {
     // Both receipts grant ACLs on shared Cargo/toolchain parents. Keep the
     // outer fixtures from observing each other's live lease; the hostile
     // self-test still proves overlapping leases inside its own process.
+    //
+    // Recover from poisoning instead of expect()-ing: when the first receipt
+    // fails it panics while holding this guard, and a poisoned unwrap then
+    // replaces the second receipt's real failure with "lock must not be
+    // poisoned". That reports one genuine defect as two, and hides which.
+    // The lock guards ordering only — no shared in-memory state is left
+    // inconsistent by a panic — so continuing past poisoning is sound.
     PRODUCTION_RECEIPT_LOCK
         .lock()
-        .expect("production receipt lock must not be poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(windows)]

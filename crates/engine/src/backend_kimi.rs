@@ -1165,7 +1165,17 @@ mod tests {
 
     #[tokio::test]
     async fn kimi_session_rejects_send_user_message() {
-        let mut child = tokio::process::Command::new("true")
+        // A process that exits 0 immediately. `true` is a POSIX binary with no
+        // cmd.exe builtin and no Windows executable, so it only resolves where
+        // Git's `usr/bin` happens to be on PATH (hosted CI, not a stock
+        // Windows box). Spawn the platform's own no-op instead.
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit 0"])
+        } else {
+            ("true", &[])
+        };
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

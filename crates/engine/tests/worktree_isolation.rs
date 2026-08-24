@@ -29,6 +29,24 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration as TokioDuration};
 
+/// `sh`/`cmd` portable "succeed iff `path` exists as a file".
+///
+/// Workspace/readiness commands bottom out in `cmd /C` on Windows and `sh -c`
+/// elsewhere. cmd.exe has no `test` builtin and Windows ships no `test.exe`,
+/// so the POSIX spelling resolves only where Git's `usr/bin` happens to be on
+/// PATH — true on hosted CI, false on a stock Windows developer box.
+///
+/// The `services` fixtures further down deliberately KEEP the POSIX spellings
+/// (`sleep infinity`, `test -f`): those commands execute inside an Alpine
+/// container rather than on the host, and their tests are runtime-gated.
+fn file_exists_cmd(path: &str) -> String {
+    if cfg!(windows) {
+        format!("if exist {path} (exit 0) else (exit 1)")
+    } else {
+        format!("test -f {path}")
+    }
+}
+
 fn write_layer(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write layer");
@@ -540,13 +558,16 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
     // Base-branch-owned contract (D-A), committed before approve — the
     // run-time gate reads the committed base-branch copy.
     std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    let readiness_cmd = file_exists_cmd(".boot-marker");
     std::fs::write(
         root.join(".kranz").join("workspace.json"),
-        r#"{
+        format!(
+            r#"{{
             "schemaVersion": 1,
             "bootstrap": ["echo boot > .boot-marker"],
-            "readiness": ["test -f .boot-marker"]
-        }"#,
+            "readiness": ["{readiness_cmd}"]
+        }}"#
+        ),
     )
     .unwrap();
     std::fs::write(root.join(".gitignore"), ".boot-marker\n").unwrap();
@@ -558,7 +579,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         id: "a-1".into(),
         statement: "the workspace marker exists".into(),
         check: AssertionCheck::Command,
-        command: Some("test -f .boot-marker".into()),
+        command: Some(file_exists_cmd(".boot-marker")),
         pty_script: None,
     }];
 
@@ -580,7 +601,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         status,
         MissionStatus::Complete,
         "completion PROVES bootstrap ran in the worktree: the final gate's \
-         `test -f .boot-marker` ran in the same execution cwd"
+         the readiness check ran in the same execution cwd"
     );
 
     // The marker never touched the primary checkout (the worktree holding it
@@ -1369,14 +1390,14 @@ fn one_feature_plan_with_contract() -> Plan {
                 id: "a-1".to_string(),
                 statement: "vacuous assertion".to_string(),
                 check: AssertionCheck::Command,
-                command: Some("true".to_string()),
+                command: Some("exit 0".to_string()),
                 pty_script: None,
             },
             Assertion {
                 id: "a-2".to_string(),
                 statement: "not-yet-landed assertion".to_string(),
                 check: AssertionCheck::Command,
-                command: Some("false".to_string()),
+                command: Some("exit 1".to_string()),
                 pty_script: None,
             },
         ],
@@ -1417,9 +1438,9 @@ async fn approval_lint_covers_worktree_mode() {
             .contains("author-bug suspects (already pass / no verdict on the untouched base)"),
         "{committed_md}"
     );
-    assert!(committed_md.contains("[a-1] true"), "{committed_md}");
+    assert!(committed_md.contains("[a-1] exit 0"), "{committed_md}");
     assert!(
-        committed_md.contains("base-expected-to-fail (benign): [a-2] false"),
+        committed_md.contains("base-expected-to-fail (benign): [a-2] exit 1"),
         "{committed_md}"
     );
 
@@ -1429,7 +1450,7 @@ async fn approval_lint_covers_worktree_mode() {
         .join("plan.md");
     let twin_md = std::fs::read_to_string(&primary_twin).expect("primary plan.md twin readable");
     assert!(twin_md.contains("## Contract lint"), "{twin_md}");
-    assert!(twin_md.contains("[a-1] true"), "{twin_md}");
+    assert!(twin_md.contains("[a-1] exit 0"), "{twin_md}");
 }
 
 // -----------------------------------------------------------------------

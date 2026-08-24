@@ -43,6 +43,41 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+/// `sh`/`cmd` portable "succeed iff `path` exists as a file".
+///
+/// Workspace/readiness/assertion commands bottom out in `cmd /C` on Windows
+/// and `sh -c` elsewhere. cmd.exe has no `test` builtin and Windows ships no
+/// `test.exe`, so the POSIX spelling resolves only where Git's `usr/bin` is on
+/// PATH — true on hosted CI, false on a stock Windows developer box, which is
+/// why fixtures once described here as portable were not.
+fn file_exists_cmd(path: &str) -> String {
+    if cfg!(windows) {
+        format!("if exist {path} (exit 0) else (exit 1)")
+    } else {
+        format!("test -f {path}")
+    }
+}
+
+/// Portable "write `text` as one line into `path`". `printf` is a POSIX binary
+/// cmd.exe cannot run; `echo` is a builtin in both shells. cmd would carry the
+/// space before `>` into the file, so close it up there.
+fn write_line_cmd(text: &str, path: &str) -> String {
+    if cfg!(windows) {
+        format!("echo {text}>{path}")
+    } else {
+        format!("echo {text} > {path}")
+    }
+}
+
+/// Portable "succeed iff `path` exists, then run `then`".
+fn if_file_exists_cmd(path: &str, then: &str) -> String {
+    if cfg!(windows) {
+        format!("if exist {path} ({then}) else (exit 1)")
+    } else {
+        format!("test -f {path} && {then}")
+    }
+}
+
 /// Generous bound proving the engine loop cannot hang in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1220,7 +1255,7 @@ async fn remote_workspace_provider_pin_recorded_at_approval() {
         return;
     }
     let (_dir, root) = init_repo();
-    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
 
     let backend = Arc::new(MockBackend::new());
     let cfg = remote_workspace_cfg(
@@ -1556,7 +1591,7 @@ async fn remote_workspace_missing_token_fails_closed_at_run_start() {
         return;
     }
     let (_dir, root) = init_repo();
-    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
 
     let var = "KRANZ_TEST_REMOTE_TOKEN_NEVER_SET";
     std::env::remove_var(var); // defensive: prove unset
@@ -1648,7 +1683,7 @@ async fn remote_workspace_terminal_hibernate_stops_the_workspace_and_records_lif
         &root,
         r#"{
             "schemaVersion": 1,
-            "readiness": ["true"],
+            "readiness": ["exit 0"],
             "secrets": ["DATABASE_URL"]
         }"#,
     );
@@ -1739,7 +1774,7 @@ async fn remote_workspace_terminal_destroy_deletes_the_workspace_and_records_lif
         return;
     }
     let (_dir, root) = init_repo();
-    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
 
     std::env::set_var("KRANZ_TEST_REMOTE_TOKEN_DESTROY", "test-token-destroy");
     let substrate = spawn_mock_substrate("running");
@@ -1802,7 +1837,7 @@ async fn remote_workspace_teardown_failure_keeps_the_terminal_outcome() {
         return;
     }
     let (_dir, root) = init_repo();
-    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["true"]}"#);
+    commit_workspace_contract(&root, r#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
 
     std::env::set_var(
         "KRANZ_TEST_REMOTE_TOKEN_TEARDOWN_FAIL",
@@ -2013,7 +2048,10 @@ async fn workspace_teardown_mode_unknown_fails_closed_at_run_start() {
 // repo-setup; without a contract nothing changes.
 //
 // Shell lines stay `sh`/`cmd` portable (CI runs this suite on windows):
-// `echo`, `>`, `&&`, `exit`, `cd`, and `test -f` only.
+// `echo`, `>`, `&&`, `exit`, and `cd` only. File-existence checks go
+// through `portable_shell_json` / `file_exists_cmd`: `test` is a POSIX binary
+// with no cmd.exe builtin, so inlining it only worked where Git's usr/bin
+// happened to be on PATH.
 // ---------------------------------------------------------------------------
 
 /// Commit a workspace contract (plus a .gitignore for the gate's marker
@@ -2021,9 +2059,41 @@ async fn workspace_teardown_mode_unknown_fails_closed_at_run_start() {
 /// branch BEFORE approve — D-A: the contract is base-branch-owned, and the
 /// run-time gate reads the committed base-branch copy
 /// (`load_workspace_contract_at_ref`), not the working tree.
+/// Rewrite the POSIX snippets these fixtures use into cmd.exe equivalents when
+/// the suite runs on Windows, so every `commit_workspace_contract` call site is
+/// portable without hand-editing nineteen JSON literals.
+///
+/// Only the contents of JSON string values are touched (the fixtures contain
+/// no escaped quotes), and only a leading `test -f` is rewritten — the shape
+/// cmd.exe cannot run. `echo`, `>`, `>>`, `&&`, `cd`, and `exit` already parse
+/// in both shells.
+fn portable_shell_json(contract_json: &str) -> String {
+    if !cfg!(windows) {
+        return contract_json.to_string();
+    }
+    contract_json
+        .split('"')
+        .enumerate()
+        .map(|(index, segment)| {
+            if index % 2 == 0 {
+                return segment.to_string();
+            }
+            match segment.strip_prefix("test -f ") {
+                None => segment.to_string(),
+                Some(rest) => match rest.split_once(" && ") {
+                    Some((path, then)) => format!("if exist {path} ({then}) else (exit 1)"),
+                    None => format!("if exist {rest} (exit 0) else (exit 1)"),
+                },
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\"")
+}
+
 fn commit_workspace_contract(root: &Path, contract_json: &str) {
+    let contract_json = portable_shell_json(contract_json);
     std::fs::create_dir_all(root.join(".kranz")).unwrap();
-    std::fs::write(root.join(".kranz").join("workspace.json"), contract_json).unwrap();
+    std::fs::write(root.join(".kranz").join("workspace.json"), &contract_json).unwrap();
     std::fs::write(root.join(".gitignore"), ".boot-marker\n.boot-count\n").unwrap();
     raw_git(root, &["add", ".kranz/workspace.json", ".gitignore"]);
     raw_git(root, &["commit", "-m", "workspace contract"]);
@@ -2082,7 +2152,7 @@ async fn workspace_bootstrap_readiness_gate_runs_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the workspace marker exists",
-        Some("test -f .boot-marker"),
+        Some(&file_exists_cmd(".boot-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -2295,7 +2365,7 @@ async fn workspace_readiness_failure_blocks_after_bootstrap() {
     );
     assert!(reason.contains("owner: repo-setup"), "{reason}");
     assert!(
-        reason.contains("test -f .no-such-readiness-file"),
+        reason.contains(&file_exists_cmd(".no-such-readiness-file")),
         "the reason names the failing check: {reason}"
     );
 }
@@ -2569,7 +2639,7 @@ async fn workspace_gate_reads_contract_from_base_branch_not_mission_branch() {
     let events = read_log(&paths);
     let reason = gate_block_reason(&events, "ms-1");
     assert!(
-        reason.contains("test -f .base-required-marker"),
+        reason.contains(&file_exists_cmd(".base-required-marker")),
         "the base branch's readiness check gated the run: {reason}"
     );
     assert!(
@@ -2969,7 +3039,8 @@ async fn workspace_provider_resume_reprovisions_idempotently() {
 // optional `data` block provisions a de-identified golden dataset into the
 // workspace before agents run; skew Blocks owned + actionable, never flake.
 //
-// Shell lines stay `sh`/`cmd` portable (echo / > / >> / && / test -f / exit
+// Shell lines stay `sh`/`cmd` portable (echo / > / >> / && / exit; file
+// existence via `portable_shell_json`)
 // only) and markers are relative paths in the workspace cwd — no
 // JSON-interpolated absolute paths.
 // ---------------------------------------------------------------------------
@@ -2979,8 +3050,9 @@ async fn workspace_provider_resume_reprovisions_idempotently() {
 /// worker's tree) onto the BASE branch BEFORE approve — D-A: the run-time
 /// gate reads the committed base-branch copy.
 fn commit_data_contract(root: &Path, contract_json: &str) {
+    let contract_json = portable_shell_json(contract_json);
     std::fs::create_dir_all(root.join(".kranz")).unwrap();
-    std::fs::write(root.join(".kranz").join("workspace.json"), contract_json).unwrap();
+    std::fs::write(root.join(".kranz").join("workspace.json"), &contract_json).unwrap();
     std::fs::write(
         root.join(".gitignore"),
         ".boot-marker\n.data-clone-marker\n.data-migrate-marker\n.data-skew-marker\n.data-reset-count\n",
@@ -3028,7 +3100,7 @@ async fn golden_data_hooks_run_in_provision_order_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the skew check ran",
-        Some("test -f .data-skew-marker"),
+        Some(&file_exists_cmd(".data-skew-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -3053,9 +3125,16 @@ async fn golden_data_hooks_run_in_provision_order_before_workers() {
     assert_eq!(
         gate_decisions(&events, "workspace data:"),
         vec![
-            "workspace data: clone `echo cloned > .data-clone-marker` → ok (exit code 0)",
-            "workspace data: migrate `test -f .data-clone-marker && echo mig > .data-migrate-marker` → ok (exit code 0)",
-            "workspace data: skewCheck `test -f .boot-marker && echo checked > .data-skew-marker` → ok (exit code 0)",
+            "workspace data: clone `echo cloned > .data-clone-marker` → ok (exit code 0)"
+                .to_string(),
+            format!(
+                "workspace data: migrate `{}` → ok (exit code 0)",
+                if_file_exists_cmd(".data-clone-marker", "echo mig > .data-migrate-marker")
+            ),
+            format!(
+                "workspace data: skewCheck `{}` → ok (exit code 0)",
+                if_file_exists_cmd(".boot-marker", "echo checked > .data-skew-marker")
+            ),
         ]
     );
     // Lifecycle order: migrate before bootstrap, skewCheck after readiness,
@@ -6917,13 +6996,13 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
 
-    // "true" already passes on the untouched base — an author-bug suspect.
-    // "false" fails on the untouched base — the usual, benign case.
+    // `exit 0` already passes on the untouched base — an author-bug suspect.
+    // `exit 1` fails on the untouched base — the usual, benign case.
     let plan = simple_plan(
         1,
         vec![
-            assertion("", "vacuous assertion", Some("true")),
-            assertion("", "not-yet-landed assertion", Some("false")),
+            assertion("", "vacuous assertion", Some("exit 0")),
+            assertion("", "not-yet-landed assertion", Some("exit 1")),
         ],
     );
     engine.approve_plan(plan).unwrap();
@@ -6935,9 +7014,9 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
         md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
         "{md}"
     );
-    assert!(md.contains("[a-1] true"), "{md}");
+    assert!(md.contains("[a-1] exit 0"), "{md}");
     assert!(
-        md.contains("base-expected-to-fail (benign): [a-2] false"),
+        md.contains("base-expected-to-fail (benign): [a-2] exit 1"),
         "{md}"
     );
 
@@ -6954,8 +7033,8 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
     assert!(summary.contains("1 author-bug suspect"), "{summary}");
     let detail = detail.expect("decision carries the full lint summary");
-    assert!(detail.contains("[a-1] true"), "{detail}");
-    assert!(detail.contains("[a-2] false"), "{detail}");
+    assert!(detail.contains("[a-1] exit 0"), "{detail}");
+    assert!(detail.contains("[a-2] exit 1"), "{detail}");
 }
 
 /// Approval-time assertion commands are agent-authored code. They run in a
@@ -6977,7 +7056,7 @@ async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
         vec![assertion(
             "",
             "hostile approval assertion",
-            Some("printf 'tampered\\n' > README.md"),
+            Some(&write_line_cmd("tampered", "README.md")),
         )],
     );
     engine.approve_plan(plan).unwrap();
@@ -7066,8 +7145,12 @@ async fn approval_lint_never_blocks() {
     let plan = simple_plan(
         1,
         vec![
-            assertion("", "vacuous assertion one", Some("true")),
-            assertion("", "vacuous assertion two", Some("test 1 -eq 1")),
+            assertion("", "vacuous assertion one", Some("exit 0")),
+            // `cd .` not `test 1 -eq 1`: `test` is a POSIX binary cmd.exe
+            // cannot run, so on Windows the second assertion would fail to
+            // execute and this test's premise (BOTH already pass on the
+            // untouched base) would be silently false.
+            assertion("", "vacuous assertion two", Some("cd .")),
         ],
     );
     engine.approve_plan(plan).unwrap();
@@ -7090,8 +7173,8 @@ async fn approval_lint_no_nested_runtime_panic() {
     let plan = simple_plan(
         1,
         vec![
-            assertion("", "passes on base", Some("true")),
-            assertion("", "fails on base", Some("false")),
+            assertion("", "passes on base", Some("exit 0")),
+            assertion("", "fails on base", Some("exit 1")),
         ],
     );
     // No panic (and no Err) proves the gate runtime lived on the bridge
@@ -7128,7 +7211,7 @@ async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
                 "marker absent",
                 Some("! grep -q landed-marker kranz-no-such-file.txt"),
             ),
-            assertion("", "not-yet-landed assertion", Some("false")),
+            assertion("", "not-yet-landed assertion", Some("exit 1")),
         ],
     );
     engine.approve_plan(plan).unwrap();
@@ -7258,7 +7341,7 @@ async fn gate_result_events_record_the_approval_ladder() {
                 "marker absent",
                 Some("! grep -q landed-marker kranz-no-such-file.txt"),
             ),
-            assertion("", "not-yet-landed assertion", Some("false")),
+            assertion("", "not-yet-landed assertion", Some("exit 1")),
         ],
     );
     engine.approve_plan(plan).unwrap();
@@ -8092,7 +8175,7 @@ async fn preflight_flags_missing_program_and_ignores_present_ones() {
     let (_dir2, root2) = init_repo();
     let backend2 = Arc::new(MockBackend::new());
     let present = vec![
-        assertion("a-1", "trivially true", Some("true")),
+        assertion("a-1", "trivially true", Some("exit 0")),
         assertion("a-2", "a builtin", Some("cd .")),
     ];
     let mut engine2 = make_engine(&backend2, &root2, test_cfg());
@@ -8322,7 +8405,7 @@ async fn sandbox_preflight_flags_command_that_writes_outside_allowlist() {
             "writes outside the allowlist",
             Some(&format!("echo x > '{real_home}/{marker}'")),
         ),
-        assertion("a-benign", "trivially true", Some("true")),
+        assertion("a-benign", "trivially true", Some("exit 0")),
     ];
     let mut engine = make_engine(&backend, &root, cfg);
     engine.approve_plan(simple_plan(1, contract)).unwrap();

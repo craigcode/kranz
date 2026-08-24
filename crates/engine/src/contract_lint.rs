@@ -265,6 +265,7 @@ pub(crate) fn run_contract_lint_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_shell::{sleep_millis, FAIL, SUCCEED};
 
     fn run_lint(cwd: &Path, base_sha: Option<&str>, contract: &[Assertion]) -> ContractLintReport {
         let scratch = tempfile::tempdir().unwrap();
@@ -388,8 +389,8 @@ mod tests {
     #[test]
     fn approval_lint_runner_buckets_true_false() {
         let contract = vec![
-            command_assertion("a1", "true"),
-            command_assertion("a2", "false"),
+            command_assertion("a1", SUCCEED),
+            command_assertion("a2", FAIL),
             judgement_assertion("a3"),
         ];
         let report = run_lint(&std::env::temp_dir(), None, &contract);
@@ -409,7 +410,7 @@ mod tests {
 
     #[test]
     fn approval_lint_runner_times_out_slow_command() {
-        let contract = vec![command_assertion("a1", "sleep 5")];
+        let contract = vec![command_assertion("a1", &sleep_millis(5_000))];
         let scratch = tempfile::tempdir().unwrap();
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
@@ -440,9 +441,9 @@ mod tests {
     #[test]
     fn approval_lint_runner_budget_skips_remainder() {
         let contract = vec![
-            command_assertion("a1", "sleep 0.2"),
-            command_assertion("a2", "true"),
-            command_assertion("a3", "false"),
+            command_assertion("a1", &sleep_millis(200)),
+            command_assertion("a2", SUCCEED),
+            command_assertion("a3", FAIL),
         ];
         let scratch = tempfile::tempdir().unwrap();
         let report = run_contract_lint_with_limits(
@@ -481,6 +482,19 @@ mod tests {
         // targeting a dependency ("tokio") that is genuinely present on the
         // untouched base, to prove the lint flags this exact shape as a
         // suspect rather than relying on `true`/`false` proxies.
+        // This assertion is ABOUT POSIX grep's exit-status semantics, so a
+        // portable rewrite would test something else and `findstr` has no
+        // equivalent of `-L`. Windows ships no grep; CI and any box with Git's
+        // `usr/bin` on PATH have one, so run it there and say so plainly when
+        // there is nothing to run against rather than failing a stock box.
+        if !crate::sandbox::command_available("grep") {
+            eprintln!(
+                "SKIP approval_lint_runner_flags_inverted_lockfile_grep_shape: \
+                 no `grep` on PATH (expected only on a Windows host without \
+                 Git's usr/bin); the inverted-polarity shape is unexercised here"
+            );
+            return;
+        }
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -511,8 +525,8 @@ mod tests {
     #[tokio::test]
     async fn approval_lint_runner_safe_under_tokio() {
         let contract = vec![
-            command_assertion("a1", "true"),
-            command_assertion("a2", "false"),
+            command_assertion("a1", SUCCEED),
+            command_assertion("a2", FAIL),
         ];
         let report = run_lint(&std::env::temp_dir(), None, &contract);
         assert_eq!(report.results.len(), 2);

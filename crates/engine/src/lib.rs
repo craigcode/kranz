@@ -84,6 +84,10 @@ pub mod standards_enforcement;
 pub mod standards_metrics;
 pub mod standards_waiver;
 mod stream_bounds;
+/// Portable `sh`/`cmd` snippets for test fixtures; see the module docs for why
+/// literal `true`/`false`/`test`/`sleep` must not appear in one.
+#[cfg(test)]
+pub(crate) mod test_shell;
 pub mod ticket;
 pub mod ticket_notes;
 pub mod trace_export;
