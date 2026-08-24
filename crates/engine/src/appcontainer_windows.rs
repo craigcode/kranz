@@ -711,6 +711,66 @@ pub(crate) fn prepare_appcontainer_host(root: &Path) -> Result<bool> {
     Ok(changed_any || changed_restricted)
 }
 
+/// Apply the same metadata-only ACEs to the PROFILE PARENT (`C:\Users`).
+///
+/// The target is DERIVED from `USERPROFILE`, never operator-supplied: this
+/// grants on a SYSTEM-owned directory shared by every AppContainer on the
+/// machine, so the only reachable target is the one Windows itself defines.
+///
+/// Needed because module resolution `lstat`s each ancestor. Node's
+/// `realpathSync` walks up to `C:\Users` and fails `EPERM` without
+/// `FILE_READ_ATTRIBUTES` there, so every Rust/Node merge gate under a normal
+/// profile-hosted repository failed closed. Bypass-traverse is not enough: it
+/// permits passing THROUGH a directory, not stat-ing the directory itself.
+///
+/// The mask is the same non-inheriting `0x00120088` used on the drive root —
+/// read attributes, read EA, read control, synchronize. It confers no
+/// directory listing, no file content, and no write.
+#[cfg(windows)]
+pub(crate) fn prepare_appcontainer_profile_parent() -> Result<(PathBuf, bool)> {
+    let parent = profile_parent().ok_or_else(|| {
+        EngineError::Backend(
+            "USERPROFILE is unset or has no parent, so the AppContainer profile parent cannot be derived"
+                .to_string(),
+        )
+    })?;
+    if volume_root(&parent) {
+        // A profile at `C:\craig` would make the parent the drive root, which
+        // the drive-root path already covers. Never double-apply.
+        return Ok((parent, false));
+    }
+    if !parent.is_dir() {
+        return Err(EngineError::Backend(format!(
+            "derived AppContainer profile parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    if !token_flag(TokenElevation, "TokenElevation")? {
+        return Err(EngineError::Backend(
+            "AppContainer profile-parent preparation requires an elevated Windows token; relaunch PowerShell as Administrator"
+                .to_string(),
+        ));
+    }
+    let _guard = DaclMutationGuard::acquire()?;
+    let mut any_package = string_sid("S-1-15-2-1", "ALL APPLICATION PACKAGES")?;
+    let mut restricted = string_sid(
+        ALL_RESTRICTED_APPLICATION_PACKAGES_SID,
+        "ALL RESTRICTED APPLICATION PACKAGES",
+    )?;
+    let changed_any = apply_named_root_metadata_ace(
+        &parent,
+        PSID(any_package.as_mut_ptr().cast()),
+        "ALL APPLICATION PACKAGES (S-1-15-2-1)",
+    )?;
+    let changed_restricted = apply_named_root_metadata_ace(
+        &parent,
+        PSID(restricted.as_mut_ptr().cast()),
+        "ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)",
+    )?;
+    verify_volume_root_prepared(&parent)?;
+    Ok((parent, changed_any || changed_restricted))
+}
+
 fn open_null_device(write: bool) -> Result<OwnedHandle> {
     let mut desired_access = GENERIC_READ.0 | READ_CONTROL.0;
     if write {
@@ -1786,7 +1846,7 @@ fn path_under_env(path: &Path, name: &str) -> bool {
 }
 
 fn system_managed_path(path: &Path) -> bool {
-    [
+    if [
         "SystemRoot",
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
@@ -1794,6 +1854,33 @@ fn system_managed_path(path: &Path) -> bool {
     ]
     .iter()
     .any(|name| path_under_env(path, name))
+    {
+        return true;
+    }
+    // The PROFILE PARENT (`C:\Users`) belongs in this list too. It is
+    // SYSTEM-owned and carries no app-package ACE, exactly like
+    // `%PROGRAMFILES%`, so an unelevated operator cannot lease it — and every
+    // Windows developer keeps repositories, `CARGO_HOME` and `RUSTUP_HOME`
+    // beneath it. Walking into it made `ancestor_directories` demand
+    // WRITE_DAC on `C:\Users` and the production GATE WRAP fail closed with
+    // "Access is denied. (0x80070005)" for any non-elevated run.
+    //
+    // The traverse grant it was reaching for is not needed: bypass-traverse
+    // (SeChangeNotifyPrivilege, held by Everyone including AppContainers)
+    // already lets the child reach paths underneath. The phase-4 hostile
+    // receipt demonstrates this directly — it reads and writes under
+    // `%TEMP%`, i.e. below `C:\Users`, with no ACE anywhere on `C:\Users`.
+    //
+    // Hosted CI never reached this: its workspace and temp live on `D:\a\...`,
+    // whose walk stops at the volume root, and its runner is elevated anyway.
+    profile_parent().is_some_and(|parent| comparable_path(path) == comparable_path(&parent))
+}
+
+/// `C:\Users` — the directory holding every user profile, not the profile.
+fn profile_parent() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .and_then(|profile| profile.parent().map(Path::to_path_buf))
 }
 
 fn caller_owned_path(path: &Path, cwd: &Path) -> bool {
