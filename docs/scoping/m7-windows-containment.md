@@ -57,11 +57,13 @@ roots. They remain supporting primitives, never the M7 boundary.
 
 ### D-WIN-2 — Do not infer container safety from runtime discovery
 
-The current container builder is live-proven for POSIX container targets on
-macOS/Linux. Its authority masks bind `/dev/null`, and its mount destinations
-reuse host path spellings. Windows containers lack that device/path contract;
-Linux containers under Docker Desktop require an explicit host-to-guest mapping.
-Accordingly, finding `docker.exe` does not enable the provider on Windows.
+The current container builder is release-supported on Linux. A macOS operator
+receipt exists, but hosted macOS cannot renew it as a CI gate; the public
+support matrix therefore refuses the provider on macOS too. Its authority
+masks bind `/dev/null`, and its mount destinations reuse host path spellings.
+Windows containers lack that device/path contract; Linux containers under
+Docker Desktop require an explicit host-to-guest mapping. Accordingly, finding
+`docker.exe` does not enable the provider on Windows.
 
 This also keeps CI honest: GitHub documents container jobs and service
 containers as Linux-runner features, so the standard `windows-latest` leg is a

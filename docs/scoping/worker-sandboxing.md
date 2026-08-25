@@ -165,7 +165,9 @@ All of it asks the agent nicely. None of it constrains the process.
   `<runtime> run` (`crates/engine/src/sandbox_container.rs`). Runtime
   detection walks PATH in preference order docker → podman → nerdctl →
   Apple `container`; `provider: "container"` with no runtime on PATH fails
-  closed, same contract as tiers 1–2.
+  closed, same contract as tiers 1–2. The release-supported host is Linux.
+  macOS and Windows fail closed even when a runtime is found; macOS operators
+  use the native Seatbelt `process` provider.
 - Write policy: the container root fs is `--read-only`; the writable set is
   exactly the declared mounts — session worktree (rw), mission dir (ro),
   the scratch tmpdir (rw, also `HOME`/`TMPDIR` inside), and each
@@ -173,10 +175,12 @@ All of it asks the agent nicely. None of it constrains the process.
   allowlist.
 - **Network policy**: `fs` keeps the runtime default bridge/NAT
   (same permissiveness as the tier-2 fs tier). `fs+net` with an EMPTY
-  egress list maps to `--network none` — a hard egress boundary that works
-  identically on macOS and Linux. Windows refuses this provider until a real
-  guest-path/authority-mask containment receipt exists. The tradeoff is
-  honest: `none` also blocks the agent's API egress, so `fs+net` suits offline gates/validation
+  egress list maps to `--network none` — a hard egress boundary on the
+  supported Linux path. A 2026-08-21 macOS operator proof remains useful
+  evidence, but GitHub-hosted macOS cannot renew it because the runner exposes
+  no virtualization for Colima; both macOS and Windows therefore refuse this
+  provider in the public support matrix. The tradeoff is honest: `none` also
+  blocks the agent's API egress, so `fs+net` suits offline gates/validation
   while API-driven workers use `fs`. `fs+net` with a NON-EMPTY egress list is
   now Docker-only and non-bypassable: the worker joins a unique
   [`--internal` network](https://docs.docker.com/engine/network/), with no

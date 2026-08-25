@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-24
+last_verified: 2026-08-25
 verified_against:
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
@@ -102,9 +102,9 @@ Two mechanisms, because printing alone is not enough:
 - **`KRANZ_REQUIRED_CAPABILITIES`** names what a platform must actually
   exercise. `skip` PANICS when a listed capability is missing, so a lane that
   starts skipping goes red instead of quietly green. CI declares expectations
-  up front — ubuntu `git,bwrap,container,grep`; macOS `git,sandbox-exec,
-  container`; Windows only `git`, since the container provider is macOS/Linux
-  only and already fails closed there.
+  up front — ubuntu `git,bwrap,container,grep`; macOS `git,sandbox-exec`;
+  Windows only `git`. The container sandbox provider is release-supported
+  only on Linux and fails closed elsewhere; macOS uses native Seatbelt.
 - **`KRANZ_SKIP_LOG`** receives a ledger line per skip. A file survives
   libtest's capture where stdout does not, and each lane prints the ledger
   after the suite, so a green run still shows what it did not exercise.

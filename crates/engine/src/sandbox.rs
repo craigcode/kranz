@@ -275,19 +275,18 @@ fn resolve_container_target(
     if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
         return (None, None);
     }
-    // The shipped container argv/mount contract is live-proven only for
-    // POSIX container targets on macOS/Linux. A Windows host is not a
-    // cosmetic path-separator variant: Windows containers have no `/dev/null`
-    // authority mask, while Linux containers under Docker Desktop need an
-    // explicit host-to-guest path mapping instead of reusing `C:\...` as the
-    // guest target. Merely finding `docker.exe` therefore cannot turn the
-    // provider into a proven boundary. Refuse before spawn until the Windows
-    // provider ticket lands a real hostile-host receipt.
-    if !matches!(target_os, "macos" | "linux") {
+    // The shipped container argv/mount contract is release-supported only on
+    // Linux. A macOS operator receipt exists, but hosted macOS cannot provision
+    // the VM-backed runtime needed to renew it as a CI release gate; Windows
+    // containers do not honor the POSIX guest-path and `/dev/null`
+    // authority-mask contract. Runtime presence alone cannot make either
+    // platform supported. Refuse before spawn; macOS uses the process
+    // provider's native Seatbelt boundary instead.
+    if target_os != "linux" {
         return (
             None,
             Some(format!(
-                "sandbox provider:container with enforce:{} is not live-proven on target_os={target_os}; refusing to run unsandboxed (or under an unverified container mount contract)",
+                "sandbox provider:container with enforce:{} is supported only on target_os=linux, not target_os={target_os}; refusing to run unsandboxed (or under an unverified container mount contract); use sandbox.provider=\"process\" for native host containment",
                 enforce_label(role_sandbox.enforce)
             )),
         );
@@ -2261,6 +2260,33 @@ mod tests {
         assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
     }
 
+    #[test]
+    fn macos_enforced_container_provider_fails_closed_to_native_process_guidance() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warning) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+        );
+        assert!(resolved.is_none());
+        let warning = warning.expect("an unproved macOS container must refuse");
+        assert!(
+            warning.contains("supported only on target_os=linux"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("sandbox.provider=\"process\""),
+            "{warning}"
+        );
+        assert!(warning.contains("native host containment"), "{warning}");
+    }
+
     /// M7 Windows parity, phase 4: the process provider resolves the stable
     /// AppContainer backend. Merely finding `docker.exe` still does not prove
     /// the Windows container mount contract, so that provider stays refused;
@@ -2308,7 +2334,7 @@ mod tests {
             assert!(resolved.is_none());
             let warning = warning.expect("an unproved Windows container must refuse");
             assert!(
-                warning.contains("not live-proven on target_os=windows"),
+                warning.contains("supported only on target_os=linux"),
                 "{warning}"
             );
             assert!(
@@ -2388,7 +2414,7 @@ mod tests {
             &cfg,
             session.path(),
             mission.path(),
-            "macos",
+            "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Podman),
         );
@@ -2409,7 +2435,7 @@ mod tests {
             &cfg,
             session.path(),
             mission.path(),
-            "macos",
+            "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
         );

@@ -721,14 +721,14 @@ async fn workspace_provider_provisions_the_integration_worktree() {
 /// INSIDE the container network, and `workspace.teardown` records keep
 /// (no teardownMode configured — the run loop's default; the test cleans
 /// the project up itself).
-/// Runtime-gated: skips on hosts with no container runtime (the macOS dev
-/// host); CI ubuntu-latest has docker.
+/// Runtime-gated: skips outside the live-proven Linux host path or without a
+/// runtime; CI ubuntu-latest has Docker.
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_events_land_for_a_full_mission_run() {
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::CONTAINER,
-            "container provider is macOS/Linux only",
+            "live container contract is supported only on Linux",
         );
         return;
     }
@@ -871,7 +871,7 @@ async fn container_workspace_terminal_teardown_hibernates_and_destroys() {
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::CONTAINER,
-            "container provider is macOS/Linux only",
+            "live container contract is supported only on Linux",
         );
         return;
     }

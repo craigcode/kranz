@@ -26,9 +26,9 @@
 //!
 //! CI declares per-platform expectations rather than asserting a skip list
 //! after the fact: ubuntu requires `git,bwrap,container,grep`, macOS requires
-//! `git,sandbox-exec,container`, Windows requires `git`. Windows deliberately
-//! omits `container` — the provider is macOS/Linux only and session and gate
-//! resolution already fail closed there.
+//! `git,sandbox-exec`, and Windows requires `git`. macOS and Windows omit
+//! `container` — the provider is supported only on Linux and session and gate
+//! resolution fail closed elsewhere.
 
 /// Environment variable naming the capabilities that MUST be present.
 /// Comma-separated; matching is exact and case-insensitive.

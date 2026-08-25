@@ -1585,15 +1585,15 @@ mod tests {
     /// projects (distinct networks — no shared port namespace), readiness
     /// passes inside the container network, the bootstrap write lands on the
     /// HOST worktree through the mount, and Destroy removes both projects.
-    /// Skips on hosts with no container runtime (this macOS dev host); CI
-    /// ubuntu-latest has docker. CI runners are ephemeral, so a failed
+    /// Skips outside the live-proven Linux host path or without a runtime;
+    /// CI ubuntu-latest has Docker. CI runners are ephemeral, so a failed
     /// assertion mid-test may leave a project behind.
     #[tokio::test]
     async fn container_workspace_smoke_provisions_isolates_and_destroys() {
         if !sandbox_container::host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
-                "container provider is macOS/Linux only",
+                "live container contract is supported only on Linux",
             );
             return;
         }

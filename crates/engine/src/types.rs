@@ -1093,9 +1093,11 @@ pub enum SandboxProvider {
     /// Tier-2 process sandboxing (Seatbelt on macOS, bubblewrap on Linux).
     #[default]
     Process,
-    /// Tier-3 container sandboxing on live-proven macOS/Linux hosts (see
-    /// `crate::sandbox_container`). Windows refuses until its mount and
-    /// authority-mask contract has a real hostile-host receipt.
+    /// Tier-3 container sandboxing on live-proven Linux hosts (see
+    /// `crate::sandbox_container`). macOS and Windows refuse until their
+    /// mount, authority-mask, and egress contracts have continuously enforced
+    /// release receipts; macOS uses native Seatbelt through the process
+    /// provider.
     Container,
 }
 

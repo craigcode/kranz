@@ -222,8 +222,8 @@ jobs:
       # bugs for the life of this lane. `test_capability::skip` panics instead
       # of skipping when the missing capability is listed here.
       #
-      # Windows deliberately omits `container`: the provider is macOS/Linux
-      # only and session and gate resolution already fail closed there. It also
+      # Windows deliberately omits `container`: the provider is supported only
+      # on Linux and session and gate resolution fail closed elsewhere. It also
       # omits `bwrap` (Linux-only) and `sandbox-exec` (macOS-only).
       - run: cargo test --workspace --no-fail-fast
         env:
@@ -287,41 +287,13 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # macOS is a CLAIMED-supported container host (sandbox_container.rs:
-      # "Host support is deliberately macOS/Linux only"), but hosted macOS
-      # runners ship no container runtime, so every live container test took
-      # its skip path and the job reported `ok` for work it never did. Colima
-      # provides a Linux VM + Docker socket so the claim is exercised rather
-      # than asserted. `KRANZ_REQUIRED_CAPABILITIES` below then makes a future
-      # runtime regression FAIL instead of silently reverting to skips.
-      - name: Provision a container runtime (Colima)
-        id: colima
-        run: |
-          brew install colima docker
-          colima start --cpu 2 --memory 4 --verbose
-          docker version
-      # `colima start` reports `level=fatal ... Errors:[]` and points at a Lima
-      # log the runner never prints, so a failure here is undiagnosable from
-      # the job output alone — which is how this cost a round trip. Surface the
-      # logs it names, on failure only.
-      - name: Show Lima/Colima logs when provisioning failed
-        if: failure() && steps.colima.outcome == 'failure'
-        run: |
-          for log in ~/.colima/_lima/colima/ha.stderr.log \
-                     ~/.colima/_lima/colima/ha.stdout.log \
-                     ~/.colima/_lima/colima/serial.log; do
-            if [ -s "$log" ]; then
-              echo "===== $log ====="
-              tail -100 "$log"
-            else
-              echo "===== $log (absent or empty) ====="
-            fi
-          done
-          colima status || true
-          colima version || true
+      # The supported macOS boundary is native Seatbelt. GitHub-hosted macOS
+      # runners do not expose the virtualization needed by VM-backed container
+      # runtimes, so container support is live-proven and required on Linux
+      # only; macOS container configuration fails closed in the engine.
       - run: cargo test --workspace --no-fail-fast
         env:
-          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec,container
+          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
       - name: Report capabilities macOS skipped
         if: always()
