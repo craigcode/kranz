@@ -1,14 +1,14 @@
 # M7 scoping — Worker sandboxing (containment, not just detection)
 
-Status: tiers 1–2 shipped, tier 3 shipped (v1). Dedicated worktrees, write
+Status: M7 complete 2026-08-23; tiers 1–3 shipped. Dedicated worktrees, write
 auditing, env hygiene, macOS Seatbelt filesystem enforcement, Linux bubblewrap
 filesystem/network isolation, fail-closed preflight behavior, the container
 provider, a macOS-capable network boundary (the filtering egress proxy, 3.3a),
 and the validator egress-grant flow that consumes its denial signal (3.3b) are
 implemented. Windows now ships the stable AppContainer process boundary and a
 protected hosted normal-gate/overhead receipt; its operator-controlled Windows
-11 completion receipt remains open. Also remaining: a hard per-host container
-egress boundary and live Linux overhead proof.
+11 completion receipt is captured. The hard per-host container egress boundary
+and live Linux overhead proof are also complete.
 
 ## Why
 
@@ -149,7 +149,8 @@ All of it asks the agent nicely. None of it constrains the process.
   `RunOutcome.denied_egress`). The validator grant flow that consumes the
   signal shipped as 3.3b. Windows production process containment and its hosted
   phase-5 gate receipt are shipped; the operator-controlled Windows 11 receipt
-  remains open (see the Windows scoping doc).
+  repeats the production hostile and overhead proof and closes parity (see the
+  Windows scoping doc).
 
 ### Tier 3 — container workspace provider (the Gas City / fleet stepping stone)
 
