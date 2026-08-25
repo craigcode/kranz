@@ -243,7 +243,7 @@ The exact remaining provider, secret, volume, containment, and smoke-test
 decisions are captured in the
 [M4/M6 operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-## M7 — Worker sandboxing ◑ (macOS Seatbelt and Linux container proofs complete; Windows operator receipt remains)
+## M7 — Worker sandboxing ✅ (all host-boundary and container-egress proofs complete 2026-08-23)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
@@ -253,7 +253,9 @@ per-host egress boundary, and per-host egress enforcement via the filtering
 egress proxy
 (`fs+net` on macOS routes loopback-only Seatbelt egress through it; structured
 denials surface on `RunOutcome` for the 3.3b grant flow). The dedicated
-operator-controlled Windows 11 receipt is the remaining item, tracked by
+operator-controlled Windows 11 receipt proves the production LPAC hostile
+boundary, exact DACL restoration, and retained Node/Rust gate overhead, closing
+the final item in
 [`m7-windows-containment-parity`](../.kranz/tickets/m7-windows-containment-parity.md).
 The sandbox still
 complements scrutiny: it bounds what CAN happen; validators judge what DID.
@@ -286,9 +288,12 @@ during any mission, sequential included.
 Windows phases 1-5 have landed: the production stable LPAC AppContainer
 launcher covers sessions, validators, and gates, while the protected hosted
 Windows matrix proves the hostile boundary, exact ACL restoration, ordinary
-Node/Rust gates, and retained overhead samples. That hosted production path is
-green; only the dedicated operator-controlled Windows 11 hostile-and-overhead
-receipt remains before M7 can close. See [the Windows containment
+Node/Rust gates, and retained overhead samples. The dedicated
+operator-controlled Windows 11 receipt repeated that production boundary on
+ARM64 and measured 1.67% Node / 1.10% Rust median wrapper overhead, both below
+the 10% ceiling. Those measurements directly attest the native ARM64 release
+artifact; the boundary is an OS mechanism shared with the separately
+CI-proven x86_64 path. See [the Windows containment
 decision](scoping/m7-windows-containment.md).
 
 ## M8 — Multi-repo operation ✅ (live inbound Slack routing proof complete 2026-08-15)

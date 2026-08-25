@@ -1,10 +1,10 @@
 # M7 Windows containment — accepted plan and production AppContainer boundary
 
-Status: accepted 2026-08-15. Phases 1–4 and the hosted part of phase 5 are
-implemented. Protected Windows CI proves the production AppContainer launcher,
-ordinary Node/Rust gates, and retained-posture overhead before the process
-provider is enabled. The dedicated operator-controlled Windows 11 receipt
-remains open, so this document does not yet call the full parity ticket closed.
+Status: accepted 2026-08-15; complete 2026-08-23. Phases 1–5 are implemented.
+Protected Windows CI proves the production AppContainer launcher, ordinary
+Node/Rust gates, and retained-posture overhead before the process provider is
+enabled. The dedicated operator-controlled Windows 11 receipt repeats the
+production hostile boundary and overhead proof, closing the parity ticket.
 
 ## Outcome first
 
@@ -141,11 +141,12 @@ job without a managed runner would be ceremony, not evidence.
    Object tree kill, validator real-checkout read denial, and engine-gate
    wrapping. The protected receipt proves exact DACL restoration after the
    child exits.
-5. **Shipped on protected hosted Windows:** run the full hostile brief plus
+5. **Shipped on protected hosted Windows and repeated on an
+   operator-controlled Windows 11 host:** run the full hostile brief plus
    normal Node/Rust gate and retained-posture overhead measurements against a
    five-second minimum representative gate payload, retaining the `10%` target.
-   Repeat that receipt on the operator-controlled Windows 11 host before
-   marking the Windows ticket and M7 parity complete.
+   The operator receipt returned every hostile-boundary field true and measured
+   1.67% Node / 1.10% Rust median overhead, closing Windows parity and M7.
 
 ## Phase-1 receipt
 

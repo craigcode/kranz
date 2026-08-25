@@ -48,12 +48,6 @@ Format:
   Source: docs/roadmap.md; docs/deploy.md
   Ticket: m6-railway-live-deployment
 
-- **M7 Windows production receipt** - hosted Windows green on the AppContainer path, then a dedicated Windows 11 hostile+overhead receipt.
-  Why: macOS, Linux, and Docker live proofs are done and the hosted Windows production path is green; the dedicated operator receipt is the remaining M7 done-when hole.
-  Trigger: An operator-controlled Windows 11 endpoint is available for the hostile+overhead run.
-  Source: docs/scoping/m7-windows-containment.md
-  Ticket: m7-windows-containment-parity
-
 ## Later / gated
 
 - **Gas City pack publish remainder** - human `gc pack registry` / `gc pack release` after Stage 1 receipt and a second consumer.
@@ -117,6 +111,8 @@ one cycle so `/kranz roadmap` readers are not surprised by the deletion.
 - M8 multi-root host design + project picker — both done.
 - M7 Linux hostile live proof — real bubblewrap receipt committed; `m7-linux-hostile-live-proof` done.
 - M7 container per-host egress — Docker internal-network boundary and native Ubuntu receipt committed; `m7-container-per-host-egress-boundary` done.
+- M7 Windows production receipt — operator-controlled Windows 11 hostile and
+  retained-overhead receipt committed; `m7-windows-containment-parity` done.
 - Gas City event dispatch + `kranz.mission.*` emits — `revive-gascity-demo` done.
 - Structured human-question events, agent hook status signals — both done.
 - Workspace provider pin at approval — done.
