@@ -778,15 +778,15 @@ fn resolve_gate_sandbox_target(
         // session resolution exactly (`sandbox::resolve_container_target` +
         // `runner::resolve_sandbox_or_refuse`): a requested container with
         // no runtime on PATH is refused — never a silent host-side gate.
-        // The container argv/mount contract is live-proven only for POSIX
-        // container targets on macOS/Linux. On Windows, a detected
-        // `docker.exe` says nothing about Linux-vs-Windows container mode,
-        // guest path mapping, or the `/dev/null` authority masks. Refuse
-        // before constructing an unverified gate command; session resolution
-        // applies the identical posture.
-        if !matches!(target_os, "macos" | "linux") {
+        // The container argv/mount contract is release-supported only on
+        // Linux. A macOS operator receipt exists, but hosted macOS cannot
+        // renew it as a CI release gate; Windows does not honor the POSIX
+        // guest-path and `/dev/null` authority-mask contract. Refuse before
+        // constructing an unverified gate command; session resolution applies
+        // the identical posture. macOS uses native Seatbelt instead.
+        if target_os != "linux" {
             return Err(crate::error::EngineError::Config(format!(
-                "sandbox provider:container with enforce:{} is not live-proven on target_os={target_os}; refusing to run engine-run gates under an unverified container mount contract",
+                "sandbox provider:container with enforce:{} is supported only on target_os=linux, not target_os={target_os}; refusing to run engine-run gates under an unverified container mount contract; use sandbox.provider=\"process\" for native host containment",
                 sandbox_cfg.enforce.as_str()
             )));
         }
@@ -1970,7 +1970,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !found {
-            eprintln!("sandbox-exec not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
             return false;
         }
         let smoke = std::process::Command::new("sandbox-exec")
@@ -1997,7 +2000,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn gate_wrap_bwrap_can_apply() -> bool {
         if !crate::sandbox::command_available("bwrap") {
-            eprintln!("bwrap not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::BWRAP,
+                "bwrap not found on this host",
+            );
             return false;
         }
         let smoke = std::process::Command::new("bwrap")
@@ -2285,8 +2291,8 @@ mod tests {
     /// provider:container + enforce != off + a detected runtime resolves to
     /// [`GateSandbox::Container`] with gate-shaped inputs (the gate cwd as the
     /// writable root, the scratch as tmpdir, the mission dir for the metadata
-    /// denies) and the configured/default image — on the live-proven macOS
-    /// and Linux hosts. Windows fails closed even when `docker.exe` exists:
+    /// denies) and the configured/default image — on the live-proven Linux
+    /// host. macOS and Windows fail closed even when a runtime exists:
     /// runtime presence does not prove guest path or authority-mask semantics.
     /// No runtime FAILS CLOSED with the shared note (mirroring session
     /// resolution — never a silent host-side gate); `fs+net` with a non-empty
@@ -2307,9 +2313,37 @@ mod tests {
         };
         let runtime = Some(crate::sandbox_container::ContainerRuntime::Docker);
 
-        // A detected runtime → the container wrap on live-proven hosts.
-        for target_os in ["macos", "linux"] {
-            let resolution = resolve_gate_sandbox_target(
+        // A detected runtime → the container wrap on the live-proven host.
+        let resolution = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "linux",
+            false,
+            runtime,
+        )
+        .unwrap();
+        assert!(resolution.note.is_none());
+        let GateSandbox::Container { inputs, spec } = &resolution.sandbox else {
+            panic!("container + runtime must resolve to GateSandbox::Container on linux");
+        };
+        assert_eq!(inputs.session_cwd, repo.path());
+        assert_eq!(inputs.tmpdir, scratch.path());
+        assert_eq!(inputs.mission_dir, mission);
+        assert_eq!(inputs.enforce, crate::types::SandboxEnforce::Fs);
+        assert_eq!(
+            spec.runtime,
+            crate::sandbox_container::ContainerRuntime::Docker
+        );
+        assert_eq!(spec.image, crate::sandbox_container::DEFAULT_IMAGE);
+
+        // Runtime presence is not containment evidence on an unproved host.
+        // Both platforms refuse before the gate process starts; macOS points
+        // to its supported native Seatbelt path.
+        for target_os in ["macos", "windows"] {
+            let error = resolve_gate_sandbox_target(
                 &container(crate::types::SandboxEnforce::Fs),
                 repo.path(),
                 &mission,
@@ -2319,49 +2353,26 @@ mod tests {
                 false,
                 runtime,
             )
-            .unwrap();
-            assert!(resolution.note.is_none());
-            let GateSandbox::Container { inputs, spec } = &resolution.sandbox else {
-                panic!("container + runtime must resolve to GateSandbox::Container on {target_os}");
-            };
-            assert_eq!(inputs.session_cwd, repo.path());
-            assert_eq!(inputs.tmpdir, scratch.path());
-            assert_eq!(inputs.mission_dir, mission);
-            assert_eq!(inputs.enforce, crate::types::SandboxEnforce::Fs);
-            assert_eq!(
-                spec.runtime,
-                crate::sandbox_container::ContainerRuntime::Docker
+            .expect_err("an unproved container gate must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("supported only on target_os=linux"),
+                "{error}"
             );
-            assert_eq!(spec.image, crate::sandbox_container::DEFAULT_IMAGE);
+            assert!(
+                error
+                    .to_string()
+                    .contains("unverified container mount contract"),
+                "{error}"
+            );
+            if target_os == "macos" {
+                assert!(
+                    error.to_string().contains("sandbox.provider=\"process\""),
+                    "{error}"
+                );
+            }
         }
-
-        // A detected Windows runtime is not containment evidence. The
-        // shipped mount contract uses POSIX guest paths and `/dev/null`
-        // authority masks, neither of which has a Windows hostile-host
-        // receipt. Fail before the gate process starts.
-        let error = resolve_gate_sandbox_target(
-            &container(crate::types::SandboxEnforce::Fs),
-            repo.path(),
-            &mission,
-            scratch.path(),
-            scratch.path(),
-            "windows",
-            false,
-            runtime,
-        )
-        .expect_err("an unproved Windows container gate must fail closed");
-        assert!(
-            error
-                .to_string()
-                .contains("not live-proven on target_os=windows"),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("unverified container mount contract"),
-            "{error}"
-        );
 
         // A configured image rides into the spec (the mission container
         // image carries the gate's toolchain — the documented assumption).
@@ -2373,7 +2384,7 @@ mod tests {
             &mission,
             scratch.path(),
             scratch.path(),
-            "macos",
+            "linux",
             false,
             runtime,
         )
@@ -2391,7 +2402,7 @@ mod tests {
             &mission,
             scratch.path(),
             scratch.path(),
-            "macos",
+            "linux",
             false,
             None,
         )
@@ -2517,7 +2528,7 @@ mod tests {
             .expect_err("an unproved Windows container gate must fail closed");
             assert!(error
                 .to_string()
-                .contains("not live-proven on target_os=windows"));
+                .contains("supported only on target_os=linux"));
             assert!(error
                 .to_string()
                 .contains("unverified container mount contract"));
@@ -2614,7 +2625,7 @@ mod tests {
             &mission,
             scratch.path(),
             scratch.path(),
-            "macos",
+            "linux",
             false,
             None,
         )
@@ -3534,14 +3545,21 @@ mod tests {
     /// host) proves the probes are valid — the SAME probes succeed there, so
     /// the container is what denies them.
     ///
-    /// Skips cleanly on hosts with no container runtime (this macOS dev
-    /// host); CI ubuntu-latest has docker. Unix-only: the probes are POSIX
+    /// Skips outside the live-proven Linux host path or without a runtime;
+    /// CI ubuntu-latest has Docker. Unix-only: the probes are POSIX
     /// shell inside the container and POSIX tempfile paths on the host. No
     /// GATE_SANDBOX_WRAP_LOCK: that lock serializes sandbox-exec/bwrap spawn
     /// contention, and this test spawns only the container runtime.
     #[cfg(unix)]
     #[tokio::test]
     async fn container_gate_wrap_runs_contract_command_inside_the_container() {
+        if !crate::sandbox_container::host_supports_container_contract() {
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "container provider is supported only on Linux",
+            );
+            return;
+        }
         if crate::sandbox_container::detect().is_none() {
             eprintln!(
                 "no container runtime (docker/podman/nerdctl/container) on PATH; skipping \

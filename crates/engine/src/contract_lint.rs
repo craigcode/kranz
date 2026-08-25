@@ -488,10 +488,9 @@ mod tests {
         // `usr/bin` on PATH have one, so run it there and say so plainly when
         // there is nothing to run against rather than failing a stock box.
         if !crate::sandbox::command_available("grep") {
-            eprintln!(
-                "SKIP approval_lint_runner_flags_inverted_lockfile_grep_shape: \
-                 no `grep` on PATH (expected only on a Windows host without \
-                 Git's usr/bin); the inverted-polarity shape is unexercised here"
+            crate::test_capability::skip(
+                crate::test_capability::capability::GREP,
+                "no grep on PATH; the inverted-polarity shape is unexercised here",
             );
             return;
         }

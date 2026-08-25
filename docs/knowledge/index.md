@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-08-22
+last_verified: 2026-08-25
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - AGENTS.md

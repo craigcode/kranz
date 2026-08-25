@@ -693,7 +693,10 @@ mod tests {
             .output()
             .is_err()
         {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         }
         git(&["init", "-b", "main"]);
@@ -755,7 +758,10 @@ mod tests {
             .output()
             .is_err()
         {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return;
         }
         git(&["init", "-b", "main"]);

@@ -3,8 +3,8 @@
 //! docs/scoping/worker-sandboxing.md tier 3.
 //!
 //! Two network postures for `enforce = "fs+net"`, chosen by the egress list.
-//! An EMPTY `egress` list runs `--network none` — a hard egress boundary that
-//! works identically on macOS and Linux. Note the honest tradeoff: `none`
+//! An EMPTY `egress` list runs `--network none` — a hard egress boundary on
+//! the live-proven Linux host path. Note the honest tradeoff: `none`
 //! also blocks the agent's API egress, so it suits offline gates/validation.
 //! A NON-EMPTY `egress` list runs the worker on a unique Docker `--internal`
 //! network. A trusted dual-homed relay is the only other container on that
@@ -18,11 +18,14 @@
 //! no egress list use `fs` (runtime default bridge/NAT, the same
 //! permissiveness as the tier-2 fs tier).
 //!
-//! Host support is deliberately macOS/Linux only. Session and gate resolution
-//! fail closed on Windows even when `docker.exe` is present: the shipped
-//! contract uses POSIX guest paths and `/dev/null` authority masks, and no
-//! Windows-container or Docker-Desktop hostile-host receipt exists. Runtime
+//! Host support is deliberately Linux only. Session and gate resolution fail
+//! closed on macOS and Windows even when a runtime is present: only Linux has
+//! a continuously enforced CI receipt for the shipped bind-mount,
+//! authority-mask, and egress contracts. A 2026-08-21 macOS operator receipt
+//! is retained as evidence, but is not a renewable release gate. Runtime
 //! detection is not evidence that those mounts enforce the declared policy.
+//! macOS remains supported through the process provider's native Seatbelt
+//! boundary.
 //!
 //! Write policy: the container's root filesystem is read-only; the writable
 //! set is exactly the declared mounts — `session_cwd` (rw), `mission_dir`
@@ -54,7 +57,7 @@ use std::path::Path;
 use crate::sandbox::SandboxInputs;
 
 /// Image used when the role config does not name one. Minimal and
-/// pullable on the supported macOS/Linux container path; production use
+/// pullable on the supported Linux container path; production use
 /// should set `sandbox.image`.
 pub const DEFAULT_IMAGE: &str = "alpine:3";
 
@@ -97,20 +100,20 @@ pub fn detect() -> Option<ContainerRuntime> {
 /// Whether this host can actually honor the shipped container contract, as
 /// opposed to merely having a runtime binary on PATH.
 ///
-/// Detection answers "is there a `docker`?"; this answers "can it run what we
-/// ship?". They diverge on Windows: `docker.exe` is present, but the contract
-/// uses POSIX guest paths and the daemon defaults to Windows-container mode,
-/// where the Linux images cannot even be pulled —
-/// `no matching manifest for windows(10.0.26100)/amd64`. Session and gate
-/// resolution already fail closed there (see the module docs), so live
-/// container tests must SKIP on Windows rather than exercise a path the
-/// provider refuses.
+/// Detection answers "is there a runtime?"; this answers "is its host contract
+/// supported?". They diverge on macOS and Windows. Hosted macOS runners do not
+/// expose the virtualization Colima needs, so the existing operator proof
+/// cannot be renewed as a CI release gate; Windows may have `docker.exe`, but
+/// the shipped contract uses POSIX guest paths and Linux images. Session and
+/// gate resolution fail closed on both platforms (see the module docs), so
+/// live container tests skip there rather than exercise a path the provider
+/// refuses.
 ///
 /// This was masked until now: `command_available` did not consult `PATHEXT`,
 /// so `detect()` never saw `docker.exe` and the Windows container tests took
 /// their silent skip path and reported `ok` without running.
 pub fn host_supports_container_contract() -> bool {
-    !cfg!(windows)
+    cfg!(target_os = "linux")
 }
 
 /// Detection with an injectable PATH lookup so tests control availability.
@@ -916,19 +919,21 @@ mod tests {
     /// mounted session dir on the host, a write outside the declared policy
     /// (`/etc`, read-only root fs) is denied, and authority material under the
     /// session root (`.kranz/serve.token`) is masked by its /dev/null bind.
-    /// Skips on hosts with no container runtime (this macOS dev host); CI
-    /// ubuntu-latest has docker.
+    /// Skips outside the live-proven Linux host path or without a runtime;
+    /// CI ubuntu-latest has Docker.
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
         if !host_supports_container_contract() {
-            eprintln!(
-                "container provider is macOS/Linux only; skipping live container smoke test on this host"
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "container provider is supported only on Linux",
             );
             return;
         }
         let Some(runtime) = detect() else {
-            eprintln!(
-                "no container runtime (docker/podman/nerdctl/container) on PATH; skipping container smoke test"
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "no docker/podman/nerdctl/container on PATH",
             );
             return;
         };

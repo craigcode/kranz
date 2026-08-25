@@ -823,7 +823,10 @@ mod tests {
             .output()
             .ok()?;
         if !init.status.success() {
-            eprintln!("skipping test: git is not on PATH");
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return None;
         }
         let git = |args: &[&str]| {

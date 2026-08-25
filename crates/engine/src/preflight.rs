@@ -931,7 +931,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !found {
-            eprintln!("sandbox-exec not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
             return false;
         }
         let smoke = std::process::Command::new("sandbox-exec")
@@ -1057,7 +1060,10 @@ mod tests {
     #[test]
     fn sandbox_preflight_worktree_creation_failure_is_advisory() {
         if !sandbox_exec_available() {
-            eprintln!("sandbox-exec not found on this host; skipping");
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
             return;
         }
         let (_dir, root, _sha) = seeded_git_repo();

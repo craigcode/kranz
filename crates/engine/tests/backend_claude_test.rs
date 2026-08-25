@@ -78,7 +78,10 @@ fn sandbox_exec_can_apply() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !found {
-        eprintln!("sandbox-exec not found on this host; skipping");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::SANDBOX_EXEC,
+            "sandbox-exec not found on this host",
+        );
         return false;
     }
     let smoke = std::process::Command::new("sandbox-exec")

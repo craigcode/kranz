@@ -243,13 +243,14 @@ The exact remaining provider, secret, volume, containment, and smoke-test
 decisions are captured in the
 [M4/M6 operator-readiness packet](reviews/m4-m6-operator-readiness.md).
 
-## M7 — Worker sandboxing ◑ (macOS/Linux and Docker proofs complete; Windows operator receipt remains)
+## M7 — Worker sandboxing ◑ (macOS Seatbelt and Linux container proofs complete; Windows operator receipt remains)
 
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
 `enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior, the
-Docker tier-3 container provider with a non-bypassable per-host egress
-boundary, and per-host egress enforcement via the filtering egress proxy
+Linux-supported Docker tier-3 container provider with a non-bypassable
+per-host egress boundary, and per-host egress enforcement via the filtering
+egress proxy
 (`fs+net` on macOS routes loopback-only Seatbelt egress through it; structured
 denials surface on `RunOutcome` for the 3.3b grant flow). The dedicated
 operator-controlled Windows 11 receipt is the remaining item, tracked by

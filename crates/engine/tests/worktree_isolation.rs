@@ -82,7 +82,10 @@ fn gate_base_sha_assertion_command(expected: &str) -> String {
 /// Fresh repo on `main` with identity + one seed commit; returns the seed sha.
 fn seeded_repo() -> Option<(tempfile::TempDir, GitRepo, String)> {
     if !git_available() {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         return None;
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -407,7 +410,10 @@ fn checkout_cfg() -> MissionConfig {
 /// Fresh git repo, seeded, on `main`, root canonicalized.
 fn mission_init_repo() -> Option<(tempfile::TempDir, PathBuf)> {
     if !git_available() {
-        eprintln!("skipping test: git is not on PATH");
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::GIT,
+            "git is not on PATH",
+        );
         return None;
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -715,13 +721,14 @@ async fn workspace_provider_provisions_the_integration_worktree() {
 /// INSIDE the container network, and `workspace.teardown` records keep
 /// (no teardownMode configured — the run loop's default; the test cleans
 /// the project up itself).
-/// Runtime-gated: skips on hosts with no container runtime (the macOS dev
-/// host); CI ubuntu-latest has docker.
+/// Runtime-gated: skips outside the live-proven Linux host path or without a
+/// runtime; CI ubuntu-latest has Docker.
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_events_land_for_a_full_mission_run() {
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
-        eprintln!(
-            "container provider is macOS/Linux only; skipping container workspace engine test on this host"
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::CONTAINER,
+            "live container contract is supported only on Linux",
         );
         return;
     }
@@ -862,8 +869,9 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_terminal_teardown_hibernates_and_destroys() {
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
-        eprintln!(
-            "container provider is macOS/Linux only; skipping container terminal-teardown test on this host"
+        kranz_engine::test_capability::skip(
+            kranz_engine::test_capability::capability::CONTAINER,
+            "live container contract is supported only on Linux",
         );
         return;
     }

@@ -2292,7 +2292,10 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !git_works {
-            eprintln!("skipping test: git is not on PATH");
+            kranz_engine::test_capability::skip(
+                kranz_engine::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
             return None;
         }
         let dir = tempfile::tempdir().expect("tempdir");
