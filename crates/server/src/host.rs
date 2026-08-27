@@ -110,6 +110,10 @@ pub struct MissionHost {
     /// Short-TTL cache for the queue-front readiness probe so a 3s dashboard
     /// poll does not re-shell every backend CLI on every GET /api/queue.
     readiness_front_cache: Mutex<Option<FrontReadinessCache>>,
+    /// Backend readiness follows the same dependency-injection boundary as
+    /// `backend`: real hosts probe configured CLIs, while hosts supplied an
+    /// already-constructed backend treat that backend as available.
+    readiness_probe: ReadinessProbe,
 }
 
 /// Cached `GET /api/queue` readiness for the current queue front only.
@@ -137,6 +141,24 @@ struct DrainState {
 /// real shell-backed default and tests can inject a scripted stub — the same
 /// seam shape as [`MissionHost::with_backend`] for the agent backend.
 type GateExecutor = Arc<dyn Fn(&str, &Path) -> (bool, String) + Send + Sync>;
+
+type ReadinessProbe =
+    fn(
+        &Path,
+        &str,
+    ) -> kranz_engine::error::Result<kranz_engine::backend_readiness::ReadinessReport>;
+
+fn injected_backend_readiness(
+    _repo_root: &Path,
+    mission_id: &str,
+) -> kranz_engine::error::Result<kranz_engine::backend_readiness::ReadinessReport> {
+    Ok(kranz_engine::backend_readiness::ReadinessReport {
+        mission_id: mission_id.to_string(),
+        roles: Vec::new(),
+        overall: kranz_engine::backend_readiness::ReadinessStatus::Ok,
+        warnings: Vec::new(),
+    })
+}
 
 /// The real gate executor delegates to the engine's 600-second process-tree
 /// bounded shell runner with a sanitized environment. It runs only from
@@ -195,6 +217,7 @@ impl MissionHost {
             global_run_permits: None,
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
+            readiness_probe: kranz_engine::backend_readiness::probe_mission,
         }
     }
 
@@ -210,6 +233,7 @@ impl MissionHost {
             global_run_permits: None,
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
+            readiness_probe: injected_backend_readiness,
         }
     }
 
@@ -230,6 +254,7 @@ impl MissionHost {
             global_run_permits: None,
             gate_executor: Arc::new(gate_executor),
             readiness_front_cache: Mutex::new(None),
+            readiness_probe: kranz_engine::backend_readiness::probe_mission,
         }
     }
 
@@ -247,6 +272,7 @@ impl MissionHost {
             global_run_permits: Some(global_run_permits),
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
+            readiness_probe: kranz_engine::backend_readiness::probe_mission,
         }
     }
 
@@ -267,6 +293,7 @@ impl MissionHost {
             global_run_permits: Some(global_run_permits),
             gate_executor: real_gate_executor(),
             readiness_front_cache: Mutex::new(None),
+            readiness_probe: injected_backend_readiness,
         }
     }
 
@@ -1281,13 +1308,20 @@ impl MissionHost {
         // can ever land on a mission branch. See `drain_task` for the
         // restore-on-exit half of this contract.
         let task_state = Arc::clone(&state);
+        let readiness_probe = self.readiness_probe;
         let join = tokio::spawn(async move {
             let _global_run_permit = global_run_permit;
-            drain_task(repo_root.clone(), task_state, once, move |mission_id| {
-                let backend = Arc::clone(&backend);
-                let repo_root = repo_root.clone();
-                async move { run_mission_headless(backend, repo_root, mission_id).await }
-            })
+            drain_task(
+                repo_root.clone(),
+                task_state,
+                once,
+                move |mission_id| {
+                    let backend = Arc::clone(&backend);
+                    let repo_root = repo_root.clone();
+                    async move { run_mission_headless(backend, repo_root, mission_id).await }
+                },
+                readiness_probe,
+            )
             .await;
         });
 
@@ -1329,7 +1363,7 @@ impl MissionHost {
                     }
                 }
             }
-            let report = kranz_engine::backend_readiness::probe_mission(&self.repo_root, mid)
+            let report = (self.readiness_probe)(&self.repo_root, mid)
                 .ok()
                 .and_then(|r| serde_json::to_value(r).ok())
                 .unwrap_or(Value::Null);
@@ -1693,18 +1727,12 @@ async fn drain_task<R, Fut>(
     state: Arc<Mutex<DrainState>>,
     once: bool,
     run_mission: R,
+    readiness_probe: ReadinessProbe,
 ) where
     R: Fn(String) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<i32>>,
 {
-    drain_task_with_probe(
-        repo_root,
-        state,
-        once,
-        run_mission,
-        kranz_engine::backend_readiness::probe_mission,
-    )
-    .await;
+    drain_task_with_probe(repo_root, state, once, run_mission, readiness_probe).await;
 }
 
 /// [`drain_task`] with an injectable readiness probe so checkout-restoration
