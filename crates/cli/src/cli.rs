@@ -355,6 +355,30 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         max_cycles: Option<u32>,
 
+        /// Create, plan, approve, and enqueue the mission without running it.
+        /// A later `kranz work` drain owns execution. This is the native-queue
+        /// handoff for headless producers such as the Gas City pack.
+        #[arg(long, conflicts_with = "push")]
+        enqueue: bool,
+
+        /// Stable producer name recorded beside an enqueued mission so its
+        /// terminal state can be returned even if another dispatcher drains
+        /// the shared queue. Must be paired with --enqueue-external-ref.
+        #[arg(
+            long,
+            value_name = "PRODUCER",
+            requires_all = ["enqueue", "enqueue_external_ref"]
+        )]
+        enqueue_source: Option<String>,
+
+        /// Producer-owned identifier recorded with --enqueue-source.
+        #[arg(
+            long,
+            value_name = "REF",
+            requires_all = ["enqueue", "enqueue_source"]
+        )]
+        enqueue_external_ref: Option<String>,
+
         /// After a COMPLETE run, push the mission's `kranz/*` branch to this
         /// git remote (the cloud-mission handoff: a human reviews the branch
         /// and opens the PR). Refuses to push anything but a kranz/* ref.
@@ -370,8 +394,14 @@ pub enum Command {
         allow_unvalidated: bool,
     },
 
-    /// Show the per-repo execution queue
-    Queue,
+    /// Show or remove an entry from the per-repo execution queue
+    Queue {
+        /// Remove the queued entry for this mission without running it. The
+        /// mission itself is retained for audit; abandon it separately when
+        /// the producer is cancelling the work rather than re-enqueueing it.
+        #[arg(long, value_name = "MISSION_ID")]
+        remove: Option<String>,
+    },
 
     /// Report docs/knowledge notes whose verified_against paths drifted.
     KnowledgeRefresh {
@@ -452,6 +482,11 @@ pub enum Command {
         /// instead of draining until the queue is empty
         #[arg(long)]
         once: bool,
+
+        /// With --once, run only when this exact mission is still at the
+        /// front. A changed front is released without execution.
+        #[arg(long, value_name = "MISSION_ID", requires = "once")]
+        expect: Option<String>,
     },
 
     /// Serve the REST/WebSocket API (and the dashboard, if built)

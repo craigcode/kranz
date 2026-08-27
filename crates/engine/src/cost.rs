@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const TOKENS_PER_MTOK: f64 = 1_000_000.0;
+const GPT_5_6_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 /// Default model id for the Codex backend, importable engine-wide.
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Whether `model` names a codex-family model (same substring match
 /// [`pricing_for_model`] uses to select codex pricing).
@@ -85,6 +86,11 @@ pub fn pricing_for_model(model: &str) -> Pricing {
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
         }
+    } else if m == "gpt-5.6" || m.contains("gpt-5.6-sol") {
+        Pricing {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+        }
     } else if m.contains("codex") || m.contains("gpt") {
         Pricing {
             input_per_mtok: 1.25,
@@ -125,14 +131,34 @@ pub fn pricing_for_model(model: &str) -> Pricing {
     }
 }
 
+fn is_gpt_5_6_sol(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m == "gpt-5.6" || m.contains("gpt-5.6-sol")
+}
+
 /// Dollar cost of a run's token usage under the model's pricing. Used as a
 /// fallback when the CLI result message does not report `cost_usd`.
 pub fn usage_cost_usd(usage: &TokenUsage, model: &str) -> f64 {
     let p = pricing_for_model(model);
-    (usage.input as f64 / TOKENS_PER_MTOK) * p.input_per_mtok
-        + (usage.output as f64 / TOKENS_PER_MTOK) * p.output_per_mtok
+    let total_input = usage
+        .input
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
+    // Official GPT-5.6 Sol pricing applies the long-context multiplier to the
+    // full request once prompt input exceeds 272K tokens. Codex emits one
+    // terminal usage record per single-shot request, so this fallback has the
+    // request boundary needed to apply it exactly.
+    let (input_multiplier, output_multiplier) =
+        if is_gpt_5_6_sol(model) && total_input > GPT_5_6_LONG_CONTEXT_THRESHOLD {
+            (2.0, 1.5)
+        } else {
+            (1.0, 1.0)
+        };
+    ((usage.input as f64 / TOKENS_PER_MTOK) * p.input_per_mtok
         + (usage.cache_read as f64 / TOKENS_PER_MTOK) * p.cache_read_per_mtok()
-        + (usage.cache_write as f64 / TOKENS_PER_MTOK) * p.cache_write_per_mtok()
+        + (usage.cache_write as f64 / TOKENS_PER_MTOK) * p.cache_write_per_mtok())
+        * input_multiplier
+        + (usage.output as f64 / TOKENS_PER_MTOK) * p.output_per_mtok * output_multiplier
 }
 
 /// [`usage_cost_usd`] fallback that is aware of the local backend: local
@@ -898,8 +924,8 @@ mod tests {
     #[test]
     fn codex_pricing_applied() {
         let codex = pricing_for_model(DEFAULT_CODEX_MODEL);
-        assert_eq!(codex.input_per_mtok, 1.25);
-        assert_eq!(codex.output_per_mtok, 10.0);
+        assert_eq!(codex.input_per_mtok, 4.0);
+        assert_eq!(codex.output_per_mtok, 20.0);
 
         let opus = pricing_for_model("opus");
         assert_ne!(codex, opus);
@@ -910,12 +936,43 @@ mod tests {
             cache_read: 500_000,
             cache_write: 200_000,
         };
-        let expected = 2.0 * 1.25 + 1.0 * 10.0 + 0.5 * (0.1 * 1.25) + 0.2 * (1.25 * 1.25);
+        // This fixture carries 2.7M total input tokens, so the Sol default's
+        // long-context rates apply to every input lane and to output.
+        let expected =
+            (2.0 * 4.0 + 0.5 * (0.1 * 4.0) + 0.2 * (1.25 * 4.0)) * 2.0 + 1.0 * 20.0 * 1.5;
         let got = usage_cost_usd(&usage, DEFAULT_CODEX_MODEL);
         assert!(
             (got - expected).abs() < 1e-9,
             "got {got}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn gpt_5_6_alias_uses_sol_pricing() {
+        assert_eq!(
+            pricing_for_model("gpt-5.6"),
+            pricing_for_model("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_sol_long_context_multiplier_starts_above_272k() {
+        let at_threshold = TokenUsage {
+            input: 200_000,
+            cache_read: 72_000,
+            cache_write: 0,
+            output: 10_000,
+        };
+        let base = 0.2 * 4.0 + 0.072 * 0.4 + 0.01 * 20.0;
+        assert!((usage_cost_usd(&at_threshold, "gpt-5.6-sol") - base).abs() < 1e-9);
+
+        let above_threshold = TokenUsage {
+            input: 200_001,
+            ..at_threshold
+        };
+        let long = (0.200001 * 4.0 + 0.072 * 0.4) * 2.0 + 0.01 * 20.0 * 1.5;
+        assert!((usage_cost_usd(&above_threshold, "gpt-5.6-sol") - long).abs() < 1e-9);
+        assert!((usage_cost_usd(&above_threshold, "gpt-5.6") - long).abs() < 1e-9);
     }
 
     #[test]

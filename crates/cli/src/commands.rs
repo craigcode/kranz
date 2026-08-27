@@ -382,25 +382,42 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         }
         Command::Exec {
             file,
-            yes,
+            yes: _,
             max_cycles,
+            enqueue,
+            enqueue_source,
+            enqueue_external_ref,
             push,
             allow_unvalidated,
         } => crate::exec::cmd_exec(
             repo,
             file,
-            yes,
-            max_cycles,
-            push,
-            cli.dangerously_allow_all,
-            allow_unvalidated,
+            crate::exec::ExecOptions {
+                max_cycles,
+                enqueue,
+                enqueue_source: enqueue_source.zip(enqueue_external_ref).map(
+                    |(producer, external_ref)| crate::exec::ExternalEnqueueSource {
+                        producer,
+                        external_ref,
+                    },
+                ),
+                push,
+                dangerously_allow_all: cli.dangerously_allow_all,
+                allow_unvalidated,
+            },
         )
         .await
         .map_err(augment_limit_hint),
-        Command::Queue => {
-            print!("{}", backlog::cmd_queue(&repo));
-            Ok(0)
-        }
+        Command::Queue { remove } => match remove {
+            Some(mission_id) => {
+                print!("{}", backlog::cmd_queue_remove(&repo, &mission_id)?);
+                Ok(0)
+            }
+            None => {
+                print!("{}", backlog::cmd_queue(&repo));
+                Ok(0)
+            }
+        },
         Command::KnowledgeRefresh { json } => cmd_knowledge_refresh(&repo, json),
         Command::Scan { staged, range } => cmd_scan(&repo, staged, range.as_deref()),
         Command::DomainLint { seed_config, json } => {
@@ -439,7 +456,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Work { once } => backlog::cmd_work(repo, once)
+        Command::Work { once, expect } => backlog::cmd_work(repo, once, expect)
             .await
             .map_err(augment_limit_hint),
         Command::Serve {

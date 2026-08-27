@@ -9,12 +9,17 @@ side.
 
 ## How it works
 
-Two halves, split by Gas City's order-exec deadline: `bin/kranz-dispatch`
-(the order, fired instantly on `bead.created`) marks ready `kranz`-labeled
-beads `in_progress` (direct status write, not an atomic claim) and spools
-mission briefs; `bin/kranz-city-worker` (a supervised long-running session —
-see `agents/kranz-worker/`) drains the spool strictly serially, running each
-brief and mapping the exit code back into City state. A slow cooldown
+Two halves keep long-running feature execution out of Gas City's order:
+`bin/kranz-dispatch` (fired on `bead.created`) atomically claims each ready
+`kranz`-labelled bead, runs the bounded create/plan/approve half of
+`kranz exec --enqueue --enqueue-source gascity --enqueue-external-ref <bead>`,
+and leaves an approved mission in the selected rig's native `.kranz/queue/`.
+The structured source receipt beside the mission is the durable City
+ownership record; prompt text is never used as identity. Any legitimate
+kranz dispatcher may consume the shared queue. `bin/kranz-city-worker` (a
+supervised non-LLM session; see `agents/kranz-worker/`) scans registered rigs
+and either drains the queue strictly serially through `kranz work --once` or
+returns a terminal source-bound mission that another dispatcher drained. A slow cooldown
 backstop order (`orders/kranz-dispatch-backstop.toml`, 15m) re-runs the same
 `kranz-dispatch` so a dead claim in a quiet city is reclaimed and a bead
 re-readied after a reopen/refine (which fires `bead.updated`, not
@@ -23,21 +28,33 @@ re-readied after a reopen/refine (which fires `bead.updated`, not
 1. Bead fields → ticket-shaped `mission.md`
    (`title → ## Goal`, `description → ## Context`,
    `acceptance_criteria → ## Acceptance hints`).
-2. Bead marked `in_progress` by a direct status write (not an atomic claim)
-   and spooled; the worker runs
-   `kranz exec -f mission.md` in the rig checkout — fully autonomous,
-   auto-approved plan, bounded fix cycles (`KRANZ_MAX_CYCLES`, default 1).
+2. The atomic first-wins City claim marks the bead `in_progress`.
+   `kranz exec --enqueue` creates and approves the mission, records its
+   external producer identity before queue visibility, and the worker (or a
+   sibling kranz dispatcher) later drains it with `kranz work --once`. Fix cycles remain bounded by
+   `KRANZ_MAX_CYCLES` (default 1).
    Rigs that disable the scrutiny validator are REFUSED (letter-over-spirit
    risk; docs/gascity.md lesson 3) unless `KRANZ_ALLOW_UNVALIDATED=1`.
    Multi-rig cities route by bead-id prefix via `gc rig list --json`.
-3. Exit code → City state:
+3. The mission's terminal state → City state:
 
-   | exit | meaning        | City effect                                      |
-   |------|----------------|--------------------------------------------------|
-   | 0    | complete       | bead closed with the mission report line          |
-   | 2    | blocked        | bead marked blocked + **mail escalation to human**|
-   | 3    | underspecified | bead reopened with a refine-the-brief comment     |
-   | 1    | failed         | bead reopened with the failure line               |
+   | mission outcome | City effect                                      |
+   |-----------------|--------------------------------------------------|
+   | complete        | bead closed with the mission report line          |
+   | blocked         | bead marked blocked + **mail escalation to human**|
+   | underspecified  | bead reopened during dispatch for refinement      |
+   | failed          | bead reopened with the failure line               |
+
+   A transient City write after terminal execution creates a
+   `gascity-return-pending.json` receipt beside the mission. The next worker
+   pass retries only the translation; it never re-runs the mission. Once the
+   City mutation is observable, the active `enqueue-source.json` becomes the
+   audit-only `enqueue-source.returned.json`.
+
+Set `KRANZ_NATIVE_QUEUE=1` on both `kranz-dispatch` and
+`kranz-city-worker`. Leaving it unset selects the previous `KRANZ_SPOOL`
+implementation as an immediate rollback while the native path receives its
+disposable-city operator receipt.
 
 Steer a blocked mission from kranz's own surfaces (web dashboard, Slack
 thread, CLI) — the escalation mail says where.
@@ -47,7 +64,8 @@ thread, CLI) — the escalation mail says where.
 1. `gc rig add <repo>` for the target checkout; give it a cheap-model
    `.kranz/config.json` if you want bounded spend.
 2. Copy `orders/kranz-dispatch.toml` into your city's `orders/`, set
-   `KRANZ_RIG_DIR`, put `bin/kranz-dispatch` (and `kranz`, `jq`) on PATH.
+   `KRANZ_NATIVE_QUEUE=1` for the order and supervised worker, optionally pin
+   `KRANZ_RIG_DIR`, and put the pack's `bin/` plus `kranz` and `jq` on PATH.
 3. Create work: `gc bd create "<goal>" --context "..." --acceptance "..."
    --label kranz`; the `bead.created` event fires `kranz-dispatch`
    instantly. A re-readied bead (reopened then refined) and a dead claim in
@@ -78,6 +96,11 @@ contract greps for the `ROUNDTRIP: PASS` marker specifically, so the same
 skip that lets a `bd`-less host merge quietly will fail the mission
 contract outright. Install `bd` before relying on a green merge gate here as
 evidence the bridge was proven against a live install.
+
+`packaging/gascity/test/kranz-native-queue-selftest.sh` is the CI-safe native
+queue contract. Deterministic `gc`/`kranz` stubs drive the production scripts
+and prove create→enqueue→`work --once`, zero private-spool writes, and
+return-receipt recovery without mission replay.
 
 `packaging/gascity/test/check-bridge-hygiene.sh` is a static check (no `bd`
 required): default mode fails if any bridge script under `bin/` still calls
@@ -113,7 +136,12 @@ only tracked for 1.1.0+), so the bridge keeps its own:
   released (`bd update --status open --assignee ""`) and immediately
   re-claimable; a claim with NO lease file is released only when the
   bead's `updated_at` is older than `KRANZ_CLAIM_TTL` (default 120s) —
-  expiry strictly as backstop.
+  expiry strictly as backstop. An active native source binding with a queue
+  claim or post-approval mission state is durable ownership and stands at any
+  age. The sole pre-queue crash shape — approved source, no queue file — is
+  protected until the source receipt's own age reaches the TTL, then ages into
+  the same recovery. This clock is deliberately independent of the older City
+  claim timestamp because planning may legitimately outlive the TTL.
 
 Proven against a live `bd` by the `LEASE: PASS (dead-claim recovered,
 live-claim preserved)` and `LEASE-TTL: PASS (expiry only as backstop:
@@ -134,8 +162,10 @@ sign-off the dialect doc's escalation section calls for: **D-BW-2
 liveness-first posture — a live pid's claim is never reaped — and TTL
 only as the backstop for lease-less (ambiguous) claims, which closes the
 failure mode that got the heuristic reverted. Residual window, documented
-rather than hidden: a claim between spool-write and a worker's first
-heartbeat is TTL-only.
+rather than hidden: on the legacy spool path, a claim between spool-write and
+a worker's first heartbeat is TTL-only. The native path closes that window
+with the durable source binding and explicitly recovers a source write that
+crashed before queue visibility.
 
 ## Distribution
 

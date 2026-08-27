@@ -10,9 +10,9 @@
 
 use clap::Parser;
 use kranz_cli::backlog::{
-    self, draft_decision, next_work_action, render_queue, render_ticket_list, render_ticket_show,
-    ticket_state_for_mission, ticket_template, work_skip_for_failed_blocker, DraftDecision,
-    TicketRow, WorkAction,
+    self, cmd_queue_remove, draft_decision, next_work_action, render_queue, render_ticket_list,
+    render_ticket_show, ticket_state_for_mission, ticket_template, work_skip_for_failed_blocker,
+    DraftDecision, TicketRow, WorkAction,
 };
 use kranz_cli::cli::{Cli, Command, TicketCommand};
 use kranz_engine::orchestrator::PlanRequest;
@@ -291,15 +291,45 @@ fn parses_draft_from_mission() {
 #[test]
 fn parses_queue() {
     let cli = Cli::try_parse_from(["kranz", "queue"]).unwrap();
-    assert!(matches!(cli.command, Command::Queue));
+    assert!(matches!(cli.command, Command::Queue { remove: None }));
+
+    let remove = Cli::try_parse_from(["kranz", "queue", "--remove", "m-abc123"]).unwrap();
+    assert!(matches!(
+        remove.command,
+        Command::Queue {
+            remove: Some(ref mission_id)
+        } if mission_id == "m-abc123"
+    ));
 }
 
 #[test]
 fn parses_work_and_work_once() {
     let drain = Cli::try_parse_from(["kranz", "work"]).unwrap();
-    assert!(matches!(drain.command, Command::Work { once: false }));
+    assert!(matches!(
+        drain.command,
+        Command::Work {
+            once: false,
+            expect: None
+        }
+    ));
     let once = Cli::try_parse_from(["kranz", "work", "--once"]).unwrap();
-    assert!(matches!(once.command, Command::Work { once: true }));
+    assert!(matches!(
+        once.command,
+        Command::Work {
+            once: true,
+            expect: None
+        }
+    ));
+    let expected =
+        Cli::try_parse_from(["kranz", "work", "--once", "--expect", "m-abc123"]).unwrap();
+    assert!(matches!(
+        expected.command,
+        Command::Work {
+            once: true,
+            expect: Some(ref mission_id)
+        } if mission_id == "m-abc123"
+    ));
+    assert!(Cli::try_parse_from(["kranz", "work", "--expect", "m-abc123"]).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +572,30 @@ fn render_queue_lists_positions_and_busy() {
     assert!(out
         .lines()
         .any(|l| l.contains("m-bbb") && l.trim_end().ends_with('-')));
+}
+
+#[test]
+fn queue_remove_retires_only_the_named_entry() {
+    let repo = tempfile::tempdir().unwrap();
+    for mission_id in ["m-remove1", "m-keep222"] {
+        queue::enqueue(
+            repo.path(),
+            QueueEntry {
+                mission_id: mission_id.to_string(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let message = cmd_queue_remove(repo.path(), "m-remove1").unwrap();
+
+    assert_eq!(message, "removed m-remove1 from the queue\n");
+    assert!(!queue::contains(repo.path(), "m-remove1"));
+    assert!(queue::contains(repo.path(), "m-keep222"));
+    assert!(cmd_queue_remove(repo.path(), "m-remove1").is_err());
 }
 
 // ---------------------------------------------------------------------------

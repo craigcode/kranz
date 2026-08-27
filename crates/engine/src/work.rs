@@ -157,6 +157,9 @@ pub struct DrainReport {
     /// mid-mission under a sibling dispatcher, and switching branches out
     /// from under it would corrupt that run's working tree.
     pub stopped_busy: bool,
+    /// An expectation-guarded one-shot drain found a different mission at
+    /// the front. The claim was released without readiness probing or run.
+    pub expected_mismatch: Option<String>,
 }
 
 /// After this many consecutive rate-limit delays on the same mission id in one
@@ -188,9 +191,29 @@ where
     R: Fn(String) -> Fut,
     Fut: Future<Output = Result<i32>>,
 {
-    drain_queue_with_probe(
+    drain_queue_expected(repo_root, once, None, run_mission).await
+}
+
+/// Drain with an optional atomic front-entry expectation. When `expected` is
+/// set and a sibling dispatcher changed the front before the claim landed,
+/// the claimed entry is released and returned in
+/// [`DrainReport::expected_mismatch`] without running it. This is the
+/// supervised-adapter guard for producers that must translate one specific
+/// queued mission's outcome back to an external system.
+pub async fn drain_queue_expected<R, Fut>(
+    repo_root: &Path,
+    once: bool,
+    expected: Option<&str>,
+    run_mission: R,
+) -> Result<DrainReport>
+where
+    R: Fn(String) -> Fut,
+    Fut: Future<Output = Result<i32>>,
+{
+    drain_queue_with_probe_expected(
         repo_root,
         once,
+        expected,
         run_mission,
         backend_readiness::probe_mission,
     )
@@ -204,6 +227,21 @@ where
 pub async fn drain_queue_with_probe<R, Fut, P>(
     repo_root: &Path,
     once: bool,
+    run_mission: R,
+    probe: P,
+) -> Result<DrainReport>
+where
+    R: Fn(String) -> Fut,
+    Fut: Future<Output = Result<i32>>,
+    P: Fn(&Path, &str) -> crate::error::Result<backend_readiness::ReadinessReport>,
+{
+    drain_queue_with_probe_expected(repo_root, once, None, run_mission, probe).await
+}
+
+async fn drain_queue_with_probe_expected<R, Fut, P>(
+    repo_root: &Path,
+    once: bool,
+    expected: Option<&str>,
     run_mission: R,
     probe: P,
 ) -> Result<DrainReport>
@@ -233,6 +271,11 @@ where
             }
             queue::ClaimFront::Claimed(claim) => {
                 let mission_id = claim.entry.mission_id.clone();
+                if expected.is_some_and(|expected| expected != mission_id) {
+                    queue::release_claim(claim);
+                    report.expected_mismatch = Some(mission_id);
+                    return Ok(report);
+                }
                 let ticket_slug = claim
                     .entry
                     .ticket_slug
@@ -257,17 +300,14 @@ where
                                 reason = %reason,
                                 "parking claimed mission: backend not ready"
                             );
-                            queue::finish_claim(claim);
-                            if let Some(slug) = &ticket_slug {
-                                Ticket::write_state(
-                                    repo_root,
-                                    slug,
-                                    TicketState::Parked,
-                                    Some(format!("parked (backend not ready): {reason}")),
-                                )?;
-                            }
+                            let stop = settle_parked_claim(
+                                repo_root,
+                                claim,
+                                ticket_slug.as_deref(),
+                                format!("parked (backend not ready): {reason}"),
+                            )?;
                             report.parked.push(mission_id);
-                            if once {
+                            if once || stop {
                                 return Ok(report);
                             }
                             continue;
@@ -284,17 +324,14 @@ where
                                 "backend rate-limited after claim"
                             );
                             if hits >= RATE_LIMIT_ROTATE_CAP {
-                                queue::finish_claim(claim);
-                                if let Some(slug) = &ticket_slug {
-                                    Ticket::write_state(
-                                        repo_root,
-                                        slug,
-                                        TicketState::Parked,
-                                        Some(format!("parked (rate-limited {hits}×): {reason}")),
-                                    )?;
-                                }
+                                let stop = settle_parked_claim(
+                                    repo_root,
+                                    claim,
+                                    ticket_slug.as_deref(),
+                                    format!("parked (rate-limited {hits}×): {reason}"),
+                                )?;
                                 report.parked.push(mission_id);
-                                if once {
+                                if once || stop {
                                     return Ok(report);
                                 }
                                 continue;
@@ -342,17 +379,14 @@ where
                         crate::disk_preflight::gib(estimate_bytes)
                     );
                     tracing::warn!(mission = %mission_id, reason = %reason, "parking claimed mission: disk preflight");
-                    queue::finish_claim(claim);
-                    if let Some(slug) = &ticket_slug {
-                        Ticket::write_state(
-                            repo_root,
-                            slug,
-                            TicketState::Parked,
-                            Some(format!("parked (disk): {reason}")),
-                        )?;
-                    }
+                    let stop = settle_parked_claim(
+                        repo_root,
+                        claim,
+                        ticket_slug.as_deref(),
+                        format!("parked (disk): {reason}"),
+                    )?;
                     report.parked.push(mission_id);
-                    if once {
+                    if once || stop {
                         return Ok(report);
                     }
                     continue;
@@ -393,6 +427,26 @@ where
                 }
             }
         }
+    }
+}
+
+/// Ticket-backed work has a durable Parked projection, so its queue entry can
+/// retire. A raw `exec --enqueue` mission has no ticket projection: releasing
+/// its claim is the only durable not-yet-run state. Stop this drain after the
+/// release so a persistent preflight failure cannot hot-loop on the same head.
+fn settle_parked_claim(
+    repo_root: &Path,
+    claim: queue::Claim,
+    ticket_slug: Option<&str>,
+    note: String,
+) -> Result<bool> {
+    if let Some(slug) = ticket_slug {
+        queue::finish_claim(claim);
+        Ticket::write_state(repo_root, slug, TicketState::Parked, Some(note))?;
+        Ok(false)
+    } else {
+        queue::release_claim(claim);
+        Ok(true)
     }
 }
 
@@ -815,6 +869,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_front_mismatch_releases_claim_without_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        for mission_id in ["mission-front", "mission-expected"] {
+            queue::enqueue(
+                repo,
+                QueueEntry {
+                    mission_id: mission_id.to_string(),
+                    ticket_slug: None,
+                    priority: 2,
+                    seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_clone = ran.clone();
+        let report = drain_queue_with_probe_expected(
+            repo,
+            true,
+            Some("mission-expected"),
+            move |_mission_id| {
+                let ran = ran_clone.clone();
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok(0)
+                }
+            },
+            always_proceed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(report.expected_mismatch.as_deref(), Some("mission-front"));
+        assert_eq!(
+            queue::list(repo)
+                .into_iter()
+                .map(|entry| entry.mission_id)
+                .collect::<Vec<_>>(),
+            vec!["mission-front", "mission-expected"]
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_drain_queue_once_reports_busy_without_running_second_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
@@ -1088,6 +1188,40 @@ mod tests {
         assert!(report.ran.is_empty());
         assert_eq!(Ticket::read_state(repo, "need-auth"), TicketState::Parked);
         assert!(queue::list(repo).is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_queue_preserves_ticketless_entry_when_readiness_parks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        queue::enqueue(
+            repo,
+            QueueEntry {
+                mission_id: "m-external".to_string(),
+                ticket_slug: None,
+                priority: 2,
+                seq: 0,
+            },
+        )
+        .unwrap();
+
+        let report = drain_queue_with_probe(
+            repo,
+            false,
+            |_mission_id| async { panic!("parked ticketless mission must not run") },
+            |_repo, id| Ok(park_report(id)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.parked, vec!["m-external".to_string()]);
+        assert_eq!(
+            queue::list(repo)
+                .into_iter()
+                .map(|entry| entry.mission_id)
+                .collect::<Vec<_>>(),
+            vec!["m-external"]
+        );
     }
 
     #[tokio::test]

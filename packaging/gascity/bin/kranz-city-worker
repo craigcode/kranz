@@ -1,11 +1,14 @@
 #!/bin/sh
 # kranz-city-worker — Gas City → kranz bridge, execution side.
 #
-# Long-lived, SUPERVISED drain loop (replaces the spike's unsupervised nohup):
-# picks the oldest spooled brief, runs it through kranz-run-bead (which owns
-# the exit-code → City-state mapping), removes the spool entry, repeats.
-# Strictly serial — kranz missions serialize per repo anyway, and one worker
-# per city keeps the spend faucet single-valved.
+# Long-lived, SUPERVISED drain loop. With KRANZ_NATIVE_QUEUE=1 it scans the
+# registered rigs, drains one approved mission through `kranz work --once`,
+# and passes the terminal state through kranz-run-bead's City translator.
+# Durable enqueue-source receipts beside missions let this adapter return a
+# terminal result even when another legitimate `kranz work` dispatcher drains
+# the shared queue. Return-only receipts retry transient City writes without
+# replaying work. The private spool remains the flag-off rollback.
+# Strictly serial: one worker per city keeps the spend faucet single-valved.
 #
 # Intended to run under the City supervisor as a named non-LLM session (see
 # packaging/gascity/agents/kranz-worker/) or any process manager. --once
@@ -41,14 +44,21 @@
 # alive-by-token holder is never stolen from, and an unverifiable one is
 # left alone (a false stand delays work; a false steal double-runs it).
 #
-# Env: KRANZ_SPOOL (default $GC_CITY/.gc/kranz-spool)
+# Env: KRANZ_NATIVE_QUEUE=1 drains each registered rig's native queue.
+#      KRANZ_SPOOL (default $GC_CITY/.gc/kranz-spool) is the rollback path.
 set -u
 
 CITY=${GC_CITY:?GC_CITY is required}
+NATIVE_QUEUE=${KRANZ_NATIVE_QUEUE:-0}
 SPOOL=${KRANZ_SPOOL:-$CITY/.gc/kranz-spool}
 BIN_DIR=$(dirname "$0")
 ONCE=${1:-}
-mkdir -p "$SPOOL"
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    WORK_ROOT="$CITY/.gc"
+else
+    WORK_ROOT="$SPOOL"
+fi
+mkdir -p "$WORK_ROOT"
 
 bd() { gc --city "$CITY" bd "$@"; }
 
@@ -71,7 +81,11 @@ pid_start_token() {
 # (kill -0 fails AND ps shows no such pid) or a provably-recycled one
 # (token mismatch) loses the lock; anything uncertain (unreadable,
 # unverifiable) stands the holder and we exit quietly.
-LOCK="$SPOOL/.worker-lock"
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    LOCK="$WORK_ROOT/.kranz-worker-lock"
+else
+    LOCK="$SPOOL/.worker-lock"
+fi
 if ! mkdir "$LOCK" 2>/dev/null; then
     read -r LOCK_PID LOCK_TOKEN < "$LOCK/holder" 2>/dev/null || LOCK_PID=""
     if [ -z "$LOCK_PID" ]; then
@@ -115,6 +129,143 @@ fi
 printf '%s %s\n' "$$" "$(pid_start_token "$$")" > "$LOCK/holder.tmp.$$" 2>/dev/null &&
     mv -f "$LOCK/holder.tmp.$$" "$LOCK/holder" 2>/dev/null || true
 trap 'rm -f "$LOCK/holder" 2>/dev/null; rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+write_native_rigs() {
+    # $1 = destination file. One raw path per line; consumers always use
+    # `IFS= read -r`, never word splitting, so spaces remain data.
+    if [ -n "${KRANZ_RIG_DIR:-}" ]; then
+        printf '%s\n' "$KRANZ_RIG_DIR" > "$1"
+    else
+        gc rig list --json 2>/dev/null | jq -r '.rigs[]?.path // empty' > "$1"
+    fi
+}
+
+valid_mission_id() {
+    printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
+}
+
+native_terminal_return() {
+    RIG_LIST=$(mktemp "$WORK_ROOT/.kranz-rigs.XXXXXX") || return 1
+    write_native_rigs "$RIG_LIST" || { rm -f "$RIG_LIST"; return 1; }
+    while IFS= read -r RIG_DIR; do
+        [ -d "$RIG_DIR/.git" ] || continue
+        for SOURCE in "$RIG_DIR"/.kranz/missions/*/enqueue-source.json; do
+            [ -e "$SOURCE" ] || continue
+            SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
+            PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
+            MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || MID=""
+            ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || ID=""
+            DIR_MID=$(basename "$(dirname "$SOURCE")")
+            [ "$SCHEMA" = "1" ] || continue
+            [ "$PRODUCER" = "gascity" ] || continue
+            valid_mission_id "$MID" || continue
+            [ -n "$MID" ] && [ "$MID" = "$DIR_MID" ] && [ -n "$ID" ] || continue
+            STATUS=$(jq -r '.mission.status // empty' < "$RIG_DIR/.kranz/missions/$MID/state.json" 2>/dev/null) || STATUS=""
+            case $STATUS in
+                complete | blocked | failed | abandoned) : ;;
+                *) continue ;;
+            esac
+            jq -n --arg rig "$RIG_DIR" --arg missionId "$MID" --arg beadId "$ID" \
+                '{rigDir:$rig, missionId:$missionId, beadId:$beadId}'
+            rm -f "$RIG_LIST"
+            return 0
+        done
+    done < "$RIG_LIST"
+    rm -f "$RIG_LIST"
+    return 1
+}
+
+native_queue_front() {
+    RIG_LIST=$(mktemp "$WORK_ROOT/.kranz-rigs.XXXXXX") || return 1
+    write_native_rigs "$RIG_LIST" || { rm -f "$RIG_LIST"; return 1; }
+    while IFS= read -r RIG_DIR; do
+        [ -d "$RIG_DIR/.git" ] || continue
+        for ENTRY in "$RIG_DIR"/.kranz/queue/*.json; do
+            [ -e "$ENTRY" ] || continue
+            MID=$(jq -r '.missionId // empty' < "$ENTRY" 2>/dev/null) || MID=""
+            [ -n "$MID" ] || continue
+            valid_mission_id "$MID" || break
+            SOURCE="$RIG_DIR/.kranz/missions/$MID/enqueue-source.json"
+            SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
+            PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
+            SOURCE_MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || SOURCE_MID=""
+            ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || ID=""
+            # Only a Gas City mission at the ACTUAL front authorizes this
+            # worker to drain the rig. Never skip past unrelated queued work:
+            # `kranz work --once` would otherwise execute that foreign front.
+            [ "$SCHEMA" = "1" ] && [ "$PRODUCER" = "gascity" ] &&
+                [ "$SOURCE_MID" = "$MID" ] && [ -n "$ID" ] || break
+            jq -n --arg rig "$RIG_DIR" --arg missionId "$MID" --arg beadId "$ID" \
+                '{rigDir:$rig, missionId:$missionId, beadId:$beadId}'
+            rm -f "$RIG_LIST"
+            return 0
+        done
+    done < "$RIG_LIST"
+    rm -f "$RIG_LIST"
+    return 1
+}
+
+drain_native_one() {
+    if FRONT=$(native_terminal_return); then
+        MODE=--return-only
+    elif FRONT=$(native_queue_front); then
+        MODE=--queued
+    else
+        return 1
+    fi
+    RIG_DIR=$(printf '%s' "$FRONT" | jq -r '.rigDir // empty')
+    MID=$(printf '%s' "$FRONT" | jq -r '.missionId // empty')
+    ID=$(printf '%s' "$FRONT" | jq -r '.beadId // empty')
+    [ -n "$RIG_DIR" ] && [ -n "$MID" ] && [ -n "$ID" ] || return 1
+
+    if [ "$MODE" = "--queued" ]; then
+        STATUS=$(bead_status "$ID")
+        case $STATUS in
+            in_progress) : ;;
+            "")
+                echo "kranz-city-worker: bead $ID state unreadable; native mission $MID left queued" >&2
+                return 0
+                ;;
+            *)
+                echo "kranz-city-worker: bead $ID is '$STATUS'; abandoning stale native mission $MID"
+                ( cd "$RIG_DIR" && kranz abandon "$MID" --reason "Gas City bead $ID left in_progress before execution" >/dev/null 2>&1 ) || true
+                ( cd "$RIG_DIR" && kranz queue --remove "$MID" >/dev/null 2>&1 ) || true
+                return 0
+                ;;
+        esac
+    fi
+
+    echo "kranz-city-worker: bead $ID -> $MODE mission $MID (rig $RIG_DIR)"
+    "$BIN_DIR/kranz-run-bead" "$MODE" "$CITY" "$ID" "$RIG_DIR" "$MID"
+    CODE=$?
+    if [ "$CODE" -eq 75 ]; then
+        echo "kranz-city-worker: mission $MID execution/return not yet settled; left for retry" >&2
+        return 75
+    fi
+    return 0
+}
+
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    if [ "$ONCE" = "--once" ]; then
+        drain_native_one
+        CODE=$?
+        if [ "$CODE" -eq 1 ]; then
+            echo "kranz-city-worker: native queues empty"
+        fi
+        if [ "$CODE" -eq 75 ]; then
+            exit 75
+        fi
+        exit 0
+    fi
+    echo "kranz-city-worker: watching kranz-native queues"
+    while :; do
+        drain_native_one
+        CODE=$?
+        if [ "$CODE" -ne 0 ]; then
+            sleep 15
+        fi
+    done
+fi
 
 # Crash/deferral recovery: reconcile any .inflight or .deferred entry left
 # by a previous worker. Terminal bead (closed/blocked) => the mission

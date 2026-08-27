@@ -37,6 +37,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "missions/*/state.json",
     "missions/*/state.json.tmp",
     "missions/*/estimate.json",
+    "missions/*/enqueue-source*.json",
     "missions/*/control/",
     "missions/*/runs/",
     "missions/*/workspace/",

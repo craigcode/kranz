@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-25
+last_verified: 2026-08-27
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -10,6 +10,7 @@ verified_against:
   - crates/engine/src/event_log.rs
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/queue.rs
+  - crates/cli/src/exec.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/paths.rs
   - crates/engine/tests/reducer_test.rs
@@ -85,7 +86,11 @@ Conceptual stages and where they live:
   [queue](../../../crates/engine/src/queue.rs) is per-repo, priority-ordered
   files under `.kranz/queue/`, since missions share one working tree and at most
   one runs at a time. `claim_front_when_repo_free` claims the front entry under
-  a repo-wide busy guard; `auto_work` drains automatically.
+  a repo-wide busy guard; `auto_work` drains automatically. A headless external
+  producer can use `kranz exec --enqueue` to create a ticketless approved
+  mission without running a worker. When it supplies the source flags, kranz
+  persists `enqueue-source.json` before queue visibility so the producer can
+  reconcile the eventual terminal state even after the queue entry is claimed.
 - **Drain / run** — `MissionEngine::run` → `run_loop` (below).
 - **Deliver** — workers commit on the mission branch; `final_gate` +
   `complete_mission` write the report and emit `mission.completed`.

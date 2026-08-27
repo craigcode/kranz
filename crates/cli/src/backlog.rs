@@ -387,6 +387,16 @@ pub fn cmd_queue(repo: &Path) -> String {
     render_queue(&entries, busy.as_deref())
 }
 
+/// `kranz queue --remove <mission-id>`: retire only the runnable queue entry.
+/// The mission record remains append-only/auditable and may be abandoned or
+/// re-enqueued by the caller's own lifecycle policy.
+pub fn cmd_queue_remove(repo: &Path, mission_id: &str) -> Result<String> {
+    if !queue::remove(repo, mission_id) {
+        bail!("mission '{mission_id}' is not queued");
+    }
+    Ok(format!("removed {mission_id} from the queue\n"))
+}
+
 /// Load a ticket by slug (error if missing).
 fn load_ticket(repo: &Path, slug: &str) -> Result<Ticket> {
     let path = Ticket::tickets_dir(repo).join(format!("{slug}.md"));
@@ -752,7 +762,7 @@ fn restore_draft_checkout(repo: &Path, original: Option<&str>, mission_branch: &
 /// wrapper keeps the CLI-only concerns — operator checkout capture/restore,
 /// live progress printing, and tailing each mission's events to stderr via
 /// [`run_mission_loop`].
-pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
+pub async fn cmd_work(repo: PathBuf, once: bool, expected: Option<String>) -> Result<i32> {
     // Remember the operator's checkout: each mission's run() asserts its own
     // branch, so when the dispatcher exits it puts the checkout back where
     // the operator started (tracked-dirty trees abort the restore).
@@ -771,24 +781,33 @@ pub async fn cmd_work(repo: PathBuf, once: bool) -> Result<i32> {
         );
     }
 
-    let report = kranz_engine::work::drain_queue(&repo, once, |mission_id| {
-        let repo = repo.clone();
-        async move {
-            println!("running mission {mission_id} from the queue");
-            let status = drive_mission(repo, &mission_id).await;
-            if let Err(e) = &status {
-                eprintln!("kranz: mission {mission_id} errored: {e:#}");
+    let report =
+        kranz_engine::work::drain_queue_expected(&repo, once, expected.as_deref(), |mission_id| {
+            let repo = repo.clone();
+            async move {
+                println!("running mission {mission_id} from the queue");
+                let status = drive_mission(repo, &mission_id).await;
+                if let Err(e) = &status {
+                    eprintln!("kranz: mission {mission_id} errored: {e:#}");
+                }
+                status
             }
-            status
-        }
-    })
-    .await?;
+        })
+        .await?;
 
     if report.stopped_busy {
         // `--once` against a busy repo: nothing was claimed or run, so the
         // checkout is left exactly where the busy sibling dispatcher needs
         // it — restoring here would switch branches out from under its
         // still-running mission.
+        return Ok(0);
+    }
+    if let Some(front) = report.expected_mismatch {
+        println!(
+            "queue front changed to {front}; expected {} — nothing ran",
+            expected.as_deref().unwrap_or("-")
+        );
+        restore_work_checkout(&repo, dispatch_branch.as_deref());
         return Ok(0);
     }
     if report.ran.is_empty() && report.skipped.is_empty() && report.parked.is_empty() {

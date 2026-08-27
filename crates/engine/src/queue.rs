@@ -12,6 +12,7 @@
 //! (falling back to legacy live `events.jsonl.lock` detection).
 
 use crate::error::{EngineError, Result};
+use crate::paths::MissionPaths;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,99 @@ use std::time::Duration;
 /// Width of the zero-padded sequence field in a queue filename. u64 max is 20
 /// digits, so this keeps lexicographic order == numeric order for any seq.
 const SEQ_WIDTH: usize = 20;
+
+/// Durable producer binding written before an externally-owned queue entry
+/// becomes visible. Unlike the queue entry itself, this survives any valid
+/// dispatcher consuming the entry, so the producer can reconcile the
+/// mission's terminal state afterward.
+pub const ENQUEUE_SOURCE_FILE: &str = "enqueue-source.json";
+
+/// Archived binding after the external producer has confirmed its return
+/// transition. Kept beside the mission for audit, outside active scans.
+pub const ENQUEUE_SOURCE_RETURNED_FILE: &str = "enqueue-source.returned.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueSource {
+    pub schema_version: u8,
+    pub mission_id: String,
+    pub producer: String,
+    pub external_ref: String,
+    /// Receipt-local clock for recovering a crash between this atomic write
+    /// and queue visibility. Never reuse an older external-system claim time
+    /// for that decision: planning may legitimately take longer than its TTL.
+    #[serde(default)]
+    pub created_unix_secs: u64,
+}
+
+/// Persist an external producer binding atomically. Callers must do this
+/// before [`enqueue`] so even a sibling dispatcher that claims immediately
+/// cannot erase the only mission-to-producer join.
+pub fn write_enqueue_source(
+    repo_root: &Path,
+    mission_id: &str,
+    producer: &str,
+    external_ref: &str,
+) -> Result<EnqueueSource> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return Err(EngineError::Config(format!(
+            "unsafe mission id for enqueue source: {mission_id:?}"
+        )));
+    }
+    if producer.trim().is_empty() || external_ref.trim().is_empty() {
+        return Err(EngineError::Config(
+            "enqueue source producer and external ref must be non-empty".to_string(),
+        ));
+    }
+    let source = EnqueueSource {
+        schema_version: 1,
+        mission_id: mission_id.to_string(),
+        producer: producer.to_string(),
+        external_ref: external_ref.to_string(),
+        created_unix_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let path = MissionPaths::new(repo_root, mission_id)
+        .mission_dir()
+        .join(ENQUEUE_SOURCE_FILE);
+    atomic_write(&path, serde_json::to_string_pretty(&source)?.as_bytes())?;
+    Ok(source)
+}
+
+/// Read a live external producer binding. Malformed or absent files are not
+/// ownership evidence and return `None`.
+pub fn read_enqueue_source(repo_root: &Path, mission_id: &str) -> Option<EnqueueSource> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return None;
+    }
+    let path = MissionPaths::new(repo_root, mission_id)
+        .mission_dir()
+        .join(ENQUEUE_SOURCE_FILE);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<EnqueueSource>(&text).ok())
+        .filter(|source| {
+            source.schema_version == 1
+                && source.mission_id == mission_id
+                && !source.producer.trim().is_empty()
+                && !source.external_ref.trim().is_empty()
+        })
+}
+
+/// Roll back a source binding when the queue write itself fails. Once enqueue
+/// succeeds, producer-owned code retires the binding only after its external
+/// return is confirmed.
+pub fn remove_enqueue_source(repo_root: &Path, mission_id: &str) {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return;
+    }
+    let path = MissionPaths::new(repo_root, mission_id)
+        .mission_dir()
+        .join(ENQUEUE_SOURCE_FILE);
+    let _ = std::fs::remove_file(path);
+}
 
 /// One queued mission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,6 +839,27 @@ mod tests {
             priority: 2,
             seq: 0,
         }
+    }
+
+    #[test]
+    fn enqueue_source_round_trips_and_rejects_mismatched_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = write_enqueue_source(tmp.path(), "m-source", "gascity", "rig-1").unwrap();
+        assert!(source.created_unix_secs > 0);
+        assert_eq!(read_enqueue_source(tmp.path(), "m-source"), Some(source));
+
+        let path = MissionPaths::new(tmp.path(), "m-source")
+            .mission_dir()
+            .join(ENQUEUE_SOURCE_FILE);
+        std::fs::write(
+            &path,
+            r#"{"schemaVersion":1,"missionId":"m-other","producer":"gascity","externalRef":"rig-1"}"#,
+        )
+        .unwrap();
+        assert!(read_enqueue_source(tmp.path(), "m-source").is_none());
+
+        remove_enqueue_source(tmp.path(), "m-source");
+        assert!(!path.exists());
     }
 
     #[test]

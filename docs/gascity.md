@@ -10,6 +10,16 @@ demo runbook, see [gascity-demo.md](gascity-demo.md). Target: Gas City only
 (`gc` 1.3.2) — the gastown-era surface (agents.json, `gt prime`, tmux
 detection) is deliberately not used.
 
+Update 2026-08-25: the supervised production-shaped path is now implemented
+behind `KRANZ_NATIVE_QUEUE=1`. Dispatch uses `kranz exec --enqueue` with a
+structured Gas City source binding, the worker uses guarded
+`kranz work --once --expect`, and transient City return writes are retried
+without replaying the mission. Prompt text is not identity, queued work is
+not expired merely for outliving the City TTL, and a generic sibling
+dispatcher may drain the shared queue without losing the City return. The
+old `KRANZ_SPOOL` path remains the immediate rollback until the separately
+human-gated disposable City receipt.
+
 ## What was proven live
 
 - **Happy path** — a City bead (`gc bd create … --label kranz`) dispatched by
@@ -31,7 +41,9 @@ detection) is deliberately not used.
    return: `kranz-dispatch` claims beads and detaches `kranz-run-bead` with
    nohup. Consequence: the runner is UNSUPERVISED — the production path is
    an order that enqueues into kranz's own queue with a long-lived
-   `kranz work` dispatcher (or a City-supervised service), not nohup.
+   `kranz work` dispatcher (or a City-supervised service), not nohup. That
+   path now ships behind `KRANZ_NATIVE_QUEUE=1`; the remaining evidence gap
+   is the human-run disposable-City receipt.
 2. **The bead title is the prompt.** A bead titled "spike smoke bead" (goal
    buried in acceptance) made a haiku orchestrator confidently build a smoke
    TEST SUITE for a repo with no code, write its own contract around the

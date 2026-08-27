@@ -2,7 +2,8 @@
 title: Absorb the ChatGPT CLI as a dispatch adapter (gpt-5.6-sol)
 priority: 2
 schedule: once
-state: open
+state: done
+state-note: "Absorbed by backend_codex on 2026-08-25: a live ChatGPT-authenticated codex exec probe against gpt-5.6-sol matched the existing JSONL seam, so no duplicate backend was warranted. Sol is the Codex default; fixture parsing, disjoint cached-token accounting, and current pricing are covered."
 ---
 
 ## Goal

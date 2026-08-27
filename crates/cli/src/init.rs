@@ -23,6 +23,7 @@ const RUNTIME_IGNORE_PATTERNS: &[&str] = &[
     ".kranz/missions/*/state.json",
     ".kranz/missions/*/state.json.tmp",
     ".kranz/missions/*/estimate.json",
+    ".kranz/missions/*/enqueue-source*.json",
     ".kranz/missions/*/control/",
     ".kranz/missions/*/runs/",
     ".kranz/missions/*/workspace/",

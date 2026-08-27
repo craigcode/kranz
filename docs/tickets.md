@@ -79,6 +79,8 @@ kranz ticket list          # slug, priority, state, title
 kranz ticket show <slug>   # one ticket in full, incl. needs-context questions
                            # or a wrong-plan escalation reason
 kranz queue                # the execution queue (approved, awaiting a run)
+kranz queue --remove <id>  # retire one runnable entry; keep its mission audit
+kranz work --once --expect <id> # run only if this mission is still the front
 ```
 
 Slack: `/kranz work` reports the queue read-only; the App Home tab shows
@@ -123,6 +125,14 @@ kranz draft my-fix        # orchestrator drafts a plan, parks plan.md for review
 kranz ticket approve my-fix   # commit approval, enqueue, mark QUEUED
 kranz work                # drain the queue: one mission at a time, crash-safe
 ```
+
+Headless producers that start from an external ticket-shaped brief can use
+`kranz exec -f mission.md --enqueue`: it creates, plans, and approves the
+mission, then writes its mission id to this same queue without running a
+worker. Producers that must reconcile a terminal result back to their own
+system pair it with `--enqueue-source <producer> --enqueue-external-ref <id>`;
+kranz writes that structured ownership receipt before exposing the queue
+entry. Execution still belongs to `kranz work` or the serve drain.
 
 What each step really does:
 

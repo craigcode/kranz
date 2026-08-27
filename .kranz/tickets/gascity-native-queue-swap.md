@@ -2,7 +2,8 @@
 title: Point the Gas City pack at the kranz-native queue instead of its private spool
 priority: 2
 schedule: once
-state: open
+state: done
+state-note: "Native create-then-enqueue shipped behind KRANZ_NATIVE_QUEUE=1 on 2026-08-25: exec --enqueue creates an approved mission, work --once --expect drains only the intended front, and the pack retries failed City returns without mission replay. The private spool remains the documented rollback until the separate human-gated disposable-city receipt."
 ---
 
 ## Goal

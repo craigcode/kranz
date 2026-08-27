@@ -485,11 +485,18 @@ fn parse_terminal(value: Value, model: &str) -> AgentEvent {
     // Reasoning tokens are output tokens for billing purposes; codex reports
     // them as a separate `reasoning_output_tokens` field alongside
     // `output_tokens`.
+    let cache_read = usage_field("cached_input_tokens");
+    let cache_write = usage_field("cache_write_input_tokens");
     let usage = TokenUsage {
-        input: usage_field("input_tokens"),
+        // Codex reports both cache lanes as subsets of input_tokens. Keep all
+        // TokenUsage lanes disjoint so the pricing fallback never bills a
+        // cached token once at the full rate and again at its cache rate.
+        input: usage_field("input_tokens")
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_write),
         output: usage_field("output_tokens") + usage_field("reasoning_output_tokens"),
-        cache_read: usage_field("cached_input_tokens"),
-        cache_write: 0,
+        cache_read,
+        cache_write,
     };
     let cost_usd = value
         .get("total_cost_usd")
@@ -849,17 +856,21 @@ mod tests {
         );
     }
 
-    fn fixture_lines() -> Vec<String> {
+    fn fixture_lines_named(name: &str) -> Vec<String> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
-            .join("codex_exec_scrutiny.jsonl");
+            .join(name);
         std::fs::read_to_string(path)
             .expect("read fixture")
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| line.to_string())
             .collect()
+    }
+
+    fn fixture_lines() -> Vec<String> {
+        fixture_lines_named("codex_exec_scrutiny.jsonl")
     }
 
     #[test]
@@ -990,6 +1001,70 @@ mod tests {
             !report.findings.is_empty(),
             "expected the fixture's ValidatorReport to have findings"
         );
+    }
+
+    #[test]
+    fn backend_codex_parses_gpt_5_6_sol_probe_fixture() {
+        let mut parser = CodexStreamParser::new();
+        let events = fixture_lines_named("codex_exec_gpt_5_6_sol_probe.jsonl")
+            .into_iter()
+            .flat_map(|line| parser.push(&line, DEFAULT_CODEX_MODEL))
+            .collect::<Vec<_>>();
+
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Init { model, .. } if model == "gpt-5.6-sol")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Text { text, .. } if text == "KRANZ_PROBE_OK")
+        }));
+
+        let (usage, cost) = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Result {
+                    usage,
+                    cost_usd: Some(cost),
+                    ..
+                } => Some((usage, cost)),
+                _ => None,
+            })
+            .expect("Sol probe must produce a priced terminal event");
+        assert_eq!(usage.input, 4_811);
+        assert_eq!(usage.cache_read, 9_984);
+        assert_eq!(usage.output, 10);
+
+        let expected =
+            4_811.0 / 1_000_000.0 * 4.0 + 9_984.0 / 1_000_000.0 * 0.4 + 10.0 / 1_000_000.0 * 20.0;
+        assert!(
+            (*cost - expected).abs() < 1e-9,
+            "got {cost}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn backend_codex_keeps_cache_read_write_and_uncached_input_disjoint() {
+        let event = parse_terminal(
+            json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 30,
+                    "cache_write_input_tokens": 20,
+                    "output_tokens": 4,
+                    "reasoning_output_tokens": 2
+                }
+            }),
+            DEFAULT_CODEX_MODEL,
+        );
+        match event {
+            AgentEvent::Result { usage, .. } => {
+                assert_eq!(usage.input, 50);
+                assert_eq!(usage.cache_read, 30);
+                assert_eq!(usage.cache_write, 20);
+                assert_eq!(usage.output, 6);
+            }
+            other => panic!("expected terminal result, got {other:?}"),
+        }
     }
 
     #[test]

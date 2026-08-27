@@ -22,18 +22,6 @@ Format:
   Source: docs/roadmap.md; docs/operator-gates.md; docs/roadmap-options.md
   Ticket: none
 
-- **ChatGPT CLI backend (gpt-5.6-sol)** - probe, then a dispatch adapter reusing the Cursor parser/picker path.
-  Why: Cursor's half of the old "absorb a CLI" line shipped. This is the remaining sibling, under the retained `AgentBackend` seam.
-  Trigger: After a written probe (auth, print-mode events, cost/model). Do not implement from a remembered model id.
-  Source: docs/scoping/cursor-cli-backend.md (pattern only)
-  Ticket: chatgpt-cli-backend
-
-- **Gas City pack → native queue (re-scope first)** - point `packaging/gascity/` at `.kranz/queue/` + `kranz work` instead of `KRANZ_SPOOL`.
-  Why: D5 leftover. The native queue holds planned mission ids; the spool holds briefs for `kranz exec`. Not a drop-in.
-  Trigger: After tomorrow's course, and after the ticket's written re-scope. Do not cut over on a demo night.
-  Source: docs/gascity-citizenship.md D5
-  Ticket: gascity-native-queue-swap
-
 ## Human-gated
 
 - **Gas City Stage 1 live-city validation** - validate the existing pack against a disposable live City before building more integration polish.
@@ -114,5 +102,12 @@ one cycle so `/kranz roadmap` readers are not surprised by the deletion.
 - M7 Windows production receipt — operator-controlled Windows 11 hostile and
   retained-overhead receipt committed; `m7-windows-containment-parity` done.
 - Gas City event dispatch + `kranz.mission.*` emits — `revive-gascity-demo` done.
+- Gas City native queue path — `exec --enqueue`, guarded `work --once
+  --expect`, and the flag-gated pack cutover shipped;
+  `gascity-native-queue-swap` done. The disposable live-City receipt remains
+  separately human-gated.
+- ChatGPT-authenticated GPT-5.6 Sol dispatch — live probe showed the supported
+  `codex exec` stream is already handled by `backend_codex`; Sol default,
+  fixture, token accounting, and pricing landed; `chatgpt-cli-backend` done.
 - Structured human-question events, agent hook status signals — both done.
 - Workspace provider pin at approval — done.
