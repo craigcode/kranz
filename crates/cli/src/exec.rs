@@ -26,7 +26,9 @@ use crate::tail::{self, EventRenderer};
 use anyhow::{Context, Result};
 use kranz_engine::backend::AgentBackend;
 use kranz_engine::control;
+use kranz_engine::git_ops::GitRepo;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
+use kranz_engine::queue::{self, QueueEntry};
 use kranz_engine::ticket::Ticket;
 use kranz_engine::types::{ControlCommand, MissionConfig, MissionStatus};
 use std::io::IsTerminal;
@@ -42,6 +44,59 @@ pub const EXIT_UNDERSPECIFIED: i32 = 3;
 /// mission failure (1) and underspecified (3) so CI can tell delivery apart
 /// from the run itself. Stdout still reports `pushed=false`.
 pub const EXIT_PUSH_FAILED: i32 = 4;
+
+/// Restores the caller's branch whenever enqueue-only planning exits —
+/// including error and underspecified paths that return before queueing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckoutPosition {
+    Branch(String),
+    Detached(String),
+}
+
+struct EnqueueCheckoutGuard {
+    repo: PathBuf,
+    original: Option<CheckoutPosition>,
+    active: bool,
+}
+
+impl EnqueueCheckoutGuard {
+    fn new(repo: &Path, active: bool) -> Self {
+        let original = active.then(|| capture_checkout_position(repo)).flatten();
+        Self {
+            repo: repo.to_path_buf(),
+            original,
+            active,
+        }
+    }
+
+    fn restore_now(&mut self) {
+        if self.active {
+            restore_enqueue_checkout(&self.repo, self.original.as_ref());
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for EnqueueCheckoutGuard {
+    fn drop(&mut self) {
+        self.restore_now();
+    }
+}
+
+/// Non-file inputs to one headless exec invocation.
+pub struct ExecOptions {
+    pub max_cycles: Option<u32>,
+    pub enqueue: bool,
+    pub enqueue_source: Option<ExternalEnqueueSource>,
+    pub push: Option<String>,
+    pub dangerously_allow_all: bool,
+    pub allow_unvalidated: bool,
+}
+
+pub struct ExternalEnqueueSource {
+    pub producer: String,
+    pub external_ref: String,
+}
 
 /// Map a terminal mission status to the process exit code exec returns.
 ///
@@ -103,7 +158,8 @@ fn read_mission_file(path: &Path) -> Result<Ticket> {
     parse_mission_markdown(slug, &markdown)
 }
 
-/// `kranz exec -f <mission.md> [--repo <path>] [--yes] [--max-cycles N] [--allow-unvalidated]`.
+/// `kranz exec -f <mission.md> [--repo <path>] [--yes] [--max-cycles N]
+/// [--enqueue] [--allow-unvalidated]`.
 ///
 /// `--yes` is accepted for symmetry with the interactive commands but is a
 /// no-op: a headless run always auto-approves. `--max-cycles`, when given,
@@ -113,20 +169,12 @@ fn read_mission_file(path: &Path) -> Result<Ticket> {
 /// Immediately after config loads and before any mission directory is
 /// created, [`scrutiny_gate`] enforces the unattended scrutiny floor: see its
 /// doc comment for the rationale.
-pub async fn cmd_exec(
-    repo: PathBuf,
-    file: PathBuf,
-    _yes: bool,
-    max_cycles: Option<u32>,
-    push: Option<String>,
-    dangerously_allow_all: bool,
-    allow_unvalidated: bool,
-) -> Result<i32> {
+pub async fn cmd_exec(repo: PathBuf, file: PathBuf, options: ExecOptions) -> Result<i32> {
     let ticket = read_mission_file(&file)?;
-    let cfg = load_config(&repo, dangerously_allow_all)?;
+    let cfg = load_config(&repo, options.dangerously_allow_all)?;
 
-    let allow_unvalidated =
-        allow_unvalidated || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
+    let allow_unvalidated = options.allow_unvalidated
+        || std::env::var("KRANZ_ALLOW_UNVALIDATED").ok().as_deref() == Some("1");
     if let Err(msg) = scrutiny_gate(cfg.skip_scrutiny, allow_unvalidated) {
         eprintln!("{msg}");
         return Ok(1);
@@ -134,7 +182,7 @@ pub async fn cmd_exec(
 
     let backend = build_backend(&cfg)?;
 
-    cmd_exec_with_backend(repo, file, ticket, max_cycles, push, cfg, backend).await
+    cmd_exec_with_backend(repo, cfg, backend, ticket, file, options).await
 }
 
 /// The body of [`cmd_exec`], parameterized on the backend so tests can drive
@@ -142,13 +190,16 @@ pub async fn cmd_exec(
 /// a real `claude` binary.
 async fn cmd_exec_with_backend(
     repo: PathBuf,
-    file: PathBuf,
-    ticket: Ticket,
-    max_cycles: Option<u32>,
-    push: Option<String>,
     cfg: MissionConfig,
     backend: Arc<dyn AgentBackend>,
+    ticket: Ticket,
+    file: PathBuf,
+    options: ExecOptions,
 ) -> Result<i32> {
+    // Declared before the engine so Rust drops the engine first on every
+    // early return/unwind, then restores the checkout after its Git handles
+    // are out of the way.
+    let mut checkout_guard = EnqueueCheckoutGuard::new(&repo, options.enqueue);
     let goal = ticket.mission_goal();
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
     let mission_id = engine.mission_id().to_string();
@@ -218,12 +269,16 @@ async fn cmd_exec_with_backend(
         .approve_plan(plan)
         .with_context(|| format!("approving the plan for mission {mission_id}"))?;
     let branch = engine.state().mission.mission_branch.clone();
-    eprintln!("kranz exec: plan approved on {branch}; running headlessly");
+    if options.enqueue {
+        eprintln!("kranz exec: plan approved on {branch}; enqueueing without a worker");
+    } else {
+        eprintln!("kranz exec: plan approved on {branch}; running headlessly");
+    }
 
     // A --max-cycles override is applied via the control inbox so it lands as a
     // config.changed event the run loop drains (never mutating config out of
     // band). Enqueued before the engine's run() drains the inbox.
-    if let Some(n) = max_cycles {
+    if let Some(n) = options.max_cycles {
         control::enqueue(
             engine.paths(),
             &ControlCommand::ConfigChange {
@@ -233,7 +288,88 @@ async fn cmd_exec_with_backend(
         .with_context(|| format!("queuing the --max-cycles override for mission {mission_id}"))?;
     }
 
-    run_and_reconcile(engine, repo, mission_id, branch, push).await
+    if options.enqueue {
+        if let Some(source) = &options.enqueue_source {
+            queue::write_enqueue_source(
+                &repo,
+                &mission_id,
+                &source.producer,
+                &source.external_ref,
+            )?;
+        }
+        let entry = match queue::enqueue(
+            &repo,
+            QueueEntry {
+                mission_id: mission_id.clone(),
+                ticket_slug: None,
+                priority: ticket.priority,
+                seq: 0,
+            },
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if options.enqueue_source.is_some() {
+                    queue::remove_enqueue_source(&repo, &mission_id);
+                }
+                return Err(error.into());
+            }
+        };
+        let cost = engine.state().total_cost_usd;
+        drop(engine);
+        checkout_guard.restore_now();
+        println!(
+            "kranz exec {mission_id} QUEUED cost=${cost:.2} branch={branch} seq={}",
+            entry.seq
+        );
+        return Ok(0);
+    }
+
+    run_and_reconcile(engine, repo, mission_id, branch, options.push).await
+}
+
+/// Put an enqueue-only invocation back on the branch from which it started.
+///
+/// Without this, the non-worktree engine parks the primary checkout on the
+/// mission branch even though the caller only asked to queue future work.
+/// Keep stdout reserved for the one-line `exec` receipt; recovery warnings
+/// belong on stderr.
+fn capture_checkout_position(repo: &Path) -> Option<CheckoutPosition> {
+    let git = GitRepo::open(repo).ok()?;
+    match git.current_branch().ok()?.as_str() {
+        "HEAD" => git.head_sha().ok().map(CheckoutPosition::Detached),
+        branch => Some(CheckoutPosition::Branch(branch.to_string())),
+    }
+}
+
+fn restore_enqueue_checkout(repo: &Path, original: Option<&CheckoutPosition>) {
+    let Some(original) = original else { return };
+    let Ok(git) = GitRepo::open(repo) else { return };
+    let current = git.current_branch().unwrap_or_else(|_| "unknown".into());
+    match original {
+        CheckoutPosition::Branch(branch) if current == *branch => return,
+        CheckoutPosition::Detached(sha)
+            if current == "HEAD" && git.head_sha().ok().as_deref() == Some(sha.as_str()) =>
+        {
+            return
+        }
+        _ => {}
+    }
+    let target = match original {
+        CheckoutPosition::Branch(branch) | CheckoutPosition::Detached(branch) => branch,
+    };
+    match git.is_clean_tracked() {
+        Ok(true) => {
+            if let Err(e) = git.checkout(target) {
+                eprintln!("warning: could not restore checkout to {target}: {e}");
+            }
+        }
+        Ok(false) => eprintln!(
+            "warning: leaving checkout on {current}: tracked files have uncommitted changes"
+        ),
+        Err(e) => {
+            eprintln!("warning: could not probe the working tree ({e}); checkout left on {current}")
+        }
+    }
 }
 
 /// The tail of [`cmd_exec_with_backend`]: run the (already planned and
@@ -556,5 +692,147 @@ mod tests {
             kranz_engine::ticket::TicketState::Done,
             "run_and_reconcile must reconcile the linked ticket to Done on Complete"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_only_exec_creates_approved_mission_without_running_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "seed"]] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let orch = kranz_engine::backend_mock::MockScript::streaming(vec![
+            kranz_engine::backend_mock::mock_init("orch-session"),
+            kranz_engine::backend_mock::mock_result_text("seed-hi"),
+        ])
+        .responding(vec![
+            reconcile_turn("the brief is self-contained"),
+            reconcile_turn(&reconcile_plan_json().to_string()),
+            reconcile_turn("approved"),
+        ]);
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(kranz_engine::backend_mock::MockBackend::with_scripts(vec![
+                orch,
+            ]));
+        let ticket = parse_mission_markdown(
+            "gas-city-bead",
+            "---\npriority: 1\n---\n## Goal\nship the demo\n\n## Acceptance hints\nit works\n",
+        )
+        .unwrap();
+        let cfg = MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            ..Default::default()
+        };
+
+        let code = cmd_exec_with_backend(
+            repo.clone(),
+            cfg,
+            backend,
+            ticket,
+            PathBuf::from("gas-city-bead.md"),
+            ExecOptions {
+                max_cycles: Some(1),
+                enqueue: true,
+                enqueue_source: Some(ExternalEnqueueSource {
+                    producer: "gascity".to_string(),
+                    external_ref: "rig-1".to_string(),
+                }),
+                push: None,
+                dangerously_allow_all: false,
+                allow_unvalidated: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            GitRepo::open(&repo).unwrap().current_branch().unwrap(),
+            "main",
+            "enqueue-only exec must restore the caller's checkout"
+        );
+        let queued = queue::list(&repo);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].priority, 1);
+        assert!(queued[0].ticket_slug.is_none());
+        let source = queue::read_enqueue_source(&repo, &queued[0].mission_id).unwrap();
+        assert_eq!(source.producer, "gascity");
+        assert_eq!(source.external_ref, "rig-1");
+
+        let state_path = repo
+            .join(".kranz")
+            .join("missions")
+            .join(&queued[0].mission_id)
+            .join("state.json");
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path).unwrap()).unwrap();
+        assert_eq!(
+            state.pointer("/mission/status").and_then(|v| v.as_str()),
+            Some("approved")
+        );
+        assert!(
+            !repo.join("delivered.txt").exists(),
+            "enqueue-only must not spawn a worker or run the approved mission"
+        );
+    }
+
+    #[test]
+    fn enqueue_checkout_guard_restores_detached_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "seed"]] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let git = GitRepo::open(repo).unwrap();
+        let original_sha = git.head_sha().unwrap();
+        git.checkout(&original_sha).unwrap();
+        assert_eq!(git.current_branch().unwrap(), "HEAD");
+
+        let mut guard = EnqueueCheckoutGuard::new(repo, true);
+        git.create_branch("kranz/mission-test", None).unwrap();
+        git.checkout("kranz/mission-test").unwrap();
+        guard.restore_now();
+
+        assert_eq!(git.current_branch().unwrap(), "HEAD");
+        assert_eq!(git.head_sha().unwrap(), original_sha);
     }
 }

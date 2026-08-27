@@ -20,6 +20,7 @@ gc lint packaging/gascity
 for t in \
     packaging/gascity/test/order-trigger-event.sh \
     packaging/gascity/test/kranz-run-bead-events.sh \
+    packaging/gascity/test/kranz-native-queue-selftest.sh \
     packaging/gascity/test/check-bridge-hygiene.sh \
     packaging/gascity/test/check-bridge-hygiene-selftest.sh \
     packaging/gascity/test/kranz-header-liveness-selftest.sh \

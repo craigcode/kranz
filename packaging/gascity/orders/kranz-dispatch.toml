@@ -1,4 +1,4 @@
-# Spool ready kranz-labeled beads for the kranz-city-worker (v3: event-driven).
+# Create approved kranz queue entries for ready kranz-labeled beads.
 #
 # City-side setup (see packaging/gascity/README.md):
 #   - run kranz-city-worker as a supervised session (agents/kranz-worker/)
@@ -13,7 +13,7 @@
 # sweep), and a bead re-readied after a reopen/refine (fires bead.updated,
 # not bead.created — there is no bead.ready event in the gc vocabulary).
 [order]
-description = "Spool ready kranz-labeled beads for the kranz-city-worker"
+description = "Queue ready kranz-labeled beads for the kranz-city-worker"
 trigger = "event"
 on = "bead.created"
 exec = "kranz-dispatch"

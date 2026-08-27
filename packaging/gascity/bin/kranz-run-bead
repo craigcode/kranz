@@ -1,30 +1,34 @@
 #!/bin/sh
-# kranz-run-bead — detached per-bead mission runner (spike).
+# kranz-run-bead — per-bead mission runner and City return translator.
 #
-# Invoked by kranz-dispatch with nohup: runs ONE bead's mission to a terminal
-# state and translates the exit code back into City state. Detached because
-# gc order exec enforces a context deadline — orders dispatch, they must not
-# host multi-minute missions (learned live; see docs/gascity.md).
+# Invoked by the supervised kranz-city-worker. Legacy mode runs one spooled
+# brief through `kranz exec`; native queued mode drains one exact mission;
+# native return-only mode retries a failed City mutation without replaying
+# terminal work. Gas City orders never host multi-minute feature execution
+# (learned live; see docs/gascity.md).
 #
-# Usage: kranz-run-bead <city-dir> <bead-id> <mission.md> <rig-dir> <max-cycles>
+# Usage:
+#   kranz-run-bead <city-dir> <bead-id> <mission.md> <rig-dir> <max-cycles>
+#   kranz-run-bead --queued <city-dir> <bead-id> <rig-dir> <mission-id>
+#   kranz-run-bead --return-only <city-dir> <bead-id> <rig-dir> <mission-id>
 #
 # Bidirectional bead status <-> kranz-side state map (all four bead
 # statuses, both directions):
 #   open         <-> Queued           (ready for dispatch / re-readied)
-#   in_progress  <-> Running          (set by kranz-dispatch's atomic claim, before the brief is spooled)
+#   in_progress  <-> Running          (set by kranz-dispatch's atomic claim, before enqueue/spool)
 #   blocked      <-> Blocked-report   (exit 2 below; escalated to a human)
 #   closed       <-> Done             (exit 0 below; mission complete)
 #
 # Claim posture (shipped in kranz-dispatch, not here): dispatch takes an
 # atomic, first-wins claim (`bd update --claim`, docs/scoping/beads-bridge-
-# dialect.md §3) before spooling the brief this script runs. bd 1.0.5
+# dialect.md §3) before enqueueing or spooling the brief. bd 1.0.5
 # itself has NO lease/TTL/heartbeat field — a server-side lease mechanism
 # is NOT YET IMPLEMENTED upstream (§3; 1.1.0+ is the tracked path) — so
 # the bridge ships its own client-side lease (f-3-1): a heartbeat file
 # under ${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}/ renewed while this mission
 # runs and removed on any terminal exit ($CITY here is the city directory
-# passed as $1 by kranz-city-worker, which kranz-dispatch resolved from
-# $GC_CITY and wrote into the spool .json). The lease line is
+# passed by kranz-city-worker, which kranz-dispatch resolved from $GC_CITY
+# (and, on the rollback path, wrote into the spool .json). The lease line is
 # `<pid> <unix-ts> <start-token>`, the token being this process's start
 # time (`ps -o lstart=`, normalized for plain string equality) — the
 # sweep's way to tell "pid alive and provably this claimant" from a
@@ -35,11 +39,14 @@
 # cannot settle it (another uid's process, a recycled token) and a
 # missing lease fall to the KRANZ_CLAIM_TTL backstop, which also removes
 # the spool pair when it releases so a re-dispatch spools exactly once.
-# Residual exposure window: a bead claimed and spooled but not yet drained
-# by kranz-city-worker (before this script starts) has no heartbeat yet
-# and without the TTL backstop would never be recovered — with the
-# spool-atomic release the window costs one reclaim cycle's delay, not a
-# duplicate mission.
+# Native queue work uses a stronger ownership record: enqueue-source.json is
+# written before the queue entry and remains active until the City mutation
+# is confirmed. A queued, claimed, running, or terminal mission therefore
+# stands at any age; a fresh approved source with no queue file protects the
+# source-before-queue interval until the receipt's own TTL, after which it is
+# the interrupted pre-queue crash shape and becomes recoverable. Residual
+# exposure on the legacy spool path: the pre-heartbeat interval still costs at
+# most one reclaim cycle's delay, not a duplicate mission.
 #
 # Claim release on reopen (shipped here): exit 3 and exit 1/other both clear
 # the assignee (`bd update --assignee ""`) alongside the status reset to
@@ -85,9 +92,37 @@
 # the exit-code contract). The refuse path's own reason comment (exit 3
 # below) is preserved as-is alongside it.
 set -u
-CITY=$1; ID=$2; MFILE=$3; RIG_DIR=$4; MAX_CYCLES=$5
+MODE=exec
+case ${1:-} in
+    --queued | --return-only)
+        MODE=${1#--}
+        CITY=$2
+        ID=$3
+        RIG_DIR=$4
+        MISSION_ID=$5
+        MFILE="$RIG_DIR/.kranz/missions/$MISSION_ID/gascity-native"
+        MAX_CYCLES=""
+        ;;
+    *)
+        CITY=$1
+        ID=$2
+        MFILE=$3
+        RIG_DIR=$4
+        MAX_CYCLES=$5
+        MISSION_ID=""
+        ;;
+esac
 
 bd() { gc --city "$CITY" bd "$@"; }
+
+valid_mission_id() {
+    printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
+}
+
+if [ "$MODE" != "exec" ] && ! valid_mission_id "$MISSION_ID"; then
+    echo "kranz-run-bead: refusing unsafe mission id '$MISSION_ID'" >&2
+    exit 75
+fi
 
 # Best-effort City event emission (Stage 3): surfaces kranz mission progress
 # in the city's event stream. `gc event emit` always exits 0, so a failed
@@ -135,35 +170,119 @@ trap 'exit 143' TERM
 printf '%s %s %s\n' "$$" "$(date +%s)" "$START_TOKEN" > "$LEASE_FILE.init.$$.tmp" 2>/dev/null &&
     mv -f "$LEASE_FILE.init.$$.tmp" "$LEASE_FILE" 2>/dev/null || true
 
-event_emit "kranz.mission.started" "kranz mission started for bead $ID"
+if [ "$MODE" != "return-only" ]; then
+    event_emit "kranz.mission.started" "kranz mission started for bead $ID"
+fi
 
-LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
-CODE=$?
+case $MODE in
+    exec)
+        LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --max-cycles "$MAX_CYCLES" 2>>"${MFILE%.md}.events.log" )
+        CODE=$?
+        ;;
+    queued)
+        WORK_OUT=$( cd "$RIG_DIR" && kranz work --once --expect "$MISSION_ID" 2>>"$RIG_DIR/.kranz/missions/$MISSION_ID/gascity.events.log" )
+        WORK_CODE=$?
+        STATUS=$(jq -r '.mission.status // empty' < "$RIG_DIR/.kranz/missions/$MISSION_ID/state.json" 2>/dev/null) || STATUS=""
+        LINE="kranz work mission $MISSION_ID status ${STATUS:-unknown} — $(printf '%s' "$WORK_OUT" | tail -1)"
+        case $STATUS in
+            complete) CODE=0 ;;
+            blocked) CODE=2 ;;
+            failed | abandoned) CODE=1 ;;
+            *)
+                echo "kranz-run-bead: mission $MISSION_ID did not reach a terminal state (work exit $WORK_CODE, status ${STATUS:-unknown}); City state left in_progress" >&2
+                exit 75
+                ;;
+        esac
+        ;;
+    return-only)
+        STATUS=$(jq -r '.mission.status // empty' < "$RIG_DIR/.kranz/missions/$MISSION_ID/state.json" 2>/dev/null) || STATUS=""
+        LINE="kranz mission $MISSION_ID terminal return retry ($STATUS)"
+        case $STATUS in
+            complete) CODE=0 ;;
+            blocked) CODE=2 ;;
+            failed | abandoned) CODE=1 ;;
+            *)
+                echo "kranz-run-bead: pending return for $MISSION_ID has non-terminal status ${STATUS:-unknown}" >&2
+                exit 75
+                ;;
+        esac
+        ;;
+esac
 
 # bd flag shapes (learned live): close takes --reason, comment takes the
 # text positionally; -m belongs to neither.
 case $CODE in
     0)
         bd close "$ID" --reason "kranz mission COMPLETE — $LINE" >/dev/null
-        event_emit "kranz.mission.complete" "kranz mission COMPLETE for bead $ID — $LINE"
+        if [ "$MODE" != "return-only" ]; then
+            event_emit "kranz.mission.complete" "kranz mission COMPLETE for bead $ID — $LINE"
+        fi
         ;;
     2)
         bd update "$ID" --status blocked >/dev/null 2>&1
-        bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
-        event_emit "kranz.mission.blocked" "kranz mission BLOCKED for bead $ID — $LINE"
-        gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
-            -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \
-            --notify >/dev/null 2>&1 || true
+        if [ "$MODE" != "return-only" ]; then
+            bd comment "$ID" "kranz mission BLOCKED — $LINE (event log in the rig's .kranz/missions dir)" >/dev/null
+            event_emit "kranz.mission.blocked" "kranz mission BLOCKED for bead $ID — $LINE"
+            gc --city "$CITY" mail send human -s "ESCALATION: bead $ID blocked in kranz" \
+                -m "kranz mission for bead $ID blocked awaiting guidance. $LINE. Steer via kranz (web/Slack/CLI) or refine the bead and re-ready it." \
+                --notify >/dev/null 2>&1 || true
+        fi
         ;;
     3)
         bd update "$ID" --status open --assignee "" >/dev/null 2>&1
-        bd comment "$ID" "kranz refused headless run: UNDERSPECIFIED — refine title/description/acceptance so the brief is self-sufficient, then re-ready. $LINE" >/dev/null
+        if [ "$MODE" != "return-only" ]; then
+            bd comment "$ID" "kranz refused headless run: UNDERSPECIFIED — refine title/description/acceptance so the brief is self-sufficient, then re-ready. $LINE" >/dev/null
+        fi
         ;;
     *)
         bd update "$ID" --status open --assignee "" >/dev/null 2>&1
-        bd comment "$ID" "kranz mission FAILED (exit $CODE) — $LINE (inspect the rig's .kranz/missions dir)" >/dev/null
+        if [ "$MODE" != "return-only" ]; then
+            bd comment "$ID" "kranz mission FAILED (exit $CODE) — $LINE (inspect the rig's .kranz/missions dir)" >/dev/null
+        fi
         ;;
 esac
+
+# Native-queue execution retires the queue claim before the City write above.
+# If that write is not yet observable, persist a return-only receipt beside
+# the mission (not a runnable waiting room) so the supervised worker retries
+# translation without ever re-running the mission.
+if [ "$MODE" != "exec" ]; then
+    case $CODE in
+        0) EXPECTED_STATUS=closed ;;
+        2) EXPECTED_STATUS=blocked ;;
+        *) EXPECTED_STATUS=open ;;
+    esac
+    OBSERVED_STATUS=$(bd show "$ID" --json 2>/dev/null |
+        jq -r '(if type == "array" then .[0] else . end) | .status // empty' 2>/dev/null | head -1)
+    PENDING="$RIG_DIR/.kranz/missions/$MISSION_ID/gascity-return-pending.json"
+    if [ "$OBSERVED_STATUS" = "$EXPECTED_STATUS" ]; then
+        # Retire the active producer binding only after the City transition is
+        # observable. The archived receipt remains auditable but no longer
+        # participates in worker scans. This is what lets a sibling generic
+        # `kranz work` drain complete the mission without losing its return.
+        SOURCE="$RIG_DIR/.kranz/missions/$MISSION_ID/enqueue-source.json"
+        RETURNED="$RIG_DIR/.kranz/missions/$MISSION_ID/enqueue-source.returned.json"
+        if [ -e "$SOURCE" ] && ! mv -f "$SOURCE" "$RETURNED"; then
+            echo "kranz-run-bead: City return confirmed but source receipt could not be retired for $MISSION_ID" >&2
+            exit 75
+        fi
+        rm -f "$PENDING" "$PENDING.tmp.$$"
+    else
+        PENDING_TMP=$(mktemp "$PENDING.tmp.XXXXXX") || {
+            echo "kranz-run-bead: could not create a safe City return receipt for $MISSION_ID" >&2
+            exit 75
+        }
+        if jq -n --arg id "$ID" --arg missionId "$MISSION_ID" --arg expected "$EXPECTED_STATUS" \
+            '{beadId:$id, missionId:$missionId, expectedStatus:$expected}' > "$PENDING_TMP"; then
+            mv -f "$PENDING_TMP" "$PENDING" || { rm -f "$PENDING_TMP"; exit 75; }
+        else
+            rm -f "$PENDING_TMP"
+            exit 75
+        fi
+        echo "kranz-run-bead: City return for $MISSION_ID is unconfirmed (expected $EXPECTED_STATUS, observed ${OBSERVED_STATUS:-unknown}); retry receipt kept" >&2
+        exit 75
+    fi
+fi
 
 # Return path (D-BW-2 brief 2): one comment naming the kranz mission id
 # and the terminal outcome, deduped on the mission-id string so a re-run
@@ -171,7 +290,9 @@ esac
 # mission's summary output; absent one (a kranz too old to print it), the
 # comment is skipped rather than posted contentless. Best-effort: a failed
 # write changes nothing about the status translation above.
-MISSION_ID=$(printf '%s' "$LINE" | grep -oE 'm-[0-9a-f]{6}' | head -1 || true)
+if [ -z "$MISSION_ID" ]; then
+    MISSION_ID=$(printf '%s' "$LINE" | grep -oE 'm-[0-9a-f]{6}' | head -1 || true)
+fi
 if [ -n "$MISSION_ID" ]; then
     case $CODE in
         0) OUTCOME="COMPLETED" ;;

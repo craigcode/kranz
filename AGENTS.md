@@ -135,6 +135,8 @@ mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitigno
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
 `.kranz/config.json`, `serve.token`, `serve.read.token`,
+`.kranz/missions/*/enqueue-source*.json` (external-producer ownership and
+returned receipts),
 `.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`,
 `.kranz/hook-status/` (ephemeral hook-signal projection — registrations +
 latest signal per run; `crates/engine/src/hook_status.rs`).
@@ -166,4 +168,3 @@ primitive with three properties). If a change drifts toward a frozen
 surface, stop and check the boundary first; `docs/what-is-kranz.md` and
 the frozen modules' doc headers (`prompts.rs`, `knowledge.rs`) carry the
 same pointer.
-

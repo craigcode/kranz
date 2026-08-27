@@ -95,6 +95,55 @@ fn exec_rejects_non_numeric_max_cycles() {
 }
 
 #[test]
+fn exec_enqueue_is_explicit_and_conflicts_with_push() {
+    let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md", "--enqueue"]).unwrap();
+    assert!(matches!(cli.command, Command::Exec { enqueue: true, .. }));
+
+    assert!(Cli::try_parse_from([
+        "kranz",
+        "exec",
+        "-f",
+        "mission.md",
+        "--enqueue",
+        "--push",
+        "origin"
+    ])
+    .is_err());
+
+    let sourced = Cli::try_parse_from([
+        "kranz",
+        "exec",
+        "-f",
+        "mission.md",
+        "--enqueue",
+        "--enqueue-source",
+        "gascity",
+        "--enqueue-external-ref",
+        "rig-1",
+    ])
+    .unwrap();
+    assert!(matches!(
+        sourced.command,
+        Command::Exec {
+            enqueue_source: Some(ref source),
+            enqueue_external_ref: Some(ref external_ref),
+            ..
+        } if source == "gascity" && external_ref == "rig-1"
+    ));
+    assert!(Cli::try_parse_from([
+        "kranz",
+        "exec",
+        "-f",
+        "mission.md",
+        "--enqueue-source",
+        "gascity",
+        "--enqueue-external-ref",
+        "rig-1",
+    ])
+    .is_err());
+}
+
+#[test]
 fn allow_unvalidated_defaults_to_false() {
     let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
     match cli.command {

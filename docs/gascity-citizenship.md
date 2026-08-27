@@ -6,6 +6,12 @@ making kranz a full citizen of Gas City; it is a companion to
 [docs/gascity.md](gascity.md), which records the spike findings this plan
 builds on.
 
+Update 2026-08-25: D5's native-queue route now ships behind
+`KRANZ_NATIVE_QUEUE=1`. Dispatch creates and approves with `kranz exec
+--enqueue`; the supervised worker drains with `kranz work --once --expect`;
+the spool described in the historical inventory below remains the rollback
+path until the separately human-gated disposable-City receipt.
+
 ## Table of contents
 
 1. [Current state](#current-state)
@@ -950,6 +956,19 @@ its function whenever kranz-side queue work is next scoped (not scheduled by
 this document). The pack-side swap is
 [`.kranz/tickets/gascity-native-queue-swap.md`](../.kranz/tickets/gascity-native-queue-swap.md).
 
+**Resolution (2026-08-25):** option (b) is implemented behind
+`KRANZ_NATIVE_QUEUE=1`. The create-then-enqueue split preserves the existing
+City claim and return contracts. A structured mission-side source receipt,
+written before queue visibility, binds the external bead without trusting
+prompt text and survives consumption by any legitimate shared-queue drainer;
+the City worker can therefore reconcile the terminal result independently of
+queue presence. Its own creation timestamp safely distinguishes a fresh
+source-before-queue handoff from an orphaned pre-queue crash without reusing
+the potentially older City claim TTL. A return receipt retries an unconfirmed
+City mutation without replaying terminal work. Option (a) remains a rollback, not the
+production-shaped source of truth. Automated evidence stays stub-only under
+D6; the live disposable-City receipt remains human-gated.
+
 ### D6 — verification strategy for city-coupled behavior
 
 Options: (a) design a disposable test-city fixture — scripted `gc init`/`gc
@@ -1109,6 +1128,5 @@ named here:
 
 | Ticket | What | Start when |
 |--------|------|------------|
-| [gascity-native-queue-swap](../.kranz/tickets/gascity-native-queue-swap.md) | Re-scope, then point the pack at `.kranz/queue/` + `kranz work` instead of `KRANZ_SPOOL` | After a written re-scope; do not cut over on a demo night |
 | [gascity-pack-publish](../.kranz/tickets/gascity-pack-publish.md) | Stage 4: CI lint (autonomous), publish metadata, human `gc pack release` | CI lint anytime; publish only after Stage 1 receipt + a second consumer |
 | [gascity-fleets](../.kranz/tickets/gascity-fleets.md) | Stage 5 fleets / cross-machine | A heterogeneous City fleet or a real `AgentBackend` cross-machine runtime exists |

@@ -2035,7 +2035,7 @@ mod tests {
         let layer_path = dir.path().join("config.json");
         std::fs::write(
             &layer_path,
-            r#"{"workerCandidates": [{"backend": "claude", "model": "sonnet"}, {"backend": "codex", "model": "gpt-5-codex"}]}"#,
+            r#"{"workerCandidates": [{"backend": "claude", "model": "sonnet"}, {"backend": "codex", "model": "gpt-5.6-sol"}]}"#,
         )
         .unwrap();
         let cfg = load_layers(&[layer_path]).unwrap();
