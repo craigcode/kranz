@@ -164,6 +164,14 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 #[cfg(target_os = "macos")]
 const SESSION_KEYCHAIN_LOCK_SECS: u32 = 8 * 60 * 60;
 
+/// `securityd` is shared by every session owned by the OS account. Even
+/// keychains at distinct explicit paths can intermittently reject overlapping
+/// create/unlock/settings requests (observed on hosted macOS while the
+/// keychain tests ran in parallel). Keep each setup or teardown transaction
+/// contiguous; this does not serialize the agent sessions themselves.
+#[cfg(target_os = "macos")]
+static SESSION_KEYCHAIN_OPERATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The per-session keychain passphrase file: a dotfile beside the db it
 /// guards, inside the session-private scratch HOME.
 #[cfg(target_os = "macos")]
@@ -380,6 +388,9 @@ fn write_session_keychain_secret(path: &Path, secret: &str) -> std::io::Result<(
 /// lock state through `security`; they consume this return value instead.
 #[cfg(target_os = "macos")]
 fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
+    let _operation = SESSION_KEYCHAIN_OPERATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let keychains = home.join("Library").join("Keychains");
     let db = keychains.join("login.keychain-db");
     let db_exists = db.exists();
@@ -504,6 +515,9 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
 /// ran. Best-effort like the seed: a failure leaves the timeout.
 #[cfg(target_os = "macos")]
 fn lock_session_login_keychain(home: &Path) -> std::io::Result<bool> {
+    let _operation = SESSION_KEYCHAIN_OPERATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let db = home
         .join("Library")
         .join("Keychains")
@@ -1665,8 +1679,25 @@ mod tests {
         let home_a = tempfile::tempdir().unwrap();
         let home_b = tempfile::tempdir().unwrap();
 
-        assert!(ensure_session_login_keychain(home_a.path(), "test-session"));
-        assert!(ensure_session_login_keychain(home_b.path(), "test-session"));
+        // Hosted macOS exposed securityd's account-global mutation race when
+        // this test overlapped the other keychain tests. Start both independent
+        // homes together and prove the production transaction lock makes both
+        // seeds reliable.
+        let start = std::sync::Barrier::new(3);
+        let (seeded_a, seeded_b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                start.wait();
+                ensure_session_login_keychain(home_a.path(), "test-session")
+            });
+            let b = scope.spawn(|| {
+                start.wait();
+                ensure_session_login_keychain(home_b.path(), "test-session")
+            });
+            start.wait();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(seeded_a);
+        assert!(seeded_b);
 
         let path_a = session_keychain_secret_path(home_a.path());
         let secret_a = std::fs::read_to_string(&path_a).unwrap();
