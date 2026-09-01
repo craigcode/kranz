@@ -3556,7 +3556,7 @@ mod tests {
         if !crate::sandbox_container::host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
-                "container provider is supported only on Linux",
+                &crate::sandbox_container::container_contract_skip_detail(),
             );
             return;
         }
