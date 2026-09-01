@@ -305,17 +305,29 @@ fn run_mount_proof(
 /// naming the runtime, because the fix is almost always to share that path
 /// or to move the mission's scratch under one the runtime already shares.
 fn unshared_path_reason(runtime: ContainerRuntime, host_dir: &Path, symptom: &str) -> String {
-    format!(
+    let mut reason = format!(
         "{} accepted a bind mount of {} and shared nothing: {symptom}. \
          The runtime's daemon cannot see this host path, so the declared write set would \
          not exist inside the container and a worker's output would be lost silently. \
          Share this path with the runtime (Colima mounts only the home directory by \
          default: `colima start --mount {}:w`; Docker Desktop keeps its own file-sharing \
-         list) or point the mission's workspace at a path it already shares",
+         list)",
         runtime.binary(),
         host_dir.display(),
         host_dir.display()
-    )
+    );
+    // The scratch root has a second remedy the others do not: kranz chose
+    // that path, so the operator can move it instead of reconfiguring a VM.
+    if host_dir == crate::backend_claude::scratch_root_base() {
+        reason.push_str(&format!(
+            ", or move kranz's own scratch to a directory the runtime already shares by \
+             setting {}=<path> (this root is scratch, not your workspace)",
+            crate::backend_claude::SCRATCH_ROOT_ENV
+        ));
+    } else {
+        reason.push_str(" or point the mission's workspace at a path it already shares");
+    }
+    reason
 }
 
 /// One proof per (runtime, path) for the life of the process.
@@ -393,7 +405,11 @@ pub fn declared_mount_roots(
     let mut roots = vec![
         session_cwd.parent().unwrap_or(session_cwd).to_path_buf(),
         mission_dir.to_path_buf(),
-        std::env::temp_dir(),
+        // The scratch BASE, not the system temp dir: an operator who pointed
+        // scratch somewhere the runtime shares must have that path proven,
+        // and proving the temp dir they no longer use would refuse a mission
+        // that works.
+        crate::backend_claude::scratch_root_base(),
     ];
     roots.extend(extra_write.iter().cloned());
     roots
@@ -785,6 +801,32 @@ mod tests {
     use crate::sandbox::SandboxInputs;
     use crate::types::SandboxEnforce;
     use std::path::PathBuf;
+
+    #[test]
+    fn declared_roots_follow_the_scratch_override_not_the_temp_dir() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let checkout = std::path::Path::new("/repos/app/worktree");
+        let mission = std::path::Path::new("/repos/app/.kranz/missions/m-1");
+        let shared = tempfile::tempdir().unwrap();
+        // SAFETY: guarded by ENV_LOCK, and removed before the guard drops.
+        unsafe { std::env::set_var(crate::backend_claude::SCRATCH_ROOT_ENV, shared.path()) };
+        let roots = declared_mount_roots(checkout, mission, &[]);
+        unsafe { std::env::remove_var(crate::backend_claude::SCRATCH_ROOT_ENV) };
+
+        // Proving the temp dir an operator no longer uses would refuse a
+        // mission that works, and proving nothing where scratch really lives
+        // would lose its output silently. The proof follows the session.
+        assert!(roots.contains(&shared.path().to_path_buf()), "{roots:?}");
+        assert!(!roots.contains(&std::env::temp_dir()), "{roots:?}");
+        assert!(
+            roots.contains(&std::path::PathBuf::from("/repos/app")),
+            "the checkout's parent is mounted, not the worktree itself: {roots:?}"
+        );
+    }
 
     #[test]
     fn mount_proof_argv_reads_the_host_sentinel_and_writes_the_guest_one() {

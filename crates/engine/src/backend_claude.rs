@@ -290,12 +290,47 @@ pub fn claude_min_config_entries() -> &'static [&'static str] {
 // Scratch worker HOME/config-dir seeding (worker env hygiene)
 // ---------------------------------------------------------------------------
 
+/// Environment override for the directory per-session scratch lives under.
+///
+/// The default is the system temp dir, which is right everywhere except one
+/// case that matters: a container mission whose runtime does not share the
+/// temp dir. Colima shares only the home directory by default and macOS puts
+/// `TMPDIR` under `/var/folders`, so the scratch a worker writes into is
+/// exactly the path its container cannot see. `kranz` refuses that mission
+/// rather than losing its output (see
+/// [`crate::sandbox_container::MountProof`]), and this variable is the cheap
+/// way out: point scratch at a directory the runtime already shares, instead
+/// of reconfiguring the runtime.
+pub const SCRATCH_ROOT_ENV: &str = "KRANZ_SCRATCH_ROOT";
+
+/// The directory per-session scratch roots live under.
+///
+/// [`SCRATCH_ROOT_ENV`] when it names an ABSOLUTE path, else the system temp
+/// dir. A relative override is ignored rather than honored: scratch paths are
+/// handed to container mounts and sandbox profiles, both of which resolve
+/// them against a working directory the operator did not choose.
+pub fn scratch_root_base() -> std::path::PathBuf {
+    match std::env::var_os(SCRATCH_ROOT_ENV).map(std::path::PathBuf::from) {
+        Some(root) if root.is_absolute() => root,
+        Some(root) => {
+            tracing::warn!(
+                override_path = %root.display(),
+                variable = SCRATCH_ROOT_ENV,
+                "ignoring a relative scratch-root override; scratch paths must be absolute \
+                 because container mounts and sandbox profiles resolve them elsewhere"
+            );
+            std::env::temp_dir()
+        }
+        None => std::env::temp_dir(),
+    }
+}
+
 /// Where a worker session's scratch `HOME` lives for a given session id.
 ///
-/// Unique per session under the system temp dir so concurrent worker
+/// Unique per session under [`scratch_root_base`] so concurrent worker
 /// sessions never share (or race on) scratch state.
 pub fn scratch_home_root(session_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("kranz-worker-home-{session_id}"))
+    scratch_root_base().join(format!("kranz-worker-home-{session_id}"))
 }
 
 /// Seed `scratch_root` with a scratch `HOME` containing exactly the
@@ -1280,6 +1315,61 @@ impl AgentSession for ClaudeSession {
 
     fn exit_status(&self) -> Option<SessionExit> {
         self.exit.clone()
+    }
+}
+
+// Cross-platform: the scratch root is chosen the same way on every host,
+// and the container hazard it exists for is not unix-specific.
+#[cfg(test)]
+mod scratch_root_tests {
+    use super::*;
+
+    /// Serializes the env mutation: `set_var` is process-global and libtest
+    /// runs these concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_absolute_override_moves_scratch_off_the_temp_root() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let shared = tempfile::tempdir().unwrap();
+        // SAFETY: guarded by ENV_LOCK, and removed before the guard drops.
+        unsafe { std::env::set_var(SCRATCH_ROOT_ENV, shared.path()) };
+        let root = scratch_home_root("sess-1");
+        unsafe { std::env::remove_var(SCRATCH_ROOT_ENV) };
+
+        assert!(root.starts_with(shared.path()), "{}", root.display());
+        assert!(
+            root.ends_with("kranz-worker-home-sess-1"),
+            "{}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn a_relative_override_is_ignored_rather_than_resolved_somewhere_surprising() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: guarded by ENV_LOCK, and removed before the guard drops.
+        unsafe { std::env::set_var(SCRATCH_ROOT_ENV, "relative/scratch") };
+        let base = scratch_root_base();
+        unsafe { std::env::remove_var(SCRATCH_ROOT_ENV) };
+
+        // Container mounts and sandbox profiles resolve paths against a cwd
+        // the operator did not choose, so a relative root is refused.
+        assert_eq!(base, std::env::temp_dir());
+    }
+
+    #[test]
+    fn no_override_keeps_the_system_temp_root() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var(SCRATCH_ROOT_ENV) };
+        assert_eq!(scratch_root_base(), std::env::temp_dir());
     }
 }
 

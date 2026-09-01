@@ -108,11 +108,19 @@ backwards.
   addresses.
 - [x] The Linux path is unchanged and pays no probe cost, because CI renews
   its receipt continuously.
-- [ ] The macOS scratch root is chosen so a default Colima install works
-  without the operator reconfiguring mounts. Today `TMPDIR` under
-  `/var/folders` is outside Colima's default share, so the proof correctly
-  refuses and the operator has to act. Refusing beats losing work silently,
-  but picking a shared scratch would beat both.
+- [x] The operator can move kranz's scratch instead of reconfiguring the
+  runtime. `KRANZ_SCRATCH_ROOT` relocates the per-session scratch root, the
+  mount proof follows it rather than probing a temp dir the mission no longer
+  uses, and the refusal names the variable when the failing root is scratch.
+  A relative override is ignored rather than resolved, because container
+  mounts and sandbox profiles resolve paths against a cwd the operator did
+  not choose.
+- [ ] Consider choosing a shared scratch root AUTOMATICALLY when the proof
+  shows the default is unshared. Deliberately not done here: relocating an
+  operator's scratch without being asked is the kind of quiet magic that is
+  hard to debug when it guesses wrong, and one named variable in a refusal
+  message is a small price for staying predictable. Revisit if operators
+  actually hit this often.
 
 ## Originally done when
 

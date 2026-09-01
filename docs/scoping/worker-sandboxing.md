@@ -244,6 +244,47 @@ under ~10% wall-clock overhead; and the primary checkout never changes branch
 during any mission, sequential included. On macOS the `fs+net` boundary is
 the loopback-only Seatbelt profile plus the egress proxy (3.3a).
 
+## Operator note — the container runtime must actually share the mounts
+
+A runtime can accept `-v /host/path:/guest` for a path its daemon cannot see,
+create an empty directory inside its VM, mount that, and exit 0. Nothing
+errors. The declared write set silently does not exist, the worker writes into
+a VM that teardown destroys, and the validator judges a tree where nothing
+landed.
+
+kranz refuses that mission rather than losing its output. Every declared root
+is proven with a bind-mount round trip before a session or a gate resolves:
+the checkout's parent, the mission dir, the scratch root, and each
+`extra_write` entry. Linux skips the probe, since CI renews its receipt
+continuously; Windows is refused whatever a probe says, because its gap is the
+POSIX guest-path and `/dev/null` mask contract that no probe addresses.
+
+The common failure has two remedies. Colima shares only the home directory by
+default and macOS puts `TMPDIR` under `/var/folders`, so kranz's own scratch
+is the one path a container mission cannot use. Either share it with the
+runtime:
+
+```bash
+colima start --mount "$TMPDIR:w"
+```
+
+or move kranz's scratch to somewhere already shared, which needs no VM
+restart:
+
+```bash
+export KRANZ_SCRATCH_ROOT="$HOME/.kranz-scratch"
+```
+
+The refusal message names whichever applies. `KRANZ_SCRATCH_ROOT` must be
+absolute; a relative value is ignored rather than resolved, because container
+mounts and sandbox profiles resolve paths against a working directory the
+operator did not choose.
+
+Note the narrower consequence for the test suite: the live container tests
+create their fixtures under `TMPDIR`, not under the scratch root, so running
+them with `container` in `KRANZ_REQUIRED_CAPABILITIES` still needs a shared
+temp dir. `KRANZ_SCRATCH_ROOT` fixes missions, not fixtures.
+
 ## Open questions
 
 1. **Resolved 2026-07-06** — minimal file/dir set the `claude` CLI needs to
