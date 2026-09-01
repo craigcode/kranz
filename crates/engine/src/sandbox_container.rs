@@ -781,14 +781,19 @@ mod tests {
 
     #[test]
     fn mount_proof_argv_reads_the_host_sentinel_and_writes_the_guest_one() {
-        let argv = mount_proof_argv(Path::new("/hosted/work"), "alpine:3", "guesttoken");
+        // The host side is spelled by the platform, not by this test: on
+        // Windows `absolutize` returns a drive path, and the verbatim form is
+        // what once broke docker's colon-delimited parser. Assert the
+        // COMPOSITION — host path, then the guest mount point — rather than a
+        // POSIX literal that only holds on unix.
+        let host = std::env::temp_dir();
+        let argv = mount_proof_argv(&host, "alpine:3", "guesttoken");
         let rendered = argv.join(" ");
+        let expected_mount = format!("{}:/kranz-mount-proof", container_host_path(&host));
+        assert!(rendered.contains(&expected_mount), "{rendered}");
+        assert!(!expected_mount.starts_with(r"\\?\"), "{expected_mount}");
         // Both directions in one run: a mount can be visible one way and
         // stale the other.
-        assert!(
-            rendered.contains("-v /hosted/work:/kranz-mount-proof"),
-            "{rendered}"
-        );
         assert!(
             rendered.contains("cat /kranz-mount-proof/host.txt"),
             "{rendered}"
@@ -805,6 +810,15 @@ mod tests {
 
     #[test]
     fn live_bind_mount_round_trip_closes_under_the_checkout() {
+        // Windows refuses the provider whatever a probe says, so a probe
+        // there proves nothing and would fail on the Linux image alone.
+        if cfg!(target_os = "windows") {
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "the container provider refuses Windows, so a bind-mount probe proves nothing",
+            );
+            return;
+        }
         let Some(runtime) = detect() else {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
