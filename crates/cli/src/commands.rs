@@ -560,6 +560,15 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             println!("created ticket '{slug}' at {}", path.display());
             Ok(0)
         }
+        TicketCommand::ImportOpenspec { path, slug } => {
+            let written = crate::openspec::import_change(repo, &path, slug.as_deref())?;
+            println!("imported {} as {}", path.display(), written.display());
+            println!(
+                "acceptance criteria are still prose: replace the placeholder in \
+                 '## Acceptance hints' with commands that can fail"
+            );
+            Ok(0)
+        }
         TicketCommand::Note { slug, text } => {
             print!(
                 "{}",
