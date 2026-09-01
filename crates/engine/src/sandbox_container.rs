@@ -18,14 +18,22 @@
 //! no egress list use `fs` (runtime default bridge/NAT, the same
 //! permissiveness as the tier-2 fs tier).
 //!
-//! Host support is deliberately Linux only. Session and gate resolution fail
-//! closed on macOS and Windows even when a runtime is present: only Linux has
-//! a continuously enforced CI receipt for the shipped bind-mount,
-//! authority-mask, and egress contracts. A 2026-08-21 macOS operator receipt
-//! is retained as evidence, but is not a renewable release gate. Runtime
-//! detection is not evidence that those mounts enforce the declared policy.
-//! macOS remains supported through the process provider's native Seatbelt
-//! boundary.
+//! Host support is evidence-gated, not a platform allowlist. Linux is
+//! supported unconditionally: CI renews a receipt for the shipped bind-mount,
+//! authority-mask, and egress contracts on every run. Windows is refused
+//! unconditionally, because the shipped contract uses POSIX guest paths,
+//! Linux images, and `/dev/null` authority masks that Windows containers do
+//! not honor; macOS keeps the process provider's native Seatbelt boundary as
+//! its default. Anything else must PROVE the mount contract on the host, at
+//! run time, via [`prove_bind_mount`] — hosted macOS cannot renew a CI
+//! receipt (its runners are guests without the virtualization a VM-backed
+//! runtime needs), but a developer's own Mac can answer the same question
+//! about itself in about a second.
+//!
+//! Runtime detection is not that evidence, and neither is a `-v` flag the
+//! runtime accepted. A daemon that cannot see the host path creates an empty
+//! directory inside its VM, mounts that, and exits 0, so the declared write
+//! set silently does not exist. See [`MountProof`].
 //!
 //! Write policy: the container's root filesystem is read-only; the writable
 //! set is exactly the declared mounts — `session_cwd` (rw), `mission_dir`
@@ -52,7 +60,10 @@
 //! the gate's `CARGO_HOME` is a seeded cache-only home precisely because the
 //! real one is a credential directory).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::sandbox::SandboxInputs;
 
@@ -101,19 +112,314 @@ pub fn detect() -> Option<ContainerRuntime> {
 /// opposed to merely having a runtime binary on PATH.
 ///
 /// Detection answers "is there a runtime?"; this answers "is its host contract
-/// supported?". They diverge on macOS and Windows. Hosted macOS runners do not
-/// expose the virtualization Colima needs, so the existing operator proof
-/// cannot be renewed as a CI release gate; Windows may have `docker.exe`, but
-/// the shipped contract uses POSIX guest paths and Linux images. Session and
-/// gate resolution fail closed on both platforms (see the module docs), so
-/// live container tests skip there rather than exercise a path the provider
-/// refuses.
+/// supported?". They diverge by platform, and for different reasons.
 ///
-/// This was masked until now: `command_available` did not consult `PATHEXT`,
-/// so `detect()` never saw `docker.exe` and the Windows container tests took
+/// Linux is supported unconditionally: CI renews a receipt for the shipped
+/// bind-mount, authority-mask, and egress contracts on every run.
+///
+/// Windows is refused unconditionally. It may have `docker.exe`, but the
+/// shipped contract uses POSIX guest paths, Linux images, and `/dev/null`
+/// authority masks that Windows containers do not honor. This was masked
+/// until `command_available` learned to consult `PATHEXT`; before that
+/// `detect()` never saw `docker.exe` and the Windows container tests took
 /// their silent skip path and reported `ok` without running.
+///
+/// macOS is supported exactly when THIS host proves it. Hosted runners cannot
+/// renew a CI receipt, because they are already guests without the
+/// virtualization a VM-backed runtime needs, so the evidence has to come from
+/// the host at run time instead of from a lane that cannot execute. The proof
+/// is a real bind-mount round trip over the paths a session mounts, which is
+/// what separates a working developer machine from one whose runtime accepts
+/// `-v` and shares nothing.
 pub fn host_supports_container_contract() -> bool {
-    cfg!(target_os = "linux")
+    if cfg!(target_os = "linux") {
+        return true;
+    }
+    if cfg!(target_os = "windows") {
+        return false;
+    }
+    let Some(runtime) = detect() else {
+        return false;
+    };
+    matches!(host_mount_contract_proof(runtime), MountProof::Proven)
+}
+
+/// The proof behind [`host_supports_container_contract`], over the roots a
+/// test or session actually mounts: the working tree and the system temp
+/// root. Sharing is per path, so proving one says nothing about the other.
+pub fn host_mount_contract_proof(runtime: ContainerRuntime) -> MountProof {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    for root in [cwd.as_path(), std::env::temp_dir().as_path()] {
+        match cached_bind_mount_proof(runtime, root, DEFAULT_IMAGE) {
+            MountProof::Proven => {}
+            failed => return failed,
+        }
+    }
+    MountProof::Proven
+}
+
+/// Guest path the bind-mount proof mounts its probe directory at.
+pub const MOUNT_PROOF_GUEST_DIR: &str = "/kranz-mount-proof";
+
+/// How long one probe container may take before the proof gives up.
+const MOUNT_PROOF_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Whether this host's runtime actually shares a bind-mounted directory with
+/// the container, as opposed to accepting the `-v` flag and sharing nothing.
+///
+/// A runtime that cannot see the host path does NOT fail. Docker creates an
+/// empty directory inside its VM, mounts that, and exits 0. The declared
+/// write set then silently does not exist: a worker writes into a VM that is
+/// destroyed at teardown, and the validator judges a tree where nothing
+/// landed. Nothing in the run reports an error.
+///
+/// Measured on an M4 Pro (2026-08-25) with Colima 0.10.3 and Docker 29.2.1.
+/// Colima's default mount set is the home directory alone, macOS puts
+/// `TMPDIR` under `/var/folders`, and a probe file written on the host before
+/// the run was invisible inside the container with exit code 0 throughout.
+/// The same hazard reaches any host whose daemon does not share its
+/// filesystem: Docker Desktop's file-sharing list, a remote `DOCKER_HOST`, a
+/// rootless daemon in its own mount namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountProof {
+    /// A sentinel written on the host was read inside the container, and a
+    /// sentinel written inside the container was read back on the host.
+    Proven,
+    /// The round trip did not close. Carries the operator-facing reason.
+    Failed(String),
+}
+
+/// The probe argv: mount `host_dir` rw, read the host's sentinel from inside,
+/// and write the guest's sentinel back out. One container run proves both
+/// directions, because a mount can be visible one way and stale the other.
+pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-v".to_string(),
+        format!(
+            "{}:{MOUNT_PROOF_GUEST_DIR}",
+            container_host_path(host_dir)
+        ),
+        image.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        // Exit non-zero ONLY when the runtime itself fails. A missing
+        // sentinel is a finding to report on stdout, not a shell error: if
+        // `cat` decides the exit code, an unshared mount and a dead daemon
+        // become the same failure, and only one of them has a remedy the
+        // operator can act on.
+        format!(
+            "if [ -r {MOUNT_PROOF_GUEST_DIR}/host.txt ]; then cat {MOUNT_PROOF_GUEST_DIR}/host.txt; \
+             else printf %s no-host-sentinel; fi; \
+             printf %s {guest_sentinel} > {MOUNT_PROOF_GUEST_DIR}/guest.txt 2>/dev/null || true"
+        ),
+    ]
+}
+
+/// Run the round trip under `host_dir` and report whether the mount is real.
+///
+/// `host_dir` must be the directory the mission will actually mount under,
+/// not a convenient one. The failure is path-dependent: on a default Colima
+/// a probe under `$HOME` passes while the same probe under `TMPDIR` shares
+/// nothing, so proving the wrong path proves nothing.
+pub fn prove_bind_mount(runtime: ContainerRuntime, host_dir: &Path, image: &str) -> MountProof {
+    let probe = host_dir.join(format!(
+        "kranz-mount-proof-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) = std::fs::create_dir_all(&probe) {
+        return MountProof::Failed(format!(
+            "could not create the mount probe directory {}: {error}",
+            probe.display()
+        ));
+    }
+    let host_sentinel = uuid::Uuid::new_v4().simple().to_string();
+    let guest_sentinel = uuid::Uuid::new_v4().simple().to_string();
+    let proof = run_mount_proof(
+        runtime,
+        host_dir,
+        &probe,
+        image,
+        &host_sentinel,
+        &guest_sentinel,
+    );
+    let _ = std::fs::remove_dir_all(&probe);
+    proof
+}
+
+fn run_mount_proof(
+    runtime: ContainerRuntime,
+    host_dir: &Path,
+    probe: &Path,
+    image: &str,
+    host_sentinel: &str,
+    guest_sentinel: &str,
+) -> MountProof {
+    if let Err(error) = std::fs::write(probe.join("host.txt"), host_sentinel) {
+        return MountProof::Failed(format!(
+            "could not write the host sentinel in {}: {error}",
+            probe.display()
+        ));
+    }
+    let argv = mount_proof_argv(probe, image, guest_sentinel);
+    let Some(output) = crate::command_exec::run_with_timeout(
+        Path::new(runtime.binary()),
+        &argv,
+        MOUNT_PROOF_TIMEOUT,
+    ) else {
+        return MountProof::Failed(format!(
+            "the {} mount proof did not finish within {}s: {}",
+            runtime.binary(),
+            MOUNT_PROOF_TIMEOUT.as_secs(),
+            argv.join(" ")
+        ));
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        return MountProof::Failed(format!(
+            "the {} mount proof exited {:?}: {}",
+            runtime.binary(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if stdout != host_sentinel {
+        return MountProof::Failed(unshared_path_reason(
+            runtime,
+            host_dir,
+            "the host sentinel was not visible inside the container",
+        ));
+    }
+    match std::fs::read_to_string(probe.join("guest.txt")) {
+        Ok(written) if written.trim() == guest_sentinel => MountProof::Proven,
+        Ok(_) | Err(_) => MountProof::Failed(unshared_path_reason(
+            runtime,
+            host_dir,
+            "the container's write did not reach the host",
+        )),
+    }
+}
+
+/// The message an operator can act on. Naming the path matters more than
+/// naming the runtime, because the fix is almost always to share that path
+/// or to move the mission's scratch under one the runtime already shares.
+fn unshared_path_reason(runtime: ContainerRuntime, host_dir: &Path, symptom: &str) -> String {
+    format!(
+        "{} accepted a bind mount of {} and shared nothing: {symptom}. \
+         The runtime's daemon cannot see this host path, so the declared write set would \
+         not exist inside the container and a worker's output would be lost silently. \
+         Share this path with the runtime (Colima mounts only the home directory by \
+         default: `colima start --mount {}:w`; Docker Desktop keeps its own file-sharing \
+         list) or point the mission's workspace at a path it already shares",
+        runtime.binary(),
+        host_dir.display(),
+        host_dir.display()
+    )
+}
+
+/// One proof per (runtime, path) for the life of the process.
+///
+/// The probe costs a container run. Session resolution happens per role and
+/// per feature, so proving every time would add that cost to every spawn,
+/// and the answer cannot change while a daemon keeps running.
+fn proof_cache() -> &'static Mutex<HashMap<(String, String), MountProof>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), MountProof>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`prove_bind_mount`] memoized per runtime and path.
+pub fn cached_bind_mount_proof(
+    runtime: ContainerRuntime,
+    host_dir: &Path,
+    image: &str,
+) -> MountProof {
+    let key = (
+        runtime.binary().to_string(),
+        host_dir.to_string_lossy().into_owned(),
+    );
+    if let Ok(cache) = proof_cache().lock() {
+        if let Some(proof) = cache.get(&key) {
+            return proof.clone();
+        }
+    }
+    let proof = prove_bind_mount(runtime, host_dir, image);
+    if let Ok(mut cache) = proof_cache().lock() {
+        cache.insert(key, proof.clone());
+    }
+    proof
+}
+
+/// Prove every distinct host root a run will mount.
+///
+/// One probe is not enough. Sharing is per path on every runtime that has
+/// this hazard, so a host can share the checkout and not the scratch: the
+/// exact shape of the 2026-08-25 macOS failure, where the worktree under
+/// `$HOME` mounted fine and `TMPDIR` under `/var/folders` did not. Proving
+/// only the convenient root would reproduce the original bug with extra
+/// ceremony, so every declared root is proven and the FIRST failure is
+/// returned, naming the path the operator has to fix.
+///
+/// Roots are deduplicated by their proof cache key, so the common case of
+/// several mounts under one shared root costs one container run.
+pub fn prove_mount_roots(runtime: ContainerRuntime, roots: &[PathBuf], image: &str) -> MountProof {
+    let mut seen = Vec::new();
+    for root in roots {
+        if root.as_os_str().is_empty() || seen.iter().any(|prior| prior == root) {
+            continue;
+        }
+        seen.push(root.clone());
+        match cached_bind_mount_proof(runtime, root, image) {
+            MountProof::Proven => {}
+            failed => return failed,
+        }
+    }
+    MountProof::Proven
+}
+
+/// The roots a session or gate actually mounts, in the order the operator
+/// would want them reported.
+///
+/// The checkout contributes its PARENT rather than the working tree itself:
+/// the tree is a git worktree, and a directory appearing and vanishing inside
+/// it can race a concurrent `git status` in a mission that cares about a
+/// clean tree. The system temp root stands in for the per-session scratch,
+/// which does not exist yet at resolution time but is created underneath it.
+pub fn declared_mount_roots(
+    session_cwd: &Path,
+    mission_dir: &Path,
+    extra_write: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = vec![
+        session_cwd.parent().unwrap_or(session_cwd).to_path_buf(),
+        mission_dir.to_path_buf(),
+        std::env::temp_dir(),
+    ];
+    roots.extend(extra_write.iter().cloned());
+    roots
+}
+
+/// Why a live container test is skipping, in the host's own terms.
+///
+/// "Supported only on Linux" was true when the platform list was the whole
+/// answer. Now a macOS host can qualify, so a skip has to say which fact
+/// disqualified this one: no runtime at all, or a runtime whose mounts do
+/// not round trip.
+pub fn container_contract_skip_detail() -> String {
+    if cfg!(target_os = "windows") {
+        return "the container provider refuses Windows: POSIX guest paths, Linux images, \
+                and /dev/null authority masks are not honored there"
+            .to_string();
+    }
+    match detect() {
+        None => "no docker/podman/nerdctl/container on PATH".to_string(),
+        Some(runtime) => match host_mount_contract_proof(runtime) {
+            MountProof::Proven => {
+                "the host contract is supported; this skip should not have fired".to_string()
+            }
+            MountProof::Failed(reason) => reason,
+        },
+    }
 }
 
 /// Detection with an injectable PATH lookup so tests control availability.
@@ -479,6 +785,67 @@ mod tests {
     use crate::sandbox::SandboxInputs;
     use crate::types::SandboxEnforce;
     use std::path::PathBuf;
+
+    #[test]
+    fn mount_proof_argv_reads_the_host_sentinel_and_writes_the_guest_one() {
+        // The host side is spelled by the platform, not by this test: on
+        // Windows `absolutize` returns a drive path, and the verbatim form is
+        // what once broke docker's colon-delimited parser. Assert the
+        // COMPOSITION — host path, then the guest mount point — rather than a
+        // POSIX literal that only holds on unix.
+        let host = std::env::temp_dir();
+        let argv = mount_proof_argv(&host, "alpine:3", "guestsentinel");
+        let rendered = argv.join(" ");
+        let expected_mount = format!("{}:/kranz-mount-proof", container_host_path(&host));
+        assert!(rendered.contains(&expected_mount), "{rendered}");
+        assert!(!expected_mount.starts_with(r"\\?\"), "{expected_mount}");
+        // Both directions in one run: a mount can be visible one way and
+        // stale the other.
+        assert!(
+            rendered.contains("cat /kranz-mount-proof/host.txt"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("printf %s guestsentinel > /kranz-mount-proof/guest.txt"),
+            "{rendered}"
+        );
+        // A missing sentinel must not become a shell error, or an unshared
+        // mount is indistinguishable from a dead daemon.
+        assert!(rendered.contains("no-host-sentinel"), "{rendered}");
+        assert!(rendered.starts_with("run --rm "), "{rendered}");
+    }
+
+    #[test]
+    fn live_bind_mount_round_trip_closes_under_the_checkout() {
+        // Windows refuses the provider whatever a probe says, so a probe
+        // there proves nothing and would fail on the Linux image alone.
+        if cfg!(target_os = "windows") {
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "the container provider refuses Windows, so a bind-mount probe proves nothing",
+            );
+            return;
+        }
+        let Some(runtime) = detect() else {
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "no container runtime on PATH, so the bind-mount round trip cannot be proven",
+            );
+            return;
+        };
+        // The checkout's parent, not a temp dir: a runtime can share one and
+        // not the other, and this is the path a mission actually mounts.
+        let checkout = std::env::current_dir().expect("a working directory");
+        let root = checkout.parent().unwrap_or(&checkout);
+        match prove_bind_mount(runtime, root, DEFAULT_IMAGE) {
+            MountProof::Proven => {}
+            MountProof::Failed(reason) => panic!(
+                "the bind-mount round trip under {} did not close, so a mission's \
+                 declared write set cannot be trusted here: {reason}",
+                root.display()
+            ),
+        }
+    }
 
     #[test]
     fn detect_prefers_docker_then_podman_then_nerdctl_then_apple_container() {
@@ -926,7 +1293,7 @@ mod tests {
         if !host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
-                "container provider is supported only on Linux",
+                &container_contract_skip_detail(),
             );
             return;
         }

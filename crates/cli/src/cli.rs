@@ -896,6 +896,19 @@ pub enum TicketCommand {
         goal: Option<String>,
     },
 
+    /// Import an OpenSpec change folder (`openspec/changes/<name>/`) as a
+    /// ticket. Carries the proposal and its requirements; deliberately drops
+    /// `tasks.md`, and never passes SHALL scenarios off as acceptance
+    /// criteria. One way only — the approved plan stays authoritative
+    ImportOpenspec {
+        /// Path to the OpenSpec change directory (must hold proposal.md)
+        path: PathBuf,
+
+        /// Ticket slug (defaults to the change directory's name)
+        #[arg(long)]
+        slug: Option<String>,
+    },
+
     /// Append a note to a ticket's discussion
     /// (`.kranz/tickets/<slug>.notes.jsonl` — append-only, committed with the
     /// ticket; D-BW-3). Author is $KRANZ_NOTE_AUTHOR, else "operator"

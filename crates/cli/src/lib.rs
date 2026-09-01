@@ -38,6 +38,7 @@ pub mod hook_status;
 pub mod host_bridge;
 pub mod init;
 pub mod merged_costs;
+pub mod openspec;
 pub mod otel;
 pub mod output;
 pub mod planning_tui;

@@ -72,6 +72,43 @@ restored its bytes. Rules scoped by `task-classes` and `when-paths` resolve
 against the immutable input as read-only context; exceptions and attestations
 remain bound to the resulting review diff.
 
+## Importing an OpenSpec change
+
+If you author work with [OpenSpec](https://github.com/Fission-AI/OpenSpec),
+`kranz ticket import-openspec` turns a change folder into a ticket:
+
+```bash
+kranz ticket import-openspec openspec/changes/dark-mode
+```
+
+It reads `proposal.md` (required) into `## Goal`, and `design.md` plus every
+`specs/**/*.md` into `## Context` as authored intent. The slug defaults to the
+change directory's name; `--slug` overrides it. Re-importing refuses rather
+than overwriting a ticket you have since edited.
+
+Two things it deliberately does not do, both of which matter more than what it
+does.
+
+It never imports `tasks.md`. That checklist is the authoring assistant's own
+decomposition, self-reported and ungraded. Importing it would slip an
+unvalidated plan past the orchestrator, which is the step that should be doing
+that thinking.
+
+It never turns spec scenarios into acceptance hints. "The app SHALL default to
+the system preference" is prose, and prose cannot fail, so copying it into
+`## Acceptance hints` would ship a vacuous criterion with every imported
+mission. The generated section says so and asks for commands that can fail,
+guarded by a passed count. Fill it in before drafting.
+
+The import runs one way. OpenSpec explains why the work exists; once you
+approve a plan, that plan is what the validator judges. Nothing writes back to
+`openspec/changes/`, so the two cannot drift into disagreeing about what was
+actually built.
+
+The lighter-weight alternative needs no import at all: point a review ticket
+at the proposal with `task-class: spec-review` and `review-artifact`, and
+kranz will critique the spec before anyone builds against it.
+
 ## Listing the backlog
 
 ```sh
