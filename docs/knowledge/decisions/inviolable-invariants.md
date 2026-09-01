@@ -2,8 +2,9 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-27
+last_verified: 2026-09-01
 verified_against:
+  - crates/engine/src/sandbox_container.rs
   - AGENTS.md
   - docs/design.md
   - crates/engine/src/git_ops.rs
@@ -119,4 +120,9 @@ untouched (AGENTS.md rules 1–3).
   ([egress_proxy.rs](../../../crates/engine/src/egress_proxy.rs)), and
   `--unshare-net` on Linux (bwrap cannot reach a host proxy), rather than
   fake a hostname egress allowlist. A proxy that cannot start fails the run
-  before the session spawns.
+  before the session spawns. The container provider extends the same rule to
+  the mounts themselves: a runtime that accepts a bind mount and shares
+  nothing would leave the declared write set silently absent, so a host
+  without a continuous CI receipt must pass a bind-mount round trip before
+  either a session or a gate resolves
+  ([sandbox_container.rs](../../../crates/engine/src/sandbox_container.rs)).
