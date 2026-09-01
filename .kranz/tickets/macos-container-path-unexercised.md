@@ -1,6 +1,6 @@
 ---
-state: done
-state-note: "Done via the ticket's honest alternative: GitHub's hosted macOS ARM runner rejected Colima because virtualization is unavailable, so the release-supported container sandbox host is now Linux only. macOS session and gate resolution fail closed with guidance to use the native Seatbelt process provider; rust-macos requires git,sandbox-exec and records container skips instead of pretending to exercise them. The 2026-08-21 macOS operator Colima receipt remains evidence, but it is not a continuously renewable CI release gate."
+state: open
+state-note: "Reopened 2026-08-31. The v0.2.0 narrowing stands on its own evidence and is NOT being reverted: hosted macOS cannot renew a CI receipt. What reopens this is a third option the ticket did not consider — proving the contract on the operator's own host at run time instead of in a lane that cannot execute. A 2026-08-31 M4 Pro receipt showed the macOS path passing its live container tests once its mounts were real, and showed the specific defect that made them fail: a runtime can accept a bind mount and share nothing, silently."
 title: The macOS container path is claimed-supported but never exercised in CI
 priority: 2
 schedule: once
@@ -47,7 +47,74 @@ The general lesson worth carrying: a runtime-gated test that returns early
 still prints `ok`, so a skip is indistinguishable from a pass in CI output.
 Every such gate is a place where support can be claimed without evidence.
 
+## Reopened: prove the host instead of claiming the platform
+
+The narrowing answered this ticket's question honestly, and the answer was
+right for the evidence available. Hosted macOS runners are guests without
+nested virtualization, so `VZErrorDomain Code=2` is the hardware refusing and
+no CI lane can renew a macOS receipt.
+
+But "cannot be proven in CI" and "does not work" are different claims, and
+v0.2.0 shipped the second while only the first was established.
+
+### What the 2026-08-31 receipt showed
+
+Apple M4 Pro, Colima 0.10.3, Docker 29.2.1, `KRANZ_REQUIRED_CAPABILITIES=git,sandbox-exec,container`:
+
+- Full workspace suite: 2584 passed, 2 failed.
+- Both failures were the same defect, and neither was in the provider.
+- With the mounted paths actually shared, both pass:
+  `test result: ok. 2 passed; 0 failed; 1050 filtered out`.
+
+### The defect the receipt found
+
+A container runtime can accept `-v /host/path:/guest` for a path its daemon
+cannot see, create an empty directory inside its VM, mount that, and exit 0.
+Proven directly: a file written on the host before the run was invisible
+inside the container, exit code 0 throughout.
+
+In production that is silent loss of work. The worker writes into a VM that
+teardown destroys, and the validator judges a tree where nothing landed. No
+error is raised at any point, which makes it strictly worse than a refusal.
+
+Colima's default mount set is the home directory alone, and macOS puts
+`TMPDIR` under `/var/folders`, so kranz's own scratch is outside it. The
+hazard is not macOS-specific: Docker Desktop keeps its own file-sharing list,
+a remote `DOCKER_HOST` shares no local path at all, and a rootless daemon can
+sit in its own mount namespace.
+
+### Why this changes the support question
+
+Platform allowlists answer "did someone prove this OS once". The mount proof
+answers "does THIS host honor the contract right now", which is the question
+that actually protects a mission. A macOS host with real mounts is safer than
+an unproven Linux host with a remote daemon, and the allowlist gets both
+backwards.
+
 ## Done when
+
+- [x] Session AND gate resolution take a bind-mount proof on any platform
+  without a renewable CI receipt, and refuse with the failing path and a
+  remedy rather than a platform verdict. Both, deliberately: with only the
+  session gated, a proven host would run its worker contained and then fail
+  at its own merge gate.
+- [x] Every declared root is proven, not a representative one. Sharing is
+  per path, and the original failure was exactly a host that shared the
+  worktree but not the scratch.
+- [x] `host_supports_container_contract` agrees with resolution, so live
+  container tests run wherever the provider would run.
+- [x] Windows stays refused regardless of any proof: its gap is the POSIX
+  guest-path and `/dev/null` authority-mask contract, which no mount proof
+  addresses.
+- [x] The Linux path is unchanged and pays no probe cost, because CI renews
+  its receipt continuously.
+- [ ] The macOS scratch root is chosen so a default Colima install works
+  without the operator reconfiguring mounts. Today `TMPDIR` under
+  `/var/folders` is outside Colima's default share, so the proof correctly
+  refuses and the operator has to act. Refusing beats losing work silently,
+  but picking a shared scratch would beat both.
+
+## Originally done when
 
 - [x] Provisioning a runtime proved impractical on hosted macOS: the runner
   exposes no virtualization for Colima.
