@@ -22,8 +22,8 @@ export function setMutationToken(token: string): void {
 
 export function mutationToken(): string | null {
   try {
-    const token = sessionStorage.getItem(TOKEN_KEY)
-    return token && token.trim() !== '' ? token : null
+    const stored = sessionStorage.getItem(TOKEN_KEY)
+    return stored && stored.trim() !== '' ? stored : null
   } catch {
     return null
   }
@@ -51,8 +51,8 @@ export class HttpKranzApi implements KranzApi {
 
   private async json<T>(path: string, init?: RequestInit): Promise<T> {
     const headers = new Headers(init?.headers)
-    const token = mutationToken()
-    if (token !== null) headers.set('x-kranz-token', token)
+    const authority = mutationToken()
+    if (authority !== null) headers.set('x-kranz-token', authority)
     const response = await this.fetchImpl(`${this.base}${path}`, { ...init, headers })
     if (!response.ok) throw await responseError(response)
     const contentType = response.headers.get('content-type') ?? ''
