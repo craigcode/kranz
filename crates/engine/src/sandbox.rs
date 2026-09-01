@@ -188,13 +188,15 @@ pub fn resolve_for_session(
     session_cwd: &Path,
     mission_dir: &Path,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
+    let runtime = crate::sandbox_container::detect();
     let resolved = resolve_for_session_target(
         role_sandbox,
         session_cwd,
         mission_dir,
         std::env::consts::OS,
         command_available("bwrap"),
-        crate::sandbox_container::detect(),
+        runtime,
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
     );
     prewarm_xcrun_for_resolved_seatbelt(resolved.0.as_ref());
     resolved
@@ -215,6 +217,37 @@ fn prewarm_xcrun_for_resolved_seatbelt(sandbox: Option<&ResolvedSandbox>) {
 #[cfg(not(target_os = "macos"))]
 fn prewarm_xcrun_for_resolved_seatbelt(_sandbox: Option<&ResolvedSandbox>) {}
 
+/// Take a bind-mount proof only where resolution needs one.
+///
+/// Linux is CI-proven and Windows is refused outright, so neither pays for a
+/// probe. Everything else pays once per host, cached, and only when a
+/// container was actually requested.
+pub(crate) fn session_mount_proof(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    runtime: Option<crate::sandbox_container::ContainerRuntime>,
+) -> Option<crate::sandbox_container::MountProof> {
+    if role_sandbox.provider != crate::types::SandboxProvider::Container
+        || role_sandbox.enforce == crate::types::SandboxEnforce::Off
+        || cfg!(target_os = "linux")
+        || cfg!(target_os = "windows")
+    {
+        return None;
+    }
+    let runtime = runtime?;
+    let extra_write: Vec<PathBuf> = role_sandbox
+        .extra_write
+        .iter()
+        .map(|raw| expand_tilde(raw))
+        .collect();
+    Some(crate::sandbox_container::prove_mount_roots(
+        runtime,
+        &crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write),
+        crate::sandbox_container::DEFAULT_IMAGE,
+    ))
+}
+
 fn resolve_for_session_target(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
@@ -222,6 +255,7 @@ fn resolve_for_session_target(
     target_os: &str,
     bwrap_available: bool,
     container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    container_mount_proof: Option<crate::sandbox_container::MountProof>,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
     if role_sandbox.provider == crate::types::SandboxProvider::Container {
         return resolve_container_target(
@@ -230,6 +264,7 @@ fn resolve_for_session_target(
             mission_dir,
             target_os,
             container_runtime,
+            container_mount_proof,
         );
     }
     match platform_support(role_sandbox.enforce, target_os) {
@@ -271,25 +306,52 @@ fn resolve_container_target(
     mission_dir: &Path,
     target_os: &str,
     runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    mount_proof: Option<crate::sandbox_container::MountProof>,
 ) -> (Option<ResolvedSandbox>, Option<String>) {
     if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
         return (None, None);
     }
-    // The shipped container argv/mount contract is release-supported only on
-    // Linux. A macOS operator receipt exists, but hosted macOS cannot provision
-    // the VM-backed runtime needed to renew it as a CI release gate; Windows
-    // containers do not honor the POSIX guest-path and `/dev/null`
-    // authority-mask contract. Runtime presence alone cannot make either
-    // platform supported. Refuse before spawn; macOS uses the process
-    // provider's native Seatbelt boundary instead.
-    if target_os != "linux" {
+    // Linux carries a continuously enforced CI receipt for the shipped
+    // bind-mount, authority-mask, and egress contracts, so it needs no
+    // per-host evidence. macOS cannot renew that receipt in CI, because
+    // hosted runners are already guests and cannot provision the VM the
+    // runtime needs. Rather than claim macOS on a receipt that expires or
+    // deny a host that demonstrably works, require the evidence AT RUN TIME:
+    // a macOS host is supported exactly when this runtime proves it really
+    // shares the mounted path. Windows stays refused whatever a probe says,
+    // because its gap is the POSIX guest-path and `/dev/null` authority-mask
+    // contract, which no mount proof addresses.
+    if target_os == "windows" {
         return (
             None,
             Some(format!(
-                "sandbox provider:container with enforce:{} is supported only on target_os=linux, not target_os={target_os}; refusing to run unsandboxed (or under an unverified container mount contract); use sandbox.provider=\"process\" for native host containment",
+                "sandbox provider:container with enforce:{} is not supported on target_os=windows: the shipped contract uses POSIX guest paths, Linux images, and /dev/null authority masks that Windows containers do not honor; refusing to run under an unverified container mount contract",
                 enforce_label(role_sandbox.enforce)
             )),
         );
+    }
+    if target_os != "linux" {
+        match mount_proof {
+            Some(crate::sandbox_container::MountProof::Proven) => {}
+            Some(crate::sandbox_container::MountProof::Failed(reason)) => {
+                return (
+                    None,
+                    Some(format!(
+                        "sandbox provider:container with enforce:{} refused on target_os={target_os}: {reason}",
+                        enforce_label(role_sandbox.enforce)
+                    )),
+                );
+            }
+            None => {
+                return (
+                    None,
+                    Some(format!(
+                        "sandbox provider:container with enforce:{} on target_os={target_os} requires a bind-mount proof on this host and none was taken; refusing to run under an unverified container mount contract; use sandbox.provider=\"process\" for native host containment",
+                        enforce_label(role_sandbox.enforce)
+                    )),
+                );
+            }
+        }
     }
     let Some(runtime) = runtime else {
         return (
@@ -429,6 +491,7 @@ pub fn resolve_validator_containment(
     read_deny_roots: &[PathBuf],
     allow_uncontained_degrade: bool,
 ) -> crate::error::Result<ValidatorContainment> {
+    let runtime = crate::sandbox_container::detect();
     let resolved = resolve_validator_containment_target(
         role_sandbox,
         backend,
@@ -438,7 +501,8 @@ pub fn resolve_validator_containment(
         allow_uncontained_degrade,
         std::env::consts::OS,
         command_available("bwrap"),
-        crate::sandbox_container::detect(),
+        runtime,
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
     );
     if let Ok(containment) = &resolved {
         prewarm_xcrun_for_resolved_seatbelt(containment.sandbox.as_ref());
@@ -461,6 +525,7 @@ fn resolve_validator_containment_target(
     target_os: &str,
     bwrap_available: bool,
     container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    container_mount_proof: Option<crate::sandbox_container::MountProof>,
 ) -> crate::error::Result<ValidatorContainment> {
     if role_sandbox.enforce != crate::types::SandboxEnforce::Off {
         // The role's own resolution governs; an enforced pair with a
@@ -473,6 +538,7 @@ fn resolve_validator_containment_target(
             target_os,
             bwrap_available,
             container_runtime,
+            container_mount_proof,
         );
         return match sandbox {
             Some(mut resolved) => {
@@ -2203,16 +2269,30 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false, None);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            None,
+            None,
+        );
         assert!(resolved.is_none());
         assert!(
             warn.unwrap().contains("bwrap"),
             "missing-bwrap warning should name bwrap"
         );
 
-        let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", true, None);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            true,
+            None,
+            None,
+        );
         assert!(warn.is_none());
         assert_eq!(
             resolved.expect("bwrap present").backend,
@@ -2239,10 +2319,83 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "macos", false, None);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            None,
+            None,
+        );
         assert!(resolved.is_none());
         assert!(warn.is_none());
+    }
+
+    #[test]
+    fn container_provider_on_macos_resolves_only_against_a_mount_proof() {
+        use crate::sandbox_container::{ContainerRuntime, MountProof};
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let resolve = |proof: Option<MountProof>| {
+            resolve_for_session_target(
+                &cfg,
+                session.path(),
+                mission.path(),
+                "macos",
+                false,
+                Some(ContainerRuntime::Docker),
+                proof,
+            )
+        };
+
+        // A host that proved the round trip is supported, receipt or no receipt.
+        let (resolved, warn) = resolve(Some(MountProof::Proven));
+        assert!(resolved.is_some(), "a proven mount must resolve: {warn:?}");
+
+        // A host whose mount shares nothing is refused, and the operator is
+        // told which path failed rather than that the platform is unsupported.
+        let (resolved, warn) = resolve(Some(MountProof::Failed(
+            "docker accepted a bind mount of /var/folders/x and shared nothing".to_string(),
+        )));
+        assert!(resolved.is_none());
+        let warn = warn.expect("a failed proof must refuse loudly");
+        assert!(warn.contains("/var/folders/x"), "{warn}");
+        assert!(warn.contains("shared nothing"), "{warn}");
+
+        // No proof is not the same as a passing proof.
+        let (resolved, warn) = resolve(None);
+        assert!(resolved.is_none());
+        let warn = warn.expect("an unproven host must refuse");
+        assert!(warn.contains("requires a bind-mount proof"), "{warn}");
+    }
+
+    #[test]
+    fn container_provider_on_windows_refuses_even_a_proven_mount() {
+        use crate::sandbox_container::{ContainerRuntime, MountProof};
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Windows fails the POSIX guest-path and /dev/null authority-mask
+        // contract, which a mount proof says nothing about.
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "windows",
+            false,
+            Some(ContainerRuntime::Docker),
+            Some(MountProof::Proven),
+        );
+        assert!(resolved.is_none());
+        let warn = warn.expect("windows must refuse");
+        assert!(
+            warn.contains("not supported on target_os=windows"),
+            "{warn}"
+        );
+        assert!(warn.contains("POSIX guest paths"), "{warn}");
     }
 
     #[test]
@@ -2251,8 +2404,15 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let mission = tempfile::tempdir().unwrap();
 
-        let (resolved, warn) =
-            resolve_for_session_target(&cfg, session.path(), mission.path(), "linux", false, None);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            None,
+            None,
+        );
         assert!(resolved.is_none());
         let warn = warn.expect("missing runtime must produce a warning");
         assert!(warn.contains("provider:container"), "{warn}");
@@ -2273,13 +2433,14 @@ mod tests {
             "macos",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
         );
         assert!(resolved.is_none());
         let warning = warning.expect("an unproved macOS container must refuse");
-        assert!(
-            warning.contains("supported only on target_os=linux"),
-            "{warning}"
-        );
+        // The refusal is now about THIS host's evidence, not about the
+        // platform: an unproved macOS host is refused, and a proved one
+        // resolves (container_provider_on_macos_resolves_only_against_a_mount_proof).
+        assert!(warning.contains("requires a bind-mount proof"), "{warning}");
         assert!(
             warning.contains("sandbox.provider=\"process\""),
             "{warning}"
@@ -2314,6 +2475,7 @@ mod tests {
                 "windows",
                 false,
                 Some(crate::sandbox_container::ContainerRuntime::Docker),
+                None,
             );
             assert!(warning.is_none(), "{warning:?}");
             let resolved = resolved.expect("Windows process enforcement resolves");
@@ -2330,11 +2492,15 @@ mod tests {
                 "windows",
                 false,
                 Some(crate::sandbox_container::ContainerRuntime::Docker),
+                None,
             );
             assert!(resolved.is_none());
             let warning = warning.expect("an unproved Windows container must refuse");
+            // Windows is refused on its own contract gap, not for want of a
+            // mount proof: guest paths and /dev/null masks are what fail
+            // there, so no probe result could change this answer.
             assert!(
-                warning.contains("supported only on target_os=linux"),
+                warning.contains("not supported on target_os=windows"),
                 "{warning}"
             );
             assert!(
@@ -2351,6 +2517,7 @@ mod tests {
             "windows",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
         );
         assert!(resolved.is_none());
         assert!(warning.is_none());
@@ -2374,6 +2541,7 @@ mod tests {
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
         );
         assert!(warn.is_none(), "{warn:?}");
         let resolved = resolved.expect("container fs+net with egress must resolve");
@@ -2396,6 +2564,7 @@ mod tests {
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Podman),
+            None,
         );
         assert!(resolved.is_none());
         let warning = warning.expect("unproved runtime must fail closed");
@@ -2417,6 +2586,7 @@ mod tests {
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Podman),
+            None,
         );
         assert!(warn.is_none());
         let resolved = resolved.expect("runtime present and policy supportable");
@@ -2438,6 +2608,7 @@ mod tests {
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
         );
         assert!(warn.is_none());
         assert_eq!(
@@ -3452,6 +3623,7 @@ mod tests {
             "macos",
             false,
             None,
+            None,
         )
         .expect("off+macos resolves the mandatory wrap");
         assert!(containment.note.is_none(), "{:?}", containment.note);
@@ -3492,6 +3664,7 @@ mod tests {
             "linux",
             false,
             None,
+            None,
         )
         .expect_err("no bwrap and no opt-in: fail closed");
         let err = err.to_string();
@@ -3512,6 +3685,7 @@ mod tests {
             "linux",
             false,
             None,
+            None,
         )
         .expect("the opt-in restores the loud degrade");
         assert!(containment.sandbox.is_none());
@@ -3528,6 +3702,7 @@ mod tests {
             false,
             "linux",
             true,
+            None,
             None,
         )
         .expect("off+linux+bwrap resolves");
@@ -3554,6 +3729,7 @@ mod tests {
                 allow_uncontained_degrade,
                 "windows",
                 false,
+                None,
                 None,
             )
             .expect("Windows resolves the mandatory AppContainer wrap");
@@ -3591,6 +3767,7 @@ mod tests {
                 "macos",
                 false,
                 None,
+                None,
             )
             .expect_err("an uncontainable backend fails closed by default");
             let err = err.to_string();
@@ -3606,6 +3783,7 @@ mod tests {
                 true,
                 "macos",
                 false,
+                None,
                 None,
             )
             .expect("the opt-in restores the loud degrade");
@@ -3637,6 +3815,7 @@ mod tests {
             "macos",
             false,
             None,
+            None,
         )
         .expect("fs on macos resolves");
         assert!(containment.note.is_none(), "{:?}", containment.note);
@@ -3662,6 +3841,7 @@ mod tests {
             false,
             "solaris",
             false,
+            None,
             None,
         )
         .expect_err("enforcement requested but unhonorable must fail closed");
@@ -3689,6 +3869,7 @@ mod tests {
             "linux",
             false,
             Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
         )
         .expect("container resolves with a runtime");
         let sandbox = containment.sandbox.expect("the container wrap");
@@ -3709,6 +3890,7 @@ mod tests {
             false,
             "macos",
             false,
+            None,
             None,
         )
         .expect("off+container still gets the mandatory process-tier wrap");
