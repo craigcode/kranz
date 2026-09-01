@@ -192,7 +192,7 @@ pub enum MountProof {
 /// The probe argv: mount `host_dir` rw, read the host's sentinel from inside,
 /// and write the guest's sentinel back out. One container run proves both
 /// directions, because a mount can be visible one way and stale the other.
-pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_token: &str) -> Vec<String> {
+pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> Vec<String> {
     vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -212,7 +212,7 @@ pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_token: &str) -> Vec<
         format!(
             "if [ -r {MOUNT_PROOF_GUEST_DIR}/host.txt ]; then cat {MOUNT_PROOF_GUEST_DIR}/host.txt; \
              else printf %s no-host-sentinel; fi; \
-             printf %s {guest_token} > {MOUNT_PROOF_GUEST_DIR}/guest.txt 2>/dev/null || true"
+             printf %s {guest_sentinel} > {MOUNT_PROOF_GUEST_DIR}/guest.txt 2>/dev/null || true"
         ),
     ]
 }
@@ -234,9 +234,16 @@ pub fn prove_bind_mount(runtime: ContainerRuntime, host_dir: &Path, image: &str)
             probe.display()
         ));
     }
-    let host_token = uuid::Uuid::new_v4().simple().to_string();
-    let guest_token = uuid::Uuid::new_v4().simple().to_string();
-    let proof = run_mount_proof(runtime, host_dir, &probe, image, &host_token, &guest_token);
+    let host_sentinel = uuid::Uuid::new_v4().simple().to_string();
+    let guest_sentinel = uuid::Uuid::new_v4().simple().to_string();
+    let proof = run_mount_proof(
+        runtime,
+        host_dir,
+        &probe,
+        image,
+        &host_sentinel,
+        &guest_sentinel,
+    );
     let _ = std::fs::remove_dir_all(&probe);
     proof
 }
@@ -246,16 +253,16 @@ fn run_mount_proof(
     host_dir: &Path,
     probe: &Path,
     image: &str,
-    host_token: &str,
-    guest_token: &str,
+    host_sentinel: &str,
+    guest_sentinel: &str,
 ) -> MountProof {
-    if let Err(error) = std::fs::write(probe.join("host.txt"), host_token) {
+    if let Err(error) = std::fs::write(probe.join("host.txt"), host_sentinel) {
         return MountProof::Failed(format!(
             "could not write the host sentinel in {}: {error}",
             probe.display()
         ));
     }
-    let argv = mount_proof_argv(probe, image, guest_token);
+    let argv = mount_proof_argv(probe, image, guest_sentinel);
     let Some(output) = crate::command_exec::run_with_timeout(
         Path::new(runtime.binary()),
         &argv,
@@ -277,7 +284,7 @@ fn run_mount_proof(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    if stdout != host_token {
+    if stdout != host_sentinel {
         return MountProof::Failed(unshared_path_reason(
             runtime,
             host_dir,
@@ -285,7 +292,7 @@ fn run_mount_proof(
         ));
     }
     match std::fs::read_to_string(probe.join("guest.txt")) {
-        Ok(written) if written.trim() == guest_token => MountProof::Proven,
+        Ok(written) if written.trim() == guest_sentinel => MountProof::Proven,
         Ok(_) | Err(_) => MountProof::Failed(unshared_path_reason(
             runtime,
             host_dir,
@@ -787,7 +794,7 @@ mod tests {
         // COMPOSITION — host path, then the guest mount point — rather than a
         // POSIX literal that only holds on unix.
         let host = std::env::temp_dir();
-        let argv = mount_proof_argv(&host, "alpine:3", "guesttoken");
+        let argv = mount_proof_argv(&host, "alpine:3", "guestsentinel");
         let rendered = argv.join(" ");
         let expected_mount = format!("{}:/kranz-mount-proof", container_host_path(&host));
         assert!(rendered.contains(&expected_mount), "{rendered}");
@@ -799,7 +806,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("printf %s guesttoken > /kranz-mount-proof/guest.txt"),
+            rendered.contains("printf %s guestsentinel > /kranz-mount-proof/guest.txt"),
             "{rendered}"
         );
         // A missing sentinel must not become a shell error, or an unshared
