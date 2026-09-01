@@ -38,7 +38,8 @@ vibe.
   holders.
 - **Report everywhere.** `kranz serve` exposes the same missions over a web
   dashboard, a Slack bridge (plan, approve, and steer from a thread), and a
-  minimal REST/SSE API that even a G2 glasses app can drive.
+  minimal REST/SSE API. The experimental Even G2 client uses that API for
+  glanceable status and bounded human decisions.
 - **Queue and drain.** Missions serialize per repo (they own the working
   tree). Approvals can enqueue; `kranz work` drains the queue one mission at a
   time, crash-safely.
@@ -174,7 +175,7 @@ seeded into future missions' prompts.
 
 `kranz serve` folds the same logs and exposes REST + SSE. The web dashboard,
 the Slack bridge (Socket Mode, buttons calling the same approve/abandon
-endpoints), and the G2 glasses app are all just renderers of
+endpoints), and the experimental G2 glasses client are all just renderers of
 `GET /api/missions` and posters to `POST /api/*` (mutation-token gated). None
 of them hold mission state; kill any of them and the missions don't notice.
 

@@ -24,6 +24,12 @@ Format:
 
 ## Human-gated
 
+- **Even Realities G2 physical demo receipt** - prove the simulator-built thin client on paired G2 glasses and an R1 ring.
+  Why: Mission status and bounded question/grant decisions now have a high-delight wearable surface without moving state or policy out of Kranz.
+  Trigger: Paired G2/R1 hardware and a disposable Kranz mission are available for a QR-sideload test.
+  Source: apps/even-g2/README.md; docs/what-is-kranz.md
+  Ticket: even-realities-g2-demo
+
 - **Gas City Stage 1 live-city validation** - validate the existing pack against a disposable live City before building more integration polish.
   Why: The pack is stub-proven and demo-ready; supervisor+worker reality still needs one careful human-run pass.
   Trigger: A live `gc` city is available and the operator is willing to spend setup/teardown time plus any live mayor-session cost. Course runbook: docs/gascity-demo.md.
@@ -61,14 +67,6 @@ Format:
   Trigger: After `repo-knowledge-refresh-drift` ships.
   Source: docs/scoping/repo-knowledge-store.md
   Ticket: none yet
-
-## Parked/demo
-
-- **Even Realities demo feature** - keep as a high-delight demo lane, not the next strategic foundation.
-  Why: It will be fun to show, but Gas City citizenship and ecosystem fit are higher-leverage right now.
-  Trigger: Revisit when core reliability and ecosystem work are calmer.
-  Source: docs/roadmap.md
-  Ticket: none
 
 ## Out of kranz lane
 

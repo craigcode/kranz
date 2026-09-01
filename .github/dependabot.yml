@@ -59,6 +59,19 @@ updates:
           - minor
           - patch
 
+  # Even Hub SDK/simulator drift affects a real device contract, so keep its
+  # lockfile independent from the dashboard and review its updates together.
+  - package-ecosystem: npm
+    directory: /apps/even-g2
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+
   # Dockerfile base images are digest-pinned. Dependabot refreshes those
   # immutable pins without changing the human-readable rolling tags.
   - package-ecosystem: docker
