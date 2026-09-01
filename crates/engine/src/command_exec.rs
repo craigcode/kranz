@@ -707,6 +707,7 @@ pub(crate) fn resolve_gate_sandbox(
     scratch_home: &std::path::Path,
     profile_dir: &std::path::Path,
 ) -> crate::error::Result<GateSandboxResolution> {
+    let runtime = crate::sandbox_container::detect();
     resolve_gate_sandbox_target(
         sandbox_cfg,
         gate_cwd,
@@ -715,7 +716,12 @@ pub(crate) fn resolve_gate_sandbox(
         profile_dir,
         std::env::consts::OS,
         crate::sandbox::command_available("bwrap"),
-        crate::sandbox_container::detect(),
+        runtime,
+        // A gate mounts the same roots the session does. Without this a
+        // proven host would run its worker contained and then refuse its own
+        // merge gate, failing the mission at the last step for a reason that
+        // no longer applied.
+        crate::sandbox::session_mount_proof(sandbox_cfg, gate_cwd, mission_dir, runtime),
     )
 }
 
@@ -760,6 +766,7 @@ fn resolve_gate_sandbox_target(
     target_os: &str,
     bwrap_available: bool,
     container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    container_mount_proof: Option<crate::sandbox_container::MountProof>,
 ) -> crate::error::Result<GateSandboxResolution> {
     use crate::types::{SandboxEnforce, SandboxProvider};
     let disabled = |note: Option<String>| {
@@ -784,11 +791,28 @@ fn resolve_gate_sandbox_target(
         // guest-path and `/dev/null` authority-mask contract. Refuse before
         // constructing an unverified gate command; session resolution applies
         // the identical posture. macOS uses native Seatbelt instead.
-        if target_os != "linux" {
+        if target_os == "windows" {
             return Err(crate::error::EngineError::Config(format!(
-                "sandbox provider:container with enforce:{} is supported only on target_os=linux, not target_os={target_os}; refusing to run engine-run gates under an unverified container mount contract; use sandbox.provider=\"process\" for native host containment",
+                "sandbox provider:container with enforce:{} is not supported on target_os=windows: the shipped contract uses POSIX guest paths, Linux images, and /dev/null authority masks that Windows containers do not honor; refusing to run engine-run gates under an unverified container mount contract",
                 sandbox_cfg.enforce.as_str()
             )));
+        }
+        if target_os != "linux" {
+            match container_mount_proof {
+                Some(crate::sandbox_container::MountProof::Proven) => {}
+                Some(crate::sandbox_container::MountProof::Failed(reason)) => {
+                    return Err(crate::error::EngineError::Config(format!(
+                        "sandbox provider:container with enforce:{} refused for engine-run gates on target_os={target_os}: {reason}",
+                        sandbox_cfg.enforce.as_str()
+                    )));
+                }
+                None => {
+                    return Err(crate::error::EngineError::Config(format!(
+                        "sandbox provider:container with enforce:{} on target_os={target_os} requires a bind-mount proof on this host and none was taken; refusing to run engine-run gates under an unverified container mount contract; use sandbox.provider=\"process\" for native host containment",
+                        sandbox_cfg.enforce.as_str()
+                    )));
+                }
+            }
         }
         let Some(runtime) = container_runtime else {
             return Err(crate::error::EngineError::Config(container_gate_note(
@@ -2111,6 +2135,7 @@ mod tests {
             "macos",
             false,
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(resolution.sandbox, GateSandbox::Disabled));
@@ -2126,6 +2151,7 @@ mod tests {
             scratch.path(),
             "macos",
             false,
+            None,
             None,
         )
         .unwrap();
@@ -2188,6 +2214,7 @@ mod tests {
             "linux",
             true,
             None,
+            None,
         )
         .unwrap();
         let GateSandbox::Bubblewrap { inputs } = &resolution.sandbox else {
@@ -2208,6 +2235,7 @@ mod tests {
             "linux",
             false,
             None,
+            None,
         )
         .expect_err("linux without bwrap must fail closed");
         assert!(error.to_string().contains("bwrap"), "{error}");
@@ -2221,6 +2249,7 @@ mod tests {
             scratch.path(),
             "windows",
             false,
+            None,
             None,
         )
         .expect("Windows process gates resolve AppContainer");
@@ -2243,6 +2272,7 @@ mod tests {
             scratch.path(),
             "solaris",
             false,
+            None,
             None,
         )
         .expect_err("an unknown platform must fail closed");
@@ -2323,6 +2353,7 @@ mod tests {
             "linux",
             false,
             runtime,
+            None,
         )
         .unwrap();
         assert!(resolution.note.is_none());
@@ -2339,6 +2370,48 @@ mod tests {
         );
         assert_eq!(spec.image, crate::sandbox_container::DEFAULT_IMAGE);
 
+        // A proven host resolves its gates exactly as it resolves its
+        // sessions. Without this the two disagree, and a mission runs its
+        // worker contained and then fails at its own merge gate.
+        let proven = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "macos",
+            false,
+            runtime,
+            Some(crate::sandbox_container::MountProof::Proven),
+        )
+        .expect("a proven macOS host must resolve its container gate");
+        assert!(
+            matches!(proven.sandbox, GateSandbox::Container { .. }),
+            "{:?}",
+            proven.sandbox
+        );
+
+        // A host whose mount shares nothing is refused with the path, not a
+        // platform verdict.
+        let unshared = resolve_gate_sandbox_target(
+            &container(crate::types::SandboxEnforce::Fs),
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "macos",
+            false,
+            runtime,
+            Some(crate::sandbox_container::MountProof::Failed(
+                "docker accepted a bind mount of /var/folders/x and shared nothing".to_string(),
+            )),
+        )
+        .expect_err("a failed proof must refuse the gate");
+        assert!(
+            unshared.to_string().contains("/var/folders/x"),
+            "{unshared}"
+        );
+
         // Runtime presence is not containment evidence on an unproved host.
         // Both platforms refuse before the gate process starts; macOS points
         // to its supported native Seatbelt path.
@@ -2352,14 +2425,9 @@ mod tests {
                 target_os,
                 false,
                 runtime,
+                None,
             )
             .expect_err("an unproved container gate must fail closed");
-            assert!(
-                error
-                    .to_string()
-                    .contains("supported only on target_os=linux"),
-                "{error}"
-            );
             assert!(
                 error
                     .to_string()
@@ -2367,6 +2435,10 @@ mod tests {
                 "{error}"
             );
             if target_os == "macos" {
+                assert!(
+                    error.to_string().contains("requires a bind-mount proof"),
+                    "{error}"
+                );
                 assert!(
                     error.to_string().contains("sandbox.provider=\"process\""),
                     "{error}"
@@ -2387,6 +2459,7 @@ mod tests {
             "linux",
             false,
             runtime,
+            None,
         )
         .unwrap();
         let GateSandbox::Container { spec, .. } = &resolution.sandbox else {
@@ -2404,6 +2477,7 @@ mod tests {
             scratch.path(),
             "linux",
             false,
+            None,
             None,
         )
         .expect_err("container without a runtime must fail closed");
@@ -2432,6 +2506,7 @@ mod tests {
             "linux",
             false,
             runtime,
+            None,
         )
         .expect_err("container fs+net with an egress list must fail closed");
         assert!(error.to_string().contains("advisory"), "{error}");
@@ -2448,6 +2523,7 @@ mod tests {
             "linux",
             false,
             runtime,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2465,6 +2541,7 @@ mod tests {
             scratch.path(),
             "macos",
             false,
+            None,
             None,
         )
         .unwrap();
@@ -2498,6 +2575,7 @@ mod tests {
                 "windows",
                 false,
                 runtime,
+                None,
             )
             .expect("Windows process gate enforcement resolves");
             assert!(resolution.note.is_none(), "{:?}", resolution.note);
@@ -2524,11 +2602,14 @@ mod tests {
                 "windows",
                 false,
                 runtime,
+                None,
             )
             .expect_err("an unproved Windows container gate must fail closed");
+            // Windows is refused on its own contract gap, not for want of a
+            // proof: no probe result could change this answer.
             assert!(error
                 .to_string()
-                .contains("supported only on target_os=linux"));
+                .contains("not supported on target_os=windows"));
             assert!(error
                 .to_string()
                 .contains("unverified container mount contract"));
@@ -2627,6 +2708,7 @@ mod tests {
             scratch.path(),
             "linux",
             false,
+            None,
             None,
         )
         .expect_err("container without a runtime must fail closed");

@@ -61,7 +61,7 @@
 //! real one is a credential directory).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -343,30 +343,53 @@ pub fn cached_bind_mount_proof(
     proof
 }
 
-/// Prove every distinct host root a session will mount.
+/// Prove every distinct host root a run will mount.
 ///
 /// One probe is not enough. Sharing is per path on every runtime that has
 /// this hazard, so a host can share the checkout and not the scratch: the
 /// exact shape of the 2026-08-25 macOS failure, where the worktree under
-/// `$HOME` mounted fine and `TMPDIR` under `/var/folders` did not.
+/// `$HOME` mounted fine and `TMPDIR` under `/var/folders` did not. Proving
+/// only the convenient root would reproduce the original bug with extra
+/// ceremony, so every declared root is proven and the FIRST failure is
+/// returned, naming the path the operator has to fix.
 ///
-/// The probe writes into the PARENT of the session cwd rather than the cwd
-/// itself. The cwd is a git worktree, and a directory appearing and vanishing
-/// inside it can race a concurrent `git status` in a mission that cares about
-/// a clean tree.
-pub fn prove_session_mounts(
-    runtime: ContainerRuntime,
-    session_cwd: &Path,
-    image: &str,
-) -> MountProof {
-    let checkout_root = session_cwd.parent().unwrap_or(session_cwd);
-    for root in [checkout_root, std::env::temp_dir().as_path()] {
+/// Roots are deduplicated by their proof cache key, so the common case of
+/// several mounts under one shared root costs one container run.
+pub fn prove_mount_roots(runtime: ContainerRuntime, roots: &[PathBuf], image: &str) -> MountProof {
+    let mut seen = Vec::new();
+    for root in roots {
+        if root.as_os_str().is_empty() || seen.iter().any(|prior| prior == root) {
+            continue;
+        }
+        seen.push(root.clone());
         match cached_bind_mount_proof(runtime, root, image) {
             MountProof::Proven => {}
             failed => return failed,
         }
     }
     MountProof::Proven
+}
+
+/// The roots a session or gate actually mounts, in the order the operator
+/// would want them reported.
+///
+/// The checkout contributes its PARENT rather than the working tree itself:
+/// the tree is a git worktree, and a directory appearing and vanishing inside
+/// it can race a concurrent `git status` in a mission that cares about a
+/// clean tree. The system temp root stands in for the per-session scratch,
+/// which does not exist yet at resolution time but is created underneath it.
+pub fn declared_mount_roots(
+    session_cwd: &Path,
+    mission_dir: &Path,
+    extra_write: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = vec![
+        session_cwd.parent().unwrap_or(session_cwd).to_path_buf(),
+        mission_dir.to_path_buf(),
+        std::env::temp_dir(),
+    ];
+    roots.extend(extra_write.iter().cloned());
+    roots
 }
 
 /// Why a live container test is skipping, in the host's own terms.

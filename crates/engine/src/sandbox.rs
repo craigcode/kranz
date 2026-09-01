@@ -196,7 +196,7 @@ pub fn resolve_for_session(
         std::env::consts::OS,
         command_available("bwrap"),
         runtime,
-        session_mount_proof(role_sandbox, session_cwd, runtime),
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
     );
     prewarm_xcrun_for_resolved_seatbelt(resolved.0.as_ref());
     resolved
@@ -222,9 +222,10 @@ fn prewarm_xcrun_for_resolved_seatbelt(_sandbox: Option<&ResolvedSandbox>) {}
 /// Linux is CI-proven and Windows is refused outright, so neither pays for a
 /// probe. Everything else pays once per host, cached, and only when a
 /// container was actually requested.
-fn session_mount_proof(
+pub(crate) fn session_mount_proof(
     role_sandbox: &crate::types::SandboxConfig,
     session_cwd: &Path,
+    mission_dir: &Path,
     runtime: Option<crate::sandbox_container::ContainerRuntime>,
 ) -> Option<crate::sandbox_container::MountProof> {
     if role_sandbox.provider != crate::types::SandboxProvider::Container
@@ -235,9 +236,14 @@ fn session_mount_proof(
         return None;
     }
     let runtime = runtime?;
-    Some(crate::sandbox_container::prove_session_mounts(
+    let extra_write: Vec<PathBuf> = role_sandbox
+        .extra_write
+        .iter()
+        .map(|raw| expand_tilde(raw))
+        .collect();
+    Some(crate::sandbox_container::prove_mount_roots(
         runtime,
-        session_cwd,
+        &crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write),
         crate::sandbox_container::DEFAULT_IMAGE,
     ))
 }
@@ -496,7 +502,7 @@ pub fn resolve_validator_containment(
         std::env::consts::OS,
         command_available("bwrap"),
         runtime,
-        session_mount_proof(role_sandbox, session_cwd, runtime),
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
     );
     if let Ok(containment) = &resolved {
         prewarm_xcrun_for_resolved_seatbelt(containment.sandbox.as_ref());

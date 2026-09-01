@@ -93,16 +93,26 @@ backwards.
 
 ## Done when
 
-- [ ] Session and gate resolution take a bind-mount proof on any platform
+- [x] Session AND gate resolution take a bind-mount proof on any platform
   without a renewable CI receipt, and refuse with the failing path and a
-  remedy rather than a platform verdict.
-- [ ] `host_supports_container_contract` agrees with resolution, so live
+  remedy rather than a platform verdict. Both, deliberately: with only the
+  session gated, a proven host would run its worker contained and then fail
+  at its own merge gate.
+- [x] Every declared root is proven, not a representative one. Sharing is
+  per path, and the original failure was exactly a host that shared the
+  worktree but not the scratch.
+- [x] `host_supports_container_contract` agrees with resolution, so live
   container tests run wherever the provider would run.
-- [ ] Windows stays refused regardless of any proof: its gap is the POSIX
+- [x] Windows stays refused regardless of any proof: its gap is the POSIX
   guest-path and `/dev/null` authority-mask contract, which no mount proof
   addresses.
-- [ ] The Linux path is unchanged and pays no probe cost, because CI renews
+- [x] The Linux path is unchanged and pays no probe cost, because CI renews
   its receipt continuously.
+- [ ] The macOS scratch root is chosen so a default Colima install works
+  without the operator reconfiguring mounts. Today `TMPDIR` under
+  `/var/folders` is outside Colima's default share, so the proof correctly
+  refuses and the operator has to act. Refusing beats losing work silently,
+  but picking a shared scratch would beat both.
 
 ## Originally done when
 

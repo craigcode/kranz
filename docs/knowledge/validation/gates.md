@@ -2,8 +2,9 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-27
+last_verified: 2026-09-01
 verified_against:
+  - crates/engine/src/sandbox_container.rs
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/merge.rs
@@ -103,8 +104,13 @@ Two mechanisms, because printing alone is not enough:
   exercise. `skip` PANICS when a listed capability is missing, so a lane that
   starts skipping goes red instead of quietly green. CI declares expectations
   up front — ubuntu `git,bwrap,container,grep`; macOS `git,sandbox-exec`;
-  Windows only `git`. The container sandbox provider is release-supported
-  only on Linux and fails closed elsewhere; macOS uses native Seatbelt.
+  Windows only `git`. The container sandbox provider is EVIDENCE-gated, not
+  platform-gated: Linux rides its continuous CI receipt, Windows is refused
+  outright (POSIX guest paths and `/dev/null` masks), and any other host is
+  supported exactly when it passes a bind-mount round trip at run time. A
+  runtime can accept a `-v` mount for a path its daemon cannot see and share
+  nothing, so `container` stays out of the macOS required list: a Mac only
+  qualifies when its runtime shares the paths a mission mounts.
 - **`KRANZ_SKIP_LOG`** receives a ledger line per skip. A file survives
   libtest's capture where stdout does not, and each lane prints the ledger
   after the suite, so a green run still shows what it did not exercise.

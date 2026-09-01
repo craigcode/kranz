@@ -248,8 +248,10 @@ decisions are captured in the
 Containment now includes dedicated worktrees, out-of-contract write auditing,
 environment hygiene, macOS Seatbelt `enforce: "fs"`, Linux bubblewrap
 `enforce: "fs" | "fs+net"` with fail-closed platform/preflight behavior, the
-Linux-supported Docker tier-3 container provider with a non-bypassable
-per-host egress boundary, and per-host egress enforcement via the filtering
+evidence-gated Docker tier-3 container provider with a non-bypassable
+per-host egress boundary (Linux on its continuous CI receipt; any other
+non-Windows host on a bind-mount round trip it passes at run time, because a
+runtime can accept a mount and share nothing), and per-host egress enforcement via the filtering
 egress proxy
 (`fs+net` on macOS routes loopback-only Seatbelt egress through it; structured
 denials surface on `RunOutcome` for the 3.3b grant flow). The dedicated
