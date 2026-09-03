@@ -1810,6 +1810,26 @@ pub fn bubblewrap_args(
     // tier cannot stop a replace of the `.git` directory NODE itself. The
     // Seatbelt and Windows tiers deny that literal; bwrap's remainder is
     // recorded here rather than papered over.
+    // A path that is READ-denied is already closed both ways by its
+    // /dev/null mask or tmpfs shadow, and must NOT also be ro-bound over
+    // itself: later binds win, so a self-bind emitted here would stack the
+    // REAL file back over its mask and hand the token to the session (the
+    // Linux CI receipt caught exactly that after the write-deny landed).
+    // The write-deny set is a superset of the read-deny set by
+    // construction, so subtract the masked paths and everything beneath a
+    // masked directory before binding.
+    let masked_files: Vec<PathBuf> = authority_read_deny_paths(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let masked_dirs: Vec<PathBuf> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let is_masked = |path: &Path| -> bool {
+        let abs = lexical_absolute(path);
+        masked_files.iter().any(|m| *m == abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
+    };
     let authority_writes = authority_write_denies(inputs);
     let git_writes = git_metadata_write_denies(inputs);
     let write_ro_binds: std::collections::BTreeSet<String> = authority_writes
@@ -1824,6 +1844,7 @@ pub fn bubblewrap_args(
                 .filter(|path| path.is_file() && !path.is_symlink()),
         )
         .chain(git_writes.dirs.iter().filter(|path| path.is_dir()))
+        .filter(|path| !is_masked(path))
         .map(|path| lexical_absolute(path).display().to_string())
         .collect();
     for bind in write_ro_binds {
@@ -2948,6 +2969,41 @@ mod tests {
     /// node is deliberately excluded — binding it whole would close the index
     /// the worker's own `git commit` writes.
     #[test]
+    /// Later binds win in bwrap. A read-denied file is closed by its
+    /// /dev/null mask; a self ro-bind of the same path emitted afterwards
+    /// would put the real content back. Every masked path must therefore be
+    /// absent from the self-bind set (Linux CI receipt, 2026-09-03).
+    #[test]
+    fn bubblewrap_args_never_self_bind_a_masked_authority_path() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+        let args = bubblewrap_args(&inputs, Path::new("/bin/true"), &[]).unwrap();
+        let mut masked: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i + 2 < args.len() {
+            if args[i] == "--ro-bind" && args[i + 1] == "/dev/null" {
+                masked.push(args[i + 2].clone());
+            }
+            i += 1;
+        }
+        assert!(
+            masked.iter().any(|m| m.ends_with("serve.token")),
+            "serve.token must be masked: {args:?}"
+        );
+        let mut i = 0;
+        while i + 2 < args.len() {
+            if args[i] == "--ro-bind" && args[i + 1] == args[i + 2] {
+                assert!(
+                    !masked.contains(&args[i + 2]),
+                    "{} is masked and must not be re-bound over itself",
+                    args[i + 2]
+                );
+            }
+            i += 1;
+        }
+    }
+
     fn bubblewrap_args_ro_bind_authority_and_git_write_denies() {
         let (repo, mission) = authority_write_fixture();
         let tmp = tempfile::tempdir().unwrap();
