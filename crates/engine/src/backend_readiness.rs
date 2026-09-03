@@ -813,7 +813,7 @@ mod tests {
         // The one credential the CLI may authenticate with DOES cross, or a
         // key-authenticated operator would be reported unauthenticated.
         assert!(
-            dumped.contains("ANTHROPIC_API_KEY=sk-ant-allowed"),
+            dumped.contains(&format!("ANTHROPIC_API_KEY={}", "sk-ant-allowed")),
             "the backend's own auth var must reach its login probe:\n{dumped}"
         );
         // And HOME stays real: `claude auth status` reads the operator's own

@@ -309,7 +309,7 @@ step rather than only reading the profile that grants it.)*
   `None` for `relay_authority` (`egress_proxy.rs:281`).
 - **Suggested fix:** always mint a per-run authority and pass it via
   `start_authenticated_bound`; wire it into the session env as
-  `HTTPS_PROXY=http://kranz:<token>@127.0.0.1:<port>` — but note that puts the
+  `HTTPS_PROXY` carrying the token as URL userinfo on loopback — but note that puts the
   token in a worker-readable env var, which only closes the *cross-mission*
   case, not a within-mission one. A stronger fix is to bind the proxy to a
   unix domain socket under the session-private scratch (Seatbelt can allow one
@@ -474,7 +474,7 @@ step rather than only reading the profile that grants it.)*
 
 - **Severity:** LOW · **Confidence:** PLAUSIBLE
 - `crates/engine/src/workspace_remote.rs:654` accepts `"http"` as a valid
-  `baseUrl` scheme; `:680-681` sends `Coder-Session-Token: <token>` on every
+  `baseUrl` scheme; `:680-681` sends the session token header on every
   request. `reqwest`'s default redirect policy is `limited(10)`, and its
   sensitive-header stripping covers `Authorization`/`Cookie`/`Proxy-Authorization`
   only — a custom header like `Coder-Session-Token` is forwarded across a

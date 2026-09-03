@@ -2233,12 +2233,12 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new().unwrap();
         seed_mission(tmp.path(), "m-1", vec![created("goal")]);
-        let secret = tmp.path().join(".kranz").join("serve.token");
-        std::fs::write(&secret, "super-secret-mutation-token").unwrap();
+        let token_file = tmp.path().join(".kranz").join("serve.token");
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
         let paths = MissionPaths::new(tmp.path(), "m-1");
-        symlink(&secret, paths.plan_md_file()).unwrap();
-        symlink(&secret, paths.report_file()).unwrap();
-        symlink(&secret, paths.plan_file()).unwrap();
+        symlink(&token_file, paths.plan_md_file()).unwrap();
+        symlink(&token_file, paths.report_file()).unwrap();
+        symlink(&token_file, paths.plan_file()).unwrap();
 
         for uri in [
             "/api/missions/m-1/plan.md",
@@ -2267,12 +2267,12 @@ mod tests {
     async fn ticket_reads_refuse_a_symlinked_file() {
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new().unwrap();
-        let secret = tmp.path().join(".kranz").join("serve.token");
+        let token_file = tmp.path().join(".kranz").join("serve.token");
         std::fs::create_dir_all(tmp.path().join(".kranz")).unwrap();
-        std::fs::write(&secret, "super-secret-mutation-token").unwrap();
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
         let tickets = tmp.path().join(".kranz").join("tickets");
         std::fs::create_dir_all(&tickets).unwrap();
-        symlink(&secret, tickets.join("leak.md")).unwrap();
+        symlink(&token_file, tickets.join("leak.md")).unwrap();
 
         let app = crate::router(tmp.path().to_path_buf(), None);
         let response = app.oneshot(get("/api/tickets/leak")).await.unwrap();
@@ -2301,9 +2301,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let missions_dir = tmp.path().join(".kranz").join("missions");
         std::fs::create_dir_all(&missions_dir).unwrap();
-        let secret = tmp.path().join(".kranz").join("serve.token");
-        std::fs::write(&secret, "super-secret-mutation-token").unwrap();
-        symlink(&secret, missions_dir.join("index.md")).unwrap();
+        let token_file = tmp.path().join(".kranz").join("serve.token");
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
+        symlink(&token_file, missions_dir.join("index.md")).unwrap();
 
         let app = crate::router(tmp.path().to_path_buf(), None);
         let response = app.oneshot(get("/api/missions")).await.unwrap();

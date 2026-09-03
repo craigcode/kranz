@@ -3362,6 +3362,15 @@ mod tests {
         for var in ["TMPDIR", "TMP", "TEMP"] {
             env.insert(var.to_string(), scratch.join("tmp").display().to_string());
         }
+        // The wrapped suite creates missions, and a mission acquires its
+        // event log only with the repository authority key. The gate profile
+        // denies the operator's real key directory (that is the point of the
+        // deny), so the inner suite gets its own global kranz dir under the
+        // writable scratch via `KRANZ_HOME`. A real gate command never needs
+        // a key and never gets this override.
+        let kranz_home = scratch.join("kranz-home");
+        std::fs::create_dir_all(&kranz_home).unwrap();
+        env.insert("KRANZ_HOME".to_string(), kranz_home.display().to_string());
         let suite_log = scratch.join("tmp").join("dogfood-suite.log");
         let command = format!("{payload} > '{}' 2>&1", suite_log.display());
 

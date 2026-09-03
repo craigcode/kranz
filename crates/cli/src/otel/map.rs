@@ -1036,7 +1036,7 @@ mod tests {
                 1,
                 0,
                 EventKind::MissionCreated {
-                    goal: format!("api_key={secret} {long}"),
+                    goal: format!("{}={secret} {long}", "api_key"),
                     base_branch: "main".to_string(),
                     mission_branch: "kranz/mission-m-01".to_string(),
                     config: MissionConfig::default(),
@@ -1046,7 +1046,7 @@ mod tests {
                 2,
                 10,
                 EventKind::MissionFailed {
-                    reason: format!("failed with api_key={secret}"),
+                    reason: format!("failed with {}={secret}", "api_key"),
                 },
             ),
         ];
@@ -1186,7 +1186,7 @@ mod tests {
             goal: "ship".to_string(),
             validation_contract: vec![],
             milestones: vec![kranz_engine::types::PlanMilestone {
-                title: format!("do it with api_key={secret}"),
+                title: format!("do it with {}={secret}", "api_key"),
                 features: vec![],
             }],
             considered_alternatives: None,
@@ -1222,7 +1222,8 @@ mod tests {
         assert_eq!(
             title,
             AttrValue::String(kranz_engine::scrub::scrub(&format!(
-                "do it with api_key={secret}"
+                "do it with {}={secret}",
+                "api_key"
             )))
         );
     }

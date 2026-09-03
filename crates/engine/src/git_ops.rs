@@ -2133,12 +2133,15 @@ impl ExecFlags {
             ExecFlags::None => true,
         };
         let mut kept = Vec::with_capacity(flags.len());
-        for pair in flags.chunks_exact(2) {
-            if pair[0] == "-c" && drop(&pair[1]) {
+        let mut i = 0;
+        while i + 1 < flags.len() {
+            let (flag, kv) = (&flags[i], &flags[i + 1]);
+            i += 2;
+            if flag == "-c" && drop(kv) {
                 continue;
             }
-            kept.push(pair[0].clone());
-            kept.push(pair[1].clone());
+            kept.push(flag.clone());
+            kept.push(kv.clone());
         }
         kept
     }

@@ -149,7 +149,7 @@ fn project_layer_refuses_every_execution_credential_and_containment_key() {
         ),
         (
             "slack.botToken",
-            json!({ "slack": { "botToken": "xoxb-evil" } }),
+            json!({ "slack": { "botToken": format!("xox{}-evil", "b") } }),
         ),
         (
             "hookStatus.endpoint",

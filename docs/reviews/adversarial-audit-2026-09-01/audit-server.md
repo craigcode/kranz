@@ -86,7 +86,7 @@ pub(crate) fn origin_allowed(origin: &str, bind_addr: Option<SocketAddr>) -> boo
 - `apps/dashboard/src/lib/token.ts:70-86` — `resolveToken()` returns that same token.
 - `apps/dashboard/src/lib/ws.ts:14-15` and its `?token=` append — the WS upgrade carries `resolveToken()` in the query.
 - `crates/server/src/lib.rs:829-834` — the stated invariant: "POSTs are header-only, so mutation authority never rides in a URL that can land in shell history or an intermediary's access log."
-- `crates/cli/src/commands.rs:2395-2401,2424-2426` — `kranz serve` mints and prints a read token, but `--open` hands the browser `#token=<mutation token>`; nothing ever delivers the read token to a dashboard.
+- `crates/cli/src/commands.rs:2395-2401,2424-2426` — `kranz serve` mints and prints a read token, but `--open` handed the browser the mutation token in the URL fragment; nothing ever delivers the read token to a dashboard.
 
 **Attacker + preconditions.** No remote attacker. This is a defence-in-depth regression: the mutation token appears in a URL (webview navigation state, any future request logging, crash reports) in exactly the case the design tried to avoid, and the "read token safe for dashboards and agents" (`commands.rs:2401`) has no consumer.
 

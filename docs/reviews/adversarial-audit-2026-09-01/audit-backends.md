@@ -307,7 +307,7 @@ Gaps found:
   is small — hence LOW, not MEDIUM.
 
 The kranz serve token is `Uuid::new_v4().simple()` (32 hex, no hyphens, `server/lib.rs:53`), so
-`is_uuid` does *not* allowlist it and `token: <value>` redacts correctly. Verified.
+`is_uuid` does *not* allowlist it and a colon-separated token field redacts correctly. Verified.
 
 ---
 

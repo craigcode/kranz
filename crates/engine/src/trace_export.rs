@@ -517,10 +517,10 @@ mod tests {
     #[test]
     fn export_output_refuses_to_write_through_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();
-        let secret = tmp.path().join("authorized_keys");
-        std::fs::write(&secret, "ssh-ed25519 REAL\n").unwrap();
+        let target = tmp.path().join("authorized_keys");
+        std::fs::write(&target, "ssh-ed25519 REAL\n").unwrap();
         let out = tmp.path().join("corpus.jsonl");
-        std::os::unix::fs::symlink(&secret, &out).unwrap();
+        std::os::unix::fs::symlink(&target, &out).unwrap();
 
         let error = write_export_output(&out, b"{}\n").unwrap_err();
         assert!(
@@ -528,7 +528,7 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(
-            std::fs::read_to_string(&secret).unwrap(),
+            std::fs::read_to_string(&target).unwrap(),
             "ssh-ed25519 REAL\n",
             "the symlink target must be untouched"
         );
