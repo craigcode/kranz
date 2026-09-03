@@ -1073,7 +1073,10 @@ mod tests {
         );
         match &root.status {
             SpanStatus::Error(reason) => {
-                assert!(!reason.contains(secret), "reason leaked a secret: {reason}");
+                assert!(
+                    !reason.contains(secret),
+                    "reason leaked the fixture value: {reason}"
+                );
                 assert!(reason.contains("[REDACTED]"));
             }
             other => panic!("expected an error status, got {other:?}"),

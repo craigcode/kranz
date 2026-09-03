@@ -56,14 +56,21 @@ fn set_home(dir: &std::path::Path) {
 }
 
 /// Write a `~/.kranz/config.json` under `home` with the given raw JSON.
-/// Remove any global config left by an earlier scenario so the next one
-/// starts from "no file".
-fn fresh_home(home: &std::path::Path) {
-    let _ = std::fs::remove_file(home.join(".kranz").join("config.json"));
+/// The global kranz directory the ENGINE resolves: `$KRANZ_HOME` when set
+/// (the wrapped dogfood suite sets it), else the `HOME` this test pinned.
+/// Writing anywhere else would test the wrong file.
+fn global_dir() -> std::path::PathBuf {
+    kranz_engine::paths::global_kranz_dir().expect("a global kranz dir resolves")
 }
 
-fn write_global_config(home: &std::path::Path, json: &str) {
-    let dir = home.join(".kranz");
+/// Remove any global config left by an earlier scenario so the next one
+/// starts from "no file".
+fn fresh_home(_home: &std::path::Path) {
+    let _ = std::fs::remove_file(global_dir().join("config.json"));
+}
+
+fn write_global_config(_home: &std::path::Path, json: &str) {
+    let dir = global_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), json).unwrap();
 }
