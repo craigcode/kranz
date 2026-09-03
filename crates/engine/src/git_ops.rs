@@ -166,12 +166,18 @@ fn empty_global_config_path() -> Result<&'static Path> {
 
 fn create_empty_global_config() -> std::result::Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("kranz-gitconfig-{}", uuid::Uuid::new_v4()));
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
+    // Built in a block so the binding is `mut` only where a mode is set;
+    // on Windows the `mut` was an unused_mut error under `-D warnings`.
+    let builder = {
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder
+    };
     builder
         .create(&dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
