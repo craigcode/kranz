@@ -10,6 +10,7 @@
 //! `actions` block carrying `button` elements. Button `action_id`s are the
 //! contract the inbound router keys on (see [`crate::inbound`]).
 
+use kranz_engine::types::Plan;
 use serde_json::{json, Value};
 
 /// `action_id` of the "approve & queue" button. The inbound router matches this
@@ -103,6 +104,9 @@ pub struct PlanReady {
     pub milestone_titles: Vec<String>,
     /// Number of validation-contract assertions (shown as a count, not dumped).
     pub assertion_count: usize,
+    /// Identity of the plan this card displays ([`plan_identity`]), carried
+    /// in the approve buttons so a stale card cannot commit a newer plan.
+    pub plan_identity: String,
 }
 
 /// A proposed mid-mission plan revision awaiting human consent.
@@ -409,6 +413,9 @@ pub struct PlanReview {
     pub goal: String,
     pub milestone_titles: Vec<String>,
     pub assertion_count: usize,
+    /// Identity of the plan this card displays ([`plan_identity`]), carried
+    /// in the approve buttons so a stale card cannot commit a newer plan.
+    pub plan_identity: String,
     pub considered_alternatives: Option<PlanAlternativesReview>,
     /// Optional one-line calibrated cost/time estimate string (rendered as
     /// context when present).
@@ -435,12 +442,43 @@ const MAX_FIELD: usize = 2500;
 /// Block Kit `header` text objects are plain_text capped at 150 chars.
 const MAX_HEADER: usize = 150;
 
+/// Characters of the plan digest carried in an approve button's value.
+/// 16 hex chars is 64 bits: far past accidental collision for the handful of
+/// plans one mission ever produces, and short enough to leave the whole
+/// button value well inside Slack's 2,000-byte `value` cap.
+const PLAN_IDENTITY_LEN: usize = 16;
+
+/// The identity of one plan: a short sha256 over its canonical JSON.
+///
+/// Plans carry no revision counter, so their CONTENT is their identity. This
+/// is what an Approve button binds to (M2): the card commits the plan it
+/// displayed, not whatever is parked host-side by the time someone scrolls
+/// back and clicks. Re-plan the same mission and the identity changes, which
+/// is exactly the case a stale card must fail on.
+pub fn plan_identity(plan: &Plan) -> String {
+    // A `Plan` is plain structs, strings and vectors, so serialization is
+    // deterministic and cannot fail; the fallback would only ever match
+    // another unserializable plan.
+    let json = serde_json::to_string(plan).unwrap_or_default();
+    let digest = kranz_engine::standards_waiver::sha256_hex(json.as_bytes());
+    digest[..PLAN_IDENTITY_LEN].to_string()
+}
+
+/// The `value` an approve/start button carries: `<mission-id>:<identity>`.
+/// The same shape the grant, revision and question buttons already use, so a
+/// click names the decision and not merely the mission.
+fn approve_button_value(mission_id: &str, plan_identity: &str) -> String {
+    format!("{mission_id}:{plan_identity}")
+}
+
 /// Escape Slack mrkdwn control characters in user-supplied text so it renders
 /// as literal text (Slack parses `<…>` as links/mentions and `&` as an entity
 /// start in mrkdwn fields). Per Slack's escaping rules only `&`, `<`, `>` need
 /// escaping; `&` goes first so already-escaped output isn't double-escaped.
 /// plain_text fields (e.g. header blocks) render verbatim and must NOT be
 /// escaped (the entities would show literally).
+///
+/// Not idempotent: escape ONCE, at the interpolation, then clip.
 pub fn escape_mrkdwn(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -611,13 +649,13 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
                     "style": "primary",
                     "text": { "type": "plain_text", "text": "Approve & start" },
                     "action_id": START_ACTION_ID,
-                    "value": p.mission_id,
+                    "value": approve_button_value(&p.mission_id, &p.plan_identity),
                 },
                 {
                     "type": "button",
                     "text": { "type": "plain_text", "text": "Approve & queue" },
                     "action_id": APPROVE_ACTION_ID,
-                    "value": p.mission_id,
+                    "value": approve_button_value(&p.mission_id, &p.plan_identity),
                 }
             ]
         }),
@@ -809,7 +847,8 @@ pub fn build_needs_context(n: &NeedsContext) -> Vec<Value> {
     let mut body = String::new();
     for q in &n.questions {
         body.push_str("• ");
-        body.push_str(q.trim());
+        // Orchestrator-authored: escape before clip (M1).
+        body.push_str(&escape_mrkdwn(q.trim()));
         body.push('\n');
     }
     if body.is_empty() {
@@ -834,8 +873,10 @@ pub fn build_blocked(b: &Blocked, dashboard_url: Option<&str>) -> Vec<Value> {
         header(&format!("Milestone blocked — {}", b.mission_id)),
         section(&format!(
             "Milestone `{}` is blocked:\n>{}",
-            b.milestone_id,
-            clip(b.reason.trim()).replace('\n', "\n>")
+            escape_mrkdwn(&b.milestone_id),
+            // Agent-authored: escape BEFORE clip, since the `&<>` expansion
+            // changes length (M1).
+            clip(&escape_mrkdwn(b.reason.trim())).replace('\n', "\n>")
         )),
         context("Reply in this thread to unblock (your reply becomes orchestrator guidance)."),
     ];
@@ -855,15 +896,18 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
         Outcome::Completed => (":white_check_mark:", "completed"),
         Outcome::Failed => (":x:", "failed"),
     };
-    let mut meta = format!("branch `{}`", c.branch);
+    let mut meta = format!("branch `{}`", escape_mrkdwn(&c.branch));
     if let Some(cost) = c.cost_usd {
         meta.push_str(&format!(" · cost ${cost:.2}"));
     }
-    meta.push_str(&format!(" · mission `{}`", c.mission_id));
+    meta.push_str(&format!(" · mission `{}`", escape_mrkdwn(&c.mission_id)));
 
+    // The summary is the report excerpt or the failure reason, both
+    // agent-authored; the diff stat and PR handoff are repo-derived. Escape
+    // before clip throughout (M1).
     let mut blocks = vec![
         header(&format!("{emoji} Mission {verb} — {}", c.mission_id)),
-        section(&clip(c.summary.trim())),
+        section(&clip(&escape_mrkdwn(c.summary.trim()))),
     ];
     if let Some(diff_stat) = c
         .diff_stat
@@ -871,7 +915,10 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        blocks.push(section(&format!("*Diff stat*\n```{}```", clip(diff_stat))));
+        blocks.push(section(&format!(
+            "*Diff stat*\n```{}```",
+            clip(&escape_mrkdwn(diff_stat))
+        )));
     }
     blocks.push(context(&meta));
     if let Some(hint) = c
@@ -880,7 +927,10 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
         .map(str::trim)
         .filter(|h| !h.is_empty())
     {
-        blocks.push(section(&format!("*PR handoff*\n```{}```", clip(hint))));
+        blocks.push(section(&format!(
+            "*PR handoff*\n```{}```",
+            clip(&escape_mrkdwn(hint))
+        )));
     }
     push_dashboard_button(&mut blocks, dashboard_url, &c.mission_id);
     if c.outcome == Outcome::Completed {
@@ -907,7 +957,9 @@ pub fn build_complete(c: &Complete, dashboard_url: Option<&str>) -> Vec<Value> {
 pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
     let mut blocks = vec![
         header(&format!("Planning {} — new mission", a.mission_id)),
-        section(&format!("*Goal*\n{}", clip(a.goal.trim()))),
+        // Goal is user prose, opening reply is orchestrator prose; both are
+        // untrusted here. Escape before clip (M1).
+        section(&format!("*Goal*\n{}", clip(&escape_mrkdwn(a.goal.trim())))),
     ];
     let footer = format!(
         "Reply in this thread to answer — each reply is a planning turn. \
@@ -921,7 +973,10 @@ pub fn build_new_mission_ack(a: &NewMissionAck) -> Vec<Value> {
         .map(str::trim)
         .filter(|r| !r.is_empty())
     {
-        blocks.push(section(&format!("*Orchestrator*\n{}", clip(reply))));
+        blocks.push(section(&format!(
+            "*Orchestrator*\n{}",
+            clip(&escape_mrkdwn(reply))
+        )));
     }
     blocks.push(context(&footer));
     blocks
@@ -1159,7 +1214,11 @@ fn build_config_modal_with_metadata(metadata: Value) -> Value {
 /// as approvable — it isn't (conversation can't approve; only the formal
 /// request-plan validates, prices, and arms the approve buttons).
 pub fn build_planning_reply(mission_id: &str, reply: &str, plan_spotted: bool) -> Vec<Value> {
-    let mut blocks = vec![section(&format!("*Orchestrator*\n{}", clip(reply.trim())))];
+    // Orchestrator prose: escape before clip (M1).
+    let mut blocks = vec![section(&format!(
+        "*Orchestrator*\n{}",
+        clip(&escape_mrkdwn(reply.trim()))
+    ))];
     if plan_spotted {
         blocks.push(section(&format!(
             ":bulb: That looks like a complete plan — but a plan in chat can't be \
@@ -1179,8 +1238,9 @@ pub fn build_planning_reply(mission_id: &str, reply: &str, plan_spotted: bool) -
 pub fn build_status(s: &StatusSummary) -> Vec<Value> {
     vec![
         header(&format!("{} — {}", s.mission_id, s.status)),
-        section(&clip(s.summary.trim())),
-        context(&format!("mission `{}`", s.mission_id)),
+        // The body carries the raw mission goal. Escape before clip (M1).
+        section(&clip(&escape_mrkdwn(s.summary.trim()))),
+        context(&format!("mission `{}`", escape_mrkdwn(&s.mission_id))),
     ]
 }
 
@@ -1246,14 +1306,22 @@ pub fn build_ticket_list(rows: &[TicketRow]) -> Vec<Value> {
             "_No backlog tickets yet. File one with_ `/kranz ticket <title>`.",
         )];
     }
+    // Threat (follow-up review M-12): slug/title/blocked-by are
+    // repo-authored ticket frontmatter and render as LIVE mrkdwn here. The
+    // same orchestrator question string is escaped through
+    // `build_needs_context` and was not escaped on this path.
     let mut body = String::new();
     for row in rows {
         body.push_str(&format!(
             "• `{}` (p{}) — *{}* — {}",
-            row.slug, row.priority, row.state, row.title
+            escape_mrkdwn(&row.slug),
+            row.priority,
+            escape_mrkdwn(&row.state),
+            escape_mrkdwn(&row.title)
         ));
         if !row.blocked_by.is_empty() {
-            body.push_str(&format!(" _(blocked by: {})_", row.blocked_by.join(", ")));
+            let blocked: Vec<String> = row.blocked_by.iter().map(|b| escape_mrkdwn(b)).collect();
+            body.push_str(&format!(" _(blocked by: {})_", blocked.join(", ")));
         }
         body.push('\n');
     }
@@ -1266,11 +1334,17 @@ pub fn build_ticket_list(rows: &[TicketRow]) -> Vec<Value> {
 /// `/kranz ticket show <slug>` reply: title/goal/state/blocked-by plus any
 /// needs-context questions and any wrong-plan escalation reason.
 pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
-    let mut body = format!("*State:* {}\n", t.state);
+    // Threat (follow-up review M-12): state/blocked-by/goal, the
+    // orchestrator's needs-context questions, and the planner's wrong-plan
+    // reason are all repo- or agent-authored and render as LIVE mrkdwn. The
+    // header stays UNESCAPED on purpose: it is a `plain_text` object, which
+    // renders entities literally.
+    let mut body = format!("*State:* {}\n", escape_mrkdwn(&t.state));
     if !t.blocked_by.is_empty() {
-        body.push_str(&format!("*Blocked by:* {}\n", t.blocked_by.join(", ")));
+        let blocked: Vec<String> = t.blocked_by.iter().map(|b| escape_mrkdwn(b)).collect();
+        body.push_str(&format!("*Blocked by:* {}\n", blocked.join(", ")));
     }
-    let goal = t.goal.trim();
+    let goal = escape_mrkdwn(t.goal.trim());
     if !goal.is_empty() {
         body.push_str(&format!("\n*Goal*\n{goal}\n"));
     }
@@ -1282,7 +1356,7 @@ pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
         let mut q = String::from("*Needs context*\n");
         for question in &t.needs_context {
             q.push_str("• ");
-            q.push_str(question);
+            q.push_str(&escape_mrkdwn(question));
             q.push('\n');
         }
         blocks.push(section(&clip(q.trim_end())));
@@ -1294,7 +1368,8 @@ pub fn build_ticket_show(t: &TicketDetail) -> Vec<Value> {
         .filter(|r| !r.is_empty())
     {
         blocks.push(section(&clip(&format!(
-            "*Wrong plan (planner escalation)*\n{reason}"
+            "*Wrong plan (planner escalation)*\n{}",
+            escape_mrkdwn(reason)
         ))));
     }
     blocks
@@ -1570,8 +1645,9 @@ fn todo_button(target: &TodoTarget) -> Option<Value> {
 
 /// Plan-review message: goal + milestones + assertion count + optional
 /// estimate, then an actions block with **Approve & start** ([`START_ACTION_ID`])
-/// and **Approve & queue** ([`APPROVE_ACTION_ID`]) buttons, both carrying the
-/// mission id in `value`.
+/// and **Approve & queue** ([`APPROVE_ACTION_ID`]) buttons, both carrying
+/// `<mission-id>:<plan-identity>` in `value` so the click commits the plan
+/// this card displayed and not a later one (M2).
 pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
     let milestones = milestone_bullets(&p.milestone_titles);
 
@@ -1581,14 +1657,19 @@ pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
         section(&format!("*Milestones*\n{}", clip(milestones.trim_end()))),
     ];
     if let Some(alternatives) = &p.considered_alternatives {
-        let mut body = format!("*Chosen:* {}", alternatives.chosen.trim());
+        // Threat (follow-up review M-11): every field here is planner output
+        // on the SAME card as the two real gated buttons, so an unescaped
+        // `<https://evil.example/approve|Approve & start>` renders as a blue
+        // link inches from them. The goal and the milestone titles were
+        // escaped; this block was missed.
+        let mut body = format!("*Chosen:* {}", escape_mrkdwn(alternatives.chosen.trim()));
         if !alternatives.rejected.is_empty() {
             body.push_str("\n*Rejected:*");
             for rejected in &alternatives.rejected {
                 body.push_str(&format!(
                     "\n• {} — {}",
-                    rejected.approach.trim(),
-                    rejected.trade_off.trim()
+                    escape_mrkdwn(rejected.approach.trim()),
+                    escape_mrkdwn(rejected.trade_off.trim())
                 ));
             }
         }
@@ -1620,13 +1701,13 @@ pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
                 "style": "primary",
                 "text": { "type": "plain_text", "text": "Approve & start" },
                 "action_id": START_ACTION_ID,
-                "value": p.mission_id,
+                "value": approve_button_value(&p.mission_id, &p.plan_identity),
             },
             {
                 "type": "button",
                 "text": { "type": "plain_text", "text": "Approve & queue" },
                 "action_id": APPROVE_ACTION_ID,
-                "value": p.mission_id,
+                "value": approve_button_value(&p.mission_id, &p.plan_identity),
             }
         ]
     }));
@@ -1888,6 +1969,7 @@ mod tests {
                 goal: "Rate-limit the notes API".into(),
                 milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
                 assertion_count: 3,
+                plan_identity: "planid0000000000".into(),
             },
             None,
         );
@@ -2115,6 +2197,163 @@ mod tests {
         assert!(!text.contains("<@U123>"), "user ping escaped: {text}");
     }
 
+    /// M1: every agent-authored field posted as mrkdwn. `<!channel>` is a
+    /// broadcast ping the bot would send on the agent's behalf, and
+    /// `<https://…|Approve>` renders as a link styled like the real, gated
+    /// approve button sitting in the same card.
+    mod untrusted_mrkdwn_sinks {
+        use super::*;
+
+        const PING: &str = "<!channel>";
+        const PHISH: &str = "<https://evil.example/approve|Approve & start>";
+
+        /// The payload both sinks-tests feed in, and the assertion that
+        /// nothing live came out the other end.
+        fn payload(label: &str) -> String {
+            format!("{label} {PING} {PHISH} <@U0DEADBEEF>")
+        }
+
+        fn assert_inert(blocks: &[Value], what: &str) {
+            let text = all_text(blocks);
+            assert!(
+                !text.contains(PING),
+                "{what}: live broadcast ping in {text}"
+            );
+            assert!(
+                !text.contains("<https://evil.example/approve|"),
+                "{what}: live link in {text}"
+            );
+            assert!(
+                !text.contains("<@U0DEADBEEF>"),
+                "{what}: live user ping in {text}"
+            );
+            assert!(
+                text.contains("&lt;!channel&gt;"),
+                "{what}: payload should survive as inert text, got {text}"
+            );
+        }
+
+        #[test]
+        fn needs_context_questions_are_escaped() {
+            let blocks = build_needs_context(&NeedsContext {
+                ticket_slug: "t-1".into(),
+                questions: vec![payload("which store?")],
+            });
+            assert_inert(&blocks, "needs-context");
+        }
+
+        #[test]
+        fn blocked_reason_is_escaped() {
+            let blocks = build_blocked(
+                &Blocked {
+                    mission_id: "m-1".into(),
+                    milestone_id: "ms-1".into(),
+                    reason: payload("the build fails:"),
+                },
+                None,
+            );
+            assert_inert(&blocks, "blocked");
+        }
+
+        #[test]
+        fn completion_summary_diff_stat_and_pr_handoff_are_escaped() {
+            let blocks = build_complete(
+                &Complete {
+                    mission_id: "m-1".into(),
+                    outcome: Outcome::Completed,
+                    summary: payload("shipped it."),
+                    branch: "kranz/mission-m-1".into(),
+                    cost_usd: Some(1.5),
+                    diff_stat: Some(payload("3 files changed")),
+                    pr_handoff: Some(payload("gh pr create")),
+                },
+                None,
+            );
+            assert_inert(&blocks, "complete");
+        }
+
+        #[test]
+        fn new_mission_ack_goal_and_opening_reply_are_escaped() {
+            let blocks = build_new_mission_ack(&NewMissionAck {
+                mission_id: "m-1".into(),
+                goal: payload("add login"),
+                opening_reply: Some(payload("a few questions:")),
+            });
+            assert_inert(&blocks, "new-mission ack");
+        }
+
+        #[test]
+        fn planning_reply_prose_is_escaped() {
+            let blocks = build_planning_reply("m-1", &payload("here is my thinking:"), false);
+            assert_inert(&blocks, "planning reply");
+        }
+
+        #[test]
+        fn status_summary_body_is_escaped() {
+            let blocks = build_status(&StatusSummary {
+                mission_id: "m-1".into(),
+                status: "Running".into(),
+                summary: payload("goal:"),
+            });
+            assert_inert(&blocks, "status");
+        }
+
+        /// M-11 (follow-up review): the alternatives block sits on the plan
+        /// card that carries the two REAL gated approve buttons, so a
+        /// phishing link there renders inches from them.
+        #[test]
+        fn plan_review_considered_alternatives_are_escaped() {
+            let blocks = build_plan_review(&PlanReview {
+                mission_id: "m-1".into(),
+                goal: payload("add login"),
+                milestone_titles: vec![payload("wire it up")],
+                assertion_count: 2,
+                plan_identity: "planid0000000000".into(),
+                considered_alternatives: Some(PlanAlternativesReview {
+                    chosen: payload("small slice"),
+                    rejected: vec![RejectedAlternativeReview {
+                        approach: payload("big bang"),
+                        trade_off: payload("too risky"),
+                    }],
+                }),
+                estimate: None,
+            });
+            assert_inert(&blocks, "plan review alternatives");
+        }
+
+        /// M-12: ticket rows are repo-authored frontmatter rendered as live
+        /// mrkdwn.
+        #[test]
+        fn ticket_list_rows_are_escaped() {
+            let blocks = build_ticket_list(&[TicketRow {
+                slug: payload("rate-limit"),
+                priority: 1,
+                state: payload("Review"),
+                title: payload("add a limiter"),
+                blocked_by: vec![payload("other-ticket")],
+            }]);
+            assert_inert(&blocks, "ticket list");
+        }
+
+        /// M-12: the SAME orchestrator question string is escaped through
+        /// `build_needs_context` and was rendered live through
+        /// `/kranz ticket show`. The header is excluded on purpose: it is a
+        /// `plain_text` object, where entities would show literally.
+        #[test]
+        fn ticket_show_mrkdwn_fields_are_escaped() {
+            let blocks = build_ticket_show(&TicketDetail {
+                slug: "rate-limit".into(),
+                title: "add a limiter".into(),
+                goal: payload("hold the line at"),
+                state: payload("Review"),
+                blocked_by: vec![payload("other-ticket")],
+                needs_context: vec![payload("which store?")],
+                wrong_plan: Some(payload("the planner disagrees:")),
+            });
+            assert_inert(&blocks, "ticket show");
+        }
+    }
+
     #[test]
     fn plan_ready_single_assertion_is_singular() {
         let blocks = build_plan_ready(
@@ -2123,6 +2362,7 @@ mod tests {
                 goal: "g".into(),
                 milestone_titles: vec![],
                 assertion_count: 1,
+                plan_identity: "planid0000000000".into(),
             },
             None,
         );
@@ -2530,12 +2770,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_review_has_two_buttons_carrying_mission_id() {
+    fn plan_review_has_two_buttons_carrying_mission_and_plan_identity() {
         let blocks = build_plan_review(&PlanReview {
             mission_id: "m-42".into(),
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
             assertion_count: 3,
+            plan_identity: "planid0000000000".into(),
             considered_alternatives: None,
             estimate: Some("~$4.50 · ~12 min".into()),
         });
@@ -2559,8 +2800,46 @@ mod tests {
             .iter()
             .find(|b| b["action_id"] == APPROVE_ACTION_ID)
             .expect("queue btn");
-        assert_eq!(start["value"], "m-42");
-        assert_eq!(queue["value"], "m-42");
+        // M2: the value names the PLAN, not merely the mission, so a card
+        // superseded by a re-plan is refused instead of committing the newer
+        // plan under this card's review.
+        assert_eq!(start["value"], "m-42:planid0000000000");
+        assert_eq!(queue["value"], "m-42:planid0000000000");
+    }
+
+    /// Content IS the identity: a changed plan gets a different one, which is
+    /// what makes a stale card detectable.
+    #[test]
+    fn plan_identity_changes_with_the_plan_and_is_stable_for_the_same_plan() {
+        use kranz_engine::types::{Plan, PlanFeature, PlanMilestone};
+        let plan = Plan {
+            goal: "ship it".into(),
+            validation_contract: vec![],
+            milestones: vec![PlanMilestone {
+                title: "one".into(),
+                features: vec![PlanFeature {
+                    title: "a".into(),
+                    spec: "do a".into(),
+                    validation_criteria: vec!["a works".into()],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+        };
+        let first = plan_identity(&plan);
+        assert_eq!(first, plan_identity(&plan.clone()), "stable for one plan");
+        assert_eq!(first.len(), PLAN_IDENTITY_LEN);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let mut replanned = plan.clone();
+        replanned.milestones[0].features[0].spec = "do a differently".into();
+        assert_ne!(
+            plan_identity(&replanned),
+            first,
+            "a re-plan must not reuse the old identity"
+        );
     }
 
     #[test]
@@ -2570,6 +2849,7 @@ mod tests {
             goal: "g".into(),
             milestone_titles: vec![],
             assertion_count: 1,
+            plan_identity: "planid0000000000".into(),
             considered_alternatives: None,
             estimate: None,
         });
@@ -2648,6 +2928,7 @@ mod tests {
             goal: "g".into(),
             milestone_titles: vec![],
             assertion_count: 1,
+            plan_identity: "planid0000000000".into(),
         };
         // Unset → no link button (only the approve button, which has no url).
         let blocks = build_plan_ready(&p, None);
@@ -2792,6 +3073,7 @@ mod tests {
                     goal: "g".into(),
                     milestone_titles: vec!["a".into()],
                     assertion_count: 1,
+                    plan_identity: "planid0000000000".into(),
                 },
                 Some("http://dash"),
             ),
@@ -2851,6 +3133,7 @@ mod tests {
             goal: "g".into(),
             milestone_titles: vec![],
             assertion_count: 1,
+            plan_identity: "planid0000000000".into(),
         };
         let unlabeled = build_plan_ready(&p, None);
         let labeled = label_blocks(unlabeled.clone(), Some("studio"));

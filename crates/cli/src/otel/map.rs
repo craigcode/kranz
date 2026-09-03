@@ -100,11 +100,56 @@ struct OpenRun {
     milestone_id: Option<String>,
 }
 
+/// Cap on any free-text string this module turns into a span attribute or a
+/// span name. Goals, milestone titles, and failure reasons are agent- or
+/// repo-authored and otherwise unbounded.
+pub const OTEL_TEXT_MAX_CHARS: usize = 512;
+
+/// Redact and bound one piece of free text before it becomes an attribute.
+///
+/// `EventLog::append_redacting` scrubs at write time, but the export's read
+/// path does not get to assume that writer: `otel::run` enumerates
+/// `<repo>/.kranz/missions/` with a bare `read_dir` and no provenance check,
+/// so a repo that commits a hand-written `events.jsonl` gets its strings
+/// into the operator's observability backend verbatim. Scrub here too, and
+/// cap the length while we are at it — an OTLP exporter is not the place to
+/// discover a megabyte attribute.
+fn clean_text(text: &str) -> String {
+    kranz_engine::scrub::truncate_chars(&kranz_engine::scrub::scrub(text), OTEL_TEXT_MAX_CHARS)
+}
+
+/// Cap on an IDENTIFIER attribute or span name (mission/run/feature/
+/// milestone ids). Ids are short by construction; a long one is a
+/// hand-written log getting creative.
+pub const OTEL_ID_MAX_CHARS: usize = 128;
+
+/// Redact and bound one identifier before it becomes an attribute or part of
+/// a span name.
+///
+/// Threat (follow-up review M-14): the module claimed every free-text field
+/// crossed [`clean_text`], and the ids did not. `otel::run` enumerates
+/// `<repo>/.kranz/missions/` with a bare `read_dir` and no provenance check,
+/// so a repo that commits a hand-written `events.jsonl` shipped its `runId`,
+/// `featureId`, `milestoneId` and mission id into the operator's
+/// observability backend verbatim and unbounded. Ids get the same scrub as
+/// prose with a tighter cap.
+///
+/// Deliberately NOT applied to `trace_id`/`span_id`: those hash the RAW id,
+/// and cleaning one side of that derivation would break parent linkage
+/// against every span already exported.
+fn clean_id(id: &str) -> String {
+    kranz_engine::scrub::truncate_chars(&kranz_engine::scrub::scrub(id), OTEL_ID_MAX_CHARS)
+}
+
 /// Fold a mission's event log into its finished spans (root, milestones,
 /// runs). Pure and deterministic: every timestamp comes from the events'
 /// `ts` fields, never from wall-clock time. A span is emitted only when its
 /// closing event is present in `events` — mirroring OTel, which exports on
 /// span end.
+///
+/// Every free-text field the log carries crosses [`clean_text`], and every
+/// identifier crosses [`clean_id`], on the way in, so no caller can build an
+/// unscrubbed or unbounded attribute or span name.
 pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
     let mut spans = Vec::new();
 
@@ -128,14 +173,14 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
     for event in events {
         match &event.kind {
             EventKind::MissionCreated { goal: g, .. } => {
-                goal = g.clone();
+                goal = clean_text(g);
                 created_seq = Some(event.seq);
                 created_ts = Some(event.ts);
             }
 
             EventKind::PlanApproved { plan, .. } => {
                 for (mi, pm) in plan.milestones.iter().enumerate() {
-                    milestone_titles.insert(format!("ms-{}", mi + 1), pm.title.clone());
+                    milestone_titles.insert(format!("ms-{}", mi + 1), clean_text(&pm.title));
                 }
             }
 
@@ -143,7 +188,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                 let title = milestone_titles
                     .get(milestone_id)
                     .cloned()
-                    .unwrap_or_else(|| milestone_id.clone());
+                    .unwrap_or_else(|| clean_id(milestone_id));
                 open_milestones.insert(
                     milestone_id.clone(),
                     OpenMilestone {
@@ -232,7 +277,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                     let mut attrs = vec![
                         (
                             "kranz.run.id".to_string(),
-                            AttrValue::String(run_id.clone()),
+                            AttrValue::String(clean_id(run_id)),
                         ),
                         (
                             "kranz.role".to_string(),
@@ -240,7 +285,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         ),
                         (
                             "kranz.model".to_string(),
-                            AttrValue::String(open.model.clone()),
+                            AttrValue::String(clean_text(&open.model)),
                         ),
                         (
                             "kranz.run.result".to_string(),
@@ -254,13 +299,13 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                     if let Some(fid) = &open.feature_id {
                         attrs.push((
                             "kranz.feature.id".to_string(),
-                            AttrValue::String(fid.clone()),
+                            AttrValue::String(clean_id(fid)),
                         ));
                     }
                     if let Some(mid) = &open.milestone_id {
                         attrs.push((
                             "kranz.milestone.id".to_string(),
-                            AttrValue::String(mid.clone()),
+                            AttrValue::String(clean_id(mid)),
                         ));
                     }
 
@@ -268,7 +313,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         trace_id: trace_id(&mission_id),
                         span_id: span_id(&mission_id, open.open_seq),
                         parent_span_id: parent,
-                        name: format!("{} {}", role_str(open.role), run_id),
+                        name: format!("{} {}", role_str(open.role), clean_id(run_id)),
                         start: open.start,
                         end: event.ts,
                         attributes: attrs,
@@ -300,7 +345,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         milestone_id,
                         &open,
                         event.ts,
-                        SpanStatus::Error(reason.clone()),
+                        SpanStatus::Error(clean_text(reason)),
                         created_seq,
                     ));
                 }
@@ -330,7 +375,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         seq,
                         start,
                         event.ts,
-                        SpanStatus::Error(reason.clone()),
+                        SpanStatus::Error(clean_text(reason)),
                         "failed",
                         &total_tokens,
                         total_cost,
@@ -346,7 +391,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
                         seq,
                         start,
                         event.ts,
-                        SpanStatus::Error(reason.clone()),
+                        SpanStatus::Error(clean_text(reason)),
                         "abandoned",
                         &total_tokens,
                         total_cost,
@@ -399,7 +444,7 @@ fn finished_milestone_span(
     let attrs = vec![
         (
             "kranz.milestone.id".to_string(),
-            AttrValue::String(milestone_id.to_string()),
+            AttrValue::String(clean_id(milestone_id)),
         ),
         (
             "kranz.milestone.title".to_string(),
@@ -423,7 +468,7 @@ fn finished_milestone_span(
         trace_id: trace_id(mission_id),
         span_id: span_id(mission_id, open.open_seq),
         parent_span_id: root_span_id(mission_id, created_seq),
-        name: format!("milestone {milestone_id}: {}", open.title),
+        name: format!("milestone {}: {}", clean_id(milestone_id), open.title),
         start: open.start,
         end,
         attributes: attrs,
@@ -446,7 +491,7 @@ fn finished_root_span(
     let mut attrs = vec![
         (
             "kranz.mission.id".to_string(),
-            AttrValue::String(mission_id.to_string()),
+            AttrValue::String(clean_id(mission_id)),
         ),
         (
             "kranz.mission.goal".to_string(),
@@ -464,7 +509,7 @@ fn finished_root_span(
         trace_id: trace_id(mission_id),
         span_id: span_id(mission_id, created_seq),
         parent_span_id: None,
-        name: format!("mission {mission_id}"),
+        name: format!("mission {}", clean_id(mission_id)),
         start,
         end,
         attributes: attrs,
@@ -975,5 +1020,210 @@ mod tests {
         let run = spans.iter().find(|s| s.name.contains("run-1")).unwrap();
         assert_eq!(run.start, ts(1020));
         assert_eq!(run.end, ts(1030));
+    }
+
+    /// Audit (backends MEDIUM): the export reads mission logs off disk with
+    /// no provenance check, so goal/title/reason text is untrusted. It
+    /// crosses the scrubber and a length cap before it becomes a span
+    /// attribute or a span name — the observability backend is not a place
+    /// to discover a repo's planted credentials.
+    #[test]
+    fn otel_mission_text_is_scrubbed_and_bounded() {
+        let secret = "sk-ant-F00barBazQuux9_7";
+        let long = "g".repeat(OTEL_TEXT_MAX_CHARS + 500);
+        let events = vec![
+            ev(
+                1,
+                0,
+                EventKind::MissionCreated {
+                    goal: format!("api_key={secret} {long}"),
+                    base_branch: "main".to_string(),
+                    mission_branch: "kranz/mission-m-01".to_string(),
+                    config: MissionConfig::default(),
+                },
+            ),
+            ev(
+                2,
+                10,
+                EventKind::MissionFailed {
+                    reason: format!("failed with api_key={secret}"),
+                },
+            ),
+        ];
+
+        let root = map_mission(&events)
+            .into_iter()
+            .find(|s| s.parent_span_id.is_none())
+            .unwrap();
+        let goal = root
+            .attributes
+            .iter()
+            .find(|(key, _)| key == "kranz.mission.goal")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        let AttrValue::String(goal) = goal else {
+            panic!("goal is a string attribute");
+        };
+        assert!(!goal.contains(secret), "goal leaked a secret: {goal}");
+        assert!(goal.contains("[REDACTED]"));
+        assert!(
+            goal.chars().count() <= OTEL_TEXT_MAX_CHARS + 32,
+            "goal is unbounded: {} chars",
+            goal.chars().count()
+        );
+        match &root.status {
+            SpanStatus::Error(reason) => {
+                assert!(!reason.contains(secret), "reason leaked a secret: {reason}");
+                assert!(reason.contains("[REDACTED]"));
+            }
+            other => panic!("expected an error status, got {other:?}"),
+        }
+    }
+
+    /// M-14 (follow-up review): the module's own claim was that EVERY
+    /// free-text field crosses the scrubber, and the ids did not: `run_id`
+    /// (attribute and span name), `model`, `feature_id`, `milestone_id` and
+    /// the mission id all shipped verbatim and uncapped from a hand-written
+    /// `events.jsonl`.
+    #[test]
+    fn otel_run_ids_model_and_mission_id_are_scrubbed_and_bounded() {
+        let secret = "sk-ant-F00barBazQuux9_7";
+        let long = "z".repeat(OTEL_ID_MAX_CHARS + 200);
+        let run_id = format!("run-{secret}-{long}");
+        let events = vec![
+            created(1, 0),
+            spawned(
+                2,
+                5,
+                &run_id,
+                Role::Worker,
+                Some(&format!("f-1-1-{secret}")),
+                Some(&format!("ms-1-{secret}")),
+                &format!("claude-{secret}"),
+            ),
+            completed(3, 9, &run_id, RunResult::Pass, TokenUsage::default(), None),
+        ];
+
+        let run = map_mission(&events)
+            .into_iter()
+            .find(|s| s.name.starts_with("worker"))
+            .expect("a finished run span");
+
+        assert!(
+            !run.name.contains(secret),
+            "span name leaked a secret: {}",
+            run.name
+        );
+        assert!(
+            run.name.chars().count() <= OTEL_ID_MAX_CHARS + 32,
+            "span name is unbounded: {} chars",
+            run.name.chars().count()
+        );
+
+        let attr = |key: &str| {
+            run.attributes
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| match v {
+                    AttrValue::String(s) => s.clone(),
+                    other => panic!("{key} is not a string attribute: {other:?}"),
+                })
+                .unwrap_or_else(|| panic!("missing attribute {key}"))
+        };
+        for key in [
+            "kranz.run.id",
+            "kranz.model",
+            "kranz.feature.id",
+            "kranz.milestone.id",
+        ] {
+            let value = attr(key);
+            assert!(!value.contains(secret), "{key} leaked a secret: {value}");
+            assert!(
+                value.contains("[REDACTED]"),
+                "{key} was not scrubbed: {value}"
+            );
+        }
+        let id = attr("kranz.run.id");
+        assert!(
+            id.chars().count() <= OTEL_ID_MAX_CHARS,
+            "kranz.run.id is unbounded: {} chars",
+            id.chars().count()
+        );
+
+        // The mission id rides the root span's attribute and name.
+        let secret_mission = format!("m-{secret}");
+        let mut events = vec![created(1, 0), ev(2, 10, EventKind::MissionCompleted {})];
+        for e in &mut events {
+            e.mission_id = secret_mission.clone();
+        }
+        let root = map_mission(&events)
+            .into_iter()
+            .find(|s| s.parent_span_id.is_none())
+            .expect("a root span");
+        assert!(
+            !root.name.contains(secret),
+            "root name leaked: {}",
+            root.name
+        );
+        let mission_attr = root
+            .attributes
+            .iter()
+            .find(|(k, _)| k == "kranz.mission.id")
+            .map(|(_, v)| format!("{v:?}"))
+            .unwrap();
+        assert!(
+            !mission_attr.contains(secret),
+            "kranz.mission.id leaked: {mission_attr}"
+        );
+    }
+
+    /// The milestone title travels the same way, into both the attribute and
+    /// the span NAME.
+    #[test]
+    fn otel_milestone_title_is_scrubbed() {
+        let secret = "sk-ant-F00barBazQuux9_7";
+        let plan = kranz_engine::types::Plan {
+            goal: "ship".to_string(),
+            validation_contract: vec![],
+            milestones: vec![kranz_engine::types::PlanMilestone {
+                title: format!("do it with api_key={secret}"),
+                features: vec![],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+        };
+        let events = vec![
+            created(1, 0),
+            ev(
+                2,
+                5,
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: None,
+                },
+            ),
+            milestone_started(3, 10, "ms-1"),
+            milestone_completed(4, 20, "ms-1"),
+        ];
+
+        let ms = map_mission(&events)
+            .into_iter()
+            .find(|s| s.name.contains("ms-1"))
+            .unwrap();
+        assert!(!ms.name.contains(secret), "span name leaked: {}", ms.name);
+        let title = ms
+            .attributes
+            .iter()
+            .find(|(key, _)| key == "kranz.milestone.title")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(
+            title,
+            AttrValue::String(kranz_engine::scrub::scrub(&format!(
+                "do it with api_key={secret}"
+            )))
+        );
     }
 }

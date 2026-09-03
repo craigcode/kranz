@@ -129,9 +129,10 @@ ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
 cannot present the token, so that route authenticates with its own per-repo
 HMAC signature and refuses closed when unconfigured (see §Webhooks).
 The token is generated at serve start (or passed in by the embedding Tauri
-shell), printed to the operator, and appended by `--open` as `#token=<t>` in
-the launched URL; the dashboard stores it (sessionStorage) and shows a
-paste-token field when a mutation is attempted without one. Missing/wrong
+shell) and printed to the operator. `--open` launches the bare URL with no
+token in it (a URL is argv, and argv is world-readable); the dashboard shows
+a paste-token field when a mutation is attempted without one and stores the
+pasted token in sessionStorage. Missing/wrong
 token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
 binding + CORS stop the network and the browser; the token stops other local
 processes and link-borne CSRF from creating or steering missions that spend

@@ -240,6 +240,14 @@ fn finding(subject: &str, evidence: String, suggested_fix: &str) -> Finding {
 
 /// Final-gate artifact contract. `changed_paths` is the union over every
 /// non-meta deliverable commit, so edit→restore of the source still fails.
+///
+/// Source immutability is decided on BYTES, not only on the path list
+/// (audit H8): git's rename detection reports `git mv docs/spec.md
+/// reviews/api.md` as the destination alone, so the source path is absent
+/// from `changed_paths` while the source itself is gone at head. Comparing
+/// the blob at base with the blob at head catches the rename, the delete,
+/// and a mode change; the path-list check stays because it also catches a
+/// path git chose not to pair.
 pub fn deliverable_findings(
     repo: &GitRepo,
     base_ref: &str,
@@ -250,16 +258,23 @@ pub fn deliverable_findings(
     let base_ref = repo.rev_parse(base_ref)?;
     let head_ref = repo.rev_parse(head_ref)?;
     let mut findings = Vec::new();
-    if changed_paths
+    let source_in_changed_paths = changed_paths
         .iter()
-        .any(|path| path == &contract.input_path)
-    {
+        .any(|path| path == &contract.input_path);
+    let base_source = repo.show_file(&base_ref, &contract.input_path)?;
+    let head_source = repo.show_file(&head_ref, &contract.input_path)?;
+    let source_bytes_differ = base_source != head_source;
+    if source_in_changed_paths || source_bytes_differ {
+        let detail = if head_source.is_none() {
+            "is gone at mission HEAD (deleted or renamed away)"
+        } else if source_bytes_differ {
+            "differs from its bytes on the approved base"
+        } else {
+            "was touched by a deliverable commit"
+        };
         findings.push(finding(
             "review-artifact:source",
-            format!(
-                "immutable review source `{}` was touched by a deliverable commit",
-                contract.input_path
-            ),
+            format!("immutable review source `{}` {detail}", contract.input_path),
             "restore the source artifact exactly and keep the review in the declared output",
         ));
     }
@@ -432,5 +447,62 @@ mod tests {
         let findings = deliverable_findings(&repo, &base, "HEAD", &[], &missing).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].subject, "review-artifact:output");
+    }
+
+    /// Audit H8: `git mv <source> <output>` makes the immutable source
+    /// DISAPPEAR at head while git's rename detection reports only the
+    /// destination, so the path-string match sees a clean deliverable. The
+    /// contract is about bytes, so the check compares them.
+    #[test]
+    fn flight_rules_review_class_source_rename_is_a_source_touch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        // Big enough that appending a few lines keeps similarity above
+        // git's rename threshold, which is the case the path-list check
+        // misses.
+        let mut spec = String::from("# API spec\n\n");
+        for n in 1..=40 {
+            spec.push_str(&format!("r{n}: requirement number {n} holds.\n"));
+        }
+        std::fs::write(root.join("docs/spec.md"), &spec).unwrap();
+        git(root, &["add", "docs/spec.md"]);
+        git(root, &["commit", "-q", "-m", "base"]);
+
+        let repo = GitRepo::open(root).unwrap();
+        let contract = from_ticket_fields(
+            "api",
+            Some(SPEC_REVIEW),
+            Some("docs/spec.md"),
+            Some("reviews/api.md"),
+        )
+        .unwrap()
+        .unwrap();
+        let base = repo.head_sha().unwrap();
+
+        // The worker renames the source onto the review output and appends,
+        // so git pairs the commit as a rename.
+        std::fs::create_dir_all(root.join("reviews")).unwrap();
+        git(root, &["mv", "docs/spec.md", "reviews/api.md"]);
+        let mut moved = std::fs::read_to_string(root.join("reviews/api.md")).unwrap();
+        moved.push_str("\n## Review\n\n- Finding cites ZZ-SPEC-001 r1.\n");
+        std::fs::write(root.join("reviews/api.md"), moved).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "review"]);
+
+        // What `git diff --name-only` reports for that commit: the
+        // destination only. The fixture asserts it, so the test cannot pass
+        // for the wrong reason if git's rename behaviour changes.
+        let changed = repo.changed_paths(&base, "HEAD").unwrap();
+        assert_eq!(changed, vec!["reviews/api.md".to_string()]);
+
+        let findings = deliverable_findings(&repo, &base, "HEAD", &changed, &contract).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.subject == "review-artifact:source"),
+            "a renamed-away source must fail the immutability check: {findings:?}"
+        );
     }
 }

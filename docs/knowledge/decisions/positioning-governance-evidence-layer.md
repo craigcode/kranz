@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-01
+last_verified: 2026-09-03
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
@@ -104,7 +104,13 @@ exist in kranz if that specific consumer did not?
   (`backend-routing-abstraction`) as implementation slices.
 - The evidence spine (`outcomes-report-task-class`,
   `escalation-ledger-export`, `provenance-replay`) is the product surface to
-  finish first — most of its substrate already exists.
+  finish first — most of its substrate already exists. Its export writers are
+  held to the same discipline as the rest of the layer:
+  `trace_export::write_export_output` backs both `export-traces --out` and
+  `export-corpus --out`, pinning the parent chain no-follow, refusing a
+  symlinked destination, and landing bytes through a rename, so an operator's
+  own export cannot be steered into overwriting a file an agent planted a link
+  at (the 2026-09-01 adversarial audit).
 - Roadmap tension, named: backend_cursor survives re-framed as a dispatch
   adapter under the routing seam; further M3-style parallel-execution
   investment and execution-side continuous-UX items are deprioritised

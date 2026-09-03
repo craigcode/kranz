@@ -2096,6 +2096,67 @@ fn acl_changes(
             });
         }
     }
+    // Authority write deny (2026-09-01 adversarial audit, H2 + H11): the
+    // repo config, the serve tokens, the lint vocabulary, the repo-level
+    // engine stores, and every SIBLING mission dir are write-denied, not
+    // only read-denied. Windows already denied READS of the authority set
+    // above (`deny_all`); this closes the write half for the wider set the
+    // process tier now shares. The `.kranz` sealing regex the Seatbelt tier
+    // emits has no ACL equivalent, so a store created after launch is the
+    // documented Windows remainder — the same spawn-time shape every ACL
+    // deny here already has.
+    let authority_writes = crate::sandbox::authority_write_denies(inputs);
+    for path in authority_writes.files {
+        if path.exists() {
+            changes.push(AclChange {
+                path,
+                permissions: deny_write,
+                inherit: false,
+                mode: AclMode::Deny,
+            });
+        }
+    }
+    for path in authority_writes.dirs {
+        if path.is_dir() {
+            changes.push(AclChange {
+                path,
+                permissions: deny_write,
+                inherit: true,
+                mode: AclMode::Deny,
+            });
+        }
+    }
+    // `.git` metadata write deny (2026-09-01 adversarial audit, H3 support):
+    // the hook and config surface that turns the engine's next unhardened
+    // `git commit` into host execution, plus the worktree gitlink. Narrow by
+    // design — the index, objects and refs stay writable because the
+    // worker's own role is to commit.
+    let git_writes = crate::sandbox::git_metadata_write_denies(inputs);
+    for path in git_writes.files {
+        // A `.git` DIRECTORY is skipped here: the non-inheriting deny would
+        // still be a deny on the container itself, and a directory node deny
+        // that Windows evaluates on child creation would close the index the
+        // worker legitimately writes. Only the gitlink FILE form and the
+        // named config files are denied.
+        if path.is_file() {
+            changes.push(AclChange {
+                path,
+                permissions: deny_write,
+                inherit: false,
+                mode: AclMode::Deny,
+            });
+        }
+    }
+    for path in git_writes.dirs {
+        if path.is_dir() {
+            changes.push(AclChange {
+                path,
+                permissions: deny_write,
+                inherit: true,
+                mode: AclMode::Deny,
+            });
+        }
+    }
     for entry in crate::sandbox::validator_read_deny_entries(inputs) {
         if entry.path.exists() {
             changes.push(AclChange {

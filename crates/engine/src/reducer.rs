@@ -48,6 +48,24 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
         }
 
         EventKind::PlanApproved { plan, base_sha } => {
+            // Status guard, the sibling of `expect_pending_grant` below
+            // (audit 2026-09-01 H6). `approve_plan` only ever emits this from
+            // `Planning`, so a `plan.approved` folded on top of a running,
+            // blocked, or completed mission did not come from the approval
+            // path: it is a late forgery appended to the log, and applying it
+            // would replace the milestone set, the contract, the touch set,
+            // and the command grants wholesale. Ignored rather than a fold
+            // error, so one bad line cannot make an existing mission
+            // permanently unreadable.
+            if state.mission.status != MissionStatus::Planning {
+                tracing::warn!(
+                    seq = event.seq,
+                    status = ?state.mission.status,
+                    "ignoring plan.approved outside Planning status"
+                );
+                state.last_seq = event.seq;
+                return Ok(());
+            }
             state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();

@@ -439,7 +439,7 @@ pub(crate) fn open_parent_nofollow(path: &Path) -> Result<(Dir, OsString)> {
 /// threat model, and canonicalizing them is the only way macOS tempdirs
 /// resolve at all. Off-unix there is no `O_NOFOLLOW`; fall back to
 /// check-then-open (Windows symlink creation needs privileges).
-pub(crate) fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
+pub fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
         use cap_fs_ext::DirExt as _;
@@ -584,10 +584,437 @@ pub fn project_config(repo_root: &Path) -> PathBuf {
     repo_root.join(".kranz").join("config.json")
 }
 
-/// Global config file path (~/.kranz/config.json), None if no home dir.
+/// Global config file path (`<global kranz dir>/config.json`), None if no
+/// home dir.
 pub fn global_config() -> Option<PathBuf> {
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(|h| PathBuf::from(h).join(".kranz").join("config.json"))
+    global_kranz_dir().map(|dir| dir.join("config.json"))
+}
+
+/// The operator's global kranz directory: `$KRANZ_HOME` when set and
+/// non-empty, else `~/.kranz` (`%USERPROFILE%\.kranz` on Windows), `None`
+/// when neither resolves.
+///
+/// `KRANZ_HOME` exists so a test harness or a CI runner can point every
+/// global store (config, authority keys, seal floors) at a scratch directory
+/// instead of the operator's real home. It is read from the ENGINE process's
+/// own environment; agent sessions spawn from a cleared environment
+/// (`agent_env`), so a session cannot redirect the key directory it is
+/// denied from reading.
+pub fn global_kranz_dir() -> Option<PathBuf> {
+    // Resolved once per process. The authority key, the seal floors, and
+    // the control marks all hang off this directory, and a signer and a
+    // verifier in the same process must agree on it even if something
+    // rewrites `HOME` in between (a test does; a wrapper script could).
+    static GLOBAL: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    GLOBAL
+        .get_or_init(|| {
+            if let Some(dir) = std::env::var_os("KRANZ_HOME") {
+                if !dir.is_empty() {
+                    return Some(PathBuf::from(dir));
+                }
+            }
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|h| PathBuf::from(h).join(".kranz"))
+        })
+        .clone()
+}
+
+// ---------------------------------------------------------------------------
+// Per-repository authority key (audit 2026-09-01 C1 / H6)
+// ---------------------------------------------------------------------------
+
+/// Length of a freshly minted authority key.
+pub const AUTHORITY_KEY_LEN: usize = 32;
+
+/// Stable per-repository id for authority material: sha256 of the CANONICAL
+/// repo root path, so `/repo`, `/repo/../repo`, and macOS `/var` vs
+/// `/private/var` all resolve to one key instead of minting a second one that
+/// would make previously signed control files and log lines unverifiable.
+fn repo_fingerprint(repo_root: &Path) -> String {
+    let canonical = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    crate::standards_waiver::sha256_hex(canonical.as_os_str().as_encoded_bytes())
+}
+
+/// Where this repository's authority key lives:
+/// `<global kranz dir>/keys/<repo fingerprint>.key`.
+///
+/// OUTSIDE the repository on purpose. The key authenticates the control inbox
+/// (`control::enqueue`/`control::drain`) and MACs `events.jsonl`, so an agent
+/// process that can read it can forge operator consent. Keeping it in the
+/// operator's home puts it inside the sandbox's authority-read-deny set
+/// (`sandbox::authority_read_deny_paths`) and, when the sandbox is off,
+/// behind the agent CLI's own `Read(~/.kranz/**)` deny rule
+/// (`permissions::AUTHORITY_DENY`).
+pub fn authority_key_path(repo_root: &Path) -> Option<PathBuf> {
+    global_kranz_dir().map(|dir| {
+        dir.join("keys")
+            .join(format!("{}.key", repo_fingerprint(repo_root)))
+    })
+}
+
+/// Where a mission's SEAL FLOOR lives: the first `events.jsonl` seq that must
+/// carry integrity fields, recorded outside the repository beside the key.
+///
+/// This is the anchor that makes the event log's integrity non-optional. The
+/// log itself cannot carry the requirement: an attacker who rewrites every
+/// line, stripping `h` and `m` from all of them, produces something
+/// indistinguishable from a log written before integrity existed, and a
+/// reader with only the file in front of it has to accept it. A floor the
+/// attacker cannot write says "from seq N on, unsealed is forged", and it
+/// grandfathers the lines below N that legitimately predate the key.
+pub fn seal_floor_path(repo_root: &Path, mission_id: &str) -> Option<PathBuf> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return None;
+    }
+    global_kranz_dir().map(|dir| {
+        dir.join("seals")
+            .join(repo_fingerprint(repo_root))
+            .join(mission_id)
+    })
+}
+
+/// The recorded seal floor for one mission, `None` when none was ever
+/// recorded (so every line is grandfathered).
+pub fn read_seal_floor(repo_root: &Path, mission_id: &str) -> Option<u64> {
+    let path = seal_floor_path(repo_root, mission_id)?;
+    std::fs::read_to_string(&path).ok()?.trim().parse().ok()
+}
+
+/// Where a mission's HIGH-WATER MARK lives: the highest seq the engine has
+/// durably written, recorded beside the seal floor and, like it, outside the
+/// repository.
+///
+/// The seal floor and the chain make a forged or edited line detectable; the
+/// high-water mark makes a TRUNCATED log detectable. Cutting `events.jsonl`
+/// at a line boundary leaves a valid chain and a valid seq run, so nothing in
+/// the file itself can say lines are missing. `state.json` carries a
+/// `last_seq`, but it sits in the repository next to the log, so whoever can
+/// truncate one can rewrite the other. A mark the same writer cannot reach
+/// is the only witness that survives.
+pub fn high_water_path(repo_root: &Path, mission_id: &str) -> Option<PathBuf> {
+    // Own subdirectory, never a suffix on the floor's name: mission ids may
+    // contain dots, so `with_extension` would fold `release-1.2` and
+    // `release-1.3` onto one mark and make mission `foo`'s mark mission
+    // `foo.hwm`'s floor (follow-up review F-5).
+    seal_floor_path(repo_root, mission_id).map(|p| {
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        dir.join("hwm").join(mission_id)
+    })
+}
+
+/// Where a mission's CONTROL MARK lives: the name of the last control file
+/// the engine acknowledged, recorded beside the high-water mark. Control
+/// file names are `<zero-padded-nanos>-<8-hex>.json`, so they order
+/// lexicographically by creation time and the mark never moves backwards.
+///
+/// The mark is what makes a signed control file single-use. The signature
+/// binds the file to its name, and the engine refuses any name at or below
+/// the mark, so a captured `approve-grant` re-dropped after the drain
+/// deleted it authenticates but is refused as a replay (follow-up review
+/// F-1).
+pub fn control_mark_path(repo_root: &Path, mission_id: &str) -> Option<PathBuf> {
+    seal_floor_path(repo_root, mission_id).map(|p| {
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        dir.join("ctl").join(mission_id)
+    })
+}
+
+/// The recorded control mark, `None` when none was ever recorded.
+pub fn read_control_mark(repo_root: &Path, mission_id: &str) -> Option<String> {
+    let path = control_mark_path(repo_root, mission_id)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Record `name` as the last acknowledged control file. Never lowers.
+pub fn record_control_mark(repo_root: &Path, mission_id: &str, name: &str) -> Result<()> {
+    let Some(path) = control_mark_path(repo_root, mission_id) else {
+        return Ok(());
+    };
+    if read_control_mark(repo_root, mission_id).is_some_and(|current| current.as_str() >= name) {
+        return Ok(());
+    }
+    write_mark(&path, name)
+}
+
+/// The recorded high-water mark, `None` when none was ever recorded.
+pub fn read_high_water(repo_root: &Path, mission_id: &str) -> Option<u64> {
+    let path = high_water_path(repo_root, mission_id)?;
+    std::fs::read_to_string(&path).ok()?.trim().parse().ok()
+}
+
+/// Record `seq` as the highest durably written event. Never lowers an
+/// existing mark. Written through a tmp file and rename so a crash between
+/// the log write and this one leaves the OLD mark, which is at most one
+/// event behind and therefore never accuses a healthy log.
+pub fn record_high_water(repo_root: &Path, mission_id: &str, seq: u64) -> Result<()> {
+    let Some(path) = high_water_path(repo_root, mission_id) else {
+        return Ok(());
+    };
+    if read_high_water(repo_root, mission_id).is_some_and(|current| current >= seq) {
+        return Ok(());
+    }
+    write_mark(&path, &seq.to_string())
+}
+
+/// Write a small witness file under the seals tree: parent dirs `0700`,
+/// file `0600`, tmp file plus rename so a crash leaves the previous value.
+fn write_mark(path: &Path, value: &str) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| EngineError::InvalidState("mark path has no parent".to_string()))?;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut cursor = Some(dir);
+        // Lock every directory we may have just created up to the seals
+        // root: the marks are authority material like the key.
+        for _ in 0..3 {
+            let Some(d) = cursor else { break };
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+            if d.file_name().is_some_and(|n| n == "seals") {
+                break;
+            }
+            cursor = d.parent();
+        }
+    }
+    let tmp = dir.join(format!(".mark.tmp-{}", uuid::Uuid::new_v4().as_simple()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(value.as_bytes())?;
+        file.sync_data()?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Record `seq` as this mission's seal floor, once. An existing floor is
+/// never moved: raising it would grandfather away lines that were sealed, and
+/// lowering it would condemn lines that legitimately were not.
+pub fn record_seal_floor(repo_root: &Path, mission_id: &str, seq: u64) -> Result<()> {
+    let Some(path) = seal_floor_path(repo_root, mission_id) else {
+        return Ok(());
+    };
+    let dir = path
+        .parent()
+        .ok_or_else(|| EngineError::InvalidState("seal floor path has no parent".to_string()))?;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Lock both the per-repo dir and the `seals` root above it: the
+        // floor is what makes a stripped log detectable, so its directory
+        // is authority material like the key's.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        if let Some(seals_root) = dir.parent() {
+            let _ = std::fs::set_permissions(seals_root, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(seq.to_string().as_bytes())?;
+            file.sync_data()?;
+            Ok(())
+        }
+        // Already recorded: whoever got there first is authoritative.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Sidecar beside each key naming the repository it was minted for, so the
+/// pruner below can tell an orphaned scratch-repo key from a live one. The
+/// key file itself is named by a one-way fingerprint, which is right for the
+/// deny sets but leaves nothing to stat.
+fn key_owner_path(key_path: &Path) -> PathBuf {
+    key_path.with_extension("path")
+}
+
+fn record_key_owner(key_path: &Path, repo_root: &Path) {
+    let canonical = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let _ = std::fs::write(
+        key_owner_path(key_path),
+        canonical.as_os_str().as_encoded_bytes(),
+    );
+}
+
+/// Remove keys (and their seal floors) minted for repositories under the
+/// system temp root that no longer exist.
+///
+/// Every mission a test creates in a `tempfile` repo mints a key, and the
+/// repo is gone the moment the test ends, so without this the operator's key
+/// directory grows by one file per test forever. Scoped to the temp root on
+/// purpose: a key for a real repository is never pruned, even when its path
+/// is momentarily absent (an unmounted volume), because losing the key
+/// strands every log line and control file it signed. Best effort, never an
+/// error: pruning is housekeeping, minting is the job.
+fn prune_orphan_temp_keys(keys_dir: &Path) {
+    let temp_root = std::env::temp_dir();
+    let temp_root = std::fs::canonicalize(&temp_root).unwrap_or(temp_root);
+    let Ok(entries) = std::fs::read_dir(keys_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let owner_path = entry.path();
+        if owner_path.extension().and_then(|e| e.to_str()) != Some("path") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&owner_path) else {
+            continue;
+        };
+        // The sidecar was written as encoded bytes of an OsStr; `from_utf8`
+        // is only a lossy view for the containment check below, never an
+        // identity we act on.
+        let repo = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+        if !repo.starts_with(&temp_root) || repo.exists() {
+            continue;
+        }
+        // The sidecar names the key it belongs to only through the
+        // fingerprint. A sidecar whose recorded path does not hash to its
+        // own filename was not written by this code, so it deletes nothing
+        // (follow-up review F-4: a planted `<real fp>.path` naming a dead
+        // temp path must not take a real repository's key with it).
+        let stem = owner_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let expected = crate::standards_waiver::sha256_hex(repo.as_os_str().as_encoded_bytes());
+        if stem != expected {
+            continue;
+        }
+        let key_path = owner_path.with_extension("key");
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&owner_path);
+        // The seal directory is left alone on purpose: a stale one costs
+        // bytes, a deleted one costs a witness.
+    }
+}
+
+/// Read this repository's authority key, or `None` when there is none to
+/// read (no home dir, no key minted yet, unreadable file).
+///
+/// The READER form: a verifier that cannot load the key degrades to the
+/// weaker check it can still perform and says so, but it never mints key
+/// material as a side effect of reading.
+pub fn load_authority_key(repo_root: &Path) -> Option<Vec<u8>> {
+    let path = authority_key_path(repo_root)?;
+    let bytes = std::fs::read(&path).ok()?;
+    (bytes.len() >= AUTHORITY_KEY_LEN).then_some(bytes)
+}
+
+/// Read this repository's authority key, minting it on first use.
+///
+/// The WRITER/SIGNER form. Directory `0700`, file `0600`, written through a
+/// tmp file + rename so a crash never leaves a truncated key at the stable
+/// path (the same shape `kranz serve` uses for `serve.token`). A racing
+/// creator wins harmlessly: `create_new` fails `AlreadyExists` and we re-read
+/// whatever landed, so two processes never disagree about the key.
+///
+/// The 32 bytes come from two `uuid` v4 values. `uuid` is already a workspace
+/// dependency drawing on the OS CSPRNG, so this adds no crate to the set
+/// `deny.toml` audits.
+pub fn load_or_create_authority_key(repo_root: &Path) -> Result<Vec<u8>> {
+    let path = authority_key_path(repo_root).ok_or_else(|| {
+        EngineError::InvalidState(
+            "cannot resolve the operator kranz directory for the authority key".to_string(),
+        )
+    })?;
+    if let Some(existing) = load_authority_key(repo_root) {
+        return Ok(existing);
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| EngineError::InvalidState("authority key path has no parent".to_string()))?;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best effort: an operator who deliberately widened ~/.kranz is not
+        // overridden loudly, but a directory we just created is ours to lock.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let key = {
+        let mut key = Vec::with_capacity(AUTHORITY_KEY_LEN);
+        key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key
+    };
+    let tmp = dir.join(format!(".key.tmp-{}", uuid::Uuid::new_v4().as_simple()));
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&key)?;
+        file.sync_data()?;
+        Ok(())
+    };
+    if let Err(error) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    // `rename` would clobber a key a racing process just minted, which would
+    // strand every file it had already signed. Link-then-unlink refuses
+    // instead, and we adopt the winner's key.
+    match std::fs::hard_link(&tmp, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            record_key_owner(&path, repo_root);
+            prune_orphan_temp_keys(dir);
+            Ok(key)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            load_authority_key(repo_root).ok_or_else(|| {
+                EngineError::InvalidState(format!(
+                    "authority key {} exists but could not be read",
+                    path.display()
+                ))
+            })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -787,5 +1214,84 @@ mod tests {
         assert!(err.to_string().contains("refusing"), "{err}");
         assert!(ensure_absent_or_regular_file(&target).is_ok());
         assert!(ensure_absent_or_regular_file(&tmp.path().join("missing.jsonl")).is_ok());
+    }
+
+    // -- authority key (audit 2026-09-01 C1 / H6) --------------------------
+
+    #[test]
+    fn the_authority_key_lives_outside_the_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = authority_key_path(tmp.path()).expect("a home dir in tests");
+        assert!(
+            !path.starts_with(tmp.path()),
+            "the key must never sit inside the repo it authenticates: {}",
+            path.display()
+        );
+        assert!(path.parent().unwrap().ends_with("keys"));
+    }
+
+    #[test]
+    fn the_authority_key_is_stable_per_repo_and_distinct_between_repos() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let first = load_or_create_authority_key(a.path()).unwrap();
+        assert_eq!(first.len(), AUTHORITY_KEY_LEN);
+        assert_eq!(
+            load_or_create_authority_key(a.path()).unwrap(),
+            first,
+            "a second call adopts the existing key rather than rotating it"
+        );
+        assert_ne!(
+            load_or_create_authority_key(b.path()).unwrap(),
+            first,
+            "one repo's key must not authenticate another repo's inbox"
+        );
+        // A path spelled differently but naming the same tree resolves to the
+        // same key, or every file signed under the other spelling would stop
+        // verifying.
+        let indirect = a
+            .path()
+            .join(".")
+            .join("..")
+            .join(a.path().file_name().unwrap());
+        assert_eq!(load_or_create_authority_key(&indirect).unwrap(), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_authority_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        load_or_create_authority_key(tmp.path()).unwrap();
+        let path = authority_key_path(tmp.path()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key mode {mode:o}");
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "keys dir mode {dir_mode:o}");
+    }
+
+    #[test]
+    fn the_seal_floor_is_recorded_once_and_never_moved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(read_seal_floor(tmp.path(), "m-1"), None);
+        record_seal_floor(tmp.path(), "m-1", 7).unwrap();
+        assert_eq!(read_seal_floor(tmp.path(), "m-1"), Some(7));
+        // Raising it would grandfather away lines that were sealed; lowering
+        // it would condemn lines that legitimately were not.
+        record_seal_floor(tmp.path(), "m-1", 1).unwrap();
+        record_seal_floor(tmp.path(), "m-1", 99).unwrap();
+        assert_eq!(read_seal_floor(tmp.path(), "m-1"), Some(7));
+        assert_eq!(read_seal_floor(tmp.path(), "m-2"), None);
+    }
+
+    #[test]
+    fn an_unsafe_mission_id_gets_no_seal_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(seal_floor_path(tmp.path(), "../../escape").is_none());
+        assert!(seal_floor_path(tmp.path(), "a/b").is_none());
     }
 }

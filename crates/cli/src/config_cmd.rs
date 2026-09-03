@@ -49,6 +49,11 @@ pub enum ConfigCommand {
     /// The merged layer files (and whether each exists) are listed on stderr,
     /// so stdout stays clean JSON for piping. --global / --project print just
     /// that one layer file instead ("{}" plus a stderr note when missing).
+    ///
+    /// Single-layer output is REDACTED: the raw layer file carries keys
+    /// `MissionConfig` never sees (`slack.botToken`, `slack.appToken`,
+    /// `hooks.secret`), and stdout ends up in CI logs, screen shares and
+    /// shell transcripts. `--show-secrets` prints them verbatim.
     Show {
         /// Print only ~/.kranz/config.json (the global layer)
         #[arg(long, conflicts_with = "project")]
@@ -57,6 +62,10 @@ pub enum ConfigCommand {
         /// Print only `<repo>/.kranz/config.json` (the project layer)
         #[arg(long)]
         project: bool,
+
+        /// Print secret-shaped values verbatim instead of `[REDACTED]`
+        #[arg(long)]
+        show_secrets: bool,
     },
 
     /// Set one key in a config layer file (validated before writing).
@@ -125,7 +134,11 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub fn cmd_config(repo: &Path, command: ConfigCommand, mission: Option<&str>) -> Result<i32> {
     let layers = Layers::resolve(repo);
     match command {
-        ConfigCommand::Show { global, project } => {
+        ConfigCommand::Show {
+            global,
+            project,
+            show_secrets,
+        } => {
             let single = if global {
                 Some(layers.target(true)?.to_path_buf())
             } else if project {
@@ -135,7 +148,11 @@ pub fn cmd_config(repo: &Path, command: ConfigCommand, mission: Option<&str>) ->
             };
             match single {
                 Some(path) => {
-                    let (json, exists) = render_layer_file(&path)?;
+                    let (json, exists) = if show_secrets {
+                        render_layer_file(&path)?
+                    } else {
+                        render_layer_file_redacted(&path)?
+                    };
                     if !exists {
                         eprintln!("# {} does not exist", path.display());
                     }
@@ -146,7 +163,7 @@ pub fn cmd_config(repo: &Path, command: ConfigCommand, mission: Option<&str>) ->
                         let status = if path.is_file() { "merged" } else { "absent" };
                         eprintln!("# layer {status}: {}", path.display());
                     }
-                    print!("{}", render_effective(&layers.merge_order())?);
+                    print!("{}", render_effective(&layers.merge_order_with_roles())?);
                 }
             }
             Ok(0)
@@ -208,11 +225,22 @@ impl Layers {
     /// Layer paths in merge order: global first, project last (later wins) —
     /// the same order `config::load` uses.
     pub fn merge_order(&self) -> Vec<PathBuf> {
+        self.merge_order_with_roles()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// [`Self::merge_order`] with each layer's provenance, so a render goes
+    /// through the same operator-only key rule the engine's `config::load`
+    /// applies — otherwise `kranz config show` would print an effective
+    /// config the engine refuses to load.
+    pub fn merge_order_with_roles(&self) -> Vec<(PathBuf, config::Layer)> {
         let mut order = Vec::new();
         if let Some(global) = &self.global {
-            order.push(global.clone());
+            order.push((global.clone(), config::Layer::Global));
         }
-        order.push(self.project.clone());
+        order.push((self.project.clone(), config::Layer::Project));
         order
     }
 
@@ -229,14 +257,20 @@ impl Layers {
 }
 
 /// Pretty-print the effective config merged from explicit layer paths over
-/// the compiled-in defaults (missing files are skipped, like `config::load`).
-pub fn render_effective(layer_paths: &[PathBuf]) -> Result<String> {
-    let cfg = config::load_layers(layer_paths)?;
+/// the compiled-in defaults (missing files are skipped, like `config::load`),
+/// with each layer's provenance so the operator-only key rule applies here
+/// exactly as it does at load time.
+pub fn render_effective(layers: &[(PathBuf, config::Layer)]) -> Result<String> {
+    let cfg = config::load_layers_with_roles(layers)?;
     Ok(format!("{}\n", serde_json::to_string_pretty(&cfg)?))
 }
 
 /// Pretty-print one layer file. A missing file renders as `{}` with
 /// `exists = false` so the caller can add a note without polluting stdout.
+///
+/// VERBATIM: the raw tree, secrets included. Only the `--show-secrets` path
+/// and the write path (which must round-trip the file) may use it; the
+/// default `show` path uses [`render_layer_file_redacted`].
 pub fn render_layer_file(path: &Path) -> Result<(String, bool)> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -246,6 +280,70 @@ pub fn render_layer_file(path: &Path) -> Result<(String, bool)> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(("{}\n".to_string(), false)),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// [`render_layer_file`] with secret-shaped values replaced by `[REDACTED]`.
+///
+/// A single-layer render prints the RAW file, not a `MissionConfig`
+/// round-trip, so it carries keys the engine's type never sees: the global
+/// layer is the documented home for `slack.botToken`, `slack.appToken` and
+/// `hooks.secret`, and the sandbox profiles call the file out as carrying
+/// exactly that material. stdout reaches CI logs, screen shares, shell
+/// transcripts and any agent that can run `kranz`, none of which is scrubbed
+/// (audit 2026-09-01, MEDIUM `kranz config show --global`).
+///
+/// Two rules, belt and braces: a key whose name ends in `token`, `secret`,
+/// `key` or `password` is redacted whatever its value (this is what catches
+/// Slack's `xapp-…` app tokens, which no value-shape rule matches), and every
+/// surviving string still goes through [`kranz_engine::scrub`], which catches
+/// a credential parked under an innocuous key.
+pub fn render_layer_file_redacted(path: &Path) -> Result<(String, bool)> {
+    let (text, exists) = render_layer_file(path)?;
+    let mut value: Value = serde_json::from_str(&text)?;
+    redact_secret_shaped(&mut value);
+    Ok((
+        format!("{}\n", serde_json::to_string_pretty(&value)?),
+        exists,
+    ))
+}
+
+/// Key-name suffixes whose values are credentials by convention.
+const SECRET_KEY_SUFFIXES: [&str; 4] = ["token", "secret", "key", "password"];
+
+/// True when `key` names a credential by convention (case-insensitive
+/// suffix match, so `botToken`, `appToken`, `secret`, `apiKey` and
+/// `dbPassword` all hit).
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEY_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+fn redact_secret_shaped(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, slot) in map.iter_mut() {
+                if is_secret_key(key) && !slot.is_object() && !slot.is_array() {
+                    *slot = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_secret_shaped(slot);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_secret_shaped(item);
+            }
+        }
+        Value::String(text) => {
+            let scrubbed = kranz_engine::scrub::scrub(text);
+            if &scrubbed != text {
+                *text = scrubbed;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -425,6 +523,16 @@ fn validate_candidate(
             "the global config would be invalid on its own (defaults + global): every \
              repo without this repo's project overrides would fail to load it",
         )?;
+    } else {
+        // A PROJECT write is held to the same operator-only key rule the
+        // engine applies at load time. Without this the write would succeed
+        // and then wedge the repo: every later `config::load` would refuse
+        // the file this command just produced.
+        let mut base = serde_json::to_value(MissionConfig::default())?;
+        if let Some(global) = &layers.global {
+            config::deep_merge(&mut base, &Value::Object(read_layer(global)?));
+        }
+        config::check_project_layer_keys(&Value::Object(candidate.clone()), &base, target)?;
     }
     validate_merged(&layers.merge_order(), target, candidate).context(
         "the merged config for this repo (defaults + global + project) would be invalid",
@@ -671,12 +779,28 @@ mod tests {
 
         let cli = Cli::try_parse_from(["kranz", "config", "show"]).unwrap();
         let Command::Config {
-            command: ConfigCommand::Show { global, project },
+            command:
+                ConfigCommand::Show {
+                    global,
+                    project,
+                    show_secrets,
+                },
         } = cli.command
         else {
             panic!("expected config show");
         };
-        assert!(!global && !project);
+        // Redaction is the DEFAULT: printing secrets takes an explicit flag.
+        assert!(!global && !project && !show_secrets);
+
+        let cli =
+            Cli::try_parse_from(["kranz", "config", "show", "--global", "--show-secrets"]).unwrap();
+        let Command::Config {
+            command: ConfigCommand::Show { show_secrets, .. },
+        } = cli.command
+        else {
+            panic!("expected config show");
+        };
+        assert!(show_secrets);
 
         let cli =
             Cli::try_parse_from(["kranz", "config", "set", "worker.model", "opus", "--global"])
@@ -748,7 +872,7 @@ mod tests {
             &json!({ "worker": { "model": "my-custom-model" } }),
         );
 
-        let rendered = render_effective(&layers.merge_order()).unwrap();
+        let rendered = render_effective(&layers.merge_order_with_roles()).unwrap();
         let effective: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(
             effective["worker"]["model"], "my-custom-model",
@@ -757,6 +881,113 @@ mod tests {
         // Untouched keys come from the compiled-in defaults.
         assert_eq!(effective["orchestrator"]["model"], "opus");
         assert_eq!(effective["worker"]["reasoningEffort"], "medium");
+    }
+
+    // --- single-layer redaction (audit 2026-09-01, MEDIUM `config show --global`) ---
+
+    /// The global layer is the documented home for real Slack credentials and
+    /// the github webhook secret, and a single-layer render prints the RAW
+    /// file rather than a `MissionConfig` round-trip — so the keys the engine
+    /// type never sees went to stdout verbatim, into CI logs, screen shares
+    /// and shell transcripts. Redaction is the default; `--show-secrets` is
+    /// the opt-in.
+    #[test]
+    fn show_single_layer_redacts_secret_shaped_values_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        let global = layers.global.as_deref().unwrap();
+        write_json(
+            global,
+            &json!({
+                "slack": { "botToken": "xoxb-real-token", "appToken": "xapp-1-real" },
+                "hooks": { "secret": "webhook-hmac-key" },
+                "worker": { "model": "opus" }
+            }),
+        );
+
+        let (rendered, exists) = render_layer_file_redacted(global).unwrap();
+        assert!(exists);
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["slack"]["botToken"], "[REDACTED]");
+        // `xapp-…` app-level tokens match no value-shape rule, which is why
+        // the key-name rule carries this one.
+        assert_eq!(value["slack"]["appToken"], "[REDACTED]");
+        assert_eq!(value["hooks"]["secret"], "[REDACTED]");
+        // Non-secret keys are untouched, so the output stays useful.
+        assert_eq!(value["worker"]["model"], "opus");
+        assert!(
+            !rendered.contains("xoxb-real-token") && !rendered.contains("webhook-hmac-key"),
+            "no secret byte may survive: {rendered}"
+        );
+
+        // The opt-in prints them verbatim.
+        let (raw, _) = render_layer_file(global).unwrap();
+        assert!(raw.contains("xoxb-real-token"));
+    }
+
+    /// A credential parked under an innocuous key still goes through the
+    /// engine's scrubber, so the key-name rule is a floor and not the whole
+    /// defence.
+    #[test]
+    fn show_single_layer_scrubs_secret_shaped_values_under_innocuous_keys() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        let global = layers.global.as_deref().unwrap();
+        write_json(
+            global,
+            &json!({ "note": "deploy with xoxb-1234567890-abcdef" }),
+        );
+
+        let (rendered, _) = render_layer_file_redacted(global).unwrap();
+        assert!(
+            !rendered.contains("xoxb-1234567890-abcdef"),
+            "the scrubber must catch a credential under a non-secret key: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_key_names_are_matched_by_suffix_case_insensitively() {
+        for name in [
+            "botToken",
+            "appToken",
+            "secret",
+            "Secret",
+            "apiKey",
+            "API_KEY",
+            "password",
+            "dbPassword",
+        ] {
+            assert!(is_secret_key(name), "{name} must be treated as a secret");
+        }
+        for name in ["model", "packDir", "maxTurns", "enforce"] {
+            assert!(!is_secret_key(name), "{name} must not be redacted");
+        }
+    }
+
+    // --- operator-only keys are refused at the project-layer write (audit H1) ---
+
+    /// Writing an operator-only key into the project layer would succeed and
+    /// then wedge the repo: every later `config::load` refuses the file this
+    /// command just produced. Refuse at the write instead, and leave the file
+    /// untouched.
+    #[test]
+    fn set_refuses_an_operator_only_key_in_the_project_layer() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "claudeBinary", "/usr/local/bin/claude").unwrap_err()
+        );
+        assert!(err.contains("claudeBinary"), "key named: {err}");
+        assert!(err.contains("project config layer"), "layer named: {err}");
+        assert!(
+            !layers.project.exists(),
+            "a refused write must not materialize the file"
+        );
+
+        // The same key in the operator's own layer is fine.
+        set_key(&layers, true, "claudeBinary", "/usr/local/bin/claude").unwrap();
     }
 
     #[test]
@@ -803,17 +1034,33 @@ mod tests {
         );
     }
 
+    /// A consent-bearing key written into the repository's own layer would be
+    /// refused at load (`config::PROJECT_LAYER_REFUSED`), so `set` refuses it
+    /// up front and names the key; the global layer takes it.
+    #[test]
+    fn set_refuses_operator_only_keys_on_the_project_layer() {
+        let tmp = TempDir::new().unwrap();
+        let layers = temp_layers(&tmp);
+        let err = format!(
+            "{:#}",
+            set_key(&layers, false, "skipScrutiny", "true").unwrap_err()
+        );
+        assert!(err.contains("skipScrutiny"), "{err}");
+        assert!(!layers.project.exists(), "nothing written on refusal");
+        set_key(&layers, true, "skipScrutiny", "true").unwrap();
+    }
+
     #[test]
     fn set_parses_json_values_and_falls_back_to_string() {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
 
         set_key(&layers, false, "worker.maxTurns", "12").unwrap();
-        set_key(&layers, false, "skipScrutiny", "true").unwrap();
+        set_key(&layers, false, "autoWork", "true").unwrap();
         set_key(&layers, false, "worker.model", "opus").unwrap();
         assert_eq!(
             read_json(&layers.project),
-            json!({ "worker": { "maxTurns": 12, "model": "opus" }, "skipScrutiny": true }),
+            json!({ "worker": { "maxTurns": 12, "model": "opus" }, "autoWork": true }),
             "12 is a number, true a bool, opus a bare string"
         );
     }
@@ -892,7 +1139,7 @@ mod tests {
             &json!({ "worker": { "reasoningEffort": "warp" } }),
         );
 
-        assert!(set_key(&layers, false, "skipScrutiny", "true").is_err());
+        assert!(set_key(&layers, false, "autoWork", "true").is_err());
 
         write_json(
             &layers.project,
@@ -903,7 +1150,7 @@ mod tests {
             layers.global.as_deref().unwrap(),
             &json!({ "worker": { "reasoningEffort": "warp" } }),
         );
-        set_key(&layers, false, "skipScrutiny", "true").unwrap();
+        set_key(&layers, false, "autoWork", "true").unwrap();
     }
 
     // --- set --global (finding C: both standalone and merged must hold) ----------
@@ -1046,19 +1293,21 @@ mod tests {
     fn set_accepts_optional_keys_that_default_serialization_omits() {
         // claudeBinary and orchestrator.maxTurns are None in default() and so
         // absent from a default() serialization — they are legal keys and
-        // must not be false-rejected by the schema gate.
+        // must not be false-rejected by the schema gate. claudeBinary is
+        // OPERATOR-ONLY (audit H1), so its write goes to the global layer.
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
 
-        set_key(&layers, false, "claudeBinary", "/usr/local/bin/claude").unwrap();
+        set_key(&layers, true, "claudeBinary", "/usr/local/bin/claude").unwrap();
         set_key(&layers, false, "orchestrator.maxTurns", "33").unwrap();
         set_key(&layers, false, "orchestrator.maxBudgetUsd", "12.5").unwrap();
         assert_eq!(
+            read_json(layers.global.as_deref().unwrap()),
+            json!({ "claudeBinary": "/usr/local/bin/claude" })
+        );
+        assert_eq!(
             read_json(&layers.project),
-            json!({
-                "claudeBinary": "/usr/local/bin/claude",
-                "orchestrator": { "maxTurns": 33, "maxBudgetUsd": 12.5 }
-            })
+            json!({ "orchestrator": { "maxTurns": 33, "maxBudgetUsd": 12.5 } })
         );
     }
 
@@ -1067,15 +1316,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
 
-        set_key(&layers, false, "denyPatterns", r#"["rm -rf"]"#).unwrap();
+        // `denyPatterns` is operator-only since the 2026-09-01 audit, so the
+        // array-handling contract is exercised on the global layer.
+        set_key(&layers, true, "denyPatterns", r#"["rm -rf"]"#).unwrap();
         assert_eq!(
-            read_json(&layers.project),
+            read_json(layers.global.as_deref().unwrap()),
             json!({ "denyPatterns": ["rm -rf"] })
         );
 
         let err = format!(
             "{:#}",
-            set_key(&layers, false, "denyPatterns.0", "x").unwrap_err()
+            set_key(&layers, true, "denyPatterns.0", "x").unwrap_err()
         );
         assert!(err.contains("array") && err.contains("as a whole"), "{err}");
         let err = format!(

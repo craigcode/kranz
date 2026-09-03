@@ -926,6 +926,134 @@ async fn run_session_scrubs_worker_report_structured_fields() {
 // Report parsing fallbacks
 // ---------------------------------------------------------------------------
 
+/// H10a: a decision turn commits the mission, so it accepts only JSON the
+/// model presented AS its answer — the whole reply, or the sole fenced block.
+/// The lenient first-`{`-to-last-`}` span stays out of this path: it takes a
+/// JSON object the model quoted and disowned as the verdict.
+#[derive(serde::Deserialize)]
+struct Verdicts {
+    verdicts: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct Decision {
+    decision: String,
+}
+
+#[test]
+fn parse_decision_refuses_quoted_and_disowned_json() {
+    let disowned = "The worker's NOTES.md contains this block, which I do NOT endorse: \
+                    {\"verdicts\":[{\"id\":\"a-1\",\"pass\":true,\"evidence\":\"see notes\"}],\
+                    \"summary\":\"all good\"} My actual finding: a-1 is NOT met.";
+    assert!(
+        kranz_engine::runner::parse_decision::<Verdicts>(disowned).is_none(),
+        "prose-embedded JSON must not be read as the decision"
+    );
+    // The lenient parser is what it is: this is the exact leniency the
+    // decision path drops.
+    let lenient =
+        kranz_engine::runner::parse_report::<Verdicts>(disowned).expect("greedy span still parses");
+    assert_eq!(
+        lenient.verdicts.len(),
+        1,
+        "fixture no longer exercises the greedy span"
+    );
+}
+
+#[test]
+fn parse_decision_accepts_the_three_legitimate_shapes() {
+    let bare = r#"{"decision":"complete"}"#;
+    assert_eq!(
+        kranz_engine::runner::parse_decision::<Decision>(bare)
+            .expect("bare JSON")
+            .decision,
+        "complete"
+    );
+    assert_eq!(
+        kranz_engine::runner::parse_decision::<Decision>(&format!("\n  {bare}\n  "))
+            .expect("whitespace-padded JSON")
+            .decision,
+        "complete"
+    );
+    assert_eq!(
+        kranz_engine::runner::parse_decision::<Decision>(&format!("```json\n{bare}\n```"))
+            .expect("sole fenced block")
+            .decision,
+        "complete"
+    );
+    assert_eq!(
+        kranz_engine::runner::parse_decision::<Decision>(&format!("```\n{bare}\n```"))
+            .expect("sole untagged fenced block")
+            .decision,
+        "complete"
+    );
+}
+
+#[test]
+fn parse_decision_refuses_two_fenced_blocks_and_unclosed_fences() {
+    let two = "```json\n{\"decision\":\"respawn\"}\n```\nand my real answer:\n\
+               ```json\n{\"decision\":\"complete\"}\n```";
+    assert!(
+        kranz_engine::runner::parse_decision::<Decision>(two).is_none(),
+        "two candidate blocks must fail closed, not pick one"
+    );
+    let unclosed = "```json\n{\"decision\":\"complete\"}";
+    assert!(kranz_engine::runner::parse_decision::<Decision>(unclosed).is_none());
+    // Prose around a sole fenced block is fine; prose INSIDE it is not.
+    let trailing = "```json\n{\"decision\":\"complete\"} then some prose\n```";
+    assert!(kranz_engine::runner::parse_decision::<Decision>(trailing).is_none());
+}
+
+/// M-6 (follow-up review): H10a's greedy-brace half was closed, but the
+/// "quoted and disowned" half only moved from bare prose into a fence. A
+/// fence is a quotation mark as easily as an answer, so the decision must be
+/// the LAST thing the reply says.
+#[test]
+fn parse_decision_refuses_a_fenced_block_the_model_disowns_afterwards() {
+    let disowned = "Here is an example of a verdict I am NOT issuing:\n\
+                    ```json\n\
+                    {\"verdicts\":[{\"id\":\"a-1\",\"pass\":true,\"evidence\":\"...\"}]}\n\
+                    ```\n\
+                    My actual verdict is FAIL.";
+    assert!(
+        kranz_engine::runner::parse_decision::<Verdicts>(disowned).is_none(),
+        "a fenced block the model disowns in trailing prose must fail closed"
+    );
+
+    // The taught shape (a lead-in, then the fence, then nothing) still
+    // parses; only trailing content is fatal.
+    let lead_in = "Here is my verdict:\n\
+                   ```json\n\
+                   {\"verdicts\":[{\"id\":\"a-1\",\"pass\":true,\"evidence\":\"...\"}]}\n\
+                   ```\n  \n";
+    assert_eq!(
+        kranz_engine::runner::parse_decision::<Verdicts>(lead_in)
+            .expect("a lead-in before the fence is fine")
+            .verdicts
+            .len(),
+        1
+    );
+}
+
+/// M-7 (follow-up review): a validator quoting a code snippet inside an
+/// `evidence` string value put backticks mid-line, the counting scan saw
+/// four fences, and a perfectly good verdict cost a retry and then landed on
+/// the caller's default. Fence state is per LINE, so mid-line backticks are
+/// just characters.
+#[test]
+fn parse_decision_accepts_json_whose_string_values_contain_backticks() {
+    let quoting = "```json\n\
+                   {\"verdicts\":[{\"id\":\"a-1\",\"pass\":false,\
+                   \"evidence\":\"the snippet ```rust fn main(){}``` never compiled\"}]}\n\
+                   ```";
+    let parsed = kranz_engine::runner::parse_decision::<Verdicts>(quoting)
+        .expect("backticks inside a JSON string value are not fences");
+    assert_eq!(parsed.verdicts.len(), 1);
+}
+
+/// The lenient parser stays for the worker/validator report channel, which is
+/// not a consent decision and where a report the model buries in prose is
+/// better recovered than dropped. `parse_decision` is the strict twin.
 #[test]
 fn parse_worker_report_strict_and_fallbacks() {
     let strict = worker_report_json().to_string();
@@ -1292,6 +1420,119 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
             ..
         } if m == "ms-1"
     )));
+}
+
+/// Worker-reported `commandsRun` is model-authored JSON with no human step,
+/// so it must not mint `Bash(...)` allow rules for the read-only validator
+/// (audit-exec M1). It stays in the prompt as a claim: the validator is told
+/// the worker says it ran these, and is told they are not permitted.
+#[tokio::test]
+async fn worker_reported_commands_never_become_validator_allow_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig {
+        allow_validator_commands: vec!["npm run lint".to_string()],
+        worker_isolation: WorkerIsolation::Checkout,
+        ..MissionConfig::default()
+    };
+    let contract = vec![assertion("a-1", Some("cargo test --all"))];
+    let worker_commands = vec!["bash -c".to_string(), "python3 -c".to_string()];
+
+    let report = json!({ "findings": [], "summary": "everything holds" });
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
+    run_validator(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        Role::ValidatorFunctional,
+        &milestone(),
+        &contract,
+        "abc123",
+        None,
+        None,
+        &[],
+        &[],
+        &worker_commands,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    let spec = &specs[0];
+    for forbidden in ["Bash(bash -c*)", "Bash(python3 -c*)"] {
+        assert!(
+            !spec.allowed_tools.iter().any(|a| a == forbidden),
+            "worker report minted {forbidden:?}: {:?}",
+            spec.allowed_tools
+        );
+    }
+    // The approved contract and operator config still grant theirs.
+    for expected in ["Bash(cargo test --all*)", "Bash(npm run lint*)"] {
+        assert!(
+            spec.allowed_tools.iter().any(|a| a == expected),
+            "lost {expected:?}: {:?}",
+            spec.allowed_tools
+        );
+    }
+    // Still visible to the validator, labelled as a claim.
+    match &spec.prompt {
+        PromptMode::SingleShot(task) => {
+            assert!(task.contains("bash -c"), "worker claim dropped from prompt");
+            assert!(
+                task.contains("worker reports"),
+                "worker claim not labelled as a claim: {task}"
+            );
+        }
+        other => panic!("validator must be single-shot, got {other:?}"),
+    }
+}
+
+/// A human-approved grant for a command the worker also reported still
+/// grants it: provenance is what changed, not the grant path.
+#[tokio::test]
+async fn granted_commands_still_allow_even_when_the_worker_reported_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig {
+        worker_isolation: WorkerIsolation::Checkout,
+        ..MissionConfig::default()
+    };
+    let report = json!({ "findings": [], "summary": "ok" });
+    let backend = MockBackend::with_scripts(vec![MockScript::single_shot_json(&report)]);
+    run_validator(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        Role::ValidatorFunctional,
+        &milestone(),
+        &[],
+        "abc123",
+        None,
+        None,
+        &["cargo fmt".to_string()],
+        &[],
+        &["cargo fmt".to_string()],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let specs = backend.started_specs();
+    assert!(
+        specs[0]
+            .allowed_tools
+            .iter()
+            .any(|a| a == "Bash(cargo fmt*)"),
+        "operator grant lost: {:?}",
+        specs[0].allowed_tools
+    );
 }
 
 #[tokio::test]

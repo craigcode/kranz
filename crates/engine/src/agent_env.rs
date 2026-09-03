@@ -368,7 +368,7 @@ fn os_account_home() -> Option<PathBuf> {
 /// only when the platform-native source is unavailable. The generated child
 /// environment redirects both HOME and USERPROFILE later; this lookup happens
 /// first against the engine's operator environment. See [`os_account_home`].
-fn operator_home() -> Option<PathBuf> {
+pub(crate) fn operator_home() -> Option<PathBuf> {
     #[cfg(unix)]
     if let Some(home) = os_account_home() {
         return Some(home);
@@ -497,6 +497,55 @@ pub fn sanitized_child_env(
         // leaving them unset hangs children in opaque ways (89f05a1 CI).
         redirect_windows_profile_env(&mut env, base_home);
     }
+    for (key, value) in extra {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
+/// The cleared environment a BINARY PROBE spawns with (2026-09-01
+/// adversarial audit, H5).
+///
+/// Every session spawn is `env_clear`'d from the allowlist above; the
+/// discovery and readiness probes were the one exception, so a
+/// repo-named `claudeBinary` or a PATH-precedence shadow of
+/// `claude`/`codex`/`droid`/`kimi`/`cursor` received the operator's whole
+/// environment — `GH_TOKEN`, `SLACK_*`, `AWS_*`, every API key — on its
+/// first `--version` invocation, before any auth decision.
+///
+/// Deliberately NOT [`sanitized_child_env`]: that builder relocates `HOME`
+/// to a scratch dir and seeds a cache-only Cargo home, which would copy the
+/// registry for a `--version` call AND would make every login probe report
+/// "not logged in" (`claude auth status` and its siblings read the
+/// operator's real config). The probe env is therefore the allowlist
+/// WITHOUT the relocation: `PATH`, the real `HOME`/`USERPROFILE`, the
+/// ambient locale/identity vars ([`AMBIENT_LOCALE_VARS`] — `USER` alone is
+/// what the claude CLI's keychain OAuth resolution needs), the system temp
+/// dir, and on Windows the process bootstrap set
+/// ([`AMBIENT_WINDOWS_VARS`]) without which process creation fails.
+/// `extra` carries the ONE ambient auth var a login probe may need, named
+/// by its caller. Nothing else crosses.
+pub(crate) fn probe_child_env(extra: &[(String, String)]) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(key.to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    for key in AMBIENT_LOCALE_VARS {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    let temp = std::env::temp_dir().display().to_string();
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        env.insert(key.to_string(), temp.clone());
+    }
+    #[cfg(windows)]
+    extend_windows_process_env(&mut env);
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());
     }

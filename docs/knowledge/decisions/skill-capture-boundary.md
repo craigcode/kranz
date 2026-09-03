@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-01
+last_verified: 2026-09-03
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -68,7 +68,12 @@ directory — the human copies or a separate approved install step does.
 ## What this does not change
 
 - Lessons, knowledge injection, packs, Flight Rules, and corpus export
-  stay. They are evidence and governance, not skill capture.
+  stay. They are evidence and governance, not skill capture. Being evidence is
+  a claim kranz has to hold up: a lesson's provenance check now compares the
+  working-tree bytes (`lessons::read_lesson_from_worktree`) against the blob in
+  the commit it verified, so a lesson whose content was overwritten after the
+  engine committed it is dropped rather than injected (the 2026-09-01
+  adversarial audit, H14).
 - Dispatch adapters (`AgentBackend`) stay. They translate; they do not
   author prompt libraries.
 - Consumer CLIs may keep their own skills. Kranz does not manage them.

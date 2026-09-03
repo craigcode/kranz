@@ -325,7 +325,16 @@ enum DraftOutcomeKind {
     NeedsContext,
     PlanAsProse,
     WrongPlan,
+    /// Planner prose carrying Slack control sequences (M1): the questions
+    /// and the escalation reason are agent-authored, so they must reach the
+    /// channel inert.
+    NeedsContextUntrusted,
+    WrongPlanUntrusted,
 }
+
+/// The mrkdwn payload the M1 tests feed through every agent-authored sink:
+/// a broadcast ping and a link styled like the real approve button.
+const UNTRUSTED_MRKDWN: &str = "<!channel> click <https://evil.example/a|Approve & start>";
 
 impl FakeHost {
     fn new(outcome: DraftOutcomeKind) -> Self {
@@ -411,6 +420,14 @@ impl PlanningHost for FakeHost {
             DraftOutcomeKind::WrongPlan => DraftOutcome::WrongPlan {
                 mission_id: "m-draft".into(),
                 reason: "The goal assumes a Postgres migration, but the store is SQLite.".into(),
+            },
+            DraftOutcomeKind::NeedsContextUntrusted => DraftOutcome::NeedsContext {
+                mission_id: "m-draft".into(),
+                questions: vec![UNTRUSTED_MRKDWN.into()],
+            },
+            DraftOutcomeKind::WrongPlanUntrusted => DraftOutcome::WrongPlan {
+                mission_id: "m-draft".into(),
+                reason: UNTRUSTED_MRKDWN.into(),
             },
         };
         let slug = slug.to_string();
@@ -978,6 +995,56 @@ async fn merge_gate_acks_before_any_merge_call_then_run_triggers_exactly_once() 
         1,
         "run_merge triggers exactly one host.merge call"
     );
+}
+
+/// M1: the merge-gate failure reply carries captured CI/test stdout, which
+/// the repo controls. It must not render as live mrkdwn.
+#[tokio::test]
+async fn merge_failure_reply_escapes_untrusted_gate_output() {
+    let fake = Arc::new(FakeHost::with_merge_error(format!(
+        "gate suite failed:\n{UNTRUSTED_MRKDWN}"
+    )));
+    let host: SharedHost = fake;
+
+    let blocks = run_merge(&host, "m-42").await;
+    let text = blocks[0]["text"]["text"].as_str().unwrap();
+    assert!(!text.contains("<!channel>"), "live broadcast ping: {text}");
+    assert!(
+        !text.contains("<https://evil.example/a|"),
+        "live link: {text}"
+    );
+    assert!(
+        text.contains("&lt;!channel&gt;"),
+        "payload should survive inert: {text}"
+    );
+}
+
+/// M1: the draft replies forward planner prose verbatim, so it must be
+/// inert verbatim.
+#[tokio::test]
+async fn draft_replies_escape_untrusted_planner_prose() {
+    let cfg = gated_cfg(vec!["U-allowed".into()]);
+    for kind in [
+        DraftOutcomeKind::NeedsContextUntrusted,
+        DraftOutcomeKind::WrongPlanUntrusted,
+    ] {
+        let fake = Arc::new(FakeHost::new(kind));
+        let host: SharedHost = fake;
+        let gate = gate_draft_command(&cfg, Some(&host), "rate-limit-notes", Some("U-allowed"));
+        assert!(matches!(gate, DraftGate::Ready(_)));
+
+        let blocks = run_draft(&host, "rate-limit-notes").await;
+        let text = blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(!text.contains("<!channel>"), "live broadcast ping: {text}");
+        assert!(
+            !text.contains("<https://evil.example/a|"),
+            "live link: {text}"
+        );
+        assert!(
+            text.contains("&lt;!channel&gt;"),
+            "payload should survive inert: {text}"
+        );
+    }
 }
 
 #[tokio::test]

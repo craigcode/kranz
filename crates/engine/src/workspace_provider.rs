@@ -197,6 +197,34 @@ pub(crate) fn effective_teardown_mode(
     }
 }
 
+/// The OPERATOR-owned half of every gate command's environment, carried from
+/// mission config through [`ProvisionSpec`] onto the [`WorkspaceHandle`] so
+/// each of the four contract-declared command lanes (bootstrap, readiness,
+/// data hooks, `disk.prune`) builds the same env from the same inputs.
+#[derive(Debug, Clone)]
+pub struct GateEnvPolicy {
+    /// The ONE scratch `HOME`/`TMPDIR`/`CARGO_HOME` every gate phase of this
+    /// mission run shares (follow-up review, M-1: a per-phase home deleted
+    /// bootstrap's output before readiness could see it).
+    pub home: PathBuf,
+    /// The operator's `contractEnvPassthrough` — the second party in the
+    /// two-party consent a contract `secrets[]` name needs before it crosses
+    /// (follow-up review, H-6). Operator-only by construction: the key is in
+    /// `config.rs`'s `PROJECT_LAYER_REFUSED`, so repo content cannot set it.
+    pub passthrough: Vec<String>,
+}
+
+impl GateEnvPolicy {
+    /// The policy for one mission run: the gate home under the mission's own
+    /// writable `runs/` dir, plus the operator's passthrough list.
+    pub fn for_mission(runtime_dir: &std::path::Path, passthrough: &[String]) -> Self {
+        Self {
+            home: crate::workspace_gate::mission_gate_home(runtime_dir),
+            passthrough: passthrough.to_vec(),
+        }
+    }
+}
+
 /// Everything a provider needs to provision one mission's workspace.
 #[derive(Debug, Clone)]
 pub struct ProvisionSpec {
@@ -218,6 +246,9 @@ pub struct ProvisionSpec {
     /// The workspace contract read from the live base branch, when present
     /// (`None` = today's worktree-only behavior, readiness trivially ready).
     pub contract: Option<WorkspaceContract>,
+    /// The operator-owned gate env inputs every provider copies onto its
+    /// handle (see [`GateEnvPolicy`]).
+    pub gate_env: GateEnvPolicy,
 }
 
 /// A contracted preview with its URL template UNFILLED — the services behind
@@ -258,6 +289,11 @@ pub struct WorkspaceHandle {
     /// name-matched previews, poll outcome); `None` for local kinds and
     /// contract-less provisions.
     pub remote: Option<crate::workspace_remote::RemoteWorkspace>,
+    /// The operator-owned gate env inputs, copied from the spec: the shared
+    /// gate HOME and the operator's `contractEnvPassthrough`. Every gate
+    /// command lane builds its env from this plus [`Self::env`] and the
+    /// contract (see `workspace_gate::gate_command_env`).
+    pub gate_env: GateEnvPolicy,
 }
 
 /// What `readiness` concluded. `Ready` = spend may start (no contract, or
@@ -329,10 +365,14 @@ pub trait WorkspaceProvider: Send + Sync {
     /// hooks. Returns the failing [`CommandOutcome`] only on failure.
     ///
     /// The default runs the command with the gate's env discipline (the
-    /// shared bounded shell runner in the handle's cwd, inherited env plus
-    /// the handle's env — never a new secrets channel). The container
-    /// provider overrides to exec INSIDE the container network, so data
-    /// hooks never run on the host when a container workspace exists.
+    /// shared bounded shell runner in the handle's cwd, with the CLEARED
+    /// gate env `workspace_gate::gate_command_env` builds — the handle's env,
+    /// the mission's shared gate HOME, the fixed operational allowlist, and
+    /// only those `secrets[]` names the OPERATOR also granted; never the
+    /// engine's ambient environment; 2026-09-01 adversarial audit H4,
+    /// follow-up review H-6/M-1/M-2). The
+    /// container provider overrides to exec INSIDE the container network, so
+    /// data hooks never run on the host when a container workspace exists.
     async fn run_data_hook(
         &self,
         handle: &WorkspaceHandle,
@@ -340,8 +380,13 @@ pub trait WorkspaceProvider: Send + Sync {
         command: &str,
         progress: &mut ProgressSink<'_>,
     ) -> Result<Option<CommandOutcome>> {
+        let env = crate::workspace_gate::gate_command_env(
+            &handle.gate_env,
+            &handle.env,
+            handle.contract.as_ref(),
+        );
         let (code, output_tail) =
-            crate::command_exec::run_shell_command_with_code(&handle.cwd, command, &handle.env)
+            crate::command_exec::run_shell_command_with_code_cleared(&handle.cwd, command, &env)
                 .await;
         crate::workspace_data::hook_outcome(hook, command, code, output_tail, progress)
     }
@@ -466,6 +511,7 @@ impl WorkspaceProvider for LocalWorktreeProvider {
             detail: None,
             container: None,
             remote: None,
+            gate_env: spec.gate_env.clone(),
         })
     }
 
@@ -502,10 +548,13 @@ impl WorkspaceProvider for LocalWorktreeProvider {
         }
 
         // 1. bootstrap — ordered, stop at first failure. Commands run with
-        //    the same env discipline as validation-contract commands:
-        //    inherited env plus the handle's `KRANZ_BASE_SHA` (bootstrap
-        //    needs real toolchain/registry env; the merge gates' stripped
-        //    env is deliberately NOT used here).
+        //    the same CLEARED env discipline as validation-contract commands
+        //    (`workspace_gate::gate_command_env`): the mission's shared gate
+        //    HOME, the toolchain cache locations, the handle's
+        //    `KRANZ_BASE_SHA`, the fixed operational allowlist, and only the
+        //    `secrets[]` names the operator also granted. Both clauses of the
+        //    old comment here ("inherited env", "the merge gates' stripped
+        //    env is deliberately NOT used") stopped being true with H4.
         if let Some(failed) = run_gate_phase(
             &GatePhase {
                 kind: "bootstrap command",
@@ -600,7 +649,14 @@ async fn run_gate_phase(
         ),
         None,
     )?;
-    let outcomes = workspace_gate::run_gate_commands(&handle.cwd, phase, &handle.env).await;
+    let outcomes = workspace_gate::run_gate_commands(
+        &handle.cwd,
+        phase,
+        &handle.gate_env,
+        &handle.env,
+        handle.contract.as_ref(),
+    )
+    .await;
     report_gate_outcomes(phase, outcomes, progress)
 }
 
@@ -661,10 +717,22 @@ impl MissionEngine {
         let base_branch = self.state.mission.base_branch.clone();
         let contract =
             crate::workspace_contract::load_workspace_contract_at_ref(&self.repo, &base_branch)?;
+        let runtime_dir = self.paths.mission_dir();
+        // The operator's `contractEnvPassthrough` is the second party in the
+        // two-party consent a contract `secrets[]` name needs (follow-up
+        // review, H-6): repo content declares what its commands need, the
+        // operator declares what may leave the host, and only the
+        // intersection crosses. The key is operator-only by construction —
+        // `config.rs`'s PROJECT_LAYER_REFUSED rejects it from the project
+        // layer for exactly this reason.
         let spec = ProvisionSpec {
             mission_id: self.state.mission.id.clone(),
             repo_root: self.active_root().to_path_buf(),
-            runtime_dir: self.paths.mission_dir(),
+            gate_env: GateEnvPolicy::for_mission(
+                &runtime_dir,
+                &self.state.config.contract_env_passthrough,
+            ),
+            runtime_dir,
             base_sha: self.state.mission.base_sha.clone(),
             contract,
         };
@@ -782,6 +850,12 @@ impl MissionEngine {
         let Some(handle) = self.workspace_handle.take() else {
             return; // never provisioned this run (e.g. resolve/provision failed)
         };
+        // The mission's ONE shared gate home (follow-up review, M-1) is
+        // removed HERE, not per phase: teardown is the last point any
+        // contract-declared command can fire (`disk.prune` runs inside the
+        // provider call below), so anything earlier would delete a home a
+        // later phase still needs.
+        let gate_home = handle.gate_env.home.clone();
         let state = match provider.teardown(handle, mode).await {
             Ok(()) => mode.success_state(),
             Err(e) => {
@@ -803,6 +877,7 @@ impl MissionEngine {
                 "failed"
             }
         };
+        workspace_gate::remove_gate_home(&gate_home);
         if let Err(e) = self.emit(EventKind::WorkspaceTeardown {
             mode: mode.as_str().to_string(),
             state: Some(state.to_string()),
@@ -842,9 +917,20 @@ mod tests {
         base_sha: Option<&str>,
         contract: Option<WorkspaceContract>,
     ) -> ProvisionSpec {
+        spec_with_passthrough(root, base_sha, contract, &[])
+    }
+
+    fn spec_with_passthrough(
+        root: PathBuf,
+        base_sha: Option<&str>,
+        contract: Option<WorkspaceContract>,
+        passthrough: &[String],
+    ) -> ProvisionSpec {
+        let runtime_dir = root.join(".kranz").join("missions").join("m-test");
         ProvisionSpec {
             mission_id: "m-test".to_string(),
-            runtime_dir: root.join(".kranz").join("missions").join("m-test"),
+            gate_env: GateEnvPolicy::for_mission(&runtime_dir, passthrough),
+            runtime_dir,
             repo_root: root,
             base_sha: base_sha.map(|s| s.to_string()),
             contract,
@@ -1323,6 +1409,183 @@ mod tests {
                 "workspace readiness: running 1 checks",
                 "workspace readiness: 1/1 checks ok",
             ]
+        );
+    }
+
+    /// H4 (2026-09-01 adversarial audit): workspace bootstrap / readiness /
+    /// data-hook commands ran with `clear_env = false`, so
+    /// `.kranz/workspace.json` — which executes at mission start, before any
+    /// agent spawns, and which a merged worker commit can edit — got every
+    /// ambient credential the engine holds. The contract's `secrets[]` list
+    /// was the stated justification but filtered nothing: it was referenced
+    /// only by the remote provider.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_commands_see_only_the_contracts_declared_secrets() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("KRANZ_SECRET_TEST", "undeclared-and-must-not-cross"),
+            ("GH_TOKEN", "ghp_poison"),
+            ("DATABASE_URL", "postgres://declared"),
+        ]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "secrets": ["DATABASE_URL"],
+                "readiness": [
+                  "test -z \"$KRANZ_SECRET_TEST\"",
+                  "test -z \"$GH_TOKEN\"",
+                  "test \"$DATABASE_URL\" = 'postgres://declared'"
+                ]
+            }"#,
+        );
+        // H-6 (follow-up review): the contract's declaration is only the
+        // FIRST party. `DATABASE_URL` crosses because the OPERATOR's
+        // `contractEnvPassthrough` names it too; `GH_TOKEN` is not on that
+        // list, so a contract that named it would still get nothing.
+        let handle = LocalWorktreeProvider
+            .provision(&spec_with_passthrough(
+                dir.path().to_path_buf(),
+                None,
+                Some(contract),
+                &["DATABASE_URL".to_string()],
+            ))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        assert!(
+            matches!(outcome, ReadinessOutcome::Ready),
+            "undeclared ambient secrets must not cross, the two-party one must: {outcome:?}"
+        );
+    }
+
+    /// H-6 (follow-up review): a contract that names a credential the
+    /// OPERATOR never granted gets nothing — repo content cannot choose which
+    /// ambient credentials cross. `.kranz/workspace.json` runs at mission
+    /// start, before any agent spawns, and is ordinary repo content a merged
+    /// worker commit can edit, so its `secrets[]` is an attacker-choosable
+    /// list; the operator's `contractEnvPassthrough` is the second party.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_repo_declared_secret_the_operator_never_granted_does_not_cross() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[("GH_TOKEN", "ghp_poison")]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "secrets": ["GH_TOKEN"],
+                "readiness": ["test -z \"$GH_TOKEN\""]
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        assert!(
+            matches!(outcome, ReadinessOutcome::Ready),
+            "the repo named GH_TOKEN and the operator did not, so it must not cross: {outcome:?}"
+        );
+    }
+
+    /// M-1 (follow-up review): every gate phase used to get a FRESH
+    /// deleted-on-drop `HOME`, so a bootstrap that installed a toolchain
+    /// (`rustup toolchain install`, `pnpm setup && pnpm install -g turbo`)
+    /// had its work deleted before readiness ran, and the mission blocked on
+    /// a readiness failure the operator could not reproduce by hand. The
+    /// phases now share one home per mission run, under the mission's own
+    /// writable `runs/` dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_output_in_home_survives_into_readiness_and_the_data_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "bootstrap": ["mkdir -p \"$HOME/bin\" && echo installed > \"$HOME/bin/turbo\""],
+                "readiness": ["test -f \"$HOME/bin/turbo\""],
+                "data": {
+                  "migrate": "true",
+                  "skewCheck": "test -f \"$HOME/bin/turbo\""
+                }
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let outcome = LocalWorktreeProvider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+
+        assert!(
+            matches!(outcome, ReadinessOutcome::Ready),
+            "readiness and the skewCheck hook must see what bootstrap installed in HOME: \
+             {outcome:?}"
+        );
+        assert_eq!(
+            handle.gate_env.home,
+            dir.path()
+                .join(".kranz")
+                .join("missions")
+                .join("m-test")
+                .join("runs")
+                .join("workspace-gate"),
+            "the shared home lives under the mission's own writable runs/ dir"
+        );
+        assert!(
+            handle.gate_env.home.join("bin").join("turbo").is_file(),
+            "the home outlives the phases; teardown is what removes it"
+        );
+    }
+
+    /// The same discipline on the golden-data hook path, which shares the
+    /// gate's env and was the third command shape H4 named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn data_hooks_see_only_the_contracts_declared_secrets() {
+        let _guard =
+            crate::agent_env::EnvTestGuard::engage(&[("KRANZ_SECRET_TEST", "must-not-cross")]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "data": {"clone": "test -z \"$KRANZ_SECRET_TEST\""}
+            }"#,
+        );
+        let handle = LocalWorktreeProvider
+            .provision(&spec(dir.path().to_path_buf(), None, Some(contract)))
+            .await
+            .expect("provision");
+        let mut progress = Progress::default();
+        let failed = LocalWorktreeProvider
+            .run_data_hook(
+                &handle,
+                crate::workspace_data::DataHookKind::Clone,
+                "test -z \"$KRANZ_SECRET_TEST\"",
+                &mut progress.sink(),
+            )
+            .await
+            .expect("hook ran");
+
+        assert!(
+            failed.is_none(),
+            "an ambient secret reached the data hook: {failed:?}"
         );
     }
 

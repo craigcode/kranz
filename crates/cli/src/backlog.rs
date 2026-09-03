@@ -188,47 +188,58 @@ pub fn render_ticket_ready(
 /// terminal label, and any "needs context" / "wrong plan" block appended to
 /// the ticket body.
 pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
+    // Ticket prose is unauthenticated tree data and the "needs context" /
+    // "wrong plan" blocks are planner-authored, so every interpolated field
+    // goes through the control-character filter (H9).
+    let clean = output::sanitize_untrusted;
     let mut out = String::new();
-    out.push_str(&format!("ticket {} [{}]\n", ticket.slug, label));
-    out.push_str(&format!("  title:    {}\n", ticket.title));
+    out.push_str(&format!("ticket {} [{}]\n", clean(&ticket.slug), label));
+    out.push_str(&format!("  title:    {}\n", clean(&ticket.title)));
     out.push_str(&format!("  priority: {}\n", ticket.priority));
     out.push_str(&format!("  schedule: {:?}\n", ticket.schedule));
     if let Some(budget) = ticket.max_budget_usd {
         out.push_str(&format!("  budget:   ${budget:.2}\n"));
     }
     if !ticket.repo_refs.is_empty() {
-        out.push_str(&format!("  refs:     {}\n", ticket.repo_refs.join(", ")));
+        out.push_str(&format!(
+            "  refs:     {}\n",
+            clean(&ticket.repo_refs.join(", "))
+        ));
     }
     if !ticket.blocked_by.is_empty() {
-        out.push_str(&format!("  blocked-by: {}\n", ticket.blocked_by.join(", ")));
+        out.push_str(&format!(
+            "  blocked-by: {}\n",
+            clean(&ticket.blocked_by.join(", "))
+        ));
     }
 
     if !ticket.goal.trim().is_empty() {
         out.push_str("\n## Goal\n");
-        out.push_str(ticket.goal.trim());
+        out.push_str(clean(ticket.goal.trim()).trim());
         out.push('\n');
     }
     if !ticket.context.trim().is_empty() {
         out.push_str("\n## Context\n");
-        out.push_str(ticket.context.trim());
+        out.push_str(clean(ticket.context.trim()).trim());
         out.push('\n');
     }
     if !ticket.scoping_answers.is_empty() {
         out.push_str("\n## Scoping answers\n");
         for item in &ticket.scoping_answers {
-            out.push_str(&format!("- {item}\n"));
+            out.push_str(&format!("- {}\n", clean(item)));
         }
     }
     if !ticket.acceptance_hints.is_empty() {
         out.push_str("\n## Acceptance hints\n");
         for item in &ticket.acceptance_hints {
-            out.push_str(&format!("- {item}\n"));
+            out.push_str(&format!("- {}\n", clean(item)));
         }
     }
 
     // The "needs context" questions are appended to the raw body by the engine;
     // surface them verbatim so `show` is enough to answer the ticket.
     if let Some(block) = section_block(&ticket.raw_body, "needs context") {
+        let block = clean(&block);
         out.push('\n');
         out.push_str(&block);
         if !block.ends_with('\n') {
@@ -238,6 +249,7 @@ pub fn render_ticket_show(ticket: &Ticket, label: &str) -> String {
     // Same for a draft-stage wrong-plan escalation: the planner's reason,
     // verbatim, so `show` is enough to reframe or re-scope the ticket.
     if let Some(block) = section_block(&ticket.raw_body, "wrong plan") {
+        let block = clean(&block);
         out.push('\n');
         out.push_str(&block);
         if !block.ends_with('\n') {
@@ -494,7 +506,7 @@ pub async fn cmd_draft(
         } => {
             println!("ticket '{slug}' needs context — the orchestrator asked:");
             for q in &questions {
-                println!("  - {q}");
+                println!("  - {}", output::sanitize_untrusted(q));
             }
             println!(
                 "answer them in {} then run `kranz draft {slug}` again.",
@@ -508,7 +520,7 @@ pub async fn cmd_draft(
                 "ticket '{slug}' WRONG-PLAN escalation (mission {mission_id}) — the planner \
                  can produce a plan but believes it is likely wrong:"
             );
-            println!("  {reason}");
+            println!("  {}", output::sanitize_untrusted(&reason));
             println!(
                 "edit or re-scope {} then run `kranz draft {slug}` again.",
                 Ticket::tickets_dir(&repo)

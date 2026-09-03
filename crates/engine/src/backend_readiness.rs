@@ -415,7 +415,7 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
                     .into(),
             ),
         };
-    match run_bounded(binary, args, Duration::from_secs(3)) {
+    match run_bounded(binary, args, Duration::from_secs(3), auth_env_for(kind)) {
         Ok((code, out)) => {
             let lower = out.to_ascii_lowercase();
             if kind == BackendKind::Kimi && lower.contains("no providers configured") {
@@ -459,18 +459,53 @@ fn probe_cli_login(binary: &Path, kind: BackendKind) -> AuthProbe {
     }
 }
 
+/// The ONE ambient var each backend's CLI may authenticate with — the same
+/// per-backend injection `agent_env::agent_session_env` performs for a
+/// session. A login probe that could not see it would report a
+/// key-authenticated operator as unauthenticated, so it is the single
+/// credential the cleared probe env carries ([`run_bounded`]).
+fn auth_env_for(kind: BackendKind) -> Option<&'static str> {
+    match kind {
+        BackendKind::Claude => Some("ANTHROPIC_API_KEY"),
+        BackendKind::Codex => Some("OPENAI_API_KEY"),
+        BackendKind::Cursor => Some("CURSOR_API_KEY"),
+        BackendKind::Kimi => Some("KIMI_API_KEY"),
+        BackendKind::Droid | BackendKind::Local | BackendKind::Acp => None,
+    }
+}
+
+/// Run one bounded readiness probe with a CLEARED environment (2026-09-01
+/// adversarial audit, H5): the discovery and readiness probes were the only
+/// children the engine spawned with the operator's whole environment, so a
+/// repo-named or PATH-shadowed CLI collected `GH_TOKEN`, `SLACK_*`, `AWS_*`
+/// and every API key on its first invocation. The probe env is
+/// `agent_env::probe_child_env` — the session allowlist WITHOUT the scratch
+/// relocation, because a login probe has to read the operator's real config
+/// to answer the question it is asked — plus `auth_env`, the one ambient
+/// credential this backend's CLI may authenticate with.
 fn run_bounded(
     binary: &Path,
     args: &[&str],
     timeout: Duration,
+    auth_env: Option<&str>,
 ) -> std::result::Result<(i32, String), String> {
     use std::process::{Command, Stdio};
+    let extra: Vec<(String, String)> = auth_env
+        .and_then(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.to_string(), value.to_string_lossy().into_owned()))
+        })
+        .into_iter()
+        .collect();
     let mut command = Command::new(binary);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(crate::agent_env::probe_child_env(&extra));
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let start = Instant::now();
     loop {
@@ -737,6 +772,78 @@ mod tests {
     fn local_role_with_invalid_base_url_is_unknown_not_panic() {
         let (status, _detail, _next_action) = probe_local_reachability(Some("not-a-url"));
         assert_eq!(status, ReadinessStatus::Unknown);
+    }
+
+    /// H5 (2026-09-01 adversarial audit), the readiness half: `run_bounded`
+    /// spawned the login probe with the engine's whole ambient environment,
+    /// so a PATH-shadowed `claude`/`codex`/`kimi`/`cursor` collected every
+    /// operator credential on its first invocation. Only the allowlist and
+    /// this backend's ONE auth var cross now.
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_spawns_with_a_cleared_env_carrying_only_its_auth_var() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("KRANZ_SECRET_TEST", "leaked-to-the-probe"),
+            ("GH_TOKEN", "ghp_poison"),
+            ("ANTHROPIC_API_KEY", "sk-ant-allowed"),
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("env-dumping-cli");
+        std::fs::write(&stub, "#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (code, dumped) = run_bounded(
+            &stub,
+            &["auth", "status"],
+            Duration::from_secs(5),
+            auth_env_for(BackendKind::Claude),
+        )
+        .unwrap();
+
+        assert_eq!(code, 0, "{dumped}");
+        for secret in ["KRANZ_SECRET_TEST", "GH_TOKEN"] {
+            assert!(
+                !dumped.contains(secret),
+                "{secret} reached the login probe:\n{dumped}"
+            );
+        }
+        // The one credential the CLI may authenticate with DOES cross, or a
+        // key-authenticated operator would be reported unauthenticated.
+        assert!(
+            dumped.contains("ANTHROPIC_API_KEY=sk-ant-allowed"),
+            "the backend's own auth var must reach its login probe:\n{dumped}"
+        );
+        // And HOME stays real: `claude auth status` reads the operator's own
+        // config to answer the question it is asked.
+        assert!(dumped.contains("HOME="), "{dumped}");
+    }
+
+    /// A backend with no auth-var convention carries none — the probe env is
+    /// then the bare allowlist.
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_without_an_auth_var_carries_no_credential() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard =
+            crate::agent_env::EnvTestGuard::engage(&[("ANTHROPIC_API_KEY", "sk-ant-poison")]);
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("env-dumping-cli");
+        std::fs::write(&stub, "#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_code, dumped) = run_bounded(
+            &stub,
+            &["--help"],
+            Duration::from_secs(5),
+            auth_env_for(BackendKind::Droid),
+        )
+        .unwrap();
+
+        assert!(!dumped.contains("ANTHROPIC_API_KEY"), "{dumped}");
     }
 
     #[test]

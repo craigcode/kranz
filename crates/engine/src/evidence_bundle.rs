@@ -35,7 +35,10 @@
 //!   reintroduces scrubbed values: `events.jsonl` crossed the redact-at-write
 //!   boundary when it was appended, and every derived file folds FROM it.
 //!   A log carrying `secret.redacted` audits yields a bundle with
-//!   fingerprints only (test-pinned).
+//!   fingerprints only (test-pinned). Artefact bytes are the one half that
+//!   did NOT cross a write boundary the engine controls — they are ordinary
+//!   files in a worker-writable tree — so [`read_artefact`] scrubs them here,
+//!   as text, and the manifest digests the redacted form (audit H5).
 //! - **Missing evidence is named, never omitted and never an error.** A
 //!   `file:` reference whose bytes are gone (a cleaned `runs/`, a pruned
 //!   mission) becomes a manifest entry marked `unresolved` carrying the
@@ -253,6 +256,21 @@ fn artefact_bundle_path(reference: &str) -> Option<String> {
 /// classifies unresolved, or whose read fails between classification and
 /// open (a racing prune), yields `(Unresolved, None)` — the bundle names
 /// the gap instead of failing.
+///
+/// The bytes cross [`crate::scrub`] on the way in (audit H5). `events.jsonl`
+/// was redacted at append time; artefacts are ordinary files in a tree a
+/// worker can write, so the bundle applies the boundary itself rather than
+/// inheriting a guarantee only the engine's own writers keep. Without this,
+/// planting a secret in a finished transcript put it in the package the
+/// module contract promises is scrubbed.
+///
+/// Artefacts are handled as TEXT: bytes are decoded lossily
+/// (`from_utf8_lossy`), scrubbed, and the scrubbed text is what ships and
+/// what the manifest digests. A binary artefact therefore travels with
+/// U+FFFD in place of its invalid bytes. That is deliberate: the alternative
+/// — passing non-UTF-8 through verbatim — makes one stray byte an opt-out of
+/// redaction, and every artefact the engine produces (JSONL transcripts,
+/// plan/report markdown, JSON) is text.
 fn read_artefact(mission_dir: &Path, reference: &str) -> (ArtefactStatus, Option<Vec<u8>>) {
     let ArtefactResolution::Resolved { path } = resolve_artefact(mission_dir, reference) else {
         return (ArtefactStatus::Unresolved, None);
@@ -263,7 +281,10 @@ fn read_artefact(mission_dir: &Path, reference: &str) -> (ArtefactStatus, Option
         Ok(bytes)
     });
     match read {
-        Ok(bytes) => (ArtefactStatus::Resolved, Some(bytes)),
+        Ok(bytes) => {
+            let scrubbed = crate::scrub::scrub(&String::from_utf8_lossy(&bytes));
+            (ArtefactStatus::Resolved, Some(scrubbed.into_bytes()))
+        }
         Err(_) => (ArtefactStatus::Unresolved, None),
     }
 }
@@ -328,7 +349,9 @@ fn render_summary(
         "Portable audit package (KRZ-326). Everything below derives from the mission's\n\
          append-only event log (`events.jsonl`, included verbatim — every line crossed\n\
          the redact-at-write boundary when appended) plus the mission-relative artefact\n\
-         bytes under `artefacts/`. References whose bytes were no longer on disk at\n\
+         bytes under `artefacts/`. Artefacts ship as scrubbed text: they are redacted\n\
+         at export (not at write), and any byte that is not valid UTF-8 travels as the\n\
+         replacement character. References whose bytes were no longer on disk at\n\
          export time are listed as `unresolved` in `manifest.json` — named, never\n\
          silently omitted.\n\n",
     );
@@ -1342,6 +1365,70 @@ mod tests {
         let log = String::from_utf8_lossy(&files[LOG_FILE]).to_string();
         assert!(log.contains(&fingerprint), "audit fingerprint missing");
         assert!(log.contains("[REDACTED]"));
+    }
+
+    /// Audit H5: artefact BYTES cross the same redact boundary the log
+    /// crossed at append time. A hostile writer who plants a secret straight
+    /// into a finished transcript (never through `append_redacting`) must not
+    /// get it into the package the operator hands an auditor, and the
+    /// manifest sha256 must be the digest of the REDACTED bytes so the
+    /// package still verifies against itself.
+    #[test]
+    fn evidence_bundle_scrubs_artefact_bytes_and_hashes_the_redacted_form() {
+        let tmp = TempDir::new().unwrap();
+        let secret = "sk-ant-F00barBazQuux9_7";
+        let paths = seed_full_mission(tmp.path());
+        // Overwrite a finished transcript the way a worker with write access
+        // to the mission dir would: raw bytes, no scrub on the way in.
+        let planted = format!("{{\"text\":\"the key is {secret} ok\"}}\n");
+        std::fs::write(paths.runs_dir().join("r-1.jsonl"), planted.as_bytes()).unwrap();
+
+        let out = tmp.path().join("bundle-artefact-secret");
+        export_evidence_bundle(tmp.path(), "m-1", &out).unwrap();
+        let files = collect_files(&out);
+        for (relative, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains(secret),
+                "secret value leaked into bundle file {relative}"
+            );
+        }
+        let shipped = &files["artefacts/runs/r-1.jsonl"];
+        assert!(String::from_utf8_lossy(shipped).contains("[REDACTED]"));
+
+        // The manifest digest is over the bytes the bundle actually ships.
+        let manifest: EvidenceManifest =
+            serde_json::from_str(&std::fs::read_to_string(out.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        let entry = manifest_entry(&manifest, "file:runs/r-1.jsonl");
+        assert_eq!(entry.sha256.as_deref(), Some(sha256_hex(shipped).as_str()));
+    }
+
+    /// A non-UTF-8 artefact still ships, as lossy-decoded scrubbed text: the
+    /// bundle has ONE rule for artefact bytes and an invalid byte must not be
+    /// a way to opt out of it.
+    #[test]
+    fn evidence_bundle_scrubs_non_utf8_artefact_bytes_lossily() {
+        let tmp = TempDir::new().unwrap();
+        let secret = "sk-ant-F00barBazQuux9_7";
+        let paths = seed_full_mission(tmp.path());
+        let mut planted = format!("the key is {secret} ok").into_bytes();
+        planted.push(0xff);
+        std::fs::write(paths.runs_dir().join("r-1.jsonl"), &planted).unwrap();
+
+        let bundle = assemble_evidence_bundle(tmp.path(), "m-1").unwrap();
+        let shipped = bundle
+            .files
+            .iter()
+            .find(|file| file.path == "artefacts/runs/r-1.jsonl")
+            .expect("artefact shipped");
+        let text = String::from_utf8(shipped.bytes.clone()).expect("lossy decode yields UTF-8");
+        assert!(!text.contains(secret));
+        assert!(text.contains("[REDACTED]"));
+        assert!(
+            text.contains('\u{fffd}'),
+            "invalid byte became a replacement"
+        );
     }
 
     /// Ticket acceptance hint 4: with `runs/` pruned, every file-backed gate

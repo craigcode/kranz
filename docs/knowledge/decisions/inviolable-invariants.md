@@ -2,9 +2,11 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-01
+last_verified: 2026-09-03
 verified_against:
   - crates/engine/src/sandbox_container.rs
+  - crates/engine/src/control.rs
+  - crates/engine/src/paths.rs
   - AGENTS.md
   - docs/design.md
   - crates/engine/src/git_ops.rs
@@ -43,7 +45,10 @@ and its sole non-test caller is [exec.rs](../../../crates/cli/src/exec.rs)
 [git_ops.rs](../../../crates/engine/src/git_ops.rs) `push_mission_branch`
 refuses anything that is not a `kranz/*` ref, and rejects a `:`, leading `-`,
 or whitespace (no `--force`, no `src:dst` refspec, no `main`, no merge) **before
-any git process runs**. [merge.rs](../../../crates/engine/src/merge.rs) states
+any git process runs**. The handle it runs on is hardened like every other
+(below), so the tree the worker just wrote cannot answer the push with a
+`pre-push` hook or a planted `core.sshCommand`.
+[merge.rs](../../../crates/engine/src/merge.rs) states
 in its module doc that the gated merge never calls push — the base branch is
 only ever advanced locally.
 
@@ -58,7 +63,7 @@ WHY: incident m-660ffc — a contract's `git diff main` assertion raced a commit
 landing on the base branch mid-mission (design.md deviation 6). Re-resolving the
 base anywhere after approval reintroduces that race.
 
-## The event log is append-only, single-writer, redact-at-write
+## The event log is append-only, single-writer, redact-at-write, sealed
 
 One engine process owns `events.jsonl` at a time via a lock file
 ([event_log.rs](../../../crates/engine/src/event_log.rs) `EventLog::acquire`).
@@ -72,6 +77,50 @@ WHY: two writers on one log corrupt it, so the liveness probe carries a hard
 rule — **anything uncertain must NEVER report Dead** (a false Dead lets two
 engines write one log). Stealing a provably-live lock needs
 `--dangerously-steal-live-lock` (design.md "Cross-process control").
+
+Since the 2026-09-01 adversarial audit the log is also **sealed**. Every line a
+keyed writer produces carries `h` (a sha256 chain over the previous `h` and the
+event's canonical bytes) and `m` (an HMAC of `h` under the repository authority
+key); `parse_log_bytes` verifies both, so every reader inherits the check.
+Unsealed lines are refused at or above the mission's out-of-repo seal floor,
+integrity may never be dropped mid-log, and `resume` refuses a log that ends
+below the recorded high-water mark. WHY: three gate decisions read the log back
+mid-run, so a forged append or a rollback by truncation is a live consent
+bypass, not only an audit gap.
+
+## The consent substrate is authenticated, and its key lives outside the repo
+
+The control inbox (`.kranz/missions/<id>/control/*.json`) carries operator
+consent: grant approvals, revision decisions, answers, config changes. Every
+file therefore carries a `sig` HMAC over the mission id and the command's
+canonical JSON ([control.rs](../../../crates/engine/src/control.rs)); `drain`
+and `peek_interrupt` verify it in constant time and quarantine anything
+unsigned or wrongly signed to `.bad` without applying it. The key that signs
+control files and MACs the log is per-repository and lives OUTSIDE the
+repository, under the global kranz dir (`$KRANZ_HOME`, else `~/.kranz`), at
+`keys/<repo fingerprint>.key`, mode `0600` in a `0700` dir
+([paths.rs](../../../crates/engine/src/paths.rs)). Seal floors and high-water
+marks sit beside it.
+WHY: it was a plain directory any process with repo write access could drop a
+file into, which made forging a human approval a one-file operation for a
+worker, a validator, or any gate command (the 2026-09-01 adversarial audit,
+C1). Never move this key inside the repo, and never widen the sandbox denies
+that cover its directory. A key an agent can read or replace proves nothing.
+
+## Engine-side git is hardened by default
+
+`GitRepo::open` ([git_ops.rs](../../../crates/engine/src/git_ops.rs)) returns a
+handle that neutralizes executable git configuration (hooks, `core.fsmonitor`,
+filter drivers, `gpg.program`) and ignores user and system config scope.
+`open_unhardened` is the explicit escape hatch, with no engine caller, and
+`ensure_identity` pins the operator's resolved `user.name`/`user.email` into
+local scope so hardened invocations do not restamp commits.
+WHY: engine-side git runs in the tree the worker controls, at the integration
+worktree handle, the per-feature checkpoint commit, and the push. An unhardened
+handle would execute a planted `pre-commit` or `core.sshCommand` outside every
+sandbox with the engine's full ambient environment. Hardening was previously
+opt-in at a handful of sites; the sites that forgot were the hole (the
+2026-09-01 adversarial audit, H3). Invert this back and the hole returns.
 
 ## A mission must deliver (empty-deliverable gate)
 
@@ -126,3 +175,17 @@ untouched (AGENTS.md rules 1–3).
   without a continuous CI receipt must pass a bind-mount round trip before
   either a session or a gate resolves
   ([sandbox_container.rs](../../../crates/engine/src/sandbox_container.rs)).
+- **Authority material is write-denied, not only read-denied**: every path the
+  read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
+  `tickets/`, `lessons/`, `hook-status/`), every SIBLING mission dir, the
+  global key and seal dirs, and the session cwd's `.git` config-and-hook
+  surface. Seatbelt also seals the direct children of `<repo>/.kranz` and
+  `.kranz/missions` and denies the operator's own tty read, write and ioctl;
+  bwrap unshares pid, ipc, uts and cgroup and takes `--new-session`
+  unconditionally; the container tier carries the relay's `--user`,
+  `--cap-drop ALL`, `no-new-privileges` and `--pids-limit`, and mounts only the
+  Cargo cache subdirs rather than the credential-bearing `$CARGO_HOME` root.
+  WHY: under `workerIsolation: "checkout"` the session cwd is the repo root, so
+  a contained worker could once overwrite the trust root it could not read, or
+  forge approvals into a sibling mission's inbox (the 2026-09-01 adversarial
+  audit, H2/H3/H7/H8/H11/H12).

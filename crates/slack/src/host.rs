@@ -34,6 +34,19 @@ pub enum PlanOutcome {
     NotReady(String),
 }
 
+/// What [`PlanningHost::approve_pending_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovePendingOutcome {
+    /// Committed; carries the mission branch.
+    Approved(String),
+    /// Nothing parked: never requested, or forfeited by a serve restart or
+    /// an idle release. The bridge's state-aware routing takes over.
+    NothingParked,
+    /// A plan IS parked and it is not the one the clicked card displayed.
+    /// Carries the PARKED identity so the refusal can name both.
+    StalePlan { parked: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct AskOutcome {
     pub answer: String,
@@ -71,6 +84,67 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// restart / idle release — re-run `/kranz plan`). A failed approve
     /// re-parks the plan so a retry can fire.
     fn approve_pending<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<String>>>;
+
+    /// The identity ([`crate::format::plan_identity`]) of the plan currently
+    /// parked for `id`, without consuming it. The bridge compares it to the
+    /// identity the clicked card carries, so an Approve on a card that has
+    /// been superseded by a re-plan is refused instead of committing a plan
+    /// nobody reviewed (M2).
+    ///
+    /// `Ok(None)` means nothing is parked, or this host cannot report an
+    /// identity — the check then degrades to the old mission-id binding, so
+    /// an implementation that leaves the default in place is no worse than
+    /// before, just unprotected.
+    fn pending_plan_identity<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        let _ = id;
+        Box::pin(async { Ok(None) })
+    }
+
+    /// [`Self::approve_pending`] fused with the identity check, in ONE host
+    /// lock acquisition.
+    ///
+    /// Threat (follow-up review M-13): reading
+    /// [`Self::pending_plan_identity`] and then calling
+    /// [`Self::approve_pending`] is check-then-act across two independent
+    /// lock takes, and the bridge runs its slow actions concurrently on
+    /// spawned tasks (`Approve`, `ApproveStart` and `RequestPlan` are all
+    /// slow). A `/kranz plan` or a web-UI approve landing between the two
+    /// commits a plan the clicker never reviewed, precisely what the
+    /// identity binding exists to prevent.
+    ///
+    /// `expected_identity` is what the CLICKED CARD displayed. `None` means
+    /// the card names no plan at all (it predates plan-bound approve), which
+    /// cannot match anything: a parked plan is then a
+    /// [`ApprovePendingOutcome::StalePlan`], because which plan its reviewer
+    /// read is unknowable and guessing is the bug.
+    ///
+    /// The default composes the two calls and is therefore still racy. It
+    /// exists so a host that cannot do better (a test fake) is no worse than
+    /// before. `kranz serve`'s adapter overrides it with the atomic version.
+    fn approve_pending_if<'a>(
+        &'a self,
+        id: &'a str,
+        expected_identity: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<ApprovePendingOutcome>> {
+        Box::pin(async move {
+            let committed = |branch: Option<String>| match branch {
+                Some(branch) => ApprovePendingOutcome::Approved(branch),
+                None => ApprovePendingOutcome::NothingParked,
+            };
+            match self.pending_plan_identity(id).await? {
+                // Nothing parked, or a host that cannot report an identity:
+                // degrade to the old mission-id binding.
+                None => Ok(committed(self.approve_pending(id).await?)),
+                Some(parked) if Some(parked.as_str()) == expected_identity => {
+                    Ok(committed(self.approve_pending(id).await?))
+                }
+                Some(parked) => Ok(ApprovePendingOutcome::StalePlan { parked }),
+            }
+        })
+    }
 
     /// Start execution: the host consumes the engine into a background run.
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
