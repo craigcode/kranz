@@ -1828,7 +1828,7 @@ pub fn bubblewrap_args(
         .collect();
     let is_masked = |path: &Path| -> bool {
         let abs = lexical_absolute(path);
-        masked_files.iter().any(|m| *m == abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
+        masked_files.contains(&abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
     };
     let authority_writes = authority_write_denies(inputs);
     let git_writes = git_metadata_write_denies(inputs);
@@ -2968,7 +2968,6 @@ mod tests {
     /// ro-bound over itself (readable, unwritable), and the `.git` DIRECTORY
     /// node is deliberately excluded — binding it whole would close the index
     /// the worker's own `git commit` writes.
-    #[test]
     /// Later binds win in bwrap. A read-denied file is closed by its
     /// /dev/null mask; a self ro-bind of the same path emitted afterwards
     /// would put the real content back. Every masked path must therefore be
@@ -3004,6 +3003,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn bubblewrap_args_ro_bind_authority_and_git_write_denies() {
         let (repo, mission) = authority_write_fixture();
         let tmp = tempfile::tempdir().unwrap();
