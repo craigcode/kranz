@@ -42,6 +42,7 @@ fn block_actions_approve_fixture_routes_to_approve() {
         routed.action,
         Action::Approve {
             mission_id: "m-42".into(),
+            plan_identity: None,
             user_id: Some("U0263M3QW".into()),
             response_url: Some("https://hooks.slack.com/actions/T024BE7LD/1234/abcd".into()),
         }

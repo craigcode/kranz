@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -166,13 +167,22 @@ pub(crate) async fn cost_per_merged_change(
 
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
 /// (never created here — callers only read the catalog).
+///
+/// No-follow, like every other repo file this crate reads: the catalog lives
+/// in a worker-writable tree and a symlinked `index.md` must read as absent,
+/// not as whatever it points at.
 fn read_missions_index(repo_root: &Path) -> String {
-    std::fs::read_to_string(
-        MissionPaths::new(repo_root, "_")
-            .missions_dir()
-            .join("index.md"),
-    )
-    .unwrap_or_default()
+    let path = MissionPaths::new(repo_root, "_")
+        .missions_dir()
+        .join("index.md");
+    let Ok(mut file) = kranz_engine::paths::open_read_nofollow(&path) else {
+        return String::new();
+    };
+    let mut content = String::new();
+    match file.read_to_string(&mut content) {
+        Ok(_) => content,
+        Err(_) => String::new(),
+    }
 }
 
 /// `GET /api/missions/:id/state` — full [`MissionState`], folded from
@@ -1252,13 +1262,39 @@ fn simple_line_diff(old_name: &str, new_name: &str, old: &str, new: &str) -> Str
     diff
 }
 
+/// Read one mission leaf file (`plan.json`, `plan.md`, `report.md`, a run
+/// transcript) NO-FOLLOW.
+///
+/// `mission_paths` pins the directory chain, but the leaf used to be a plain
+/// `read_to_string`, which follows symlinks: under checkout isolation a
+/// session could replace `plan.md` with a link to `.kranz/serve.token` and
+/// read the mutation token back over a tokenless loopback GET, defeating the
+/// sandbox's own read-deny on that file. Every leaf read goes through the
+/// engine's no-follow open now — the same helper `EventLog` uses. A refusal
+/// is a 404, like a missing file: the API says nothing about what the link
+/// pointed at.
 fn read_file_or_404(
     path: &Path,
     not_found_msg: impl FnOnce() -> String,
 ) -> Result<String, ApiError> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(content),
-        Err(e) if e.kind() == ErrorKind::NotFound => Err(ApiError::not_found(not_found_msg())),
+    let mut file = match kranz_engine::paths::open_read_nofollow(path) {
+        Ok(file) => file,
+        Err(kranz_engine::error::EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+            return Err(ApiError::not_found(not_found_msg()))
+        }
+        Err(kranz_engine::error::EngineError::InvalidState(detail)) => {
+            return Err(ApiError::not_found(detail))
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "failed to read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut content = String::new();
+    match file.read_to_string(&mut content) {
+        Ok(_) => Ok(content),
         Err(e) => Err(ApiError::internal(format!(
             "failed to read {}: {e}",
             path.display()
@@ -2184,6 +2220,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Audit (server MEDIUM): the mission-dir walk is no-follow but the LEAF
+    /// read was not, so a session under checkout isolation could point
+    /// `plan.md` at `.kranz/serve.token` and read the mutation token back
+    /// over a tokenless loopback GET. The leaf read is no-follow now: the
+    /// route refuses instead of returning the target's bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mission_leaf_reads_refuse_a_symlinked_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-1", vec![created("goal")]);
+        let token_file = tmp.path().join(".kranz").join("serve.token");
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        symlink(&token_file, paths.plan_md_file()).unwrap();
+        symlink(&token_file, paths.report_file()).unwrap();
+        symlink(&token_file, paths.plan_file()).unwrap();
+
+        for uri in [
+            "/api/missions/m-1/plan.md",
+            "/api/missions/m-1/report.md",
+            "/api/missions/m-1/plan",
+        ] {
+            let app = crate::router(tmp.path().to_path_buf(), None);
+            let response = app.oneshot(get(uri)).await.unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::OK,
+                "{uri} must refuse a symlinked leaf"
+            );
+            let body = body_json(response).await;
+            assert!(
+                !body.to_string().contains("super-secret-mutation-token"),
+                "{uri} leaked the symlink target: {body}"
+            );
+        }
+    }
+
+    /// The same leaf rule for the tickets surface, which reads through
+    /// `Ticket::load`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ticket_reads_refuse_a_symlinked_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let token_file = tmp.path().join(".kranz").join("serve.token");
+        std::fs::create_dir_all(tmp.path().join(".kranz")).unwrap();
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
+        let tickets = tmp.path().join(".kranz").join("tickets");
+        std::fs::create_dir_all(&tickets).unwrap();
+        symlink(&token_file, tickets.join("leak.md")).unwrap();
+
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/tickets/leak")).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            !body.to_string().contains("super-secret-mutation-token"),
+            "ticket read leaked the symlink target: {body}"
+        );
+
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/tickets")).await.unwrap();
+        let body = body_json(response).await;
+        assert!(
+            !body.to_string().contains("super-secret-mutation-token"),
+            "ticket listing leaked the symlink target: {body}"
+        );
+    }
+
+    /// The missions catalog (`.kranz/missions/index.md`) is read the same
+    /// way: a symlinked index yields an empty catalog, never the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missions_index_read_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let missions_dir = tmp.path().join(".kranz").join("missions");
+        std::fs::create_dir_all(&missions_dir).unwrap();
+        let token_file = tmp.path().join(".kranz").join("serve.token");
+        std::fs::write(&token_file, "super-secret-mutation-token").unwrap();
+        symlink(&token_file, missions_dir.join("index.md")).unwrap();
+
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app.oneshot(get("/api/missions")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            !body.to_string().contains("super-secret-mutation-token"),
+            "the catalog read followed a symlink: {body}"
+        );
     }
 
     /// 12th-pass review: an unbounded `windowDays` once reached the engine's

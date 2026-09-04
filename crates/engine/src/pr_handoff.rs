@@ -150,6 +150,28 @@ pub fn assess(repo_root: &Path, inputs: &PrHandoffInputs<'_>) -> PrHandoff {
     }
 }
 
+/// Read one mission document (report/plan) with the whole `.kranz` chain and
+/// the leaf pinned no-follow.
+///
+/// Threat (follow-up review H-4): `report.md` becomes the BODY of
+/// `PrHandoff::ReadyToCreate`, which `GET /api/missions/:id/pr-handoff`
+/// serves and `POST .../pr-handoff/create` publishes into a real GitHub PR
+/// description. A worker under checkout isolation can replace that leaf with
+/// a symlink (`ln -sf ../../serve.token .kranz/missions/m-1/report.md`), and
+/// the route's `require_no_follow()` pins the mission DIRECTORY chain only.
+/// A refused read yields no body, which the caller already renders honestly.
+fn read_mission_doc(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    crate::paths::open_read_nofollow(path)
+        .and_then(|mut file| {
+            file.read_to_string(&mut text)?;
+            Ok(())
+        })
+        .ok()?;
+    Some(text)
+}
+
 /// Convenience: assess from on-disk mission state + report/plan files.
 pub fn assess_mission(repo_root: &Path, mission_id: &str) -> Result<PrHandoff> {
     let paths = crate::paths::MissionPaths::new(repo_root, mission_id);
@@ -166,8 +188,8 @@ pub fn assess_mission(repo_root: &Path, mission_id: &str) -> Result<PrHandoff> {
             EngineError::Config(format!("invalid state.json for '{mission_id}': {e}"))
         })?
     };
-    let report = std::fs::read_to_string(paths.report_file()).ok();
-    let plan = std::fs::read_to_string(paths.plan_md_file()).ok();
+    let report = read_mission_doc(&paths.report_file());
+    let plan = read_mission_doc(&paths.plan_md_file());
     Ok(assess(
         repo_root,
         &PrHandoffInputs {
@@ -349,6 +371,37 @@ mod tests {
             executor_route: None,
             standards_manifest: None,
         }
+    }
+
+    /// H-4 (follow-up review): `report.md` becomes the PR body a click
+    /// publishes to GitHub, so a symlinked leaf must yield NO body rather
+    /// than the target's content. The route's directory-chain pin does not
+    /// cover the leaf; this read does.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_report_yields_no_body_not_the_targets_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("serve.token"), "SUPER-SECRET-MUTATION-TOKEN").unwrap();
+
+        let paths = crate::paths::MissionPaths::new(root, "m-test");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+
+        // A real report reads back verbatim.
+        std::fs::write(paths.report_file(), "# Report\n\nAll good.").unwrap();
+        assert_eq!(
+            read_mission_doc(&paths.report_file()).as_deref(),
+            Some("# Report\n\nAll good.")
+        );
+
+        // The same leaf, swapped for a symlink out of the mission tree.
+        std::fs::remove_file(paths.report_file()).unwrap();
+        std::os::unix::fs::symlink(root.join("serve.token"), paths.report_file()).unwrap();
+        assert_eq!(
+            read_mission_doc(&paths.report_file()),
+            None,
+            "a symlinked report.md must not be read through"
+        );
     }
 
     #[test]

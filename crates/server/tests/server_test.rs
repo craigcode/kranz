@@ -837,16 +837,18 @@ async fn diff_stat_500s_when_pinned_base_sha_does_not_resolve() {
     // `git diff --stat <bogus>..<tip>` fails inside git and the handler's `?`
     // must degrade to a 500 with a JSON error body, not panic.
     let bogus_base = "0000000000000000000000000000000000000000";
-    seed_diffable_mission(&repo_root, "m-badbase", &base_sha, true);
-    // Overwrite the pinned base_sha to the bogus value directly in the log.
-    let paths = MissionPaths::new(&repo_root, "m-badbase");
-    let mut log = EventLog::acquire(&paths, "m-badbase", Duration::ZERO, LockForce::No).unwrap();
-    log.append(EventKind::PlanApproved {
-        plan: sample_plan(),
-        base_sha: Some(bogus_base.to_string()),
-    })
-    .unwrap();
-    drop(log);
+    // Pin the bogus base in the one `plan.approved` the reducer will honour.
+    // A second `plan.approved` appended to an already-approved mission is
+    // ignored by the reducer's status guard (2026-09-01 audit, H6), so the
+    // bogus value has to ride the seed itself; the branch is then created by
+    // hand from the real base so `git diff --stat <bogus>..<tip>` has a tip.
+    seed_diffable_mission(&repo_root, "m-badbase", bogus_base, false);
+    let branch = "kranz/mission-m-badbase";
+    raw_git(&repo_root, &["checkout", "-b", branch, &base_sha]);
+    std::fs::write(repo_root.join("feature.txt"), "new feature\n").unwrap();
+    raw_git(&repo_root, &["add", "--", "feature.txt"]);
+    raw_git(&repo_root, &["commit", "-m", "add feature"]);
+    raw_git(&repo_root, &["checkout", "main"]);
     let app = kranz_server::router(repo_root.clone(), None);
 
     let (status, body) = get_json(&app, "/api/missions/m-badbase/diff-stat").await;

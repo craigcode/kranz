@@ -1009,10 +1009,30 @@ pub(crate) fn mission_dir_exists(repo_root: &Path, mission_id: &str) -> bool {
 /// ephemeral. (Not every reply warrants the full header/section/context frame.)
 /// Clipped with a trailing ellipsis safely below Slack's 3,000-char section
 /// cap, leaving room for instance labeling.
+///
+/// This is a LITERAL-TEXT funnel: it does not escape, because callers frame
+/// their own mrkdwn (backticks, `*bold*`, `>` quotes, emoji). Callers that
+/// interpolate agent-, repo-, or engine-authored text must run it through
+/// [`crate::format::escape_mrkdwn`] first — escape, then clip (M1).
 pub(crate) fn error_blocks(msg: &str) -> Vec<Value> {
     const MAX_SLACK_FIELD: usize = 2500;
     let text = crate::format::clip_to(msg, MAX_SLACK_FIELD);
     vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } })]
+}
+
+/// Escape ONE value on its way into an mrkdwn message the caller frames.
+///
+/// Threat (follow-up review M-12): [`error_blocks`] is a literal-text funnel
+/// by design, so the escaping has to happen at the interpolation. Refusal and
+/// error strings carry engine and host text (which carries agent text) and
+/// operator-typed mission ids and slugs; unescaped, `<https://evil.example
+/// /approve|Approve & start>` in an error renders as a blue link styled like
+/// the real gated button. Escaping the VALUE and not the whole message keeps
+/// the caller's own backticks, `*bold*` and `>` quotes live, and keeps
+/// [`crate::format::escape_mrkdwn`] applied exactly once (it is not
+/// idempotent).
+pub(crate) fn esc(value: impl std::fmt::Display) -> String {
+    crate::format::escape_mrkdwn(&value.to_string())
 }
 
 /// The `/kranz ask` answer reply. `pub` so tests can pin the overflow clipping
@@ -2794,6 +2814,7 @@ mod tests {
             tmp.path(),
             &Action::Approve {
                 mission_id: "m-1".into(),
+                plan_identity: None,
                 user_id: None,
                 response_url: None,
             },
@@ -4530,11 +4551,13 @@ mod tests {
         // thread reply on a planning mission runs a full planning turn.
         assert!(is_slow_action(&Action::Approve {
             mission_id: "m-1".into(),
+            plan_identity: None,
             user_id: None,
             response_url: None,
         }));
         assert!(is_slow_action(&Action::ApproveStart {
             mission_id: "m-1".into(),
+            plan_identity: None,
             user_id: None,
             response_url: None,
         }));

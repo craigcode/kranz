@@ -63,6 +63,11 @@ pub mod capability {
     /// POSIX `grep`, for the assertions that are ABOUT its exit-status
     /// semantics and cannot be rewritten portably.
     pub const GREP: &str = "grep";
+    /// macOS `security` able to CREATE a login keychain under a relocated
+    /// HOME. The GitHub macOS runner image 20260831.0337.3 broke this
+    /// (image 20260728.0273.1 did not); the cursor keychain tests probe it
+    /// and skip rather than report a runner regression as a code failure.
+    pub const KEYCHAIN: &str = "keychain";
 }
 
 /// True when `capability` is listed in [`REQUIRED_CAPABILITIES_ENV`].

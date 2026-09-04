@@ -7,7 +7,7 @@ use crate::bridge::{
     apply_action, ask_answer_blocks, build_home_view, build_outcomes_reply,
     build_pipeline_status_reply, build_roadmap_reply, build_status_reply, build_ticket_list_reply,
     build_ticket_show_reply, build_todo_reply, build_work_reply, change_config, create_ticket,
-    error_blocks, grant_control, guidance, is_ticket_slug, looks_like_mission_id,
+    error_blocks, esc, grant_control, guidance, is_ticket_slug, looks_like_mission_id,
     looks_like_plan_json, mission_dir_exists, mission_status, new_mission, no_host_blocks,
     not_authorized_blocks_for, not_authorized_text_for, post_thread_note, post_to_mission_thread,
     question_control, reply_ephemeral, revision_control, scaffold_ticket, slugify, steer,
@@ -68,7 +68,7 @@ pub(crate) async fn dispatch_action(
                             cfg,
                             client,
                             response_url.as_deref(),
-                            &error_blocks(&format!("Couldn't read that mission: {e}")),
+                            &error_blocks(&format!("Couldn't read that mission: {}", esc(&e))),
                         )
                         .await;
                     }
@@ -162,7 +162,7 @@ pub(crate) async fn dispatch_action(
                         cfg,
                         client,
                         response_url.as_deref(),
-                        &error_blocks(&format!("Couldn't answer that yet: {e}")),
+                        &error_blocks(&format!("Couldn't answer that yet: {}", esc(&e))),
                     )
                     .await;
                 }
@@ -244,7 +244,7 @@ pub(crate) async fn dispatch_action(
                         response_url.as_deref(),
                         channel,
                         user_id.as_deref(),
-                        &error_blocks(&format!("Couldn't create the mission: {e}")),
+                        &error_blocks(&format!("Couldn't create the mission: {}", esc(&e))),
                     )
                     .await;
                 }
@@ -284,8 +284,9 @@ pub(crate) async fn dispatch_action(
                     client,
                     response_url.as_deref(),
                     &error_blocks(&format!(
-                        "Couldn't open the config form: {e}. One-line fallback: \
-                         `/kranz config [<id>] <role> [backend] <model> [effort]`."
+                        "Couldn't open the config form: {}. One-line fallback: \
+                         `/kranz config [<id>] <role> [backend] <model> [effort]`.",
+                        esc(&e)
                     )),
                 )
                 .await;
@@ -326,8 +327,9 @@ pub(crate) async fn dispatch_action(
                     client,
                     response_url.as_deref(),
                     &error_blocks(&format!(
-                        "Couldn't open the new-mission form: {e}. One-line fallback: \
-                         `/kranz new <goal>`."
+                        "Couldn't open the new-mission form: {}. One-line fallback: \
+                         `/kranz new <goal>`.",
+                        esc(&e)
                     )),
                 )
                 .await;
@@ -372,8 +374,9 @@ pub(crate) async fn dispatch_action(
                     client,
                     response_url.as_deref(),
                     &error_blocks(&format!(
-                        "Couldn't open the new-ticket form: {e}. One-line fallback: \
-                         `/kranz ticket <title>`."
+                        "Couldn't open the new-ticket form: {}. One-line fallback: \
+                         `/kranz ticket <title>`.",
+                        esc(&e)
                     )),
                 )
                 .await;
@@ -430,7 +433,11 @@ pub(crate) async fn dispatch_action(
                     if let Err(e) = client
                         .post_message(
                             channel,
-                            &error_blocks(&format!("Couldn't create ticket `{slug}`: {e}")),
+                            &error_blocks(&format!(
+                                "Couldn't create ticket `{}`: {}",
+                                esc(slug),
+                                esc(&e)
+                            )),
                             None,
                         )
                         .await
@@ -494,7 +501,7 @@ pub(crate) async fn dispatch_action(
                         response_url.as_deref(),
                         channel,
                         user_id.as_deref(),
-                        &error_blocks(&format!("Couldn't scaffold ticket: {e}")),
+                        &error_blocks(&format!("Couldn't scaffold ticket: {}", esc(&e))),
                     )
                     .await;
                 }
@@ -534,9 +541,10 @@ pub(crate) async fn dispatch_action(
                 client,
                 response_url.as_deref(),
                 &error_blocks(&format!(
-                    ":hourglass_flowing_sand: Requesting the plan for `{mission_id}` — the \
+                    ":hourglass_flowing_sand: Requesting the plan for `{}` — the \
                      orchestrator turn usually takes a minute or two; the plan will post \
-                     in the mission thread."
+                     in the mission thread.",
+                    esc(mission_id)
                 )),
             )
             .await;
@@ -547,6 +555,11 @@ pub(crate) async fn dispatch_action(
                         goal: plan.goal.clone(),
                         milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
                         assertion_count: plan.validation_contract.len(),
+                        // Bind the approve buttons to THIS plan (M2): a
+                        // re-plan posts a new card, and the old card's
+                        // click is refused rather than committing the new
+                        // plan under the old plan's review.
+                        plan_identity: crate::format::plan_identity(&plan),
                         considered_alternatives: plan.considered_alternatives.as_ref().map(|a| {
                             crate::format::PlanAlternativesReview {
                                 chosen: a.chosen.clone(),
@@ -574,8 +587,10 @@ pub(crate) async fn dispatch_action(
                             client,
                             response_url.as_deref(),
                             &error_blocks(&format!(
-                                "The plan is ready but posting it failed: {e}. \
-                                 Run `/kranz plan {mission_id}` again."
+                                "The plan is ready but posting it failed: {}. \
+                                 Run `/kranz plan {}` again.",
+                                esc(&e),
+                                esc(mission_id)
                             )),
                         )
                         .await;
@@ -595,7 +610,7 @@ pub(crate) async fn dispatch_action(
                         cfg,
                         client,
                         response_url.as_deref(),
-                        &error_blocks(&format!("Couldn't request the plan: {e}")),
+                        &error_blocks(&format!("Couldn't request the plan: {}", esc(&e))),
                     )
                     .await;
                 }
@@ -621,6 +636,8 @@ pub(crate) async fn dispatch_action(
                     threads,
                     host,
                     mission_id,
+                    // The slash twin reviews no card, so it claims no plan.
+                    None,
                     user_id.as_deref(),
                     response_url.as_deref(),
                     false,
@@ -649,6 +666,8 @@ pub(crate) async fn dispatch_action(
                     threads,
                     host,
                     mission_id,
+                    // The slash twin reviews no card, so it claims no plan.
+                    None,
                     user_id.as_deref(),
                     response_url.as_deref(),
                     false,
@@ -673,8 +692,9 @@ pub(crate) async fn dispatch_action(
                     client,
                     response_url.as_deref(),
                     &error_blocks(&format!(
-                        "`{slug}` isn't a backlog ticket — `queue` is for tickets. \
-                         To approve a mission plan, use `/kranz approve <mission-id>`."
+                        "`{}` isn't a backlog ticket — `queue` is for tickets. \
+                         To approve a mission plan, use `/kranz approve <mission-id>`.",
+                        esc(slug)
                     )),
                 )
                 .await;
@@ -1004,6 +1024,7 @@ pub(crate) async fn dispatch_action(
         // command enforces.
         Action::Approve {
             mission_id,
+            plan_identity,
             user_id,
             response_url,
         } => {
@@ -1014,6 +1035,7 @@ pub(crate) async fn dispatch_action(
                 threads,
                 host,
                 mission_id,
+                plan_identity.as_deref(),
                 user_id.as_deref(),
                 response_url.as_deref(),
                 false,
@@ -1023,6 +1045,7 @@ pub(crate) async fn dispatch_action(
         }
         Action::ApproveStart {
             mission_id,
+            plan_identity,
             user_id,
             response_url,
         } => {
@@ -1033,6 +1056,7 @@ pub(crate) async fn dispatch_action(
                 threads,
                 host,
                 mission_id,
+                plan_identity.as_deref(),
                 user_id.as_deref(),
                 response_url.as_deref(),
                 true,

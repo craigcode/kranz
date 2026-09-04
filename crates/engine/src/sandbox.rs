@@ -720,7 +720,7 @@ fn lexical_absolute(path: &Path) -> PathBuf {
 }
 
 /// Escape a path for embedding in an SBPL string literal.
-fn escape_sbpl_literal(path: &Path) -> String {
+pub(crate) fn escape_sbpl_literal(path: &Path) -> String {
     escape_sbpl_string(&path.to_string_lossy())
 }
 
@@ -877,12 +877,7 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
     let mut paths = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
         if let Some(kranz_dir) = mission_dir.parent().and_then(Path::parent) {
-            for name in [
-                "serve.token",
-                "serve.read.token",
-                "config.json",
-                "domain-terms.local",
-            ] {
+            for name in KRANZ_AUTHORITY_FILES {
                 paths.push(kranz_dir.join(name));
             }
         }
@@ -908,6 +903,13 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
 ///   pause / config-change commands). The orchestrator polls it from outside
 ///   the sandbox; no session ever legitimately reads it. The bwrap write
 ///   shadow already hid its contents — this aligns the Seatbelt read posture.
+/// - `<global kranz dir>/keys/` — the operator-side authority keys the
+///   consent substrate is authenticated with (2026-09-01 adversarial audit,
+///   C1/H6: control files and the event log are MACed with a key that must
+///   live OUTSIDE every sandboxed session's readable set, or the MAC proves
+///   nothing against the agent it is meant to exclude). Denied for writes
+///   too ([`authority_write_denies`]): a session that can replace the key
+///   can re-sign whatever it likes.
 pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
@@ -916,7 +918,334 @@ pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
             dirs.push(kranz_dir.join("hook-status"));
         }
     }
+    for keys_dir in global_key_dirs() {
+        dirs.push(keys_dir);
+    }
     dirs
+}
+
+/// The GLOBAL kranz authority stores (`<global kranz dir>/keys`, where the
+/// per-repository authority key lives, and `<global kranz dir>/seals`, where
+/// each mission's seal floor lives), each in raw and canonical form. The
+/// global dir comes from [`crate::paths::global_kranz_dir`], the same
+/// resolver the key writer and the seal recorder use, so the deny and the
+/// writers cannot drift apart. Empty when no global dir resolves (no home,
+/// no key dir, nothing to deny).
+fn global_key_dirs() -> Vec<PathBuf> {
+    let Some(global) = crate::paths::global_kranz_dir() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in ["keys", "seals"] {
+        let dir = global.join(name);
+        let canonical = absolutize(&dir);
+        if canonical != dir {
+            out.push(canonical);
+        }
+        out.push(dir);
+    }
+    out
+}
+
+/// Repo-level `<repo>/.kranz` stores the ENGINE owns end to end. Named
+/// explicitly (not only enumerated from the live directory) so the deny
+/// exists before the store does: a session that could CREATE
+/// `.kranz/queue/` would own the autoWork drain outright.
+const KRANZ_ENGINE_OWNED_DIRS: &[&str] = &["queue", "tickets", "lessons", "hook-status"];
+
+/// Authority FILES that live directly under a `<repo>/.kranz` dir — the
+/// same four [`authority_read_deny_paths`] names, factored out so the
+/// container tier can apply them to the `.kranz` under its own session
+/// mount without re-typing the list (2026-09-01 adversarial audit, MED-3:
+/// the hand-copied three-name list had already drifted).
+const KRANZ_AUTHORITY_FILES: &[&str] = &[
+    "serve.token",
+    "serve.read.token",
+    "config.json",
+    "domain-terms.local",
+];
+
+/// The authority set under ONE `<repo>/.kranz` dir: the engine-owned files
+/// and the engine-owned stores. Shared by the process, container, and
+/// Windows tiers so none of them can drift from the others.
+pub(crate) fn kranz_authority_entries(kranz_dir: &Path) -> WriteDenySet {
+    WriteDenySet {
+        files: KRANZ_AUTHORITY_FILES
+            .iter()
+            .map(|name| kranz_dir.join(name))
+            .collect(),
+        dirs: KRANZ_ENGINE_OWNED_DIRS
+            .iter()
+            .map(|name| kranz_dir.join(name))
+            .collect(),
+    }
+}
+
+/// The `(<repo>/.kranz, <repo>/.kranz/missions, <mission dir>)` triples this
+/// session's mission dir sits in — raw and canonical form — and ONLY when
+/// the mission dir actually has the canonical `<repo>/.kranz/missions/<id>`
+/// shape.
+///
+/// The shape check is load-bearing, not defensive tidiness: the deny
+/// derivation below SWEEPS these directories, and a mission dir that is not
+/// in the canonical layout (a bare temp dir in a fixture, a future layout
+/// change) would otherwise make the sweep walk the system temp root, or
+/// `/`, and deny writes across the whole host. A non-canonical layout
+/// yields nothing here, which is the fail-quiet direction for a deny that is
+/// additive to an already-narrow write allowlist.
+fn repo_kranz_dirs(inputs: &SandboxInputs) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+        let Some(missions_dir) = mission_dir.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        let Some(kranz_dir) = missions_dir.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        if missions_dir.file_name() != Some(std::ffi::OsStr::new("missions"))
+            || kranz_dir.file_name() != Some(std::ffi::OsStr::new(".kranz"))
+        {
+            continue;
+        }
+        out.push((kranz_dir, missions_dir, mission_dir));
+    }
+    out
+}
+
+/// A write-deny set split by what each tier can express: `files` deny as
+/// Seatbelt literals / bwrap self ro-binds / Windows non-inheriting ACL
+/// denies, `dirs` as Seatbelt subpaths / bwrap self ro-binds / inheriting
+/// ACL denies.
+pub(crate) struct WriteDenySet {
+    pub files: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
+}
+
+fn sorted_dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Authority material a sandboxed session must never WRITE (2026-09-01
+/// adversarial audit H2 + H11).
+///
+/// The pre-audit posture denied READS of `<repo>/.kranz/config.json`,
+/// `serve.token`, `serve.read.token`, `domain-terms.local`, `hook-status/`
+/// and the mission `control/` inbox while leaving them WRITABLE: under
+/// `workerIsolation: "checkout"` the session cwd IS the repo root, so a
+/// contained worker could overwrite the trust root it could not read. The
+/// running mission is immune (its config is pinned into `MissionCreated`);
+/// the next mission picks up `claudeBinary`, `dangerouslyAllowAll`, or
+/// `enforce: off` from the file the worker wrote. Every path the read deny
+/// names is therefore denied for writes as well.
+///
+/// H11 is the same asymmetry one level up: every mission-metadata deny was
+/// derived from THIS session's `mission_dir`, so a mission-A worker could
+/// forge approvals into mission B's `control/` inbox, or drop entries into
+/// `.kranz/queue/`, `.kranz/tickets/`, `.kranz/lessons/`. The deny is now
+/// derived from `<repo>/.kranz` as a whole:
+///
+/// - every ENGINE-owned repo-level store ([`KRANZ_ENGINE_OWNED_DIRS`]),
+///   named unconditionally so a store that does not exist yet cannot be
+///   created by a session either,
+/// - every top-level entry of `<repo>/.kranz` present at profile-build time
+///   EXCEPT `missions/`, which is carved out because the session's own
+///   mission dir lives under it,
+/// - every SIBLING mission dir under `<repo>/.kranz/missions/` — the
+///   session's own mission dir is carved back in, and inside it the
+///   narrower [`mission_write_denies`] keeps the audit log, state snapshot,
+///   control inbox and transcripts read-only while leaving the session's
+///   own worktree/scratch under `runs/` writable,
+/// - the global key dir, via [`authority_read_deny_dirs`].
+///
+/// Enumeration is spawn-time, so an entry created under `<repo>/.kranz`
+/// AFTER the profile is built is not individually named. Seatbelt closes
+/// that residue with [`sealed_kranz_dir_roots`]; bwrap and Windows cannot
+/// express it (their masks likewise require the target to exist at spawn),
+/// which is the documented remainder on those tiers.
+pub(crate) fn authority_write_denies(inputs: &SandboxInputs) -> WriteDenySet {
+    let mut files = authority_read_deny_paths(inputs);
+    let mut dirs = authority_read_deny_dirs(inputs);
+    for (kranz_dir, missions_dir, mission_dir) in repo_kranz_dirs(inputs) {
+        let entries = kranz_authority_entries(&kranz_dir);
+        files.extend(entries.files);
+        dirs.extend(entries.dirs);
+        if let Ok(entries) = std::fs::read_dir(&kranz_dir) {
+            for entry in entries.flatten() {
+                // `missions/` is the one carve-out: the session's own
+                // mission dir is under it (see the sibling sweep below).
+                if entry.file_name().as_os_str() == std::ffi::OsStr::new("missions") {
+                    continue;
+                }
+                let path = entry.path();
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => dirs.push(path),
+                    // A symlink is denied as a file: denying the LINK is
+                    // what stops a session replacing it, and following it
+                    // would deny some unrelated target instead.
+                    Ok(_) => files.push(path),
+                    Err(_) => {}
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&missions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == mission_dir {
+                    continue;
+                }
+                dirs.push(path);
+            }
+        }
+    }
+    WriteDenySet {
+        files: sorted_dedup(files),
+        dirs: sorted_dedup(dirs),
+    }
+}
+
+/// Seatbelt-only companion to [`authority_write_denies`]: directory roots
+/// whose DIRECT children may not be created or replaced, emitted as a
+/// `^<root>/[^/]*$` write-deny regex. Sealing `<repo>/.kranz` stops a
+/// session creating `.kranz/queue/` (or any future engine store) after the
+/// profile was built; sealing `<repo>/.kranz/missions` stops it fabricating
+/// a sibling mission dir to forge approvals into. Neither seal reaches
+/// GRANDchildren, so the session's own `<mission>/runs/<scratch>` stays
+/// writable.
+pub(crate) fn sealed_kranz_dir_roots(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (kranz_dir, missions_dir, _) in repo_kranz_dirs(inputs) {
+        roots.push(kranz_dir);
+        roots.push(missions_dir);
+    }
+    sorted_dedup(roots)
+}
+
+/// The operator's OWN controlling terminal, in raw and canonical form
+/// (2026-09-01 adversarial audit, H7).
+///
+/// The gate profile grants read/write/`file-ioctl` on the pty device class
+/// `^/dev/tty[p-t][0-9a-f]+$` so the validator harness's `openpty` chain
+/// works. On macOS that pool IS the terminal pool: a Terminal.app session is
+/// `/dev/ttys003`, matched by the same regex. A contained gate command could
+/// therefore open the operator's own terminal, write raw escape sequences to
+/// it, or issue `TIOCSTI` to push characters into the operator's shell —
+/// arbitrary execution as the operator, outside the sandbox. Naming the
+/// parent's terminal explicitly lets both profiles DENY exactly that one
+/// device while keeping the pty pair the harness allocates for itself; SBPL
+/// denies beat allows regardless of clause order, which this file already
+/// relies on throughout.
+///
+/// Resolved from the ENGINE's own fds 0/1/2 at profile-build time. Every
+/// child the engine spawns gets piped or null stdio, so no sandboxed process
+/// legitimately holds this device. An empty result (no tty at all: a daemon,
+/// CI, `kranz serve`) emits nothing extra.
+#[cfg(unix)]
+pub(crate) fn operator_tty_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for fd in [0, 1, 2] {
+        // SAFETY: `isatty` and `ttyname_r` take a plain fd and, for the
+        // latter, a caller-owned buffer with its length; no ownership
+        // crosses. `ttyname_r` is the thread-safe form (`ttyname` returns a
+        // shared static buffer).
+        let name = unsafe {
+            if libc::isatty(fd) != 1 {
+                continue;
+            }
+            let mut buffer = [0 as libc::c_char; 1024];
+            if libc::ttyname_r(fd, buffer.as_mut_ptr(), buffer.len()) != 0 {
+                continue;
+            }
+            std::ffi::CStr::from_ptr(buffer.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(name);
+        paths.push(absolutize(&path));
+        paths.push(path);
+    }
+    sorted_dedup(paths)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn operator_tty_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Render the operator-terminal deny block for `paths` (2026-09-01
+/// adversarial audit, H7). Empty in, empty out: a host with no controlling
+/// terminal has nothing to protect, and an empty `(deny …)` block would be
+/// noise in every CI profile. Shared by [`generate_profile`] and the gate
+/// extras (`crate::command_exec::gate_profile_extras`) so the two cannot
+/// render the same guard differently. Parameterized on the paths rather
+/// than calling [`operator_tty_paths`] itself, so the rendering is testable
+/// on a host whose test runner has no tty.
+pub(crate) fn tty_deny_block(paths: &[PathBuf]) -> String {
+    let literals: std::collections::BTreeSet<String> =
+        paths.iter().map(|path| escape_sbpl_literal(path)).collect();
+    if literals.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("(deny file-read* file-write* file-ioctl\n");
+    for literal in &literals {
+        block.push_str(&format!("  (literal \"{literal}\")\n"));
+    }
+    block.push_str(")\n");
+    block
+}
+
+/// The `.git` metadata a sandboxed session must never write (2026-09-01
+/// adversarial audit H3 support).
+///
+/// The engine runs git IN the tree the worker controls: `commit_dirty_paths`
+/// checkpoints after every feature on an UNHARDENED handle
+/// (`orchestrator.rs`), and `push_mission_branch` pushes from the CLI. A
+/// worker that plants `.git/hooks/pre-commit`, sets `core.fsmonitor` /
+/// `core.sshCommand` in `.git/config`, or rewrites the WORKTREE GITLINK to
+/// point at a `.git` dir of its own making gets host execution with the
+/// engine's full environment, outside every sandbox.
+///
+/// The deny is NARROW on purpose: the worker's own role is to commit (see
+/// `prompts/worker.md` step 6), so `.git/index`, `.git/objects`,
+/// `.git/refs`, and `.git/logs` must stay writable. What is denied is the
+/// config-and-hook surface that turns a later engine-side git invocation
+/// into code execution, plus the gitlink FILE form:
+///
+/// - `<cwd>/.git/hooks/` and `<cwd>/.git/info/` (subtrees),
+/// - `<cwd>/.git/modules/` (subtree) — a submodule keeps its own `config`
+///   and `hooks/` under `.git/modules/<name>/`, the SAME host-execution
+///   surface one level down, and in checkout mode it sits inside the rw
+///   session bind (follow-up review, M-9). Denied as a whole subtree so a
+///   submodule added after the profile was built is covered too; git never
+///   needs to write it from inside the sandbox.
+/// - `<cwd>/.git/config` and `<cwd>/.git/config.worktree` (files),
+/// - `<cwd>/.git` itself as a LITERAL — in worktree mode that path is the
+///   gitlink file, and denying the literal stops a rewrite of it; in
+///   checkout mode it is the directory node, where the literal deny stops a
+///   replace of the directory without touching anything beneath it.
+///
+/// Reads stay allowed throughout: git cannot operate without reading its
+/// own config, and secrecy was never this tier's promise.
+pub(crate) fn git_metadata_write_denies(inputs: &SandboxInputs) -> WriteDenySet {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for cwd in [inputs.session_cwd.clone(), absolutize(&inputs.session_cwd)] {
+        let git = cwd.join(".git");
+        files.push(git.clone());
+        files.push(git.join("config"));
+        files.push(git.join("config.worktree"));
+        dirs.push(git.join("hooks"));
+        dirs.push(git.join("info"));
+        dirs.push(git.join("modules"));
+    }
+    WriteDenySet {
+        files: sorted_dedup(files),
+        dirs: sorted_dedup(dirs),
+    }
 }
 
 /// One entry of the validator read-deny set: a top-level path of a real
@@ -1208,6 +1537,91 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
         profile.push_str(&format!("  (regex #\"^{lit}/[^/]*\\.jsonl$\")\n"));
     }
     profile.push_str(")\n");
+    profile.push('\n');
+
+    // Authority write deny (2026-09-01 adversarial audit, H2 + H11 — see
+    // authority_write_denies for the full why): every path the read deny
+    // above names, plus the repo-level `.kranz` stores and every SIBLING
+    // mission dir. Under checkout mode `session_cwd` is the repo root, so
+    // without this block a contained worker could overwrite the trust root
+    // it cannot read, or forge approvals into another mission's inbox.
+    // Denies take precedence over allows regardless of clause order, so
+    // placement after the write allow is documentary.
+    let authority_writes = authority_write_denies(inputs);
+    let mut authority_write_literals = std::collections::BTreeSet::new();
+    for path in &authority_writes.files {
+        authority_write_literals.insert(escape_sbpl_literal(path));
+    }
+    let mut authority_write_subpaths = std::collections::BTreeSet::new();
+    for path in &authority_writes.dirs {
+        authority_write_subpaths.insert(escape_sbpl_literal(path));
+    }
+    // The spawn-time residue the enumeration cannot cover: sealing the
+    // DIRECT children of `<repo>/.kranz` and `<repo>/.kranz/missions` stops
+    // a session creating a store or a sibling mission dir after the profile
+    // was built. `[^/]*` never crosses a separator, so the session's own
+    // `<mission>/runs/<scratch>` stays writable.
+    let mut sealed_regexes = std::collections::BTreeSet::new();
+    for root in sealed_kranz_dir_roots(inputs) {
+        sealed_regexes.insert(escape_sbpl_regex(&root));
+    }
+    if !authority_write_literals.is_empty()
+        || !authority_write_subpaths.is_empty()
+        || !sealed_regexes.is_empty()
+    {
+        profile.push_str("(deny file-write*\n");
+        for lit in &authority_write_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &authority_write_literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        for root in &sealed_regexes {
+            profile.push_str(&format!("  (regex #\"^{root}/[^/]*$\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+
+    // `.git` metadata write deny (2026-09-01 adversarial audit, H3 support —
+    // see git_metadata_write_denies): the engine checkpoints with an
+    // unhardened git handle in the tree the worker controls, so the hook and
+    // config surface that turns the next engine-side `git commit` into host
+    // execution is denied. Narrow by design — the worker's own role is to
+    // commit, so the index, objects, refs and logs stay writable.
+    let git_writes = git_metadata_write_denies(inputs);
+    let mut git_write_literals = std::collections::BTreeSet::new();
+    for path in &git_writes.files {
+        git_write_literals.insert(escape_sbpl_literal(path));
+    }
+    let mut git_write_subpaths = std::collections::BTreeSet::new();
+    for path in &git_writes.dirs {
+        git_write_subpaths.insert(escape_sbpl_literal(path));
+    }
+    if !git_write_literals.is_empty() || !git_write_subpaths.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for lit in &git_write_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &git_write_literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+
+    // Operator terminal deny (2026-09-01 adversarial audit, H7 — see
+    // operator_tty_paths): the engine's own controlling terminal is denied
+    // read, write, AND ioctl. Every child the engine spawns has piped or
+    // null stdio, so nothing inside the sandbox needs this device, and the
+    // deny is what stops escape-sequence writes and TIOCSTI-class input
+    // injection into the operator's shell. Nothing is emitted when the
+    // engine has no terminal (a daemon, CI, `kranz serve`).
+    let tty_block = tty_deny_block(&operator_tty_paths());
+    if !tty_block.is_empty() {
+        profile.push_str(&tty_block);
+        profile.push('\n');
+    }
 
     // Shared-Cargo-cache write deny (13th-pass review, P1 — see
     // cargo_cache_write_deny_paths for the full why): when the shared
@@ -1273,6 +1687,41 @@ pub fn bubblewrap_args(
         "/dev".to_string(),
         "--proc".to_string(),
         "/proc".to_string(),
+        // Namespace set (2026-09-01 adversarial audit, H8). Before it the
+        // argv unshared ONLY the network namespace, and only under `fs+net`:
+        //
+        // - `--unshare-pid` is what makes `--proc /proc` mean what the mount
+        //   above assumes. Without it the contained agent sees HOST procfs
+        //   and can read `/proc/<engine pid>/environ` — precisely the set
+        //   `agent_env`'s env_clear exists to keep away from a
+        //   prompt-injectable child — on any host with
+        //   `kernel.yama.ptrace_scope = 0`. It also stops the agent
+        //   signalling the engine or any same-uid host process.
+        // - `--unshare-ipc` closes the System V / POSIX IPC channel to host
+        //   processes.
+        // - `--unshare-uts` and `--unshare-cgroup-try` keep hostname and
+        //   cgroup views from being host-identifying or host-mutable. The
+        //   `-try` suffix is load-bearing (follow-up review, M-8): cgroup
+        //   namespaces need Linux >= 4.6 and are unavailable in some nested
+        //   container and hardened-kernel environments, where the plain
+        //   `--unshare-cgroup` makes bwrap EXIT non-zero — and every resolver
+        //   in this file fails closed, so the whole session would die rather
+        //   than degrade by one namespace. `--unshare-pid`/`ipc`/`uts` are
+        //   long-supported and stay unconditional.
+        // - `--new-session` drops the controlling terminal, which is the
+        //   Linux half of the TIOCSTI escape H7 names on macOS (still live
+        //   on kernels built with CONFIG_LEGACY_TIOCSTI). Safe here: every
+        //   child the engine spawns gets piped or null stdio, and the pty
+        //   harness passes its OWN slave fd rather than relying on an
+        //   inherited ctty.
+        //
+        // Unconditional, unlike `--unshare-net` below: none of these is an
+        // egress decision, and `fs` is a containment tier too.
+        "--unshare-pid".to_string(),
+        "--unshare-ipc".to_string(),
+        "--unshare-uts".to_string(),
+        "--unshare-cgroup-try".to_string(),
+        "--new-session".to_string(),
     ];
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
         out.push("--unshare-net".to_string());
@@ -1335,6 +1784,70 @@ pub fn bubblewrap_args(
         .map(|path| path.display().to_string())
         .collect();
     for bind in cache_ro_binds {
+        out.push("--ro-bind".to_string());
+        out.push(bind.clone());
+        out.push(bind);
+    }
+    // The bwrap analogue of the profile's authority and `.git` write denies
+    // (2026-09-01 adversarial audit, H2 + H11 + H3 support): bwrap has no
+    // per-path write deny to stack over an rw bind, so each denied path is
+    // ro-bound OVER ITSELF — the contents stay READABLE (git cannot run
+    // without its own config, and the Seatbelt side denies writes only) while
+    // every write closes. Later binds win, and this block lands after every
+    // rw bind, so a wide writable root cannot re-expose a denied path.
+    //
+    // Authority FILES additionally appear in the /dev/null mask set above,
+    // which closes reads AND writes; the ro-bind here is what covers the
+    // directories and the `.git` surface. The spawn-time existence filter is
+    // the same residual gap every bwrap mask carries: a path created AFTER
+    // spawn is unmasked until the next session (the Seatbelt tier closes
+    // that with an explicit deny and a sealing regex; bwrap cannot).
+    //
+    // One deliberate exclusion: a `.git` that is a DIRECTORY (checkout mode)
+    // is never ro-bound as a whole — that would close the index, objects and
+    // refs the worker's own `git commit` writes. Only the gitlink FILE form
+    // and the named config/hook paths beneath it are bound, so the bwrap
+    // tier cannot stop a replace of the `.git` directory NODE itself. The
+    // Seatbelt and Windows tiers deny that literal; bwrap's remainder is
+    // recorded here rather than papered over.
+    // A path that is READ-denied is already closed both ways by its
+    // /dev/null mask or tmpfs shadow, and must NOT also be ro-bound over
+    // itself: later binds win, so a self-bind emitted here would stack the
+    // REAL file back over its mask and hand the token to the session (the
+    // Linux CI receipt caught exactly that after the write-deny landed).
+    // The write-deny set is a superset of the read-deny set by
+    // construction, so subtract the masked paths and everything beneath a
+    // masked directory before binding.
+    let masked_files: Vec<PathBuf> = authority_read_deny_paths(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let masked_dirs: Vec<PathBuf> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let is_masked = |path: &Path| -> bool {
+        let abs = lexical_absolute(path);
+        masked_files.contains(&abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
+    };
+    let authority_writes = authority_write_denies(inputs);
+    let git_writes = git_metadata_write_denies(inputs);
+    let write_ro_binds: std::collections::BTreeSet<String> = authority_writes
+        .files
+        .iter()
+        .chain(authority_writes.dirs.iter())
+        .filter(|path| path.exists())
+        .chain(
+            git_writes
+                .files
+                .iter()
+                .filter(|path| path.is_file() && !path.is_symlink()),
+        )
+        .chain(git_writes.dirs.iter().filter(|path| path.is_dir()))
+        .filter(|path| !is_masked(path))
+        .map(|path| lexical_absolute(path).display().to_string())
+        .collect();
+    for bind in write_ro_binds {
         out.push("--ro-bind".to_string());
         out.push(bind.clone());
         out.push(bind);
@@ -2193,6 +2706,367 @@ mod tests {
         assert!(joined.ends_with("/usr/bin/claude --print"));
     }
 
+    /// H8 (2026-09-01 adversarial audit): the argv unshared ONLY the network
+    /// namespace, and only under `fs+net`. Host `/proc` was therefore the
+    /// engine's own `/proc`, so a contained agent could read
+    /// `/proc/<engine>/environ` (the very set `agent_env` exists to withhold)
+    /// on a `ptrace_scope = 0` host, keep the controlling terminal, and
+    /// signal the engine. Every namespace flag is unconditional; only
+    /// `--unshare-net` stays tier-gated, because it is an egress decision.
+    #[test]
+    fn bubblewrap_args_unshare_every_namespace_on_both_tiers() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+            inputs.enforce = enforce;
+            let args = bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &[]).unwrap();
+
+            for flag in [
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--new-session",
+                "--die-with-parent",
+            ] {
+                assert!(
+                    args.contains(&flag.to_string()),
+                    "{enforce:?} argv missing {flag}: {args:?}"
+                );
+            }
+            // M-8 (follow-up review): the non-try form makes bwrap EXIT
+            // non-zero where cgroup namespaces are unavailable (kernels
+            // before 4.6, nested containers, hardened kernels), and every
+            // resolver here fails closed — so the whole session dies rather
+            // than degrading by one namespace.
+            assert!(
+                !args.contains(&"--unshare-cgroup".to_string()),
+                "the non-try cgroup unshare must never be emitted: {args:?}"
+            );
+            assert_eq!(
+                args.contains(&"--unshare-net".to_string()),
+                enforce == crate::types::SandboxEnforce::FsNet,
+                "--unshare-net is the one tier-gated namespace: {args:?}"
+            );
+        }
+    }
+
+    /// The canonical `<repo>/.kranz/missions/<id>` fixture the authority
+    /// write denies need: a repo root with the mission's own dir, a SIBLING
+    /// mission, the repo-level engine stores, and a `.git`.
+    fn authority_write_fixture() -> (tempfile::TempDir, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+        let mission = kranz.join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("runs").join("scratch")).unwrap();
+        std::fs::create_dir_all(kranz.join("missions").join("m-other")).unwrap();
+        for name in ["queue", "tickets", "lessons", "hook-status"] {
+            std::fs::create_dir_all(kranz.join(name)).unwrap();
+        }
+        for name in ["config.json", "serve.token", "serve.read.token"] {
+            std::fs::write(kranz.join(name), "secret").unwrap();
+        }
+        std::fs::create_dir_all(repo.path().join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".git").join("info")).unwrap();
+        std::fs::write(repo.path().join(".git").join("config"), "[core]\n").unwrap();
+        (repo, mission)
+    }
+
+    /// H2 + H11 (2026-09-01 adversarial audit): `.kranz/config.json` was
+    /// read-denied but WRITE-allowed, and every metadata deny was derived
+    /// from the session's OWN mission dir. Under checkout mode `session_cwd`
+    /// is the repo root, so a contained worker could overwrite the trust
+    /// root it could not read, and forge approvals into a sibling mission.
+    #[test]
+    fn sandbox_profile_denies_authority_material_writes() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+
+        // Checkout mode: session_cwd IS the repo root, the hostile shape.
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+
+        for name in ["config.json", "serve.token", "serve.read.token"] {
+            let expected = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&absolutize(&kranz.join(name)))
+            );
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .kranz/{name}:\n{profile}"
+            );
+        }
+        for name in ["queue", "tickets", "lessons", "hook-status"] {
+            let expected = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(&kranz.join(name)))
+            );
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .kranz/{name}/:\n{profile}"
+            );
+        }
+        // The SIBLING mission is denied; the session's OWN mission dir is
+        // not denied wholesale (mission_write_denies keeps the narrow set,
+        // and runs/<scratch> must stay writable).
+        let other = absolutize(&kranz.join("missions").join("m-other"));
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", escape_sbpl_literal(&other))),
+            "profile missing write deny for the sibling mission dir:\n{profile}"
+        );
+        let own = absolutize(&mission);
+        assert!(
+            !profile.contains(&format!("(subpath \"{}\")\n", escape_sbpl_literal(&own))),
+            "the session's own mission dir must not be denied wholesale:\n{profile}"
+        );
+        // The sealing regexes: no NEW store under `.kranz`, no NEW sibling
+        // mission dir, after the profile was built.
+        for root in [absolutize(&kranz), absolutize(&kranz.join("missions"))] {
+            let expected = format!("(regex #\"^{}/[^/]*$\")", escape_sbpl_regex(&root));
+            assert!(
+                profile.contains(&expected),
+                "profile missing the sealing regex for {}:\n{profile}",
+                root.display()
+            );
+        }
+    }
+
+    /// The global kranz key dir (`~/.kranz/keys`) is denied for BOTH reads
+    /// and writes on every tier (2026-09-01 adversarial audit, C1/H6): the
+    /// consent substrate's MAC key has to live outside a sandboxed session's
+    /// readable set, or the MAC proves nothing against the agent it excludes;
+    /// and a session that could replace the key could re-sign anything.
+    #[test]
+    fn global_key_dir_is_read_and_write_denied() {
+        // The global dir is resolved once per process (`paths::global_kranz_dir`),
+        // so the test reads the resolved value instead of rebinding HOME: the
+        // property under test is that the deny follows the SAME resolver the
+        // key writer and the seal recorder use.
+        let global = crate::paths::global_kranz_dir().expect("a global kranz dir resolves");
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+
+        for store in ["keys", "seals"] {
+            let dir = global.join(store);
+            assert!(
+                authority_read_deny_dirs(&inputs).contains(&dir),
+                "the global {store} dir must be read-denied"
+            );
+            assert!(
+                authority_write_denies(&inputs).dirs.contains(&dir),
+                "the global {store} dir must be write-denied"
+            );
+            let profile = generate_profile(&inputs);
+            let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&dir));
+            assert!(
+                profile.matches(&expected).count() >= 2,
+                "the {store} dir belongs in BOTH the read-deny and the write-deny block:\n{profile}"
+            );
+        }
+    }
+
+    /// A mission dir that is NOT in the canonical
+    /// `<repo>/.kranz/missions/<id>` layout must yield no sweep at all — the
+    /// derivation walks parents, and a bare temp-dir mission would otherwise
+    /// seal the system temp root (or `/`) against every write.
+    #[test]
+    fn authority_write_denies_refuse_a_noncanonical_mission_layout() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+
+        assert!(
+            sealed_kranz_dir_roots(&inputs).is_empty(),
+            "a non-canonical mission dir must seal nothing"
+        );
+        let denies = authority_write_denies(&inputs);
+        let temp_root = absolutize(&std::env::temp_dir());
+        assert!(
+            !denies.dirs.iter().any(|d| d == &temp_root),
+            "the sweep must never reach the system temp root: {:?}",
+            denies.dirs
+        );
+    }
+
+    /// H3 support (2026-09-01 adversarial audit): the engine checkpoints with
+    /// an UNHARDENED git handle in the tree the worker controls, so a planted
+    /// `.git/hooks/pre-commit` or a `core.sshCommand` in `.git/config`
+    /// executes on the host with the engine's full environment. The deny is
+    /// narrow because the worker's own role is to commit.
+    #[test]
+    fn sandbox_profile_denies_git_config_and_hook_writes_but_not_the_index() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+
+        let git = absolutize(&repo.path().join(".git"));
+        for dir in ["hooks", "info"] {
+            let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&git.join(dir)));
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .git/{dir}/:\n{profile}"
+            );
+        }
+        for file in ["config", "config.worktree"] {
+            let expected = format!("(literal \"{}\")", escape_sbpl_literal(&git.join(file)));
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .git/{file}:\n{profile}"
+            );
+        }
+        // The gitlink FILE form (worktree mode) is denied as a literal, which
+        // in checkout mode denies a replace of the `.git` directory node.
+        assert!(
+            profile.contains(&format!("(literal \"{}\")", escape_sbpl_literal(&git))),
+            "profile missing write deny for the .git node itself:\n{profile}"
+        );
+        // The commit path stays open: nothing denies the index or objects.
+        for open in ["index", "objects", "refs"] {
+            let denied = format!("(subpath \"{}\")", escape_sbpl_literal(&git.join(open)));
+            assert!(
+                !profile.contains(&denied),
+                ".git/{open} must stay writable — the worker commits:\n{profile}"
+            );
+        }
+    }
+
+    /// M-9 (follow-up review): a submodule keeps its own `config` and
+    /// `hooks/` under `.git/modules/<name>/`, which is the SAME host-execution
+    /// surface `.git/config` and `.git/hooks/` are — and in checkout mode it
+    /// sits inside the rw session bind. The subtree deny covers every
+    /// submodule, present and future; git never needs to write it from
+    /// inside the sandbox.
+    #[test]
+    fn git_metadata_write_denies_cover_the_submodule_config_and_hook_surface() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+
+        let modules = absolutize(&repo.path().join(".git").join("modules"));
+        assert!(
+            git_metadata_write_denies(&inputs).dirs.contains(&modules),
+            "the .git/modules subtree must be write-denied: {:?}",
+            git_metadata_write_denies(&inputs).dirs
+        );
+        let profile = generate_profile(&inputs);
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", escape_sbpl_literal(&modules))),
+            "profile missing write deny for .git/modules/:\n{profile}"
+        );
+    }
+
+    /// The bwrap analogue of the two blocks above: each denied path is
+    /// ro-bound over itself (readable, unwritable), and the `.git` DIRECTORY
+    /// node is deliberately excluded — binding it whole would close the index
+    /// the worker's own `git commit` writes.
+    /// Later binds win in bwrap. A read-denied file is closed by its
+    /// /dev/null mask; a self ro-bind of the same path emitted afterwards
+    /// would put the real content back. Every masked path must therefore be
+    /// absent from the self-bind set (Linux CI receipt, 2026-09-03).
+    #[test]
+    fn bubblewrap_args_never_self_bind_a_masked_authority_path() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+        let args = bubblewrap_args(&inputs, Path::new("/bin/true"), &[]).unwrap();
+        let mut masked: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i + 2 < args.len() {
+            if args[i] == "--ro-bind" && args[i + 1] == "/dev/null" {
+                masked.push(args[i + 2].clone());
+            }
+            i += 1;
+        }
+        assert!(
+            masked.iter().any(|m| m.ends_with("serve.token")),
+            "serve.token must be masked: {args:?}"
+        );
+        let mut i = 0;
+        while i + 2 < args.len() {
+            if args[i] == "--ro-bind" && args[i + 1] == args[i + 2] {
+                assert!(
+                    !masked.contains(&args[i + 2]),
+                    "{} is masked and must not be re-bound over itself",
+                    args[i + 2]
+                );
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn bubblewrap_args_ro_bind_authority_and_git_write_denies() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, tmp.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        for path in [
+            kranz.join("queue"),
+            kranz.join("tickets"),
+            kranz.join("lessons"),
+            kranz.join("missions").join("m-other"),
+            repo.path().join(".git").join("hooks"),
+            repo.path().join(".git").join("info"),
+            repo.path().join(".git").join("config"),
+        ] {
+            let expected = format!("--ro-bind {0} {0}", lexical_absolute(&path).display());
+            assert!(
+                joined.contains(&expected),
+                "bwrap argv missing the write-closing ro-bind for {}: {args:?}",
+                path.display()
+            );
+        }
+        let git = lexical_absolute(&repo.path().join(".git"));
+        assert!(
+            !joined.contains(&format!("--ro-bind {0} {0}", git.display())),
+            "the .git DIRECTORY must never be ro-bound whole — the worker commits: {args:?}"
+        );
+    }
+
+    /// H7 (2026-09-01 adversarial audit): the operator's own terminal must
+    /// be denied read, write AND ioctl — the last is what closes TIOCSTI —
+    /// even though the gate extras still ALLOW the pty device class the
+    /// harness's `openpty` needs, and even though `/dev/ttys003` is matched
+    /// by that class. Rendered from an explicit path list so the assertion
+    /// holds on a test runner with no controlling terminal of its own.
+    #[test]
+    fn tty_deny_block_denies_ioctl_on_the_named_terminal_and_nothing_when_absent() {
+        let block = tty_deny_block(&[
+            PathBuf::from("/dev/ttys003"),
+            PathBuf::from("/dev/ttys003"),
+            PathBuf::from("/dev/ttys001"),
+        ]);
+        assert!(block.starts_with("(deny file-read* file-write* file-ioctl\n"));
+        assert!(block.contains("(literal \"/dev/ttys003\")"), "{block}");
+        assert!(block.contains("(literal \"/dev/ttys001\")"), "{block}");
+        assert_eq!(
+            block.matches("/dev/ttys003").count(),
+            1,
+            "duplicate fds must collapse to one literal:\n{block}"
+        );
+        assert!(
+            tty_deny_block(&[]).is_empty(),
+            "no controlling terminal means no deny block"
+        );
+    }
+
     #[test]
     fn sandbox_profile_write_profile_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -2964,6 +3838,105 @@ mod tests {
                 target.display()
             );
             assert!(target.exists());
+        }
+    }
+
+    /// The live half of `sandbox_profile_denies_authority_material_writes`
+    /// and `..._git_config_and_hook_writes...`: a real `sandbox-exec` run
+    /// under a checkout-mode profile refuses the writes and keeps the
+    /// session's own work going (H2, H11, H3 support).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_denies_authority_and_git_metadata_writes() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let (repo, mission) = authority_write_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+        let git = repo.path().join(".git");
+        std::fs::write(git.join("index"), "idx").unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, scratch.path(), vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let denied = [
+            // The trust root: overwritten without ever being read.
+            format!("echo '{{}}' > {}", kranz.join("config.json").display()),
+            // A sibling mission's control inbox (forged operator consent).
+            format!(
+                "echo x > {}",
+                kranz
+                    .join("missions")
+                    .join("m-other")
+                    .join("approve.json")
+                    .display()
+            ),
+            // A NEW sibling mission dir, and a NEW repo-level store.
+            format!(
+                "mkdir {}",
+                kranz.join("missions").join("m-forged").display()
+            ),
+            format!("mkdir {}", kranz.join("newstore").display()),
+            // Repo-level engine stores.
+            format!("echo x > {}", kranz.join("queue").join("q.json").display()),
+            format!("echo x > {}", kranz.join("lessons").join("l.md").display()),
+            // The git hook and config surface the engine's next checkpoint
+            // commit would execute.
+            format!(
+                "echo x > {}",
+                git.join("hooks").join("pre-commit").display()
+            ),
+            format!("echo x > {}", git.join("config").display()),
+        ];
+        for command in &denied {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(!status.success(), "write must be denied: {command}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(kranz.join("config.json")).unwrap(),
+            "secret"
+        );
+        assert!(!kranz.join("missions").join("m-forged").exists());
+        assert!(!kranz.join("newstore").exists());
+        assert!(!git.join("hooks").join("pre-commit").exists());
+
+        // The session's own work is untouched: the repo tree, the private
+        // scratch, its own mission scratch under runs/, and the git index
+        // the worker's own `git commit` writes.
+        let allowed = [
+            repo.path().join("src.txt"),
+            scratch.path().join("notes.txt"),
+            mission.join("runs").join("scratch").join("out.txt"),
+            git.join("index"),
+        ];
+        for target in allowed {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ok > {}", target.display()))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                status.success(),
+                "write must be allowed: {}",
+                target.display()
+            );
         }
     }
 

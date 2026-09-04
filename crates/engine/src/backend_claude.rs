@@ -173,9 +173,26 @@ pub(crate) mod win_job {
 /// well-known install locations. Each candidate is validated by running it
 /// with `--version`; the first one that succeeds wins. Errors list every
 /// attempt so the user can see what was tried.
+///
+/// A RELATIVE `configured` path is refused outright rather than tried
+/// (audit 2026-09-01 H1): candidate one is executed, and a relative path
+/// resolves against the process working directory, so `{"claudeBinary":
+/// "./scripts/helper"}` in a repository's config layer plus a committed
+/// executable is code execution as the operator on the first command that
+/// resolves a backend. `config::validate_claude_binary` refuses it earlier
+/// and with more context (it also knows the repo root); this is the same
+/// refusal at the execution site, for the callers that pass a raw string.
 pub fn discover_claude_binary(configured: Option<&str>) -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(configured) = configured {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() && !Path::new(trimmed).is_absolute() {
+            return Err(EngineError::Config(format!(
+                "configured claude binary {trimmed:?} must be an absolute path: a relative \
+                 path resolves against the process working directory, so which program runs \
+                 depends on where kranz was invoked"
+            )));
+        }
         candidates.push(PathBuf::from(configured));
     }
     if let Some(env_bin) = std::env::var_os("KRANZ_CLAUDE_BIN") {
@@ -369,6 +386,18 @@ pub fn seed_worker_scratch_home(
 pub fn build_args(spec: &SessionSpec) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-p".into(),
+        // Load only the operator's own settings. Verified 2026-09-02 against
+        // Claude Code 2.1.220 in a `-p` session with a fresh scratch HOME
+        // and no trust record: a repository's `.claude/settings.json`
+        // `SessionStart` hook ran, and a repository `.mcp.json` server
+        // command started, both before the model's first turn and outside
+        // its permission system. With `--setting-sources user` neither
+        // fired. Repository content is the untrusted input every other
+        // guard in this crate assumes, so project and local settings are
+        // never loaded; kranz's own hook projection still arrives through
+        // `--settings` below (2026-09-01 adversarial audit, exec I1).
+        "--setting-sources".into(),
+        "user".into(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),

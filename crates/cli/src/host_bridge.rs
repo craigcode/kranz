@@ -6,8 +6,8 @@
 
 use kranz_engine::draft::DraftOutcome;
 use kranz_engine::types::{Plan, TokenUsage};
-use kranz_server::{ApiError, MissionHost};
-use kranz_slack::host::{AskOutcome, BoxFuture, PlanOutcome, PlanningHost};
+use kranz_server::{ApiError, MissionHost, PendingApproval};
+use kranz_slack::host::{ApprovePendingOutcome, AskOutcome, BoxFuture, PlanOutcome, PlanningHost};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -51,6 +51,49 @@ impl PlanningHost for HostedPlanning {
 
     fn approve_pending<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
         Box::pin(async move { self.0.try_approve_pending(id).await.map_err(plain) })
+    }
+
+    /// The atomic identity-checked approve (follow-up review M-13): ONE
+    /// acquisition of the host's registry lock reads the parked plan's
+    /// identity, compares it with the clicked card's, and takes the plan, so
+    /// a concurrent `/kranz plan` or web-UI approve cannot slip a
+    /// different plan in between. Overrides the trait's racy default.
+    fn approve_pending_if<'a>(
+        &'a self,
+        id: &'a str,
+        expected_identity: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<ApprovePendingOutcome>> {
+        Box::pin(async move {
+            let outcome = self
+                .0
+                .try_approve_pending_matching(
+                    id,
+                    expected_identity,
+                    &kranz_slack::format::plan_identity,
+                )
+                .await
+                .map_err(plain)?;
+            Ok(match outcome {
+                PendingApproval::Approved(branch) => ApprovePendingOutcome::Approved(branch),
+                PendingApproval::NothingParked => ApprovePendingOutcome::NothingParked,
+                PendingApproval::Mismatch { parked } => ApprovePendingOutcome::StalePlan { parked },
+            })
+        })
+    }
+
+    /// Reads the parked plan without consuming it, so the bridge can refuse
+    /// an approve from a card that shows an older plan (Slack M2).
+    fn pending_plan_identity<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async move {
+            Ok(self
+                .0
+                .pending_plan(id)
+                .as_ref()
+                .map(kranz_slack::format::plan_identity))
+        })
     }
 
     fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {

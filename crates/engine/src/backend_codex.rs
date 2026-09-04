@@ -105,6 +105,12 @@ fn seed_codex_scratch_home(
     let home = scratch_root.join("home");
     let codex_dir = home.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
+    // Owner-only on every scratch dir down to the seeded credential
+    // (2026-09-01 adversarial audit, H13): `scratch_root` lives under
+    // `std::env::temp_dir()`, which on Linux and CI runners is the SHARED
+    // `/tmp`, and `create_dir_all` leaves 0755 parents there. The uuid in
+    // the path buys nothing, because `/tmp` is listable.
+    restrict_to_owner(&[scratch_root, &home, &codex_dir])?;
     if let Some(real_home) = real_home {
         let source = real_home.join(".codex");
         for entry in CODEX_SEED_ENTRIES {
@@ -116,17 +122,54 @@ fn seed_codex_scratch_home(
                 // protected descriptor attached to operator credentials.
                 // This also avoids CopyFile's intermittent ERROR_PATH_NOT_FOUND
                 // on hosted Windows runners after AppContainer ACL exercises.
+                //
+                // The stream is the one seeding site that does NOT carry the
+                // source mode over (every other backend uses `fs::copy`,
+                // which does), so `auth.json` — the Codex CLI's OAuth tokens
+                // and API key — landed 0666 & ~umask, typically 0644, in
+                // shared `/tmp` (2026-09-01 adversarial audit, H13). Create
+                // it 0600 and re-assert the mode after: `.mode()` applies
+                // only at creation, so a pre-existing file (impossible under
+                // `create_new`, but the invariant is the file's, not the
+                // call's) would otherwise keep whatever it had.
                 let mut source = std::fs::File::open(&src)?;
-                let mut target = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dst)?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let mut target = options.open(&dst)?;
                 std::io::copy(&mut source, &mut target)?;
                 target.flush()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+                }
             }
         }
     }
     Ok(home)
+}
+
+/// Narrow each scratch directory to owner-only (`0700`) on unix. A no-op
+/// elsewhere: Windows scratch dirs inherit the operator profile's ACL, which
+/// is already the owner-only posture this achieves. A failure is surfaced,
+/// not swallowed — seeding into a world-readable dir is the defect.
+#[cfg(unix)]
+fn restrict_to_owner(dirs: &[&Path]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for dir in dirs {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_dirs: &[&Path]) -> std::io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1131,45 @@ mod tests {
             !seeded.join("sessions").exists(),
             "per-session transcripts are never seeded"
         );
+    }
+
+    /// H13 (2026-09-01 adversarial audit): the seed streams bytes through
+    /// `OpenOptions` rather than `fs::copy`, so it did NOT carry the
+    /// source's `0600` over — `auth.json` (the Codex CLI's OAuth tokens and
+    /// API key) landed `0666 & ~umask`, typically 0644, under `0755` parents
+    /// in `std::env::temp_dir()`. On Linux and CI runners that is the shared
+    /// `/tmp`, and the uuid in the path buys nothing because `/tmp` is
+    /// listable.
+    #[cfg(unix)]
+    #[test]
+    fn seed_codex_scratch_home_writes_owner_only_credentials_and_dirs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let real_home = tempfile::tempdir().unwrap();
+        let codex = real_home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+        std::fs::write(codex.join("config.toml"), "model = \"gpt-5\"").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_root = scratch.path().join("kranz-worker-home-abc");
+        std::fs::create_dir_all(&scratch_root).unwrap();
+
+        let home = seed_codex_scratch_home(&scratch_root, Some(real_home.path())).unwrap();
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        for entry in ["auth.json", "config.toml"] {
+            assert_eq!(
+                mode(&home.join(".codex").join(entry)),
+                0o600,
+                "{entry} must be owner-only"
+            );
+        }
+        // Every parent down to the credential, or the 0600 leaf is still
+        // reachable by name from a listable shared /tmp.
+        for dir in [&scratch_root, &home, &home.join(".codex")] {
+            assert_eq!(mode(dir), 0o700, "{} must be owner-only", dir.display());
+        }
     }
 
     #[test]

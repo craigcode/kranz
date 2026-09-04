@@ -38,6 +38,35 @@ const KNOWN_TOOLS: &[&str] = &[
     "BashOutput",
 ];
 
+/// Deny rules protecting the consent substrate, applied to EVERY role
+/// (audit 2026-09-01 C1 / H6).
+///
+/// Two things must stay out of reach of an agent session:
+///
+/// - `~/.kranz/**` holds the repository authority key that signs control
+///   files and MACs `events.jsonl`, plus `serve.token`. A session that can
+///   read the key can forge operator consent; one that can write there can
+///   substitute a key of its own.
+/// - `.kranz/missions/**/control/**` is the control inbox itself. Signature
+///   checking already refuses forged files, but a session with no business
+///   writing there should not be able to fill the inbox with quarantine
+///   fodder, and the deny rule states the boundary where a reader will look
+///   for it.
+///
+/// This is the barrier under the DEFAULT posture, where `sandbox.enforce` is
+/// `off` and there is no OS containment at all. It is the agent CLI enforcing
+/// its own rules, so it is weaker than the sandbox's read-deny set and does
+/// not survive `dangerouslyAllowAll`, which short-circuits every profile to
+/// `bypassPermissions` by design.
+const AUTHORITY_DENY: &[&str] = &[
+    "Read(~/.kranz/**)",
+    "Edit(~/.kranz/**)",
+    "Write(~/.kranz/**)",
+    "Read(.kranz/missions/**/control/**)",
+    "Edit(.kranz/missions/**/control/**)",
+    "Write(.kranz/missions/**/control/**)",
+];
+
 /// Built-in worker deny list (§4.7): no pushing, no publishing, no privilege
 /// escalation, no raw network access.
 const WORKER_DENY: &[&str] = &[
@@ -160,6 +189,10 @@ pub fn for_role(
             if !deny_exceptions.is_empty() {
                 disallowed.retain(|rule| !deny_exceptions.contains(rule));
             }
+            // AFTER the lift: a `WorkerDeny` grant is an operator decision
+            // about a shell command, and must never be able to hand a session
+            // the authority key that signs the operator's own approvals.
+            disallowed.extend(authority_deny());
             let mut allowed = vec!["Bash".to_string()];
             for grant in grants {
                 allowed.extend(command_allow_patterns(grant));
@@ -180,7 +213,7 @@ pub fn for_role(
                 permission_mode: Some("default".to_string()),
                 tools: Some(to_strings(INSPECT_TOOLS)),
                 allowed_tools: allowed,
-                disallowed_tools: to_strings(READ_ONLY_DENY),
+                disallowed_tools: read_only_deny(),
             }
         }
 
@@ -230,7 +263,7 @@ pub fn for_role(
                 permission_mode: Some("default".to_string()),
                 tools: Some(to_strings(INSPECT_TOOLS)),
                 allowed_tools: allowed,
-                disallowed_tools: to_strings(READ_ONLY_DENY),
+                disallowed_tools: read_only_deny(),
             }
         }
     }
@@ -325,6 +358,37 @@ fn as_tool_rule(pattern: &str) -> String {
     }
 }
 
+/// The read-only roles' deny set with [`AUTHORITY_DENY`] folded in. The
+/// read-only roles already deny `Write`/`Edit` outright, so the authority
+/// rules add the `Read` half: an orchestrator or validator has no business
+/// reading the key that signs the operator's approvals either.
+fn read_only_deny() -> Vec<String> {
+    let mut deny = to_strings(READ_ONLY_DENY);
+    deny.extend(authority_deny());
+    deny
+}
+
+/// [`AUTHORITY_DENY`] plus the same rules in ABSOLUTE form for the global
+/// kranz directory that actually resolves at runtime. `~` in a rule relies
+/// on the agent CLI expanding it, and `KRANZ_HOME` moves the key directory
+/// somewhere `~/.kranz/**` never covers; the absolute rule follows
+/// `paths::global_kranz_dir` so the deny and the key writer cannot drift
+/// (follow-up review F-9 and F-17). Backends without a permission-rule
+/// plane (codex, droid) never see these rules; there the OS sandbox is the
+/// only barrier, and the module docs say so.
+pub fn authority_deny() -> Vec<String> {
+    let mut deny = to_strings(AUTHORITY_DENY);
+    if let Some(global) = crate::paths::global_kranz_dir() {
+        let global = global.to_string_lossy().replace('\\', "/");
+        let global = global.trim_end_matches('/');
+        for tool in ["Read", "Edit", "Write"] {
+            deny.push(format!("{tool}(/{global}/**)"));
+        }
+    }
+    dedup_preserving_order(&mut deny);
+    deny
+}
+
 fn to_strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -338,6 +402,71 @@ fn dedup_preserving_order(items: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 2026-09-01 C1/H6: every role denies the authority material, and
+    /// the deny survives the one operator lever that edits the deny list.
+    #[test]
+    fn every_role_denies_the_authority_key_and_the_control_inbox() {
+        let cfg = MissionConfig::default();
+        for role in [
+            Role::Worker,
+            Role::Orchestrator,
+            Role::ValidatorScrutiny,
+            Role::ValidatorFunctional,
+        ] {
+            let profile = for_role(role, &cfg, &[], &[], &[]);
+            for rule in AUTHORITY_DENY {
+                assert!(
+                    profile.disallowed_tools.iter().any(|r| r == rule),
+                    "{role:?} must deny `{rule}`: {:?}",
+                    profile.disallowed_tools
+                );
+            }
+        }
+
+        // A WorkerDeny grant lifts the rule it names, never the authority
+        // rules: an operator approving `git push` must not hand the session
+        // the key that signs their own approvals.
+        let lifted = for_role(
+            Role::Worker,
+            &cfg,
+            &[],
+            &[],
+            &[
+                "Bash(git push*)".to_string(),
+                "Read(~/.kranz/**)".to_string(),
+            ],
+        );
+        assert!(!lifted
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git push*)"));
+        assert!(
+            lifted
+                .disallowed_tools
+                .iter()
+                .any(|r| r == "Read(~/.kranz/**)"),
+            "the authority deny is not liftable: {:?}",
+            lifted.disallowed_tools
+        );
+    }
+
+    /// The escape hatch stays an escape hatch: `dangerouslyAllowAll` clears
+    /// every list including this one, and the docs say so. Pinned so the
+    /// interaction is a decision on the record rather than an oversight.
+    #[test]
+    fn dangerously_allow_all_still_clears_the_authority_deny() {
+        let cfg = MissionConfig {
+            dangerously_allow_all: true,
+            ..MissionConfig::default()
+        };
+        let profile = for_role(Role::Worker, &cfg, &[], &[], &[]);
+        assert!(profile.disallowed_tools.is_empty());
+        assert_eq!(
+            profile.permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
+    }
 
     #[test]
     fn worker_deny_exceptions_lift_exactly_the_named_rule() {

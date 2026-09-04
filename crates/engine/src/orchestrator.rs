@@ -554,6 +554,18 @@ impl MissionEngine {
         write_kranz_gitignore(&paths)?;
 
         let events = EventLog::read_events(&paths.events_file())?;
+        // Rollback check BEFORE the fold (audit 2026-09-01 H6). Truncating
+        // `events.jsonl` at a line boundary leaves a perfectly valid log:
+        // contiguous seqs, matching mission ids, intact hash chain. What it
+        // does is roll the mission back past a `grant.denied`, a
+        // `milestone.failed`, or a `validation.finding` — and resume used to
+        // fold the shortened file as truth and then OVERWRITE `state.json`
+        // with the result, destroying the only other copy of the high-water
+        // mark. `state.json` is repo-writable too, so this is a detector, not
+        // a boundary: an attacker who truncates the log must now also match
+        // the snapshot, and the honest name for that is "harder", not
+        // "impossible".
+        crate::event_log::check_no_rollback(&paths, &events)?;
         let state = reducer::fold(&events)?;
 
         // The most recent orchestrator session's sdk id (events are in seq
@@ -8276,9 +8288,15 @@ fn unexecuted_pty_assertions<'a>(
         .collect()
 }
 
-/// De-duplicated, first-seen-order commands run by this milestone's workers,
-/// gathered from each feature's `worker_runs` reports so validators can
-/// re-run what workers already cited as evidence.
+/// De-duplicated, first-seen-order commands this milestone's workers CLAIM
+/// they ran, gathered from each feature's `worker_runs` reports.
+///
+/// Untrusted, model-authored strings: the validator prompt names them so the
+/// validator knows what to check, and [`crate::runner::run_validator_in`]
+/// deliberately keeps them out of the permission profile. A worker cannot
+/// widen the read-only role's Bash allow list by reporting a command it
+/// would like the validator to be able to run (audit-exec M1); widening
+/// takes the approved contract, `allowValidatorCommands`, or a human grant.
 pub(crate) fn worker_commands_for_milestone(
     state: &MissionState,
     milestone: &Milestone,
@@ -8464,7 +8482,10 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
 /// and validate, or the event must not be appended (the reducer would poison
 /// every future fold of the log).
 fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> Result<()> {
-    config::apply_validated_patch(current, patch).map(|_| ())
+    // PatchSource::Inbox: this is the drain path, and the control inbox is an
+    // unauthenticated filesystem channel — consent-bearing keys are refused
+    // here even though an operator surface may set them (audit C1).
+    config::apply_validated_patch_from(current, patch, config::PatchSource::Inbox).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

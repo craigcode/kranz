@@ -132,6 +132,95 @@ pub fn to_jsonl(pairs: &[InstructionPair]) -> String {
     out
 }
 
+/// Write one export payload to an operator-named `--out` path: parent chain
+/// pinned no-follow, a symlinked (or otherwise non-regular) destination
+/// REFUSED, bytes landed through a sibling temp file and a rename.
+///
+/// Shared by `kranz export-traces --out` and `kranz export-corpus --out`,
+/// which both used a bare `std::fs::write`. That truncates THROUGH a
+/// symlink, so an agent could plant `corpus.jsonl` → `~/.ssh/authorized_keys`
+/// (or a git hook) in the repo root and have the operator's own export
+/// overwrite it with partly agent-authored JSONL. Refusing the link is the
+/// point; the atomic rename is the same discipline the queue and ticket
+/// writers already use.
+///
+/// Lives here rather than in `paths` only because both exports are the
+/// callers; it is a candidate to move next to the other no-follow helpers.
+pub fn write_export_output(path: &std::path::Path, bytes: &[u8]) -> crate::error::Result<()> {
+    use cap_fs_ext::OpenOptionsFollowExt as _;
+    use cap_primitives::fs::FollowSymlinks;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        crate::error::EngineError::InvalidState(format!(
+            "export output path {} has no file name",
+            path.display()
+        ))
+    })?;
+    // A bare `corpus.jsonl` has an EMPTY parent, which no path helper can
+    // canonicalize; anchor it at the cwd first.
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let anchored = parent.join(file_name);
+    let (dir, name) = crate::paths::open_parent_nofollow(&anchored)?;
+
+    let refusal = || {
+        crate::error::EngineError::InvalidState(format!(
+            "refusing to write export output through a symlink or non-regular file: {}",
+            path.display()
+        ))
+    };
+    match dir.symlink_metadata(&name) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(refusal()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let tmp = format!(
+        ".{}.{}.kranz-export.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    );
+    let write = (|| -> crate::error::Result<()> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = dir.open_with(&tmp, &options)?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        drop(file);
+        // POSIX rename replaces the destination NAME, so a link swapped in
+        // after the check is replaced, never written through. Windows needs
+        // the destination gone first.
+        match dir.rename(&tmp, &dir, &name) {
+            Ok(()) => Ok(()),
+            Err(error) if cfg!(windows) => {
+                match dir.symlink_metadata(&name) {
+                    Ok(metadata) if metadata.file_type().is_file() => {
+                        dir.remove_file(&name)?;
+                    }
+                    Ok(_) => return Err(refusal()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(error.into()),
+                    Err(e) => return Err(e.into()),
+                }
+                dir.rename(&tmp, &dir, &name)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    })();
+    if write.is_err() {
+        let _ = dir.remove_file(&tmp);
+    }
+    write
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +509,48 @@ mod tests {
             assert_eq!(value["quant"], "n/a");
             assert!(value.get("weightHash").is_none());
         }
+    }
+
+    /// Audit M2: `--out` used a bare `std::fs::write`, which truncates
+    /// through a symlink an agent can plant at a plausible output path.
+    #[cfg(unix)]
+    #[test]
+    fn export_output_refuses_to_write_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("authorized_keys");
+        std::fs::write(&target, "ssh-ed25519 REAL\n").unwrap();
+        let out = tmp.path().join("corpus.jsonl");
+        std::os::unix::fs::symlink(&target, &out).unwrap();
+
+        let error = write_export_output(&out, b"{}\n").unwrap_err();
+        assert!(
+            error.to_string().contains("refusing"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "ssh-ed25519 REAL\n",
+            "the symlink target must be untouched"
+        );
+    }
+
+    #[test]
+    fn export_output_writes_and_replaces_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("nested").join("corpus.jsonl");
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+
+        write_export_output(&out, b"first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "first\n");
+        write_export_output(&out, b"second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "second\n");
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(out.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("kranz-export"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     }
 }

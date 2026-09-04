@@ -1272,3 +1272,312 @@ fn racing_acquires_on_a_dead_lock_admit_exactly_one_winner() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Line integrity: hash chain + per-mission MAC (audit 2026-09-01 H6)
+// ---------------------------------------------------------------------------
+
+/// A mission tree whose repo root is `dir`, with three real lifecycle events
+/// written through the writer so every line is sealed.
+fn seeded_log(dir: &std::path::Path) -> MissionPaths {
+    let p = paths(dir);
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    log.append(EventKind::MissionCreated {
+        goal: "one".to_string(),
+        base_branch: "main".to_string(),
+        mission_branch: format!("kranz/mission-{MISSION}"),
+        config: kranz_engine::types::MissionConfig::default(),
+    })
+    .unwrap();
+    for text in ["two", "three"] {
+        log.append(lifecycle(text)).unwrap();
+    }
+    drop(log);
+    p
+}
+
+fn append_line(path: &std::path::Path, line: &str) {
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[test]
+fn the_writer_seals_every_line_and_readers_accept_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    for line in raw.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            value.get("h").and_then(|v| v.as_str()).is_some(),
+            "every written line carries a chain hash: {line}"
+        );
+    }
+    // The sealed fields must stay invisible to the event type itself.
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[0].kind, EventKind::MissionCreated { goal, .. } if goal == "one"));
+}
+
+/// The H1/H6 attack: append a well-formed event with the next seq and the
+/// mission's own id. Before the chain, `resume` folded it as truth.
+#[test]
+fn a_forged_well_formed_append_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    append_line(&p.events_file(), &raw_event(4, lifecycle("forged")));
+
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("integrity chain")),
+        "a forged append must be corruption, not truth: {err:?}"
+    );
+}
+
+/// The H6 variant that used to be invisible: rewrite one line's payload in
+/// place, preserving line count and seq numbering.
+#[test]
+fn an_in_place_payload_rewrite_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    let rewritten = raw.replace("\"two\"", "\"rewritten\"");
+    assert_ne!(rewritten, raw, "fixture: the rewrite must actually apply");
+    std::fs::write(p.events_file(), rewritten).unwrap();
+
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("integrity chain broken")),
+        "{err:?}"
+    );
+}
+
+/// Stripping the chain off the tail an attacker wants to own is itself the
+/// signal: no downgrade once a log is chained.
+#[test]
+fn dropping_the_chain_mid_log_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    // Strip the integrity fields off the LAST line only.
+    let mut value: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("h");
+    object.remove("m");
+    *lines.last_mut().unwrap() = serde_json::to_string(&value).unwrap();
+    std::fs::write(p.events_file(), lines.join("\n") + "\n").unwrap();
+
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("integrity chain dropped")),
+        "{err:?}"
+    );
+}
+
+/// A log written before chaining existed must still read: refusing it would
+/// strand every in-flight mission. Documented compatibility, pinned.
+#[test]
+fn a_legacy_unchained_log_still_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = paths(tmp.path());
+    write_raw_log(
+        &p.events_file(),
+        &[
+            raw_event(1, lifecycle("one")),
+            raw_event(2, lifecycle("two")),
+        ],
+    );
+    assert_eq!(EventLog::read_events(&p.events_file()).unwrap().len(), 2);
+}
+
+/// A plain seq gap must still report as a seq gap. The chain breaks too, but
+/// the more specific diagnosis is the useful one, so check order matters.
+#[test]
+fn a_seq_gap_still_reports_as_a_seq_discontinuity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = paths(tmp.path());
+    write_raw_log(
+        &p.events_file(),
+        &[
+            raw_event(1, lifecycle("one")),
+            raw_event(3, lifecycle("three")),
+        ],
+    );
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("seq discontinuity")),
+        "{err:?}"
+    );
+}
+
+/// The chain alone cannot stop a forger: they can recompute every `h`. The
+/// MAC is what stops them, because the key is outside the repo. With a key
+/// present, a wholly recomputed chain that carries no MAC is refused.
+#[test]
+fn a_recomputed_chain_without_the_mac_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Mint the repo's authority key first, so the writer MACs every line.
+    kranz_engine::paths::load_or_create_authority_key(tmp.path()).unwrap();
+    let p = seeded_log(tmp.path());
+
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    assert!(
+        raw.lines().all(|l| l.contains("\"m\":")),
+        "fixture: the writer must MAC every line when the key exists"
+    );
+
+    // The attacker knows the chain algorithm and recomputes it over a log
+    // with one extra event. What they cannot produce is `m`.
+    let mut events = EventLog::read_events(&p.events_file()).unwrap();
+    let mut forged = events[0].clone();
+    forged.seq = 4;
+    forged.kind = lifecycle("forged");
+    events.push(forged);
+    std::fs::write(
+        p.events_file(),
+        kranz_engine::event_log::seal_events(&events, None).unwrap(),
+    )
+    .unwrap();
+
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("mac")),
+        "a chain the attacker recomputed must fail the MAC: {err:?}"
+    );
+}
+
+/// A MAC computed under the wrong key is refused, not merely a missing one.
+#[test]
+fn a_mac_under_the_wrong_key_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    kranz_engine::paths::load_or_create_authority_key(tmp.path()).unwrap();
+    let p = seeded_log(tmp.path());
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    std::fs::write(
+        p.events_file(),
+        kranz_engine::event_log::seal_events(&events, Some(b"not the authority key")).unwrap(),
+    )
+    .unwrap();
+
+    let err = EventLog::read_events(&p.events_file()).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::LogCorruption(m) if m.contains("mac does not verify")),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rollback by truncation (audit 2026-09-01 H6, attack B)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_log_shorter_than_the_snapshot_refuses_to_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.len(), 3);
+
+    // Snapshot the full history the way the engine does.
+    let state = kranz_engine::reducer::fold(&events).unwrap();
+    assert_eq!(state.last_seq, 3);
+    kranz_engine::reducer::write_snapshot(&state, &p.state_file()).unwrap();
+
+    // Truncate at a line boundary: still contiguous, still chained, still a
+    // valid log — and two decisions lighter.
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    let kept: Vec<&str> = raw.lines().take(1).collect();
+    std::fs::write(p.events_file(), kept.join("\n") + "\n").unwrap();
+    let short = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(short.len(), 1, "the truncated log still parses cleanly");
+
+    let err = kranz_engine::event_log::check_no_rollback(&p, &short).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("seq 1"), "names the log's end: {message}");
+    assert!(
+        message.contains("seq 3"),
+        "names the snapshot's mark: {message}"
+    );
+}
+
+#[test]
+fn a_snapshot_behind_the_log_is_not_a_rollback() {
+    // The log is the source of truth and the snapshot is rewritten after the
+    // fold, so a crash in between legitimately leaves it stale.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+
+    let stale = kranz_engine::reducer::fold(&events[..1]).unwrap();
+    assert_eq!(stale.last_seq, 1);
+    kranz_engine::reducer::write_snapshot(&stale, &p.state_file()).unwrap();
+    kranz_engine::event_log::check_no_rollback(&p, &events).unwrap();
+}
+
+#[test]
+fn a_missing_snapshot_is_not_a_rollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    kranz_engine::event_log::check_no_rollback(&p, &events).unwrap();
+}
+
+/// Truncating at a line boundary leaves a valid chain and a valid seq run,
+/// and `state.json` sits beside the log where the same writer can trim it.
+/// The out-of-repo high-water mark is the witness that survives both.
+#[test]
+fn truncation_is_refused_even_when_the_snapshot_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    let recorded = kranz_engine::paths::read_high_water(&p.repo_root, MISSION)
+        .expect("a sealed mission records its high-water mark");
+    assert_eq!(recorded, 3);
+    // No snapshot at all: the only witness left is the mark.
+    let _ = std::fs::remove_file(p.state_file());
+
+    let full = std::fs::read_to_string(p.events_file()).unwrap();
+    let first_line = full.lines().next().unwrap();
+    std::fs::write(p.events_file(), format!("{first_line}\n")).unwrap();
+
+    let short = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(short.len(), 1, "a clean prefix still parses on its own");
+    let err = kranz_engine::event_log::check_no_rollback(&p, &short).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("high-water mark"), "{message}");
+    assert!(
+        message.contains("seq 1") && message.contains("seq 3"),
+        "{message}"
+    );
+}
+
+/// The mark never moves backwards, so a stale writer cannot lower it.
+#[test]
+fn high_water_mark_never_lowers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    kranz_engine::paths::record_high_water(&p.repo_root, MISSION, 1).unwrap();
+    assert_eq!(
+        kranz_engine::paths::read_high_water(&p.repo_root, MISSION),
+        Some(3)
+    );
+}
+
+/// A writer that carried on unsealed because the key file was unreadable
+/// would hand a same-uid attacker the downgrade the seal exists to prevent
+/// (follow-up review F-2). No key, no mission.
+#[test]
+fn acquire_refuses_when_the_authority_key_is_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = seeded_log(tmp.path());
+    let key_path = kranz_engine::paths::authority_key_path(&p.repo_root).unwrap();
+    std::fs::write(&key_path, b"").unwrap();
+
+    let err = EventLog::acquire(&p, MISSION, NEVER, LockForce::No)
+        .expect_err("acquire must refuse without a readable key");
+    let message = err.to_string();
+    assert!(message.contains("authority key"), "{message}");
+}

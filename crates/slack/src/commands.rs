@@ -10,6 +10,7 @@
 
 use crate::bridge::error_blocks;
 use crate::config::SlackConfig;
+use crate::format::escape_mrkdwn;
 use crate::host::SharedHost;
 use kranz_engine::draft::DraftOutcome;
 use serde_json::Value;
@@ -94,16 +95,22 @@ pub async fn run_draft(host: &SharedHost, slug: &str) -> Vec<Value> {
                  `{slug}` can continue:\n"
             );
             for q in &questions {
-                text.push_str(&format!("• {q}\n"));
+                // Orchestrator-authored: escape so `<!channel>` and
+                // `<url|label>` reach the channel inert (M1).
+                text.push_str(&format!("• {}\n", escape_mrkdwn(q)));
             }
             error_blocks(text.trim_end())
         }
         Ok(DraftOutcome::WrongPlan { mission_id, reason }) => error_blocks(&format!(
             ":warning: Mission `{mission_id}` escalated while drafting `{slug}` — the planner \
-             can produce a plan but believes it is likely WRONG:\n{reason}\nEdit or re-scope \
-             the ticket, then run `/kranz draft {slug}` again."
+             can produce a plan but believes it is likely WRONG:\n{}\nEdit or re-scope \
+             the ticket, then run `/kranz draft {slug}` again.",
+            escape_mrkdwn(&reason)
         )),
-        Err(e) => error_blocks(&format!("Couldn't draft `{slug}`: {e}")),
+        Err(e) => error_blocks(&format!(
+            "Couldn't draft `{slug}`: {}",
+            escape_mrkdwn(&e.to_string())
+        )),
     }
 }
 
@@ -204,7 +211,7 @@ pub async fn run_merge(host: &SharedHost, mission_id: &str) -> Vec<Value> {
                 .and_then(|v| v.get("message"))
                 .and_then(Value::as_str)
             {
-                message.push_str(&format!("\n:warning: {warning}"));
+                message.push_str(&format!("\n:warning: {}", escape_mrkdwn(warning)));
             }
             error_blocks(&message)
         }
@@ -256,8 +263,9 @@ pub async fn run_approve_ticket_command(
         )),
         // VERBATIM: `e` is the engine's own refusal message (blocked-by,
         // not-REVIEW, or a blocked-by cycle) — forwarded unchanged, never
-        // wrapped in extra prose that would obscure it.
-        Err(e) => error_blocks(&e.to_string()),
+        // wrapped in extra prose that would obscure it. Escaped, since a
+        // refusal can quote ticket prose (M1); the words are unchanged.
+        Err(e) => error_blocks(&escape_mrkdwn(&e.to_string())),
     };
     ApproveTicketInvocation {
         authorized: true,
@@ -270,6 +278,9 @@ fn merge_error_blocks(mission_id: &str, detail: &str) -> Vec<Value> {
     // tail while keeping the complete Block Kit field safely below Slack's
     // 3,000-character limit (and leave room for instance labeling).
     const MAX_DETAIL: usize = 2300;
+    // `detail` is captured CI/test stdout, so it is repo-controlled. Escape
+    // BEFORE the tail clip, since the `&<>` expansion changes length (M1).
+    let detail = escape_mrkdwn(detail);
     let chars: Vec<char> = detail.chars().collect();
     let clipped = if chars.len() > MAX_DETAIL {
         format!(

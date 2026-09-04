@@ -5,6 +5,57 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Security: authenticated the mission control inbox and the event log so an
+  agent process with repository write access can no longer forge operator
+  consent, roll a mission back past a denial, or patch consent-bearing config
+  at runtime (adversarial audit 2026-09-01, C1 and H6).
+- Security: repository-provided `.kranz/config.json` can no longer name the
+  agent binary, an ACP program, a pack directory, an ambient-secret
+  passthrough, a remote model endpoint, or a containment escape; those keys are
+  operator-only. The sandbox now write-denies the authority files it already
+  read-denied, on all three tiers (H1, H2, H11).
+- Security: engine-side git handles are hooks-disabled by default, workspace
+  bootstrap commands and backend version probes run with a cleared
+  environment, and the macOS gate profile no longer grants the operator's own
+  terminal device (H3, H4, H5, H7). bubblewrap sessions now unshare pid, ipc,
+  uts, and cgroup namespaces and start a new session (H8).
+- Security: those git handles also neutralize the credential helper, ssh
+  command, editors, and transport hooks a repository's own config can name.
+  Network operations (`kranz exec --push`, the mission-branch probe) keep the
+  operator's global git config in force, so a credential helper, an
+  `insteadOf` rewrite, or an `http.proxy` in `~/.gitconfig` still applies —
+  and they refuse to run at all when the repository's own config (including a
+  linked worktree's `config.worktree`) carries a credential helper, an ssh
+  command, a URL rewrite, or a transport hook, naming every offending key.
+  Remove such a key from `.git/config` to push.
+- Security: Claude sessions launch with `--setting-sources user`, so a
+  repository's `.claude/settings.json` hooks and `.mcp.json` servers no longer
+  execute inside worker sessions (verified against Claude Code 2.1.220).
+- Security: agent-authored text is stripped of terminal control sequences
+  before it reaches the operator's terminal, including the plan approval
+  screen; Slack posts escape every agent-authored field (H9).
+- Security: validator verdict parsing requires the JSON to be the whole reply
+  or the sole fenced block, and duplicate verdict ids fail the assertion
+  (H10). Container sessions no longer mount the credential-bearing Cargo
+  root; the codex scratch credential seed is created 0600 (H12, H13).
+- Security: evidence bundles scrub artefact bytes, lesson and review-artifact
+  provenance compare committed bytes rather than the working tree, ticket
+  prose cannot set the task class, and server file reads refuse symlinks
+  (H14).
+- Security: the global kranz directory now honours `KRANZ_HOME`; the
+  authority key, seal floors, high-water marks, and control marks live
+  under it, outside every repository, and keys minted for temporary
+  repositories are pruned automatically.
+- Security: workspace gate commands see a contract-declared secret only when
+  the operator's `contractEnvPassthrough` also names it; container sessions
+  run as the operator's uid with all capabilities dropped and a pids limit.
+- Upgrade note: stop every running kranz process before installing this
+  version. The first sealed acquire records a seal floor for each mission, and
+  a pre-seal binary appending above it makes that mission's log unreadable.
+- Added `docs/reviews/adversarial-audit-2026-09-01.md`, the consolidated
+  audit with the seven per-surface source reports and the two follow-up
+  reviews of the fixes beside it.
+
 ## 0.2.0 - 2026-08-22
 
 - Prepared the repository's security, contribution, release, and supply-chain

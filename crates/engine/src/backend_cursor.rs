@@ -1605,6 +1605,28 @@ mod tests {
     /// interactive auth (see the non-interactivity invariant above
     /// [`SESSION_KEYCHAIN_LOCK_SECS`]): `show-keychain-info` only ever
     /// against a db the seed JUST reported unlocked.
+    /// Whether this host's `security` can seed a login keychain under a
+    /// relocated HOME at all, probed by running the seed itself against a
+    /// throwaway HOME. On a host where it cannot (the GitHub macOS runner
+    /// image 20260831.0337.3 refuses it; 20260728.0273.1 did not; a
+    /// sandboxed developer shell refuses the unlock), the keychain tests
+    /// skip with the capability marker instead of reporting a runner
+    /// regression as a defect in the seed. `KRANZ_REQUIRED_CAPABILITIES`
+    /// can still demand it, in which case the skip is a panic that names
+    /// the missing capability.
+    #[cfg(target_os = "macos")]
+    fn keychain_can_be_created() -> bool {
+        let home = tempfile::tempdir().unwrap();
+        if ensure_session_login_keychain(home.path(), "capability-probe") {
+            return true;
+        }
+        crate::test_capability::skip(
+            crate::test_capability::capability::KEYCHAIN,
+            "security cannot create and unlock a login keychain under a relocated HOME",
+        );
+        false
+    }
+
     #[cfg(target_os = "macos")]
     fn security_output(home: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("security")
@@ -1625,6 +1647,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_seeded_empty_when_absent() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
 
         // The seed's own unlock witness (batch A's exit 0) is the only
@@ -1656,6 +1681,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_never_replaces_an_existing_db() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let keychains = home.path().join("Library").join("Keychains");
         std::fs::create_dir_all(&keychains).unwrap();
@@ -1675,6 +1703,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_secret_is_random_per_session_and_stored_0600() {
+        if !keychain_can_be_created() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         let home_a = tempfile::tempdir().unwrap();
         let home_b = tempfile::tempdir().unwrap();
@@ -1731,6 +1762,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_lock_timeout_is_bounded_and_unlocked() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
 
         assert!(
@@ -1777,6 +1811,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_teardown_relocks_the_store() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         assert!(ensure_session_login_keychain(home.path(), "test-session"));
 
@@ -1825,6 +1862,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_legacy_seed_still_unlocks() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let keychains = home.path().join("Library").join("Keychains");
         std::fs::create_dir_all(&keychains).unwrap();

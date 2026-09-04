@@ -480,8 +480,15 @@ fn build_args_single_shot_puts_prompt_last() {
     let args = build_args(&spec);
 
     assert_eq!(
-        &args[..4],
-        &["-p", "--output-format", "stream-json", "--verbose"]
+        &args[..6],
+        &[
+            "-p",
+            "--setting-sources",
+            "user",
+            "--output-format",
+            "stream-json",
+            "--verbose"
+        ]
     );
     assert_eq!(args[index_of(&args, "--model") + 1], "sonnet");
     assert_eq!(args[index_of(&args, "--effort") + 1], "medium");
@@ -1582,4 +1589,29 @@ fn seed_worker_scratch_home_worker_env_hygiene_config_dir_override_takes_precede
         copied, "relocated-creds",
         "an explicit CLAUDE_CONFIG_DIR override must win over $HOME/.claude as the copy source"
     );
+}
+
+/// A repository's own `.claude/settings.json` hooks and `.mcp.json` servers
+/// run before the model's first turn, outside its permission system, when
+/// Claude Code loads project settings (verified 2026-09-02 against 2.1.220).
+/// Every session pins the setting sources to the operator's own, and the
+/// pin must never depend on a per-spec field a caller could forget.
+#[test]
+fn build_args_pins_setting_sources_to_the_operator_for_every_session() {
+    for prompt in [
+        PromptMode::SingleShot("ok".to_string()),
+        PromptMode::Streaming("ok".to_string()),
+    ] {
+        let mut spec = base_spec(prompt);
+        spec.resume = Some("prev".to_string());
+        let args = build_args(&spec);
+        let at = index_of(&args, "--setting-sources");
+        assert_eq!(args[at + 1], "user");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("project") || a.contains("local")),
+            "no project or local settings source may be requested: {args:?}"
+        );
+    }
 }

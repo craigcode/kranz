@@ -82,6 +82,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             goal: plan.goal.clone(),
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
             assertion_count: plan.validation_contract.len(),
+            plan_identity: crate::format::plan_identity(plan),
         })),
 
         EventKind::PlanRevisionProposed {

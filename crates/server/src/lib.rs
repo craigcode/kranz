@@ -24,7 +24,7 @@ mod tickets;
 mod ws;
 
 pub use error::ApiError;
-pub use host::MissionHost;
+pub use host::{MissionHost, PendingApproval};
 pub use multi::{
     load_host_config, HostConfig, MultiRepoHost, RepoActivity, RepoConfig, RepoContext,
     RepoSlackConfig, RepoSummary, SlackChannelRoute,

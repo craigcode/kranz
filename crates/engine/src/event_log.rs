@@ -8,6 +8,48 @@
 //! [`EventLog::flush_if_due`] — by the next lifecycle append, by explicit
 //! [`EventLog::flush`], or on drop. Losing buffered deltas on a crash is
 //! recoverable; losing a lifecycle event is not, hence the asymmetry.
+//!
+//! # Line integrity (audit 2026-09-01 H6)
+//!
+//! The log is not only an audit record: three gate decisions read it back
+//! mid-run, so a well-formed forged append or a rollback by truncation is a
+//! live consent bypass, not a post-hoc bookkeeping problem. Every line the
+//! writer produces therefore carries two extra fields, kept to one character
+//! because they ride every event:
+//!
+//! - `h` — the CHAIN. Hex sha256 over the previous line's `h` (the empty
+//!   string for the first chained line) concatenated with this line's
+//!   canonical event bytes, which are the event re-serialized WITHOUT `h` and
+//!   `m`. Both writer and reader build those bytes from an [`Event`], so the
+//!   two sides cannot drift on key order or number formatting. The chain
+//!   makes an edit anywhere in the file loud instead of local.
+//! - `m` — the MAC. Hex HMAC-SHA256 of `h` under the repository authority key
+//!   ([`crate::paths::authority_key_path`]).
+//!
+//! Be clear about which does what. The chain ALONE only catches accidental
+//! corruption: an attacker who rewrites a line can recompute every following
+//! `h` themselves. `m` is what defeats a same-uid forger, because the key
+//! lives outside the repository, in the sandbox's authority-read-deny set and
+//! behind the agent CLI's `Read(~/.kranz/**)` deny rule, so they cannot
+//! compute it.
+//!
+//! Compatibility, and why it is not a hole. A log written before this existed
+//! has no `h` on any line, and refusing it would strand every in-flight
+//! mission, so an unsealed line is not refused on its own. Two rules stop
+//! that from becoming a free downgrade:
+//!
+//! 1. No downgrade WITHIN a log. Once a line carries `h`, every later line
+//!    must; once a line carries `m`, every later line must. An attacker
+//!    cannot strip integrity off just the tail they want to rewrite.
+//! 2. A SEAL FLOOR outside the repository. The first time a writer with the
+//!    key opens a mission's log it records, under `~/.kranz/seals/`, the seq
+//!    it will start sealing from ([`crate::paths::record_seal_floor`]). Every
+//!    line at or above that seq must carry a valid `h` and `m`. That is what
+//!    stops the whole-log rewrite: stripping every line makes the file look
+//!    legacy, but the floor is not in the file and the attacker cannot lower
+//!    it. It is also why the `m` rule is not simply "the key exists, so every
+//!    line needs `m`" — the key can be minted mid-mission, and the lines
+//!    written before that legitimately have none.
 
 use crate::error::{EngineError, Result};
 use crate::events::{Event, EventKind};
@@ -21,6 +63,126 @@ use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq as _;
+
+/// JSON key holding a line's chain hash.
+const CHAIN_FIELD: &str = "h";
+
+/// JSON key holding a line's MAC over the chain hash.
+const MAC_FIELD: &str = "m";
+
+/// Canonical bytes for one event: the event re-serialized without `h`/`m`.
+fn canonical_event_bytes(event: &Event) -> Result<String> {
+    Ok(serde_json::to_string(event)?)
+}
+
+/// Next link in the chain: sha256 over the previous link and this event's
+/// canonical bytes.
+fn chain_hash(prev: &str, body: &str) -> String {
+    let mut input = String::with_capacity(prev.len() + body.len());
+    input.push_str(prev);
+    input.push_str(body);
+    crate::standards_waiver::sha256_hex(input.as_bytes())
+}
+
+/// Serialize one event as a sealed log line (no trailing newline), returning
+/// the line and the chain hash the NEXT line must build on.
+fn seal_line(event: &Event, prev_hash: &str, key: Option<&[u8]>) -> Result<(String, String)> {
+    let body = canonical_event_bytes(event)?;
+    let hash = chain_hash(prev_hash, &body);
+    let mut value: serde_json::Value = serde_json::from_str(&body)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        EngineError::InvalidState("event did not serialize as a JSON object".to_string())
+    })?;
+    object.insert(
+        CHAIN_FIELD.to_string(),
+        serde_json::Value::String(hash.clone()),
+    );
+    if let Some(key) = key {
+        object.insert(
+            MAC_FIELD.to_string(),
+            serde_json::Value::String(crate::hooks::hmac_sha256_hex(key, hash.as_bytes())),
+        );
+    }
+    Ok((serde_json::to_string(&value)?, hash))
+}
+
+/// Seal a whole event sequence into `events.jsonl` bytes exactly as the
+/// writer would. Public so tests and tooling can build a log that satisfies
+/// [`EventLog::read_events`] without driving a live [`EventLog`].
+pub fn seal_events(events: &[Event], key: Option<&[u8]>) -> Result<String> {
+    let mut out = String::new();
+    let mut prev = String::new();
+    for event in events {
+        let (line, hash) = seal_line(event, &prev, key)?;
+        out.push_str(&line);
+        out.push('\n');
+        prev = hash;
+    }
+    Ok(out)
+}
+
+/// Refuse to carry on when the log is SHORTER than the last snapshot says it
+/// was (audit 2026-09-01 H6, rollback by truncation).
+///
+/// `state.json` is a derived cache, but it holds an independent copy of the
+/// high-water mark (`MissionState::last_seq`), and nothing compared the two.
+/// A log cut at a line boundary stays internally valid, so the only signal
+/// that events were erased is that the snapshot remembers more of them.
+///
+/// A snapshot that is BEHIND the log is normal: the log is the source of
+/// truth and the snapshot is rewritten after the fold, so a crash between the
+/// two leaves it stale. Only the shorter-log direction is refused, and the
+/// error names both numbers so an operator can see the size of the gap.
+///
+/// A missing or unreadable snapshot is not an error: a mission resumed on a
+/// machine that never wrote one has nothing to compare against.
+pub fn check_no_rollback(paths: &MissionPaths, events: &[Event]) -> Result<()> {
+    // Two witnesses, and the higher one wins. The snapshot lives in the
+    // repository beside the log, so it only catches a crash or a careless
+    // edit; the high-water mark lives outside the repository beside the
+    // authority key, so it also catches a writer who trimmed both.
+    let snapshot_seq = crate::reducer::read_snapshot(&paths.state_file())
+        .map(|snapshot| snapshot.last_seq)
+        .unwrap_or(0);
+    let mark_seq = crate::paths::read_high_water(&paths.repo_root, &paths.mission_id).unwrap_or(0);
+    let (witness_seq, witness) = if mark_seq >= snapshot_seq {
+        (mark_seq, "the out-of-repo high-water mark")
+    } else {
+        (snapshot_seq, "the last snapshot")
+    };
+    let log_last_seq = events.last().map(|e| e.seq).unwrap_or(0);
+    if witness_seq > log_last_seq {
+        return Err(EngineError::LogCorruption(format!(
+            "refusing to resume mission '{}': {} ends at seq {log_last_seq} but {witness} \
+             recorded seq {witness_seq}. The log has lost {} event(s) since it was written; \
+             resuming would overwrite the snapshot with the rolled-back state and erase the \
+             evidence. Restore the log from the mission branch or abandon the mission.",
+            paths.mission_id,
+            paths.events_file().display(),
+            witness_seq - log_last_seq
+        )));
+    }
+    Ok(())
+}
+
+/// The repository root and mission id a log sits under, recovered from its
+/// path (`<repo>/.kranz/missions/<id>/events.jsonl`). Used to locate the
+/// authority key and the seal floor from the static reader entry points,
+/// which take only a path.
+fn log_identity(path: &Path) -> Option<(&Path, &str)> {
+    let mission_dir = path.parent()?;
+    let mission_id = mission_dir.file_name()?.to_str()?;
+    let missions_dir = mission_dir.parent()?;
+    if missions_dir.file_name()? != "missions" {
+        return None;
+    }
+    let kranz_dir = missions_dir.parent()?;
+    if kranz_dir.file_name()? != ".kranz" {
+        return None;
+    }
+    Some((kranz_dir.parent()?, mission_id))
+}
 
 /// How aggressively [`EventLog::acquire`] may steal an existing lock.
 ///
@@ -72,6 +234,14 @@ struct ParsedLog {
     /// False only when the last parsed line lacked a trailing newline (a torn
     /// write that cut exactly at the terminator).
     terminated: bool,
+    /// Chain hash of the last parsed line, `None` when the log is empty or
+    /// its tail is still unchained (a legacy log). The next append builds on
+    /// this, so a legacy log starts a fresh chain from the empty string.
+    last_hash: Option<String>,
+    /// True once any parsed line carried a MAC, so the writer keeps MACing
+    /// even if the key becomes unreadable rather than silently downgrading a
+    /// log every reader would then refuse.
+    saw_mac: bool,
 }
 
 /// Single-writer, append-only handle on a mission's `events.jsonl`.
@@ -98,6 +268,16 @@ pub struct EventLog {
     next_seq: u64,
     throttle: Duration,
     buffer: Vec<BufferedLine>,
+    /// Repository root, for the out-of-repo high-water mark recorded after
+    /// every durable append (see [`crate::paths::record_high_water`]).
+    repo_root: PathBuf,
+    /// Chain hash of the last line written (or loaded at acquire); the empty
+    /// string for a fresh or still-unchained log.
+    prev_hash: String,
+    /// Repository authority key, when one is readable. `None` writes the
+    /// chain without a MAC, which is what a reader with no key can verify
+    /// anyway.
+    authority_key: Option<Vec<u8>>,
 }
 
 /// Write buffered lines to `sink` from the front, removing each line from
@@ -242,6 +422,9 @@ impl EventLog {
             lock_file.flush()?;
 
             let events_path = paths.events_file();
+            // Chain state carried forward from whatever is already on disk.
+            let mut prev_hash = String::new();
+            let mut tail_had_mac = false;
             let last_seq = if mission_dir
                 .symlink_metadata("events.jsonl")
                 .is_ok_and(|metadata| metadata.file_type().is_file())
@@ -278,12 +461,63 @@ impl EventLog {
                     repair.write_all(b"\n")?;
                     repair.sync_data()?;
                 }
+                prev_hash = parsed.last_hash.clone().unwrap_or_default();
+                tail_had_mac = parsed.saw_mac;
                 parsed.events.last().map(|e| e.seq).unwrap_or(0)
             } else {
                 0
             };
 
             let file = open_append_at(&mission_dir, "events.jsonl", true)?;
+            // Acquiring the writer IS the operator action that starts or
+            // resumes a mission, so it mints the repository key on first
+            // use: a mission that never saw a control command must still
+            // be sealed, or the MAC and the high-water mark protect nothing
+            // until the first `kranz msg`. Minting failure (no resolvable
+            // home, an unwritable one) degrades to an unsealed log with a
+            // warning rather than refusing every mission on such a host;
+            // the readers treat an unsealed log exactly as before.
+            // Refuse, never degrade: a writer that carried on unsealed
+            // because the key file was unreadable would hand a same-uid
+            // attacker exactly the downgrade the seal exists to prevent
+            // (zero the key, delete the floor, rewrite the log keyless;
+            // follow-up review F-2). No key, no mission.
+            let authority_key = Some(
+                crate::paths::load_or_create_authority_key(&paths.repo_root).map_err(|error| {
+                    EngineError::InvalidState(format!(
+                        "cannot mint or read the repository authority key for mission '{mission_id}' \
+                         ({}): {error}. The event log is not written unsealed; restore the key \
+                         directory before running this mission",
+                        crate::paths::authority_key_path(&paths.repo_root)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<global kranz dir>/keys/<repo>.key".to_string())
+                    ))
+                })?,
+            );
+            if authority_key.is_none() && tail_had_mac {
+                // The tail is MACed and we cannot MAC any more: appending
+                // would write a downgrade every reader then refuses. Refuse
+                // now, naming the key, instead of corrupting the log.
+                return Err(EngineError::InvalidState(format!(
+                    "event log {} is MAC-protected but the repository authority key is unreadable; \
+                     restore {} before running this mission",
+                    events_path.display(),
+                    crate::paths::authority_key_path(&paths.repo_root)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "~/.kranz/keys/<repo>.key".to_string())
+                )));
+            }
+            if authority_key.is_some() {
+                // Record, outside the repo and exactly once, the first seq
+                // this writer will seal. From here on an unsealed line at or
+                // above that seq is a forgery, not a legacy line, and the
+                // lines below it stay grandfathered.
+                crate::paths::record_seal_floor(
+                    &paths.repo_root,
+                    mission_id,
+                    last_seq.saturating_add(1),
+                )?;
+            }
             Ok(EventLog {
                 mission_id: mission_id.to_string(),
                 events_path,
@@ -295,6 +529,9 @@ impl EventLog {
                 next_seq: last_seq + 1,
                 throttle,
                 buffer: Vec::new(),
+                repo_root: paths.repo_root.clone(),
+                prev_hash,
+                authority_key,
             })
         };
 
@@ -378,7 +615,10 @@ impl EventLog {
         let mut value = serde_json::to_value(&event)?;
         let findings = crate::scrub::scrub_json_value(&mut value, "event");
         let event: Event = serde_json::from_value(value)?;
-        let mut line = serde_json::to_string(&event)?;
+        // Seal AFTER scrubbing, so the chain covers the bytes that actually
+        // land on disk rather than the pre-redaction event.
+        let (mut line, hash) = seal_line(&event, &self.prev_hash, self.authority_key.as_deref())?;
+        self.prev_hash = hash;
         line.push('\n');
 
         if event.kind.is_stream_delta() {
@@ -395,6 +635,13 @@ impl EventLog {
             self.file.write_all(line.as_bytes())?;
             self.file.flush()?;
             self.file.sync_data()?;
+            // The line is durable; move the out-of-repo witness up to it.
+            // Only sealed missions carry one, the same missions whose lines
+            // a forger cannot rewrite, so the mark and the MAC cover the
+            // same set.
+            if self.authority_key.is_some() {
+                crate::paths::record_high_water(&self.repo_root, &self.mission_id, event.seq)?;
+            }
         }
 
         self.next_seq += 1;
@@ -496,14 +743,40 @@ impl EventLog {
 
     /// Parse one in-memory buffer — the single entry point every reader
     /// funnels into, so the validation rules (seq contiguity, one mission
-    /// id, torn-final-line drop) can never drift between the file-reading
-    /// forms and the single-snapshot form.
+    /// id, torn-final-line drop, and the `h`/`m` integrity checks described
+    /// in the module docs) can never drift between the file-reading forms and
+    /// the single-snapshot form.
+    ///
+    /// Check order is load-bearing: seq and mission id are verified BEFORE
+    /// the chain, so a plain seq gap still reports as a seq discontinuity
+    /// rather than as the broken chain it also is.
     fn parse_log_bytes(bytes: &[u8], path: &Path) -> Result<ParsedLog> {
+        let identity = log_identity(path);
+        if identity.is_none() {
+            // A log read from outside the `<repo>/.kranz/missions/<id>/`
+            // layout (a bundle, an archive, a copied file) gets the chain
+            // check only: no key, no floor, no mark. Say so, because
+            // chain-only is no defence against a forger (follow-up review
+            // F-6).
+            tracing::warn!(
+                path = %path.display(),
+                "event log read from a non-mission path: integrity verified by chain only"
+            );
+        }
+        let key = identity.and_then(|(root, _)| crate::paths::load_authority_key(root));
+        // The floor lives outside the repository, so an attacker who rewrites
+        // every line cannot lower it back to "this log was never sealed".
+        let seal_floor = identity
+            .and_then(|(root, mission)| crate::paths::read_seal_floor(root, mission))
+            .unwrap_or(u64::MAX);
         let mut events = Vec::new();
         let mut valid_len: usize = 0;
         let mut terminated = true;
         let mut offset: usize = 0;
         let mut line_no: usize = 0;
+        let mut prev_hash = String::new();
+        let mut last_hash: Option<String> = None;
+        let mut saw_mac = false;
         while offset < bytes.len() {
             line_no += 1;
             let rest = &bytes[offset..];
@@ -513,7 +786,40 @@ impl EventLog {
             };
             let is_final = offset + step == bytes.len();
             let line = String::from_utf8_lossy(&rest[..line_end]);
-            let event: Event = match serde_json::from_str(&line) {
+            let mut value: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(err) => {
+                    if is_final {
+                        tracing::warn!(
+                            path = %path.display(),
+                            line = line_no,
+                            error = %err,
+                            "dropping unparseable final event line (torn write)"
+                        );
+                        break;
+                    }
+                    return Err(EngineError::LogCorruption(format!(
+                        "unparseable event at {}:{}: {err}",
+                        path.display(),
+                        line_no
+                    )));
+                }
+            };
+            // Lift `h`/`m` OUT before deserializing: the canonical bytes the
+            // chain covers are the event without them, and removing the keys
+            // here means the `Event` type never has to tolerate extras.
+            let (presented_hash, presented_mac) = match value.as_object_mut() {
+                Some(object) => (
+                    object
+                        .remove(CHAIN_FIELD)
+                        .and_then(|v| v.as_str().map(str::to_string)),
+                    object
+                        .remove(MAC_FIELD)
+                        .and_then(|v| v.as_str().map(str::to_string)),
+                ),
+                None => (None, None),
+            };
+            let event: Event = match serde_json::from_value(value) {
                 Ok(e) => e,
                 Err(err) => {
                     if is_final {
@@ -552,6 +858,64 @@ impl EventLog {
                     )));
                 }
             }
+            match &presented_hash {
+                Some(hash) => {
+                    let body = canonical_event_bytes(&event)?;
+                    let expected_hash = chain_hash(&prev_hash, &body);
+                    if expected_hash != *hash {
+                        return Err(EngineError::LogCorruption(format!(
+                            "integrity chain broken at {}:{}: the line does not hash to its recorded `h`",
+                            path.display(),
+                            line_no
+                        )));
+                    }
+                    match (&key, &presented_mac) {
+                        (Some(key), Some(mac)) => {
+                            let expected_mac = crate::hooks::hmac_sha256_hex(key, hash.as_bytes());
+                            if !bool::from(expected_mac.as_bytes().ct_eq(mac.as_bytes())) {
+                                return Err(EngineError::LogCorruption(format!(
+                                    "integrity mac does not verify at {}:{}",
+                                    path.display(),
+                                    line_no
+                                )));
+                            }
+                        }
+                        // A MAC we cannot check is not a MAC we reject: a
+                        // reader with no key still gets the chain, which is
+                        // the whole point of chaining separately.
+                        (None, Some(_)) => {}
+                        (_, None) if saw_mac || event.seq >= seal_floor => {
+                            return Err(EngineError::LogCorruption(format!(
+                                "integrity mac missing at {}:{}: this mission is sealed from seq {}, and earlier lines carry `m`",
+                                path.display(),
+                                line_no,
+                                seal_floor
+                            )));
+                        }
+                        (_, None) => {}
+                    }
+                    saw_mac |= presented_mac.is_some();
+                    prev_hash = hash.clone();
+                    last_hash = Some(hash.clone());
+                }
+                None if last_hash.is_some() => {
+                    return Err(EngineError::LogCorruption(format!(
+                        "integrity chain dropped at {}:{}: earlier lines carry `h`, so a line without one is a downgrade",
+                        path.display(),
+                        line_no
+                    )));
+                }
+                None if event.seq >= seal_floor => {
+                    return Err(EngineError::LogCorruption(format!(
+                        "integrity chain missing at {}:{}: this mission is sealed from seq {seal_floor} on",
+                        path.display(),
+                        line_no
+                    )));
+                }
+                // Unchained legacy prefix: tolerated, and the chain starts
+                // fresh from the empty string at the first line that has one.
+                None => {}
+            }
             events.push(event);
             offset += step;
             valid_len = offset;
@@ -561,6 +925,8 @@ impl EventLog {
             events,
             valid_len: valid_len as u64,
             terminated,
+            last_hash,
+            saw_mac,
         })
     }
 

@@ -21,6 +21,15 @@ pub(crate) fn probe_version(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // agent-env-clear applies to the discovery probe too (2026-09-01
+    // adversarial audit, H5): every session spawn clears the environment,
+    // and this was the one child that did not — so a repo-named
+    // `claudeBinary` or a PATH-precedence shadow collected every operator
+    // credential in `envp` on its first `--version`, before any auth
+    // decision. `--version` needs the allowlist and nothing else; no auth
+    // var is injected here, because no version banner needs one.
+    command.env_clear();
+    command.envs(crate::agent_env::probe_child_env(&[]));
     #[cfg(unix)]
     command.process_group(0);
 
@@ -194,6 +203,46 @@ mod tests {
         let version = probe_version(&stub, Duration::from_secs(3)).unwrap();
 
         assert!(version.ends_with("healthy-version-1.2.3"), "{version}");
+    }
+
+    /// H5 (2026-09-01 adversarial audit): the discovery probe was the ONE
+    /// child the engine spawned without `env_clear`, so a repo-named
+    /// `claudeBinary` or a PATH-precedence shadow received every operator
+    /// credential in `envp` on its first `--version` — before any auth
+    /// decision was made about it.
+    #[test]
+    fn version_probe_spawns_without_the_operators_ambient_secrets() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("KRANZ_SECRET_TEST", "leaked-to-the-probe"),
+            ("GH_TOKEN", "ghp_poison"),
+            ("SLACK_BOT_TOKEN", "xoxb-poison"),
+            ("ANTHROPIC_API_KEY", "sk-ant-poison"),
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("env-dumping-version");
+        std::fs::write(&stub, "#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dumped = probe_version(&stub, Duration::from_secs(5)).unwrap();
+
+        for secret in [
+            "KRANZ_SECRET_TEST",
+            "GH_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ] {
+            assert!(
+                !dumped.contains(secret),
+                "{secret} reached the version probe:\n{dumped}"
+            );
+        }
+        // PATH still crosses: a probe that cannot resolve its own
+        // interpreter proves nothing about the binary it is probing.
+        assert!(
+            dumped.contains("PATH="),
+            "the probe env needs PATH:\n{dumped}"
+        );
     }
 
     #[test]

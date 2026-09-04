@@ -214,7 +214,8 @@ pub(crate) fn is_git_repo(root: &std::path::Path) -> bool {
 /// execution goes through [`run_shell_command_sandboxed`] (whose
 /// [`GateSandbox::Disabled`] arm reproduces this path byte-for-byte — the
 /// off-regression tests compare against this reference implementation), and
-/// the workspace-gate trust channel uses [`run_shell_command_with_code`].
+/// the workspace-gate trust channel uses
+/// [`run_shell_command_with_code_cleared`].
 ///
 /// `all(test, unix)`: every caller is a unix-gated shell test — on Windows
 /// test builds the function is dead code and clippy's `-D warnings` gates
@@ -234,6 +235,15 @@ pub(crate) async fn run_shell_command(
 /// in those cases the output string says which). The workspace bootstrap/
 /// readiness gate names the code in its block reasons so a blocked mission
 /// reads "exit code 3", not just "failed".
+///
+/// Test-only since the follow-up review's M-3: `disk.prune` was the last
+/// production caller of the INHERITED-env arm, and repo-authored
+/// `.kranz/workspace.json` commands have no business running with the
+/// engine's ambient credentials. Every contract-declared command lane now
+/// uses [`run_shell_command_with_code_cleared`]; this stays as the exit-code
+/// reference the shared plumbing is tested against. `cfg(test)` is what stops
+/// a future caller quietly reopening the inherited-env channel.
+#[cfg(test)]
 pub(crate) async fn run_shell_command_with_code(
     cwd: &std::path::Path,
     command: &str,
@@ -242,15 +252,38 @@ pub(crate) async fn run_shell_command_with_code(
     run_shell_command_with_timeout_env(cwd, command, COMMAND_TIMEOUT, env, false).await
 }
 
+/// [`run_shell_command_with_code`] with the environment CLEARED — `env` is
+/// the child's COMPLETE environment, the same trust channel every
+/// validation-contract command runs on.
+///
+/// All FOUR contract-declared command lanes use this — bootstrap, readiness,
+/// the golden-data hooks, and (since the follow-up review's M-3)
+/// `disk.prune`. They used to inherit the engine's whole ambient environment
+/// on the strength of a doc comment about the workspace contract's
+/// `secrets[]` list that nothing actually enforced (2026-09-01 adversarial
+/// audit, H4). Their env is built by
+/// `crate::workspace_gate::gate_command_env`, where a `secrets[]` name
+/// crosses only when the OPERATOR's `contractEnvPassthrough` names it too
+/// (follow-up review, H-6 — repo content must not choose which ambient
+/// credentials leave the host).
+pub(crate) async fn run_shell_command_with_code_cleared(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+) -> (Option<i32>, String) {
+    run_shell_command_with_timeout_env(cwd, command, COMMAND_TIMEOUT, env, true).await
+}
+
 /// [`run_shell_command`] with an explicit timeout (separated so tests can
 /// exercise the timeout path without waiting ten minutes).
 ///
-/// `clear_env` selects the trust channel: `true` for validation-contract
-/// commands (the `env` map is the child's COMPLETE environment — see
-/// [`run_shell_command`]); `false` for workspace-gate/bootstrap/data-hook
-/// commands, whose workspace contract declares its own secrets channel
-/// (`workspace.json`'s `secrets`) fed from ambient — never a contract
-/// command path.
+/// `clear_env` selects the trust channel: `true` for every command a
+/// contract can name — validation-contract commands and, since H4 and the
+/// follow-up review's M-3, all four workspace-contract lanes (the `env` map
+/// is then the child's COMPLETE environment — see [`run_shell_command`]).
+/// The `false` arm inherits the engine's ambient environment and has no
+/// production caller left; it survives only as the test reference for the
+/// exit-code plumbing.
 ///
 /// Pipe draining and the process-tree timeout kill (unix process group,
 /// Windows Job Object) live in the one shared core, [`run_command_bounded`].
@@ -629,13 +662,37 @@ fn gate_profile_extras() -> String {
     // contract carries pty assertions (merge gates never see one), so the
     // scoped lines ride every wrapped gate — the surface they open is the
     // pty device pair and nothing else.
-    String::from(
+    //
+    // 2026-09-01 adversarial audit (H7): the scoped regex still matched the
+    // OPERATOR'S OWN terminal. On macOS the pty slave pool IS the terminal
+    // pool — a Terminal.app session is `/dev/ttys003`, matched by
+    // `^/dev/tty[p-t][0-9a-f]+$` (`s` is in `[p-t]`) — so the narrowing did
+    // not exclude the very thing its comment names. A repo-authored gate
+    // command could open that node, write raw escape sequences to it, or
+    // `ioctl(TIOCSTI)` characters into the operator's shell, which the shell
+    // executes once `kranz` returns: arbitrary execution as the operator,
+    // outside the sandbox.
+    //
+    // The device-class allow stays (openpty needs it, and the profile cannot
+    // know which slave the harness will be handed), and the operator's own
+    // controlling terminal is DENIED by name after it —
+    // `crate::sandbox::operator_tty_paths` resolves the engine's fds 0/1/2.
+    // SBPL denies beat allows regardless of clause order, so the deny wins
+    // over the regex above; emitting it last is documentary. Nothing extra
+    // is emitted when the engine has no controlling terminal (a daemon, CI,
+    // `kranz serve`) — there is then no operator tty to protect, and every
+    // pty the harness allocates for itself stays reachable either way.
+    let mut extras = String::from(
         "\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/ptmx\"))\n\
          (allow file-read* (literal \"/dev/ptmx\"))\n\
          (allow file-read* file-write* (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
          (allow file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/tty[p-t][0-9a-f]+$\"))\n\
          (allow signal (target same-sandbox))\n",
-    )
+    );
+    extras.push_str(&crate::sandbox::tty_deny_block(
+        &crate::sandbox::operator_tty_paths(),
+    ));
+    extras
 }
 
 /// Refresh the xcrun shims' tool-resolution cache OUTSIDE the sandbox, once
@@ -2317,6 +2374,83 @@ mod tests {
         );
     }
 
+    /// H7 (2026-09-01 adversarial audit): the scoped regex above still
+    /// matched the OPERATOR's own terminal — on macOS the pty slave pool IS
+    /// the terminal pool, and `/dev/ttys003` is matched by
+    /// `^/dev/tty[p-t][0-9a-f]+$`. The tests before this one asserted the
+    /// PRESENCE of the scoped grant and so locked the bug in. The device
+    /// class stays allowed (openpty needs it); the parent's own terminal is
+    /// denied by name after it, and SBPL denies beat allows.
+    #[test]
+    fn gate_profile_extras_deny_the_operators_own_terminal() {
+        let extras = gate_profile_extras();
+        let ttys = crate::sandbox::operator_tty_paths();
+        if ttys.is_empty() {
+            // No controlling terminal (CI, `kranz serve`, a detached test
+            // runner): there is nothing to protect, and the profile must
+            // stay byte-identical to the pre-audit shape rather than emit an
+            // empty deny block.
+            assert!(
+                !extras.contains("(deny file-read* file-write* file-ioctl"),
+                "no tty means no deny block:\n{extras}"
+            );
+            return;
+        }
+        assert!(
+            extras.contains("(deny file-read* file-write* file-ioctl"),
+            "a controlling terminal must produce a deny block:\n{extras}"
+        );
+        for tty in &ttys {
+            let expected = format!("(literal \"{}\")", crate::sandbox::escape_sbpl_literal(tty));
+            assert!(
+                extras.contains(&expected),
+                "the operator terminal {} must be denied:\n{extras}",
+                tty.display()
+            );
+        }
+        // The deny lands AFTER the pty allows, which is where the audit's
+        // fix sketch put it (documentary — denies win regardless of order).
+        let allow = extras
+            .find("(allow file-ioctl (literal \"/dev/ptmx\")")
+            .expect("the pty ioctl allow");
+        let deny = extras
+            .find("(deny file-read* file-write* file-ioctl")
+            .expect("the terminal deny");
+        assert!(deny > allow, "the deny must follow the allows:\n{extras}");
+    }
+
+    /// The same deny rides the WORKER/session profile, not only wrapped
+    /// gates: an agent session under Seatbelt is the other process that
+    /// could reach the operator's terminal through the broad read allow.
+    #[test]
+    fn session_profile_denies_the_operators_own_terminal() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = crate::sandbox::generate_profile(&crate::sandbox::SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: repo.path().to_path_buf(),
+            mission_dir: mission,
+            tmpdir: scratch.path().to_path_buf(),
+            extra_write: vec![],
+            egress: vec![],
+            validator_read_deny_roots: vec![],
+        });
+
+        for tty in crate::sandbox::operator_tty_paths() {
+            let expected = format!(
+                "(literal \"{}\")",
+                crate::sandbox::escape_sbpl_literal(&tty)
+            );
+            assert!(
+                profile.contains(&expected),
+                "the session profile must deny the operator terminal {}:\n{profile}",
+                tty.display()
+            );
+        }
+    }
+
     /// The container arm of the resolve matrix (ticket container-gate-wrapper):
     /// provider:container + enforce != off + a detected runtime resolves to
     /// [`GateSandbox::Container`] with gate-shaped inputs (the gate cwd as the
@@ -3228,6 +3362,15 @@ mod tests {
         for var in ["TMPDIR", "TMP", "TEMP"] {
             env.insert(var.to_string(), scratch.join("tmp").display().to_string());
         }
+        // The wrapped suite creates missions, and a mission acquires its
+        // event log only with the repository authority key. The gate profile
+        // denies the operator's real key directory (that is the point of the
+        // deny), so the inner suite gets its own global kranz dir under the
+        // writable scratch via `KRANZ_HOME`. A real gate command never needs
+        // a key and never gets this override.
+        let kranz_home = scratch.join("kranz-home");
+        std::fs::create_dir_all(&kranz_home).unwrap();
+        env.insert("KRANZ_HOME".to_string(), kranz_home.display().to_string());
         let suite_log = scratch.join("tmp").join("dogfood-suite.log");
         let command = format!("{payload} > '{}' 2>&1", suite_log.display());
 

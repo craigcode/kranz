@@ -1286,6 +1286,22 @@ fn queued_json_files(repo: &Path, mission_id: &str) -> Vec<PathBuf> {
     files
 }
 
+/// One queued control file's command JSON, with the authenticity tag lifted
+/// off and checked. `control::enqueue` signs every file (audit 2026-09-01
+/// C1), so the shape assertions below stay about the command while the
+/// signature's presence is asserted once, here.
+fn queued_command(path: &Path) -> serde_json::Value {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let sig = value
+        .as_object_mut()
+        .expect("a control file is a JSON object")
+        .remove("sig")
+        .expect("every enqueued control file carries a signature");
+    assert_eq!(sig.as_str().unwrap().len(), 64, "hex HMAC-SHA256: {sig}");
+    value
+}
+
 #[test]
 fn msg_enqueues_control_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1297,8 +1313,7 @@ fn msg_enqueues_control_command() {
 
     let files = queued_json_files(repo, "m-1");
     assert_eq!(files.len(), 1);
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let value: serde_json::Value = queued_command(&files[0]);
     assert_eq!(
         value,
         serde_json::json!({ "kind": "msg", "text": "hello there", "interrupt": true })
@@ -1316,10 +1331,8 @@ fn pause_and_resume_enqueue_control_commands() {
 
     let files = queued_json_files(repo, "m-1");
     assert_eq!(files.len(), 2);
-    let first: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
-    let second: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[1]).unwrap()).unwrap();
+    let first: serde_json::Value = queued_command(&files[0]);
+    let second: serde_json::Value = queued_command(&files[1]);
     assert_eq!(first, serde_json::json!({ "kind": "pause" }));
     assert_eq!(second, serde_json::json!({ "kind": "resume" }));
 }
@@ -1350,8 +1363,7 @@ fn revision_commands_enqueue_for_a_revisable_mission() {
     commands::cmd_request_revision(repo, "m-1", "drop feature two").unwrap();
     let files = queued_json_files(repo, "m-1");
     assert_eq!(files.len(), 1);
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let value: serde_json::Value = queued_command(&files[0]);
     assert_eq!(
         value,
         serde_json::json!({ "kind": "request-revision", "instructions": "drop feature two" })
@@ -1394,8 +1406,7 @@ fn revision_commands_enqueue_for_a_revisable_mission() {
         }
         let files = queued_json_files(repo, mission);
         assert_eq!(files.len(), 1, "{mission}");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+        let value: serde_json::Value = queued_command(&files[0]);
         assert_eq!(value, expected, "{mission}");
     }
 }
@@ -1488,8 +1499,7 @@ fn grant_commands_enqueue_the_right_control_command() {
     commands::cmd_approve_grant(repo, "m-a", "gc audit --deep").unwrap();
     let files = queued_json_files(repo, "m-a");
     assert_eq!(files.len(), 1);
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let value: serde_json::Value = queued_command(&files[0]);
     assert_eq!(
         value,
         serde_json::json!({ "kind": "approve-grant", "command": "gc audit --deep" })
@@ -1499,8 +1509,7 @@ fn grant_commands_enqueue_the_right_control_command() {
     commands::cmd_deny_grant(repo, "m-b", "gc audit --deep", "not this run").unwrap();
     let files = queued_json_files(repo, "m-b");
     assert_eq!(files.len(), 1);
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let value: serde_json::Value = queued_command(&files[0]);
     assert_eq!(
         value,
         serde_json::json!({
@@ -1613,8 +1622,7 @@ fn question_events_commands_list_and_answer() {
     commands::cmd_answer_question(repo, "m-q", "q-1", "sqlite", Some(0)).unwrap();
     let files = queued_json_files(repo, "m-q");
     assert_eq!(files.len(), 1);
-    let value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let value: serde_json::Value = queued_command(&files[0]);
     assert_eq!(
         value,
         serde_json::json!({
@@ -1966,6 +1974,34 @@ fn question_events_renderer_renders_question_lines() {
     assert_eq!(
         renderer.render(&cleared),
         "[mission] question q-2 cleared (milestone completed)"
+    );
+}
+
+/// H9: the tail is the default `kranz run` surface, so agent-authored event
+/// text must reach the terminal with no escape sequence and no OSC payload
+/// left behind as bare text.
+///
+/// Each stripped sequence leaves a U+FFFD in its place (follow-up review
+/// H-3): silent deletion on an operator-facing surface hides the fact that
+/// the field was tampered with at all.
+#[test]
+fn renderer_strips_control_sequences_from_body_and_tag() {
+    let mut renderer = EventRenderer::new(false);
+
+    let blocked = event(
+        1,
+        "m-1",
+        EventKind::MilestoneBlocked {
+            milestone_id: "ms-1\u{1b}[2A".to_string(),
+            reason: "stuck\u{1b}]52;c;Y3VybCBldmlsfHNo\u{7} on the build".to_string(),
+        },
+    );
+    let line = renderer.render(&blocked);
+    assert!(!line.contains('\u{1b}'), "ESC survived the tail: {line:?}");
+    assert!(!line.contains("52;c;"), "OSC payload survived: {line:?}");
+    assert_eq!(
+        line,
+        "[milestone ms-1\u{fffd}] BLOCKED: stuck\u{fffd} on the build"
     );
 }
 

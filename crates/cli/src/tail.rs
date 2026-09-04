@@ -6,7 +6,7 @@
 //! event to stderr. [`EventRenderer`] does the event → line mapping and is
 //! separate so tests can assert on exact lines.
 
-use crate::output::{ansi, one_line};
+use crate::output::{ansi, one_line, sanitize_untrusted};
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::types::{GrantKind, MissionState, Role, RunResult};
@@ -680,7 +680,11 @@ impl EventRenderer {
             ),
         };
 
-        // Budget: "[tag] body" must fit LINE_MAX visible chars.
+        // Budget: "[tag] body" must fit LINE_MAX visible chars. Both halves
+        // interpolate model-authored ids and prose, so both are sanitized
+        // before they reach the operator's terminal (H9); `one_line` already
+        // sanitizes, the tag needs it explicitly.
+        let tag = sanitize_untrusted(&tag);
         let budget = LINE_MAX.saturating_sub(tag.chars().count() + 3);
         let body = one_line(&body, budget);
         if self.color {

@@ -925,15 +925,27 @@ fn planted_git_hooks_do_not_run_during_the_merge_flow() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // Control: the hook genuinely fires for a normal (hooks-enabled)
-    // checkout, proving the no-sentinel assertion below is not vacuous.
-    repo.checkout("kranz/mission-x").unwrap();
-    repo.checkout("main").unwrap();
+    // Control: the hook genuinely fires for a hooks-enabled checkout,
+    // proving the no-sentinel assertion below is not vacuous. That now takes
+    // the EXPLICIT escape hatch — `GitRepo::open` is hardened by default
+    // (audit 2026-09-01 H3), so an ordinary handle no longer runs hooks
+    // anywhere, which the second assertion pins.
+    let unhardened = GitRepo::open_unhardened(dir.path()).unwrap();
+    unhardened.checkout("kranz/mission-x").unwrap();
+    unhardened.checkout("main").unwrap();
     assert!(
         sentinel.exists(),
         "control checkout must fire the planted hook"
     );
     std::fs::remove_file(&sentinel).unwrap();
+
+    // The ordinary handle every engine caller gets does not.
+    repo.checkout("kranz/mission-x").unwrap();
+    repo.checkout("main").unwrap();
+    assert!(
+        !sentinel.exists(),
+        "GitRepo::open is hardened by default: an engine checkout must not run hooks"
+    );
 
     let report = merge_mission(
         &repo,
