@@ -69,6 +69,19 @@ fn main_inner() -> ExitCode {
         };
     }
 
+    // Self-test receipts use stdout; cleanup errors must remain visible on
+    // stderr even though these fixtures run before ordinary CLI setup.
+    #[cfg(windows)]
+    if kranz_engine::sandbox_windows::internal_self_test_requested()
+        || kranz_engine::sandbox_windows::internal_gate_self_test_requested()
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
+
     #[cfg(windows)]
     if kranz_engine::sandbox_windows::internal_self_test_requested() {
         return match kranz_engine::sandbox_windows::run_production_hostile_self_test() {

@@ -69,7 +69,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Console::{
@@ -305,6 +305,11 @@ impl Drop for AppContainerLease {
                     .sort_by_key(|entry| entry.path.components().count());
                 for snapshot in &self.original_dacls {
                     if let Err(error) = remove_sid_aces(snapshot, sid.0) {
+                        #[cfg(test)]
+                        eprintln!(
+                            "AppContainer ACE cleanup {}: {error}",
+                            snapshot.path.display()
+                        );
                         tracing::error!(path = %snapshot.path.display(), error = %error,
                             "failed to remove AppContainer ACEs from a DACL");
                     }
@@ -317,6 +322,11 @@ impl Drop for AppContainerLease {
                         .get(&comparable_path(&snapshot.path))
                     {
                         if let Err(error) = restore_boundary_inheritance(snapshot, original) {
+                            #[cfg(test)]
+                            eprintln!(
+                                "AppContainer inheritance cleanup {}: {error}",
+                                snapshot.path.display()
+                            );
                             tracing::error!(path = %snapshot.path.display(), error = %error,
                                 "failed to restore AppContainer boundary inheritance");
                         }
@@ -440,10 +450,14 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
 
 fn snapshot_dacl_with_pin(path: &Path, pin: bool) -> Result<DaclSnapshot> {
     let path_wide = wide(path.as_os_str());
+    // Metadata-only opens do not participate in Windows sharing checks.
+    // FILE_READ_DATA (FILE_LIST_DIRECTORY on directories) makes the retained
+    // no-share-delete handle a real replacement pin; no contents are read.
+    let access = READ_CONTROL.0 | WRITE_DAC.0 | if pin { FILE_READ_DATA.0 } else { 0 };
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
-            READ_CONTROL.0 | WRITE_DAC.0,
+            access,
             FILE_SHARE_READ
                 | FILE_SHARE_WRITE
                 | if pin {
@@ -4385,6 +4399,11 @@ mod tests {
                 drop(remaining);
                 for before in [&authority_before, &gitlink_before, &root_before] {
                     let after = snapshot_dacl(&before.path).unwrap();
+                    if before.protected != after.protected || before.acl != after.acl {
+                        eprintln!(
+                            "boundary restoration mismatch: before={before:?} after={after:?}"
+                        );
+                    }
                     assert_eq!(
                         before.protected,
                         after.protected,
