@@ -128,6 +128,18 @@ pub enum EventKind {
         feature_id: String,
     },
 
+    /// Engine-observed sequential feature baseline and cumulative commit receipts.
+    /// Recorded before execution and after checkpoints, so retries and resume
+    /// cannot turn retained work into an apparently commitless feature.
+    #[serde(rename = "feature.progress")]
+    FeatureProgress {
+        #[serde(rename = "featureId")]
+        feature_id: String,
+        #[serde(rename = "baseSha")]
+        base_sha: String,
+        commits: Vec<String>,
+    },
+
     #[serde(rename = "worker.spawned")]
     WorkerSpawned {
         #[serde(rename = "runId")]
@@ -1120,6 +1132,7 @@ impl EventKind {
             EventKind::GrantDenied { .. } => "grant.denied",
             EventKind::MilestoneStarted { .. } => "milestone.started",
             EventKind::FeatureStarted { .. } => "feature.started",
+            EventKind::FeatureProgress { .. } => "feature.progress",
             EventKind::WorkerSpawned { .. } => "worker.spawned",
             EventKind::WorkerMessage { .. } => "worker.message",
             EventKind::WorkerEgressDenied { .. } => "worker.egress.denied",

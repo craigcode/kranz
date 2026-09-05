@@ -20,6 +20,12 @@ unhealthy root stays distinguishable from an unknown repo id (404).
 Unknown `/api/*` paths always return JSON and never fall through to the
 dashboard SPA.
 
+The additive `feature.progress` event records a sequential feature’s pinned
+`baseSha` and cumulative commit receipts. Folded state exposes the optional
+`featureBaseShas` map; it is absent for legacy logs without these events.
+See the [contract change](reviews/2026-09-05-feature-progress-contract.md) for
+retry, recovery, and upgrade semantics.
+
 ## REST
 
 | Method/Path | Response |

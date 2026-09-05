@@ -806,6 +806,11 @@ pub struct ProvisionedPreview {
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
     pub mission: Mission,
+    /// Sequential feature baselines pinned before worker execution. Empty in
+    /// older logs; reconstructed from feature.progress rather than trusted
+    /// from the cached state file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub feature_base_shas: BTreeMap<String, String>,
     /// All runs keyed by run id (BTreeMap for deterministic serialization).
     pub runs: BTreeMap<String, WorkerRun>,
     pub totals: TokenUsage,

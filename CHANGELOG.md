@@ -7,6 +7,9 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Fixed retries losing earlier checkpoint commit receipts. Sequential features
+  now persist their baseline and cumulative receipts before retry or resume;
+  failed features with retained work cannot be mistaken for empty proposals.
 - Fixed fractional costs producing event lines that failed their own integrity
   checks. New versioned seals preserve numeric bits; valid legacy seals keep
   their original interpretation and can be continued without rewriting them.

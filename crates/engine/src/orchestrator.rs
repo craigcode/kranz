@@ -3309,6 +3309,13 @@ impl MissionEngine {
             self.emit(EventKind::FeatureStarted { feature_id })?;
         }
 
+        let feature_id = self.state.mission.milestones[mi].features[fi].id.clone();
+        let feature_base_sha = match self.state.feature_base_shas.get(&feature_id) {
+            Some(base) => base.clone(),
+            None => self.active_repo().head_sha()?,
+        };
+        self.record_feature_progress(mi, fi, &feature_base_sha)?;
+
         let mut guidance: Option<String> = None;
         loop {
             // Snapshot everything the runner needs (avoids borrowing state
@@ -3321,7 +3328,6 @@ impl MissionEngine {
             let egress_grants = self.state.mission.egress_grants.clone();
             let deny_exceptions = self.state.mission.deny_exceptions.clone();
             let touch_set = self.state.mission.touch_set.clone();
-            let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
             // the notify on `Msg { interrupt: true }`; run_session aborts the
@@ -3417,6 +3423,10 @@ impl MissionEngine {
             let outcome = outcome?;
             caught?;
 
+            // Persist worker-created commits before processing controls. A
+            // terminal failure or park must not lose their attribution.
+            self.record_feature_progress(mi, fi, &feature_base_sha)?;
+
             // Interrupt (or any queued command) → events now, so the
             // judgement digest reflects them.
             self.drain_control().await?;
@@ -3454,15 +3464,10 @@ impl MissionEngine {
             if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
             }
-            let commits: Vec<String> = self
-                .active_repo()
-                .commits_between(&pre_run_sha, "HEAD")?
-                .iter()
-                .map(|c| format!("{} {}", c.sha, c.subject))
-                .collect();
+            let commits = self.record_feature_progress(mi, fi, &feature_base_sha)?;
             let diff_stat = self
                 .active_repo()
-                .diff_stat(&pre_run_sha, "HEAD")
+                .diff_stat(&feature_base_sha, "HEAD")
                 .unwrap_or_default();
 
             // Worker-deny grant (grant-request-decision-flow): a worker command
@@ -3556,6 +3561,46 @@ impl MissionEngine {
                 }
             }
         }
+    }
+
+    fn record_feature_progress(
+        &mut self,
+        mi: usize,
+        fi: usize,
+        base_sha: &str,
+    ) -> Result<Vec<String>> {
+        let feature = &self.state.mission.milestones[mi].features[fi];
+        let feature_id = feature.id.clone();
+        let mut commits = feature.commits.clone();
+        if !self.active_repo().is_ancestor(base_sha, "HEAD")? {
+            return Err(EngineError::InvalidState(format!(
+                "feature '{feature_id}' baseline is no longer an ancestor of HEAD"
+            )));
+        }
+        for receipt in &commits {
+            let sha = receipt.split_whitespace().next().unwrap_or("");
+            if !self.active_repo().is_ancestor(sha, "HEAD")? {
+                return Err(EngineError::InvalidState(format!(
+                    "feature '{feature_id}' recorded commit is no longer on HEAD: {sha}"
+                )));
+            }
+        }
+        for commit in self.active_repo().commits_between(base_sha, "HEAD")? {
+            if !commits
+                .iter()
+                .any(|receipt| receipt.split_whitespace().next() == Some(commit.sha.as_str()))
+            {
+                commits.push(format!("{} {}", commit.sha, commit.subject));
+            }
+        }
+        if !self.state.feature_base_shas.contains_key(&feature_id) || commits != feature.commits {
+            self.emit(EventKind::FeatureProgress {
+                feature_id,
+                base_sha: base_sha.to_string(),
+                commits: commits.clone(),
+            })?;
+        }
+        Ok(commits)
     }
 
     // -----------------------------------------------------------------------
@@ -10112,6 +10157,7 @@ pub(crate) mod tests {
         runs.insert("run-1".to_string(), run);
         runs.insert("run-2".to_string(), second_run);
         let state = MissionState {
+            feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".to_string(),
                 goal: String::new(),

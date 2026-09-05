@@ -4643,6 +4643,71 @@ async fn capture_turn_error_still_completes_mission() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn retry_retains_prior_checkpoint_commit_receipts() {
+    if !setup() {
+        return;
+    }
+    for isolation in [WorkerIsolation::Checkout, WorkerIsolation::Worktree] {
+        for succeeds in [true, false] {
+            let (_dir, root) = init_repo();
+            let partial = MockScript::single_shot_json(&json!({
+                "result": "partial",
+                "summary": "implementation left for the next attempt to verify",
+                "commits": []
+            }))
+            .writes_file("attempt.txt", "work from the first attempt\n");
+            let mut replies = vec![dirty_tree_commit_as_is()];
+            if succeeds {
+                replies.push(judgement("complete", "verified the retained work"));
+            }
+            replies.push(no_lesson());
+            let backend = Arc::new(MockBackend::with_scripts(vec![
+                partial,
+                orch_script(replies),
+                if succeeds {
+                    worker_pass_no_write()
+                } else {
+                    worker_fail()
+                },
+            ]));
+            let cfg = MissionConfig {
+                max_respawns: 1,
+                worker_isolation: isolation,
+                ..test_cfg()
+            };
+            let mut engine = make_engine(&backend, &root, cfg);
+            engine.approve_plan(simple_plan(1, vec![])).unwrap();
+            timeout(TEST_TIMEOUT, engine.run()).await.unwrap().unwrap();
+            let feature = &engine.state().mission.milestones[0].features[0];
+            assert_eq!(
+                feature.status,
+                if succeeds {
+                    FeatureStatus::Complete
+                } else {
+                    FeatureStatus::Failed
+                }
+            );
+            let committed = raw_git(
+                &root,
+                &[
+                    "log",
+                    &engine.state().mission.mission_branch,
+                    "--format=%H",
+                    "--",
+                    "attempt.txt",
+                ],
+            );
+            assert_eq!(committed.lines().count(), 1);
+            assert_eq!(feature.commits.len(), 1, "{isolation:?}, succeeds={succeeds}: prior attempt's checkpoint must remain attributed");
+            assert_eq!(
+                feature.commits[0].split_whitespace().next(),
+                Some(committed.trim())
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn respawn_bounded_fails_feature_then_mission_continues() {
     if !setup() {
         return;
@@ -6458,6 +6523,70 @@ async fn orchestrator_decision_detail_is_scrubbed() {
 // ---------------------------------------------------------------------------
 // 6. Kill + resume (§4.3 acceptance, in-process)
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_retains_prior_checkpoint_commit_receipts() {
+    if !setup() {
+        return;
+    }
+    for isolation in [WorkerIsolation::Checkout, WorkerIsolation::Worktree] {
+        let (_dir, root) = init_repo();
+        let backend1 = Arc::new(MockBackend::with_scripts(vec![
+            worker_pass_no_write().writes_file("before-crash.txt", "retained work\n"),
+            orch_script(vec![dirty_tree_commit_as_is()]),
+        ]));
+        let mut engine = make_engine(
+            &backend1,
+            &root,
+            MissionConfig {
+                worker_isolation: isolation,
+                ..test_cfg()
+            },
+        );
+        engine.approve_plan(simple_plan(1, vec![])).unwrap();
+        engine.set_orch_stall_timeout(Duration::from_millis(400));
+        let mission_id = engine.mission_id().to_string();
+        let paths = engine.paths().clone();
+        timeout(TEST_TIMEOUT, engine.run())
+            .await
+            .expect("first run must not hang")
+            .expect_err("judgement stalls after the checkpoint");
+        drop(engine);
+        let before = reducer::fold(&read_log(&paths)).unwrap();
+        let feature = &before.mission.milestones[0].features[0];
+        assert_eq!(feature.status, FeatureStatus::Active);
+        assert_eq!(feature.commits.len(), 1);
+        assert!(before.feature_base_shas.contains_key(&feature.id));
+
+        // Resume must reconstruct the baseline and receipts from the log,
+        // even when the second worker only verifies the existing commit.
+        let backend2 = Arc::new(MockBackend::with_scripts(vec![
+            worker_pass_no_write(),
+            orch_script(vec![judgement("complete", "verified"), no_lesson()]),
+        ]));
+        let backend2_dyn: Arc<dyn AgentBackend> = backend2;
+        let mut engine =
+            MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+        assert_eq!(
+            timeout(TEST_TIMEOUT, engine.run()).await.unwrap().unwrap(),
+            MissionStatus::Complete
+        );
+        let after = &engine.state().mission.milestones[0].features[0];
+        assert_eq!(after.commits, feature.commits, "{isolation:?}");
+        assert_eq!(engine.state().feature_base_shas, before.feature_base_shas);
+        assert_eq!(
+            raw_git(
+                &root,
+                &[
+                    "show",
+                    &format!("{}:before-crash.txt", before.mission.mission_branch)
+                ]
+            ),
+            "retained work\n"
+        );
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_and_resume_completes_on_single_log() {

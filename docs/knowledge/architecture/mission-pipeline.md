@@ -162,7 +162,12 @@ records `start_sha`; then the next feature runs or the milestone enters
 So the loop walks **milestones → features → workers → validators → judgement**:
 `run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
 judgement turn), then refreshes protected Git handles before inspecting the
-delivered tree so newly configured executable drivers are disabled;
+delivered tree so newly configured executable drivers are disabled. Sequential
+features pin their baseline in `feature.progress` before execution and retain
+cumulative commit receipts across retries and process resume. Removed recorded
+commits fail closed; a failed feature with retained work cannot be implicitly
+replaced as a commitless proposal. The additive schema and legacy behavior are
+recorded in the [contract change](../../reviews/2026-09-05-feature-progress-contract.md).
 `validation_round` runs scrutiny + functional validators (each
 skippable) plus a deterministic out-of-contract-write sweep, converts findings
 to fix-features or waives them (blocking at `max_fix_cycles_per_milestone`);
