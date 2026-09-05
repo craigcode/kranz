@@ -3416,6 +3416,14 @@ impl MissionEngine {
             // Fold the runner's events into state even when the run errored
             // (worker.spawned may already be on disk).
             let caught = self.catch_up();
+            // The worker may have planted executable Git configuration or
+            // hooks. Refresh verification handles before any engine-side Git
+            // read/checkpoint, including control commands drained below. Open
+            // fresh handles so newly configured filter drivers are enumerated.
+            self.repo = GitRepo::open(&self.paths.repo_root)?.with_hooks_disabled()?;
+            if let Some((root, repo)) = &mut self.active_tree {
+                *repo = GitRepo::open(&*root)?.with_hooks_disabled()?;
+            }
             let outcome = outcome?;
             caught?;
 
@@ -10382,6 +10390,56 @@ pub(crate) mod tests {
             mock.started_specs().len(),
             2,
             "only the auth preflight and worker should run; no orchestrator judgement turn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sequential_worker_git_checks_disable_newly_planted_fsmonitor() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let payload_dir = tempfile::tempdir().unwrap();
+        let marker = payload_dir.path().join("executed-fsmonitor");
+        let payload = payload_dir.path().join("fsmonitor.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "\n[core]\n\tfsmonitor = /bin/sh '{}'\n",
+            payload.display()
+        ));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report("worker done"))
+                .writes_file(".git/config", &config)
+                .with_exit(SessionExit::Aborted),
+        ]));
+        let cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            max_respawns: 0,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(mock.clone(), &root, "goal", cfg).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+        engine.run_feature(0, 0).await.unwrap();
+        assert_eq!(mock.started_specs().len(), 1);
+        assert!(
+            !marker.exists(),
+            "the engine executed worker-authored Git configuration"
+        );
+        // Prove that the payload was actually installed and executable.
+        GitRepo::open_unhardened(&root).unwrap().is_clean().unwrap();
+        assert!(
+            marker.exists(),
+            "ordinary git must execute the fixture payload"
         );
     }
 

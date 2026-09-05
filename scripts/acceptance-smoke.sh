@@ -2,7 +2,8 @@
 set -euo pipefail
 
 : "${KRANZ_BIN:?set KRANZ_BIN to the kranz binary under test}"
-: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required for the live acceptance mission}"
+# CI supplies ANTHROPIC_API_KEY; local rehearsals may use an authenticated
+# Claude Code installation. Backend preflight reports missing credentials.
 
 scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/kranz-acceptance.XXXXXX")"
 repo="$scratch/sample-repo"

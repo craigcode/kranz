@@ -338,7 +338,7 @@ fn link_cargo_cache(name: &str, from: &Path, to: &Path) {
 /// unavailable, and the toolchain env vars themselves remain the explicit
 /// override (handled in [`toolchain_var_value`]).
 #[cfg(unix)]
-fn os_account_home() -> Option<PathBuf> {
+pub(crate) fn os_account_home() -> Option<PathBuf> {
     // getpwuid_r (the reentrant form): the engine is a multi-threaded tokio
     // process, so the static-buffer getpwuid is not sound here. pw_dir points
     // into `buf`; copy it to an owned PathBuf before returning.
@@ -683,6 +683,34 @@ pub fn contract_command_env(
 /// cannot restore a var mid-assertion.
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Global authority resolution is cached once per process. Fixtures that
+/// relocate HOME must initialize it in a fresh process, without changing the
+/// cached store used by other tests in the workspace.
+#[cfg(test)]
+pub(crate) fn isolated_global_home_test(name: &str) -> bool {
+    if std::env::var("KRANZ_ISOLATED_GLOBAL_HOME_TEST").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture"])
+        .env("KRANZ_ISOLATED_GLOBAL_HOME_TEST", name)
+        .env("RUST_TEST_THREADS", "1")
+        .env_remove("KRANZ_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated fixture {name}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "fixture filter matched no test"
+    );
+    true
+}
 
 /// RAII guard: set each `(name, value)` pair on engage, restore the prior
 /// state (set/unset) on drop, all while holding [`ENV_TEST_LOCK`].

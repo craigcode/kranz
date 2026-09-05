@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-05
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -153,7 +153,9 @@ records `start_sha`; then the next feature runs or the milestone enters
 
 So the loop walks **milestones → features → workers → validators → judgement**:
 `run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
-judgement turn); `validation_round` runs scrutiny + functional validators (each
+judgement turn), then refreshes protected Git handles before inspecting the
+delivered tree so newly configured executable drivers are disabled;
+`validation_round` runs scrutiny + functional validators (each
 skippable) plus a deterministic out-of-contract-write sweep, converts findings
 to fix-features or waives them (blocking at `max_fix_cycles_per_milestone`);
 `final_gate` fails an empty deliverable outright, runs `check:"command"`

@@ -360,7 +360,7 @@ impl GitRepo {
     /// payload ran first). Opt-in per handle: worker-side git behavior is
     /// deliberately unchanged.
     ///
-    /// Building the handle enumerates the repo's configured filter drivers;
+    /// Building the handle enumerates the repo's configured filter and merge drivers;
     /// an enumeration failure fails CLOSED (no handle) — a verification
     /// handle that cannot name its armed drivers cannot promise the surface
     /// is disabled.
@@ -457,13 +457,9 @@ impl GitRepo {
     /// URL consult it, and those all go through
     /// [`Self::refuse_network_on_armed_local_config`], which refuses them.
     ///
-    /// Documented residual (no overclaim this time): `merge.<name>.driver`
-    /// and `diff.<name>.command`/`.textconv` also execute repo-configured
-    /// commands when an attribute arms them — but only on merge/diff
-    /// porcelain, and an EMPTY override makes those git commands fail
-    /// loudly rather than fall back to the builtin behavior (probed
-    /// 2026-08-04), so neutralizing them is a behavior change of its own,
-    /// not a silent rider on this countermeasure.
+    /// Verification diffs pass `--no-ext-diff --no-textconv`; custom merge
+    /// drivers fail closed. Worker-authored configuration must not execute
+    /// outside its sandbox during an engine diff or merge.
     fn build_exec_disable_flags(&self) -> Result<Vec<String>> {
         const BASE: &[&str] = &[
             "core.hooksPath=",
@@ -471,6 +467,7 @@ impl GitRepo {
             "core.attributesFile=/dev/null",
             "commit.gpgSign=false",
             "gpg.program=/bin/false",
+            "merge.default=text",
             CREDENTIAL_HELPER_RESET,
             SSH_COMMAND_OVERRIDE,
             "core.askPass=",
@@ -491,6 +488,10 @@ impl GitRepo {
             }
             flags.push("-c".to_string());
             flags.push(format!("filter.{name}.required=false"));
+        }
+        for name in self.enumerated_subsections("^merge\\..*\\.driver$", "merge.")? {
+            flags.push("-c".to_string());
+            flags.push(format!("merge.{name}.driver=false"));
         }
         for name in self.configured_remote_programs()? {
             for sub in ["uploadpack", "receivepack"] {
@@ -2080,8 +2081,13 @@ impl GitRepo {
                 cmd.env(key, value);
             }
         }
-        cmd.args(args)
-            .current_dir(&self.root)
+        if self.exec_disable_flags.is_some() && args.first().is_some_and(|arg| arg == "diff") {
+            cmd.args(["diff", "--no-ext-diff", "--no-textconv"])
+                .args(&args[1..]);
+        } else {
+            cmd.args(args);
+        }
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .output()
             .map_err(|e| {
@@ -2408,6 +2414,73 @@ mod tests {
         // argv segment, never a duplicated or re-enumerated one.
         let rewrapped = repo.with_hooks_disabled().unwrap();
         assert_eq!(repo.exec_disable_flags, rewrapped.exec_disable_flags);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_textconv_never_runs_on_checkpoint_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) = git_exec_config_repo(
+            &dir,
+            "#!/bin/sh\necho textconv-ran >> '__LOG__'\ncat \"$1\"\n",
+        );
+        let raw = GitRepo::open_unhardened(&root).unwrap();
+        raw.run(&["config", "diff.hostile.textconv", payload.to_str().unwrap()])
+            .unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt diff=hostile\n").unwrap();
+        std::fs::write(root.join("seed.txt"), "modified\n").unwrap();
+        raw.diff_head().unwrap();
+        assert!(
+            log.exists(),
+            "ordinary diff must execute the fixture converter"
+        );
+        std::fs::remove_file(&log).unwrap();
+
+        let guarded = raw.with_hooks_disabled().unwrap();
+        assert!(guarded.diff_head().unwrap().contains("+modified"));
+        assert!(matches!(
+            guarded.commit_dirty_paths("checkpoint").unwrap(),
+            CheckpointOutcome::Committed(_)
+        ));
+        assert!(!log.exists(), "the engine ran the planted converter");
+        assert_eq!(
+            guarded.show_file("HEAD", "seed.txt").unwrap().unwrap(),
+            b"modified\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_merge_driver_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) =
+            git_exec_config_repo(&dir, "#!/bin/sh\necho merge-ran >> '__LOG__'\nexit 0\n");
+        let raw = GitRepo::open_unhardened(&root).unwrap();
+        raw.run(&["checkout", "-b", "other"]).unwrap();
+        std::fs::write(root.join("seed.txt"), "other\n").unwrap();
+        raw.run(&["commit", "-am", "other"]).unwrap();
+        raw.run(&["checkout", "-b", "left", "HEAD~1"]).unwrap();
+        std::fs::write(root.join("seed.txt"), "left\n").unwrap();
+        raw.run(&["commit", "-am", "left"]).unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt merge=hostile.name\n").unwrap();
+        raw.run(&[
+            "config",
+            "merge.hostile.name.driver",
+            payload.to_str().unwrap(),
+        ])
+        .unwrap();
+        let guarded = raw.with_hooks_disabled().unwrap();
+        assert!(guarded.run(&["merge", "--no-edit", "other"]).is_err());
+        assert!(
+            !log.exists(),
+            "engine merge executed a worker-authored driver"
+        );
+        raw.run(&["merge", "--abort"]).unwrap();
+        raw.run(&["merge", "--no-edit", "other"]).unwrap();
+        assert!(
+            log.exists(),
+            "ordinary merge must execute the fixture driver"
+        );
     }
 
     /// A planted `gpg.program` with signing forced on by repo config

@@ -3349,7 +3349,10 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
-        let err = cmd_release(&repo, "m-1", "http://127.0.0.1:4560", None)
+        // A loopback URL can discover an operator token from the developer's
+        // running server. A non-loopback documentation address has no ambient
+        // token source, so this exercises the missing-token error without I/O.
+        let err = cmd_release(&repo, "m-1", "http://192.0.2.1:4560", None)
             .await
             .unwrap_err();
         let msg = err.to_string();

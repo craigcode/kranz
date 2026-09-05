@@ -5,6 +5,21 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-05
+
+- Security: webhook comment triggers require an explicit GitHub user allowlist;
+  workflow failure triggers refuse fork-owned branches.
+- Security: engine diffs disable external programs and text converters, custom
+  merge drivers fail closed, and protected Git handles refresh after workers.
+- Security: sandbox authority directories hide future and rotated credentials,
+  sibling mission metadata stays protected, and validator cache copies refuse
+  links and special files.
+- Fixed macOS Cursor private Keychain seeding, legacy migration, lock/unlock
+  verification, and rejection of injected passphrase commands.
+- Fixed container gate launch and timeout cleanup to preserve the host runtime
+  context without forwarding ambient secrets or client proxy credentials.
+- Updated the yanked `chacha20` dependency to 0.10.2 in both lockfiles.
+
 - Security: authenticated the mission control inbox and the event log so an
   agent process with repository write access can no longer forge operator
   consent, roll a mission back past a denial, or patch consent-bearing config
@@ -56,7 +71,6 @@ Notable user-visible changes are documented here. This project follows
   audit with the seven per-surface source reports and the two follow-up
   reviews of the fixes beside it.
 
-## 0.2.0 - 2026-08-22
 
 - Prepared the repository's security, contribution, release, and supply-chain
   controls for public distribution.

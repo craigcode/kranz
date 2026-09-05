@@ -83,7 +83,16 @@ ticket pipeline — never a prompt loop, never a run, never a land (ticket
 NOT the mutation token, and refuses CLOSED when no secret is configured.
 Config (additive, `.kranz/config.json` — gitignored, so the secret is never
 committed): `hooks.secret`, `hooks.fixLabel` (default `kranz:fix`),
-`hooks.queueLabel` (default `kranz:fix-and-queue`). In a multi-repository
+`hooks.queueLabel` (default `kranz:fix-and-queue`), and `hooks.allowUsers`
+(GitHub logins explicitly allowed to request work through PR comments,
+compared case-insensitively). An absent or empty `allowUsers` disables comment
+triggers; HMAC verification authenticates GitHub's delivery, not the comment
+author's authority. For example, set `"allowUsers": ["your-github-login"]`
+inside the local `hooks` object to enable your own comment triggers.
+Workflow-failure triggers remain independent of this comment allowlist, but
+must originate in the receiving repository; a fork's matching branch name
+does not authorize a draft.
+In a multi-repository
 serve the repo-scoped twin `/api/repos/:repoId/hooks/github` verifies against
 THAT repository's config and identity.
 

@@ -490,19 +490,63 @@ pub(crate) fn dir_size_exceeds(dir: &Path, limit: u64) -> bool {
     false
 }
 
-/// Recursive plain byte copy of `src` to `dst` (created). Symlinks are
-/// followed (the copy owns real bytes; the destination must never share
-/// state with the source through a link).
+/// Recursive plain byte copy of regular files and directories only. Pin
+/// each directory and open files no-follow: worker-controlled cache links
+/// must never make the engine copy denied authority into a readable snapshot.
 pub(crate) fn copy_dir_plain(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
+    use cap_fs_ext::DirExt as _;
+    let (src_parent, src_name) =
+        crate::paths::open_parent_nofollow(src).map_err(std::io::Error::other)?;
+    let source = src_parent.open_dir_nofollow(src_name)?;
+    let (dst_parent, dst_name) =
+        crate::paths::open_parent_nofollow(dst).map_err(std::io::Error::other)?;
+    match dst_parent.create_dir(&dst_name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let destination = dst_parent.open_dir_nofollow(dst_name)?;
+    copy_dir_contents(&source, &destination)
+}
+
+fn copy_dir_contents(src: &cap_std::fs::Dir, dst: &cap_std::fs::Dir) -> std::io::Result<()> {
+    use cap_fs_ext::{DirExt as _, OpenOptionsFollowExt as _};
+    use cap_primitives::fs::FollowSymlinks;
+    for entry in src.entries()? {
         let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.metadata()?.is_dir() {
-            copy_dir_plain(&from, &to)?;
+        let name = entry.file_name();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            let source = src.open_dir_nofollow(&name)?;
+            dst.create_dir(&name)?;
+            let destination = dst.open_dir_nofollow(&name)?;
+            copy_dir_contents(&source, &destination)?;
+        } else if kind.is_file() {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                // A racing replacement with a FIFO must not block the engine.
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let mut source = src.open_with(&name, &options)?.into_std();
+            let metadata = source.metadata()?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::other("cache entry is not a regular file"));
+            }
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            let mut destination = dst.open_with(&name, &options)?.into_std();
+            std::io::copy(&mut source, &mut destination)?;
+            destination.set_permissions(metadata.permissions())?;
         } else {
-            std::fs::copy(&from, &to)?;
+            return Err(std::io::Error::other(
+                "refusing a symlink or special cache entry",
+            ));
         }
     }
     Ok(())
@@ -511,6 +555,50 @@ pub(crate) fn copy_dir_plain(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_plain_copy_refuses_authority_links_and_preserves_executables() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("target");
+        std::fs::create_dir(&source).unwrap();
+        let authority = dir.path().join("serve.token");
+        std::fs::write(&authority, "fake-authority").unwrap();
+        symlink(&authority, source.join("leak")).unwrap();
+        let destination = dir.path().join("copy");
+        assert!(copy_dir_plain(&source, &destination).is_err());
+        assert!(!destination.join("leak").exists());
+        assert_eq!(
+            std::fs::read_to_string(&authority).unwrap(),
+            "fake-authority"
+        );
+
+        std::fs::remove_file(source.join("leak")).unwrap();
+        std::fs::write(source.join("test-bin"), "executable").unwrap();
+        std::fs::set_permissions(
+            source.join("test-bin"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        copy_dir_plain(&source, &destination).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("test-bin")).unwrap(),
+            b"executable"
+        );
+        assert_ne!(
+            std::fs::metadata(destination.join("test-bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+
+        let linked_destination = dir.path().join("linked-copy");
+        symlink(&source, &linked_destination).unwrap();
+        assert!(copy_dir_plain(&source, &linked_destination).is_err());
+    }
 
     /// A temp git repo with one committed file, or None when git is not on
     /// PATH (mirrors the orchestrator tests' `lessons_test_repo` skip).

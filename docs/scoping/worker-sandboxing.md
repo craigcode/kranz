@@ -123,6 +123,13 @@ All of it asks the agent nicely. None of it constrains the process.
   Native `.exe` agent backends are required; batch shims are refused. The open
   normal-gate/overhead/Windows-11 completion bar is recorded in
   [`m7-windows-containment.md`](m7-windows-containment.md).
+- **Authority directory views** on Linux/bubblewrap and containers hide
+  existing, future, and replaced credentials without creating host placeholders.
+  Existing non-secret policy/cache entries remain readable but immutable; the
+  source tree and private scratch retain their declared writes. Nested mounts
+  cannot reopen global authority or sibling mission metadata. Symlink entries
+  are omitted from these private views. On macOS, Seatbelt also pins protected
+  ancestor names against renaming.
 - Config per role:
   `sandbox: { enforce: "off" | "fs" | "fs+net", extraWrite: [...], egress: [...] }`.
   `SessionSpec` grows a `sandbox` field; `backend_claude` wraps the spawn.
