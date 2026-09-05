@@ -79,8 +79,8 @@ use windows::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows::Win32::System::Threading::{
     CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ReleaseMutex,
-    ResumeThread, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -477,6 +477,12 @@ fn snapshot_dacl_with_pin(path: &Path, pin: bool) -> Result<DaclSnapshot> {
             path.display()
         ))
     })?;
+    snapshot_dacl_handle(path, handle, pin)
+}
+
+// `path` is a diagnostic label only. Cleanup must keep using the retained
+// kernel object even if an ancestor has moved since preparation.
+fn snapshot_dacl_handle(path: &Path, handle: OwnedHandle, pin: bool) -> Result<DaclSnapshot> {
     let mut acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
@@ -1414,7 +1420,23 @@ fn prepare_acl_boundary(
 }
 
 fn restore_boundary_inheritance(snapshot: &DaclSnapshot, originally_protected: bool) -> Result<()> {
-    let current = snapshot_dacl(&snapshot.path)?;
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate = HANDLE::default();
+    unsafe {
+        DuplicateHandle(
+            process,
+            snapshot.handle.0,
+            process,
+            &mut duplicate,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!("failed to retain boundary cleanup handle: {error}"))
+    })?;
+    let current = snapshot_dacl_handle(&snapshot.path, OwnedHandle(duplicate), false)?;
     // Read-only gitlink grants from other profiles are legitimate while their
     // marker is present; namespace grants were refused at preparation.
     if inspect_boundary_acl(&current, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0)?.is_some()
@@ -2810,6 +2832,10 @@ struct ProcessHandles {
 impl Drop for ProcessHandles {
     fn drop(&mut self) {
         unsafe {
+            // Job setup can fail before the suspended child is assigned.
+            // Closing handles alone would leave that process alive forever.
+            // After normal completion/job teardown this is an inert retry.
+            let _ = TerminateProcess(self.process, 1);
             let _ = CloseHandle(self.thread);
             let _ = CloseHandle(self.process);
         }
@@ -4288,6 +4314,93 @@ mod tests {
                 std::fs::rename(&gitlink, root.path().join("moved-gitlink")).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn suspended_child_is_reaped_when_setup_exits_before_job_assignment() {
+        let program =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+        let application = wide(program.as_os_str());
+        let mut line = command_line(&program, &["/C".to_string(), "exit 0".to_string()]);
+        let environment = [0u16, 0u16];
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of_val(&startup.StartupInfo) as u32;
+        let mut process_info = PROCESS_INFORMATION::default();
+        unsafe {
+            CreateProcessW(
+                PCWSTR(application.as_ptr()),
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                Some(environment.as_ptr().cast()),
+                PCWSTR::null(),
+                &startup.StartupInfo,
+                &mut process_info,
+            )
+        }
+        .unwrap();
+        let handles = ProcessHandles {
+            process: process_info.hProcess,
+            thread: process_info.hThread,
+        };
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                process,
+                handles.process,
+                process,
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .unwrap();
+        let wait_handle = OwnedHandle(duplicate);
+        assert_eq!(
+            unsafe { WaitForSingleObject(wait_handle.0, 0) },
+            WAIT_TIMEOUT
+        );
+        // Mirrors an early return on CreateJobObject/AssignProcess failure.
+        drop(handles);
+        assert_eq!(
+            unsafe { WaitForSingleObject(wait_handle.0, 5_000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn boundary_inheritance_cleanup_follows_retained_object_after_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join(".git");
+        let moved = root.path().join("moved-gitlink");
+        std::fs::write(&original, "gitdir: example").unwrap();
+        // Share-delete makes the handle stale by name while keeping the actual
+        // object alive. The production pin is additional protection, not an
+        // excuse for cleanup to recover its authority from a fresh pathname.
+        let before = snapshot_dacl(&original).unwrap();
+        let acl = before.acl.as_ref().unwrap();
+        win32(unsafe {
+            SetSecurityInfo(
+                before.handle.0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(acl.as_ptr().cast::<ACL>()),
+                None,
+            )
+        })
+        .unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        assert!(!original.exists());
+        restore_boundary_inheritance(&before, before.protected).unwrap();
+        let after = snapshot_dacl(&moved).unwrap();
+        assert_eq!(before.acl, after.acl);
+        assert_eq!(before.protected, after.protected);
     }
 
     #[test]
