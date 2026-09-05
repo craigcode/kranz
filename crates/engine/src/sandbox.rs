@@ -1971,18 +1971,18 @@ pub fn bubblewrap_args(
         .filter(|path| path.is_dir())
         .map(|path| path.display().to_string())
         .collect();
-    for bind in cache_ro_binds {
+    for bind in &cache_ro_binds {
         out.push("--ro-bind".to_string());
         out.push(bind.clone());
-        out.push(bind);
+        out.push(bind.clone());
     }
     // The bwrap analogue of the profile's authority and `.git` write denies
     // (2026-09-01 adversarial audit, H2 + H11 + H3 support): bwrap has no
     // per-path write deny to stack over an rw bind, so each denied path is
     // ro-bound OVER ITSELF — the contents stay READABLE (git cannot run
     // without its own config, and the Seatbelt side denies writes only) while
-    // every write closes. Later binds win, and this block lands after every
-    // rw bind, so a wide writable root cannot re-expose a denied path.
+    // every write closes. Later binds win: install these after the initial
+    // writable roots, and restore them after any private-root rebind below.
     //
     // Private authority directory views below close both reads and writes,
     // including authority files created after launch. These extra ro-binds
@@ -2032,10 +2032,10 @@ pub fn bubblewrap_args(
         .filter(|path| !is_masked(path))
         .map(|path| lexical_absolute(path).display().to_string())
         .collect();
-    for bind in write_ro_binds {
+    for bind in &write_ro_binds {
         out.push("--ro-bind".to_string());
         out.push(bind.clone());
-        out.push(bind);
+        out.push(bind.clone());
     }
     // Reject hostile metadata leaves before constructing read-only views.
     // Missing state/transcript files stay absent in the private namespace;
@@ -2058,15 +2058,30 @@ pub fn bubblewrap_args(
         .iter()
         .map(|path| absolutize(path))
         .collect();
-    for mask in authority_directory_masks(inputs) {
+    let authority_masks = authority_directory_masks(inputs);
+    for mask in &authority_masks {
         let display = mask.path.display().to_string();
         out.extend(["--tmpfs".to_string(), display.clone()]);
-        for path in mask.visible_entries {
+        for path in &mask.visible_entries {
             let path = path.display().to_string();
             // Ordinary entries can disappear after enumeration (for example,
             // another gate's temporary cache). Leaving a missing entry hidden
             // is safe; the enclosing mask and read-only remount remain required.
             out.extend(["--ro-bind-try".to_string(), path.clone(), path]);
+        }
+        // A deeper mask may replace an entry hidden by this one (e.g.
+        // HOME/.kranz below a HOME mask for a missing Cargo home). Reserve
+        // its empty mountpoint in the private tmpfs before sealing it.
+        for nested in &authority_masks {
+            if nested.path != mask.path
+                && nested.path.starts_with(&mask.path)
+                && !mask
+                    .visible_entries
+                    .iter()
+                    .any(|entry| nested.path.starts_with(entry))
+            {
+                out.extend(["--dir".to_string(), nested.path.display().to_string()]);
+            }
         }
         out.extend(["--remount-ro".to_string(), display]);
         // A snapshot or session-private scratch under .kranz remains writable.
@@ -2080,7 +2095,28 @@ pub fn bubblewrap_args(
                     .any(|denied| private.starts_with(denied))
             {
                 let path = private.display().to_string();
-                out.extend(["--bind".to_string(), path.clone(), path]);
+                out.extend(["--bind".to_string(), path.clone(), path.clone()]);
+                // Host-source binds replace every nested mount. Restore the
+                // write denies this private root just covered, before deeper
+                // authority masks hide their secrets. Rebinding denied host
+                // directories after those masks would expose them again.
+                let restored_denies: std::collections::BTreeSet<_> = cache_ro_binds
+                    .iter()
+                    .chain(&write_ro_binds)
+                    .filter_map(|denied| {
+                        let denied_path = Path::new(denied);
+                        if denied_path.starts_with(&private) {
+                            Some(denied)
+                        } else if private.starts_with(denied_path) {
+                            Some(&path)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for denied in restored_denies {
+                    out.extend(["--ro-bind".to_string(), denied.clone(), denied.clone()]);
+                }
             }
         }
     }
@@ -4465,6 +4501,107 @@ mod tests {
             std::fs::read_to_string(&late_authority_path).unwrap(),
             "late-secret"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_bwrap_rebinding_keeps_git_and_authority_protected() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_bwrap_rebinding_keeps_git_and_authority_protected",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let cargo = home.join(".cargo");
+        std::fs::create_dir(home.join(".kranz")).unwrap();
+        let _env = crate::agent_env::EnvTestGuard::engage(&[
+            ("HOME", home.to_str().unwrap()),
+            ("CARGO_HOME", cargo.to_str().unwrap()),
+        ]);
+        // The absent Cargo home promotes its authority mask to HOME, above
+        // the checkout. A validator snapshot also gets rebound below runs/.
+        assert!(!cargo.exists());
+        for snapshot in [false, true] {
+            let repo = home.join(if snapshot {
+                "validator-repo"
+            } else {
+                "checkout"
+            });
+            let mission = repo.join(".kranz/missions/m-rebind");
+            let scratch = mission.join("runs/scratch");
+            let cwd = if snapshot {
+                mission.join("runs/snapshot")
+            } else {
+                repo.clone()
+            };
+            for path in [&cwd, &scratch] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let protected = if snapshot {
+                vec![cwd.join(".git")]
+            } else {
+                std::fs::create_dir_all(cwd.join(".git/hooks")).unwrap();
+                vec![cwd.join(".git/config"), cwd.join(".git/hooks/probe")]
+            };
+            for path in &protected {
+                std::fs::write(path, "protected").unwrap();
+            }
+            let token = repo.join(".kranz/serve.token");
+            std::fs::write(&token, "secret").unwrap();
+            let ordinary = if snapshot {
+                cwd.join("witness")
+            } else {
+                cwd.join(".git/index")
+            };
+            let mut command = vec![
+                "-c".into(),
+                "printf work > \"$1\" || exit 1; printf work > \"$2\" || exit 2; \
+                 if cat \"$3\"; then exit 3; fi; shift 3; \
+                 for path in \"$@\"; do \
+                 test \"$(cat \"$path\")\" = protected || exit 4; \
+                 if printf forged > \"$path\"; then exit 5; fi; done"
+                    .into(),
+                "rebind-test".into(),
+                ordinary.display().to_string(),
+                scratch.join("witness").display().to_string(),
+                token.display().to_string(),
+            ];
+            command.extend(protected.iter().map(|path| path.display().to_string()));
+            let args = bubblewrap_args(
+                &inputs(&cwd, &mission, &scratch, vec![]),
+                Path::new("/bin/sh"),
+                &command,
+            )
+            .unwrap();
+            for path in &protected {
+                let last_bind = args.windows(3).rev().find(|part| {
+                    matches!(part[0].as_str(), "--bind" | "--ro-bind" | "--ro-bind-try")
+                        && path.starts_with(&part[2])
+                });
+                assert_eq!(
+                    last_bind.map(|part| part[0].as_str()),
+                    Some("--ro-bind"),
+                    "a later writable ancestor reopened {}: {args:?}",
+                    path.display()
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if bwrap_can_apply() {
+                let output = std::process::Command::new("bwrap")
+                    .args(&args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "snapshot={snapshot}: {output:?}");
+                assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), "work");
+                assert_eq!(std::fs::read_to_string(&token).unwrap(), "secret");
+                for path in protected {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), "protected");
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

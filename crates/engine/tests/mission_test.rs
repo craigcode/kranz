@@ -4438,6 +4438,74 @@ async fn declared_pty_script_that_never_executes_cannot_green() {
     );
 }
 
+/// Cancellation joins the PTY cleanup before the mission can release its
+/// writer lock and let a second engine resume the retained worktree.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_pty_validation_stops_writes_before_mission_unlock() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let contract = vec![Assertion {
+        id: "a-cancel-pty".into(),
+        statement: "the target completes".into(),
+        check: AssertionCheck::PtyScript,
+        command: None,
+        pty_script: Some(PtyScript {
+            command: "printf '%s' $$ > pty.pid; exec sleep 30".into(),
+            steps: vec![PtyStep::Expect {
+                pattern: "never printed".into(),
+                regex: false,
+                timeout_ms: Some(30_000),
+            }],
+            timeout_secs: Some(30),
+        }),
+    }];
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+    ]));
+    let mut engine = make_engine(
+        &backend,
+        &root,
+        MissionConfig {
+            skip_functional: false,
+            ..test_cfg()
+        },
+    );
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+    let paths = engine.paths().clone();
+    let mut run = Box::pin(engine.run());
+    let pid: i32 = tokio::select! {
+        status = &mut run => panic!("mission ended before cancellation: {status:?}"),
+        pid = async {
+            for _ in 0..1000 {
+                if let Ok(text) = std::fs::read_to_string(root.join("pty.pid")) {
+                    if let Ok(pid) = text.parse() { return pid; }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("PTY validation did not start");
+        } => pid,
+    };
+    let started = std::time::Instant::now();
+    // This is the same future-drop path the CLI's SIGINT branch takes.
+    drop(run);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(paths.lock_file().exists(), "the engine still owns its lock");
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the PTY target outlived cancellation and could race a resumed mission"
+    );
+    drop(engine);
+    assert!(!paths.lock_file().exists());
+    let events = read_log(&paths);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::ValidationPtyTranscript { .. })));
+}
+
 /// The other side of the backstop (unix hosts): a declared pty-script that
 /// EXECUTES and PASSES greens exactly as before — the round drives the
 /// scripted session, the transcript event lands, and the final gate's

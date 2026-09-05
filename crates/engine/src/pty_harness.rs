@@ -75,6 +75,8 @@ use crate::command_exec::GateSandbox;
 use crate::types::{Assertion, AssertionCheck, PtyScript};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// Default wall-clock cap for one whole scripted session.
@@ -181,6 +183,23 @@ pub(crate) struct PtyAssertionRun {
     pub skipped: Vec<PtySkippedAssertion>,
 }
 
+/// Dropping the mission future must finish the blocking driver's cleanup
+/// before its caller can release the mission lock or remove the worktree.
+struct CancelPtyOnDrop {
+    cancelled: Arc<AtomicBool>,
+    completed: mpsc::Receiver<()>,
+}
+
+impl Drop for CancelPtyOnDrop {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        // The driver owns the only sender and drops it after cleanup, even
+        // on panic or when a queued blocking task never starts. It never
+        // needs this async executor to make progress.
+        let _ = self.completed.recv();
+    }
+}
+
 /// Run every pty-script assertion in `contract` as part of the validation
 /// round's engine-run evidence pass. Called exactly where the bounded
 /// contract commands run, with the same `root`, cleared contract `env`, and
@@ -244,18 +263,27 @@ pub(crate) async fn run_pty_assertions(
             };
         let root = root.to_path_buf();
         let command = script.command.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || imp::run_session(&script, &wrapped, &root, &env))
-                .await
-                .unwrap_or_else(|join_error| PtyRunOutcome {
-                    // A panicking driver must not take the round down — surface it
-                    // as an honest FAIL against the assertion instead.
-                    verdict: PtyVerdict::Fail,
-                    steps: Vec::new(),
-                    transcript: Vec::new(),
-                    truncated: false,
-                    note: Some(format!("pty driver task failed: {join_error}")),
-                });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (completed, completion) = mpsc::channel();
+        let cancel_on_drop = CancelPtyOnDrop {
+            cancelled: Arc::clone(&cancelled),
+            completed: completion,
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _completed = completed;
+            imp::run_session(&script, &wrapped, &root, &env, cancelled)
+        })
+        .await
+        .unwrap_or_else(|join_error| PtyRunOutcome {
+            // A panicking driver must not take the round down — surface it
+            // as an honest FAIL against the assertion instead.
+            verdict: PtyVerdict::Fail,
+            steps: Vec::new(),
+            transcript: Vec::new(),
+            truncated: false,
+            note: Some(format!("pty driver task failed: {join_error}")),
+        });
+        drop(cancel_on_drop);
         let (line, artifact, skip) = fold_outcome(assertion, &command, &outcome, runs_dir);
         rendered.push_str(&line);
         if let Some(artifact) = artifact {
@@ -430,7 +458,11 @@ mod imp {
         wrapped: &WrappedCommand,
         cwd: &Path,
         env: &HashMap<String, String>,
+        cancelled: Arc<AtomicBool>,
     ) -> PtyRunOutcome {
+        if cancelled.load(Ordering::Acquire) {
+            return spawn_failure("pty validation cancelled before spawn".to_string());
+        }
         // Allocate with close-on-exec atomically: openpty followed by fcntl
         // races other threads spawning children between those two calls.
         let master = unsafe {
@@ -576,6 +608,7 @@ mod imp {
             transcript: Vec::new(),
             truncated: false,
             child_eof: false,
+            cancelled,
         };
         let session_deadline = Instant::now()
             + Duration::from_secs(script.timeout_secs.unwrap_or(DEFAULT_SESSION_TIMEOUT_SECS));
@@ -698,6 +731,7 @@ mod imp {
         /// The master returned EOF/EIO — the target closed the pty, so
         /// later expects can never match and sends can never land.
         child_eof: bool,
+        cancelled: Arc<AtomicBool>,
     }
 
     /// Drain one bounded batch into the transcript, then yield to the caller's
@@ -746,6 +780,7 @@ mod imp {
             transcript: Vec::new(),
             truncated: false,
             child_eof: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         let first = drain(&mut input, &mut session);
         assert!(
@@ -772,6 +807,13 @@ mod imp {
         let mut written = 0usize;
         let bytes = text.as_bytes();
         while written < bytes.len() {
+            if session.cancelled.load(Ordering::Acquire) {
+                return PtyStepOutcome {
+                    step: index,
+                    ok: false,
+                    detail: "pty validation cancelled".to_string(),
+                };
+            }
             if session.child_eof {
                 return PtyStepOutcome {
                     step: index,
@@ -852,6 +894,13 @@ mod imp {
         };
         let started = Instant::now();
         loop {
+            if session.cancelled.load(Ordering::Acquire) {
+                return PtyStepOutcome {
+                    step: index,
+                    ok: false,
+                    detail: "pty validation cancelled".to_string(),
+                };
+            }
             let fresh = drain(master, session);
             if matched(&session.transcript) {
                 return PtyStepOutcome {
@@ -910,6 +959,7 @@ mod imp {
         _wrapped: &WrappedCommand,
         _cwd: &Path,
         _env: &HashMap<String, String>,
+        _cancelled: Arc<AtomicBool>,
     ) -> PtyRunOutcome {
         PtyRunOutcome {
             verdict: PtyVerdict::Skipped,
@@ -942,6 +992,101 @@ mod tests {
     #[cfg(unix)]
     const REPL_DEFECT: &str = "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
          printf 'bye\\n'; exit 0;; *) printf 'echo:WRONG:%s\\n> ' \"$line\";; esac; done";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_validation_cancellation_waits_for_target_cleanup() {
+        use std::time::Instant;
+
+        for send in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let command = "stty raw -echo || exit 1; trap '' HUP; sleep 30 & child=$!; \
+                printf '%s %s' \"$$\" \"$child\" > pids; printf 'ready\\n'; wait";
+            let step = if send {
+                // Fill the terminal input queue; cancellation must also
+                // interrupt a blocked send to a target that never reads.
+                PtyStep::Send {
+                    text: "x".repeat(1024 * 1024),
+                }
+            } else {
+                PtyStep::Expect {
+                    pattern: "never printed".into(),
+                    regex: false,
+                    timeout_ms: Some(30_000),
+                }
+            };
+            let contract = vec![pty_assertion(
+                "a-cancel",
+                command,
+                vec![
+                    PtyStep::Expect {
+                        pattern: "ready".into(),
+                        regex: false,
+                        timeout_ms: Some(5_000),
+                    },
+                    step,
+                ],
+            )];
+            let env = HashMap::new();
+            let runs = dir.path().join("runs");
+            let mut run = Box::pin(run_pty_assertions(
+                &contract,
+                dir.path(),
+                &env,
+                &GateSandbox::Disabled,
+                &runs,
+            ));
+            let pids = tokio::select! {
+                result = &mut run => panic!("PTY finished before cancellation: {result:?}"),
+                pids = async {
+                    for _ in 0..1000 {
+                        if let Ok(text) = std::fs::read_to_string(dir.path().join("pids")) {
+                            let pids: Vec<i32> = text
+                                .split_whitespace()
+                                .filter_map(|pid| pid.parse().ok())
+                                .collect();
+                            if pids.len() == 2 {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                return pids;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("PTY target did not start");
+                } => pids,
+            };
+            let start = Instant::now();
+            drop(run);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "cancellation waited for the script deadline"
+            );
+            assert!(
+                unsafe { libc::kill(pids[0], 0) } != 0,
+                "the PTY leader was not reaped before drop returned"
+            );
+            // Orphaned descendants can briefly remain zombies under init;
+            // their process group must have received SIGKILL too.
+            while unsafe { libc::kill(pids[1], 0) } == 0 {
+                #[cfg(target_os = "linux")]
+                if std::fs::read_to_string(format!("/proc/{}/stat", pids[1])).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, fields)| fields.starts_with("Z "))
+                }) {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "PTY descendant survived cancellation"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !runs.join("pty-transcripts").exists(),
+                "a cancelled assertion recorded a completed verdict"
+            );
+        }
+    }
 
     #[cfg(unix)]
     fn pty_assertion(id: &str, command: &str, steps: Vec<PtyStep>) -> Assertion {
