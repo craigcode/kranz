@@ -61,6 +61,7 @@ Rust 1.97.1 and Node 22.23.2.
 | Installed-binary smoke with source-checkout reads denied | v0.2.0, help, idempotent init, readiness JSON, embedded HTML/assets, read/mutation authorization, 0600 tokens, and graceful token cleanup all pass |
 | Public-tree and uncommitted-diff Gitleaks scans | Pass |
 | Baseline full advertised-ref history audit | 1,239 commits scanned, no leaks; all branch, tag, and pull-request refs fetched |
+| Committed candidate `bd43327` history audit | 1,240 commits scanned, no leaks; exit 0 |
 | Version/changelog alignment | v0.2.0 check passes with remote-main check explicitly skipped for the unmerged candidate |
 
 The skip ledger records container fixtures not exercised on this host because
