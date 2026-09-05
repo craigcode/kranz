@@ -75,6 +75,12 @@ from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull
 request must pass every required GitHub check on the exact commit that will be
 tagged.
 
+The manually dispatched live-smoke job additionally needs the repository's
+`ANTHROPIC_API_KEY` secret. Its Linux setup installs and probes bubblewrap and
+enables user namespaces on the disposable hosted runner before spending model
+tokens. Validator containment remains required; local OAuth rehearsal evidence
+does not establish that the remote job's credentials or host setup work.
+
 ## 3. Rehearse crate packaging honestly
 
 Cargo removes workspace `path` dependencies when publishing and resolves their
