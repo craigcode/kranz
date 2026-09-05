@@ -116,6 +116,29 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      # These ACL/handle regressions need no machine-wide host preparation.
+      # Run them first so cleanup failures report native descriptor evidence
+      # without waiting for the slower host and production-gate proofs.
+      - name: Check Windows ACL lease and process cleanup
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          for name in \
+            gitlink_aliases_never_receive_generic_metadata_denies \
+            boundary_parent_rejects_package_delete_child_grants \
+            sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance \
+            boundary_inheritance_cleanup_follows_retained_object_after_rename \
+            suspended_child_is_reaped_when_setup_exits_before_job_assignment; do
+            log="$RUNNER_TEMP/kranz-windows-$name.log"
+            set +e
+            cargo test -p kranz-engine --lib "appcontainer_windows::tests::$name" -- --exact --nocapture >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            test "$status" -eq 0
+            grep -qE 'test result: ok\. [1-9]' "$log"
+          done
       # AppContainer tools probe each local drive root and open NUL during
       # startup. The disposable runner is elevated once here to install
       # Microsoft's exact drive-root metadata ACEs and null-device descriptor;

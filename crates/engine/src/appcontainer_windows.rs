@@ -3623,6 +3623,17 @@ fn production_hostile_self_test() -> Result<String> {
         && gitlink_before.protected == gitlink_after.protected;
     eprintln!("fixture DACL restoration: root={root_restored} authority={authority_restored} gitlink={gitlink_restored}");
     receipt.dacl_restored = root_restored && authority_restored && gitlink_restored;
+    if !receipt.dacl_restored {
+        for (before, after) in [
+            (&authority_before, &authority_after),
+            (&gitlink_before, &gitlink_after),
+        ] {
+            eprintln!(
+                "fixture restoration detail: path={} before_protected={} after_protected={} before_acl={:?} after_acl={:?}",
+                before.path.display(), before.protected, after.protected, before.acl, after.acl
+            );
+        }
+    }
     receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
@@ -4380,7 +4391,12 @@ mod tests {
                         "{}",
                         before.path.display()
                     );
-                    assert_eq!(before.acl, after.acl, "{}", before.path.display());
+                    assert_eq!(
+                        before.acl,
+                        after.acl,
+                        "{} originally_protected={originally_protected} reverse={reverse}",
+                        before.path.display()
+                    );
                 }
                 // Releasing the final lease also releases replacement pins.
                 std::fs::rename(&authority, root.path().join("moved")).unwrap();
