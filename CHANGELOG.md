@@ -7,6 +7,9 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Fixed Linux sandbox startup racing with removal of ordinary temporary files
+  from private directory views. Disappearing entries stay hidden; authority
+  masks and read-only restrictions remain mandatory.
 - Fixed PTY validation waiting for a timeout after its target exited. Parent
   terminal handles now close after spawning, and child programs inherit only
   the intended standard terminal streams. Continuous output yields to session

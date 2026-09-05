@@ -224,6 +224,15 @@ jobs:
           before_status="$(git status --porcelain --untracked-files=no)"
           test -z "$before_status"
 
+          regression_log="$RUNNER_TEMP/kranz-linux-disappearing-entry.log"
+          set +e
+          cargo test -p kranz-engine --lib sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries -- --exact --nocapture >"$regression_log" 2>&1
+          status=$?
+          set -e
+          cat "$regression_log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$regression_log"
+
           receipt_log="$RUNNER_TEMP/kranz-linux-bubblewrap-live-receipt.log"
           set +e
           cargo test -p kranz-engine --lib command_exec::tests::linux_bubblewrap_hostile_live_receipt -- --exact --ignored --nocapture >"$receipt_log" 2>&1

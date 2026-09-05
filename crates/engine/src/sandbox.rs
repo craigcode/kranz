@@ -2063,7 +2063,10 @@ pub fn bubblewrap_args(
         out.extend(["--tmpfs".to_string(), display.clone()]);
         for path in mask.visible_entries {
             let path = path.display().to_string();
-            out.extend(["--ro-bind".to_string(), path.clone(), path]);
+            // Ordinary entries can disappear after enumeration (for example,
+            // another gate's temporary cache). Leaving a missing entry hidden
+            // is safe; the enclosing mask and read-only remount remain required.
+            out.extend(["--ro-bind-try".to_string(), path.clone(), path]);
         }
         out.extend(["--remount-ro".to_string(), display]);
         // A snapshot or session-private scratch under .kranz remains writable.
@@ -2837,7 +2840,7 @@ mod tests {
         for path in [&events, &state, &mission.join("runs")] {
             let path = absolutize(path).display().to_string();
             assert!(
-                joined.contains(&format!("--ro-bind {path} {path}")),
+                joined.contains(&format!("--ro-bind-try {path} {path}")),
                 "metadata must remain read-only: {args:?}"
             );
         }
@@ -2846,10 +2849,11 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "--tmpfs" && pair[1] == mission_abs));
         assert!(
-            !joined.contains(&format!(
-                "--ro-bind {0} {0}",
-                absolutize(&control).display()
-            )),
+            !args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == absolutize(&control).display().to_string()
+                    && part[1] == part[2]
+            }),
             "the control inbox must not be rebound into the private mission directory"
         );
         assert!(
@@ -3270,7 +3274,9 @@ mod tests {
             .any(|pair| pair[0] == "--tmpfs" && pair[1] == kranz));
         let mut i = 0;
         while i + 2 < args.len() {
-            if args[i] == "--ro-bind" && args[i + 1] == args[i + 2] {
+            if matches!(args[i].as_str(), "--ro-bind" | "--ro-bind-try")
+                && args[i + 1] == args[i + 2]
+            {
                 assert!(
                     !masked.contains(&args[i + 2]),
                     "{} is masked and must not be re-bound over itself",
@@ -4381,6 +4387,88 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries",
+        ) {
+            return;
+        }
+        if !bwrap_can_apply() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", home.path().to_str().unwrap())]);
+        let kranz = home.path().join(".kranz");
+        let mission = repo.path().join(".kranz/missions/m-mask-race");
+        std::fs::create_dir_all(&mission).unwrap();
+        let transient_dir = home.path().join("temporary-cache");
+        let transient_file = home.path().join("temporary-note");
+        let public = home.path().join("public.txt");
+        let authority_path = repo.path().join(".kranz/serve.token");
+        let late_authority_path = kranz.join("serve.read.token");
+        let writable = repo.path().join("result.txt");
+        std::fs::create_dir(&transient_dir).unwrap();
+        std::fs::write(&transient_file, "temporary").unwrap();
+        std::fs::write(&public, "public").unwrap();
+        std::fs::write(&authority_path, "secret").unwrap();
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "test ! -e \"$1\" && test ! -e \"$2\" \
+                 && test \"$(cat \"$3\")\" = public && ! touch \"$3\" \
+                 && test ! -e \"$4\" && test ! -e \"$5\" \
+                 && printf ok > \"$6\""
+                    .into(),
+                "mask-race".into(),
+                transient_dir.display().to_string(),
+                transient_file.display().to_string(),
+                public.display().to_string(),
+                authority_path.display().to_string(),
+                late_authority_path.display().to_string(),
+                writable.display().to_string(),
+            ],
+        )
+        .unwrap();
+        for path in [&transient_dir, &transient_file] {
+            let path = absolutize(path).display().to_string();
+            assert!(args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == path
+                    && part[2] == path
+            }));
+        }
+        // Deterministically reproduce deletion between enumeration and mount
+        // setup, while also creating authority that the private view must hide.
+        std::fs::remove_dir(&transient_dir).unwrap();
+        std::fs::remove_file(&transient_file).unwrap();
+        std::fs::create_dir(&kranz).unwrap();
+        std::fs::write(&late_authority_path, "late-secret").unwrap();
+        let output = std::process::Command::new("bwrap")
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "missing ordinary entries must stay hidden without breaking the sandbox: {output:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&writable).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(&public).unwrap(), "public");
+        assert_eq!(std::fs::read_to_string(&authority_path).unwrap(), "secret");
+        assert_eq!(
+            std::fs::read_to_string(&late_authority_path).unwrap(),
+            "late-secret"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_enforcement_linux_bwrap_masks_authority_material() {
         if crate::agent_env::isolated_global_home_test(
             "sandbox::tests::sandbox_enforcement_linux_bwrap_masks_authority_material",
@@ -4904,7 +4992,11 @@ mod tests {
             assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == shadow));
             let denied = absolutize(&dir).display().to_string();
             assert!(
-                !joined.contains(&format!("--ro-bind {denied} {denied}")),
+                !args.windows(3).any(|part| {
+                    matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                        && part[1] == denied
+                        && part[2] == denied
+                }),
                 "denied directory must not be rebound: {args:?}"
             );
         }
