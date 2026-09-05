@@ -860,11 +860,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sanitized_child_env_windows_redirects_profile_and_temp_to_scratch() {
-        // Create both roots BEFORE poisoning TEMP/TMP. The poison paths must
-        // exist: Rust tests share one process, so another concurrently
-        // running test may legitimately call tempfile while this guard is
-        // engaged. A nonexistent C:\operator-tmp made those unrelated tests
-        // fail nondeterministically on windows-latest.
+        if isolated_global_home_test(
+            "agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch",
+        ) {
+            return;
+        }
+        // Relocate ambient paths in a separate process. Otherwise parallel
+        // tests can create temporary directories under this fixture's roots
+        // and lose them when the fixture completes and deletes those roots.
         let home = tempfile::tempdir().unwrap();
         let operator = tempfile::tempdir().unwrap();
         let operator_temp = operator.path().join("operator-temp");
@@ -889,8 +892,8 @@ mod tests {
             ("APPDATA", &operator_roaming),
             ("LOCALAPPDATA", &operator_local),
         ]);
-        let _parallel_temp =
-            tempfile::tempdir().expect("ambient poison paths must remain usable by parallel tests");
+        let _relocated_temp =
+            tempfile::tempdir().expect("relocated temporary paths must remain usable");
 
         let env = sanitized_child_env(home.path(), &extra(&[]));
 

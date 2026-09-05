@@ -125,16 +125,19 @@ jobs:
         timeout-minutes: 15
         run: |
           for name in \
-            gitlink_aliases_never_receive_generic_metadata_denies \
-            boundary_parent_rejects_package_delete_child_grants \
-            boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules \
-            boundary_marker_without_shared_baseline_fails_closed \
-            sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance \
-            boundary_inheritance_cleanup_follows_retained_object_after_rename \
-            suspended_child_is_reaped_when_setup_exits_before_job_assignment; do
-            log="$RUNNER_TEMP/kranz-windows-$name.log"
+            appcontainer_windows::tests::gitlink_aliases_never_receive_generic_metadata_denies \
+            appcontainer_windows::tests::boundary_parent_rejects_package_delete_child_grants \
+            appcontainer_windows::tests::boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules \
+            appcontainer_windows::tests::boundary_marker_without_shared_baseline_fails_closed \
+            appcontainer_windows::tests::sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance \
+            appcontainer_windows::tests::boundary_inheritance_cleanup_follows_retained_object_after_rename \
+            appcontainer_windows::tests::suspended_child_is_reaped_when_setup_exits_before_job_assignment \
+            appcontainer_windows::tests::recursive_grants_reserve_only_the_isolated_worktree_authority_namespace \
+            agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch \
+            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens; do
+            log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
             set +e
-            cargo test -p kranz-engine --lib "appcontainer_windows::tests::$name" -- --exact --nocapture >"$log" 2>&1
+            cargo test -p kranz-engine --lib "$name" -- --exact --nocapture >"$log" 2>&1
             status=$?
             set -e
             cat "$log"

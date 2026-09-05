@@ -1879,16 +1879,20 @@ mod tests {
             container_run_args(&inputs, &spec(), Path::new("sh"), &[], None),
             container_gate_run_args(&inputs, &spec(), "true", &Default::default(), "test"),
         ] {
-            assert!(args.windows(2).any(|pair| pair[0] == "--tmpfs"
-                && pair[1]
-                    == format!(
-                        "{}:ro,noexec,nosuid,nodev,mode=755",
-                        crate::sandbox::absolutize(&global).display()
-                    )));
             assert!(
-                !args.windows(2).any(|pair| pair[0] == "-v"
+                args.windows(2).any(|pair| pair[0] == "--tmpfs"
                     && pair[1]
-                        .starts_with(&crate::sandbox::absolutize(&global).display().to_string())),
+                        == format!(
+                            "{}:ro,noexec,nosuid,nodev,mode=755",
+                            container_host_path(&global)
+                        )),
+                "authority mask missing: {args:?}"
+            );
+            assert!(
+                !args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-v"
+                        && pair[1].starts_with(&container_host_path(&global))),
                 "nested mounts must not reopen global authority: {args:?}"
             );
         }

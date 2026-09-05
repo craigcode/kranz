@@ -2383,6 +2383,17 @@ fn validate_recursive_roots(
     read_roots: &[PathBuf],
     shared_git: &Path,
 ) -> Result<()> {
+    // Root callers and policy paths may use different Windows spellings
+    // (notably an 8.3 TEMP path). Compare their resolved physical paths.
+    let write_roots: Vec<_> = write_roots
+        .iter()
+        .map(|path| crate::sandbox::absolutize(path))
+        .collect();
+    let read_roots: Vec<_> = read_roots
+        .iter()
+        .map(|path| crate::sandbox::absolutize(path))
+        .collect();
+    let shared_git = crate::sandbox::absolutize(shared_git);
     let cwd = crate::sandbox::absolutize(&inputs.session_cwd);
     let session_authority = cwd.join(".kranz");
     let session_files = crate::sandbox::kranz_authority_entries(&session_authority).files;
@@ -2396,19 +2407,19 @@ fn validate_recursive_roots(
     };
     let mut read_denies = crate::sandbox::authority_read_deny_paths(inputs)
         .into_iter()
-        .map(|path| (path, false))
+        .map(|path| (crate::sandbox::absolutize(&path), false))
         .collect::<Vec<_>>();
     read_denies.extend(
         crate::sandbox::authority_read_deny_dirs(inputs)
             .into_iter()
-            .map(|path| (path, true)),
+            .map(|path| (crate::sandbox::absolutize(&path), true)),
     );
     read_denies.extend(
         crate::sandbox::validator_read_deny_entries(inputs)
             .into_iter()
-            .map(|entry| (entry.path, entry.is_dir)),
+            .map(|entry| (crate::sandbox::absolutize(&entry.path), entry.is_dir)),
     );
-    for root in write_roots.iter().chain(read_roots) {
+    for root in write_roots.iter().chain(&read_roots) {
         if path_contains(&session_authority, root) {
             return Err(EngineError::Backend(format!(
                 "AppContainer grant {} is inside the protected worktree .kranz directory",
@@ -2437,7 +2448,7 @@ fn validate_recursive_roots(
         .into_iter()
         .chain(mission.files)
         .chain(git.files)
-        .map(|path| (path, false))
+        .map(|path| (crate::sandbox::absolutize(&path), false))
         .collect::<Vec<_>>();
     write_denies.extend(
         authority
@@ -2446,10 +2457,10 @@ fn validate_recursive_roots(
             .chain(mission.control_dirs)
             .chain(git.dirs)
             .chain(crate::sandbox::cargo_cache_write_deny_paths())
-            .chain(std::iter::once(shared_git.to_path_buf()))
-            .map(|path| (path, true)),
+            .chain(std::iter::once(shared_git))
+            .map(|path| (crate::sandbox::absolutize(&path), true)),
     );
-    for root in write_roots {
+    for root in &write_roots {
         // The runs directory contains engine-owned transcripts, but private
         // scratch directories below it remain writable. Never grant its root.
         if mission
@@ -4433,6 +4444,7 @@ mod tests {
         std::fs::write(cwd.join(".git"), "gitdir: trusted").unwrap();
         let shared_git = root.path().join("repo/.git");
         validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[], &shared_git).unwrap();
+        assert!(validate_recursive_roots(&inputs, &[cwd.join(".git")], &[], &shared_git).is_err());
         for forbidden in [
             root.path().to_path_buf(),
             root.path().join("repo"),
