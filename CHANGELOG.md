@@ -14,6 +14,8 @@ Notable user-visible changes are documented here. This project follows
   tested changes for the engine's reviewed, secret-scanned checkpoint.
 - Fixed the acceptance rehearsal to verify the delivered branch in a detached
   worktree and to support an existing authenticated Claude Code installation.
+  It now preserves failed fixtures for resume and independently verifies the
+  final CLI against a fixed HTTP contract.
 - Security: webhook comment triggers require an explicit GitHub user allowlist;
   workflow failure triggers refuse fork-owned branches.
 - Security: engine diffs disable external programs and text converters, custom

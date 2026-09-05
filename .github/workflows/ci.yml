@@ -388,6 +388,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Validate macOS CI structure
         run: bash scripts/check-macos-ci.sh
+      - name: Verify acceptance harness without a model
+        run: python3 scripts/test-acceptance-smoke.py
       - run: cargo check --workspace --locked
 
   # The Tauri desktop shell (apps/dashboard/src-tauri) is a STANDALONE cargo

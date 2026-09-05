@@ -42,6 +42,15 @@ imported into the clean public-origin history.
   the original primary branch and commit remain unchanged. Synthetic auth
   values use explicit example names so generated fixture plans do not look
   like leaked credentials; the production secret scanner remains unchanged.
+- The rehearsal also exercised a checkpoint refusal for a runtime function
+  call caught by the scanner's generic assignment heuristic. Its exact
+  fingerprint was reviewed and scoped to the synthetic fixture's allowlist;
+  no production rule, file, or credential category was exempted. Failed
+  rehearsals retain their repository for inspection/resume. A fixed base-owned
+  HTTP contract now drives the first milestone, and final acceptance also
+  verifies CLI success, CLI authentication failure, documentation, and that
+  the delivered branch did not alter the contract. Four offline harness
+  regressions run in CI without a model or credentials.
 
 The review covered correctness, readability, architecture, security, and
 performance. Changes retain the existing event/state schema, environment
@@ -74,6 +83,7 @@ Rust 1.97.1 and Node 22.23.2.
 | Engine crates.io publish dry-run with locked dependencies | Package verification passes; upload was not performed |
 | Optimized CLI installation into an empty installation prefix | `cargo install --path crates/cli --locked` succeeds |
 | Installed-binary smoke with source-checkout reads denied | v0.2.0, help, idempotent init, readiness JSON, embedded HTML/assets, read/mutation authorization, 0600 tokens, and graceful token cleanup all pass |
+| Acceptance harness offline regressions | Four pass: valid isolated delivery, failed-run retention, bad CLI rejection, and contract replacement rejection |
 | Public-tree and uncommitted-diff Gitleaks scans | Pass |
 | Baseline full advertised-ref history audit | 1,239 commits scanned, no leaks; all branch, tag, and pull-request refs fetched |
 | Committed candidate `bd43327` history audit | 1,240 commits scanned, no leaks; exit 0 |
