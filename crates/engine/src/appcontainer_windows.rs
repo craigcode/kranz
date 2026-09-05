@@ -3054,6 +3054,44 @@ pub fn run_production_hostile_self_test() -> std::result::Result<String, String>
     production_hostile_self_test().map_err(|error| error.to_string())
 }
 
+// Inspect only disposable fixture paths and the disposable profile SID. Keep
+// this evidence in failures so native ACL propagation and overlap regressions
+// can be distinguished from a child's access-check behavior.
+fn self_test_acl_diagnostics(paths: &[PathBuf], profile: &str, stage: &str) -> Result<()> {
+    let sid = derive_profile_sid(profile)?;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let snapshot = snapshot_dacl(path)?;
+        let mut entries = Vec::new();
+        if let Some(acl) = &snapshot.acl {
+            let acl = acl.as_ptr().cast::<ACL>();
+            for index in 0..unsafe { (*acl).AceCount } {
+                let mut ace = null_mut();
+                unsafe { GetAce(acl, u32::from(index), &mut ace) }.map_err(|error| {
+                    EngineError::Backend(format!("failed to inspect fixture ACE: {error}"))
+                })?;
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                if header.AceType > 1 {
+                    continue;
+                }
+                // Ordinary allow and deny ACEs have the same mask/SID layout.
+                let entry = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                let trustee = PSID((&entry.SidStart as *const u32).cast_mut().cast());
+                if unsafe { EqualSid(trustee, sid.0) }.is_ok() {
+                    entries.push((header.AceType, header.AceFlags, entry.Mask));
+                }
+            }
+        }
+        eprintln!(
+            "fixture ACL: stage={stage} path={} profile_aces(type,flags,mask)={entries:?}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn production_hostile_self_test() -> Result<String> {
     let root = SelfTestRoot::create()?;
     let repo = root.0.join("repo");
@@ -3222,11 +3260,25 @@ fn production_hostile_self_test() -> Result<String> {
         &[INTERNAL_HOSTILE_CHILD_ARG.to_string()],
         &env,
     )?;
+    let diagnostic_paths = std::iter::once(worktree.clone())
+        .chain(std::iter::once(worktree_authority.clone()))
+        .chain(manifest.worktree_authority_files.iter().cloned())
+        .collect::<Vec<_>>();
+    self_test_acl_diagnostics(
+        &diagnostic_paths,
+        &overlapping.lease.profile_name,
+        "first-prepared",
+    )?;
     let prepared = prepare_launch(
         &inputs,
         &executable,
         &[INTERNAL_HOSTILE_CHILD_ARG.to_string()],
         &env,
+    )?;
+    self_test_acl_diagnostics(
+        &diagnostic_paths,
+        &prepared.lease.profile_name,
+        "second-prepared",
     )?;
     let PreparedLaunch {
         program,
@@ -3237,6 +3289,7 @@ fn production_hostile_self_test() -> Result<String> {
         std::fs::write(path, "must-not-cross")?;
     }
     drop(overlapping.lease);
+    self_test_acl_diagnostics(&diagnostic_paths, &lease.profile_name, "first-reaped")?;
     let output = std::process::Command::new(program)
         .args(args)
         .current_dir(&worktree)
@@ -3303,7 +3356,8 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.volume_root_dacl_restored;
     if !all_passed {
         return Err(EngineError::Backend(format!(
-            "production hostile receipt contained a failed assertion: {receipt:?}"
+            "production hostile receipt contained a failed assertion: {receipt:?}; child diagnostics: {}",
+            String::from_utf8_lossy(&output.stderr)
         )));
     }
     serde_json::to_string(&receipt).map_err(|error| {
@@ -3667,6 +3721,19 @@ fn hostile_child() -> Result<()> {
     .map_err(|error| EngineError::Backend(format!("invalid hostile-child manifest: {error}")))?;
     let worktree_authority = std::env::current_dir()?.join(".kranz");
     let ordinary_file = std::env::current_dir()?.join("ordinary-delete-control");
+    let authority_probes = manifest
+        .worktree_authority_files
+        .iter()
+        .map(|path| {
+            let read_error = std::fs::read(path).err();
+            let write_error = std::fs::write(path, "escape").err();
+            eprintln!(
+                "fixture authority probe: path={} read_error={read_error:?} write_error={write_error:?}",
+                path.display()
+            );
+            (read_error, write_error)
+        })
+        .collect::<Vec<_>>();
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
         // Windows Server 2025 returns ERROR_INVALID_PARAMETER for the
@@ -3685,14 +3752,16 @@ fn hostile_child() -> Result<()> {
         scratch_write: std::fs::write(&manifest.scratch_write, "allowed").is_ok(),
         outside_write_denied: std::fs::write(&manifest.outside_write, "escape").is_err(),
         authority_read_denied: std::fs::read(&manifest.authority_file).is_err(),
-        worktree_authority_read_denied: manifest
-            .worktree_authority_files
-            .iter()
-            .all(|path| std::fs::read(path).is_err()),
-        worktree_authority_write_denied: manifest
-            .worktree_authority_files
-            .iter()
-            .all(|path| std::fs::write(path, "escape").is_err()),
+        worktree_authority_read_denied: authority_probes.iter().all(|(read_error, _)| {
+            read_error
+                .as_ref()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }),
+        worktree_authority_write_denied: authority_probes.iter().all(|(_, write_error)| {
+            write_error
+                .as_ref()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }),
         worktree_authority_create_denied: std::fs::write(
             worktree_authority.join("new-authority"),
             "escape",
