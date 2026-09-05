@@ -10,7 +10,9 @@ Notable user-visible changes are documented here. This project follows
 - Fixed Windows AppContainer launches refusing every worktree after authority
   hardening. The isolated worktree's `.kranz` namespace is protected separately,
   including future files and directory renames; ordinary source files remain
-  writable and removable.
+  writable and removable. Protected DACL inheritance and retained handles keep
+  broad LPAC grants out of that namespace and prevent Git-pointer replacement;
+  overlapping launches restore the original ACLs and inheritance settings.
 - Fixed retries losing earlier checkpoint commit receipts. Sequential features
   now persist their baseline and cumulative receipts before retry or resume;
   failed features with retained work cannot be mistaken for empty proposals.

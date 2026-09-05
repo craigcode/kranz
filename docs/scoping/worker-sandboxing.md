@@ -124,6 +124,18 @@ All of it asks the agent nicely. None of it constrains the process.
   the worktree boundary and retains it for the worktree lifetime so overlapping
   leases cannot remove each other's protection. Redirecting that directory
   through a reparse point or explicitly granting a root beneath it fails closed.
+  Windows package-SID deny ACEs do not subtract inherited LPAC grants, so the
+  launcher blocks DACL inheritance at `.kranz` before granting the worktree.
+  Its descendants must not already carry package/capability grants or reparse
+  points. The worktree Git pointer similarly blocks inheritance and receives
+  only read/execute access. Retained no-share-delete handles pin both objects.
+  Per-profile ACL markers preserve the original inheritance setting across
+  overlapping launches; the final lease restores it after removing its grants.
+  A crashed lease leaves the boundary protected until its orphan ACLs are
+  cleaned up, just as its disposable grants can remain after a crash.
+  Grants that contain or sit inside other authority directories, validator
+  source roots, shared Git metadata, or shared Cargo caches are refused before
+  ACL mutation. Shared Git metadata remains read-only on this provider.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open

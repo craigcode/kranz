@@ -55,13 +55,15 @@ use windows::Win32::Security::Isolation::{
 use windows::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
     FreeSid, GetAce, GetAclInformation, GetKernelObjectSecurity, GetLengthSid,
-    GetSecurityDescriptorDacl, GetTokenInformation, SetKernelObjectSecurity, TokenElevation,
-    TokenIsAppContainer, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSidIdentifierAuthority,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, SetKernelObjectSecurity,
+    TokenElevation, TokenIsAppContainer, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
     ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
     CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE,
-    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
-    TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_CAPABILITIES, SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -152,6 +154,9 @@ pub struct ProductionHostileReceipt {
     pub toolchain_read: bool,
     pub toolchain_write_denied: bool,
     pub worktree_write: bool,
+    pub worktree_git_read: bool,
+    pub worktree_git_write_denied: bool,
+    pub worktree_git_replace_denied: bool,
     pub scratch_write: bool,
     pub outside_write_denied: bool,
     pub authority_read_denied: bool,
@@ -217,6 +222,7 @@ pub(crate) struct AppContainerLaunchContext(Arc<Mutex<Option<AppContainerLease>>
 struct DaclSnapshot {
     path: PathBuf,
     acl: Option<Vec<u8>>,
+    protected: bool,
     handle: OwnedHandle,
 }
 
@@ -278,6 +284,7 @@ pub(crate) struct AppContainerLease {
     rustup_toolchain: Option<PathBuf>,
     original_dacls: Vec<DaclSnapshot>,
     snapshot_indices: BTreeMap<PathBuf, usize>,
+    boundary_protection: BTreeMap<PathBuf, bool>,
     applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
     plan_paths: Vec<PathBuf>,
 }
@@ -300,6 +307,19 @@ impl Drop for AppContainerLease {
                     if let Err(error) = remove_sid_aces(snapshot, sid.0) {
                         tracing::error!(path = %snapshot.path.display(), error = %error,
                             "failed to remove AppContainer ACEs from a DACL");
+                    }
+                }
+                // Parent grants are gone before an authority boundary can
+                // inherit again. Other leases keep their own marker and pin.
+                for snapshot in &self.original_dacls {
+                    if let Some(&original) = self
+                        .boundary_protection
+                        .get(&comparable_path(&snapshot.path))
+                    {
+                        if let Err(error) = restore_boundary_inheritance(snapshot, original) {
+                            tracing::error!(path = %snapshot.path.display(), error = %error,
+                                "failed to restore AppContainer boundary inheritance");
+                        }
                     }
                 }
             }
@@ -415,12 +435,22 @@ fn create_profile(allow_network: bool) -> Result<(String, OwnedSid)> {
 }
 
 fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
+    snapshot_dacl_with_pin(path, false)
+}
+
+fn snapshot_dacl_with_pin(path: &Path, pin: bool) -> Result<DaclSnapshot> {
     let path_wide = wide(path.as_os_str());
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
             READ_CONTROL.0 | WRITE_DAC.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ
+                | FILE_SHARE_WRITE
+                | if pin {
+                    Default::default()
+                } else {
+                    FILE_SHARE_DELETE
+                },
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -462,6 +492,23 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
         )
     })?;
     let _descriptor = LocalAllocation(HLOCAL(descriptor.0));
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.map_err(
+        |error| EngineError::Backend(format!("failed to inspect DACL protection: {error}")),
+    )?;
+    if pin {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle.0, &mut info) }.map_err(|error| {
+            EngineError::Backend(format!("failed to inspect pinned boundary: {error}"))
+        })?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(EngineError::Backend(format!(
+                "AppContainer boundary {} is a reparse point",
+                path.display()
+            )));
+        }
+    }
     let acl = if acl.is_null() {
         None
     } else {
@@ -471,6 +518,7 @@ fn snapshot_dacl(path: &Path) -> Result<DaclSnapshot> {
     Ok(DaclSnapshot {
         path: path.to_path_buf(),
         acl,
+        protected: control & SE_DACL_PROTECTED.0 != 0,
         handle,
     })
 }
@@ -1169,6 +1217,15 @@ fn remove_sid_aces(snapshot: &DaclSnapshot, sid: PSID) -> Result<()> {
 }
 
 fn apply_acl_change(change: &AclChange, sid: PSID, handle: HANDLE) -> Result<()> {
+    apply_acl_change_security(change, sid, handle, DACL_SECURITY_INFORMATION)
+}
+
+fn apply_acl_change_security(
+    change: &AclChange,
+    sid: PSID,
+    handle: HANDLE,
+    security: OBJECT_SECURITY_INFORMATION,
+) -> Result<()> {
     let mut old_acl: *mut ACL = null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     win32(unsafe {
@@ -1209,10 +1266,174 @@ fn apply_acl_change(change: &AclChange, sid: PSID, handle: HANDLE) -> Result<()>
         SetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            security,
             None,
             None,
             Some(new_acl),
+            None,
+        )
+    })
+}
+
+// A non-inheriting, disposable-profile marker records the original protection
+// flag for every overlapping lease. It grants no rights. The final lease can
+// restore inheritance even when it did not create the boundary; a crashed
+// lease leaves it protected, just as orphan profile grants remain inert.
+const BOUNDARY_MARKER: u32 = WRITE_DAC.0 | WRITE_OWNER.0;
+
+fn appcontainer_sid(sid: PSID) -> bool {
+    unsafe { (*GetSidIdentifierAuthority(sid)).Value == [0, 0, 0, 0, 0, 15] }
+}
+
+fn boundary_marker(entry: &ACCESS_ALLOWED_ACE) -> Option<bool> {
+    let header = &entry.Header;
+    if header.AceType != 1
+        || header.AceFlags != 0
+        || ![BOUNDARY_MARKER, BOUNDARY_MARKER | DELETE.0].contains(&entry.Mask)
+    {
+        return None;
+    }
+    let sid = PSID((&entry.SidStart as *const u32).cast_mut().cast());
+    if appcontainer_sid(sid)
+        && unsafe { *GetSidSubAuthorityCount(sid) == 8 && *GetSidSubAuthority(sid, 0) == 2 }
+    {
+        Some(entry.Mask & DELETE.0 == 0)
+    } else {
+        None
+    }
+}
+
+fn inspect_boundary_acl(snapshot: &DaclSnapshot, allowed: u32) -> Result<Option<bool>> {
+    let bytes = snapshot.acl.as_ref().ok_or_else(|| {
+        EngineError::Backend(format!(
+            "AppContainer boundary {} has a null DACL",
+            snapshot.path.display()
+        ))
+    })?;
+    let acl = bytes.as_ptr().cast::<ACL>();
+    let mut original = None;
+    for index in 0..unsafe { (*acl).AceCount } {
+        let mut ace = null_mut();
+        unsafe { GetAce(acl, u32::from(index), &mut ace) }.map_err(|error| {
+            EngineError::Backend(format!("failed to inspect boundary ACE: {error}"))
+        })?;
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if header.AceType > 1 {
+            return Err(EngineError::Backend(format!(
+                "AppContainer boundary {} has an unsupported ACE type {}",
+                snapshot.path.display(),
+                header.AceType
+            )));
+        }
+        let entry = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = PSID((&entry.SidStart as *const u32).cast_mut().cast());
+        if header.AceType == 0 && appcontainer_sid(sid) && entry.Mask & !allowed != 0 {
+            return Err(EngineError::Backend(format!(
+                "AppContainer boundary {} already grants package/capability access beyond its protected rights",
+                snapshot.path.display()
+            )));
+        }
+        if let Some(value) = boundary_marker(entry) {
+            if original.is_some_and(|previous| previous != value) {
+                return Err(EngineError::Backend(
+                    "conflicting AppContainer boundary lease markers".to_string(),
+                ));
+            }
+            original = Some(value);
+        }
+    }
+    Ok(original)
+}
+
+fn prepare_acl_boundary(
+    lease: &mut AppContainerLease,
+    sid: PSID,
+    path: &Path,
+    allowed: u32,
+) -> Result<()> {
+    let key = comparable_path(path);
+    if lease.boundary_protection.contains_key(&key) {
+        return Ok(());
+    }
+    // Denying DELETE on the object cannot override DELETE_CHILD on its
+    // writable parent. A retained no-share-delete handle pins the object
+    // without preventing ordinary source files from being removed.
+    let snapshot = snapshot_dacl_with_pin(path, true)?;
+    let prior = inspect_boundary_acl(&snapshot, allowed)?;
+    if prior.is_some() && !snapshot.protected {
+        return Err(EngineError::Backend(
+            "AppContainer boundary lost its active inheritance protection".to_string(),
+        ));
+    }
+    let original = prior.unwrap_or(snapshot.protected);
+    if path.is_dir() {
+        let mut directories = vec![path.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory)? {
+                let child = entry?.path();
+                // A child junction could point back into the writable tree,
+                // and pre-existing broad package grants could bypass the
+                // namespace through a known child path. Reject both shapes.
+                let child_acl = snapshot_dacl_with_pin(&child, true)?;
+                inspect_boundary_acl(&child_acl, allowed)?;
+                if child.is_dir() {
+                    directories.push(child);
+                }
+            }
+        }
+    }
+    let index = lease.original_dacls.len();
+    let handle = snapshot.handle.0;
+    lease.original_dacls.push(snapshot);
+    lease.snapshot_indices.insert(key.clone(), index);
+    lease.boundary_protection.insert(key, original);
+    apply_acl_change_security(
+        &AclChange {
+            path: path.to_path_buf(),
+            permissions: BOUNDARY_MARKER | if original { 0 } else { DELETE.0 },
+            inherit: false,
+            mode: AclMode::Deny,
+        },
+        sid,
+        handle,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    )?;
+    if allowed != 0 {
+        apply_acl_change(
+            &AclChange {
+                path: path.to_path_buf(),
+                permissions: allowed,
+                inherit: false,
+                mode: AclMode::Grant,
+            },
+            sid,
+            handle,
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_boundary_inheritance(snapshot: &DaclSnapshot, originally_protected: bool) -> Result<()> {
+    let current = snapshot_dacl(&snapshot.path)?;
+    // Read-only gitlink grants from other profiles are legitimate while their
+    // marker is present; namespace grants were refused at preparation.
+    if inspect_boundary_acl(&current, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0)?.is_some()
+        || originally_protected
+    {
+        return Ok(());
+    }
+    let acl = current
+        .acl
+        .as_ref()
+        .expect("inspection rejects a null DACL");
+    win32(unsafe {
+        SetSecurityInfo(
+            snapshot.handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl.as_ptr().cast::<ACL>()),
             None,
         )
     })
@@ -1924,12 +2145,33 @@ fn validate_recursive_roots(
     inputs: &crate::sandbox::SandboxInputs,
     write_roots: &[PathBuf],
     read_roots: &[PathBuf],
+    shared_git: &Path,
 ) -> Result<()> {
     let cwd = crate::sandbox::absolutize(&inputs.session_cwd);
     let session_authority = cwd.join(".kranz");
     let session_files = crate::sandbox::kranz_authority_entries(&session_authority).files;
-    let authority_paths = crate::sandbox::authority_read_deny_paths(inputs);
-    let authority_dirs = crate::sandbox::authority_read_deny_dirs(inputs);
+    let gitlink = cwd.join(".git");
+    let sealed_file = |root: &Path, protected: &Path| {
+        comparable_path(root) == comparable_path(&cwd)
+            && (session_files
+                .iter()
+                .any(|path| comparable_path(path) == comparable_path(protected))
+                || (gitlink.is_file() && path_contains(&gitlink, protected)))
+    };
+    let mut read_denies = crate::sandbox::authority_read_deny_paths(inputs)
+        .into_iter()
+        .map(|path| (path, false))
+        .collect::<Vec<_>>();
+    read_denies.extend(
+        crate::sandbox::authority_read_deny_dirs(inputs)
+            .into_iter()
+            .map(|path| (path, true)),
+    );
+    read_denies.extend(
+        crate::sandbox::validator_read_deny_entries(inputs)
+            .into_iter()
+            .map(|entry| (entry.path, entry.is_dir)),
+    );
     for root in write_roots.iter().chain(read_roots) {
         if path_contains(&session_authority, root) {
             return Err(EngineError::Backend(format!(
@@ -1937,43 +2179,61 @@ fn validate_recursive_roots(
                 root.display()
             )));
         }
-        for protected in authority_paths.iter().chain(&authority_dirs) {
-            if path_contains(root, protected) {
-                // The worktree's own authority namespace receives a separate
-                // inheriting deny below, including when these files are absent.
-                // Every other authority overlap still fails before mutation.
-                if comparable_path(root) == comparable_path(&cwd)
+        for (protected, directory) in &read_denies {
+            if (path_contains(root, protected) || (*directory && path_contains(protected, root)))
+                && !(comparable_path(root) == comparable_path(&cwd)
                     && session_files
                         .iter()
-                        .any(|path| comparable_path(path) == comparable_path(protected))
-                {
-                    continue;
-                }
+                        .any(|path| comparable_path(path) == comparable_path(protected)))
+            {
                 return Err(EngineError::Backend(format!(
-                    "AppContainer recursive grant {} would cover protected authority path {}; refusing before ACL mutation",
-                    root.display(),
-                    protected.display()
+                    "AppContainer recursive grant {} overlaps protected read path {}; refusing before ACL mutation",
+                    root.display(), protected.display()
                 )));
             }
         }
     }
-    let mission = crate::sandbox::absolutize(&inputs.mission_dir);
+    let authority = crate::sandbox::authority_write_denies(inputs);
+    let mission = crate::sandbox::mission_write_denies(inputs);
+    let git = crate::sandbox::git_metadata_write_denies(inputs);
+    let mut write_denies = authority
+        .files
+        .into_iter()
+        .chain(mission.files)
+        .chain(git.files)
+        .map(|path| (path, false))
+        .collect::<Vec<_>>();
+    write_denies.extend(
+        authority
+            .dirs
+            .into_iter()
+            .chain(mission.control_dirs)
+            .chain(git.dirs)
+            .chain(crate::sandbox::cargo_cache_write_deny_paths())
+            .chain(std::iter::once(shared_git.to_path_buf()))
+            .map(|path| (path, true)),
+    );
     for root in write_roots {
-        if path_contains(root, &mission) {
+        // The runs directory contains engine-owned transcripts, but private
+        // scratch directories below it remain writable. Never grant its root.
+        if mission
+            .runs_dirs
+            .iter()
+            .any(|runs| path_contains(root, runs))
+            || path_contains(root, &crate::sandbox::absolutize(&inputs.mission_dir))
+        {
             return Err(EngineError::Backend(format!(
-                "AppContainer writable root {} covers engine-owned mission metadata {}; Windows enforcement requires a discardable worktree outside that metadata root",
-                root.display(),
-                mission.display()
+                "AppContainer writable root {} covers engine-owned mission metadata",
+                root.display()
             )));
         }
-    }
-    for cache in crate::sandbox::cargo_cache_write_deny_paths() {
-        for root in write_roots {
-            if path_contains(root, &cache) {
+        for (protected, directory) in &write_denies {
+            if (path_contains(root, protected) || (*directory && path_contains(protected, root)))
+                && !sealed_file(root, protected)
+            {
                 return Err(EngineError::Backend(format!(
-                    "AppContainer writable root {} covers shared Cargo cache {}; refusing to make the operator cache writable",
-                    root.display(),
-                    cache.display()
+                    "AppContainer writable root {} overlaps protected write path {}; refusing before ACL mutation",
+                    root.display(), protected.display()
                 )));
             }
         }
@@ -2003,7 +2263,8 @@ fn acl_changes(
         env,
         rustup_toolchain,
     )?;
-    validate_recursive_roots(inputs, &write_roots, &read_roots)?;
+    let shared_git = trusted_git_read_root(&inputs.session_cwd, &inputs.mission_dir)?;
+    validate_recursive_roots(inputs, &write_roots, &read_roots, &shared_git)?;
 
     // Windows ACLs need an existing object. Reserve the namespace only after
     // validating that this is an isolated worktree, never the primary tree.
@@ -2072,21 +2333,8 @@ fn acl_changes(
         | FILE_DELETE_CHILD.0
         | DELETE.0;
     let deny_write = FILE_GENERIC_WRITE.0 | FILE_DELETE_CHILD.0 | DELETE.0;
-    // An inherited deny on .kranz precedes the worktree's more distant allow.
-    // Pin the directory too: DELETE_CHILD on its parent otherwise authorizes
-    // renaming/deleting it despite the deny on the directory itself.
-    changes.push(AclChange {
-        path: session_authority,
-        permissions: deny_all,
-        inherit: true,
-        mode: AclMode::Deny,
-    });
-    changes.push(AclChange {
-        path: crate::sandbox::absolutize(&inputs.session_cwd),
-        permissions: FILE_DELETE_CHILD.0,
-        inherit: false,
-        mode: AclMode::Deny,
-    });
+    // The worktree namespace and gitlink are sealed before root grants.
+    // Package-SID deny ACEs alone cannot subtract inherited LPAC access.
     for path in crate::sandbox::authority_read_deny_paths(inputs) {
         if path.exists() {
             changes.push(AclChange {
@@ -2197,7 +2445,10 @@ fn acl_changes(
         // that Windows evaluates on child creation would close the index the
         // worker legitimately writes. Only the gitlink FILE form and the
         // named config files are denied.
-        if path.is_file() {
+        if path.is_file()
+            && comparable_path(&path)
+                != comparable_path(&crate::sandbox::absolutize(&inputs.session_cwd).join(".git"))
+        {
             changes.push(AclChange {
                 path,
                 permissions: deny_write,
@@ -2235,6 +2486,7 @@ fn new_lease(profile_name: String, rustup_toolchain: Option<PathBuf>) -> AppCont
         rustup_toolchain,
         original_dacls: Vec::new(),
         snapshot_indices: BTreeMap::new(),
+        boundary_protection: BTreeMap::new(),
         applied_changes: HashSet::new(),
         plan_paths: Vec::new(),
     }
@@ -2341,6 +2593,17 @@ fn prepare_launch_for_lease(
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
     let _guard = DaclMutationGuard::acquire()?;
+    let authority = crate::sandbox::absolutize(&inputs.session_cwd).join(".kranz");
+    prepare_acl_boundary(lease, sid, &authority, 0)?;
+    let gitlink = crate::sandbox::absolutize(&inputs.session_cwd).join(".git");
+    if gitlink.is_file() {
+        prepare_acl_boundary(
+            lease,
+            sid,
+            &gitlink,
+            FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+        )?;
+    }
     // Key retained handles by physical Windows spelling too. A worktree can
     // be present as both `C:\...` and canonical `\\?\C:\...` changes with
     // different permissions, so the exact-change collapse below deliberately
@@ -3168,6 +3431,7 @@ fn production_hostile_self_test() -> Result<String> {
         format!("gitdir: {}\n", worktree_git.display()),
     )?;
     std::fs::write(worktree_git.join("commondir"), "../..\n")?;
+    let gitlink_before = snapshot_dacl(&worktree.join(".git"))?;
 
     let source_executable = std::env::current_exe().map_err(|error| {
         EngineError::Backend(format!("failed to locate self-test executable: {error}"))
@@ -3319,8 +3583,14 @@ fn production_hostile_self_test() -> Result<String> {
         })?)
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
-    receipt.dacl_restored =
-        before.acl == after.acl && authority_before.acl == snapshot_dacl(&worktree_authority)?.acl;
+    let authority_after = snapshot_dacl(&worktree_authority)?;
+    let gitlink_after = snapshot_dacl(&worktree.join(".git"))?;
+    receipt.dacl_restored = before.acl == after.acl
+        && before.protected == after.protected
+        && authority_before.acl == authority_after.acl
+        && authority_before.protected == authority_after.protected
+        && gitlink_before.acl == gitlink_after.acl
+        && gitlink_before.protected == gitlink_after.protected;
     receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
@@ -3339,6 +3609,9 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.toolchain_read
         && receipt.toolchain_write_denied
         && receipt.worktree_write
+        && receipt.worktree_git_read
+        && receipt.worktree_git_write_denied
+        && receipt.worktree_git_replace_denied
         && receipt.scratch_write
         && receipt.outside_write_denied
         && receipt.authority_read_denied
@@ -3721,6 +3994,9 @@ fn hostile_child() -> Result<()> {
     .map_err(|error| EngineError::Backend(format!("invalid hostile-child manifest: {error}")))?;
     let worktree_authority = std::env::current_dir()?.join(".kranz");
     let ordinary_file = std::env::current_dir()?.join("ordinary-delete-control");
+    let gitlink = std::env::current_dir()?.join(".git");
+    let replacement_gitlink = std::env::current_dir()?.join("replacement-gitlink");
+    std::fs::write(&replacement_gitlink, "gitdir: forged")?;
     let authority_probes = manifest
         .worktree_authority_files
         .iter()
@@ -3749,6 +4025,11 @@ fn hostile_child() -> Result<()> {
         toolchain_read: std::fs::metadata(&manifest.executable).is_ok(),
         toolchain_write_denied: std::fs::write(&manifest.toolchain_denied_write, "escape").is_err(),
         worktree_write: std::fs::write(&manifest.worktree_write, "allowed").is_ok(),
+        worktree_git_read: std::fs::read_to_string(&gitlink)
+            .is_ok_and(|value| value.starts_with("gitdir: ")),
+        worktree_git_write_denied: std::fs::write(&gitlink, "gitdir: forged")
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+        worktree_git_replace_denied: std::fs::rename(&replacement_gitlink, &gitlink).is_err(),
         scratch_write: std::fs::write(&manifest.scratch_write, "allowed").is_ok(),
         outside_write_denied: std::fs::write(&manifest.outside_write, "escape").is_err(),
         authority_read_denied: std::fs::read(&manifest.authority_file).is_err(),
@@ -3856,22 +4137,188 @@ mod tests {
             egress: Vec::new(),
             validator_read_deny_roots: Vec::new(),
         };
-        validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[]).unwrap();
+        std::fs::write(cwd.join(".git"), "gitdir: trusted").unwrap();
+        let shared_git = root.path().join("repo/.git");
+        validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[], &shared_git).unwrap();
         for forbidden in [
             root.path().to_path_buf(),
             root.path().join("repo"),
             cwd.join(".kranz"),
             cwd.join(".kranz/nested"),
         ] {
-            assert!(
-                validate_recursive_roots(&inputs, std::slice::from_ref(&forbidden), &[]).is_err()
-            );
-            assert!(validate_recursive_roots(&inputs, &[], &[forbidden]).is_err());
+            assert!(validate_recursive_roots(
+                &inputs,
+                std::slice::from_ref(&forbidden),
+                &[],
+                &shared_git
+            )
+            .is_err());
+            assert!(validate_recursive_roots(&inputs, &[], &[forbidden], &shared_git).is_err());
+        }
+        for forbidden in [
+            root.path().join("repo/.kranz/queue/nested"),
+            shared_git.clone(),
+            shared_git.join("objects"),
+            inputs.mission_dir.join("runs"),
+        ]
+        .into_iter()
+        .chain(
+            crate::sandbox::cargo_cache_write_deny_paths()
+                .into_iter()
+                .map(|path| path.join("nested")),
+        ) {
+            assert!(validate_recursive_roots(&inputs, &[forbidden], &[], &shared_git).is_err());
+        }
+        let real_checkout = root.path().join("real-checkout");
+        let source = real_checkout.join("src");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        let mut validator = inputs.clone();
+        validator.validator_read_deny_roots.push(real_checkout);
+        for forbidden in [source.clone(), source.join("nested")] {
+            assert!(validate_recursive_roots(
+                &validator,
+                std::slice::from_ref(&forbidden),
+                &[],
+                &shared_git
+            )
+            .is_err());
+            assert!(validate_recursive_roots(&validator, &[], &[forbidden], &shared_git).is_err());
         }
         assert!(
             !cwd.join(".kranz").exists(),
             "validation must not create paths"
         );
+    }
+
+    #[test]
+    fn sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance() {
+        for originally_protected in [false, true] {
+            for reverse in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let authority = root.path().join(".kranz");
+                let gitlink = root.path().join(".git");
+                std::fs::create_dir(&authority).unwrap();
+                std::fs::write(authority.join("serve.token"), "protected").unwrap();
+                std::fs::write(&gitlink, "gitdir: example").unwrap();
+                if originally_protected {
+                    for path in [&authority, &gitlink] {
+                        let snapshot = snapshot_dacl(path).unwrap();
+                        let acl = snapshot.acl.as_ref().unwrap();
+                        win32(unsafe {
+                            SetSecurityInfo(
+                                snapshot.handle.0,
+                                SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                None,
+                                None,
+                                Some(acl.as_ptr().cast::<ACL>()),
+                                None,
+                            )
+                        })
+                        .unwrap();
+                    }
+                }
+                let authority_before = snapshot_dacl(&authority).unwrap();
+                let gitlink_before = snapshot_dacl(&gitlink).unwrap();
+                let root_before = snapshot_dacl(root.path()).unwrap();
+                let prepare = || {
+                    let (name, sid) = create_profile(false).unwrap();
+                    let mut lease = new_lease(name, None);
+                    let _guard = DaclMutationGuard::acquire().unwrap();
+                    prepare_acl_boundary(&mut lease, sid.0, &authority, 0).unwrap();
+                    prepare_acl_boundary(
+                        &mut lease,
+                        sid.0,
+                        &gitlink,
+                        FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+                    )
+                    .unwrap();
+                    let snapshot = snapshot_dacl(root.path()).unwrap();
+                    apply_acl_change(
+                        &AclChange {
+                            path: root.path().to_path_buf(),
+                            permissions: FILE_GENERIC_READ.0
+                                | FILE_GENERIC_WRITE.0
+                                | FILE_GENERIC_EXECUTE.0
+                                | DELETE.0
+                                | FILE_DELETE_CHILD.0,
+                            inherit: true,
+                            mode: AclMode::Grant,
+                        },
+                        sid.0,
+                        snapshot.handle.0,
+                    )
+                    .unwrap();
+                    lease.original_dacls.push(snapshot);
+                    lease
+                };
+                let first = prepare();
+                let second = prepare();
+                std::fs::write(authority.join("config.json"), "late authority").unwrap();
+                let remaining = if reverse {
+                    drop(second);
+                    first
+                } else {
+                    drop(first);
+                    second
+                };
+                let protected = snapshot_dacl(&authority).unwrap();
+                assert!(protected.protected);
+                assert_eq!(
+                    inspect_boundary_acl(&protected, 0).unwrap(),
+                    Some(originally_protected)
+                );
+                inspect_boundary_acl(&snapshot_dacl(&authority.join("config.json")).unwrap(), 0)
+                    .unwrap();
+                assert!(std::fs::rename(&authority, root.path().join("moved")).is_err());
+                assert!(std::fs::rename(&gitlink, root.path().join("moved-gitlink")).is_err());
+                drop(remaining);
+                for before in [&authority_before, &gitlink_before, &root_before] {
+                    let after = snapshot_dacl(&before.path).unwrap();
+                    assert_eq!(
+                        before.protected,
+                        after.protected,
+                        "{}",
+                        before.path.display()
+                    );
+                    assert_eq!(before.acl, after.acl, "{}", before.path.display());
+                }
+                // Releasing the final lease also releases replacement pins.
+                std::fs::rename(&authority, root.path().join("moved")).unwrap();
+                std::fs::rename(&gitlink, root.path().join("moved-gitlink")).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_authority_rejects_preexisting_package_grants_in_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = root.path().join(".kranz");
+        std::fs::create_dir(&authority).unwrap();
+        let file = authority.join("serve.token");
+        std::fs::write(&file, "protected").unwrap();
+        let (name, sid) = create_profile(false).unwrap();
+        let mut lease = new_lease(name, None);
+        let before = snapshot_dacl(&authority).unwrap();
+        let file_acl = snapshot_dacl(&file).unwrap();
+        let mut any_package =
+            well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES").unwrap();
+        let _guard = DaclMutationGuard::acquire().unwrap();
+        apply_acl_change(
+            &AclChange {
+                path: file,
+                permissions: FILE_GENERIC_READ.0,
+                inherit: false,
+                mode: AclMode::Grant,
+            },
+            PSID(any_package.as_mut_ptr().cast()),
+            file_acl.handle.0,
+        )
+        .unwrap();
+        assert!(prepare_acl_boundary(&mut lease, sid.0, &authority, 0).is_err());
+        let after = snapshot_dacl(&authority).unwrap();
+        assert_eq!(before.acl, after.acl);
+        assert_eq!(before.protected, after.protected);
     }
 
     #[test]
