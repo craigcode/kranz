@@ -128,7 +128,11 @@ All of it asks the agent nicely. None of it constrains the process.
   launcher blocks DACL inheritance at `.kranz` before granting the worktree.
   Its descendants must not already carry package/capability grants or reparse
   points. The worktree Git pointer similarly blocks inheritance and receives
-  only read/execute access. Retained no-share-delete handles pin both objects.
+  only read/execute access. Writable grants omit `FILE_DELETE_CHILD`, which
+  could authorize replacing protected children through their parent; ordinary
+  source files inherit `DELETE` on themselves. Existing package/capability
+  grants that reopen parent deletion are refused. Retained no-share-delete
+  handles additionally pin both protected objects.
   Per-profile ACL markers preserve the original inheritance setting across
   overlapping launches; the final lease restores it after removing its grants.
   A crashed lease leaves the boundary protected until its orphan ACLs are

@@ -1286,6 +1286,10 @@ fn apply_acl_change_security(
 // restore inheritance even when it did not create the boundary; a crashed
 // lease leaves it protected, just as orphan profile grants remain inert.
 const BOUNDARY_MARKER: u32 = WRITE_DAC.0 | WRITE_OWNER.0;
+// Ordinary children inherit DELETE on themselves. DELETE_CHILD on a parent
+// would also authorize replacement of sealed children that lack DELETE.
+const WRITABLE_ROOT_ACCESS: u32 =
+    FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0 | DELETE.0;
 
 fn appcontainer_sid(sid: PSID) -> bool {
     unsafe { (*GetSidIdentifierAuthority(sid)).Value == [0, 0, 0, 0, 0, 15] }
@@ -1361,9 +1365,8 @@ fn prepare_acl_boundary(
     if lease.boundary_protection.contains_key(&key) {
         return Ok(());
     }
-    // Denying DELETE on the object cannot override DELETE_CHILD on its
-    // writable parent. A retained no-share-delete handle pins the object
-    // without preventing ordinary source files from being removed.
+    // Pin the object throughout the lease in addition to excluding package
+    // delete rights on both this object and its writable parent.
     let snapshot = snapshot_dacl_with_pin(path, true)?;
     let prior = inspect_boundary_acl(&snapshot, allowed)?;
     if prior.is_some() && !snapshot.protected {
@@ -2309,16 +2312,11 @@ fn acl_changes(
 
     let toolchain_entries = toolchain_entry_points(env);
     let mut changes = Vec::new();
-    let rwx = FILE_GENERIC_READ.0
-        | FILE_GENERIC_WRITE.0
-        | FILE_GENERIC_EXECUTE.0
-        | FILE_DELETE_CHILD.0
-        | DELETE.0;
     let rx = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
     for root in &write_roots {
         changes.push(AclChange {
             path: root.clone(),
-            permissions: rwx,
+            permissions: WRITABLE_ROOT_ACCESS,
             inherit: true,
             mode: AclMode::Grant,
         });
@@ -2430,10 +2428,8 @@ fn acl_changes(
     // engine stores, and every SIBLING mission dir are write-denied, not
     // only read-denied. Windows already denied READS of the authority set
     // above (`deny_all`); this closes the write half for the wider set the
-    // process tier now shares. The `.kranz` sealing regex the Seatbelt tier
-    // emits has no ACL equivalent, so a store created after launch is the
-    // documented Windows remainder — the same spawn-time shape every ACL
-    // deny here already has.
+    // process tier now shares. The positive namespace boundary and grant
+    // overlap checks above also exclude stores created after launch.
     let authority_writes = crate::sandbox::authority_write_denies(inputs);
     for path in authority_writes.files {
         if path.exists() {
@@ -2458,10 +2454,14 @@ fn acl_changes(
     // `.git` metadata write deny (2026-09-01 adversarial audit, H3 support):
     // the hook and config surface that turns the engine's next unhardened
     // `git commit` into host execution, plus the worktree gitlink. Narrow by
-    // design — the index, objects and refs stay writable because the
-    // worker's own role is to commit.
+    // design; the positive root policy already keeps shared metadata
+    // read-only on this provider.
     let git_writes = crate::sandbox::git_metadata_write_denies(inputs);
     for path in git_writes.files {
+        // Resolve short (8.3) aliases as well as verbatim paths. A generic
+        // deny on the sealed gitlink would merge with its lease marker,
+        // hiding the marker from overlapping-lease cleanup.
+        let path = crate::sandbox::absolutize(&path);
         // A `.git` DIRECTORY is skipped here: the non-inheriting deny would
         // still be a deny on the container itself, and a directory node deny
         // that Windows evaluates on child creation would close the index the
@@ -2615,9 +2615,13 @@ fn prepare_launch_for_lease(
     // across Kranz processes so simultaneous prepare/drop paths cannot publish
     // stale ACL copies over one another on shared toolchain or Git roots.
     let _guard = DaclMutationGuard::acquire()?;
-    let authority = crate::sandbox::absolutize(&inputs.session_cwd).join(".kranz");
+    let cwd = crate::sandbox::absolutize(&inputs.session_cwd);
+    // A pre-existing package/capability DELETE_CHILD grant on the parent
+    // can replace sealed objects regardless of their own delete rights.
+    inspect_boundary_acl(&snapshot_dacl(&cwd)?, WRITABLE_ROOT_ACCESS)?;
+    let authority = cwd.join(".kranz");
     prepare_acl_boundary(lease, sid, &authority, 0)?;
-    let gitlink = crate::sandbox::absolutize(&inputs.session_cwd).join(".git");
+    let gitlink = cwd.join(".git");
     if gitlink.is_file() {
         prepare_acl_boundary(
             lease,
@@ -3374,8 +3378,8 @@ fn self_test_acl_diagnostics(paths: &[PathBuf], profile: &str, stage: &str) -> R
             }
         }
         eprintln!(
-            "fixture ACL: stage={stage} path={} profile_aces(type,flags,mask)={entries:?}",
-            path.display()
+            "fixture ACL: stage={stage} path={} protected={} profile_aces(type,flags,mask)={entries:?}",
+            path.display(), snapshot.protected
         );
     }
     Ok(())
@@ -3552,6 +3556,7 @@ fn production_hostile_self_test() -> Result<String> {
     )?;
     let diagnostic_paths = std::iter::once(worktree.clone())
         .chain(std::iter::once(worktree_authority.clone()))
+        .chain(std::iter::once(worktree.join(".git")))
         .chain(manifest.worktree_authority_files.iter().cloned())
         .collect::<Vec<_>>();
     self_test_acl_diagnostics(
@@ -3611,12 +3616,13 @@ fn production_hostile_self_test() -> Result<String> {
     receipt.overlapping_lease_safe = true;
     let authority_after = snapshot_dacl(&worktree_authority)?;
     let gitlink_after = snapshot_dacl(&worktree.join(".git"))?;
-    receipt.dacl_restored = before.acl == after.acl
-        && before.protected == after.protected
-        && authority_before.acl == authority_after.acl
-        && authority_before.protected == authority_after.protected
-        && gitlink_before.acl == gitlink_after.acl
+    let root_restored = before.acl == after.acl && before.protected == after.protected;
+    let authority_restored = authority_before.acl == authority_after.acl
+        && authority_before.protected == authority_after.protected;
+    let gitlink_restored = gitlink_before.acl == gitlink_after.acl
         && gitlink_before.protected == gitlink_after.protected;
+    eprintln!("fixture DACL restoration: root={root_restored} authority={authority_restored} gitlink={gitlink_restored}");
+    receipt.dacl_restored = root_restored && authority_restored && gitlink_restored;
     receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
@@ -4036,6 +4042,11 @@ fn hostile_child() -> Result<()> {
             (read_error, write_error)
         })
         .collect::<Vec<_>>();
+    let gitlink_read =
+        std::fs::read_to_string(&gitlink).is_ok_and(|value| value.starts_with("gitdir: "));
+    let gitlink_write_error = std::fs::write(&gitlink, "gitdir: forged").err();
+    let gitlink_replace_error = std::fs::rename(&replacement_gitlink, &gitlink).err();
+    eprintln!("fixture gitlink probe: write_error={gitlink_write_error:?} replace_error={gitlink_replace_error:?}");
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
         // Windows Server 2025 returns ERROR_INVALID_PARAMETER for the
@@ -4051,11 +4062,10 @@ fn hostile_child() -> Result<()> {
         toolchain_read: std::fs::metadata(&manifest.executable).is_ok(),
         toolchain_write_denied: std::fs::write(&manifest.toolchain_denied_write, "escape").is_err(),
         worktree_write: std::fs::write(&manifest.worktree_write, "allowed").is_ok(),
-        worktree_git_read: std::fs::read_to_string(&gitlink)
-            .is_ok_and(|value| value.starts_with("gitdir: ")),
-        worktree_git_write_denied: std::fs::write(&gitlink, "gitdir: forged")
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
-        worktree_git_replace_denied: std::fs::rename(&replacement_gitlink, &gitlink).is_err(),
+        worktree_git_read: gitlink_read,
+        worktree_git_write_denied: gitlink_write_error
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+        worktree_git_replace_denied: gitlink_replace_error.is_some(),
         scratch_write: std::fs::write(&manifest.scratch_write, "allowed").is_ok(),
         outside_write_denied: std::fs::write(&manifest.outside_write, "escape").is_err(),
         authority_read_denied: std::fs::read(&manifest.authority_file).is_err(),
@@ -4217,6 +4227,73 @@ mod tests {
     }
 
     #[test]
+    fn gitlink_aliases_never_receive_generic_metadata_denies() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("worktree");
+        let mission = root.path().join("repo/.kranz/missions/m-test");
+        let gitdir = root.path().join("repo/.git/worktrees/test");
+        let scratch = root.path().join("scratch");
+        let toolchain = root.path().join("toolchain");
+        let alias = root.path().join("alias");
+        for path in [&cwd, &mission, &gitdir, &scratch, &toolchain, &alias] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let executable = toolchain.join("probe.exe");
+        std::fs::write(&executable, "fixture").unwrap();
+        let inputs = crate::sandbox::SandboxInputs {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            session_cwd: alias.join("../worktree"),
+            mission_dir: mission,
+            tmpdir: scratch,
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let changes = acl_changes(&inputs, &executable, &HashMap::new(), None).unwrap();
+        let gitlink = comparable_path(&crate::sandbox::absolutize(&cwd.join(".git")));
+        assert!(changes.iter().all(|change| {
+            comparable_path(&crate::sandbox::absolutize(&change.path)) != gitlink
+        }));
+        assert!(changes.iter().any(|change| {
+            change.mode == AclMode::Grant
+                && comparable_path(&change.path)
+                    == comparable_path(&crate::sandbox::absolutize(&cwd))
+                && change.permissions & DELETE.0 != 0
+                && change.permissions & FILE_DELETE_CHILD.0 == 0
+        }));
+    }
+
+    #[test]
+    fn boundary_parent_rejects_package_delete_child_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_dacl(root.path()).unwrap();
+        let mut any_package =
+            well_known_sid(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES").unwrap();
+        let sid = PSID(any_package.as_mut_ptr().cast());
+        let _guard = DaclMutationGuard::acquire().unwrap();
+        for permissions in [WRITABLE_ROOT_ACCESS, FILE_DELETE_CHILD.0] {
+            apply_acl_change(
+                &AclChange {
+                    path: root.path().to_path_buf(),
+                    permissions,
+                    inherit: true,
+                    mode: AclMode::Grant,
+                },
+                sid,
+                snapshot.handle.0,
+            )
+            .unwrap();
+            let current = snapshot_dacl(root.path()).unwrap();
+            assert_eq!(
+                inspect_boundary_acl(&current, WRITABLE_ROOT_ACCESS).is_ok(),
+                permissions == WRITABLE_ROOT_ACCESS
+            );
+        }
+    }
+
+    #[test]
     fn sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance() {
         for originally_protected in [false, true] {
             for reverse in [false, true] {
@@ -4263,11 +4340,7 @@ mod tests {
                     apply_acl_change(
                         &AclChange {
                             path: root.path().to_path_buf(),
-                            permissions: FILE_GENERIC_READ.0
-                                | FILE_GENERIC_WRITE.0
-                                | FILE_GENERIC_EXECUTE.0
-                                | DELETE.0
-                                | FILE_DELETE_CHILD.0,
+                            permissions: WRITABLE_ROOT_ACCESS,
                             inherit: true,
                             mode: AclMode::Grant,
                         },
