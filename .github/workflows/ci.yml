@@ -533,7 +533,7 @@ jobs:
         # unpinned install would auto-pull any newly published (possibly
         # hijacked) release straight into a secret-bearing environment. Bump
         # deliberately.
-        run: npm install --global @anthropic-ai/claude-code@2.1.206
+        run: npm install --global @anthropic-ai/claude-code@2.1.261
       - name: Build kranz
         run: cargo build --release --locked --package kranz --bin kranz
       - name: Run flagship live acceptance mission

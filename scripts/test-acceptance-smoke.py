@@ -75,7 +75,7 @@ mission.mkdir(parents=True)
 (mission / "events.jsonl").write_text('{"type":"fixfeature.created"}\n')
 (mission / "state.json").write_text(json.dumps({'mission': {'milestones': [{'features': [{
     'origin': 'plan' if mode == 'premature-auth' else 'fix', 'status': 'complete',
-    'commits': [subprocess.check_output(['git', '-C', str(worker), 'rev-parse', 'HEAD'], text=True).strip()],
+    'commits': [subprocess.check_output(['git', '-C', str(worker), 'log', '-1', '--format=%H' if mode == 'bare-sha' else '--format=%H %s'], text=True).strip()],
 }]}]}}))
 pathlib.Path(os.environ['FIXTURE_HEADS']).write_text(json.dumps([initial, git('rev-parse', 'HEAD'), git('branch', '--show-current')]))
 print('kranz exec m-abcdef COMPLETE cost=$0.00 branch=' + branch)
@@ -112,6 +112,10 @@ class AcceptanceHarnessTests(unittest.TestCase):
         self.assertIn("Ran 5 tests", result.stderr)
         self.assertIn("acceptance smoke passed: m-abcdef", result.stdout)
         self.assertFalse(list(root.glob("kranz-acceptance.*")))
+
+    def test_bare_commit_hashes_also_identify_the_repair(self):
+        _, result = self.run_fixture("bare-sha")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_failed_mission_retains_repository_and_exit_code(self):
         root, result = self.run_fixture("failed")

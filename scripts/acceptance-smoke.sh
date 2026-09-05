@@ -290,7 +290,7 @@ repo, base, branch, state_file = sys.argv[1:]
 with open(state_file, encoding="utf-8") as handle:
     state = json.load(handle)
 fix_commits = {
-    commit
+    commit.split(maxsplit=1)[0]
     for milestone in state["mission"]["milestones"]
     for feature in milestone["features"]
     if feature["origin"] == "fix" and feature["status"] == "complete"
