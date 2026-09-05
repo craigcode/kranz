@@ -69,6 +69,21 @@ list of dictionaries; `service.server.make_server(port=0)` returns an HTTPServer
 bound to 127.0.0.1; `python3 -m service.client --url URL --token VALUE` calls that
 complete endpoint URL and prints its JSON response. README.md must document
 the Python invocation, `/items`, and `--token`.
+Use the existing `service.auth.accepts_bearer(bearer_value)` helper for
+credential verification. Every planned feature must preserve service/auth.py
+byte-for-byte relative to that feature's starting checkout; include that
+constraint in its validation criteria. A validator-created repair feature may
+change the helper. Milestone two starts AFTER that repair and must retain the
+repaired helper. Never require auth.py to equal the mission's pinned base in
+milestone two, or revert the repair. Check a planned feature's own diff for
+helper changes, not the cumulative mission diff. In particular, do not use
+`git diff $KRANZ_BASE_SHA -- service/auth.py` as a feature criterion: the
+external acceptance audit independently verifies repair provenance.
+All feature criteria must remain true after the authorized repair. Do not
+encode the temporary defect as a permanent test or criterion (such as requiring
+permissive authentication or forbidding wrong-token regression tests). Before
+the repair, cover the store, missing credentials, and valid credentials; the
+repair adds wrong-token coverage.
 
 The immutable `acceptance_contract.py` is the pre-agreed executable contract.
 Use exactly one mission contract assertion, with command
@@ -79,17 +94,26 @@ fail on the untouched base and on the seeded authentication defect. The CLI
 and documentation belong to milestone two's feature criteria; the external
 acceptance runner additionally verifies them with `--final` after COMPLETE.
 Do not add commands requiring milestone-two files to the milestone-one gate.
+Name parsed request credential variables `bearer_value`: the conservative
+secret heuristic treats assignments to generic credential names as potential
+literal secrets, even when the right-hand side is a runtime expression.
+Every planned feature and repair specification must repeat these fixture
+constraints: use `bearer_value` for parsed credentials and use only
+`example-kranz-token` / `example-wrong-token` as literal credential values.
+Additional invalid examples, if needed, must start with `example-`.
 Set touchSet to `service/**`, `tests/**`, and `README.md`. Do not edit the
 contract script, mission input, .gitignore, or secret allowlist.
 
-Deliberately seed one validator-detectable defect in the HTTP endpoint feature:
-accept any non-empty Bearer token instead of requiring the exact token
-`example-kranz-token`. Do not mention the defect in that feature's validation criteria
-and do not repair it in a later planned feature. The mission-level contract,
-however, MUST state that a wrong non-empty token is rejected with HTTP 403.
-This controlled contradiction is intentional: validation must report it after
-milestone one, the orchestrator must create a fix-feature, and that fix-feature
-must repair it before the mission completes.
+The base already contains a controlled legacy defect: accepts_bearer accepts
+any non-empty value. The three milestone-one planned features must preserve
+that defect; do not fix it preemptively or work around it in the endpoint.
+The two milestone-two planned features must preserve the REPAIRED helper.
+The immutable
+contract independently tests the helper as well as the actual HTTP endpoint.
+After milestone-one validation reports the defect, the orchestrator must
+create a fix-feature that repairs the helper and adds its regression coverage.
+The final audit verifies that the helper's first change belongs to a completed
+fix-feature, not a planned feature.
 
 Use these explicit example credentials throughout; this fixture contains no
 real secrets. Keep each feature specification under 150 words and each
@@ -110,8 +134,8 @@ the required considered-alternatives object with at least two rejected shapes.
   non-zero with a useful message on HTTP/authentication failure.
 - Plan shape: exactly two milestones and exactly five planned features, split
   3 then 2 as described above.
-- Controlled defect: required, and it must survive until milestone-one
-  validation so the fix-feature path is exercised.
+- Controlled defect: the existing authentication helper must survive unchanged
+  until milestone-one validation so the fix-feature path is exercised.
 
 ## Acceptance hints
 
@@ -139,6 +163,10 @@ import urllib.request
 
 
 def main():
+    from service.auth import accepts_bearer
+
+    assert not accepts_bearer("example-wrong-token"), "the seeded authentication helper must reject a wrong credential"
+    assert accepts_bearer("example-kranz-token"), "the authentication helper must accept the valid example credential"
     from service.server import make_server
     from service.store import list_items
 
@@ -187,12 +215,26 @@ if __name__ == "__main__":
     main()
 PY_CONTRACT
 
+mkdir -p "$repo/service"
+touch "$repo/service/__init__.py"
+cat >"$repo/service/auth.py" <<'PY_AUTH'
+"""Existing authentication policy; planned features preserve this module."""
+
+
+def accepts_bearer(bearer_value):
+    return bool(bearer_value)
+PY_AUTH
+
 mkdir -p "$repo/.kranz"
 cat >"$repo/.kranz/secret-allowlist" <<'EOF'
-# Reviewed false positive: the runtime bearer-extraction call observed during
-# the release rehearsal. This fingerprint waives only that exact expression;
-# literal credentials and every other scanner finding remain blocked.
+# Reviewed false positives observed during the release rehearsals. Each
+# fingerprint waives only its exact runtime expression or synthetic value.
 62bbd92fdcee8c5fb97a7061
+6536daa68e3c17e1c8379f9d
+# Reviewed runtime expression: auth_header.partition(...).
+b1f79d2459c595bd2c724888
+# Reviewed synthetic negative-test value: some-other-wrong-token.
+67179b9130867b23549262cb
 EOF
 
 cat >"$repo/.gitignore" <<'EOF'
@@ -200,7 +242,7 @@ __pycache__/
 *.pyc
 EOF
 
-git -C "$repo" add README.md mission.md .gitignore acceptance_contract.py .kranz/secret-allowlist
+git -C "$repo" add README.md mission.md .gitignore acceptance_contract.py .kranz/secret-allowlist service
 git -C "$repo" commit -m "seed flagship acceptance fixture"
 base_sha="$(git -C "$repo" rev-parse HEAD)"
 
@@ -238,6 +280,28 @@ git -C "$repo" check-ref-format --branch "$branch" >/dev/null
 deliverable="$scratch/deliverable"
 git -C "$repo" worktree add --detach "$deliverable" "$branch"
 git -C "$repo" diff --exit-code "$base_sha" "$branch" -- acceptance_contract.py mission.md .gitignore .kranz/secret-allowlist
+
+python3 - "$repo" "$base_sha" "$branch" "$mission_dir/state.json" <<'PY_REPAIR'
+import json
+import subprocess
+import sys
+
+repo, base, branch, state_file = sys.argv[1:]
+with open(state_file, encoding="utf-8") as handle:
+    state = json.load(handle)
+fix_commits = {
+    commit
+    for milestone in state["mission"]["milestones"]
+    for feature in milestone["features"]
+    if feature["origin"] == "fix" and feature["status"] == "complete"
+    for commit in feature["commits"]
+}
+changes = subprocess.check_output(
+    ["git", "-C", repo, "log", "--reverse", "--format=%H", f"{base}..{branch}", "--", "service/auth.py"],
+    text=True,
+).splitlines()
+assert changes and changes[0] in fix_commits, "the authentication helper must first change in a completed fix-feature"
+PY_REPAIR
 
 (
   cd "$deliverable"

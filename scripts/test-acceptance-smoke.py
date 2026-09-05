@@ -21,9 +21,13 @@ initial = git("rev-parse", "HEAD")
 branch = "kranz/mission-m-abcdef"
 worker = repo.parent / "worker"
 git("worktree", "add", "-b", branch, str(worker))
-(worker / "service").mkdir()
+(worker / "service").mkdir(exist_ok=True)
 (worker / "tests").mkdir()
 (worker / "service/__init__.py").write_text("")
+if mode != "unrepaired-auth":
+    (worker / "service/auth.py").write_text("def accepts_bearer(bearer_value): return bearer_value == 'example-kranz-token'\n")
+if mode == "bad-auth":
+    (worker / "service/auth.py").write_text("def accepts_bearer(bearer_value): return True\n")
 (worker / "service/store.py").write_text("def list_items(): return [{'id': 1, 'name': 'fixture'}]\n")
 (worker / "service/server.py").write_text("""
 import json
@@ -69,6 +73,10 @@ mission.mkdir(parents=True)
 (mission / "plan.json").write_text(json.dumps({'milestones': [{'features': [{}, {}, {}]}, {'features': [{}, {}]}]}))
 (mission / "report.md").write_text("fixture report")
 (mission / "events.jsonl").write_text('{"type":"fixfeature.created"}\n')
+(mission / "state.json").write_text(json.dumps({'mission': {'milestones': [{'features': [{
+    'origin': 'plan' if mode == 'premature-auth' else 'fix', 'status': 'complete',
+    'commits': [subprocess.check_output(['git', '-C', str(worker), 'rev-parse', 'HEAD'], text=True).strip()],
+}]}]}}))
 pathlib.Path(os.environ['FIXTURE_HEADS']).write_text(json.dumps([initial, git('rev-parse', 'HEAD'), git('branch', '--show-current')]))
 print('kranz exec m-abcdef COMPLETE cost=$0.00 branch=' + branch)
 '''
@@ -121,6 +129,21 @@ class AcceptanceHarnessTests(unittest.TestCase):
         _, result = self.run_fixture("tamper")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("diff --git a/acceptance_contract.py", result.stdout)
+
+    def test_unchanged_seeded_helper_cannot_pass_on_correct_http_alone(self):
+        _, result = self.run_fixture("unrepaired-auth")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the authentication helper must first change", result.stderr)
+
+    def test_planned_feature_cannot_preempt_the_required_repair(self):
+        _, result = self.run_fixture("premature-auth")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the authentication helper must first change", result.stderr)
+
+    def test_a_fix_commit_must_actually_repair_the_seeded_helper(self):
+        _, result = self.run_fixture("bad-auth")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the seeded authentication helper must reject a wrong credential", result.stderr)
 
 
 if __name__ == "__main__":
