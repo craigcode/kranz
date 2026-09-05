@@ -691,6 +691,13 @@ pub struct AcpSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for AcpSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl AcpSession {
     // -- wire helpers -------------------------------------------------------
 

@@ -62,12 +62,17 @@ coverage.
 
 Deliberately seed one validator-detectable defect in the HTTP endpoint feature:
 accept any non-empty Bearer token instead of requiring the exact token
-`kranz-secret`. Do not mention the defect in that feature's validation criteria
+`example-kranz-token`. Do not mention the defect in that feature's validation criteria
 and do not repair it in a later planned feature. The mission-level contract,
 however, MUST state that a wrong non-empty token is rejected with HTTP 403.
 This controlled contradiction is intentional: scrutiny must report it after
 milestone one, the orchestrator must create a fix-feature, and that fix-feature
 must repair it before the mission completes.
+
+Use these explicit example credentials throughout; this fixture contains no
+real secrets. Keep each feature specification under 150 words and each
+validation criterion under 30 words. Reuse a compact standard-library test
+command for contract assertions.
 
 Keep the implementation compact. Listen only on a caller-selected localhost
 port in tests, never access the network outside localhost, never push, and
@@ -78,7 +83,7 @@ the required considered-alternatives object with at least two rejected shapes.
 
 - Language: Python 3 standard library only.
 - API: `GET /items` returns JSON; missing credentials return 401; the exact
-  `Bearer kranz-secret` succeeds; any other non-empty Bearer token returns 403.
+  `Bearer example-kranz-token` succeeds; any other non-empty Bearer token returns 403.
 - CLI: invokes the endpoint, supplies a token, prints returned JSON, and exits
   non-zero with a useful message on HTTP/authentication failure.
 - Plan shape: exactly two milestones and exactly five planned features, split
@@ -89,7 +94,7 @@ the required considered-alternatives object with at least two rejected shapes.
 ## Acceptance hints
 
 - `python3 -m unittest discover -s tests -v` exits zero and runs at least five tests.
-- The final implementation rejects `Bearer wrong-token` with HTTP 403.
+- The final implementation rejects `Bearer example-wrong-token` with HTTP 403.
 - The CLI succeeds against a live localhost fixture server and fails clearly
   for a wrong token.
 - `plan.json` contains exactly two milestones and five plan-origin features.
@@ -131,8 +136,16 @@ if len(milestones) != 2 or len(features) != 5:
     )
 PY
 
+# Worktree isolation leaves the primary checkout on its original branch.
+# Verify the delivered commit in a separate checkout, without moving that ref.
+branch="$(printf '%s\n' "$summary" | awk '{for (i=1; i<=NF; i++) if ($i ~ /^branch=/) {sub(/^branch=/, "", $i); print $i}}')"
+[[ "$branch" == kranz/* ]]
+git -C "$repo" check-ref-format --branch "$branch" >/dev/null
+deliverable="$scratch/deliverable"
+git -C "$repo" worktree add --detach "$deliverable" "$branch"
+
 (
-  cd "$repo"
+  cd "$deliverable"
   python3 - <<'PY'
 import unittest
 

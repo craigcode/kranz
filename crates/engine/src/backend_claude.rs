@@ -1044,6 +1044,17 @@ pub(crate) fn kill_group(pgid: i32) -> bool {
     unsafe { libc::kill(-pgid, libc::SIGKILL) == 0 }
 }
 
+/// Future cancellation can drop a session without reaching async abort.
+/// A reaped Child has no id, so this never signals a recycled leader pid.
+#[cfg(unix)]
+pub(crate) fn kill_unreaped_group(child: &Child) {
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        if pid > 0 {
+            kill_group(pid);
+        }
+    }
+}
+
 /// A live `claude` CLI session (the [`AgentSession`] impl).
 pub struct ClaudeSession {
     /// Updated by the last `system/init` seen; defaults to the spec value.
@@ -1077,6 +1088,13 @@ pub struct ClaudeSession {
     saw_result: bool,
     saw_success_result: bool,
     exit: Option<SessionExit>,
+}
+
+#[cfg(unix)]
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        kill_unreaped_group(&self.child);
+    }
 }
 
 impl ClaudeSession {

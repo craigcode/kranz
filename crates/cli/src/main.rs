@@ -2,7 +2,7 @@
 //! tests can drive parsing/rendering/enqueueing without spawning processes.
 
 use clap::Parser;
-use kranz_cli::cli::Cli;
+use kranz_cli::cli::{Cli, Command};
 use kranz_cli::commands;
 use std::process::ExitCode;
 
@@ -128,7 +128,31 @@ async fn run_cli() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
-    match commands::run_cli(cli).await {
+    // Native agents own separate process groups. Catch SIGINT so dropping
+    // the mission also drops their group guards and flushes its event log.
+    // Serve retains its own graceful shutdown and token-cleanup path.
+    let interruptible = matches!(
+        cli.command,
+        Command::Exec { .. } | Command::Run | Command::Work { .. }
+    );
+    let result = if interruptible {
+        tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                match signal {
+                    Ok(()) => {
+                        eprintln!("kranz: interrupted; mission state is retained for resume");
+                        Ok(130)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            result = commands::run_cli(cli) => result,
+        }
+    } else {
+        commands::run_cli(cli).await
+    };
+    match result {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("kranz: {e:#}");

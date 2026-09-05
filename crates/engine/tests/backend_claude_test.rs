@@ -981,6 +981,30 @@ mod fake_cli {
     }
 
     #[tokio::test]
+    async fn dropping_a_session_kills_its_tool_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "fake-claude.sh", SPAWN_TOOL_CHILD_THEN_HANG);
+        let backend = ClaudeBackend::new(script);
+        let mut spec = base_spec(PromptMode::SingleShot("ignored".to_string()));
+        spec.cwd = dir.path().to_path_buf();
+        let mut session = backend.start(spec).await.unwrap();
+        let AgentEvent::Other { raw } = next_event(&mut session).await.unwrap() else {
+            panic!("expected the tool child pid");
+        };
+        let pid = i32::try_from(raw["pid"].as_i64().unwrap()).unwrap();
+        assert!(process_alive(pid));
+        drop(session);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool process {pid} survived session cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn send_user_message_errors_on_single_shot_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let lines = vec![init_line("ss"), result_line("done")];

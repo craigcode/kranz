@@ -356,19 +356,19 @@ fn read_session_keychain_secret(path: &Path) -> std::io::Result<Option<String>> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let mut secret = String::new();
+    let mut contents = String::new();
     if file.metadata()?.is_file() {
-        file.take(129).read_to_string(&mut secret)?;
+        file.take(129).read_to_string(&mut contents)?;
     }
     // This file is worker-writable. Never let arbitrary contents become
     // commands in the stdin-fed `security -i` protocol on a respawn.
-    if secret.len() != 32 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if contents.len() != 32 || !contents.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid session keychain secret",
         ));
     }
-    Ok(Some(secret))
+    Ok(Some(contents))
 }
 
 /// Seed/unlock the session's login keychain (see the block doc above
@@ -1350,6 +1350,13 @@ pub struct CursorSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for CursorSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl CursorSession {
     fn observe(&mut self, event: &AgentEvent) {
         match event {
@@ -1997,13 +2004,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let keychains = home.path().join("Library/Keychains");
         std::fs::create_dir_all(&keychains).unwrap();
-        let secret = "bad\nlock-keychain\n";
-        std::fs::write(session_keychain_secret_path(home.path()), secret).unwrap();
+        let injected = "bad\nlock-keychain\n";
+        std::fs::write(session_keychain_secret_path(home.path()), injected).unwrap();
         assert!(!ensure_session_login_keychain(home.path(), "test-session"));
         assert!(!keychains.join(SESSION_KEYCHAIN_DB).exists());
         assert_eq!(
             std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap(),
-            secret
+            injected
         );
     }
 

@@ -12,6 +12,8 @@ verified_against:
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/queue.rs
   - crates/cli/src/exec.rs
+  - crates/cli/src/main.rs
+  - crates/engine/src/backend_claude.rs
   - crates/engine/src/git_ops.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/paths.rs
@@ -205,3 +207,9 @@ up exactly where the log left off. Guard this: `dry_run_revised_plan` validates
 a revised plan against a clone *before* emit, because `emit` appends before it
 folds — an event the reducer would reject would otherwise brick the mission on
 every future load.
+
+`exec`, `run`, and `work` catch Ctrl-C so their mission futures unwind and the
+event-log lock is released. Native backend sessions kill their own process
+groups on drop, covering cancellation paths that do not reach async `abort`.
+This matters because agent processes use separate process groups and would
+otherwise survive the CLI's default signal exit.

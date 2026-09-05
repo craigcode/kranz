@@ -719,6 +719,13 @@ pub struct CodexSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl CodexSession {
     fn observe(&mut self, event: &AgentEvent) {
         match event {

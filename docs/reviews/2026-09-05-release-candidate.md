@@ -29,6 +29,19 @@ imported into the clean public-origin history.
   that client, and client proxy settings cannot inject payload credentials.
 - Both Cargo lockfiles replace yanked `chacha20` 0.10.1 with 0.10.2. No
   dependency policy or advisory exception was broadened.
+- The live rehearsal exposed repeated worker attempts to commit through a
+  correctly denied shared Git index. Static worker instructions now direct
+  that case to the existing reviewed engine checkpoint, without widening the
+  sandbox. Verification instructions also preserve actual command exit codes.
+- Interrupting the rehearsal exposed native processes surviving the CLI.
+  `exec`, `run`, and `work` now unwind on Ctrl-C, and all six native backend
+  session types kill their process group on drop. Regression tests cover a
+  tool descendant, exit code 130, retained mission logs, and lock release.
+- The acceptance script now checks the delivered branch in a detached
+  worktree. An offline regression fixture verifies five delivered tests while
+  the original primary branch and commit remain unchanged. Synthetic auth
+  values use explicit example names so generated fixture plans do not look
+  like leaked credentials; the production secret scanner remains unchanged.
 
 The review covered correctness, readability, architecture, security, and
 performance. Changes retain the existing event/state schema, environment
@@ -44,7 +57,7 @@ Rust 1.97.1 and Node 22.23.2.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --workspace --no-fail-fast` after the final code/dependency changes | 2,783 passed, 0 failed, 7 ignored; exit 0 |
+| `cargo test --workspace --no-fail-fast` including interruption regressions | 2,785 passed, 0 failed, 7 ignored; exit 0 |
 | Required runtime capabilities | Git, Seatbelt, Keychain, and grep were required; unavailable capabilities could not silently pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0 |
 | `cargo fmt --all`, then `cargo fmt --all --check` | Exit 0 |
@@ -62,6 +75,7 @@ Rust 1.97.1 and Node 22.23.2.
 | Public-tree and uncommitted-diff Gitleaks scans | Pass |
 | Baseline full advertised-ref history audit | 1,239 commits scanned, no leaks; all branch, tag, and pull-request refs fetched |
 | Committed candidate `bd43327` history audit | 1,240 commits scanned, no leaks; exit 0 |
+| Subsequent candidate `3da2484` history and knowledge audits | Both pass; 1,241 commits scanned |
 | Version/changelog alignment | v0.2.0 check passes with remote-main check explicitly skipped for the unmerged candidate |
 
 The skip ledger records container fixtures not exercised on this host because

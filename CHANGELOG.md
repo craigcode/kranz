@@ -7,6 +7,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Fixed Ctrl-C handling for `exec`, `run`, and `work`: native agent sessions
+  terminate their process groups when cancelled, while mission logs remain
+  available for resume.
+- Sandboxed workers now stop retrying denied Git metadata writes and leave
+  tested changes for the engine's reviewed, secret-scanned checkpoint.
+- Fixed the acceptance rehearsal to verify the delivered branch in a detached
+  worktree and to support an existing authenticated Claude Code installation.
 - Security: webhook comment triggers require an explicit GitHub user allowlist;
   workflow failure triggers refuse fork-owned branches.
 - Security: engine diffs disable external programs and text converters, custom

@@ -1920,12 +1920,12 @@ mod tests {
         let global_config = home.join(".kranz/config.json");
         let cargo = home.join(".cargo");
         std::fs::create_dir(&cargo).unwrap();
-        let repo_token = session.join(".kranz/serve.token");
-        let repo_read_token = session.join(".kranz/serve.read.token");
+        let repo_token_path = session.join(".kranz/serve.token");
+        let repo_read_token_path = session.join(".kranz/serve.read.token");
         let repo_config = session.join(".kranz/config.json");
         let cargo_credentials = cargo.join("credentials.toml");
         let policy = session.join(".kranz/merge-gates.json");
-        std::fs::write(&repo_token, "original-token").unwrap();
+        std::fs::write(&repo_token_path, "original-token").unwrap();
         std::fs::write(&policy, "visible-policy").unwrap();
         let input = SandboxInputs {
             enforce: SandboxEnforce::FsNet,
@@ -1964,8 +1964,8 @@ mod tests {
                     session.join("host-witness").display().to_string(),
                     authority.display().to_string(),
                     global_config.display().to_string(),
-                    repo_token.display().to_string(),
-                    repo_read_token.display().to_string(),
+                    repo_token_path.display().to_string(),
+                    repo_read_token_path.display().to_string(),
                     repo_config.display().to_string(),
                     cargo_credentials.display().to_string(),
                     policy.display().to_string(),
@@ -1999,7 +1999,7 @@ mod tests {
         std::fs::create_dir(authority.parent().unwrap()).unwrap();
         std::fs::write(&authority, "fake-authority").unwrap();
         std::fs::write(&global_config, "fake-config").unwrap();
-        for path in [&repo_read_token, &repo_config, &cargo_credentials] {
+        for path in [&repo_read_token_path, &repo_config, &cargo_credentials] {
             assert!(
                 !path.exists(),
                 "mount setup created a placeholder credential"
@@ -2008,7 +2008,7 @@ mod tests {
         }
         let rotated = session.join(".kranz/rotated.tmp");
         std::fs::write(&rotated, "rotated-token").unwrap();
-        std::fs::rename(rotated, &repo_token).unwrap();
+        std::fs::rename(rotated, &repo_token_path).unwrap();
         std::fs::write(session.join("host-witness"), "visible").unwrap();
         child
             .stdin
@@ -2024,10 +2024,10 @@ mod tests {
             "authority alias was replaced"
         );
         assert_eq!(
-            std::fs::read_to_string(repo_token).unwrap(),
+            std::fs::read_to_string(repo_token_path).unwrap(),
             "rotated-token"
         );
-        for path in [&repo_read_token, &repo_config, &cargo_credentials] {
+        for path in [&repo_read_token_path, &repo_config, &cargo_credentials] {
             assert_eq!(std::fs::read_to_string(path).unwrap(), "fake-authority");
         }
         assert_eq!(
