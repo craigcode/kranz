@@ -308,7 +308,7 @@ jobs:
           rem Fail loudly rather than guard nothing if the image moves Git.
           where true >nul 2>&1 && (echo GUARD VACUOUS: POSIX coreutils still on PATH & exit /b 1) || echo coreutils absent as intended
           where git >nul 2>&1 || (echo git must stay on PATH & exit /b 1)
-          cargo test -p kranz-engine --lib --no-fail-fast
+          cargo test -p kranz-engine --lib --no-fail-fast || exit /b 1
           cargo test -p kranz-engine --test mission_test --test worktree_isolation --no-fail-fast
 
   # Dedicated macOS job (not folded into the matrix above) so the Seatbelt
