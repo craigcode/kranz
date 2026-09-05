@@ -82,6 +82,10 @@ Since the 2026-09-01 adversarial audit the log is also **sealed**. Every line a
 keyed writer produces carries `h` (a sha256 chain over the previous `h` and the
 event's canonical bytes) and `m` (an HMAC of `h` under the repository authority
 key); `parse_log_bytes` verifies both, so every reader inherits the check.
+New seals carry `v:2` and bind that version through the
+`kranz.event-log.v2\n` hash prefix. They use exact float parsing and sorted
+object keys. Versionless seals retain the legacy parser and hash format;
+never relax a failed hash or re-sign old evidence to make an upgrade pass.
 Unsealed lines are refused at or above the mission's out-of-repo seal floor,
 integrity may never be dropped mid-log, and `resume` refuses a log that ends
 below the recorded high-water mark. WHY: three gate decisions read the log back

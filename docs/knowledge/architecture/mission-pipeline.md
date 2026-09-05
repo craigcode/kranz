@@ -46,7 +46,8 @@ cannot reach.
   the writer). `parse_log` refuses any gap/duplicate as `LogCorruption`. Only an
   unparseable *final* line is tolerated (torn write) and repaired on acquire.
 - **Line integrity.** Each sealed line carries `h`, a sha256 chain over the
-  previous line's `h` and this event's canonical bytes, and `m`, an HMAC of `h`
+  version prefix, previous line's `h`, and this event's canonical bytes, and `m`,
+  an HMAC of `h`
   under the repository authority key. `parse_log_bytes` verifies both, so every
   reader inherits the check; seq and mission id are checked first, so a plain
   gap still reports as a gap. The chain alone only catches accidental
@@ -54,6 +55,11 @@ cannot reach.
   forger. Unsealed legacy lines are tolerated only below the mission's **seal
   floor**, the seq the first keyed writer recorded outside the repo; at or above
   it an unsealed line is a forgery, and integrity may never be dropped mid-log.
+  New lines carry `v:2`: numeric parsing preserves floating-point bits, object
+  keys are sorted, and the hash input starts with `kranz.event-log.v2\n`.
+  Lines without `v` retain legacy numeric parsing and the unprefixed hash;
+  valid old records can be continued without rewriting their bytes. A missing,
+  changed, or unsupported version cannot turn a v2 seal into a legacy seal.
 - **No silent rollback.** Truncating the log at a line boundary leaves it
   internally valid, so `resume` calls `event_log::check_no_rollback` BEFORE the
   fold: the log may not end below the seq that `state.json` or the out-of-repo

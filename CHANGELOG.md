@@ -7,6 +7,21 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Fixed fractional costs producing event lines that failed their own integrity
+  checks. New versioned seals preserve numeric bits; valid legacy seals keep
+  their original interpretation and can be continued without rewriting them.
+- Fixed resume discarding uncommitted integration repairs. Retained worktrees
+  are validated and reused; unexpected repositories, branches, and symlinks
+  are refused without deleting their contents.
+- Fixed secret redaction corrupting escaped JSON decisions and transcripts.
+  Redaction preserves JSON structure and duplicate-key rejection.
+- Fixed secret-rule labels being mistaken for bearer credentials and hiding
+  source paths in redacted finding diagnostics.
+- Fixed full-file Python secret scans interpreting conditional-block colons as
+  credential assignments; following real credentials remain detectable.
+- Fixed double-counted Claude streaming costs: new result events carry each
+  turn's incremental cost while retaining the provider's raw cumulative value.
+  Existing event logs are not rewritten; their historical estimates may be inflated.
 - Fixed Ctrl-C handling for `exec`, `run`, and `work`: native agent sessions
   terminate their process groups when cancelled, while mission logs remain
   available for resume.

@@ -1,9 +1,14 @@
 # Public-readiness gate
 
-Status (2026-08-22): **release preparation authorized; gate in progress**. The
+Status (2026-09-05): **release preparation authorized; gate in progress**. The
 owner explicitly approved the v0.2.0 public-release sequence. The clean-origin
 migration is complete, while the active repository remains private until the
 exact release candidate passes every gate below.
+
+The active-origin hardening and local verification are recorded in the
+[v0.2.0 candidate review](reviews/2026-09-05-release-candidate.md). That evidence
+does not replace the exact-commit platform CI, public visibility review,
+protected release environment, or published-artifact checks below.
 
 Making Kranz public exposes every reachable Git object and every existing
 GitHub release asset. It is an operator action, separate from merging ordinary
