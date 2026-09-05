@@ -389,7 +389,15 @@ jobs:
       - name: Validate macOS CI structure
         run: bash scripts/check-macos-ci.sh
       - name: Verify acceptance harness without a model
-        run: python3 scripts/test-acceptance-smoke.py
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo build --locked --package kranz-engine --example acceptance_gate
+          python3 scripts/test-acceptance-smoke.py
       - run: cargo check --workspace --locked
 
   # The Tauri desktop shell (apps/dashboard/src-tauri) is a STANDALONE cargo
@@ -546,11 +554,14 @@ jobs:
         # deliberately.
         run: npm install --global @anthropic-ai/claude-code@2.1.261
       - name: Build kranz
-        run: cargo build --release --locked --package kranz --bin kranz
+        run: |
+          cargo build --release --locked --package kranz --bin kranz
+          cargo build --release --locked --package kranz-engine --example acceptance_gate
       - name: Run flagship live acceptance mission
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           KRANZ_BIN: ${{ github.workspace }}/target/release/kranz
+          KRANZ_ACCEPTANCE_GATE_BIN: ${{ github.workspace }}/target/release/examples/acceptance_gate
           ARTIFACT_DIR: ${{ runner.temp }}/kranz-acceptance-artifacts
         run: bash scripts/acceptance-smoke.sh
       - name: Upload mission record

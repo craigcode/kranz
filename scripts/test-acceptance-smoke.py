@@ -63,6 +63,35 @@ if mode == "bad-cli":
     "import unittest\nfrom service.store import list_items\nclass Store(unittest.TestCase):\n"
     + ''.join("    def test_%d(self): self.assertEqual(list_items()[0]['id'], 1)\n" % i for i in range(5))
 )
+if mode == "containment":
+    probe = """
+import os
+from pathlib import Path
+assert "KRANZ_ACCEPTANCE_SECRET" not in os.environ, "ambient credential inherited"
+for path in PROTECTED_PATHS:
+    try:
+        value = Path(path).read_text()
+    except OSError:
+        continue
+    assert "example-authority-sentinel" not in value, "authority credential readable"
+try:
+    Path(OUTSIDE_PATH).write_text("escaped")
+except OSError:
+    pass
+else:
+    raise AssertionError("write escaped the deliverable")
+"""
+    authority = pathlib.Path(os.environ["KRANZ_HOME"])
+    (authority / "keys").mkdir(parents=True)
+    paths = [repo / ".kranz/serve.token", authority / "keys/test.key"]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("example-authority-sentinel")
+    probe = probe.replace("PROTECTED_PATHS", repr([str(path) for path in paths]))
+    probe = probe.replace("OUTSIDE_PATH", repr(str(repo.parent / "escaped")))
+    with (worker / "tests/test_store.py").open("a") as handle:
+        handle.write("\nclass Containment(unittest.TestCase):\n    def test_boundary(self):\n")
+        handle.write("\n".join("        " + line for line in probe.strip().splitlines()) + "\n")
 (worker / "README.md").write_text("python3 -m service.client --url http://127.0.0.1:8000/items --token example-kranz-token\n")
 if mode == "tamper":
     (worker / "acceptance_contract.py").write_text("pass\n")
@@ -93,8 +122,14 @@ class AcceptanceHarnessTests(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             KRANZ_BIN=str(fake), RUNNER_TEMP=str(root),
+            KRANZ_ACCEPTANCE_GATE_BIN=os.environ.get(
+                "KRANZ_ACCEPTANCE_GATE_BIN",
+                str(ROOT / "target/debug/examples/acceptance_gate"),
+            ),
             ARTIFACT_DIR=str(root / "artifacts"), FIXTURE_MODE=mode,
             FIXTURE_HEADS=str(root / "heads.json"),
+            KRANZ_HOME=str(root / "authority"),
+            KRANZ_ACCEPTANCE_SECRET="example-environment-sentinel",
         )
         env.pop("ANTHROPIC_API_KEY", None)
         result = subprocess.run(
@@ -116,6 +151,11 @@ class AcceptanceHarnessTests(unittest.TestCase):
     def test_bare_commit_hashes_also_identify_the_repair(self):
         _, result = self.run_fixture("bare-sha")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_final_audit_contains_generated_code_and_strips_credentials(self):
+        _, result = self.run_fixture("containment")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ran 6 tests", result.stderr)
 
     def test_failed_mission_retains_repository_and_exit_code(self):
         root, result = self.run_fixture("failed")

@@ -81,6 +81,15 @@ enables user namespaces on the disposable hosted runner before spending model
 tokens. Validator containment remains required; local OAuth rehearsal evidence
 does not establish that the remote job's credentials or host setup work.
 
+The final acceptance audit also executes generated code. Build the test-only
+adapter with `cargo build --locked -p kranz-engine --example acceptance_gate`
+and set `KRANZ_ACCEPTANCE_GATE_BIN` to that executable when invoking
+`scripts/acceptance-smoke.sh`. It uses the existing production gate runner with
+`fs` enforcement, a sanitized environment, and mission authority read-denies;
+there is no unsandboxed fallback. The filesystem tier permits networking,
+including the localhost listener required by the HTTP contract. The offline
+harness tests use the debug example by default and require Seatbelt on macOS or working bubblewrap on Linux.
+
 ## 3. Rehearse crate packaging honestly
 
 Cargo removes workspace `path` dependencies when publishing and resolves their

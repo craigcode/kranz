@@ -2,6 +2,8 @@
 set -euo pipefail
 
 : "${KRANZ_BIN:?set KRANZ_BIN to the kranz binary under test}"
+: "${KRANZ_ACCEPTANCE_GATE_BIN:?build kranz-engine --example acceptance_gate and set KRANZ_ACCEPTANCE_GATE_BIN}"
+test -x "$KRANZ_ACCEPTANCE_GATE_BIN"
 # CI supplies ANTHROPIC_API_KEY; local rehearsals may use an authenticated
 # Claude Code installation. Backend preflight reports missing credentials.
 
@@ -305,9 +307,9 @@ changes = subprocess.check_output(
 assert changes and changes[0] in fix_commits, "the authentication helper must first change in a completed fix-feature"
 PY_REPAIR
 
-(
-  cd "$deliverable"
-  python3 acceptance_contract.py --final
-)
+# Generated tests/imports are hostile children too. Use the production gate
+# wrapper with fs enforced, sanitized env, and this mission's authority
+# read-denies. Never fall back to running the final audit on the host.
+"$KRANZ_ACCEPTANCE_GATE_BIN" "$deliverable" "$mission_dir"
 
 printf 'acceptance smoke passed: %s\n' "$mission_id"
