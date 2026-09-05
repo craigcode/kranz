@@ -200,7 +200,12 @@ Empty pool ⇒ the sequential path is byte-identical (regression-tested).
 `MissionEngine::resume` reads the log, refuses a rollback
 (`check_no_rollback`, above) before anything else, `fold`s it back to
 `MissionState`, re-acquires the single-writer lock, recovers the last orchestrator sdk session
-id for `--resume`, reaps crash-leaked worktrees/branches, and re-snapshots. No
+id for `--resume`, reaps per-feature crash-leaked worktrees/branches, and
+re-snapshots. The integration worktree is retained, including its index and
+uncommitted repair files. Setup verifies that the path is a registered worktree
+of this repository on the expected mission branch before reusing it; an
+unexpected path or branch is refused without deleting evidence. Errors also
+retain the integration worktree for recovery. No
 agent session starts here — sessions are lazy. Because state is a pure fold, a
 killed engine loses nothing durable: the run loop's status/feature checks pick
 up exactly where the log left off. Guard this: `dry_run_revised_plan` validates
@@ -213,3 +218,9 @@ event-log lock is released. Native backend sessions kill their own process
 groups on drop, covering cancellation paths that do not reach async `abort`.
 This matters because agent processes use separate process groups and would
 otherwise survive the CLI's default signal exit.
+
+Claude streaming results report cumulative cost but per-turn token usage. The
+backend converts cost to a per-turn delta before `worker.completed` adds it
+to mission totals. Raw provider totals remain in the transcript. Conversation
+resets start a new segment; missing or zeroed crash results do not erase prior
+spend. A resumed process starts a fresh ledger. Existing event logs stay intact.

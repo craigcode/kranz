@@ -622,17 +622,9 @@ impl MissionEngine {
                 }
             }
         }
-        // A leaked mission integration worktree (M7 tier 1) is the same story:
-        // it exists only while a lock-holding engine has one set up, so with
-        // the lock now held it is a crash leak. Reap it the same way.
-        for integration_path in [
-            mission_worktree_path(&repo_root, mission_id),
-            legacy_mission_worktree_path(mission_id),
-        ] {
-            if integration_path.exists() {
-                let _ = repo.remove_worktree(&integration_path);
-            }
-        }
+        // Keep the integration worktree: a blocked checkpoint or interrupted
+        // worker may have left its only repair there. Setup validates and
+        // reuses it under this mission's single-writer lock.
         let _ = repo.prune_worktrees();
         for milestone in &state.mission.milestones {
             for feature in &milestone.features {
@@ -2668,14 +2660,12 @@ impl MissionEngine {
         }
 
         // Integration worktree lifetime: torn down once the mission reaches
-        // a status the resume/reconcile path already accounts for (terminal,
-        // or an error that ends this process) — never on Blocked/Paused,
-        // where the mission may resume and wants its worktree intact
-        // (a leaked one is reaped by `resume()`'s crash sweep regardless).
+        // a terminal status — Blocked/Paused and errors retain uncommitted
+        // work for operator inspection and the next resume.
         if worktree_mode {
             let should_teardown = match &result {
                 Ok(status) => is_terminal_status(*status),
-                Err(_) => true,
+                Err(_) => false,
             };
             if should_teardown {
                 self.teardown_mission_worktree();
@@ -4458,13 +4448,41 @@ impl MissionEngine {
         }
 
         let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
-        // Idempotent: a stale integration worktree from a prior crash must be
-        // gone before checking the branch out again (git refuses to check the
-        // same branch out twice).
-        let _ = self.repo.remove_worktree(&path);
-        let _ = self
-            .repo
-            .remove_worktree(&legacy_mission_worktree_path(&self.state.mission.id));
+        for retained in [
+            path.clone(),
+            legacy_mission_worktree_path(&self.state.mission.id),
+        ] {
+            let metadata = match std::fs::symlink_metadata(&retained) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // A stale path is not authority to reuse an arbitrary repository
+            // or symlink. Verify ownership and branch without changing either.
+            let canonical = std::fs::canonicalize(&retained)?;
+            let registered = self
+                .repo
+                .list_worktrees()?
+                .iter()
+                .any(|entry| std::fs::canonicalize(entry).is_ok_and(|path| path == canonical));
+            if !metadata.is_dir() || metadata.file_type().is_symlink() || !registered {
+                return Err(EngineError::Git(format!(
+                    "retained integration path {} is not this repository's worktree; preserved for inspection",
+                    retained.display()
+                )));
+            }
+            let wt_repo = GitRepo::open(&retained)?;
+            if canonical_root(wt_repo.git_common_dir()?)
+                != canonical_root(self.repo.git_common_dir()?)
+                || wt_repo.current_branch()? != mission_branch
+            {
+                return Err(EngineError::Git(format!(
+                    "retained integration worktree {} has unexpected repository or branch; preserved for inspection",
+                    retained.display()
+                )));
+            }
+            return Ok((retained, wt_repo));
+        }
         let _ = self.repo.prune_worktrees();
 
         self.repo.add_worktree_checkout(&path, &mission_branch)?;
@@ -4476,7 +4494,13 @@ impl MissionEngine {
     /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
     /// the parallel-batch cleanup guard: failures are logged, never fatal.
     fn teardown_mission_worktree(&self) {
-        let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
+        let path = self
+            .active_tree
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| {
+                mission_worktree_path(&self.paths.repo_root, &self.state.mission.id)
+            });
         if let Err(e) = self.repo.remove_worktree(&path) {
             tracing::warn!(path = %path.display(), error = %e, "mission worktree cleanup failed");
         }
@@ -9566,11 +9590,10 @@ pub(crate) mod tests {
         engine.teardown_mission_worktree();
     }
 
-    /// A mission integration worktree left behind by a crashed engine (never
-    /// torn down) is reaped by `resume()`'s crash-recovery sweep, the same
-    /// way per-feature worktrees are (orchestrator.rs:~408-414, M7 tier 1).
+    /// Recovery must keep the only copy of an uncommitted repair, including
+    /// its index and untracked files, while leaving the primary untouched.
     #[test]
-    fn resume_reaps_leaked_integration_worktree() {
+    fn resume_preserves_uncommitted_integration_repair() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
@@ -9580,7 +9603,19 @@ pub(crate) mod tests {
                 .unwrap();
         let mission_id = engine.state.mission.id.clone();
 
-        let (path, _wt_repo) = engine.setup_mission_worktree().expect("setup");
+        let (path, wt_repo) = engine.setup_mission_worktree().expect("setup");
+        let primary_readme = std::fs::read(root.join("README.md")).unwrap();
+        let original_head = wt_repo.head_sha().unwrap();
+        std::fs::write(path.join("README.md"), "staged repair\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(path.join("README.md"), "unstaged repair\n").unwrap();
+        std::fs::write(path.join("new-repair.txt"), "untracked repair\n").unwrap();
+        let original_status = wt_repo.porcelain_status().unwrap();
         assert_eq!(path, mission_worktree_path(&root, &mission_id));
         assert!(path.exists(), "integration worktree dir must exist");
 
@@ -9597,17 +9632,83 @@ pub(crate) mod tests {
         drop(engine);
 
         let resumed = MissionEngine::resume(backend, &root, &mission_id, LockForce::No)
-            .expect("resume should reap the leaked integration worktree and succeed");
+            .expect("resume should retain the integration repair");
 
         let after = resumed.repo.list_worktrees().unwrap();
         assert!(
-            !after.iter().any(|p| worktree_entry_is(p, &canon_path)),
-            "integration worktree still listed after resume: {after:?}"
+            after.iter().any(|p| worktree_entry_is(p, &canon_path)),
+            "integration worktree lost after resume: {after:?}"
         );
-        assert!(
-            !path.exists(),
-            "integration worktree dir must be pruned after resume"
+        let (reused_path, reused_repo) = resumed.setup_mission_worktree().unwrap();
+        assert_eq!(reused_path, path);
+        assert_eq!(reused_repo.head_sha().unwrap(), original_head);
+        assert_eq!(reused_repo.porcelain_status().unwrap(), original_status);
+        let staged = std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["show", ":README.md"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"staged repair\n");
+        assert_eq!(
+            std::fs::read_to_string(path.join("README.md")).unwrap(),
+            "unstaged repair\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(path.join("new-repair.txt")).unwrap(),
+            "untracked repair\n"
+        );
+        assert_eq!(resumed.repo.current_branch().unwrap(), "main");
+        assert_eq!(
+            std::fs::read(root.join("README.md")).unwrap(),
+            primary_readme
+        );
+        resumed.teardown_mission_worktree();
+    }
+
+    #[test]
+    fn integration_recovery_refuses_wrong_branch_without_discarding_files() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let (path, wt_repo) = engine.setup_mission_worktree().unwrap();
+        wt_repo.create_branch("unexpected-branch", None).unwrap();
+        wt_repo.checkout("unexpected-branch").unwrap();
+        std::fs::write(path.join("repair.txt"), "retain me\n").unwrap();
+        let error = engine.setup_mission_worktree().unwrap_err().to_string();
+        assert!(error.contains("unexpected repository or branch"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("repair.txt")).unwrap(),
+            "retain me\n"
+        );
+        assert_eq!(wt_repo.current_branch().unwrap(), "unexpected-branch");
+        assert_eq!(engine.repo.current_branch().unwrap(), "main");
+        engine.teardown_mission_worktree();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_recovery_refuses_symlink_without_touching_target() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let path = mission_worktree_path(&root, engine.mission_id());
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("repair.txt"), "retain me\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+        let error = engine.setup_mission_worktree().unwrap_err().to_string();
+        assert!(error.contains("not this repository's worktree"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("repair.txt")).unwrap(),
+            "retain me\n"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     /// `mission_worktree_path` never collides with a per-feature
