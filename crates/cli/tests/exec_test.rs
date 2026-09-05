@@ -365,8 +365,13 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
             let _ = self.child.wait();
             if let Ok(bytes) = std::fs::read(&self.pids) {
                 if let Ok(ids) = serde_json::from_slice::<Vec<u32>>(&bytes) {
-                    let _ = Process::new("kill")
-                        .args(["-KILL", "--", &format!("-{}", ids[0])])
+                    let _ = Process::new("sh")
+                        .args([
+                            "-c",
+                            "kill -s KILL -- \"$1\"",
+                            "kranz-test",
+                            &format!("-{}", ids[0]),
+                        ])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
@@ -392,8 +397,14 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         assert!(Instant::now() < deadline, "fixture backend did not start");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(Process::new("kill")
-        .args(["-INT", &running.child.id().to_string()])
+    // POSIX shells provide kill even on minimal hosts without /bin/kill.
+    assert!(Process::new("sh")
+        .args([
+            "-c",
+            "kill -s INT \"$1\"",
+            "kranz-test",
+            &running.child.id().to_string(),
+        ])
         .status()
         .unwrap()
         .success());
@@ -407,8 +418,8 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
     };
     assert_eq!(status.code(), Some(130));
     for pid in ids {
-        while Process::new("kill")
-            .args(["-0", &pid.to_string()])
+        while Process::new("sh")
+            .args(["-c", "kill -0 \"$1\"", "kranz-test", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()

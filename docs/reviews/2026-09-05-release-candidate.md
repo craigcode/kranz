@@ -58,6 +58,8 @@ Rust 1.97.1 and Node 22.23.2.
 | Check | Result |
 | --- | --- |
 | `cargo test --workspace --no-fail-fast` including interruption regressions | 2,785 passed, 0 failed, 7 ignored; exit 0 |
+| Full macOS workspace suite through the production gate sandbox | 2,785 passed, 0 failed, 7 ignored; wrapped command exit 0; nine explicit `SKIP-UNDER-WRAP` markers |
+| Linux arm64 full workspace suite, Rust 1.94, clean container with standard toolchain homes | 2,751 passed, 0 failed, 6 ignored; exit 0; Git, bubblewrap, and grep required |
 | Required runtime capabilities | Git, Seatbelt, Keychain, and grep were required; unavailable capabilities could not silently pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0 |
 | `cargo fmt --all`, then `cargo fmt --all --check` | Exit 0 |
@@ -76,11 +78,16 @@ Rust 1.97.1 and Node 22.23.2.
 | Baseline full advertised-ref history audit | 1,239 commits scanned, no leaks; all branch, tag, and pull-request refs fetched |
 | Committed candidate `bd43327` history audit | 1,240 commits scanned, no leaks; exit 0 |
 | Subsequent candidate `3da2484` history and knowledge audits | Both pass; 1,241 commits scanned |
+| Candidate `ef0d9f8` history, native secret scan against origin main, and knowledge audits | All pass; 1,242 commits scanned |
 | Version/changelog alignment | v0.2.0 check passes with remote-main check explicitly skipped for the unmerged candidate |
 
-The skip ledger records container fixtures not exercised on this host because
-its VM does not share the system temporary directory, plus Linux-only
-integration fixtures. These do not constitute a Linux or Windows receipt.
+The macOS skip ledger records container fixtures not exercised on this host
+because its VM does not share the system temporary directory, plus Linux-only
+integration fixtures. The Linux container proves bubblewrap but has no nested
+container runtime; its container-provider fixtures are explicitly skipped.
+Windows and the CI Linux container-egress proof remain required remote gates.
+The interruption test uses the POSIX shell's signal builtin so minimal Linux
+hosts do not need a standalone `kill` executable.
 The supported release artifacts remain the CLI and embedded dashboard; signed
 Tauri desktop installers are outside this release.
 
