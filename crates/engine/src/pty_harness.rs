@@ -1163,15 +1163,20 @@ mod tests {
     #[tokio::test]
     async fn pty_validation_transcript_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oversized.txt"),
+            vec![b'x'; MAX_TRANSCRIPT_BYTES + 4096],
+        )
+        .unwrap();
         let contract = vec![pty_assertion(
             "a-pty",
-            // 4 KiB per write: fills the 256 KiB transcript cap well
-            // inside the 2s expect timeout even on a loaded host.
-            "x=$(printf '%04096d' 0); while :; do printf '%s' \"$x\"; done",
+            // A finite oversized payload reaches EOF after crossing the cap;
+            // truncation must not depend on throughput before a short timer.
+            "/bin/cat oversized.txt",
             vec![PtyStep::Expect {
                 pattern: "this-pattern-never-appears".to_string(),
                 regex: false,
-                timeout_ms: Some(2_000),
+                timeout_ms: None,
             }],
         )];
         let run = run_pty_assertions(
@@ -1183,12 +1188,21 @@ mod tests {
         )
         .await;
         assert!(!run.artifacts[0].pass, "never-matching expect fails");
+        assert!(
+            run.artifacts[0].detail.contains("unmatched: target exited"),
+            "fixture must finish its output: {}",
+            run.artifacts[0].detail
+        );
         let transcript = std::fs::read(dir.path().join(&run.artifacts[0].transcript_rel)).unwrap();
         // File bytes = capped transcript + the truncation marker line.
         assert!(
             transcript.len() <= MAX_TRANSCRIPT_BYTES + 128,
             "bounded on disk: {} bytes",
             transcript.len()
+        );
+        assert_eq!(
+            &transcript[..MAX_TRANSCRIPT_BYTES],
+            vec![b'x'; MAX_TRANSCRIPT_BYTES]
         );
         let text = String::from_utf8_lossy(&transcript);
         assert!(text.contains("transcript truncated"), "truncation recorded");
