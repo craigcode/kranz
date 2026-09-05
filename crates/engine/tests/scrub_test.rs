@@ -15,6 +15,57 @@ const MARKER: &str = "[REDACTED]";
 const TRUNCATED: &str = "… [truncated]";
 
 #[test]
+fn python_suite_headers_are_not_credential_assignments() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "if supplied != VALID_TOKEN:\n    self._send_json(403, {})\n";
+    std::fs::write(dir.path().join("handler.py"), source).unwrap();
+    assert!(kranz_engine::scrub::scan_paths(dir.path(), &[Path::new("handler.py")]).is_empty());
+    // This refinement belongs to Python source; generic text/data keeps its
+    // conservative interpretation rather than silently changing all callers.
+    assert!(!scan_text(source).is_empty());
+}
+
+#[test]
+fn python_suite_scan_keeps_following_credentials_and_original_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "password";
+    let credential = ["Sensitive", "Value", "123456"].concat();
+    let vendor = ["sk-ant-api03-", "CredentialMaterial123456"].concat();
+    let source = format!("# café\nif VALID_TOKEN:\n    {key} = \"{credential}\"\nelif other == \"{vendor}\":\n    pass\n");
+    std::fs::write(dir.path().join("handler.py"), &source).unwrap();
+    let findings = kranz_engine::scrub::scan_paths(dir.path(), &[Path::new("handler.py")]);
+    assert!(findings
+        .iter()
+        .any(|f| source[f.start..f.end] == credential));
+    assert!(findings.iter().any(|f| source[f.start..f.end] == vendor));
+    assert_eq!(findings.len(), 2, "{findings:?}");
+}
+
+#[test]
+fn source_scan_keeps_multiline_json_yaml_and_python_dictionary_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "password";
+    let credential = ["Sensitive", "Value", "123456"].concat();
+    for (name, source) in [
+        ("config.json", format!("{{\"{key}\":\n\"{credential}\"}}")),
+        ("config.yaml", format!("{key}:\n  {credential}\n")),
+        (
+            "config.py",
+            format!("config = {{\"{key}\":\n\"{credential}\"}}\n"),
+        ),
+    ] {
+        std::fs::write(dir.path().join(name), &source).unwrap();
+        let findings = kranz_engine::scrub::scan_paths(dir.path(), &[Path::new(name)]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| source[f.start..f.end] == credential),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
 fn finding_diagnostics_do_not_redact_their_own_file_location() {
     let input = format!("Bearer {}", ["Synthetic", "Credential", "123456"].concat());
     let findings = scan_text_at(&input, "tests/test_server.py:53");

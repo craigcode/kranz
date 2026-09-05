@@ -383,6 +383,14 @@ fn push_finding(
 
 /// Find secrets in `text`, using `location` only for diagnostics.
 pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
+    scan_text_with_assignments(text, text, location)
+}
+
+fn scan_text_with_assignments(
+    text: &str,
+    assignment_text: &str,
+    location: &str,
+) -> Vec<SecretFinding> {
     let mut out = Vec::new();
     let mut occupied: Vec<Range<usize>> = Vec::new();
     for rule in rules() {
@@ -404,7 +412,7 @@ pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
         }
     }
 
-    for caps in generic_assignment_re().captures_iter(text) {
+    for caps in generic_assignment_re().captures_iter(assignment_text) {
         if let Some(value) = caps.get(2) {
             push_finding(
                 &mut out,
@@ -417,7 +425,7 @@ pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
         }
     }
 
-    for caps in entropy_assignment_re().captures_iter(text) {
+    for caps in entropy_assignment_re().captures_iter(assignment_text) {
         if let Some(value) = caps.get(2) {
             if is_high_entropy_secret(value.as_str()) {
                 push_finding(
@@ -866,9 +874,39 @@ pub fn scan_paths(repo_root: &Path, paths: &[&Path]) -> Vec<SecretFinding> {
             .ok()
             .and_then(|p| p.to_str())
             .unwrap_or_else(|| full.to_str().unwrap_or("<path>"));
-        findings.extend(scan_text_at(&text, location));
+        let assignments = if full.extension().is_some_and(|ext| ext == "py") {
+            python_assignment_text(&text)
+        } else {
+            Cow::Borrowed(text.as_ref())
+        };
+        findings.extend(scan_text_with_assignments(&text, &assignments, location));
     }
     findings
+}
+
+// A Python suite header such as `if supplied != VALID_TOKEN:` is not an
+// assignment. Its colon otherwise lets the generic heuristic consume the
+// next statement (and even swallow a real credential's variable name).
+// Mask only those terminal colons, retaining byte offsets. Fixed credential
+// patterns still inspect the original file, and data/config scans are intact.
+fn python_assignment_text(text: &str) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(text);
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end();
+        let keyword = trimmed.split_whitespace().next().unwrap_or("");
+        if trimmed.ends_with(':')
+            && matches!(
+                keyword,
+                "if" | "elif" | "while" | "for" | "with" | "except" | "class" | "match" | "case"
+            )
+        {
+            let colon = offset + trimmed.len() - 1;
+            out.to_mut().replace_range(colon..colon + 1, " ");
+        }
+        offset += line.len();
+    }
+    out
 }
 
 /// Truncate to at most `max` characters (not bytes), appending
