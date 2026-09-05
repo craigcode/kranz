@@ -153,9 +153,9 @@ fn restore_legacy_float_parsing(value: &mut serde_json::Value) -> Result<()> {
 }
 
 fn legacy_float_number(number: &serde_json::Number) -> Option<serde_json::Number> {
-    let token = number.to_string();
-    let negative = token.starts_with('-');
-    let unsigned = token.strip_prefix('-').unwrap_or(&token);
+    let decimal = number.to_string();
+    let negative = decimal.starts_with('-');
+    let unsigned = decimal.strip_prefix('-').unwrap_or(&decimal);
     let (mantissa, exponent) = unsigned.split_once('e').unwrap_or((unsigned, "0"));
     let fraction_digits = mantissa
         .split_once('.')

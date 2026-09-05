@@ -10,6 +10,7 @@ Notable user-visible changes are documented here. This project follows
 - Fixed fractional costs producing event lines that failed their own integrity
   checks. New versioned seals preserve numeric bits; valid legacy seals keep
   their original interpretation and can be continued without rewriting them.
+  Older binaries cannot verify the new seals.
 - Fixed resume discarding uncommitted integration repairs. Retained worktrees
   are validated and reused; unexpected repositories, branches, and symlinks
   are refused without deleting their contents.
