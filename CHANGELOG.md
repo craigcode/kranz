@@ -9,7 +9,8 @@ Notable user-visible changes are documented here. This project follows
 
 - Fixed PTY validation waiting for a timeout after its target exited. Parent
   terminal handles now close after spawning, and child programs inherit only
-  the intended standard terminal streams.
+  the intended standard terminal streams. Continuous output yields to session
+  deadline checks instead of keeping the drain loop running indefinitely.
 - Fixed Windows AppContainer launches refusing every worktree after authority
   hardening. The isolated worktree's `.kranz` namespace is protected separately,
   including future files and directory renames; ordinary source files remain

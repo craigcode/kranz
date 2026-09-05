@@ -16,7 +16,7 @@
 //! add `anyhow`/`filedescriptor`/`shared_library`/`winapi`-adjacent deps to
 //! buy Windows ConPTY this ticket does not need). The harness therefore
 //! lives on `std::process` plus the platform's own pty facility through
-//! `libc::openpty` — `libc` is ALREADY the engine's unix dependency, so the
+//! POSIX PTY calls — `libc` is ALREADY the engine's unix dependency, so the
 //! whole mechanism is one contained module with no new dependency. The cost
 //! is platform coverage: the session core is `#[cfg(unix)]`, and non-unix
 //! hosts degrade LOUDLY — every pty-script assertion renders a SKIP line
@@ -93,6 +93,9 @@ const FAIL_TAIL_BYTES: usize = 2048;
 /// promptly, coarse enough to never busy-spin.
 #[cfg_attr(not(unix), allow(dead_code))]
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Return to the deadline checks even when a target keeps the pty readable.
+#[cfg(unix)]
+const MAX_DRAIN_BYTES: usize = 64 * 1024;
 
 /// The session-level verdict of one pty-script assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,73 +431,68 @@ mod imp {
         cwd: &Path,
         env: &HashMap<String, String>,
     ) -> PtyRunOutcome {
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        // A fixed 80x24 window: TUIs lay out against the winsize, and a
-        // deterministic size keeps transcripts reproducible across hosts.
-        // The `mut` is only read on macOS (glibc's openpty takes *const), so
-        // it carries the platform-gated allow (ubuntu clippy, -D warnings).
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut winsize = libc::winsize {
+        // Allocate with close-on-exec atomically: openpty followed by fcntl
+        // races other threads spawning children between those two calls.
+        let master = unsafe {
+            libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        };
+        if master == -1 {
+            return spawn_failure(format!(
+                "posix_openpt failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::grantpt(master) } == -1 || unsafe { libc::unlockpt(master) } == -1 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(master) };
+            return spawn_failure(format!("preparing pty slave failed: {err}"));
+        }
+        let mut name = [0 as libc::c_char; 128];
+        // macOS exposes this ptsname ioctl in sys/ttycom.h; its libc crate
+        // has no ptsname_r binding. Both paths use a caller-owned buffer.
+        #[cfg(target_os = "macos")]
+        const TIOCPTYGNAME: libc::c_ulong = 0x4080_7453;
+        #[cfg(target_os = "macos")]
+        let name_result = unsafe { libc::ioctl(master, TIOCPTYGNAME, name.as_mut_ptr()) };
+        #[cfg(not(target_os = "macos"))]
+        let name_result = unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) };
+        if name_result != 0 || !name.contains(&0) {
+            let err = if name_result > 0 {
+                std::io::Error::from_raw_os_error(name_result)
+            } else {
+                std::io::Error::last_os_error()
+            };
+            unsafe { libc::close(master) };
+            return spawn_failure(format!("resolving pty slave failed: {err}"));
+        }
+        let slave = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if slave == -1 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(master) };
+            return spawn_failure(format!("opening pty slave failed: {err}"));
+        }
+        // Match the fixed 80x24 terminal the harness has always provided.
+        let winsize = libc::winsize {
             ws_row: 24,
             ws_col: 80,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: all pointers valid; null `name`/`termp` accept the
-        // platform defaults (canonical mode + echo, the boring terminal a
-        // REPL expects). The pointer mutability differs across platforms —
-        // macOS declares `termp`/`winp` mutable, glibc const, so the winsize
-        // reference is cfg-split: clippy's unnecessary_mut_passed fires on
-        // Linux for the macOS shape (ubuntu-latest CI gates -D warnings).
-        #[cfg(target_os = "macos")]
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut winsize,
-            )
-        };
-        #[cfg(not(target_os = "macos"))]
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &winsize,
-            )
-        };
-        if rc != 0 {
-            return spawn_failure(format!(
-                "openpty failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        // Only the child's three standard streams may survive exec. Retained
-        // terminal descriptors otherwise leak into other launched programs.
-        for fd in [master, slave] {
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                let err = std::io::Error::last_os_error();
-                unsafe {
-                    libc::close(master);
-                    libc::close(slave);
-                }
-                return spawn_failure(format!("setting pty close-on-exec failed: {err}"));
-            }
-        }
-        // Set nonblocking before spawning: a failure must not leave a child
-        // running or let a blocking read bypass the session's deadlines.
-        if unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+        #[allow(clippy::unnecessary_cast)]
+        let size_result =
+            unsafe { libc::ioctl(slave, libc::TIOCSWINSZ as libc::c_ulong, &winsize) };
+        if size_result == -1 {
             let err = std::io::Error::last_os_error();
             unsafe {
                 libc::close(master);
                 libc::close(slave);
             }
-            return spawn_failure(format!("setting pty nonblocking failed: {err}"));
+            return spawn_failure(format!("setting pty size failed: {err}"));
         }
 
         // The child gets the slave on stdin/stdout/stderr. dup it twice and
@@ -702,13 +700,13 @@ mod imp {
         child_eof: bool,
     }
 
-    /// Drain whatever the master has right now into the bounded transcript.
-    /// Returns the number of fresh bytes appended (0 also covers EOF, which
-    /// flips `child_eof`).
+    /// Drain one bounded batch into the transcript, then yield to the caller's
+    /// deadline checks. Returns bytes read, including discarded output (0
+    /// also covers EOF, which flips `child_eof`).
     fn drain(master: &mut std::fs::File, session: &mut Session) -> usize {
         let mut fresh = 0usize;
         let mut buf = [0u8; 8192];
-        loop {
+        while fresh < MAX_DRAIN_BYTES {
             match master.read(&mut buf) {
                 Ok(0) => {
                     session.child_eof = true;
@@ -735,6 +733,33 @@ mod imp {
             }
         }
         fresh
+    }
+
+    #[test]
+    fn pty_drain_yields_before_exhausting_continuously_ready_output() {
+        use std::io::{Seek, SeekFrom};
+        let mut input = tempfile::tempfile().unwrap();
+        let payload = vec![b'x'; MAX_TRANSCRIPT_BYTES * 2];
+        input.write_all(&payload).unwrap();
+        input.seek(SeekFrom::Start(0)).unwrap();
+        let mut session = Session {
+            transcript: Vec::new(),
+            truncated: false,
+            child_eof: false,
+        };
+        let first = drain(&mut input, &mut session);
+        assert!(
+            first > 0 && first < payload.len(),
+            "ready output must yield before EOF so deadlines can be checked"
+        );
+        assert!(!session.child_eof);
+        let mut total = first;
+        while !session.child_eof {
+            total += drain(&mut input, &mut session);
+        }
+        assert_eq!(total, payload.len(), "yielding must not lose input");
+        assert_eq!(session.transcript, payload[..MAX_TRANSCRIPT_BYTES]);
+        assert!(session.truncated);
     }
 
     fn drive_send(
