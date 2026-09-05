@@ -235,6 +235,8 @@ cat >"$repo/.kranz/secret-allowlist" <<'EOF'
 b1f79d2459c595bd2c724888
 # Reviewed synthetic negative-test value: some-other-wrong-token.
 67179b9130867b23549262cb
+# Reviewed Python parameter default referencing the synthetic VALID_TOKEN.
+768d6ae6a32900be95cb671b
 EOF
 
 cat >"$repo/.gitignore" <<'EOF'
