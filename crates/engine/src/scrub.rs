@@ -383,6 +383,14 @@ fn push_finding(
 
 /// Find secrets in `text`, using `location` only for diagnostics.
 pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
+    scan_text_with_assignments(text, text, location)
+}
+
+fn scan_text_with_assignments(
+    text: &str,
+    assignment_text: &str,
+    location: &str,
+) -> Vec<SecretFinding> {
     let mut out = Vec::new();
     let mut occupied: Vec<Range<usize>> = Vec::new();
     for rule in rules() {
@@ -404,7 +412,7 @@ pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
         }
     }
 
-    for caps in generic_assignment_re().captures_iter(text) {
+    for caps in generic_assignment_re().captures_iter(assignment_text) {
         if let Some(value) = caps.get(2) {
             push_finding(
                 &mut out,
@@ -417,7 +425,7 @@ pub fn scan_text_at(text: &str, location: &str) -> Vec<SecretFinding> {
         }
     }
 
-    for caps in entropy_assignment_re().captures_iter(text) {
+    for caps in entropy_assignment_re().captures_iter(assignment_text) {
         if let Some(value) = caps.get(2) {
             if is_high_entropy_secret(value.as_str()) {
                 push_finding(
@@ -480,7 +488,7 @@ fn scrub_entropy(text: &str) -> Cow<'_, str> {
 /// segment only, keeping `user:` and `@host`. The final entropy pass catches
 /// unprefixed high-entropy blobs assigned to secret-ish names, gated so prose,
 /// git SHAs, and UUIDs survive.
-fn scrub_impl(text: &str) -> String {
+fn scrub_plain(text: &str) -> String {
     let mut out = text.to_owned();
     for rule in rules() {
         if let Cow::Owned(replaced) = rule.re.replace_all(&out, rule.replacement) {
@@ -499,6 +507,147 @@ fn scrub_impl(text: &str) -> String {
     if let Cow::Owned(replaced) = scrub_entropy(&out) {
         out = replaced;
     }
+    out
+}
+
+// Decode JSON before redacting its strings. Applying regex replacements to
+// serialized strings can consume the backslash of an escaped quote and turn
+// a valid decision (or a transcript containing one) into malformed JSON.
+fn scrub_json_text(text: &str) -> Option<String> {
+    // Validate syntax first, but do not serialize a parsed object: that would
+    // collapse duplicate keys and could turn a rejected decision into a valid
+    // one. Replace individual string tokens, preserving all other bytes.
+    serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut copied = 0;
+    let mut out = String::new();
+    let mut key: Option<String> = None;
+    while cursor < bytes.len() {
+        let start = cursor;
+        if bytes[cursor] == b'"' {
+            cursor += 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor += 2,
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            let decoded: String = serde_json::from_str(&text[start..cursor]).ok()?;
+            let is_key = text[cursor..].trim_start().starts_with(':');
+            let redacted = if is_key {
+                scrub_plain(&decoded)
+            } else {
+                scrub_json_assignment(scrub_impl(&decoded), key.as_deref())
+            };
+            if redacted != decoded {
+                out.push_str(&text[copied..start]);
+                // Runtime evidence deliberately escapes prompt delimiters.
+                // Re-encoding a changed string must not restore those markers.
+                out.push_str(
+                    &serde_json::to_string(&redacted)
+                        .ok()?
+                        .replace('<', "\\u003c")
+                        .replace('>', "\\u003e"),
+                );
+                copied = cursor;
+            }
+            key = is_key.then_some(decoded);
+        } else if bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b':' {
+            cursor += 1;
+        } else {
+            // Numeric credentials must not escape merely because JSON did not
+            // quote them. Structural delimiters consume any pending field key.
+            if key.is_some() && matches!(bytes[cursor], b'-' | b'0'..=b'9') {
+                while cursor < bytes.len()
+                    && matches!(
+                        bytes[cursor],
+                        b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
+                    )
+                {
+                    cursor += 1;
+                }
+                let value = &text[start..cursor];
+                let redacted = scrub_json_assignment(value.to_owned(), key.as_deref());
+                if redacted != value {
+                    out.push_str(&text[copied..start]);
+                    out.push_str(&serde_json::to_string(&redacted).ok()?);
+                    copied = cursor;
+                }
+            } else {
+                cursor += 1;
+            }
+            key = None;
+        }
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+fn scrub_json_assignment(mut value: String, key: Option<&str>) -> String {
+    if let Some(key) = key {
+        // Match only the immediate value's context, not assignments inside a
+        // nested JSON string that has already been redacted and re-escaped.
+        let prefix = format!("{key}=\"");
+        let contextual = format!("{prefix}{value}");
+        for (regex, entropy_only) in [
+            (generic_assignment_re(), false),
+            (entropy_assignment_re(), true),
+        ] {
+            let Some(caps) = regex.captures(&contextual) else {
+                continue;
+            };
+            let candidate = caps.get(2).expect("assignment value capture");
+            if candidate.start() == prefix.len()
+                && if entropy_only {
+                    is_high_entropy_secret(candidate.as_str())
+                } else {
+                    !is_allowlisted(candidate.as_str())
+                }
+            {
+                value.replace_range(..candidate.len(), REDACTED);
+                break;
+            }
+        }
+    }
+    value
+}
+
+fn scrub_impl(text: &str) -> String {
+    if let Some(redacted) = scrub_json_text(text) {
+        return redacted;
+    }
+    // Preserve fenced replies and their surrounding prose. This only redacts;
+    // the decision parser still owns whether a particular fence is an answer.
+    let mut out = String::new();
+    let mut plain_start = 0;
+    let mut body_start = None;
+    let mut cursor = 0;
+    for line in text.split_inclusive('\n') {
+        let start = cursor;
+        cursor += line.len();
+        let trimmed = line.trim();
+        if body_start.is_none() && matches!(trimmed, "```" | "```json" | "```JSON") {
+            body_start = Some(cursor);
+        } else if trimmed == "```" {
+            if let Some(body) = body_start.take() {
+                if let Some(redacted) = scrub_json_text(&text[body..start]) {
+                    out.push_str(&scrub_plain(&text[plain_start..body]));
+                    out.push_str(&redacted);
+                    // Serialization may remove the newline before the fence.
+                    if !redacted.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    plain_start = start;
+                }
+            }
+        }
+    }
+    out.push_str(&scrub_plain(&text[plain_start..]));
     out
 }
 
@@ -521,10 +670,8 @@ pub fn scrub_json_value(value: &mut serde_json::Value, location: &str) -> Vec<Se
         match value {
             serde_json::Value::String(s) => {
                 let scan = scrub_with_findings(s, &path);
-                if !scan.findings.is_empty() {
-                    *s = scan.redacted;
-                    findings.extend(scan.findings);
-                }
+                *s = scan.redacted;
+                findings.extend(scan.findings);
             }
             serde_json::Value::Array(items) => {
                 for (idx, item) in items.iter_mut().enumerate() {
@@ -633,7 +780,7 @@ pub fn format_findings(findings: &[SecretFinding]) -> String {
         .iter()
         .map(|finding| {
             format!(
-                "{} {} {} bytes {}..{}",
+                "{} [{}] {} bytes {}..{}",
                 finding.fingerprint, finding.rule_id, finding.location, finding.start, finding.end
             )
         })
@@ -727,9 +874,39 @@ pub fn scan_paths(repo_root: &Path, paths: &[&Path]) -> Vec<SecretFinding> {
             .ok()
             .and_then(|p| p.to_str())
             .unwrap_or_else(|| full.to_str().unwrap_or("<path>"));
-        findings.extend(scan_text_at(&text, location));
+        let assignments = if full.extension().is_some_and(|ext| ext == "py") {
+            python_assignment_text(&text)
+        } else {
+            Cow::Borrowed(text.as_ref())
+        };
+        findings.extend(scan_text_with_assignments(&text, &assignments, location));
     }
     findings
+}
+
+// A Python suite header such as `if supplied != VALID_TOKEN:` is not an
+// assignment. Its colon otherwise lets the generic heuristic consume the
+// next statement (and even swallow a real credential's variable name).
+// Mask only those terminal colons, retaining byte offsets. Fixed credential
+// patterns still inspect the original file, and data/config scans are intact.
+fn python_assignment_text(text: &str) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(text);
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end();
+        let keyword = trimmed.split_whitespace().next().unwrap_or("");
+        if trimmed.ends_with(':')
+            && matches!(
+                keyword,
+                "if" | "elif" | "while" | "for" | "with" | "except" | "class" | "match" | "case"
+            )
+        {
+            let colon = offset + trimmed.len() - 1;
+            out.to_mut().replace_range(colon..colon + 1, " ");
+        }
+        offset += line.len();
+    }
+    out
 }
 
 /// Truncate to at most `max` characters (not bytes), appending

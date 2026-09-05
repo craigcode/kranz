@@ -697,6 +697,15 @@ pub(crate) fn absolutize(path: &Path) -> PathBuf {
     if let Ok(canon) = path.canonicalize() {
         return canon;
     }
+    // Future authority paths still need their existing ancestors resolved
+    // (notably /var -> /private/var), even before their leaf is created.
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(canon) = ancestor.canonicalize() {
+            if let Ok(suffix) = path.strip_prefix(ancestor) {
+                return canon.join(suffix);
+            }
+        }
+    }
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -706,9 +715,7 @@ pub(crate) fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
-/// Make a path absolute without resolving any component. Mount destinations
-/// must name the inspected leaf itself; canonicalizing a hostile symlink
-/// would instead mask its target and leave the leaf replaceable.
+// Mount destinations name the inspected leaf without following its links.
 fn lexical_absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -717,6 +724,10 @@ fn lexical_absolute(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     }
+}
+
+pub(crate) fn global_authority_dir() -> Option<PathBuf> {
+    crate::paths::global_config().and_then(|path| path.parent().map(absolutize))
 }
 
 /// Escape a path for embedding in an SBPL string literal.
@@ -777,14 +788,13 @@ pub(crate) fn write_allowlist(inputs: &SandboxInputs) -> Vec<PathBuf> {
 /// address either form).
 pub(crate) struct MissionWriteDenies {
     /// Engine-written files at the mission-dir root: literal write denies
-    /// (Seatbelt) / `/dev/null` masks (bwrap).
+    /// (Seatbelt) / read-only directory views (bwrap).
     pub files: Vec<PathBuf>,
-    /// The `control/` inbox dir: subpath write deny / tmpfs shadow.
+    /// Current and sibling `control/` inboxes: subpath write deny / tmpfs shadow.
     pub control_dirs: Vec<PathBuf>,
     /// The `runs/` transcript dirs: `runs/*.jsonl` regex write deny
-    /// (Seatbelt) / per-file `/dev/null` masks for files present at spawn
-    /// (bwrap). Subdirectories of `runs/` (the session scratch, the
-    /// preflight worktree) stay writable — the regex never crosses `/`.
+    /// (Seatbelt) / read-only directory binds (bwrap). Session scratch and
+    /// the current worktree keep their explicit writable roots.
     pub runs_dirs: Vec<PathBuf>,
 }
 
@@ -804,7 +814,23 @@ pub(crate) fn mission_write_denies(inputs: &SandboxInputs) -> MissionWriteDenies
         control_dirs: Vec::new(),
         runs_dirs: Vec::new(),
     };
-    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+    let mut mission_dirs = vec![inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)];
+    // Checkout mode makes the whole repository writable. Protect sibling
+    // missions as well as the current one; their inboxes have equal authority.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions"))
+    {
+        if let Ok(entries) = std::fs::read_dir(missions) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    mission_dirs.extend([entry.path(), absolutize(&entry.path())]);
+                }
+            }
+        }
+    }
+    for mission_dir in mission_dirs {
         for name in MISSION_METADATA_FILES {
             denies.files.push(mission_dir.join(name));
         }
@@ -876,11 +902,26 @@ pub(crate) fn cargo_cache_write_deny_paths() -> Vec<PathBuf> {
 pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
-        if let Some(kranz_dir) = mission_dir.parent().and_then(Path::parent) {
+        if let Some(kranz_dir) = mission_dir
+            .parent()
+            .filter(|path| path.ends_with("missions"))
+            .and_then(Path::parent)
+        {
             for name in KRANZ_AUTHORITY_FILES {
                 paths.push(kranz_dir.join(name));
             }
         }
+    }
+    for name in [
+        "serve.token",
+        "serve.read.token",
+        "config.json",
+        "domain-terms.local",
+    ] {
+        paths.push(absolutize(&inputs.session_cwd).join(".kranz").join(name));
+    }
+    if let Some(global) = crate::paths::global_config() {
+        paths.extend([global.clone(), absolutize(&global)]);
     }
     if let Some(cargo_home) = operator_cargo_home() {
         for base in [cargo_home.clone(), absolutize(&cargo_home)] {
@@ -888,6 +929,11 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
             paths.push(base.join("credentials"));
         }
     }
+    // Config layers can be symlinked. Deny the resolved file as well as its
+    // configured name so a canonical read cannot bypass the authority rule.
+    paths.extend(paths.clone().iter().map(|path| absolutize(path)));
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -914,14 +960,121 @@ pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
         dirs.push(mission_dir.join("control"));
-        if let Some(kranz_dir) = mission_dir.parent().and_then(Path::parent) {
+        if let Some(kranz_dir) = mission_dir
+            .parent()
+            .filter(|path| path.ends_with("missions"))
+            .and_then(Path::parent)
+        {
             dirs.push(kranz_dir.join("hook-status"));
         }
+    }
+    if let Some(global) = crate::paths::global_kranz_dir() {
+        dirs.extend([global.clone(), absolutize(&global)]);
     }
     for keys_dir in global_key_dirs() {
         dirs.push(keys_dir);
     }
     dirs
+}
+
+/// Mount-backed sandboxes need a private directory namespace, not just
+/// per-file masks: an absent token/config can be created while a worker is
+/// running. Rebind only existing non-authority entries read-only beneath an
+/// empty tmpfs. No placeholder files are created in the host checkout.
+pub(crate) struct AuthorityDirectoryMask {
+    pub path: PathBuf,
+    pub visible_entries: Vec<PathBuf>,
+}
+
+pub(crate) fn authority_directory_masks(inputs: &SandboxInputs) -> Vec<AuthorityDirectoryMask> {
+    let files: std::collections::BTreeSet<_> = authority_read_deny_paths(inputs)
+        .into_iter()
+        .filter_map(|path| Some(absolutize(path.parent()?).join(path.file_name()?)))
+        .collect();
+    let dirs: std::collections::BTreeSet<_> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|path| absolutize(path))
+        .collect();
+    let mut roots: std::collections::BTreeSet<_> = files
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    // Hide denied subdirectories through their parent's private namespace.
+    // This also works when control/ or hook-status/ does not yet exist under
+    // a read-only mission bind; setup need not mkdir in the host directory.
+    for dir in &dirs {
+        if !roots.contains(dir) {
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+        }
+    }
+    let writable = write_allowlist(inputs);
+    // A denied path may pass through a symlink beneath an allowed write root.
+    // Mask the link's parent too: masking only its target would let the worker
+    // replace the alias and redirect the engine's next config read. Ancestors
+    // outside writable roots need no extra view (e.g. the system /var alias).
+    for path in authority_read_deny_paths(inputs)
+        .into_iter()
+        .chain(authority_read_deny_dirs(inputs))
+    {
+        for ancestor in path.ancestors() {
+            if std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                if let Some(parent) = ancestor.parent().map(absolutize) {
+                    if writable.iter().any(|root| parent.starts_with(root)) {
+                        roots.insert(parent);
+                    }
+                }
+            }
+        }
+    }
+    let roots: std::collections::BTreeSet<_> = roots
+        .into_iter()
+        .map(|path| {
+            if !path.exists() && !writable.iter().any(|root| path.starts_with(root)) {
+                // bwrap cannot create a mountpoint inside its read-only / bind.
+                // Mask the nearest existing ancestor instead; denied descendants
+                // are never rebound, and private write roots are restored below.
+                path.ancestors()
+                    .skip(1)
+                    .find(|parent| parent.is_dir())
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            } else {
+                path
+            }
+        })
+        .collect();
+    roots
+        .into_iter()
+        .map(|path| {
+            let mut visible_entries = Vec::new();
+            if !dirs.iter().any(|dir| path.starts_with(dir)) {
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        // Never follow a worker-authored link while constructing
+                        // a privileged bind. Unknown/unreadable entries stay hidden.
+                        if entry
+                            .file_type()
+                            .is_ok_and(|kind| kind.is_dir() || kind.is_file())
+                            && !files.contains(&entry_path)
+                            && !dirs.iter().any(|dir| entry_path.starts_with(dir))
+                        {
+                            visible_entries.push(entry_path);
+                        }
+                    }
+                }
+            }
+            visible_entries.sort();
+            AuthorityDirectoryMask {
+                path,
+                visible_entries,
+            }
+        })
+        .collect()
 }
 
 /// The GLOBAL kranz authority stores (`<global kranz dir>/keys`, where the
@@ -1623,6 +1776,58 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
         profile.push('\n');
     }
 
+    profile.push_str("(deny file-write*\n");
+    // Match future sibling missions too: enumeration alone would leave an
+    // inbox created after this session starts writable under checkout mode.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions"))
+    {
+        for root in [missions.to_path_buf(), absolutize(missions)] {
+            let root = escape_sbpl_regex(&root);
+            profile.push_str(&format!(
+                "  (regex #\"^{root}/[^/]+/(events\\.jsonl(\\.lock)?|state\\.json(\\.tmp)?|estimate\\.json)$\")\n"
+            ));
+            profile.push_str(&format!("  (regex #\"^{root}/[^/]+/control(/|$)\")\n"));
+            profile.push_str(&format!(
+                "  (regex #\"^{root}/[^/]+/runs/[^/]*\\.jsonl$\")\n"
+            ));
+        }
+    }
+    profile.push_str(")\n");
+
+    // Denying a file alone does not stop renaming its parent directory,
+    // which would move authority outside path-based read/write rules.
+    // Pin ancestor names without denying ordinary writes to their children.
+    let mut pinned_dirs = std::collections::BTreeSet::new();
+    for path in authority_read_deny_paths(inputs)
+        .into_iter()
+        .chain(authority_read_deny_dirs(inputs))
+        .chain(mission_write_denies(inputs).control_dirs)
+    {
+        for parent in path.ancestors().skip(1) {
+            pinned_dirs.insert(escape_sbpl_literal(parent));
+        }
+    }
+    profile.push_str("(deny file-write-unlink\n");
+    for path in pinned_dirs {
+        profile.push_str(&format!("  (literal \"{path}\")\n"));
+    }
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|p| p.ends_with("missions"))
+    {
+        for path in [missions.to_path_buf(), absolutize(missions)] {
+            profile.push_str(&format!(
+                "  (regex #\"^{}/[^/]+(/(control|runs))?$\")\n",
+                escape_sbpl_regex(&path)
+            ));
+        }
+    }
+    profile.push_str(")\n");
+
     // Shared-Cargo-cache write deny (13th-pass review, P1 — see
     // cargo_cache_write_deny_paths for the full why): when the shared
     // registry/git cache exceeds the copy ceiling, the isolated contract
@@ -1732,40 +1937,23 @@ pub fn bubblewrap_args(
         out.push(path.clone());
         out.push(path);
     }
-    // bwrap has no per-path read deny, so mask the authority material the
-    // whole-fs ro-bind would otherwise expose: a /dev/null bind stacked over
-    // each file that exists at spawn time (later binds win; the destination
-    // must exist, hence the filter). A token file created AFTER spawn stays
-    // a residual gap the Seatbelt profile does not have.
-    let masks: std::collections::BTreeSet<String> = authority_read_deny_paths(inputs)
-        .iter()
-        .filter(|path| path.exists())
-        .map(|path| absolutize(path).display().to_string())
-        .collect();
-    for mask in masks {
-        out.push("--ro-bind".to_string());
-        out.push("/dev/null".to_string());
-        out.push(mask);
-    }
-    // The bwrap analogue of the profile's validator read-deny block (ticket
-    // validator-mandatory-containment — see the fn doc): shadow each real
-    // source-tree entry so the whole-fs ro-bind stops exposing it. Dirs get
-    // an empty tmpfs (the existing control/-shadow idiom), files a
-    // /dev/null ro-bind (the authority-mask idiom). Entries were enumerated
-    // from the live fs and exist at spawn; later binds win, and this block
-    // lands after every rw bind, so a wide writable root cannot re-expose a
-    // denied entry — the carve-outs (`.git`, `.kranz`) were never in the
-    // set, so the snapshot and the shared git dir stay as their binds left
-    // them.
-    for entry in validator_read_deny_entries(inputs) {
-        let display = entry.path.display().to_string();
-        if entry.is_dir {
-            out.push("--tmpfs".to_string());
-            out.push(display);
-        } else {
-            out.push("--ro-bind".to_string());
-            out.push("/dev/null".to_string());
-            out.push(display);
+    // Keep the mission namespace read-only, including siblings created
+    // after spawn. A validator snapshot or private scratch nested here
+    // gets its own writable bind back before the metadata masks below.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions") && path.is_dir())
+    {
+        let missions = absolutize(missions);
+        let display = missions.display().to_string();
+        out.extend(["--ro-bind".to_string(), display.clone(), display]);
+        for private in [&inputs.session_cwd, &inputs.tmpdir] {
+            let private = absolutize(private);
+            if private.starts_with(&missions) && private != missions {
+                let display = private.display().to_string();
+                out.extend(["--bind".to_string(), display.clone(), display]);
+            }
         }
     }
     // The bwrap analogue of the profile's shared-Cargo-cache write deny
@@ -1775,9 +1963,9 @@ pub fn bubblewrap_args(
     // re-widen them — stack an explicit ro-bind OVER each cache dir
     // present at spawn (later binds win; the destination must exist,
     // hence the is_dir filter). The dir stays READABLE — a linked cache
-    // is the session/gate's registry — only writes close. Same residual
-    // gap as the authority masks: a cache dir created AFTER spawn is
-    // unmasked until the next session.
+    // is the session/gate's registry — only writes close. This
+    // behavior is also enforced by the private Cargo-home namespace below,
+    // which keeps later credential/cache creation out of the session.
     let cache_ro_binds: std::collections::BTreeSet<String> = cargo_cache_write_deny_paths()
         .iter()
         .filter(|path| path.is_dir())
@@ -1796,12 +1984,11 @@ pub fn bubblewrap_args(
     // every write closes. Later binds win, and this block lands after every
     // rw bind, so a wide writable root cannot re-expose a denied path.
     //
-    // Authority FILES additionally appear in the /dev/null mask set above,
-    // which closes reads AND writes; the ro-bind here is what covers the
-    // directories and the `.git` surface. The spawn-time existence filter is
-    // the same residual gap every bwrap mask carries: a path created AFTER
-    // spawn is unmasked until the next session (the Seatbelt tier closes
-    // that with an explicit deny and a sealing regex; bwrap cannot).
+    // Private authority directory views below close both reads and writes,
+    // including authority files created after launch. These extra ro-binds
+    // cover readable policy and Git metadata outside those views. For that
+    // Git-only surface, a path absent at spawn remains unbound until the
+    // next session (Seatbelt also denies future paths explicitly).
     //
     // One deliberate exclusion: a `.git` that is a DIRECTORY (checkout mode)
     // is never ro-bound as a whole — that would close the index, objects and
@@ -1810,11 +1997,9 @@ pub fn bubblewrap_args(
     // tier cannot stop a replace of the `.git` directory NODE itself. The
     // Seatbelt and Windows tiers deny that literal; bwrap's remainder is
     // recorded here rather than papered over.
-    // A path that is READ-denied is already closed both ways by its
-    // /dev/null mask or tmpfs shadow, and must NOT also be ro-bound over
-    // itself: later binds win, so a self-bind emitted here would stack the
-    // REAL file back over its mask and hand the token to the session (the
-    // Linux CI receipt caught exactly that after the write-deny landed).
+    // Do not directly bind READ-denied paths: their private directory view
+    // owns the destination. A host bind stacked over a mask would restore
+    // the credential the mask is meant to hide.
     // The write-deny set is a superset of the read-deny set by
     // construction, so subtract the masked paths and everything beneath a
     // masked directory before binding.
@@ -1852,23 +2037,9 @@ pub fn bubblewrap_args(
         out.push(bind.clone());
         out.push(bind);
     }
-    // Mission metadata must stay unwritable inside the sandbox: in checkout
-    // mode the rw `session_cwd` bind covers the mission dir, so the audit
-    // log, state snapshot, control inbox, and transcripts need the same
-    // spawn-time masking the authority material gets (bwrap has no per-path
-    // write deny to stack over an rw bind). Files are masked with /dev/null
-    // binds; the control dir gets an empty tmpfs shadow (writes evaporate,
-    // the host dir is untouched). Same residual gap as the authority masks:
-    // a metadata file created AFTER spawn is unmasked until the next
-    // session — the engine creates all of these before the first session,
-    // EXCEPT `state.json.tmp`, which is transient (recreated on every atomic
-    // state write and routinely absent at spawn). Create just that one so
-    // the mask binds — an empty placeholder is inert: the engine truncates
-    // it on use and nothing ever reads it. (The other metadata files are NOT
-    // pre-created here: an empty `state.json` would turn a clean NotFound
-    // into a parse error for first-run flows.) A creation failure is NOT
-    // best-effort: proceeding would silently leave the metadata writable —
-    // fail the spawn instead (3rd-pass review).
+    // Reject hostile metadata leaves before constructing read-only views.
+    // Missing state/transcript files stay absent in the private namespace;
+    // no host-side state.json.tmp placeholder is needed.
     let write_denies = mission_write_denies(inputs);
     for path in &write_denies.files {
         match std::fs::symlink_metadata(path) {
@@ -1883,93 +2054,56 @@ pub fn bubblewrap_args(
             Err(error) => return Err(error.into()),
         }
     }
-    for path in write_denies
-        .files
+    let authority_dirs: Vec<_> = authority_read_deny_dirs(inputs)
         .iter()
-        .filter(|p| p.ends_with("state.json.tmp"))
-    {
-        let metadata = std::fs::symlink_metadata(path);
-        match metadata {
-            // A regular file already there: mask binds over it as-is.
-            Ok(m) if m.file_type().is_file() => continue,
-            // Anything else present (symlink, dir, fifo, device): refuse.
-            // In particular, accepting a symlink and later canonicalizing it
-            // masks the target rather than the state.json.tmp mount point.
-            Ok(_) => {
-                return Err(crate::error::EngineError::InvalidState(format!(
-                    "bwrap mask prep: {} exists and is not a regular file",
-                    path.display()
-                )));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        // Pin the mission parent from the trusted repository anchor, then
-        // create the leaf relative to that capability with no-follow. This
-        // closes both the hostile-parent canonicalization gap and the leaf
-        // swap between metadata and open.
-        let (parent, name) = crate::paths::open_parent_nofollow(path)?;
-        use cap_fs_ext::OpenOptionsFollowExt as _;
-        use cap_primitives::fs::FollowSymlinks;
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .follow(FollowSymlinks::No);
-        let open_result = parent.open_with(name, &options);
-        open_result.map_err(|e| {
-            crate::error::EngineError::Io(std::io::Error::new(
-                e.kind(),
-                format!("bwrap mask prep: create {}: {e}", path.display()),
-            ))
-        })?;
-    }
-    let mut write_masks: std::collections::BTreeSet<String> = write_denies
-        .files
-        .iter()
-        .filter(|path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
-        })
-        .map(|path| lexical_absolute(path).display().to_string())
+        .map(|path| absolutize(path))
         .collect();
-    // Transcripts: bwrap cannot express the Seatbelt `runs/*.jsonl` regex,
-    // so mask each transcript file present at spawn individually. The sweep
-    // is shallow — `runs/` subdirectories (session scratch, preflight
-    // worktree) are not transcripts and stay as their binds left them.
-    for runs_dir in &write_denies.runs_dirs {
-        if let Ok(entries) = std::fs::read_dir(runs_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if entry.file_type().is_ok_and(|kind| kind.is_file())
-                    && path.extension().is_some_and(|ext| ext == "jsonl")
-                {
-                    write_masks.insert(lexical_absolute(&path).display().to_string());
-                }
+    for mask in authority_directory_masks(inputs) {
+        let display = mask.path.display().to_string();
+        out.extend(["--tmpfs".to_string(), display.clone()]);
+        for path in mask.visible_entries {
+            let path = path.display().to_string();
+            // Ordinary entries can disappear after enumeration (for example,
+            // another gate's temporary cache). Leaving a missing entry hidden
+            // is safe; the enclosing mask and read-only remount remain required.
+            out.extend(["--ro-bind-try".to_string(), path.clone(), path]);
+        }
+        out.extend(["--remount-ro".to_string(), display]);
+        // A snapshot or session-private scratch under .kranz remains writable.
+        // Later (deeper) masks still hide its own authority directories.
+        for private in [&inputs.session_cwd, &inputs.tmpdir] {
+            let private = absolutize(private);
+            if private != mask.path
+                && private.starts_with(&mask.path)
+                && !authority_dirs
+                    .iter()
+                    .any(|denied| private.starts_with(denied))
+            {
+                let path = private.display().to_string();
+                out.extend(["--bind".to_string(), path.clone(), path]);
             }
         }
     }
-    for mask in write_masks {
-        out.push("--ro-bind".to_string());
-        out.push("/dev/null".to_string());
-        out.push(mask);
-    }
-    // tmpfs shadows for dirs a session must not read or write: the mission
-    // control inbox (the write-deny idiom — a shadow hides writes AND reads)
-    // plus the authority read-deny dirs (14th-pass review — the hook-status
-    // projection under the validator wrap's `.kranz` carve-out;
-    // authority_read_deny_dirs overlaps control_dirs on the inbox, the set
-    // dedups). Same spawn-time existence filter as the masks.
-    let dir_shadows: std::collections::BTreeSet<String> = write_denies
-        .control_dirs
-        .iter()
-        .chain(authority_read_deny_dirs(inputs).iter())
-        .filter(|path| path.is_dir())
-        .map(|path| absolutize(path).display().to_string())
-        .collect();
-    for shadow in dir_shadows {
-        out.push("--tmpfs".to_string());
-        out.push(shadow);
+    // The bwrap analogue of the profile's validator read-deny block (ticket
+    // validator-mandatory-containment — see the fn doc): shadow each real
+    // source-tree entry so the whole-fs ro-bind stops exposing it. Dirs get
+    // an empty tmpfs (the existing control/-shadow idiom), files a
+    // /dev/null ro-bind (the authority-mask idiom). Entries were enumerated
+    // from the live fs and exist at spawn; later binds win, and this block
+    // lands after every bind and authority view, so neither can re-expose a
+    // denied entry — the carve-outs (`.git`, `.kranz`) were never in the
+    // set, so the snapshot and the shared git dir stay as their binds left
+    // them.
+    for entry in validator_read_deny_entries(inputs) {
+        let display = entry.path.display().to_string();
+        if entry.is_dir {
+            out.push("--tmpfs".to_string());
+            out.push(display);
+        } else {
+            out.push("--ro-bind".to_string());
+            out.push("/dev/null".to_string());
+            out.push(display);
+        }
     }
     out.push("--chdir".to_string());
     out.push(absolutize(&inputs.session_cwd).display().to_string());
@@ -2167,6 +2301,7 @@ mod tests {
 
     #[test]
     fn sandbox_profile_denies_authority_material_reads() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         let repo = tempfile::tempdir().unwrap();
         let mission = repo.path().join(".kranz").join("missions").join("m-x");
         std::fs::create_dir_all(&mission).unwrap();
@@ -2201,6 +2336,142 @@ mod tests {
         assert!(
             profile.contains("credentials.toml"),
             "profile missing read deny for cargo credentials:\n{profile}"
+        );
+        if let Some(global) = crate::paths::global_config() {
+            let global_dir = global.parent().unwrap();
+            for operation in ["(deny file-read*", "(deny file-write*"] {
+                for protected in [&global, global_dir] {
+                    assert!(
+                        profile.split(operation).skip(1).any(|block| {
+                            block
+                                .split("\n)\n")
+                                .next()
+                                .unwrap()
+                                .contains(&escape_sbpl_literal(protected))
+                        }),
+                        "missing {operation} rule for {}",
+                        protected.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_checkout_denies_authority_writes_and_future_sibling_inboxes() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let mission = root.join(".kranz/missions/m-current");
+        std::fs::create_dir_all(&mission).unwrap();
+        let config = root.join(".kranz/config.json");
+        let config_target = root.join("operator-config.json");
+        std::fs::write(&config_target, "original").unwrap();
+        std::os::unix::fs::symlink(&config_target, &config).unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = generate_profile(&inputs(&root, &mission, &scratch, vec![]));
+        // Create a sibling after generating the profile to cover future
+        // missions rather than relying on a spawn-time directory listing.
+        let sibling = root.join(".kranz/missions/m-later/control");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let run = |script: &str, path: &Path| {
+            Command::new("sandbox-exec")
+                .args(["-p", &profile, "/bin/sh", "-c", script, "audit"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let probe = run("exit 0", &root);
+        if !probe.status.success()
+            && String::from_utf8_lossy(&probe.stderr).contains("sandbox_apply")
+        {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        assert!(probe.status.success(), "{probe:?}");
+        for protected in [
+            config.clone(),
+            config_target.clone(),
+            sibling.join("forged.json"),
+            sibling.parent().unwrap().join("events.jsonl"),
+        ] {
+            assert!(
+                !run("printf forged > \"$1\"", &protected).status.success(),
+                "wrote {}",
+                protected.display()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(config).unwrap(), "original");
+        assert!(
+            !run("cat \"$1\"", &config_target).status.success(),
+            "the symlink's target must carry the same authority read denial"
+        );
+        assert!(!sibling.join("forged.json").exists());
+        assert!(
+            !run(
+                "ln \"$1/.kranz/config.json\" \"$1/authority-hardlink\"",
+                &root
+            )
+            .status
+            .success(),
+            "a hard link must not move authority outside the read deny"
+        );
+        assert!(
+            !run("mv \"$1/.kranz\" \"$1/moved-authority\"", &root)
+                .status
+                .success(),
+            "renaming the authority parent must not move it outside its deny rules"
+        );
+        assert!(run("printf feature > \"$1\"", &root.join("feature.txt"))
+            .status
+            .success());
+        assert!(run("printf scratch > \"$1\"", &scratch.join("work.txt"))
+            .status
+            .success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_global_authority_is_denied_when_created_after_profile() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_global_authority_is_denied_when_created_after_profile",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("operator");
+        let alias = root.join("operator-alias");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let session = root.join("session");
+        let mission = session.join(".kranz/missions/m-test");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&mission).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = {
+            let _env = crate::agent_env::EnvTestGuard::engage(&[("HOME", alias.to_str().unwrap())]);
+            generate_profile(&inputs(&session, &mission, &scratch, vec![home.clone()]))
+        };
+        let authority = home.join(".kranz/serve/later.token");
+        std::fs::create_dir_all(authority.parent().unwrap()).unwrap();
+        std::fs::write(&authority, "fake-authority").unwrap();
+        let output = std::process::Command::new("sandbox-exec")
+            .args(["-p", &profile, "/bin/sh", "-c",
+                "printf witness > \"$1/witness\" || exit 2; if cat \"$2\"; then exit 3; fi; if printf forged > \"$2\"; then exit 4; fi",
+                "test"])
+            .arg(&session).arg(&authority).output().unwrap();
+        if String::from_utf8_lossy(&output.stderr).contains("sandbox_apply") {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        assert!(output.status.success(), "{output:?}");
+        assert!(session.join("witness").exists());
+        assert_eq!(
+            std::fs::read_to_string(authority).unwrap(),
+            "fake-authority"
         );
     }
 
@@ -2322,15 +2593,19 @@ mod tests {
         .unwrap();
         let joined = args.join(" ");
 
-        let expected = format!("--ro-bind /dev/null {}", absolutize(&serve_token).display());
+        let expected = format!(
+            "--tmpfs {}",
+            absolutize(serve_token.parent().unwrap()).display()
+        );
         assert!(
             joined.contains(&expected),
-            "missing /dev/null mask for serve.token: {args:?}"
+            "missing private authority directory: {args:?}"
         );
-        // Absent files are not masked — bwrap requires the destination to exist.
+        // Neither existing nor future credentials get a bind back into it.
+        assert!(!joined.contains("serve.token"));
         assert!(
             !joined.contains("serve.read.token"),
-            "absent authority files must not be masked: {args:?}"
+            "future authority files must not get a host bind: {args:?}"
         );
     }
 
@@ -2562,19 +2837,28 @@ mod tests {
         .unwrap();
         let joined = args.join(" ");
 
-        for f in [&events, &state, &transcript, &denials] {
-            let expected = format!("--ro-bind /dev/null {}", absolutize(f).display());
+        for path in [&events, &state, &mission.join("runs")] {
+            let path = absolutize(path).display().to_string();
             assert!(
-                joined.contains(&expected),
-                "missing /dev/null mask for {}: {args:?}",
-                f.display()
+                joined.contains(&format!("--ro-bind-try {path} {path}")),
+                "metadata must remain read-only: {args:?}"
             );
         }
-        let control_abs = absolutize(&control).display().to_string();
+        let mission_abs = absolutize(&mission).display().to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == mission_abs));
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--tmpfs" && w[1] == control_abs),
-            "missing tmpfs shadow for control/: {args:?}"
+            !args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == absolutize(&control).display().to_string()
+                    && part[1] == part[2]
+            }),
+            "the control inbox must not be rebound into the private mission directory"
+        );
+        assert!(
+            !mission.join("state.json.tmp").exists(),
+            "argv construction must not create metadata"
         );
         // Absent metadata files are not masked (bwrap needs the destination
         // to exist).
@@ -2978,21 +3262,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
         let args = bubblewrap_args(&inputs, Path::new("/bin/true"), &[]).unwrap();
-        let mut masked: Vec<String> = Vec::new();
+        let masked: Vec<String> = authority_read_deny_paths(&inputs)
+            .iter()
+            .map(|path| absolutize(path).display().to_string())
+            .collect();
+        let kranz = absolutize(&repo.path().join(".kranz"))
+            .display()
+            .to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == kranz));
         let mut i = 0;
         while i + 2 < args.len() {
-            if args[i] == "--ro-bind" && args[i + 1] == "/dev/null" {
-                masked.push(args[i + 2].clone());
-            }
-            i += 1;
-        }
-        assert!(
-            masked.iter().any(|m| m.ends_with("serve.token")),
-            "serve.token must be masked: {args:?}"
-        );
-        let mut i = 0;
-        while i + 2 < args.len() {
-            if args[i] == "--ro-bind" && args[i + 1] == args[i + 2] {
+            if matches!(args[i].as_str(), "--ro-bind" | "--ro-bind-try")
+                && args[i + 1] == args[i + 2]
+            {
                 assert!(
                     !masked.contains(&args[i + 2]),
                     "{} is masked and must not be re-bound over itself",
@@ -4103,7 +4387,94 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries",
+        ) {
+            return;
+        }
+        if !bwrap_can_apply() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", home.path().to_str().unwrap())]);
+        let kranz = home.path().join(".kranz");
+        let mission = repo.path().join(".kranz/missions/m-mask-race");
+        std::fs::create_dir_all(&mission).unwrap();
+        let transient_dir = home.path().join("temporary-cache");
+        let transient_file = home.path().join("temporary-note");
+        let public = home.path().join("public.txt");
+        let authority_path = repo.path().join(".kranz/serve.token");
+        let late_authority_path = kranz.join("serve.read.token");
+        let writable = repo.path().join("result.txt");
+        std::fs::create_dir(&transient_dir).unwrap();
+        std::fs::write(&transient_file, "temporary").unwrap();
+        std::fs::write(&public, "public").unwrap();
+        std::fs::write(&authority_path, "secret").unwrap();
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "test ! -e \"$1\" && test ! -e \"$2\" \
+                 && test \"$(cat \"$3\")\" = public && ! touch \"$3\" \
+                 && test ! -e \"$4\" && test ! -e \"$5\" \
+                 && printf ok > \"$6\""
+                    .into(),
+                "mask-race".into(),
+                transient_dir.display().to_string(),
+                transient_file.display().to_string(),
+                public.display().to_string(),
+                authority_path.display().to_string(),
+                late_authority_path.display().to_string(),
+                writable.display().to_string(),
+            ],
+        )
+        .unwrap();
+        for path in [&transient_dir, &transient_file] {
+            let path = absolutize(path).display().to_string();
+            assert!(args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == path
+                    && part[2] == path
+            }));
+        }
+        // Deterministically reproduce deletion between enumeration and mount
+        // setup, while also creating authority that the private view must hide.
+        std::fs::remove_dir(&transient_dir).unwrap();
+        std::fs::remove_file(&transient_file).unwrap();
+        std::fs::create_dir(&kranz).unwrap();
+        std::fs::write(&late_authority_path, "late-secret").unwrap();
+        let output = std::process::Command::new("bwrap")
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "missing ordinary entries must stay hidden without breaking the sandbox: {output:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&writable).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(&public).unwrap(), "public");
+        assert_eq!(std::fs::read_to_string(&authority_path).unwrap(), "secret");
+        assert_eq!(
+            std::fs::read_to_string(&late_authority_path).unwrap(),
+            "late-secret"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_enforcement_linux_bwrap_masks_authority_material() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_enforcement_linux_bwrap_masks_authority_material",
+        ) {
+            return;
+        }
         use std::process::Command;
 
         if !bwrap_can_apply() {
@@ -4118,12 +4489,18 @@ mod tests {
         std::fs::write(&serve_token, "secret").unwrap();
         let public = repo.path().join("public.txt");
         std::fs::write(&public, "public").unwrap();
-        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+        let home = tempfile::tempdir().unwrap();
+        let authority_target = tempfile::tempdir().unwrap();
+        let alias = home.path().join(".kranz");
+        std::os::unix::fs::symlink(authority_target.path(), &alias).unwrap();
+        let config_target = authority_target.path().join("settings.json");
+        std::fs::write(&config_target, "config-secret").unwrap();
+        std::os::unix::fs::symlink(&config_target, repo.path().join(".kranz/config.json")).unwrap();
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", home.path().to_str().unwrap())]);
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![home.path().into()]);
 
-        // A /dev/null mask can surface as an empty successful read or EACCES,
-        // depending on the host's user-namespace/AppArmor policy. Both are a
-        // valid read-deny boundary; the public-file control below proves the
-        // child itself can still read ordinary repository content.
+        // The private directory has no authority entry at all.
         let masked = Command::new("bwrap")
             .args(
                 bubblewrap_args(
@@ -4136,9 +4513,56 @@ mod tests {
             .output()
             .expect("failed to run bwrap");
         assert!(
-            masked.stdout.is_empty(),
-            "serve.token content must be masked inside the sandbox: {}",
-            String::from_utf8_lossy(&masked.stdout)
+            !masked.status.success(),
+            "reading the hidden authority path must fail: {}",
+            String::from_utf8_lossy(&masked.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&masked.stdout).contains("secret"),
+            "serve.token content must be masked inside the sandbox"
+        );
+
+        let late = repo.path().join(".kranz/serve.read.token");
+        let args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/cat"),
+            &[late.display().to_string()],
+        )
+        .unwrap();
+        // Create the token after the mount policy has been resolved. The old
+        // existence-filtered file mask would have exposed this value.
+        std::fs::write(&late, "late-secret").unwrap();
+        let output = Command::new("bwrap").args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("late-secret"));
+
+        let host_view = format!("/proc/{}/root{}", std::process::id(), serve_token.display());
+        let output = Command::new("bwrap")
+            .args(bubblewrap_args(&inputs, Path::new("/bin/cat"), &[host_view]).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "host /proc roots must not bypass the namespace"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+
+        for (binary, path) in [("/bin/cat", &config_target), ("/bin/rm", &alias)] {
+            let output = Command::new("bwrap")
+                .args(
+                    bubblewrap_args(&inputs, Path::new(binary), &[path.display().to_string()])
+                        .unwrap(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "authority alias/target was exposed: {output:?}"
+            );
+        }
+        assert!(
+            alias.is_symlink(),
+            "the operator's authority alias was replaced"
         );
 
         let control = Command::new("bwrap")
@@ -4336,6 +4760,11 @@ mod tests {
             &mission,
             scratch.path(),
         ));
+        let read_rules: String = profile
+            .split("(deny file-read*")
+            .skip(1)
+            .map(|block| block.split("\n)\n").next().unwrap_or_default())
+            .collect();
 
         for base in [root.clone(), absolutize(&root)] {
             let src = format!("(subpath \"{}\")", escape_sbpl_literal(&base.join("src")));
@@ -4352,7 +4781,7 @@ mod tests {
             }
             let root_lit = format!("(literal \"{}\")", escape_sbpl_literal(&base));
             assert!(
-                !profile.contains(&root_lit),
+                !read_rules.contains(&root_lit),
                 "the root itself is deliberately NOT denied (a literal deny breaks \
                  coreutils `mkdir -p`, which stats every ancestor):\n{profile}"
             );
@@ -4360,12 +4789,12 @@ mod tests {
             // .kranz DIRS themselves (the closing quote makes this exact).
             let git_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".git")));
             assert!(
-                !profile.contains(&git_rule),
+                !read_rules.contains(&git_rule),
                 ".git must stay readable (the inspection's git surface):\n{profile}"
             );
             let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".kranz")));
             assert!(
-                !profile.contains(&kranz_rule),
+                !read_rules.contains(&kranz_rule),
                 ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
             );
         }
@@ -4414,6 +4843,11 @@ mod tests {
             &mission,
             scratch.path(),
         ));
+        let read_rules: String = profile
+            .split("(deny file-read*")
+            .skip(1)
+            .map(|block| block.split("\n)\n").next().unwrap_or_default())
+            .collect();
 
         let kranz = root.join(".kranz");
         for base in [kranz.clone(), absolutize(&kranz)] {
@@ -4449,7 +4883,7 @@ mod tests {
         for base in [kranz.clone(), absolutize(&kranz)] {
             let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base));
             assert!(
-                !profile.contains(&kranz_rule),
+                !read_rules.contains(&kranz_rule),
                 ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
             );
         }
@@ -4545,22 +4979,25 @@ mod tests {
         .unwrap();
         let joined = args.join(" ");
 
-        let terms = absolutize(&root.join(".kranz").join("domain-terms.local"))
-            .display()
-            .to_string();
+        let kranz = absolutize(&root.join(".kranz")).display().to_string();
         assert!(
-            joined.contains(&format!("--ro-bind /dev/null {terms}")),
-            "missing /dev/null mask for domain-terms.local: {args:?}"
+            joined.contains(&format!("--tmpfs {kranz}")) && !joined.contains("domain-terms.local"),
+            "the private authority directory must exclude domain-terms.local: {args:?}"
         );
         for dir in [
             root.join(".kranz").join("hook-status"),
             mission.join("control"),
         ] {
-            let shadow = absolutize(&dir).display().to_string();
+            let shadow = absolutize(dir.parent().unwrap()).display().to_string();
+            assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == shadow));
+            let denied = absolutize(&dir).display().to_string();
             assert!(
-                args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == shadow),
-                "missing tmpfs shadow for {}: {args:?}",
-                dir.display()
+                !args.windows(3).any(|part| {
+                    matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                        && part[1] == denied
+                        && part[2] == denied
+                }),
+                "denied directory must not be rebound: {args:?}"
             );
         }
     }
@@ -5056,9 +5493,14 @@ mod tests {
         if !bwrap_can_apply() {
             return;
         }
-        let Some((_dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
+        let Some((dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
             return;
         };
+        // An absent global authority directory makes its HOME the enclosing
+        // private view. Restoring the repo under that view must not reopen
+        // the validator's real-checkout read denies.
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", dir.path().to_str().unwrap())]);
         let scratch = tempfile::tempdir().unwrap();
         let inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
         let run = |command: &str| {

@@ -1079,16 +1079,19 @@ async fn run_shell_command_sandboxed_with_code(
             )
         }
     };
+    // The host runtime needs its own context/connection settings. The payload
+    // already received only the sanitized gate env as explicit container flags.
+    let client_env = match sandbox {
+        GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
+        _ => env,
+    };
     let (code, output) =
-        run_bounded_argv(cwd, &wrapped.program, &wrapped.args, timeout, &env).await;
+        run_bounded_argv(cwd, &wrapped.program, &wrapped.args, timeout, &client_env).await;
     if code.is_none() {
         if let Some((program, args)) = wrapped.timeout_teardown {
-            // Best-effort, bounded, off the async executor: a teardown
-            // failure (the runtime already reaped the container) is ignored.
-            let _ = tokio::task::spawn_blocking(move || {
-                run_with_timeout(&program, &args, Duration::from_secs(30))
-            })
-            .await;
+            // Reuse the exact client context that started this container.
+            let _ =
+                run_bounded_argv(cwd, &program, &args, Duration::from_secs(30), &client_env).await;
         }
     }
     (code, output)
@@ -2151,7 +2154,13 @@ mod tests {
     /// the gate cwd is an ANCESTOR of the mission dir.
     #[cfg(unix)]
     fn gate_wrap_layout() -> (tempfile::TempDir, std::path::PathBuf) {
-        let repo = tempfile::tempdir().unwrap();
+        gate_wrap_layout_with_repo(tempfile::tempdir().unwrap())
+    }
+
+    #[cfg(unix)]
+    fn gate_wrap_layout_with_repo(
+        repo: tempfile::TempDir,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let kranz_dir = repo.path().join(".kranz");
         let mission = kranz_dir.join("missions").join("m-gate");
         std::fs::create_dir_all(mission.join("runs")).unwrap();
@@ -2907,6 +2916,83 @@ mod tests {
         );
     }
 
+    /// The fake runtime records launch and teardown context without a daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_gate_runtime_context_survives_timeout_without_worker_or_ambient_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("operator");
+        let scratch = fixture.path().join("worker");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let stub = fixture.path().join("docker");
+        std::fs::write(&stub, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$DOCKER_HOST\" \"${{GH_TOKEN-unset}}\" > '{}/'$1.env\nprintf '%s\\n' \"$@\" > '{}/'$1.args\nif [ \"$1\" = run ]; then sleep 30; fi\n",
+            fixture.path().display(), fixture.path().display(),
+        )).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!(
+            "{}:{}",
+            fixture.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("PATH", &path),
+            ("HOME", home.to_str().unwrap()),
+            ("DOCKER_HOST", "unix:///operator-context.sock"),
+            ("GH_TOKEN", "host-secret"),
+        ]);
+        let sandbox = GateSandbox::Container {
+            inputs: Box::new(crate::sandbox::SandboxInputs {
+                enforce: crate::types::SandboxEnforce::Fs,
+                session_cwd: scratch.clone(),
+                mission_dir: scratch.join("mission"),
+                tmpdir: scratch.clone(),
+                extra_write: vec![],
+                egress: vec![],
+                validator_read_deny_roots: vec![],
+            }),
+            spec: crate::sandbox_container::ContainerSpec {
+                runtime: crate::sandbox_container::ContainerRuntime::Docker,
+                image: "fixture".to_string(),
+                network: None,
+                name: None,
+            },
+        };
+        let env = HashMap::from([
+            ("HOME".to_string(), scratch.display().to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "unix:///worker-request.sock".to_string(),
+            ),
+            ("WORKER_SENTINEL".to_string(), "allowed".to_string()),
+        ]);
+        let (code, output) = run_shell_command_sandboxed_with_code(
+            &scratch,
+            "true",
+            Duration::from_millis(500),
+            &env,
+            &sandbox,
+        )
+        .await;
+        assert_eq!(
+            code, None,
+            "the fixture must exercise timeout cleanup: {output}"
+        );
+        for action in ["run", "rm"] {
+            assert_eq!(
+                std::fs::read_to_string(fixture.path().join(format!("{action}.env"))).unwrap(),
+                format!("{}\nunix:///operator-context.sock\nunset\n", home.display())
+            );
+        }
+        let args = std::fs::read_to_string(fixture.path().join("run.args")).unwrap();
+        assert!(args.contains("WORKER_SENTINEL=allowed"));
+        assert!(args.contains("DOCKER_HOST=unix:///worker-request.sock"));
+        assert!(!args.contains("host-secret"));
+    }
+
     /// The ticket's core test gate: a contract command run under
     /// `enforce != off` provably executes INSIDE the profile. A write outside
     /// the allowlist (a sibling temp dir, and a file directly in the SHARED
@@ -3132,6 +3218,13 @@ mod tests {
 
         let pidfile = scratch.path().join("child.pid");
         let command = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        #[cfg(target_os = "linux")]
+        let namespace_file = scratch.path().join("child.pid-namespace");
+        #[cfg(target_os = "linux")]
+        let command = format!(
+            "readlink /proc/self/ns/pid > '{}'; {command}",
+            namespace_file.display()
+        );
         let (code, output) = tokio::time::timeout(
             Duration::from_secs(15),
             run_shell_command_sandboxed_with_code(
@@ -3152,8 +3245,26 @@ mod tests {
             .trim()
             .parse()
             .expect("pidfile contains a pid");
+        #[cfg(target_os = "linux")]
+        let namespace = std::fs::read_to_string(namespace_file).unwrap();
+        let child_alive = || {
+            #[cfg(target_os = "linux")]
+            {
+                // $! is namespace-local after bwrap's --unshare-pid. Inspect
+                // the namespace from the host instead of treating that small
+                // integer as an unrelated host PID (often PID 2).
+                std::fs::read_dir("/proc").unwrap().flatten().any(|entry| {
+                    std::fs::read_link(entry.path().join("ns/pid"))
+                        .is_ok_and(|link| link.to_string_lossy() == namespace.trim())
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                (unsafe { libc::kill(pid, 0) }) == 0
+            }
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while unsafe { libc::kill(pid, 0) } == 0 {
+        while child_alive() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "background child {pid} survived the group kill through the sandbox wrapper"
@@ -3777,7 +3888,9 @@ mod tests {
     /// contention, and this test spawns only the container runtime.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn container_gate_wrap_runs_contract_command_inside_the_container() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         if !crate::sandbox_container::host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
@@ -3793,9 +3906,13 @@ mod tests {
             return;
         }
 
-        let (repo, mission) = gate_wrap_layout();
+        // Only live container fixtures need a VM-shared path. Native gate
+        // fixtures stay outside the checkout so Git cannot discover its config.
+        let (repo, mission) = gate_wrap_layout_with_repo(
+            tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap(),
+        );
         let kranz_dir = repo.path().join(".kranz");
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let outside = tempfile::tempdir().unwrap();
         let container_cfg = crate::types::SandboxConfig {
             enforce: crate::types::SandboxEnforce::Fs,

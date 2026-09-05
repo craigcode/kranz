@@ -202,6 +202,15 @@ impl EventRenderer {
                 ansi::BLUE,
                 "started".to_string(),
             ),
+            EventKind::FeatureProgress {
+                feature_id,
+                commits,
+                ..
+            } => (
+                format!("feature {feature_id}"),
+                ansi::DIM,
+                format!("recorded {} cumulative commit(s)", commits.len()),
+            ),
             EventKind::WorkerSpawned {
                 run_id,
                 role,

@@ -283,3 +283,167 @@ fn non_terminal_statuses_map_to_failure() {
         assert_eq!(exit_code_for(status), 1, "status {status:?}");
     }
 }
+
+/// SIGINT must unwind the running mission instead of exiting while its
+/// separately grouped backend and tool subprocess continue changing files.
+#[cfg(unix)]
+#[test]
+fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command as Process, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let authority = dir.path().join("authority");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&authority).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.name", "kranz-test"],
+        vec!["config", "user.email", "test@kranz.local"],
+    ] {
+        assert!(Process::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(repo.join("README.md"), "# Interrupt fixture\n").unwrap();
+    assert!(Process::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Process::new("git")
+        .args(["commit", "-qm", "seed"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    let ticket = dir.path().join("mission.md");
+    std::fs::write(
+        &ticket,
+        "---\ntitle: Interrupt fixture\n---\n\n## Goal\nImplement a fixture.\n",
+    )
+    .unwrap();
+    let pids = dir.path().join("pids.json");
+    let fake = dir.path().join("claude");
+    std::fs::write(&fake, format!(
+        "#!/usr/bin/env python3\nimport json,os,pathlib,subprocess,sys,time\nif '--version' in sys.argv:\n print('2.1.0 (Claude Code)'); sys.exit(0)\nchild=subprocess.Popen(['sleep','300'])\npathlib.Path({:?}).write_text(json.dumps([os.getpid(),child.pid]))\ntime.sleep(300)\n",
+        pids.to_str().unwrap()
+    )).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        authority.join("config.json"),
+        serde_json::json!({"claudeBinary":fake}).to_string(),
+    )
+    .unwrap();
+    let child = Process::new(env!("CARGO_BIN_EXE_kranz"))
+        .args([
+            "--repo",
+            repo.to_str().unwrap(),
+            "exec",
+            "-f",
+            ticket.to_str().unwrap(),
+        ])
+        .env("KRANZ_HOME", &authority)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Cleanup {
+        child: std::process::Child,
+        pids: std::path::PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Ok(bytes) = std::fs::read(&self.pids) {
+                if let Ok(ids) = serde_json::from_slice::<Vec<u32>>(&bytes) {
+                    let _ = Process::new("sh")
+                        .args([
+                            "-c",
+                            "kill -s KILL -- \"$1\"",
+                            "kranz-test",
+                            &format!("-{}", ids[0]),
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
+    }
+    let mut running = Cleanup {
+        child,
+        pids: pids.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let ids: Vec<u32> = loop {
+        if let Ok(bytes) = std::fs::read(&pids) {
+            if let Ok(ids) = serde_json::from_slice(&bytes) {
+                break ids;
+            }
+        }
+        assert!(
+            running.child.try_wait().unwrap().is_none(),
+            "CLI exited before starting the fixture"
+        );
+        assert!(Instant::now() < deadline, "fixture backend did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // POSIX shells provide kill even on minimal hosts without /bin/kill.
+    assert!(Process::new("sh")
+        .args([
+            "-c",
+            "kill -s INT \"$1\"",
+            "kranz-test",
+            &running.child.id().to_string(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = running.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "CLI did not exit after SIGINT");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+    for pid in ids {
+        while Process::new("sh")
+            .args(["-c", "kill -0 \"$1\"", "kranz-test", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "backend/tool process {pid} survived SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // The groups are gone; do not signal their numeric ids again on drop.
+    std::fs::remove_file(&pids).unwrap();
+    let missions = std::fs::read_dir(repo.join(".kranz/missions")).unwrap();
+    let mission = missions
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    assert!(mission.join("events.jsonl").is_file());
+    assert!(
+        !mission.join("events.jsonl.lock").exists(),
+        "interruption retained the writer lock"
+    );
+}

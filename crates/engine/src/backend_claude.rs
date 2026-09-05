@@ -509,6 +509,8 @@ pub fn parse_stream_line(line: &str) -> Vec<AgentEvent> {
 }
 
 /// Map one parsed stream-json value to events (see module docs / fixture).
+/// This stateless parser preserves protocol costs; live streaming sessions
+/// normalize cumulative costs before delivering events to the engine.
 pub fn parse_stream_value(value: Value) -> Vec<AgentEvent> {
     let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
     match line_type {
@@ -1025,6 +1027,7 @@ impl AgentBackend for ClaudeBackend {
             assistant_ids: HashSet::new(),
             saw_result: false,
             saw_success_result: false,
+            accounted_cost_usd: 0.0,
             exit: None,
         }))
     }
@@ -1042,6 +1045,17 @@ pub(crate) fn kill_group(pgid: i32) -> bool {
     // SAFETY: kill(2) takes a pid and a signal number; no pointers or shared
     // state are involved. A negative pid targets the whole process group.
     unsafe { libc::kill(-pgid, libc::SIGKILL) == 0 }
+}
+
+/// Future cancellation can drop a session without reaching async abort.
+/// A reaped Child has no id, so this never signals a recycled leader pid.
+#[cfg(unix)]
+pub(crate) fn kill_unreaped_group(child: &Child) {
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        if pid > 0 {
+            kill_group(pid);
+        }
+    }
 }
 
 /// A live `claude` CLI session (the [`AgentSession`] impl).
@@ -1076,20 +1090,67 @@ pub struct ClaudeSession {
     assistant_ids: HashSet<String>,
     saw_result: bool,
     saw_success_result: bool,
+    /// Streaming result costs are cumulative; usage tokens are per turn.
+    accounted_cost_usd: f64,
     exit: Option<SessionExit>,
+}
+
+#[cfg(unix)]
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        kill_unreaped_group(&self.child);
+    }
 }
 
 impl ClaudeSession {
     /// Record bookkeeping the session derives from its own event stream.
-    fn observe(&mut self, event: &AgentEvent) {
+    fn observe(&mut self, event: &mut AgentEvent) {
         match event {
             AgentEvent::Init { session_id, .. } => {
+                if self.session_id != *session_id {
+                    self.accounted_cost_usd = 0.0;
+                }
                 self.session_id = session_id.clone();
             }
-            AgentEvent::Result { is_error, .. } => {
+            AgentEvent::Result {
+                is_error,
+                cost_usd,
+                raw,
+                ..
+            } => {
+                if self.streaming {
+                    // A conversation reset changes the session id. A new
+                    // process (including --resume) starts with a zero ledger.
+                    if let Some(id) = raw.get("session_id").and_then(Value::as_str) {
+                        if id != self.session_id {
+                            self.accounted_cost_usd = 0.0;
+                            self.session_id = id.to_string();
+                        }
+                    }
+                    if let Some(total) = *cost_usd {
+                        *cost_usd = if total.is_finite() && total >= 0.0 {
+                            let delta = (total - self.accounted_cost_usd).max(0.0);
+                            // Crashes may report zero: retain the high-water
+                            // mark so earlier spend is never counted twice.
+                            self.accounted_cost_usd = self.accounted_cost_usd.max(total);
+                            Some(delta)
+                        } else {
+                            None
+                        };
+                    }
+                }
                 self.saw_result = true;
-                if !is_error {
+                if !*is_error {
                     self.saw_success_result = true;
+                }
+            }
+            AgentEvent::Other { raw }
+                if raw.get("type").and_then(Value::as_str) == Some("system")
+                    && raw.get("subtype").and_then(Value::as_str) == Some("conversation_reset") =>
+            {
+                self.accounted_cost_usd = 0.0;
+                if let Some(id) = raw.get("session_id").and_then(Value::as_str) {
+                    self.session_id = id.to_string();
                 }
             }
             _ => {}
@@ -1270,8 +1331,8 @@ impl AgentSession for ClaudeSession {
                 self.exit = Some(SessionExit::Aborted);
                 continue; // queue is empty here → next iteration returns None
             }
-            let events = parse_stream_value(value);
-            for event in &events {
+            let mut events = parse_stream_value(value);
+            for event in &mut events {
                 self.observe(event);
             }
             self.queue.extend(events);

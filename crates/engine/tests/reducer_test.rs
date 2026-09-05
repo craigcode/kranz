@@ -431,6 +431,220 @@ fn duplicate_fixfeature_rejects_a_failed_feature_with_commits() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn feature_progress_pins_baseline_and_retains_receipts_on_failure() {
+    let mut state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: "ms-1".into(),
+                feature: fix_feature("repair"),
+            },
+        ),
+        ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "repair".into(),
+            },
+        ),
+        ev(
+            5,
+            EventKind::FeatureProgress {
+                feature_id: "repair".into(),
+                base_sha: "base".into(),
+                commits: vec!["abc first attempt".into()],
+            },
+        ),
+        ev(
+            6,
+            EventKind::FeatureProgress {
+                feature_id: "repair".into(),
+                base_sha: "base".into(),
+                commits: vec!["abc".into(), "def second attempt".into()],
+            },
+        ),
+    ])
+    .unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    let repin = apply(
+        &mut state,
+        &ev(
+            7,
+            EventKind::FeatureProgress {
+                feature_id: "repair".into(),
+                base_sha: "replacement".into(),
+                commits: vec![],
+            },
+        ),
+    );
+    assert!(repin.is_err());
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    apply(
+        &mut state,
+        &ev(
+            7,
+            EventKind::FeatureFailed {
+                feature_id: "repair".into(),
+                reason: "last attempt failed".into(),
+                commits: vec![],
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        feature(&state, "repair").commits,
+        ["abc first attempt", "def second attempt"]
+    );
+    let mut revised = fix_feature("repair");
+    revised.title = "replacement proposal".into();
+    assert!(
+        apply(
+            &mut state,
+            &ev(
+                8,
+                EventKind::FixFeatureCreated {
+                    milestone_id: "ms-1".into(),
+                    feature: revised,
+                }
+            )
+        )
+        .is_err(),
+        "retained work prevents implicit supersession"
+    );
+    assert!(
+        apply(
+            &mut state,
+            &ev(
+                8,
+                EventKind::FeatureProgress {
+                    feature_id: "repair".into(),
+                    base_sha: "base".into(),
+                    commits: vec!["ghi".into()],
+                }
+            )
+        )
+        .is_err(),
+        "a terminal feature cannot acquire progress"
+    );
+}
+
+#[test]
+fn feature_progress_baseline_clears_only_on_commitless_supersession() {
+    let mut revised = fix_feature("repair");
+    revised.title = "replacement proposal".into();
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FixFeatureCreated {
+                milestone_id: "ms-1".into(),
+                feature: fix_feature("repair"),
+            },
+        ),
+        ev(
+            4,
+            EventKind::FeatureStarted {
+                feature_id: "repair".into(),
+            },
+        ),
+        ev(
+            5,
+            EventKind::FeatureProgress {
+                feature_id: "repair".into(),
+                base_sha: "old".into(),
+                commits: vec![],
+            },
+        ),
+        ev(
+            6,
+            EventKind::FeatureFailed {
+                feature_id: "repair".into(),
+                reason: "no work".into(),
+                commits: vec![],
+            },
+        ),
+        ev(
+            7,
+            EventKind::FixFeatureCreated {
+                milestone_id: "ms-1".into(),
+                feature: revised,
+            },
+        ),
+        ev(
+            8,
+            EventKind::FeatureStarted {
+                feature_id: "repair".into(),
+            },
+        ),
+        ev(
+            9,
+            EventKind::FeatureProgress {
+                feature_id: "repair".into(),
+                base_sha: "new".into(),
+                commits: vec!["abc work".into()],
+            },
+        ),
+        ev(
+            10,
+            EventKind::FeatureCompleted {
+                feature_id: "repair".into(),
+                commits: vec!["abc work".into()],
+            },
+        ),
+    ])
+    .unwrap();
+    assert_eq!(state.feature_base_shas["repair"], "new");
+    assert_eq!(feature(&state, "repair").commits, ["abc work"]);
+}
+
+#[test]
+fn legacy_fold_omits_feature_baselines_and_keeps_existing_receipts() {
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::FeatureStarted {
+                feature_id: "f-1-1".into(),
+            },
+        ),
+        ev(
+            4,
+            EventKind::FeatureCompleted {
+                feature_id: "f-1-1".into(),
+                commits: vec!["abc first".into(), "abc".into()],
+            },
+        ),
+    ])
+    .unwrap();
+    let json = serde_json::to_value(&state).unwrap();
+    assert!(json.get("featureBaseShas").is_none());
+    let restored: MissionState = serde_json::from_value(json).unwrap();
+    assert!(restored.feature_base_shas.is_empty());
+    assert_eq!(feature(&restored, "f-1-1").commits, ["abc first", "abc"]);
+}
+
+#[test]
 fn golden_happy_path() {
     // Stage 1: created.
     let e1 = ev(1, created());

@@ -646,6 +646,13 @@ pub struct KimiSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for KimiSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl KimiSession {
     fn observe(&mut self, event: &AgentEvent) {
         match event {

@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-05
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - crates/engine/src/control.rs
@@ -82,6 +82,10 @@ Since the 2026-09-01 adversarial audit the log is also **sealed**. Every line a
 keyed writer produces carries `h` (a sha256 chain over the previous `h` and the
 event's canonical bytes) and `m` (an HMAC of `h` under the repository authority
 key); `parse_log_bytes` verifies both, so every reader inherits the check.
+New seals carry `v:2` and bind that version through the
+`kranz.event-log.v2\n` hash prefix. They use exact float parsing and sorted
+object keys. Versionless seals retain the legacy parser and hash format;
+never relax a failed hash or re-sign old evidence to make an upgrade pass.
 Unsealed lines are refused at or above the mission's out-of-repo seal floor,
 integrity may never be dropped mid-log, and `resume` refuses a log that ends
 below the recorded high-water mark. WHY: three gate decisions read the log back
@@ -111,7 +115,10 @@ that cover its directory. A key an agent can read or replace proves nothing.
 
 `GitRepo::open` ([git_ops.rs](../../../crates/engine/src/git_ops.rs)) returns a
 handle that neutralizes executable git configuration (hooks, `core.fsmonitor`,
-filter drivers, `gpg.program`) and ignores user and system config scope.
+filter drivers, custom merge drivers, `gpg.program`) and ignores user and
+system config scope for local operations. Engine diffs also disable external
+diff programs and text converters. Protected handles are refreshed after a
+worker returns, before its output is inspected.
 `open_unhardened` is the explicit escape hatch, with no engine caller, and
 `ensure_identity` pins the operator's resolved `user.name`/`user.email` into
 local scope so hardened invocations do not restamp commits.
@@ -185,6 +192,10 @@ untouched (AGENTS.md rules 1–3).
   unconditionally; the container tier carries the relay's `--user`,
   `--cap-drop ALL`, `no-new-privileges` and `--pids-limit`, and mounts only the
   Cargo cache subdirs rather than the credential-bearing `$CARGO_HOME` root.
+  Mount-backed sandboxes use private read-only authority directory views,
+  preserving allowed policy entries while hiding token/config files created
+  or atomically replaced after launch. Seatbelt also pins authority ancestors
+  against renames that would move protected files outside their path denies.
   WHY: under `workerIsolation: "checkout"` the session cwd is the repo root, so
   a contained worker could once overwrite the trust root it could not read, or
   forge approvals into a sibling mission's inbox (the 2026-09-01 adversarial

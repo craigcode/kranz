@@ -1320,6 +1320,207 @@ fn the_writer_seals_every_line_and_readers_accept_it() {
     assert!(matches!(&events[0].kind, EventKind::MissionCreated { goal, .. } if goal == "one"));
 }
 
+#[test]
+fn fractional_costs_keep_their_bits_and_integrity_across_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    kranz_engine::paths::load_or_create_authority_key(tmp.path()).unwrap();
+    let p = paths(tmp.path());
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    // Two live cost values exposed a lossy JSON parse between hashing and
+    // writing. Include adjacent floats, scientific notation, and signed zero.
+    let mut costs = vec![-0.0, f64::MIN_POSITIVE, 1e-100, 1e100, f64::MAX];
+    for value in [0.3917785_f64, 0.095758_f64] {
+        for bits in value.to_bits() - 2..=value.to_bits() + 2 {
+            costs.push(f64::from_bits(bits));
+        }
+    }
+    for &cost in &costs {
+        log.append(EventKind::WorkerCompleted {
+            run_id: "r-cost".into(),
+            result: kranz_engine::types::RunResult::Pass,
+            tokens: kranz_engine::types::TokenUsage::default(),
+            cost_usd: Some(cost),
+            report: None,
+        })
+        .unwrap();
+    }
+    drop(log);
+
+    let events = EventLog::read_events(&p.events_file()).unwrap();
+    assert_eq!(events.len(), costs.len());
+    for (event, cost) in events.iter().zip(costs) {
+        let EventKind::WorkerCompleted {
+            cost_usd: Some(observed),
+            ..
+        } = &event.kind
+        else {
+            panic!("unexpected event: {event:?}");
+        };
+        assert_eq!(observed.to_bits(), cost.to_bits());
+    }
+    let mut reopened = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    reopened.append(lifecycle("after reopen")).unwrap();
+    drop(reopened);
+    assert_eq!(
+        EventLog::read_events(&p.events_file()).unwrap().len(),
+        events.len() + 1
+    );
+
+    // Correct float parsing must not make altered costs acceptable.
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    let changed = raw.replacen("\"costUsd\":-0.0", "\"costUsd\":0.5", 1);
+    assert_ne!(raw, changed);
+    std::fs::write(p.events_file(), changed).unwrap();
+    assert!(matches!(
+        EventLog::read_events(&p.events_file()),
+        Err(EngineError::LogCorruption(_))
+    ));
+}
+
+#[test]
+fn legacy_float_seals_still_read_and_accept_versioned_appends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = kranz_engine::paths::load_or_create_authority_key(tmp.path()).unwrap();
+    let p = paths(tmp.path());
+    // Independently reproduced with serde_json 1.0.151's default parser:
+    // writing original produces stored, then reading stored recovers original.
+    let original = 4.613131942124616e-9_f64;
+    let stored = 4.6131319421246164e-9_f64;
+    let mut previous = String::new();
+    let mut lines = Vec::new();
+    for (index, kind) in [
+        EventKind::WorkerCompleted {
+            run_id: "r-legacy".into(),
+            result: kranz_engine::types::RunResult::Pass,
+            tokens: kranz_engine::types::TokenUsage::default(),
+            cost_usd: Some(original),
+            report: None,
+        },
+        EventKind::ConfigChanged {
+            patch: serde_json::json!({"thresholds": [original], "count": 7, "label": "0.095758"}),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event = Event {
+            seq: index as u64 + 1,
+            ts: Utc::now(),
+            mission_id: MISSION.into(),
+            kind,
+        };
+        let body = serde_json::to_string(&event).unwrap();
+        let hash =
+            kranz_engine::standards_waiver::sha256_hex(format!("{previous}{body}").as_bytes());
+        let mut value = serde_json::to_value(&event).unwrap();
+        if index == 0 {
+            value["payload"]["costUsd"] = stored.into();
+        } else {
+            value["payload"]["patch"]["thresholds"][0] = stored.into();
+        }
+        value["h"] = hash.clone().into();
+        value["m"] = kranz_engine::hooks::hmac_sha256_hex(&key, hash.as_bytes()).into();
+        lines.push(serde_json::to_string(&value).unwrap());
+        previous = hash;
+    }
+    write_raw_log(&p.events_file(), &lines);
+    let legacy_bytes = std::fs::read(p.events_file()).unwrap();
+    for events in [
+        EventLog::read_events(&p.events_file()).unwrap(),
+        EventLog::read_tail_events(&p.events_file(), u64::MAX).unwrap(),
+    ] {
+        assert!(
+            matches!(events[0].kind, EventKind::WorkerCompleted { cost_usd: Some(cost), .. } if cost.to_bits() == original.to_bits())
+        );
+        let EventKind::ConfigChanged { patch } = &events[1].kind else {
+            panic!("wrong event")
+        };
+        assert_eq!(
+            patch["thresholds"][0].as_f64().unwrap().to_bits(),
+            original.to_bits()
+        );
+        assert_eq!(patch["count"].as_u64(), Some(7));
+        assert_eq!(patch["label"].as_str(), Some("0.095758"));
+    }
+    let mut reopened = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    reopened.append(lifecycle("new writer")).unwrap();
+    drop(reopened);
+    assert_eq!(EventLog::read_events(&p.events_file()).unwrap().len(), 3);
+    let bytes = std::fs::read(p.events_file()).unwrap();
+    assert!(
+        bytes.starts_with(&legacy_bytes),
+        "upgrade must not rewrite legacy evidence"
+    );
+    let last: serde_json::Value = serde_json::from_slice(
+        bytes
+            .split(|b| *b == b'\n')
+            .rfind(|line| !line.is_empty())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["v"], 2);
+}
+
+#[test]
+fn versioned_seals_refuse_numeric_downgrades_and_unknown_versions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = paths(tmp.path());
+    let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
+    log.append(EventKind::WorkerCompleted {
+        run_id: "r-version".into(),
+        result: kranz_engine::types::RunResult::Pass,
+        tokens: kranz_engine::types::TokenUsage::default(),
+        cost_usd: Some(4.613131942124616e-9),
+        report: None,
+    })
+    .unwrap();
+    drop(log);
+    let raw = std::fs::read_to_string(p.events_file()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["v"], 2);
+    for version in [
+        None,
+        Some(serde_json::json!(1)),
+        Some(serde_json::json!(3)),
+        Some(serde_json::json!(2.0)),
+        Some(serde_json::json!("2")),
+    ] {
+        let mut changed = value.clone();
+        match version {
+            None => {
+                changed.as_object_mut().unwrap().remove("v");
+            }
+            Some(version) => {
+                changed["v"] = version;
+            }
+        }
+        // Under the old parser this adjacent float maps to the original.
+        // A v2 seal must not accept that interpretation after losing its tag.
+        changed["payload"]["costUsd"] = serde_json::json!(4.6131319421246164e-9);
+        std::fs::write(
+            p.events_file(),
+            serde_json::to_string(&changed).unwrap() + "\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            EventLog::read_events(&p.events_file()),
+            Err(EngineError::LogCorruption(_))
+        ));
+    }
+    let mut unsealed = value;
+    unsealed.as_object_mut().unwrap().remove("h");
+    unsealed.as_object_mut().unwrap().remove("m");
+    std::fs::write(
+        p.events_file(),
+        serde_json::to_string(&unsealed).unwrap() + "\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        EventLog::read_events(&p.events_file()),
+        Err(EngineError::LogCorruption(_))
+    ));
+}
+
 /// The H1/H6 attack: append a well-formed event with the next seq and the
 /// mission's own id. Before the chain, `resume` folded it as truth.
 #[test]

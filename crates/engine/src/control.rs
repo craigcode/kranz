@@ -650,6 +650,38 @@ mod tests {
     }
 
     #[test]
+    fn signed_fractional_config_values_keep_their_bits() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-fractional");
+        let costs = [
+            0.3917785_f64,
+            f64::from_bits(0.3917785_f64.to_bits() + 1),
+            0.095758,
+        ];
+        for cost in costs {
+            enqueue(
+                &paths,
+                &ControlCommand::ConfigChange {
+                    patch: serde_json::json!({"worker": {"maxBudgetUsd": cost}}),
+                },
+            )
+            .unwrap();
+        }
+        let drained = drain(&paths).unwrap();
+        assert_eq!(drained.len(), costs.len());
+        for ((_, command), expected) in drained.iter().zip(costs) {
+            let ControlCommand::ConfigChange { patch } = command else {
+                panic!("wrong command")
+            };
+            assert_eq!(
+                patch["worker"]["maxBudgetUsd"].as_f64().unwrap().to_bits(),
+                expected.to_bits()
+            );
+        }
+        assert!(quarantined(&paths).is_empty());
+    }
+
+    #[test]
     fn a_signature_from_another_mission_does_not_transfer() {
         // The mission id is inside the signed payload, so lifting a valid
         // file out of mission A's inbox into mission B's must not carry the

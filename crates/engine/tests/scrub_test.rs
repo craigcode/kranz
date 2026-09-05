@@ -15,6 +15,138 @@ const MARKER: &str = "[REDACTED]";
 const TRUNCATED: &str = "… [truncated]";
 
 #[test]
+fn python_suite_headers_are_not_credential_assignments() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "if supplied != VALID_TOKEN:\n    self._send_json(403, {})\n";
+    std::fs::write(dir.path().join("handler.py"), source).unwrap();
+    assert!(kranz_engine::scrub::scan_paths(dir.path(), &[Path::new("handler.py")]).is_empty());
+    // This refinement belongs to Python source; generic text/data keeps its
+    // conservative interpretation rather than silently changing all callers.
+    assert!(!scan_text(source).is_empty());
+}
+
+#[test]
+fn python_suite_scan_keeps_following_credentials_and_original_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "password";
+    let credential = ["Sensitive", "Value", "123456"].concat();
+    let vendor = ["sk-ant-api03-", "CredentialMaterial123456"].concat();
+    let source = format!("# café\nif VALID_TOKEN:\n    {key} = \"{credential}\"\nelif other == \"{vendor}\":\n    pass\n");
+    std::fs::write(dir.path().join("handler.py"), &source).unwrap();
+    let findings = kranz_engine::scrub::scan_paths(dir.path(), &[Path::new("handler.py")]);
+    assert!(findings
+        .iter()
+        .any(|f| source[f.start..f.end] == credential));
+    assert!(findings.iter().any(|f| source[f.start..f.end] == vendor));
+    assert_eq!(findings.len(), 2, "{findings:?}");
+}
+
+#[test]
+fn source_scan_keeps_multiline_json_yaml_and_python_dictionary_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "password";
+    let credential = ["Sensitive", "Value", "123456"].concat();
+    for (name, source) in [
+        ("config.json", format!("{{\"{key}\":\n\"{credential}\"}}")),
+        ("config.yaml", format!("{key}:\n  {credential}\n")),
+        (
+            "config.py",
+            format!("config = {{\"{key}\":\n\"{credential}\"}}\n"),
+        ),
+    ] {
+        std::fs::write(dir.path().join(name), &source).unwrap();
+        let findings = kranz_engine::scrub::scan_paths(dir.path(), &[Path::new(name)]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| source[f.start..f.end] == credential),
+            "{name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn finding_diagnostics_do_not_redact_their_own_file_location() {
+    let input = format!("Bearer {}", ["Synthetic", "Credential", "123456"].concat());
+    let findings = scan_text_at(&input, "tests/test_server.py:53");
+    assert_eq!(findings.len(), 1);
+    let diagnostic = kranz_engine::scrub::format_findings(&findings);
+    assert!(diagnostic.contains("[authorization-bearer] tests/test_server.py:53"));
+    assert_eq!(scrub(&diagnostic), diagnostic);
+}
+
+#[test]
+fn scrub_preserves_escaped_json_decisions_and_nested_transcripts() {
+    let reason = format!(
+        "Review {} = _extract_bearer_token(self.headers.get(\"Authorization\")) before resuming.",
+        "token"
+    );
+    let decision = serde_json::json!({
+        "action": "unblock-add-fix",
+        "reason": reason
+    });
+    let reply = serde_json::to_string(&decision).unwrap();
+    for text in [
+        reply.clone(),
+        format!("Decision follows.\n```json\n{reply}\n```\n"),
+    ] {
+        let redacted = scrub(&text);
+        let parsed: serde_json::Value = kranz_engine::runner::parse_decision(&redacted)
+            .expect("redaction must not corrupt the decision's JSON escaping");
+        assert_eq!(parsed["action"], "unblock-add-fix");
+        assert!(parsed["reason"].as_str().unwrap().contains(MARKER));
+        assert_eq!(scrub(&redacted), redacted, "redaction must be idempotent");
+    }
+    let transcript = serde_json::json!({"result": reply});
+    let redacted = scrub(&transcript.to_string());
+    let outer: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+    let inner: serde_json::Value = serde_json::from_str(outer["result"].as_str().unwrap()).unwrap();
+    assert_eq!(inner["action"], "unblock-add-fix");
+    assert!(inner["reason"].as_str().unwrap().contains(MARKER));
+}
+
+#[test]
+fn scrub_json_keeps_credential_context_and_decodes_escaped_secrets() {
+    let value = ["Credential", "Value", "123456"].concat();
+    let field = "password";
+    let token_field = "token";
+    let input = serde_json::json!({(field): value, "nested": [{(token_field): value}], "ok": true});
+    let out: serde_json::Value = serde_json::from_str(&scrub(&input.to_string())).unwrap();
+    assert_eq!(out["password"], MARKER);
+    assert_eq!(out["nested"][0]["token"], MARKER);
+    assert_eq!(out["ok"], true);
+
+    let escaped = format!(r#"{{"{field}":"\u0043{}"}}"#, &value[1..]);
+    let out: serde_json::Value = serde_json::from_str(&scrub(&escaped)).unwrap();
+    assert_eq!(out["password"], MARKER);
+    let plain = "  { \"action\": \"continue\", \"nested\": [true, 3] }\n";
+    assert_eq!(scrub(plain), plain, "secret-free JSON stays byte-identical");
+    let number = 123456789012345u64;
+    let numeric = format!(r#"{{"{field}":{number},"count":{number}}}"#);
+    let out: serde_json::Value = serde_json::from_str(&scrub(&numeric)).unwrap();
+    assert_eq!(out["password"], MARKER);
+    assert_eq!(out["count"], 123456789012345u64);
+}
+
+#[test]
+fn scrub_json_does_not_normalize_duplicate_decision_keys() {
+    #[derive(serde::Deserialize, Debug)]
+    struct Decision {
+        #[serde(rename = "action")]
+        _action: String,
+    }
+    let input = format!(
+        r#"{{"action":"stay-blocked","reason":"{} = suspicious_value","action":"unblock-add-fix"}}"#,
+        "token"
+    );
+    assert!(kranz_engine::runner::parse_decision::<Decision>(&input).is_none());
+    let redacted = scrub(&input);
+    assert!(redacted.contains(MARKER));
+    assert_eq!(redacted.matches("\"action\"").count(), 2);
+    assert!(kranz_engine::runner::parse_decision::<Decision>(&redacted).is_none());
+}
+
+#[test]
 fn anthropic_key_redacted() {
     let out = scrub("using key sk-ant-api03-AbCdEf_123-xyz for auth");
     assert_eq!(out, "using key [REDACTED] for auth");

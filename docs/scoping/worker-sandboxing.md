@@ -118,11 +118,44 @@ All of it asks the agent nicely. None of it constrains the process.
   `LOCALAPPDATA`, refusing any redirect outside the writable roots.
   The same launcher wraps workers, validators, and engine-run gates, and
   protected CI proves authority/real-checkout denial plus DACL restoration.
+  The isolated worktree's `.kranz` directory is unreadable and unwritable,
+  including files created there after launch; ordinary source files remain
+  writable. The launcher creates that directory if absent after validating
+  the worktree boundary and retains it for the worktree lifetime so overlapping
+  leases cannot remove each other's protection. Redirecting that directory
+  through a reparse point or explicitly granting a root beneath it fails closed.
+  Windows package-SID deny ACEs do not subtract inherited LPAC grants, so the
+  launcher blocks DACL inheritance at `.kranz` before granting the worktree.
+  Its descendants must not already carry package/capability grants or reparse
+  points. The worktree Git pointer similarly blocks inheritance and receives
+  only read/execute access. Writable grants omit `FILE_DELETE_CHILD`, which
+  could authorize replacing protected children through their parent; ordinary
+  source files inherit `DELETE` on themselves. Existing package/capability
+  grants that reopen parent deletion are refused. Retained no-share-delete
+  handles additionally pin both protected objects.
+  Per-profile ACL markers preserve the original inheritance setting across
+  overlapping launches. A host-only, pagefile-backed shared record preserves
+  the original ACE inheritance flags until the last lease closes; cleanup
+  restores those flags without replacing unrelated explicit operator rules.
+  This avoids duplicating permissions that Windows temporarily converts to
+  explicit entries while inheritance is blocked. A crashed lease can leave
+  the boundary protected. If its volatile baseline is missing, subsequent
+  launches fail closed and require operator recovery of the orphan ACLs.
+  Grants that contain or sit inside other authority directories, validator
+  source roots, shared Git metadata, or shared Cargo caches are refused before
+  ACL mutation. Shared Git metadata remains read-only on this provider.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open
   normal-gate/overhead/Windows-11 completion bar is recorded in
   [`m7-windows-containment.md`](m7-windows-containment.md).
+- **Authority directory views** on Linux/bubblewrap and containers hide
+  existing, future, and replaced credentials without creating host placeholders.
+  Existing non-secret policy/cache entries remain readable but immutable; the
+  source tree and private scratch retain their declared writes. Nested mounts
+  cannot reopen global authority or sibling mission metadata. Symlink entries
+  are omitted from these private views. On macOS, Seatbelt also pins protected
+  ancestor names against renaming.
 - Config per role:
   `sandbox: { enforce: "off" | "fs" | "fs+net", extraWrite: [...], egress: [...] }`.
   `SessionSpec` grows a `sandbox` field; `backend_claude` wraps the spawn.

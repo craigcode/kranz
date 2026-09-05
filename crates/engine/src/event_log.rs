@@ -14,15 +14,19 @@
 //! The log is not only an audit record: three gate decisions read it back
 //! mid-run, so a well-formed forged append or a rollback by truncation is a
 //! live consent bypass, not a post-hoc bookkeeping problem. Every line the
-//! writer produces therefore carries two extra fields, kept to one character
+//! writer produces therefore carries three extra fields, kept to one character
 //! because they ride every event:
 //!
-//! - `h` — the CHAIN. Hex sha256 over the previous line's `h` (the empty
-//!   string for the first chained line) concatenated with this line's
-//!   canonical event bytes, which are the event re-serialized WITHOUT `h` and
-//!   `m`. Both writer and reader build those bytes from an [`Event`], so the
-//!   two sides cannot drift on key order or number formatting. The chain
-//!   makes an edit anywhere in the file loud instead of local.
+//! - `v` — canonicalization version, currently 2. Absent means the legacy
+//!   float parser. Version 2 preserves floating-point bits and prefixes the
+//!   hash input with `kranz.event-log.v2\n`, so stripping `v` cannot downgrade it.
+//! - `h` — the CHAIN. Hex sha256 over the version prefix, the previous line's
+//!   `h` (empty for the first chained line), and this line's
+//!   canonical event bytes, which are the event re-serialized WITHOUT `v`, `h`,
+//!   and `m`. Legacy seals have no prefix and retain their original numeric
+//!   interpretation. Version 2 sorts all object keys, independently of Cargo's
+//!   `serde_json/preserve_order` feature. Both sides start from an [`Event`].
+//!   The chain makes an edit anywhere in the file loud instead of local.
 //! - `m` — the MAC. Hex HMAC-SHA256 of `h` under the repository authority key
 //!   ([`crate::paths::authority_key_path`]).
 //!
@@ -70,16 +74,30 @@ const CHAIN_FIELD: &str = "h";
 
 /// JSON key holding a line's MAC over the chain hash.
 const MAC_FIELD: &str = "m";
+const VERSION_FIELD: &str = "v";
+const EXACT_FLOAT_VERSION: u64 = 2;
 
-/// Canonical bytes for one event: the event re-serialized without `h`/`m`.
-fn canonical_event_bytes(event: &Event) -> Result<String> {
-    Ok(serde_json::to_string(event)?)
+/// Canonical bytes for one event, excluding the `v`/`h`/`m` envelope.
+fn canonical_event_bytes(event: &Event, version: u64) -> Result<String> {
+    if version == EXACT_FLOAT_VERSION {
+        let mut value = serde_json::to_value(event)?;
+        value.sort_all_objects();
+        Ok(serde_json::to_string(&value)?)
+    } else {
+        Ok(serde_json::to_string(event)?)
+    }
 }
 
 /// Next link in the chain: sha256 over the previous link and this event's
 /// canonical bytes.
-fn chain_hash(prev: &str, body: &str) -> String {
-    let mut input = String::with_capacity(prev.len() + body.len());
+fn chain_hash(prev: &str, body: &str, version: u64) -> String {
+    let prefix = if version == EXACT_FLOAT_VERSION {
+        "kranz.event-log.v2\n"
+    } else {
+        ""
+    };
+    let mut input = String::with_capacity(prefix.len() + prev.len() + body.len());
+    input.push_str(prefix);
     input.push_str(prev);
     input.push_str(body);
     crate::standards_waiver::sha256_hex(input.as_bytes())
@@ -88,12 +106,13 @@ fn chain_hash(prev: &str, body: &str) -> String {
 /// Serialize one event as a sealed log line (no trailing newline), returning
 /// the line and the chain hash the NEXT line must build on.
 fn seal_line(event: &Event, prev_hash: &str, key: Option<&[u8]>) -> Result<(String, String)> {
-    let body = canonical_event_bytes(event)?;
-    let hash = chain_hash(prev_hash, &body);
-    let mut value: serde_json::Value = serde_json::from_str(&body)?;
+    let body = canonical_event_bytes(event, EXACT_FLOAT_VERSION)?;
+    let hash = chain_hash(prev_hash, &body, EXACT_FLOAT_VERSION);
+    let mut value = serde_json::to_value(event)?;
     let object = value.as_object_mut().ok_or_else(|| {
         EngineError::InvalidState("event did not serialize as a JSON object".to_string())
     })?;
+    object.insert(VERSION_FIELD.to_string(), EXACT_FLOAT_VERSION.into());
     object.insert(
         CHAIN_FIELD.to_string(),
         serde_json::Value::String(hash.clone()),
@@ -105,6 +124,63 @@ fn seal_line(event: &Event, prev_hash: &str, key: Option<&[u8]>) -> Result<(Stri
         );
     }
     Ok((serde_json::to_string(&value)?, hash))
+}
+
+// The old writer parsed its serialized body once before writing, and readers
+// parsed it again. Some valid seals depend on that parser's rounded arithmetic.
+// Reproduce it only for legacy lines, using the canonical float token emitted
+// by serde_json (at most 17 significant digits). Integers and strings stay intact.
+fn restore_legacy_float_parsing(value: &mut serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            *number = legacy_float_number(number).ok_or_else(|| {
+                EngineError::LogCorruption("legacy event has an out-of-range float".into())
+            })?;
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                restore_legacy_float_parsing(value)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                restore_legacy_float_parsing(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn legacy_float_number(number: &serde_json::Number) -> Option<serde_json::Number> {
+    let decimal = number.to_string();
+    let negative = decimal.starts_with('-');
+    let unsigned = decimal.strip_prefix('-').unwrap_or(&decimal);
+    let (mantissa, exponent) = unsigned.split_once('e').unwrap_or((unsigned, "0"));
+    let fraction_digits = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let mut exponent = exponent.parse::<i32>().ok()? - i32::try_from(fraction_digits).ok()?;
+    let coefficient = mantissa.replace('.', "").parse::<u64>().ok()?;
+    let mut parsed = coefficient as f64;
+    if exponent < -308 {
+        parsed /= 1e308;
+        exponent += 308;
+    }
+    if exponent.unsigned_abs() > 308 {
+        return None;
+    }
+    // Decimal parsing gives the same rounded powers as the old parser's
+    // literal table. powi() can round differently and cannot substitute here.
+    let power = format!("1e{}", exponent.unsigned_abs())
+        .parse::<f64>()
+        .ok()?;
+    parsed = if exponent < 0 {
+        parsed / power
+    } else {
+        parsed * power
+    };
+    serde_json::Number::from_f64(if negative { -parsed } else { parsed })
 }
 
 /// Seal a whole event sequence into `events.jsonl` bytes exactly as the
@@ -805,10 +881,10 @@ impl EventLog {
                     )));
                 }
             };
-            // Lift `h`/`m` OUT before deserializing: the canonical bytes the
+            // Lift the envelope OUT before deserializing: the canonical bytes the
             // chain covers are the event without them, and removing the keys
             // here means the `Event` type never has to tolerate extras.
-            let (presented_hash, presented_mac) = match value.as_object_mut() {
+            let (presented_hash, presented_mac, version) = match value.as_object_mut() {
                 Some(object) => (
                     object
                         .remove(CHAIN_FIELD)
@@ -816,9 +892,24 @@ impl EventLog {
                     object
                         .remove(MAC_FIELD)
                         .and_then(|v| v.as_str().map(str::to_string)),
+                    object.remove(VERSION_FIELD),
                 ),
-                None => (None, None),
+                None => (None, None, None),
             };
+            let version = match version {
+                None => 1,
+                Some(value) if value.as_u64() == Some(EXACT_FLOAT_VERSION) => EXACT_FLOAT_VERSION,
+                Some(_) => {
+                    return Err(EngineError::LogCorruption(format!(
+                        "unsupported integrity version at {}:{}",
+                        path.display(),
+                        line_no
+                    )));
+                }
+            };
+            if version == 1 {
+                restore_legacy_float_parsing(&mut value)?;
+            }
             let event: Event = match serde_json::from_value(value) {
                 Ok(e) => e,
                 Err(err) => {
@@ -860,8 +951,8 @@ impl EventLog {
             }
             match &presented_hash {
                 Some(hash) => {
-                    let body = canonical_event_bytes(&event)?;
-                    let expected_hash = chain_hash(&prev_hash, &body);
+                    let body = canonical_event_bytes(&event, version)?;
+                    let expected_hash = chain_hash(&prev_hash, &body, version);
                     if expected_hash != *hash {
                         return Err(EngineError::LogCorruption(format!(
                             "integrity chain broken at {}:{}: the line does not hash to its recorded `h`",
@@ -908,6 +999,13 @@ impl EventLog {
                 None if event.seq >= seal_floor => {
                     return Err(EngineError::LogCorruption(format!(
                         "integrity chain missing at {}:{}: this mission is sealed from seq {seal_floor} on",
+                        path.display(),
+                        line_no
+                    )));
+                }
+                None if version == EXACT_FLOAT_VERSION => {
+                    return Err(EngineError::LogCorruption(format!(
+                        "integrity chain missing at {}:{}: versioned lines must be sealed",
                         path.display(),
                         line_no
                     )));
@@ -973,7 +1071,20 @@ impl EventLog {
         Ok(slice
             .split(|&b| b == b'\n')
             .filter(|line| !line.is_empty())
-            .filter_map(|line| serde_json::from_str(&String::from_utf8_lossy(line)).ok())
+            .filter_map(|line| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&String::from_utf8_lossy(line)).ok()?;
+                let object = value.as_object_mut()?;
+                let version = object.remove(VERSION_FIELD);
+                object.remove(CHAIN_FIELD);
+                object.remove(MAC_FIELD);
+                match version {
+                    None => restore_legacy_float_parsing(&mut value).ok()?,
+                    Some(version) if version.as_u64() == Some(EXACT_FLOAT_VERSION) => {}
+                    Some(_) => return None,
+                }
+                serde_json::from_value(value).ok()
+            })
             .collect())
     }
 }
@@ -1656,6 +1767,42 @@ pub(crate) fn process_identity_token(_pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_float_parser_matches_independent_reference() {
+        let reference: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/legacy-json-floats.json"))
+                .unwrap();
+        let cases = reference["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 96);
+        for case in cases {
+            let number: serde_json::Number =
+                serde_json::from_str(case["json"].as_str().unwrap()).unwrap();
+            let actual = legacy_float_number(&number)
+                .and_then(|n| n.as_f64())
+                .map(f64::to_bits);
+            let expected = case["expected_bits"]
+                .as_str()
+                .map(|bits| bits.parse::<u64>().unwrap());
+            assert_eq!(actual, expected, "reference: {case}");
+        }
+    }
+
+    #[test]
+    fn versioned_canonical_bytes_sort_nested_objects() {
+        let event = Event {
+            seq: 1,
+            ts: "2026-09-05T00:00:00Z".parse().unwrap(),
+            mission_id: "m-canonical".into(),
+            kind: EventKind::ConfigChanged {
+                patch: serde_json::json!({"z": 1, "a": [{"d": 2, "b": 3}]}),
+            },
+        };
+        assert_eq!(
+            canonical_event_bytes(&event, EXACT_FLOAT_VERSION).unwrap(),
+            r#"{"missionId":"m-canonical","payload":{"patch":{"a":[{"b":3,"d":2}],"z":1}},"seq":1,"ts":"2026-09-05T00:00:00Z","type":"config.changed"}"#
+        );
+    }
 
     // `probe_liveness`'s non-unix arm (the actual code path this pins) only
     // compiles under `#[cfg(not(unix))]`, and our CI runs macOS/Linux, so it

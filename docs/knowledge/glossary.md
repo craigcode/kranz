@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-05
 verified_against:
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
@@ -36,8 +36,8 @@ Project vocabulary. Terms link to the note that explains them in depth.
   [gates](validation/gates.md).
 - **Orchestrator** — the planning-and-judging agent role: drafts plans, proposes
   revisions, and renders final-gate verdicts. Runs as one streaming session.
-- **Worker** — the coding agent role; one run per feature, in its own git
-  worktree ([worktree isolation](decisions/inviolable-invariants.md)).
+- **Worker** — the coding agent role; one run per feature, using the configured
+  checkout or dedicated [worktree isolation](decisions/inviolable-invariants.md).
 - **Validator** — the checking roles: **scrutiny** (adversarial review) and
   **functional** (runs the contract's command gates). Configurable floors apply
   to autonomous runs.
@@ -77,7 +77,7 @@ Project vocabulary. Terms link to the note that explains them in depth.
   keys, and the `dangerouslyAllowAll` family. They are settable from the global
   layer only. A repository may RAISE `sandbox.enforce`, never lower it.
   Runtime `config-change` patches carry the same split by source: the
-  unauthenticated control inbox may re-tune bounded mission knobs, while
+  authenticated control inbox may re-tune bounded mission knobs, while
   consent-bearing keys need an operator surface.
 - **Deliver vs Land** — a mission is **Delivered** when it Completes but its
   branch is unmerged, and **Landed** once merged.

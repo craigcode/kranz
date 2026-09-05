@@ -1668,7 +1668,9 @@ mod tests {
     /// CI ubuntu-latest has Docker. CI runners are ephemeral, so a failed
     /// assertion mid-test may leave a project behind.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn container_workspace_smoke_provisions_isolates_and_destroys() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         if !sandbox_container::host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
@@ -1701,8 +1703,10 @@ mod tests {
             return;
         }
 
-        let dir_a = tempfile::tempdir().expect("tempdir a");
-        let dir_b = tempfile::tempdir().expect("tempdir b");
+        // Desktop VMs share the checkout, not necessarily /var/folders.
+        let parent = std::env::current_dir().unwrap();
+        let dir_a = tempfile::tempdir_in(&parent).expect("tempdir a");
+        let dir_b = tempfile::tempdir_in(&parent).expect("tempdir b");
         let provider = LocalContainerProvider::new();
         let handle_a = provider
             .provision(&spec(dir_a.path(), "m-smoke-a", Some(fake_contract())))
@@ -1757,7 +1761,12 @@ mod tests {
             .expect("destroy b");
         for project in [&project_a, &project_b] {
             let output = std::process::Command::new(runtime.binary())
-                .args(["compose", "-p", project, "ps", "-q"])
+                .args([
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    &format!("label=com.docker.compose.project={project}"),
+                ])
                 .stdin(std::process::Stdio::null())
                 .output()
                 .expect("spawn compose ps");

@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-05
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -12,6 +12,8 @@ verified_against:
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/queue.rs
   - crates/cli/src/exec.rs
+  - crates/cli/src/main.rs
+  - crates/engine/src/backend_claude.rs
   - crates/engine/src/git_ops.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/paths.rs
@@ -44,7 +46,8 @@ cannot reach.
   the writer). `parse_log` refuses any gap/duplicate as `LogCorruption`. Only an
   unparseable *final* line is tolerated (torn write) and repaired on acquire.
 - **Line integrity.** Each sealed line carries `h`, a sha256 chain over the
-  previous line's `h` and this event's canonical bytes, and `m`, an HMAC of `h`
+  version prefix, previous line's `h`, and this event's canonical bytes, and `m`,
+  an HMAC of `h`
   under the repository authority key. `parse_log_bytes` verifies both, so every
   reader inherits the check; seq and mission id are checked first, so a plain
   gap still reports as a gap. The chain alone only catches accidental
@@ -52,6 +55,11 @@ cannot reach.
   forger. Unsealed legacy lines are tolerated only below the mission's **seal
   floor**, the seq the first keyed writer recorded outside the repo; at or above
   it an unsealed line is a forgery, and integrity may never be dropped mid-log.
+  New lines carry `v:2`: numeric parsing preserves floating-point bits, object
+  keys are sorted, and the hash input starts with `kranz.event-log.v2\n`.
+  Lines without `v` retain legacy numeric parsing and the unprefixed hash;
+  valid old records can be continued without rewriting their bytes. A missing,
+  changed, or unsupported version cannot turn a v2 seal into a legacy seal.
 - **No silent rollback.** Truncating the log at a line boundary leaves it
   internally valid, so `resume` calls `event_log::check_no_rollback` BEFORE the
   fold: the log may not end below the seq that `state.json` or the out-of-repo
@@ -153,7 +161,14 @@ records `start_sha`; then the next feature runs or the milestone enters
 
 So the loop walks **milestones → features → workers → validators → judgement**:
 `run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
-judgement turn); `validation_round` runs scrutiny + functional validators (each
+judgement turn), then refreshes protected Git handles before inspecting the
+delivered tree so newly configured executable drivers are disabled. Sequential
+features pin their baseline in `feature.progress` before execution and retain
+cumulative commit receipts across retries and process resume. Removed recorded
+commits fail closed; a failed feature with retained work cannot be implicitly
+replaced as a commitless proposal. The additive schema and legacy behavior are
+recorded in the [contract change](../../reviews/2026-09-05-feature-progress-contract.md).
+`validation_round` runs scrutiny + functional validators (each
 skippable) plus a deterministic out-of-contract-write sweep, converts findings
 to fix-features or waives them (blocking at `max_fix_cycles_per_milestone`);
 `final_gate` fails an empty deliverable outright, runs `check:"command"`
@@ -196,10 +211,27 @@ Empty pool ⇒ the sequential path is byte-identical (regression-tested).
 `MissionEngine::resume` reads the log, refuses a rollback
 (`check_no_rollback`, above) before anything else, `fold`s it back to
 `MissionState`, re-acquires the single-writer lock, recovers the last orchestrator sdk session
-id for `--resume`, reaps crash-leaked worktrees/branches, and re-snapshots. No
+id for `--resume`, reaps per-feature crash-leaked worktrees/branches, and
+re-snapshots. The integration worktree is retained, including its index and
+uncommitted repair files. Setup verifies that the path is a registered worktree
+of this repository on the expected mission branch before reusing it; an
+unexpected path or branch is refused without deleting evidence. Errors also
+retain the integration worktree for recovery. No
 agent session starts here — sessions are lazy. Because state is a pure fold, a
 killed engine loses nothing durable: the run loop's status/feature checks pick
 up exactly where the log left off. Guard this: `dry_run_revised_plan` validates
 a revised plan against a clone *before* emit, because `emit` appends before it
 folds — an event the reducer would reject would otherwise brick the mission on
 every future load.
+
+`exec`, `run`, and `work` catch Ctrl-C so their mission futures unwind and the
+event-log lock is released. Native backend sessions kill their own process
+groups on drop, covering cancellation paths that do not reach async `abort`.
+This matters because agent processes use separate process groups and would
+otherwise survive the CLI's default signal exit.
+
+Claude streaming results report cumulative cost but per-turn token usage. The
+backend converts cost to a per-turn delta before `worker.completed` adds it
+to mission totals. Raw provider totals remain in the transcript. Conversation
+resets start a new segment; missing or zeroed crash results do not erase prior
+spend. A resumed process starts a fresh ledger. Existing event logs stay intact.

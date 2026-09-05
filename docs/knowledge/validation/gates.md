@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-05
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
@@ -115,6 +115,12 @@ Two mechanisms, because printing alone is not enough:
 - **`KRANZ_SKIP_LOG`** receives a ledger line per skip. A file survives
   libtest's capture where stdout does not, and each lane prints the ledger
   after the suite, so a green run still shows what it did not exercise.
+
+Container gate launches and timeout cleanup use the same allowlisted host
+runtime context. The worker's sanitized environment crosses only through
+explicit container flags, so a contract's `DOCKER_HOST` cannot redirect the
+host runtime. Explicit empty proxy variables also prevent Docker's client
+configuration from injecting proxy credentials into the payload.
 
 ## Empty-deliverable safety net
 

@@ -914,6 +914,137 @@ mod fake_cli {
         assert!(matches!(err, EngineError::Backend(_)), "got {err:?}");
     }
 
+    fn cost_line(total: Option<f64>, is_error: bool, session_id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&result_line("done")).unwrap();
+        value["total_cost_usd"] = json!(total);
+        value["is_error"] = json!(is_error);
+        value["session_id"] = json!(session_id);
+        value.to_string()
+    }
+
+    async fn replay_cost_stream(
+        lines: &[String],
+        prompt: PromptMode,
+        resume: Option<String>,
+    ) -> Vec<AgentEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, env) = fake_backend(&dir, CAT_STREAM_THEN_SLEEP, lines);
+        let mut spec = base_spec(prompt);
+        spec.cwd = dir.path().to_path_buf();
+        spec.env = env;
+        spec.resume = resume;
+        let mut session = backend.start(spec).await.unwrap();
+        let mut events = Vec::new();
+        for _ in lines {
+            events.push(next_event(&mut session).await.expect("scripted cost event"));
+        }
+        session.abort().await.unwrap();
+        events
+    }
+
+    #[tokio::test]
+    async fn streaming_costs_emit_deltas_and_keep_raw_totals_and_turn_usage() {
+        // Cumulative costs observed in consecutive real CLI results.
+        let totals = [0.289037, 0.4237075, 0.5846045];
+        let mut lines = vec![init_line("cost-session")];
+        lines.extend(totals.map(|total| cost_line(Some(total), false, "cost-session")));
+        let events = replay_cost_stream(&lines, PromptMode::Streaming("start".into()), None).await;
+        let mut sum = 0.0;
+        for (event, total) in events[1..].iter().zip(totals) {
+            let AgentEvent::Result {
+                cost_usd,
+                usage,
+                raw,
+                ..
+            } = event
+            else {
+                panic!("expected a result");
+            };
+            sum += cost_usd.unwrap();
+            assert!((sum - total).abs() < 1e-12);
+            assert_eq!(raw["total_cost_usd"].as_f64(), Some(total));
+            assert_eq!(usage.input, 1);
+            assert_eq!(usage.output, 2, "token usage is already per-turn");
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_costs_preserve_spend_across_missing_crash_and_reset_results() {
+        let lines = vec![
+            init_line("before-reset"),
+            cost_line(Some(0.4), false, "before-reset"),
+            cost_line(None, false, "before-reset"),
+            cost_line(Some(0.0), true, "before-reset"),
+            cost_line(Some(-1.0), true, "before-reset"),
+            cost_line(Some(0.6), false, "before-reset"),
+            json!({"type":"system", "subtype":"conversation_reset", "session_id":"after-reset"})
+                .to_string(),
+            cost_line(Some(0.1), false, "after-reset"),
+            init_line("after-reset"),
+            cost_line(Some(0.2), false, "after-reset"),
+            // Older consumers may miss the reset event; its new id is also
+            // present on the next result, so it starts a fresh cost segment.
+            cost_line(Some(0.05), false, "another-reset"),
+        ];
+        let events = replay_cost_stream(&lines, PromptMode::Streaming("start".into()), None).await;
+        let costs: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Result { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .collect();
+        let expected = [
+            Some(0.4),
+            None,
+            Some(0.0),
+            None,
+            Some(0.2),
+            Some(0.1),
+            Some(0.1),
+            Some(0.05),
+        ];
+        assert_eq!(costs.len(), expected.len());
+        for (actual, expected) in costs.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => assert!((actual - expected).abs() < 1e-12),
+                (None, None) => {}
+                other => panic!("unexpected cost: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_costs_start_fresh_for_a_resumed_process() {
+        for total in [0.5, 0.2] {
+            let lines = vec![
+                init_line("same-sdk-session"),
+                cost_line(Some(total), false, "same-sdk-session"),
+            ];
+            let events = replay_cost_stream(
+                &lines,
+                PromptMode::Streaming("start".into()),
+                Some("same-sdk-session".into()),
+            )
+            .await;
+            assert!(
+                matches!(&events[1], AgentEvent::Result { cost_usd: Some(cost), .. } if *cost == total)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_shot_cost_is_the_reported_call_total() {
+        let lines = vec![
+            init_line("one-shot"),
+            cost_line(Some(0.4237075), false, "one-shot"),
+        ];
+        let events = replay_cost_stream(&lines, PromptMode::SingleShot("start".into()), None).await;
+        assert!(
+            matches!(&events[1], AgentEvent::Result { cost_usd: Some(cost), .. } if *cost == 0.4237075)
+        );
+    }
+
     /// Fake CLI that spawns a background subprocess (stand-in for a tool
     /// child like a test runner), reports that child's pid as a JSON line on
     /// stdout, then streams forever until killed.
@@ -975,6 +1106,30 @@ mod fake_cli {
             assert!(
                 std::time::Instant::now() < deadline,
                 "tool subprocess {tool_pid} survived abort for 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_kills_its_tool_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(dir.path(), "fake-claude.sh", SPAWN_TOOL_CHILD_THEN_HANG);
+        let backend = ClaudeBackend::new(script);
+        let mut spec = base_spec(PromptMode::SingleShot("ignored".to_string()));
+        spec.cwd = dir.path().to_path_buf();
+        let mut session = backend.start(spec).await.unwrap();
+        let AgentEvent::Other { raw } = next_event(&mut session).await.unwrap() else {
+            panic!("expected the tool child pid");
+        };
+        let pid = i32::try_from(raw["pid"].as_i64().unwrap()).unwrap();
+        assert!(process_alive(pid));
+        drop(session);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool process {pid} survived session cancellation"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

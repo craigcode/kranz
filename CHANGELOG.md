@@ -5,6 +5,62 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-05
+
+- Fixed Linux sandbox startup racing with removal of ordinary temporary files
+  from private directory views. Disappearing entries stay hidden; authority
+  masks and read-only restrictions remain mandatory.
+- Fixed PTY validation waiting for a timeout after its target exited. Parent
+  terminal handles now close after spawning, and child programs inherit only
+  the intended standard terminal streams. Continuous output yields to session
+  deadline checks instead of keeping the drain loop running indefinitely.
+- Fixed Windows AppContainer launches refusing every worktree after authority
+  hardening. The isolated worktree's `.kranz` namespace is protected separately,
+  including future files and directory renames; ordinary source files remain
+  writable and removable. Protected DACL inheritance and retained handles keep
+  broad LPAC grants out of that namespace and prevent Git-pointer replacement;
+  overlapping launches restore the original ACLs and inheritance settings.
+- Fixed retries losing earlier checkpoint commit receipts. Sequential features
+  now persist their baseline and cumulative receipts before retry or resume;
+  failed features with retained work cannot be mistaken for empty proposals.
+- Fixed fractional costs producing event lines that failed their own integrity
+  checks. New versioned seals preserve numeric bits; valid legacy seals keep
+  their original interpretation and can be continued without rewriting them.
+  Older binaries cannot verify the new seals.
+- Fixed resume discarding uncommitted integration repairs. Retained worktrees
+  are validated and reused; unexpected repositories, branches, and symlinks
+  are refused without deleting their contents.
+- Fixed secret redaction corrupting escaped JSON decisions and transcripts.
+  Redaction preserves JSON structure and duplicate-key rejection.
+- Fixed secret-rule labels being mistaken for bearer credentials and hiding
+  source paths in redacted finding diagnostics.
+- Fixed full-file Python secret scans interpreting conditional-block colons as
+  credential assignments; following real credentials remain detectable.
+- Fixed double-counted Claude streaming costs: new result events carry each
+  turn's incremental cost while retaining the provider's raw cumulative value.
+  Existing event logs are not rewritten; their historical estimates may be inflated.
+- Fixed Ctrl-C handling for `exec`, `run`, and `work`: native agent sessions
+  terminate their process groups when cancelled, while mission logs remain
+  available for resume.
+- Sandboxed workers now stop retrying denied Git metadata writes and leave
+  tested changes for the engine's reviewed, secret-scanned checkpoint.
+- Fixed the acceptance rehearsal to verify the delivered branch in a detached
+  worktree and to support an existing authenticated Claude Code installation.
+  It now preserves failed fixtures for resume and independently verifies the
+  final CLI against a fixed HTTP contract.
+- Security: webhook comment triggers require an explicit GitHub user allowlist;
+  workflow failure triggers refuse fork-owned branches.
+- Security: engine diffs disable external programs and text converters, custom
+  merge drivers fail closed, and protected Git handles refresh after workers.
+- Security: sandbox authority directories hide future and rotated credentials,
+  sibling mission metadata stays protected, and validator cache copies refuse
+  links and special files.
+- Fixed macOS Cursor private Keychain seeding, legacy migration, lock/unlock
+  verification, and rejection of injected passphrase commands.
+- Fixed container gate launch and timeout cleanup to preserve the host runtime
+  context without forwarding ambient secrets or client proxy credentials.
+- Updated the yanked `chacha20` dependency to 0.10.2 in both lockfiles.
+
 - Security: authenticated the mission control inbox and the event log so an
   agent process with repository write access can no longer forge operator
   consent, roll a mission back past a denial, or patch consent-bearing config
@@ -56,7 +112,6 @@ Notable user-visible changes are documented here. This project follows
   audit with the seven per-surface source reports and the two follow-up
   reviews of the fixes beside it.
 
-## 0.2.0 - 2026-08-22
 
 - Prepared the repository's security, contribution, release, and supply-chain
   controls for public distribution.

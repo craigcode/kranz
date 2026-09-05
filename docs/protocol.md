@@ -20,6 +20,12 @@ unhealthy root stays distinguishable from an unknown repo id (404).
 Unknown `/api/*` paths always return JSON and never fall through to the
 dashboard SPA.
 
+The additive `feature.progress` event records a sequential feature’s pinned
+`baseSha` and cumulative commit receipts. Folded state exposes the optional
+`featureBaseShas` map; it is absent for legacy logs without these events.
+See the [contract change](reviews/2026-09-05-feature-progress-contract.md) for
+retry, recovery, and upgrade semantics.
+
 ## REST
 
 | Method/Path | Response |
@@ -83,7 +89,16 @@ ticket pipeline — never a prompt loop, never a run, never a land (ticket
 NOT the mutation token, and refuses CLOSED when no secret is configured.
 Config (additive, `.kranz/config.json` — gitignored, so the secret is never
 committed): `hooks.secret`, `hooks.fixLabel` (default `kranz:fix`),
-`hooks.queueLabel` (default `kranz:fix-and-queue`). In a multi-repository
+`hooks.queueLabel` (default `kranz:fix-and-queue`), and `hooks.allowUsers`
+(GitHub logins explicitly allowed to request work through PR comments,
+compared case-insensitively). An absent or empty `allowUsers` disables comment
+triggers; HMAC verification authenticates GitHub's delivery, not the comment
+author's authority. For example, set `"allowUsers": ["your-github-login"]`
+inside the local `hooks` object to enable your own comment triggers.
+Workflow-failure triggers remain independent of this comment allowlist, but
+must originate in the receiving repository; a fork's matching branch name
+does not authorize a draft.
+In a multi-repository
 serve the repo-scoped twin `/api/repos/:repoId/hooks/github` verifies against
 THAT repository's config and identity.
 

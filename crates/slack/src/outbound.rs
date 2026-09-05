@@ -233,6 +233,7 @@ mod tests {
 
     fn base_state() -> MissionState {
         MissionState {
+            feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".into(),
                 goal: "Rate-limit the notes API".into(),
