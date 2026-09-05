@@ -474,10 +474,38 @@ mod imp {
             ));
         }
 
+        // Only the child's three standard streams may survive exec. Retained
+        // terminal descriptors otherwise leak into other launched programs.
+        for fd in [master, slave] {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(master);
+                    libc::close(slave);
+                }
+                return spawn_failure(format!("setting pty close-on-exec failed: {err}"));
+            }
+        }
+        // Set nonblocking before spawning: a failure must not leave a child
+        // running or let a blocking read bypass the session's deadlines.
+        if unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return spawn_failure(format!("setting pty nonblocking failed: {err}"));
+        }
+
         // The child gets the slave on stdin/stdout/stderr. dup it twice and
         // hand the original over as the third — each Stdio owns exactly one
         // fd.
-        let (dup1, dup2) = unsafe { (libc::dup(slave), libc::dup(slave)) };
+        let (dup1, dup2) = unsafe {
+            (
+                libc::fcntl(slave, libc::F_DUPFD_CLOEXEC, 0),
+                libc::fcntl(slave, libc::F_DUPFD_CLOEXEC, 0),
+            )
+        };
         if dup1 == -1 || dup2 == -1 {
             let err = std::io::Error::last_os_error();
             unsafe {
@@ -538,13 +566,12 @@ mod imp {
             }
         };
         let pid = child.id() as i32;
+        // Command owns the parent's slave descriptors even after spawn.
+        // Close them now so the master can observe EOF when the child exits.
+        drop(cmd);
 
         // The parent drives the master only; nonblocking so the poll loop
         // owns the timing (per-step and whole-session deadlines).
-        // SAFETY: master is a valid open fd; O_NONBLOCK is the only change.
-        unsafe {
-            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
-        }
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
 
         let mut session = Session {
@@ -1154,6 +1181,39 @@ mod tests {
         let skip = skip.expect("the skip is recorded for the round decision");
         assert_eq!(skip.assertion_id, "a-pty");
         assert!(skip.note.contains("unix hosts only"), "{}", skip.note);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_validation_child_inherits_only_standard_terminal_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = vec![pty_assertion(
+            "a-pty",
+            "for fd in /dev/fd/*; do n=${fd##*/}; \
+             if [ -t \"$n\" ]; then printf 'tty-fd:%s\\n' \"$n\"; fi; done; \
+             printf 'probe-complete\\n'",
+            vec![PtyStep::Expect {
+                pattern: "probe-complete".to_string(),
+                regex: false,
+                timeout_ms: None,
+            }],
+        )];
+        let run = run_pty_assertions(
+            &contract,
+            dir.path(),
+            &HashMap::new(),
+            &GateSandbox::Disabled,
+            &dir.path().join("runs"),
+        )
+        .await;
+        assert!(run.artifacts[0].pass, "{}", run.artifacts[0].detail);
+        let transcript =
+            std::fs::read_to_string(dir.path().join(&run.artifacts[0].transcript_rel)).unwrap();
+        let terminals: Vec<_> = transcript
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("tty-fd:"))
+            .collect();
+        assert_eq!(terminals, ["0", "1", "2"], "{transcript}");
     }
 
     /// The transcript is bounded: a target spewing output past
