@@ -137,6 +137,7 @@ struct SelfTestManifest {
     outside_write: PathBuf,
     broad_app_packages_write: PathBuf,
     authority_file: PathBuf,
+    worktree_authority_files: Vec<PathBuf>,
     real_source: PathBuf,
     shared_git_marker: PathBuf,
     loopback_addr: SocketAddr,
@@ -154,6 +155,11 @@ pub struct ProductionHostileReceipt {
     pub scratch_write: bool,
     pub outside_write_denied: bool,
     pub authority_read_denied: bool,
+    pub worktree_authority_read_denied: bool,
+    pub worktree_authority_write_denied: bool,
+    pub worktree_authority_create_denied: bool,
+    pub worktree_authority_rename_denied: bool,
+    pub ordinary_file_delete: bool,
     pub real_checkout_read_denied: bool,
     pub shared_git_read: bool,
     pub overlapping_lease_safe: bool,
@@ -1919,11 +1925,30 @@ fn validate_recursive_roots(
     write_roots: &[PathBuf],
     read_roots: &[PathBuf],
 ) -> Result<()> {
+    let cwd = crate::sandbox::absolutize(&inputs.session_cwd);
+    let session_authority = cwd.join(".kranz");
+    let session_files = crate::sandbox::kranz_authority_entries(&session_authority).files;
     let authority_paths = crate::sandbox::authority_read_deny_paths(inputs);
     let authority_dirs = crate::sandbox::authority_read_deny_dirs(inputs);
     for root in write_roots.iter().chain(read_roots) {
+        if path_contains(&session_authority, root) {
+            return Err(EngineError::Backend(format!(
+                "AppContainer grant {} is inside the protected worktree .kranz directory",
+                root.display()
+            )));
+        }
         for protected in authority_paths.iter().chain(&authority_dirs) {
             if path_contains(root, protected) {
+                // The worktree's own authority namespace receives a separate
+                // inheriting deny below, including when these files are absent.
+                // Every other authority overlap still fails before mutation.
+                if comparable_path(root) == comparable_path(&cwd)
+                    && session_files
+                        .iter()
+                        .any(|path| comparable_path(path) == comparable_path(protected))
+                {
+                    continue;
+                }
                 return Err(EngineError::Backend(format!(
                     "AppContainer recursive grant {} would cover protected authority path {}; refusing before ACL mutation",
                     root.display(),
@@ -1980,6 +2005,25 @@ fn acl_changes(
     )?;
     validate_recursive_roots(inputs, &write_roots, &read_roots)?;
 
+    // Windows ACLs need an existing object. Reserve the namespace only after
+    // validating that this is an isolated worktree, never the primary tree.
+    // Keep an empty directory for the worktree lifetime: removing it when one
+    // overlapping lease ends would reopen the other lease's future-file gap.
+    let session_authority = crate::sandbox::absolutize(&inputs.session_cwd).join(".kranz");
+    match std::fs::create_dir(&session_authority) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    use std::os::windows::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(&session_authority)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(EngineError::Backend(format!(
+            "AppContainer worktree authority namespace {} must be a no-follow directory",
+            session_authority.display()
+        )));
+    }
+
     let toolchain_entries = toolchain_entry_points(env);
     let mut changes = Vec::new();
     let rwx = FILE_GENERIC_READ.0
@@ -2028,6 +2072,21 @@ fn acl_changes(
         | FILE_DELETE_CHILD.0
         | DELETE.0;
     let deny_write = FILE_GENERIC_WRITE.0 | FILE_DELETE_CHILD.0 | DELETE.0;
+    // An inherited deny on .kranz precedes the worktree's more distant allow.
+    // Pin the directory too: DELETE_CHILD on its parent otherwise authorizes
+    // renaming/deleting it despite the deny on the directory itself.
+    changes.push(AclChange {
+        path: session_authority,
+        permissions: deny_all,
+        inherit: true,
+        mode: AclMode::Deny,
+    });
+    changes.push(AclChange {
+        path: crate::sandbox::absolutize(&inputs.session_cwd),
+        permissions: FILE_DELETE_CHILD.0,
+        inherit: false,
+        mode: AclMode::Deny,
+    });
     for path in crate::sandbox::authority_read_deny_paths(inputs) {
         if path.exists() {
             changes.push(AclChange {
@@ -3050,6 +3109,16 @@ fn production_hostile_self_test() -> Result<String> {
             broad_acl.handle.0,
         )?;
     }
+    let worktree_authority = worktree.join(".kranz");
+    std::fs::create_dir(&worktree_authority)?;
+    let worktree_authority_files =
+        crate::sandbox::kranz_authority_entries(&worktree_authority).files;
+    // Two files predate the ACL lease; two appear only after both overlapping
+    // leases are prepared. Both sets must remain unreadable and immutable.
+    for path in &worktree_authority_files[..2] {
+        std::fs::write(path, "must-not-cross")?;
+    }
+    let authority_before = snapshot_dacl(&worktree_authority)?;
     let authority_file = kranz_dir.join("serve.token");
     std::fs::write(&authority_file, "must-not-cross")?;
     let real_source = real_checkout.join("source.rs");
@@ -3092,6 +3161,7 @@ fn production_hostile_self_test() -> Result<String> {
         outside_write: outside.join("must-not-write.txt"),
         broad_app_packages_write: broad_app_packages.join("must-not-write.txt"),
         authority_file,
+        worktree_authority_files,
         real_source,
         shared_git_marker,
         loopback_addr: listener.local_addr().map_err(|error| {
@@ -3163,6 +3233,9 @@ fn production_hostile_self_test() -> Result<String> {
         args,
         lease,
     } = prepared;
+    for path in &manifest.worktree_authority_files[2..] {
+        std::fs::write(path, "must-not-cross")?;
+    }
     drop(overlapping.lease);
     let output = std::process::Command::new(program)
         .args(args)
@@ -3193,7 +3266,8 @@ fn production_hostile_self_test() -> Result<String> {
         })?)
         .map_err(|error| EngineError::Backend(format!("invalid production receipt: {error}")))?;
     receipt.overlapping_lease_safe = true;
-    receipt.dacl_restored = before.acl == after.acl;
+    receipt.dacl_restored =
+        before.acl == after.acl && authority_before.acl == snapshot_dacl(&worktree_authority)?.acl;
     receipt.volume_root_dacl_restored = volume_root_before == volume_root_after;
     std::fs::write(
         worktree.join(".git"),
@@ -3215,6 +3289,11 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.scratch_write
         && receipt.outside_write_denied
         && receipt.authority_read_denied
+        && receipt.worktree_authority_read_denied
+        && receipt.worktree_authority_write_denied
+        && receipt.worktree_authority_create_denied
+        && receipt.worktree_authority_rename_denied
+        && receipt.ordinary_file_delete
         && receipt.real_checkout_read_denied
         && receipt.shared_git_read
         && receipt.overlapping_lease_safe
@@ -3586,6 +3665,8 @@ fn hostile_child() -> Result<()> {
         std::env::current_dir()?.join(SELF_TEST_MANIFEST),
     )?)
     .map_err(|error| EngineError::Backend(format!("invalid hostile-child manifest: {error}")))?;
+    let worktree_authority = std::env::current_dir()?.join(".kranz");
+    let ordinary_file = std::env::current_dir()?.join("ordinary-delete-control");
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
         // Windows Server 2025 returns ERROR_INVALID_PARAMETER for the
@@ -3604,6 +3685,26 @@ fn hostile_child() -> Result<()> {
         scratch_write: std::fs::write(&manifest.scratch_write, "allowed").is_ok(),
         outside_write_denied: std::fs::write(&manifest.outside_write, "escape").is_err(),
         authority_read_denied: std::fs::read(&manifest.authority_file).is_err(),
+        worktree_authority_read_denied: manifest
+            .worktree_authority_files
+            .iter()
+            .all(|path| std::fs::read(path).is_err()),
+        worktree_authority_write_denied: manifest
+            .worktree_authority_files
+            .iter()
+            .all(|path| std::fs::write(path, "escape").is_err()),
+        worktree_authority_create_denied: std::fs::write(
+            worktree_authority.join("new-authority"),
+            "escape",
+        )
+        .is_err(),
+        worktree_authority_rename_denied: std::fs::rename(
+            &worktree_authority,
+            worktree_authority.with_file_name("moved-authority"),
+        )
+        .is_err(),
+        ordinary_file_delete: std::fs::write(&ordinary_file, "allowed").is_ok()
+            && std::fs::remove_file(&ordinary_file).is_ok(),
         real_checkout_read_denied: std::fs::read(&manifest.real_source).is_err(),
         shared_git_read: std::fs::read_to_string(&manifest.shared_git_marker)
             .is_ok_and(|value| value == "git-readable"),
@@ -3667,6 +3768,42 @@ pub fn run_internal_launcher() -> std::result::Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursive_grants_reserve_only_the_isolated_worktree_authority_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("worktree");
+        let mission = root.path().join("repo/.kranz/missions/m-test");
+        let scratch = root.path().join("scratch");
+        for path in [&cwd, &mission, &scratch] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let inputs = crate::sandbox::SandboxInputs {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            session_cwd: cwd.clone(),
+            mission_dir: mission,
+            tmpdir: scratch.clone(),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[]).unwrap();
+        for forbidden in [
+            root.path().to_path_buf(),
+            root.path().join("repo"),
+            cwd.join(".kranz"),
+            cwd.join(".kranz/nested"),
+        ] {
+            assert!(
+                validate_recursive_roots(&inputs, std::slice::from_ref(&forbidden), &[]).is_err()
+            );
+            assert!(validate_recursive_roots(&inputs, &[], &[forbidden]).is_err());
+        }
+        assert!(
+            !cwd.join(".kranz").exists(),
+            "validation must not create paths"
+        );
+    }
 
     #[test]
     fn host_preparation_accepts_only_literal_local_drive_roots() {

@@ -7,6 +7,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Fixed Windows AppContainer launches refusing every worktree after authority
+  hardening. The isolated worktree's `.kranz` namespace is protected separately,
+  including future files and directory renames; ordinary source files remain
+  writable and removable.
 - Fixed retries losing earlier checkpoint commit receipts. Sequential features
   now persist their baseline and cumulative receipts before retry or resume;
   failed features with retained work cannot be mistaken for empty proposals.

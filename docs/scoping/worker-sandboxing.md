@@ -118,6 +118,12 @@ All of it asks the agent nicely. None of it constrains the process.
   `LOCALAPPDATA`, refusing any redirect outside the writable roots.
   The same launcher wraps workers, validators, and engine-run gates, and
   protected CI proves authority/real-checkout denial plus DACL restoration.
+  The isolated worktree's `.kranz` directory is unreadable and unwritable,
+  including files created there after launch; ordinary source files remain
+  writable. The launcher creates that directory if absent after validating
+  the worktree boundary and retains it for the worktree lifetime so overlapping
+  leases cannot remove each other's protection. Redirecting that directory
+  through a reparse point or explicitly granting a root beneath it fails closed.
   The container provider remains fail-closed even when `docker.exe` is present:
   the shipped mounts assume POSIX guest paths and `/dev/null` authority masks.
   Native `.exe` agent backends are required; batch shims are refused. The open
