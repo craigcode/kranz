@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
-    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE, HLOCAL, WAIT_ABANDONED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
@@ -56,14 +56,15 @@ use windows::Win32::Security::{
     AclSizeInformation, CreateWellKnownSid, DeleteAce, DeriveCapabilitySidsFromName, EqualSid,
     FreeSid, GetAce, GetAclInformation, GetKernelObjectSecurity, GetLengthSid,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSidIdentifierAuthority,
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, SetKernelObjectSecurity,
-    TokenElevation, TokenIsAppContainer, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
-    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, INHERITED_ACE,
-    LABEL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_CAPABILITIES, SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
-    TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidAcl,
+    SetKernelObjectSecurity, TokenElevation, TokenIsAppContainer, WinBuiltinAnyPackageSid,
+    WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    GROUP_SECURITY_INFORMATION, INHERITED_ACE, LABEL_SECURITY_INFORMATION, NO_INHERITANCE,
+    OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandle, ReadFile, BY_HANDLE_FILE_INFORMATION, DELETE,
@@ -74,6 +75,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+    FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows::Win32::System::Threading::{
@@ -140,6 +145,7 @@ struct SelfTestManifest {
     broad_app_packages_write: PathBuf,
     authority_file: PathBuf,
     worktree_authority_files: Vec<PathBuf>,
+    boundary_state_names: Vec<String>,
     real_source: PathBuf,
     shared_git_marker: PathBuf,
     loopback_addr: SocketAddr,
@@ -157,6 +163,7 @@ pub struct ProductionHostileReceipt {
     pub worktree_git_read: bool,
     pub worktree_git_write_denied: bool,
     pub worktree_git_replace_denied: bool,
+    pub boundary_state_write_denied: bool,
     pub scratch_write: bool,
     pub outside_write_denied: bool,
     pub authority_read_denied: bool,
@@ -234,6 +241,25 @@ struct DaclSnapshot {
 unsafe impl Send for DaclSnapshot {}
 
 #[derive(Debug)]
+struct BoundaryBaseline {
+    originally_protected: bool,
+    acl: Vec<u8>,
+    _mapping: OwnedHandle,
+}
+
+// Only the kernel handle and an owned byte copy cross threads. Mapped views
+// are temporary and accessed synchronously under DaclMutationGuard.
+unsafe impl Send for BoundaryBaseline {}
+
+struct BoundaryView(MEMORY_MAPPED_VIEW_ADDRESS);
+
+impl Drop for BoundaryView {
+    fn drop(&mut self) {
+        let _ = unsafe { UnmapViewOfFile(self.0) };
+    }
+}
+
+#[derive(Debug)]
 struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {
@@ -284,7 +310,7 @@ pub(crate) struct AppContainerLease {
     rustup_toolchain: Option<PathBuf>,
     original_dacls: Vec<DaclSnapshot>,
     snapshot_indices: BTreeMap<PathBuf, usize>,
-    boundary_protection: BTreeMap<PathBuf, bool>,
+    boundary_protection: BTreeMap<PathBuf, BoundaryBaseline>,
     applied_changes: HashSet<(PathBuf, u32, bool, AclMode)>,
     plan_paths: Vec<PathBuf>,
 }
@@ -317,11 +343,15 @@ impl Drop for AppContainerLease {
                 // Parent grants are gone before an authority boundary can
                 // inherit again. Other leases keep their own marker and pin.
                 for snapshot in &self.original_dacls {
-                    if let Some(&original) = self
+                    if let Some(original) = self
                         .boundary_protection
                         .get(&comparable_path(&snapshot.path))
                     {
-                        if let Err(error) = restore_boundary_inheritance(snapshot, original) {
+                        if let Err(error) = restore_boundary_inheritance(
+                            snapshot,
+                            original.originally_protected,
+                            &original.acl,
+                        ) {
                             #[cfg(test)]
                             eprintln!(
                                 "AppContainer inheritance cleanup {}: {error}",
@@ -332,6 +362,9 @@ impl Drop for AppContainerLease {
                         }
                     }
                 }
+                // Retire the final shared baseline before releasing the
+                // mutex, so the next lease starts from the restored DACL.
+                self.boundary_protection.clear();
             }
             (Err(error), _) => {
                 tracing::error!(profile = %self.profile_name, error = %error,
@@ -1369,6 +1402,163 @@ fn inspect_boundary_acl(snapshot: &DaclSnapshot, allowed: u32) -> Result<Option<
     Ok(original)
 }
 
+const BOUNDARY_STATE_HEADER: usize = 16;
+const BOUNDARY_STATE_SIZE: usize = BOUNDARY_STATE_HEADER + u16::MAX as usize;
+
+fn boundary_state_name(snapshot: &DaclSnapshot) -> Result<String> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(snapshot.handle.0, &mut info) }.map_err(|error| {
+        EngineError::Backend(format!("failed to identify boundary object: {error}"))
+    })?;
+    if info.nFileIndexHigh == 0 && info.nFileIndexLow == 0 {
+        return Err(EngineError::Backend(
+            "AppContainer boundary has no stable file identity".to_string(),
+        ));
+    }
+    Ok(format!(
+        "Local\\Kranz.AppContainer.Boundary.v1.{:08x}.{:08x}{:08x}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+    ))
+}
+
+// SetSecurityInfo converts inherited ACEs into explicit entries when a DACL
+// is protected. Keep their original provenance across processes and lease
+// cleanup order. The pagefile-backed object lives until the last lease closes
+// its non-inheritable handle; no worker-readable filesystem sidecar is used.
+fn retain_boundary_baseline(
+    snapshot: &DaclSnapshot,
+    prior: Option<bool>,
+) -> Result<BoundaryBaseline> {
+    let name = wide(OsStr::new(&boundary_state_name(snapshot)?));
+    let mapping = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            None,
+            PAGE_READWRITE,
+            0,
+            BOUNDARY_STATE_SIZE as u32,
+            PCWSTR(name.as_ptr()),
+        )
+    }
+    .map_err(|error| {
+        EngineError::Backend(format!("failed to retain boundary baseline: {error}"))
+    })?;
+    let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    let mapping = OwnedHandle(mapping);
+    if existed != prior.is_some() {
+        return Err(EngineError::Backend(
+            "AppContainer boundary baseline and lease markers disagree; orphan ACL recovery is required"
+                .to_string(),
+        ));
+    }
+    let access = if existed {
+        FILE_MAP_READ
+    } else {
+        FILE_MAP_WRITE
+    };
+    let view = unsafe { MapViewOfFile(mapping.0, access, 0, 0, BOUNDARY_STATE_SIZE) };
+    if view.Value.is_null() {
+        return Err(EngineError::Backend(format!(
+            "failed to map boundary baseline: {}",
+            windows::core::Error::from_thread()
+        )));
+    }
+    let view = BoundaryView(view);
+    let (originally_protected, acl) = if existed {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(view.0.Value.cast::<u8>(), BOUNDARY_STATE_SIZE) };
+        let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        if &bytes[..4] != b"KAC1"
+            || bytes[4] > 1
+            || len < std::mem::size_of::<ACL>()
+            || len > BOUNDARY_STATE_SIZE - BOUNDARY_STATE_HEADER
+            || Some(bytes[4] != 0) != prior
+        {
+            return Err(EngineError::Backend(
+                "invalid boundary baseline header".to_string(),
+            ));
+        }
+        let acl = bytes[BOUNDARY_STATE_HEADER..BOUNDARY_STATE_HEADER + len].to_vec();
+        if usize::from(u16::from_le_bytes([acl[2], acl[3]])) != len
+            || !unsafe { IsValidAcl(acl.as_ptr().cast::<ACL>()) }.as_bool()
+        {
+            return Err(EngineError::Backend(
+                "invalid boundary baseline DACL".to_string(),
+            ));
+        }
+        (bytes[4] != 0, acl)
+    } else {
+        let acl = snapshot
+            .acl
+            .as_ref()
+            .expect("boundary inspection rejects null DACLs");
+        let mut bytes = vec![0u8; BOUNDARY_STATE_HEADER + acl.len()];
+        bytes[..4].copy_from_slice(b"KAC1");
+        bytes[4] = u8::from(snapshot.protected);
+        bytes[8..12].copy_from_slice(&(acl.len() as u32).to_le_bytes());
+        bytes[BOUNDARY_STATE_HEADER..].copy_from_slice(acl);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.0.Value.cast::<u8>(), bytes.len());
+        }
+        (snapshot.protected, acl.clone())
+    };
+    Ok(BoundaryBaseline {
+        originally_protected,
+        acl,
+        _mapping: mapping,
+    })
+}
+
+fn restore_inherited_ace_flags(current: &mut [u8], original: &[u8]) -> Result<()> {
+    let inherited = INHERITED_ACE.0 as u8;
+    let entries = |bytes: &[u8]| -> Result<Vec<(usize, usize)>> {
+        let acl = bytes.as_ptr().cast::<ACL>();
+        if bytes.len() < std::mem::size_of::<ACL>()
+            || usize::from(u16::from_le_bytes([bytes[2], bytes[3]])) != bytes.len()
+            || !unsafe { IsValidAcl(acl) }.as_bool()
+        {
+            return Err(EngineError::Backend("invalid restoration DACL".to_string()));
+        }
+        let mut result = Vec::new();
+        for index in 0..unsafe { (*acl).AceCount } {
+            let mut ace = null_mut();
+            unsafe { GetAce(acl, u32::from(index), &mut ace) }.map_err(|error| {
+                EngineError::Backend(format!("failed to inspect restoration ACE: {error}"))
+            })?;
+            let offset = ace as usize - bytes.as_ptr() as usize;
+            let size = usize::from(unsafe { (*ace.cast::<ACE_HEADER>()).AceSize });
+            result.push((offset, size));
+        }
+        Ok(result)
+    };
+    let current_entries = entries(current)?;
+    let mut original_entries = entries(original)?;
+    // Preserve original explicit entries before matching inherited copies,
+    // including a redundant explicit rule identical to its inherited peer.
+    original_entries.sort_by_key(|(offset, _)| original[offset + 1] & inherited != 0);
+    let mut matched = HashSet::new();
+    for (offset, size) in original_entries {
+        let old = &original[offset..offset + size];
+        for &(current_offset, current_size) in &current_entries {
+            if current_size != size || matched.contains(&current_offset) {
+                continue;
+            }
+            let now = &current[current_offset..current_offset + size];
+            if old[0] == now[0]
+                && old[1] & !inherited == now[1] & !inherited
+                && old[2..] == now[2..]
+            {
+                matched.insert(current_offset);
+                if old[1] & inherited != 0 {
+                    current[current_offset + 1] |= inherited;
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prepare_acl_boundary(
     lease: &mut AppContainerLease,
     sid: PSID,
@@ -1405,11 +1595,12 @@ fn prepare_acl_boundary(
             }
         }
     }
+    let baseline = retain_boundary_baseline(&snapshot, prior)?;
     let index = lease.original_dacls.len();
     let handle = snapshot.handle.0;
     lease.original_dacls.push(snapshot);
     lease.snapshot_indices.insert(key.clone(), index);
-    lease.boundary_protection.insert(key, original);
+    lease.boundary_protection.insert(key, baseline);
     apply_acl_change_security(
         &AclChange {
             path: path.to_path_buf(),
@@ -1436,7 +1627,11 @@ fn prepare_acl_boundary(
     Ok(())
 }
 
-fn restore_boundary_inheritance(snapshot: &DaclSnapshot, originally_protected: bool) -> Result<()> {
+fn restore_boundary_inheritance(
+    snapshot: &DaclSnapshot,
+    originally_protected: bool,
+    original_acl: &[u8],
+) -> Result<()> {
     let process = unsafe { GetCurrentProcess() };
     let mut duplicate = HANDLE::default();
     unsafe {
@@ -1461,10 +1656,12 @@ fn restore_boundary_inheritance(snapshot: &DaclSnapshot, originally_protected: b
     {
         return Ok(());
     }
-    let acl = current
+    let mut acl = current
         .acl
         .as_ref()
-        .expect("inspection rejects a null DACL");
+        .expect("inspection rejects a null DACL")
+        .clone();
+    restore_inherited_ace_flags(&mut acl, original_acl)?;
     win32(unsafe {
         SetSecurityInfo(
             snapshot.handle.0,
@@ -3508,6 +3705,10 @@ fn production_hostile_self_test() -> Result<String> {
         broad_app_packages_write: broad_app_packages.join("must-not-write.txt"),
         authority_file,
         worktree_authority_files,
+        boundary_state_names: vec![
+            boundary_state_name(&authority_before)?,
+            boundary_state_name(&gitlink_before)?,
+        ],
         real_source,
         shared_git_marker,
         loopback_addr: listener.local_addr().map_err(|error| {
@@ -3589,6 +3790,18 @@ fn production_hostile_self_test() -> Result<String> {
         &prepared.lease.profile_name,
         "second-prepared",
     )?;
+    // Positive control: the named baselines exist and the trusted parent can
+    // open them for writing before the contained child attempts the same.
+    for name in &manifest.boundary_state_names {
+        let name = wide(OsStr::new(name));
+        for access in [FILE_MAP_WRITE.0, WRITE_DAC.0, WRITE_OWNER.0] {
+            let _handle = unsafe { OpenFileMappingW(access, false, PCWSTR(name.as_ptr())) }
+                .map(OwnedHandle)
+                .map_err(|error| {
+                    EngineError::Backend(format!("baseline access control failed: {error}"))
+                })?;
+        }
+    }
     let PreparedLaunch {
         program,
         args,
@@ -3669,6 +3882,7 @@ fn production_hostile_self_test() -> Result<String> {
         && receipt.worktree_git_read
         && receipt.worktree_git_write_denied
         && receipt.worktree_git_replace_denied
+        && receipt.boundary_state_write_denied
         && receipt.scratch_write
         && receipt.outside_write_denied
         && receipt.authority_read_denied
@@ -4072,6 +4286,22 @@ fn hostile_child() -> Result<()> {
     let gitlink_write_error = std::fs::write(&gitlink, "gitdir: forged").err();
     let gitlink_replace_error = std::fs::rename(&replacement_gitlink, &gitlink).err();
     eprintln!("fixture gitlink probe: write_error={gitlink_write_error:?} replace_error={gitlink_replace_error:?}");
+    let boundary_state_denials = manifest
+        .boundary_state_names
+        .iter()
+        .flat_map(|name| {
+            [FILE_MAP_WRITE.0, WRITE_DAC.0, WRITE_OWNER.0].map(|access| {
+                let name = wide(OsStr::new(name));
+                let result = unsafe { OpenFileMappingW(access, false, PCWSTR(name.as_ptr())) }
+                    .map(OwnedHandle);
+                eprintln!(
+                    "fixture boundary state access={access:?}: {:?}",
+                    result.as_ref().err()
+                );
+                result.is_err()
+            })
+        })
+        .collect::<Vec<_>>();
     let receipt = ProductionHostileReceipt {
         token_is_appcontainer: is_appcontainer_process()?,
         // Windows Server 2025 returns ERROR_INVALID_PARAMETER for the
@@ -4091,6 +4321,8 @@ fn hostile_child() -> Result<()> {
         worktree_git_write_denied: gitlink_write_error
             .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
         worktree_git_replace_denied: gitlink_replace_error.is_some(),
+        boundary_state_write_denied: !boundary_state_denials.is_empty()
+            && boundary_state_denials.iter().all(|denied| *denied),
         scratch_write: std::fs::write(&manifest.scratch_write, "allowed").is_ok(),
         outside_write_denied: std::fs::write(&manifest.outside_write, "escape").is_err(),
         authority_read_denied: std::fs::read(&manifest.authority_file).is_err(),
@@ -4319,6 +4551,112 @@ mod tests {
     }
 
     #[test]
+    fn boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = root.path().join(".kranz");
+        let expected = root.path().join("expected");
+        std::fs::create_dir(&authority).unwrap();
+        std::fs::create_dir(&expected).unwrap();
+        let mut system = string_sid("S-1-5-18", "SYSTEM").unwrap();
+        let mut guests = string_sid("S-1-5-32-546", "Guests").unwrap();
+        let explicit = |path: &Path, sid, permissions, mode| {
+            let snapshot = snapshot_dacl(path).unwrap();
+            let _guard = DaclMutationGuard::acquire().unwrap();
+            apply_acl_change(
+                &AclChange {
+                    path: path.to_path_buf(),
+                    permissions,
+                    inherit: true,
+                    mode,
+                },
+                sid,
+                snapshot.handle.0,
+            )
+            .unwrap();
+        };
+        // A redundant explicit SYSTEM rule must stay explicit even though
+        // its inherited peer is temporarily converted to the same shape.
+        for path in [&authority, &expected] {
+            explicit(
+                path,
+                PSID(system.as_mut_ptr().cast()),
+                windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS.0,
+                AclMode::Grant,
+            );
+        }
+        explicit(
+            &expected,
+            PSID(guests.as_mut_ptr().cast()),
+            FILE_GENERIC_WRITE.0,
+            AclMode::Deny,
+        );
+        let baseline = snapshot_dacl(&authority).unwrap();
+        let acl = baseline.acl.as_ref().unwrap().as_ptr().cast::<ACL>();
+        let mut system_inheritance = Vec::new();
+        for index in 0..unsafe { (*acl).AceCount } {
+            let mut ace = null_mut();
+            unsafe { GetAce(acl, u32::from(index), &mut ace) }.unwrap();
+            let entry = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = PSID((&entry.SidStart as *const u32).cast_mut().cast());
+            if unsafe { EqualSid(sid, PSID(system.as_mut_ptr().cast())) }.is_ok() {
+                system_inheritance.push(entry.Header.AceFlags & INHERITED_ACE.0 as u8 != 0);
+            }
+        }
+        assert!(system_inheritance.contains(&false));
+        assert!(system_inheritance.contains(&true));
+        let expected = snapshot_dacl(&expected).unwrap();
+        let prepare = || {
+            let (name, sid) = create_profile(false).unwrap();
+            let mut lease = new_lease(name, None);
+            let _guard = DaclMutationGuard::acquire().unwrap();
+            prepare_acl_boundary(&mut lease, sid.0, &authority, 0).unwrap();
+            assert_eq!(
+                lease.boundary_protection.values().next().unwrap().acl,
+                *baseline.acl.as_ref().unwrap()
+            );
+            lease
+        };
+        let first = prepare();
+        let second = prepare();
+        drop(first);
+        // Preserve an unrelated explicit operator edit made during a lease.
+        explicit(
+            &authority,
+            PSID(guests.as_mut_ptr().cast()),
+            FILE_GENERIC_WRITE.0,
+            AclMode::Deny,
+        );
+        let third = prepare();
+        drop(second);
+        assert!(snapshot_dacl(&authority).unwrap().protected);
+        drop(third);
+        let after = snapshot_dacl(&authority).unwrap();
+        assert_eq!(after.protected, expected.protected);
+        assert_eq!(after.acl, expected.acl);
+    }
+
+    #[test]
+    fn boundary_marker_without_shared_baseline_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = root.path().join(".kranz");
+        std::fs::create_dir(&authority).unwrap();
+        let (name, sid) = create_profile(false).unwrap();
+        let mut orphan = new_lease(name, None);
+        {
+            let _guard = DaclMutationGuard::acquire().unwrap();
+            prepare_acl_boundary(&mut orphan, sid.0, &authority, 0).unwrap();
+            // Model the last original owner crashing: its volatile baseline
+            // disappears but its protected marker remains on the object.
+            orphan.boundary_protection.clear();
+        }
+        let (name, sid) = create_profile(false).unwrap();
+        let mut next = new_lease(name, None);
+        let _guard = DaclMutationGuard::acquire().unwrap();
+        assert!(prepare_acl_boundary(&mut next, sid.0, &authority, 0).is_err());
+        assert!(snapshot_dacl(&authority).unwrap().protected);
+    }
+
+    #[test]
     fn sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance() {
         for originally_protected in [false, true] {
             for reverse in [false, true] {
@@ -4505,7 +4843,8 @@ mod tests {
         .unwrap();
         std::fs::rename(&original, &moved).unwrap();
         assert!(!original.exists());
-        restore_boundary_inheritance(&before, before.protected).unwrap();
+        restore_boundary_inheritance(&before, before.protected, before.acl.as_ref().unwrap())
+            .unwrap();
         let after = snapshot_dacl(&moved).unwrap();
         assert_eq!(before.acl, after.acl);
         assert_eq!(before.protected, after.protected);

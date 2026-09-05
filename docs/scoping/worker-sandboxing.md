@@ -134,9 +134,13 @@ All of it asks the agent nicely. None of it constrains the process.
   grants that reopen parent deletion are refused. Retained no-share-delete
   handles additionally pin both protected objects.
   Per-profile ACL markers preserve the original inheritance setting across
-  overlapping launches; the final lease restores it after removing its grants.
-  A crashed lease leaves the boundary protected until its orphan ACLs are
-  cleaned up, just as its disposable grants can remain after a crash.
+  overlapping launches. A host-only, pagefile-backed shared record preserves
+  the original ACE inheritance flags until the last lease closes; cleanup
+  restores those flags without replacing unrelated explicit operator rules.
+  This avoids duplicating permissions that Windows temporarily converts to
+  explicit entries while inheritance is blocked. A crashed lease can leave
+  the boundary protected. If its volatile baseline is missing, subsequent
+  launches fail closed and require operator recovery of the orphan ACLs.
   Grants that contain or sit inside other authority directories, validator
   source roots, shared Git metadata, or shared Cargo caches are refused before
   ACL mutation. Shared Git metadata remains read-only on this provider.

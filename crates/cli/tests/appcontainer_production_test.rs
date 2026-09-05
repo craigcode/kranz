@@ -46,6 +46,7 @@ fn windows_production_appcontainer_helper_enforces_and_restores_boundary() {
         "worktreeGitRead",
         "worktreeGitWriteDenied",
         "worktreeGitReplaceDenied",
+        "boundaryStateWriteDenied",
         "scratchWrite",
         "outsideWriteDenied",
         "authorityReadDenied",
