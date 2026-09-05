@@ -1,9 +1,15 @@
 # Public-readiness gate
 
-Status (2026-09-05): **release preparation authorized; gate in progress**. The
-owner explicitly approved the v0.2.0 public-release sequence. The clean-origin
-migration is complete, while the active repository remains private until the
-exact release candidate passes every gate below.
+Status (2026-09-05): **local candidate verified; public release still gated**.
+The owner approved v0.2.0 release preparation, and the clean-origin migration
+is complete. Local workspace, dashboard, security, packaging, and assisted live
+acceptance checks pass. The active repository remains private: exact-commit
+platform CI, an unattended live smoke, owner confidentiality/licensing review,
+and the publication controls below remain required.
+
+The remote preflight found no `ANTHROPIC_API_KEY` Actions secret and no reviewer
+protection on the `release` environment. Local OAuth credentials were not
+uploaded. `KRANZ_PUBLIC_RELEASE_ENABLED` remains `false`.
 
 The active-origin hardening and local verification are recorded in the
 [v0.2.0 candidate review](reviews/2026-09-05-release-candidate.md). That evidence
