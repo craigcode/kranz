@@ -34,6 +34,8 @@
   ],
   "workflow_url": "https://github.com/craigcode/kranz/actions/runs/34012676218",
   "artifact_expires_at": "2026-12-05T04:54:41Z",
+  "generated_deliverable_retained": false,
+  "fixture_git_history_retained": false,
   "event_hmac_verified": false,
   "operator_intervention": false,
   "validator_containment_decisions": 12,

@@ -1,9 +1,9 @@
 {
   "files": {
     "acceptance-summary.json": {
-      "bytes": 2297,
+      "bytes": 2381,
       "retention": "repository",
-      "sha256": "ab47f6b2d0494c32ea3e9fcc024a929a8ae6b11a4566f46320b78f30638db7d2"
+      "sha256": "f6901460cae1e6db3c912e84ef460b320f2fda0dc3eb9f13b5d21d63bacf597d"
     },
     "advertised-refs.tsv": {
       "bytes": 3990,

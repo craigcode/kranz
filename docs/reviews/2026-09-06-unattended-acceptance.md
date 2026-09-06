@@ -31,7 +31,7 @@ a human review of the generated plan.
 | Event structure | 876 contiguous events, sequences 1–876; cached state at 876 |
 | Sessions | 28 recorded sessions |
 | Execution override | Event 38 sets `maxFixCyclesPerMilestone=3` before milestone work |
-| Delivery | Mission branch retained; CLI summary records `pushed=false` |
+| Delivery | Mission branch audited before fixture cleanup; CLI summary records `pushed=false` |
 
 ## Qualifications
 
@@ -73,6 +73,14 @@ rewritten to repair the budget narrative.
   evidence directory retains the original ZIP, full smoke log, API receipts,
   plan, research, report, state, and transcripts beyond that retention window.
   Runtime files and credentials are not added to this source repository.
+
+The artifact contains mission records and session transcripts, not the
+generated source tree or its Git history. On success,
+`scripts/acceptance-smoke.sh` copies only `.kranz/missions` before deleting
+the scratch repository and its worktrees. The recorded branch name and commit
+IDs therefore do not provide a retained deliverable that a reviewer can check
+out or rerun. The final-audit result is retained as execution evidence; this
+archive cannot independently reproduce that audit against the delivered code.
 
 ## Release status
 
