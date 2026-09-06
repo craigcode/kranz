@@ -34,7 +34,8 @@ COPY . .
 
 # Build only the CLI crate (package `kranz`, binary name: `kranz`) in release.
 RUN cargo build --release --locked -p kranz \
-    && strip target/release/kranz
+    && strip target/release/kranz \
+    && cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" /tmp/RUST_LIBRARY_NOTICES.html
 
 # ---- runtime -----------------------------------------------------------------
 FROM debian:stable-slim@sha256:1710bde34461551a19a47c787885ec9ad7058d9a5bead2affb8d088fa2f8502b AS runtime
@@ -52,8 +53,13 @@ RUN useradd --create-home --uid 10001 kranz
 WORKDIR /work
 RUN chown kranz:kranz /work
 
-# The kranz binary, and only the kranz binary.
+# The executable carries project/dependency notices via `kranz licenses`;
+# retain standalone copies and the compiler's library inventory in the image.
 COPY --from=builder /src/target/release/kranz /usr/local/bin/kranz
+COPY --from=builder /src/LICENSE /usr/share/doc/kranz/LICENSE
+COPY --from=builder /src/crates/cli/assets/THIRD_PARTY_NOTICES.txt /usr/share/doc/kranz/THIRD_PARTY_NOTICES.txt
+COPY --from=builder /src/crates/cli/assets/dashboard/dist/THIRD_PARTY_NOTICES.txt /usr/share/doc/kranz/DASHBOARD_THIRD_PARTY_NOTICES.txt
+COPY --from=builder /tmp/RUST_LIBRARY_NOTICES.html /usr/share/doc/kranz/RUST_LIBRARY_NOTICES.html
 
 # TODO (deployment-specific, see docs/deploy.md):
 #   - Provide the `claude` CLI on PATH. The usual path is a small Node layer:

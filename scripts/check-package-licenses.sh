@@ -10,6 +10,8 @@ packages=(
   'kranz-slack:crates/slack'
   'kranz:crates/cli'
 )
+listing="$(mktemp)"
+trap 'rm -f "$listing"' EXIT
 
 for entry in "${packages[@]}"; do
   package="${entry%%:*}"
@@ -18,10 +20,15 @@ for entry in "${packages[@]}"; do
     echo "package license check: $crate_dir/LICENSE differs from the root LICENSE" >&2
     exit 1
   }
-  cargo package --locked --allow-dirty --list -p "$package" | grep -qx 'LICENSE' || {
+  cargo package --locked --allow-dirty --list -p "$package" > "$listing"
+  grep -qx 'LICENSE' "$listing" || {
     echo "package license check: $package archive omits LICENSE" >&2
     exit 1
   }
+  if [ "$package" = kranz ]; then
+    grep -qx 'assets/THIRD_PARTY_NOTICES.txt' "$listing"
+    grep -qx 'assets/dashboard/dist/THIRD_PARTY_NOTICES.txt' "$listing"
+  fi
 done
 
 echo 'package license check: all four archives contain the canonical MIT notice'

@@ -43,6 +43,17 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     }
 
     match cli.command {
+        Command::Licenses => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(include_bytes!("../LICENSE"))?;
+            out.write_all(b"\n\n")?;
+            out.write_all(include_bytes!("../assets/THIRD_PARTY_NOTICES.txt"))?;
+            out.write_all(b"\n\nEmbedded dashboard dependency notices\n")?;
+            out.write_all(include_bytes!(
+                "../assets/dashboard/dist/THIRD_PARTY_NOTICES.txt"
+            ))?;
+            Ok(0)
+        }
         Command::Init {
             gates,
             register,

@@ -127,13 +127,19 @@ git push origin vX.Y.Z
 
 The tag starts `.github/workflows/release.yml`. It rechecks version/main
 alignment, all reachable history, Rust/dashboard gates, documentation, and
-dependency policy before building. Each platform binary receives a GitHub
-build-provenance attestation. The final protected-environment job assembles the
-binaries, SPDX JSON SBOM, and `SHA256SUMS`; an owner must approve that job before
+dependency policy before building. It also verifies upstream license text
+and the committed dependency notices using pinned cargo-about 0.9.2. Each
+platform archive contains the executable, MIT license, Rust/dashboard
+dependency notices, and the build toolchain's Rust library copyright inventory.
+Archives receive GitHub build-provenance attestations. The final
+protected-environment job assembles the archives, SPDX JSON SBOM and
+`SHA256SUMS`; an owner must approve that job before
 GitHub creates the release.
 
 After approval, verify all assets, checksums, attestations, generated notes,
-and `kranz --version` on clean Linux, macOS, and Windows hosts. A failed matrix
+and `kranz --version` on clean Linux, macOS, and Windows hosts. Also inspect
+the extracted notices, run `kranz licenses` outside a source checkout, and
+check `/THIRD_PARTY_NOTICES.txt` from the served embedded dashboard. A failed matrix
 or missing evidence means no release—delete the draft/tag only through the
 documented operator recovery process.
 

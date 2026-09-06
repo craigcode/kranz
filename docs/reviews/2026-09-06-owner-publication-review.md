@@ -4,6 +4,12 @@ Prepared 2026-09-06 UTC for the owner. **No confidentiality, ownership,
 licensing, or publication approval is recorded.** This packet makes the
 remaining decisions concrete after [unattended acceptance passed](2026-09-06-unattended-acceptance.md).
 
+Follow-up: [distribution notice preparation](2026-09-06-distribution-notices.md)
+implements the crate, binary, Docker and dashboard delivery changes described
+below. The measurements in this packet remain pinned to the older source;
+use the follow-up PR's final validation receipt for the changed payloads.
+Owner provenance decisions and final scope approval remain unsigned.
+
 ## Pinned scope
 
 The accepted source commit is `d1eafe037df0dc08dd67e94889937fa66f56f7ac`, tree

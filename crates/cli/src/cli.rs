@@ -67,6 +67,9 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Print Kranz, Rust dependency and embedded-dashboard license notices
+    Licenses,
+
     /// Prepare an existing Git worktree for its first Kranz mission.
     ///
     /// Scaffolds an additive runtime-ignore block, a tracked merge-gate
