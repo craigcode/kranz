@@ -4547,8 +4547,8 @@ mod tests {
             for path in &protected {
                 std::fs::write(path, "protected").unwrap();
             }
-            let token = repo.join(".kranz/serve.token");
-            std::fs::write(&token, "secret").unwrap();
+            let authority_path = repo.join(".kranz/serve.token");
+            std::fs::write(&authority_path, "secret").unwrap();
             let ordinary = if snapshot {
                 cwd.join("witness")
             } else {
@@ -4565,7 +4565,7 @@ mod tests {
                 "rebind-test".into(),
                 ordinary.display().to_string(),
                 scratch.join("witness").display().to_string(),
-                token.display().to_string(),
+                authority_path.display().to_string(),
             ];
             command.extend(protected.iter().map(|path| path.display().to_string()));
             let args = bubblewrap_args(
@@ -4596,7 +4596,7 @@ mod tests {
                     .unwrap();
                 assert!(output.status.success(), "snapshot={snapshot}: {output:?}");
                 assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), "work");
-                assert_eq!(std::fs::read_to_string(&token).unwrap(), "secret");
+                assert_eq!(std::fs::read_to_string(&authority_path).unwrap(), "secret");
                 for path in protected {
                     assert_eq!(std::fs::read_to_string(path).unwrap(), "protected");
                 }
