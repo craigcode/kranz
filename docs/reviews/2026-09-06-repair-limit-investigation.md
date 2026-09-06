@@ -6,6 +6,25 @@ orchestrator's durable-state digest.** This investigation concerns source
 [the successful unattended run](2026-09-06-unattended-acceptance.md).
 It does not change runtime behavior or rewrite that run's evidence.
 
+## Follow-up implementation
+
+The repair-budget fix adds the effective cap, used cycles and saturating
+remaining allowance to the existing execution digest. It explicitly makes
+current policy authoritative over planning/research observations and states
+that exhaustion does not justify a waiver or establish contract completion.
+The CLI override stays on its existing audited control-inbox path after
+approval, including enqueue-only operation; moving it into planning is
+unnecessary for execution correctness and would change those semantics.
+
+The mock regression starts planning at two, consumes two repair rounds,
+accepts a control change to three, and captures the next actual findings
+message with one round remaining. It emits that third repair, refuses a
+fourth, lowers the cap to one without resetting usage, and verifies replay,
+streaming reseed and single-shot execution context. Existing local-tier
+escalation and non-waivable final-gate checks remain unchanged. The historical
+probe below must still be run against its pinned source; it deliberately
+asserts the old omission and is expected to fail against the fixed source.
+
 ## Evidence chain
 
 1. Event 1 creates the mission with the default
