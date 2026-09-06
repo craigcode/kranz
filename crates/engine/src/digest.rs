@@ -60,14 +60,22 @@ pub fn render(state: &MissionState) -> String {
         out.push('\n');
     }
 
+    let repair_cap = state.config.max_fix_cycles_per_milestone;
+    out.push_str(&format!(
+        "REPAIR POLICY: current cap {repair_cap} rounds per milestone, per executor tier. \
+         Current policy supersedes planning/research observations. Exhaustion limits repairs; \
+         it does not justify a waiver or establish that the contract is met.\n"
+    ));
     out.push_str("MILESTONES:\n");
     for milestone in &mission.milestones {
         out.push_str(&format!(
-            "{} [{}] {} (fixCycles {})\n",
+            "{} [{}] {} (fixCycles {}, repair cap {}, remaining {})\n",
             milestone.id,
             milestone_status(milestone.status),
             truncate_chars(&milestone.title, ITEM_MAX),
-            milestone.fix_cycles
+            milestone.fix_cycles,
+            repair_cap,
+            repair_cap.saturating_sub(milestone.fix_cycles)
         ));
         for feature in &milestone.features {
             out.push_str(&format!(
