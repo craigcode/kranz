@@ -7,6 +7,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## 0.2.0 - 2026-09-05
 
+- Security: Linux sandbox private-workspace rebinds preserve Git metadata
+  and shared-cache write protections while keeping authority files hidden.
+- Fixed PTY validation cancellation to finish target process-group cleanup
+  before releasing the mission lock. Waiting for output or blocked terminal
+  input no longer delays cancellation until the script deadline.
 - Fixed Linux sandbox startup racing with removal of ordinary temporary files
   from private directory views. Disappearing entries stay hidden; authority
   masks and read-only restrictions remain mandatory.
