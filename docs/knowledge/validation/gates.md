@@ -18,6 +18,9 @@ verified_against:
   - crates/engine/src/knowledge.rs
   - crates/engine/src/test_capability.rs
   - .github/workflows/ci.yml
+  - scripts/check-rust-notices.sh
+  - scripts/check-package-licenses.sh
+  - scripts/package-release.py
   - docs/tickets.md
 ---
 
@@ -51,6 +54,14 @@ full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
 tests, and lint.
+
+The supply-chain job also checks the four package MIT notices, regenerates
+the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
+generic-license fallbacks without upstream source text. Archive tests verify
+the binary and notice payload for all five release targets. The dashboard
+build generates its bundled dependency notices; the embedded-bundle freshness
+check covers that file too. `kranz licenses` exposes the project and dependency
+notices from a copied executable outside a checkout.
 
 The `knowledge-refresh` job checks out full history, then runs
 `cargo run --locked --package kranz -- knowledge-refresh`. Full history is
