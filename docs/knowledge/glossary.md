@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 verified_against:
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
@@ -35,7 +35,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   (re-evaluated by a validator/orchestrator). See
   [gates](validation/gates.md).
 - **Orchestrator** — the planning-and-judging agent role: drafts plans, proposes
-  revisions, and renders final-gate verdicts. Runs as one streaming session.
+  revisions, and renders final-gate verdicts. Claude uses a streaming session;
+  non-Claude backends use fresh single-shot turns. Execution turns receive the
+  current durable-state digest, including the effective repair allowance.
 - **Worker** — the coding agent role; one run per feature, using the configured
   checkout or dedicated [worktree isolation](decisions/inviolable-invariants.md).
 - **Validator** — the checking roles: **scrutiny** (adversarial review) and
@@ -100,5 +102,6 @@ Project vocabulary. Terms link to the note that explains them in depth.
   compose an operator-configured catalog of repositories for the dashboard and
   the single Slack bridge.
 - **Respawn / fix-cycle / fix-feature** — a respawn re-runs a failed worker; a
-  fix-cycle is a validation round that produced findings; a fix-feature is a
-  feature created to resolve a finding.
+  fix-cycle is counted when a validation round emits repair features; a
+  fix-feature is a feature created to resolve a finding. Waiving findings
+  does not consume a repair round.

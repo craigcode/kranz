@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
