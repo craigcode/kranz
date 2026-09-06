@@ -31,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Audit tracked public content
         run: scripts/audit-public-tree.sh
+      - name: Prove required operator-marker audits fail closed
+        run: python3 scripts/test-audit-operator-markers.py
       - name: Audit reachable history metadata
         env:
           KRANZ_SKIP_GITLEAKS: "1"
@@ -42,6 +44,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
         with:
           command: check
+      - name: Verify package licenses and dependency notices
+        run: |
+          cargo install cargo-about --locked --version 0.9.2 --features cli
+          bash scripts/check-rust-notices.sh
+          bash scripts/check-package-licenses.sh
+          python3 scripts/test-package-release.py
 
   # Stage 4 autonomous slice (docs/gascity-citizenship.md, ticket
   # gascity-pack-publish): pin gc, lint the pack, run stub-safe pack tests.

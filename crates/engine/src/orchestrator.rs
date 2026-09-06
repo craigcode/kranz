@@ -12016,6 +12016,154 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn current_repair_budget_survives_config_change_replay_and_session_reseed() {
+        use crate::backend_mock::{MockBackend, MockScript};
+
+        let (_dir, root) = lessons_test_repo().expect("git fixture");
+        let mut replies = vec!["Planning observed a two-round repair cap.".to_string()];
+        replies.extend((0..5).map(|_| tier_escalation_fix_reply()));
+        let mock = Arc::new(MockBackend::with_scripts(vec![projection_orch_script(
+            replies,
+        )]));
+        let cfg = MissionConfig {
+            skip_functional: true,
+            validator_allow_uncontained_degrade: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(mock.clone(), &root, "goal", cfg).unwrap();
+        assert_eq!(engine.state.config.max_fix_cycles_per_milestone, 2);
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        engine
+            .planning_turn("plan with the current policy")
+            .await
+            .unwrap();
+        engine.approve_plan(flight_rules_pin_plan(vec![])).unwrap();
+        engine
+            .emit(EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: engine.repo.head_sha().unwrap(),
+            })
+            .unwrap();
+
+        for used in 1..=2 {
+            mock.push_script(tier_escalation_finding_script("a real defect"));
+            engine.validation_round(0).await.unwrap();
+            assert_eq!(engine.state.mission.milestones[0].fix_cycles, used);
+        }
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::ConfigChange {
+                patch: serde_json::json!({"maxFixCyclesPerMilestone": 3}),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        let injected = mock.injected_messages();
+        let third_round = injected[0].last().unwrap();
+        assert!(
+            third_round.contains("fixCycles 2, repair cap 3, remaining 1"),
+            "{third_round}"
+        );
+        assert!(third_round.contains("Current policy supersedes planning/research observations."));
+        assert!(third_round
+            .contains("it does not justify a waiver or establish that the contract is met."));
+        assert_eq!(engine.state.mission.milestones[0].fix_cycles, 3);
+        let features_after_third = engine.state.mission.milestones[0].features.len();
+        assert_eq!(
+            features_after_third, 4,
+            "one plan feature and three repairs"
+        );
+
+        // The same session asks for a fourth round: block without inventing
+        // a waiver or emitting another feature. Frontier has no escalation.
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].features.len(),
+            features_after_third
+        );
+
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::ConfigChange {
+                patch: serde_json::json!({"maxFixCyclesPerMilestone": 1}),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].features.len(),
+            features_after_third
+        );
+        assert!(mock.injected_messages()[0]
+            .last()
+            .unwrap()
+            .contains("fixCycles 3, repair cap 1, remaining 0"));
+
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::ConfigChanged { .. }))
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::MilestoneCompleted { .. } | EventKind::TierEscalated { .. }
+        )));
+        engine.state = crate::reducer::fold(&events).unwrap();
+        assert_eq!(engine.state.mission.milestones[0].fix_cycles, 3);
+
+        engine.force_reseed();
+        mock.push_script(projection_orch_script(vec!["ready".into()]));
+        engine.orch_turn("decide after replay").await.unwrap();
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs.last().unwrap().prompt else {
+            panic!("expected reseeded streaming session");
+        };
+        assert!(
+            seed.contains("fixCycles 3, repair cap 1, remaining 0"),
+            "{seed}"
+        );
+        assert!(seed.contains("APPROVED PLAN (plan.json)"));
+        assert!(mock.injected_messages().last().unwrap()[0]
+            .contains("fixCycles 3, repair cap 1, remaining 0"));
+
+        // Exercise the single-shot execution seam with the same replayed
+        // state and recording backend; no real Codex process is required.
+        mock.push_script(MockScript::single_shot_json(
+            &serde_json::json!({"summary": "ready"}),
+        ));
+        engine
+            .orch_single_shot_turn("decide in a fresh context")
+            .await
+            .unwrap();
+        let specs = mock.started_specs();
+        let PromptMode::SingleShot(prompt) = &specs.last().unwrap().prompt else {
+            panic!("expected single-shot session");
+        };
+        assert!(
+            prompt.contains("fixCycles 3, repair cap 1, remaining 0"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Current policy supersedes planning/research observations."));
+    }
+
     /// Escalating the executor must never touch the validator role configs —
     /// validators stay on the frontier tier throughout, per the mission's
     /// D-X decision.

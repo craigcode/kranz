@@ -521,11 +521,12 @@ branch kranz/mission-m-1 (from main) | tokens in/out 1200/340 | cost $0.50
 CONTRACT:
 - [a-1|command] cargo test passes :: cargo test
 - [a-2|judgement] docs are accurate
+REPAIR POLICY: current cap 2 rounds per milestone, per executor tier. Current policy supersedes planning/research observations. Exhaustion limits repairs; it does not justify a waiver or establish that the contract is met.
 MILESTONES:
-ms-1 [active] Milestone one (fixCycles 0)
+ms-1 [active] Milestone one (fixCycles 0, repair cap 2, remaining 2)
   f-1-1 [active|plan] Alpha (runs 1, respawns 0)
   f-1-2 [pending|plan] Beta (runs 0, respawns 0)
-ms-2 [pending] Milestone two (fixCycles 0)
+ms-2 [pending] Milestone two (fixCycles 0, repair cap 2, remaining 2)
   f-2-1 [pending|plan] Gamma (runs 0, respawns 0)
 RECENT DECISIONS:
 - started milestone one; alpha implemented
@@ -543,7 +544,9 @@ fn digest_matches_committed_snapshot_and_is_deterministic() {
     assert!(rendered.contains("branch kranz/mission-m-1 (from main)"));
     assert!(rendered.contains("- [a-1|command] cargo test passes :: cargo test"));
     assert!(rendered.contains("- [a-2|judgement] docs are accurate"));
-    assert!(rendered.contains("ms-1 [active] Milestone one (fixCycles 0)"));
+    assert!(
+        rendered.contains("ms-1 [active] Milestone one (fixCycles 0, repair cap 2, remaining 2)")
+    );
     assert!(rendered.contains("  f-1-1 [active|plan] Alpha (runs 1, respawns 0)"));
     assert!(rendered.contains("- started milestone one; alpha implemented"));
     assert!(rendered.contains("- and update the readme"));

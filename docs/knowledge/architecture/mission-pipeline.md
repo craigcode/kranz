@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -10,6 +10,8 @@ verified_against:
   - crates/engine/src/event_log.rs
   - crates/engine/src/control.rs
   - crates/engine/src/orchestrator.rs
+  - crates/engine/src/digest.rs
+  - crates/engine/src/findings.rs
   - crates/engine/src/queue.rs
   - crates/cli/src/exec.rs
   - crates/cli/src/main.rs
@@ -175,6 +177,16 @@ to fix-features or waives them (blocking at `max_fix_cycles_per_milestone`);
 assertions itself and sends `agent-judgement` assertions to the orchestrator
 against the `base_sha..HEAD` diff. Roles: `Orchestrator`, `Worker`,
 `ValidatorScrutiny`, `ValidatorFunctional`.
+
+Every execution turn receives a freshly rendered durable-state digest,
+including the current repair cap, used cycles and remaining rounds per
+milestone. Lowering the cap below usage renders zero remaining without
+rewriting history. The same policy reaches streaming, single-shot and reseed
+contexts, superseding earlier planning/research observations. Exhaustion
+bounds further repair rounds; it does not establish that a finding may be
+waived or that the contract passes. A capped local executor retains its
+existing one-time escalation to frontier; a capped frontier executor blocks
+when another repair is requested.
 
 ## The dispatch pool (`workerCandidates`, KRZ-303)
 

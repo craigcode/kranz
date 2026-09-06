@@ -16,6 +16,38 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[test]
+fn licenses_travel_with_the_binary_outside_a_source_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir
+        .path()
+        .join(if cfg!(windows) { "kranz.exe" } else { "kranz" });
+    fs::copy(env!("CARGO_BIN_EXE_kranz"), &binary).unwrap();
+    let output = std::process::Command::new(&binary)
+        .arg("licenses")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.starts_with(include_str!("../LICENSE")));
+    assert!(text.contains(include_str!("../assets/THIRD_PARTY_NOTICES.txt")));
+    assert!(text.ends_with(include_str!(
+        "../assets/dashboard/dist/THIRD_PARTY_NOTICES.txt"
+    )));
+    assert!(text.contains("Microsoft Corporation"));
+    assert!(text.contains("Meta Platforms"));
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "licenses need no repository or sidecar files"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

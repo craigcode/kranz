@@ -1,20 +1,32 @@
 # Public-readiness gate
 
-Status (2026-09-05): **local candidate verified; public release still gated**.
+Status (2026-09-06 UTC): **platform CI and unattended acceptance passed;
+public release still gated**.
 The owner approved v0.2.0 release preparation, and the clean-origin migration
-is complete. Local workspace, dashboard, security, packaging, and assisted live
-acceptance checks pass. The active repository remains private: exact-commit
-platform CI, an unattended live smoke, owner confidentiality/licensing review,
-and the publication controls below remain required.
+is complete. Commit `d1eafe037df0dc08dd67e94889937fa66f56f7ac` passed all jobs
+in the manually dispatched platform workflow, including the first unattended
+live smoke attempt. The [acceptance receipt](reviews/2026-09-06-unattended-acceptance.md)
+records the artifact digest, two automated waivers, and the limits of that proof.
 
-The remote preflight found no `ANTHROPIC_API_KEY` Actions secret and no reviewer
-protection on the `release` environment. Local OAuth credentials were not
-uploaded. `KRANZ_PUBLIC_RELEASE_ENABLED` remains `false`.
+The Actions credential gap is closed. The repository remains private, the
+`release` environment has no reviewer protection, and
+`KRANZ_PUBLIC_RELEASE_ENABLED` remains `false`. The
+[owner review packet](reviews/2026-09-06-owner-publication-review.md) is prepared
+but unsigned. Its open items include package and distribution notices, source
+provenance, and confidentiality across every advertised ref. The
+[repair-limit investigation](reviews/2026-09-06-repair-limit-investigation.md)
+also identifies stale decision context that needs a focused correction before
+release-candidate closure.
 
 The active-origin hardening and local verification are recorded in the
 [v0.2.0 candidate review](reviews/2026-09-05-release-candidate.md). That evidence
-does not replace the exact-commit platform CI, public visibility review,
+does not replace the final release commit's platform CI, public visibility review,
 protected release environment, or published-artifact checks below.
+
+The passing run is evidence for the pinned commit above. Subsequent runtime,
+dependency, workflow, or fixture changes need their own relevant checks; the
+eventual tag must have exact-commit release evidence. Preparation and scans do
+not constitute owner approval to publish.
 
 Making Kranz public exposes every reachable Git object and every existing
 GitHub release asset. It is an operator action, separate from merging ordinary
@@ -25,9 +37,18 @@ hardening changes. Keep the repository private until every item below is true.
 - `scripts/audit-public-tree.sh` passes on the exact proposed public commit.
 - `scripts/audit-public-history.sh` passes with every branch, tag, and GitHub
   pull-request ref fetched.
+- Both audits pass with `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the owner's
+  reviewed private vocabulary supplied outside the checkout. The matching
+  `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret is configured. Ordinary CI's
+  built-in-marker scan does not substitute for this owner-supplied vocabulary.
 - Mission records, tickets, fixtures, and review documents have received a
   human confidentiality/licensing review; automated secret scans do not detect
   external-party identifiers, private prompts, or proprietary prose reliably.
+- The owner has signed the pinned scope in the
+  [review packet](reviews/2026-09-06-owner-publication-review.md), and package,
+  binary, and embedded-dashboard notices have been verified in the actual
+  distribution payloads. An SPDX label or dependency-policy pass alone does
+  not close that evidence gap.
 - A fresh anonymous-equivalent clone contains no required private submodule,
   credential, local path, or untracked generated asset.
 
@@ -88,6 +109,10 @@ release. They must never silently become the supported distribution.
   `patterns_allowed` to a personal-account repository after it is public.
 - The `release` environment requires the repository owner to approve the
   publish job.
+  The 2026-09-06 preparation attempt to add that rule was rejected by GitHub
+  because the current plan does not support required reviewers for this
+  private repository. Keep the release switch off; after separately approved
+  public visibility, configure and verify the rule before enabling releases.
 - The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` remains
   `false` until every item in this document is complete; set it to `true` only
   after the protected release environment is verified.

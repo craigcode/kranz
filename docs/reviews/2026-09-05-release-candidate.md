@@ -1,5 +1,12 @@
 # v0.2.0 release-candidate review
 
+Historical local-preparation record. The later
+[2026-09-06 unattended acceptance receipt](2026-09-06-unattended-acceptance.md)
+closes the remote platform-CI and live-smoke gaps for `d1eafe0`. References below
+to the missing Actions credential and pending remote checks describe this
+earlier review, not the current release status. Owner review and publication
+remain gated by the [current checklist](../public-readiness.md).
+
 The release work is based on active origin commit
 `eea2e62d8723d6e2ea3d59890c07820f17a6b36c`, in a fresh clone of
 `craigcode/kranz`. The earlier local audit was on the archived lineage.

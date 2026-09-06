@@ -89,10 +89,15 @@ dependencies automatically:
 cargo install kranz --locked
 ```
 
-**Prebuilt binaries.** Download the binary for your platform plus `SHA256SUMS`
+**Prebuilt binaries.** Download the archive for your platform plus `SHA256SUMS`
 from the [latest GitHub release](https://github.com/craigcode/kranz/releases/latest).
-Release assets carry GitHub build-provenance attestations and include macOS
-Apple silicon/Intel, Linux x86-64, and Windows x86-64/ARM64 builds.
+Verify the checksum, extract the archive and put `kranz` (`kranz.exe` on
+Windows) on your PATH. Keep the accompanying license and notice files when
+redistributing it. `kranz licenses` prints the project, Rust dependency and
+dashboard notices; the archive also carries the compiler's Rust library
+copyright inventory. Release archives carry GitHub build-provenance
+attestations: macOS Apple silicon/Intel and Linux x86-64 use `.tar.gz`;
+Windows x86-64/ARM64 use `.zip`.
 
 **From a source checkout.** This is useful for contributors and unreleased
 development snapshots:

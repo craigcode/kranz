@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+python3 "$(dirname "$0")/audit-operator-markers.py" tree
+
 # Fast, deterministic privacy lint for the tree that a public clone receives.
 # Secret detection is a separate gate; these markers catch operator metadata
 # that is not normally classified as a credential.
