@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 verified_against:
   - .kranz/lessons/index.md
   - AGENTS.md
@@ -43,6 +43,9 @@ left to per-mission capture:
   validation assertion; completed milestones are frozen.
 - **kranz never pushes by default.** The explicit cloud handoff can push only
   a completed `kranz/*` branch; see the invariants note.
+- **Sandbox mount ordering.** Restoring a writable private workspace must
+  preserve covered Git/cache write protections and later authority masks;
+  see the authority-material rule in the invariants note.
 
 When a new lesson turns out to be a durable rule (not just a one-mission scar),
 promote it into AGENTS.md / the invariants note and link it here — keep the

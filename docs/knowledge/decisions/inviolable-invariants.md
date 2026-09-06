@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-06
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - crates/engine/src/control.rs
@@ -196,6 +196,10 @@ untouched (AGENTS.md rules 1–3).
   preserving allowed policy entries while hiding token/config files created
   or atomically replaced after launch. Seatbelt also pins authority ancestors
   against renames that would move protected files outside their path denies.
+  On Linux, restoring a writable private workspace must also restore any Git
+  or cache write protections it covers, before deeper authority masks are
+  applied. A later host bind must never reopen a protected path or hidden
+  credential.
   WHY: under `workerIsolation: "checkout"` the session cwd is the repo root, so
   a contained worker could once overwrite the trust root it could not read, or
   forge approvals into a sibling mission's inbox (the 2026-09-01 adversarial
