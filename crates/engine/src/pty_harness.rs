@@ -664,16 +664,18 @@ mod imp {
                 // 'trying to exit' state and wait() never returns), so pump
                 // the master while polling the reap. A target STILL
                 // unreaped after the bound — never observed, defense only —
-                // is dropped (a SIGKILLed process reaps to init via the
-                // zombie path) rather than allowed to hang the validation
-                // round in an unbounded wait().
+                // is dropped rather than allowed to hang the validation
+                // round in an unbounded wait(). It may remain a zombie
+                // until the engine exits.
                 let reap_deadline = Instant::now() + Duration::from_secs(10);
                 let reaped = loop {
                     drain(&mut master, &mut session);
                     if child.try_wait().ok().flatten().is_some() {
                         break true;
                     }
-                    if session.child_eof || Instant::now() >= reap_deadline {
+                    // Terminal EOF can precede a waitable process exit;
+                    // it does not mean the target has been reaped.
+                    if Instant::now() >= reap_deadline {
                         break false;
                     }
                     std::thread::sleep(POLL_INTERVAL);
@@ -683,8 +685,8 @@ mod imp {
                 } else {
                     tracing::warn!(
                         "pty target did not reap within 10s of SIGKILL despite a drained \
-                         pty; dropping the handle (the round continues, the killed target \
-                         reaps to init)"
+                         pty; dropping the handle (the killed target may remain \
+                         unreaped until the engine exits)"
                     );
                 }
                 if let Some((program, args)) = &wrapped.timeout_teardown {
