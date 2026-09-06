@@ -1,0 +1,43 @@
+{
+  "source_commit": "d1eafe037df0dc08dd67e94889937fa66f56f7ac",
+  "run_id": 34012676218,
+  "run_attempt": 1,
+  "workflow_conclusion": "success",
+  "smoke_conclusion": "success",
+  "mission_id": "m-53a35b",
+  "mission_status": "complete",
+  "milestones": 2,
+  "planned_features": 5,
+  "repair_features": 10,
+  "repair_features_with_commits": 5,
+  "final_audit_tests": 15,
+  "event_count": 876,
+  "event_sequence_contiguous": true,
+  "recorded_cost_usd": 11.543975550000006,
+  "live_step_minutes": 45.15,
+  "waiver_decisions": [
+    {
+      "detail": "- [f-1-2] non-Bearer scheme handling / [ms-1-fix-2-1] case-insensitive bearer scheme: Test-coverage gap only \u2014 the runtime behaviour is correct and matches f-1-2's spec ('non-Bearer scheme ... respond 401'), contract assertion a1 passes, and ms-1's two fix cycles are already spent, so a fresh session would buy one regression test against a defect that does not exist.",
+      "summary": "waived 1 finding(s): [f-1-2] non-Bearer scheme handling / [ms-1-fix-2-1] case-insensitive bearer scheme"
+    },
+    {
+      "detail": "- [f-2-1] CLI error handling / README claim that 'other request error' prints an explanation to stderr and exits non-zero: Cosmetic polish on an untested error path \u2014 a mid-response disconnect or non-JSON body still exits non-zero with the reason on stderr, just as a traceback rather than a formatted line; no contract assertion or feature criterion is violated, and ms-2 has spent both fix cycles.",
+      "summary": "waived 1 finding(s): [f-2-1] CLI error handling / README claim that 'other request error' prints an explanation to stderr and exits non-zero"
+    }
+  ],
+  "artifact_id": 9983608804,
+  "artifact_digest": "sha256:bab7a1cb7c96ae0c6b3d225d9fd1177693fbc75fdb0dd2f2f3ce5e868536e310",
+  "downloaded_archive_digest": "sha256:bab7a1cb7c96ae0c6b3d225d9fd1177693fbc75fdb0dd2f2f3ce5e868536e310",
+  "waiver_event_sequences": [
+    477,
+    866
+  ],
+  "workflow_url": "https://github.com/craigcode/kranz/actions/runs/34012676218",
+  "artifact_expires_at": "2026-12-05T04:54:41Z",
+  "event_hmac_verified": false,
+  "operator_intervention": false,
+  "validator_containment_decisions": 12,
+  "worker_sandbox_enforcement": "off",
+  "final_audit_sandbox_enforcement": "fs",
+  "publication_authorized": false
+}

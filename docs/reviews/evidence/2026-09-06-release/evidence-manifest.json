@@ -1,0 +1,97 @@
+{
+  "files": {
+    "acceptance-summary.json": {
+      "bytes": 2297,
+      "retention": "repository",
+      "sha256": "ab47f6b2d0494c32ea3e9fcc024a929a8ae6b11a4566f46320b78f30638db7d2"
+    },
+    "advertised-refs.tsv": {
+      "bytes": 3990,
+      "retention": "repository",
+      "sha256": "18792f51a26fd23e0554fad2b08383976ff6fa09e6f40ed9df4efb77b63199b1"
+    },
+    "owner-scope-summary.json": {
+      "bytes": 719,
+      "retention": "repository",
+      "sha256": "4f886da739685967b7fc8fc26d0f2a4e94d61b18a2de6e57608c27bef15b3ccb"
+    },
+    "owner-tree-inventory.csv": {
+      "bytes": 110326,
+      "retention": "repository",
+      "sha256": "453a6f2ef88ea513cf61b34d60e3b75f021ce27da27eec9c7dbc0dccbd3fe580"
+    },
+    "package-notice-observations.json": {
+      "bytes": 538,
+      "retention": "repository",
+      "sha256": "12a961ecadfaa092a5ecdaf24f3fc053b29a2f15b4671ac05a0cdb6cefd999db"
+    },
+    "private/live-acceptance-34012676218/artifacts.json": {
+      "bytes": 710,
+      "retention": "private evidence directory outside repository",
+      "sha256": "dec3635d44fc180ad67a9333f889b4725194c6017170cc3068e2f4d16b915723"
+    },
+    "private/live-acceptance-34012676218/mission-artifact.zip": {
+      "bytes": 856297,
+      "retention": "private evidence directory outside repository",
+      "sha256": "bab7a1cb7c96ae0c6b3d225d9fd1177693fbc75fdb0dd2f2f3ce5e868536e310"
+    },
+    "private/live-acceptance-34012676218/run-attempt.json": {
+      "bytes": 233,
+      "retention": "private evidence directory outside repository",
+      "sha256": "7195c2ddf538f72dfc7040e598f3f742a116ddc39ea47f49c4cdc1ece9d2eb76"
+    },
+    "private/live-acceptance-34012676218/run.json": {
+      "bytes": 33570,
+      "retention": "private evidence directory outside repository",
+      "sha256": "715d1f7833392bc73734e79746e04611df83baa82035af60b5364d3208093859"
+    },
+    "private/live-acceptance-34012676218/smoke.log": {
+      "bytes": 234538,
+      "retention": "private evidence directory outside repository",
+      "sha256": "0d1614f3499188bac23c752b511fed7cd48445a4a7534de956310051fa87d62e"
+    },
+    "private/owner-history-inventory.csv": {
+      "bytes": 693929,
+      "retention": "private evidence directory outside repository",
+      "sha256": "b480eec2eebacbe70d1f6da4e55bd5537828baa7b650b1b972e86c2120b8b79d"
+    },
+    "private/preflight/kranz-unattended-acceptance-harness.log": {
+      "bytes": 107,
+      "retention": "private evidence directory outside repository",
+      "sha256": "a15f46697241f9bde581dfc2ab2ad55cdc1d6af2cd465f67c4ee0c347da7555a"
+    },
+    "private/preflight/kranz-unattended-audit-public-history.sh.log": {
+      "bytes": 139,
+      "retention": "private evidence directory outside repository",
+      "sha256": "275ec6a1511374c7f9b724df562c9f2babce0b37f74a9f9dbcb390d30df5deed"
+    },
+    "private/preflight/kranz-unattended-audit-public-tree.sh.log": {
+      "bytes": 22,
+      "retention": "private evidence directory outside repository",
+      "sha256": "f307663c68b50cc279c68c2e3e920b7c751f877b0697e77609fba09103f9d95e"
+    },
+    "private/preflight/kranz-unattended-dependency-policy.log": {
+      "bytes": 48,
+      "retention": "private evidence directory outside repository",
+      "sha256": "f1a0fca39d4280363937aabd77783990ea6480bd9ca257816de3b68fc8efa845"
+    },
+    "private/repair-budget-probe.log": {
+      "bytes": 140,
+      "retention": "private evidence directory outside repository",
+      "sha256": "737591622abcffc746b8a3bb6f70b94b4c75f40c51e70a6289bc6e96af44b514"
+    },
+    "repair-budget-probe.rs": {
+      "bytes": 1881,
+      "retention": "repository",
+      "sha256": "65c9691b259d9461183d78e2e3d63695249f116926fa4feb5814ce19f6e53ea9"
+    },
+    "repair-limit-observations.json": {
+      "bytes": 1356,
+      "retention": "repository",
+      "sha256": "5a232f573c5fefc3d750d328aeefc7d55b012698fc90764100ff161328600e9e"
+    }
+  },
+  "hash_scope": "File-byte integrity only; no claim of event HMAC verification or human approval.",
+  "prepared_at": "2026-09-06 UTC",
+  "source_commit": "d1eafe037df0dc08dd67e94889937fa66f56f7ac"
+}
