@@ -806,6 +806,11 @@ pub struct ProvisionedPreview {
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
     pub mission: Mission,
+    /// Sequential feature baselines pinned before worker execution. Empty in
+    /// older logs; reconstructed from feature.progress rather than trusted
+    /// from the cached state file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub feature_base_shas: BTreeMap<String, String>,
     /// All runs keyed by run id (BTreeMap for deterministic serialization).
     pub runs: BTreeMap<String, WorkerRun>,
     pub totals: TokenUsage,
@@ -1620,6 +1625,19 @@ pub struct MissionConfig {
     /// after-fingerprint tripwire as the only remaining layers.
     #[serde(default)]
     pub validator_allow_uncontained_degrade: bool,
+    /// Non-loopback hosts a local-backend `baseUrl` may name (audit
+    /// 2026-09-01, MEDIUM `baseUrl`).
+    ///
+    /// The engine POSTs the assembled system + user prompt to `baseUrl` from
+    /// the engine process, outside every sandbox, and the readiness probe
+    /// connects to whatever host:port it names. `config::validate` therefore
+    /// requires the host to be loopback unless it is listed here — the same
+    /// reasoning `hookStatus.endpoint` already carries. OPERATOR-ONLY: the
+    /// project config layer may not set this key (it is the escape hatch
+    /// from the rule, so a repo that could set it would face no rule at
+    /// all). Empty (the default) means loopback only.
+    #[serde(default)]
+    pub local_backend_allowed_hosts: Vec<String>,
 }
 
 impl Default for MissionConfig {
@@ -1706,6 +1724,7 @@ impl Default for MissionConfig {
             routing: RoutingConfig::default(),
             hook_status: None,
             validator_allow_uncontained_degrade: false,
+            local_backend_allowed_hosts: Vec::new(),
         }
     }
 }

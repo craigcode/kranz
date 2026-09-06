@@ -1,0 +1,29 @@
+{
+  "source_commit": "d1eafe037df0dc08dd67e94889937fa66f56f7ac",
+  "cargo_package_lists": [
+    {
+      "crate": "kranz-engine",
+      "exit_code": 0,
+      "entries": 162,
+      "notice_paths": []
+    },
+    {
+      "crate": "kranz-server",
+      "exit_code": 0,
+      "entries": 18,
+      "notice_paths": []
+    },
+    {
+      "crate": "kranz-slack",
+      "exit_code": 0,
+      "entries": 35,
+      "notice_paths": []
+    },
+    {
+      "crate": "kranz",
+      "exit_code": 0,
+      "entries": 42,
+      "notice_paths": []
+    }
+  ]
+}

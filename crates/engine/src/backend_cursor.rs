@@ -139,6 +139,9 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 /// valid, secret-free domain. Never link or copy the operator's real login
 /// keychain — that would hand the session every credential reachable in it,
 /// defeating the scratch-HOME posture.
+/// The actual private store is `kranz-session.keychain-db`; a relative
+/// `login.keychain-db` alias stays inside this scratch directory. This avoids
+/// securityd's special login-store handling without exposing operator state.
 ///
 /// Two further live findings shape the seed (m-eee81f): an EMPTY-password
 /// keychain cannot be unlocked programmatically, and a fresh keychain
@@ -163,6 +166,9 @@ const PRE_BILLING_FAILURE_PHRASES: &[&str] = &["cannot use this model", "authent
 /// no-timeout; [`lock_session_login_keychain`] relocks at session end.
 #[cfg(target_os = "macos")]
 const SESSION_KEYCHAIN_LOCK_SECS: u32 = 8 * 60 * 60;
+
+#[cfg(target_os = "macos")]
+const SESSION_KEYCHAIN_DB: &str = "kranz-session.keychain-db";
 
 /// `securityd` is shared by every session owned by the OS account. Even
 /// keychains at distinct explicit paths can intermittently reject overlapping
@@ -334,7 +340,35 @@ fn write_session_keychain_secret(path: &Path, secret: &str) -> std::io::Result<(
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     file.write_all(secret.as_bytes())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(target_os = "macos")]
+fn read_session_keychain_secret(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut contents = String::new();
+    if file.metadata()?.is_file() {
+        file.take(129).read_to_string(&mut contents)?;
+    }
+    // This file is worker-writable. Never let arbitrary contents become
+    // commands in the stdin-fed `security -i` protocol on a respawn.
+    if contents.len() != 32 || !contents.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid session keychain secret",
+        ));
+    }
+    Ok(Some(contents))
 }
 
 /// Seed/unlock the session's login keychain (see the block doc above
@@ -377,37 +411,71 @@ fn write_session_keychain_secret(path: &Path, secret: &str) -> std::io::Result<(
 ///   operator, even on a respawn into a scratch HOME this module's own
 ///   teardown just relocked.
 ///
-/// Returns true iff the seed left the session db UNLOCKED (batch A's
-/// unlock exited 0). This is the ONLY trustworthy non-interactive witness
-/// of lock state: for a `login.keychain-db` that securityd has previously
-/// unlocked this session, `unlock-keychain -p <wrong>` can exit 0 anyway
-/// (securityd credential caching — verified live 2026-08-09, and the probe
-/// attempt itself RE-UNLOCKS the db), while `show-keychain-info` /
-/// `set-keychain-settings` on a locked db either error 152 or HANG on a GUI
-/// dialog, nondeterministically. Callers/tests must therefore never probe
-/// lock state through `security`; they consume this return value instead.
+/// Unlock the private backing store, migrating legacy login-named stores
+/// without replacing their contents. Failed legacy unlocks restore the path.
 #[cfg(target_os = "macos")]
 fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
     let _operation = SESSION_KEYCHAIN_OPERATION_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(|poison| poison.into_inner());
     let keychains = home.join("Library").join("Keychains");
-    let db = keychains.join("login.keychain-db");
-    let db_exists = db.exists();
-    if !db_exists {
-        if let Err(e) = std::fs::create_dir_all(&keychains) {
+    let normalized = crate::sandbox::absolutize(&keychains);
+    let Some(operator) = crate::agent_env::os_account_home() else {
+        tracing::warn!(
+            "cursor session keychain seed: cannot identify the operator's keychain directory"
+        );
+        return false;
+    };
+    if normalized != crate::sandbox::absolutize(home).join("Library/Keychains")
+        || normalized.starts_with(crate::sandbox::absolutize(
+            &operator.join("Library/Keychains"),
+        ))
+    {
+        tracing::warn!(
+            "cursor session keychain seed: refusing an operator or redirected keychain directory"
+        );
+        return false;
+    }
+    let db = keychains.join(SESSION_KEYCHAIN_DB);
+    let login = keychains.join("login.keychain-db");
+    // Refuse foreign aliases and special files. Legacy regular login stores
+    // are moved without changing their contents, then get our local alias.
+    let managed_exists = match std::fs::symlink_metadata(&db) {
+        Ok(metadata) if metadata.is_file() => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return false,
+    };
+    let migrate_login = match std::fs::symlink_metadata(&login) {
+        Ok(metadata) if metadata.is_file() && !managed_exists => true,
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                && std::fs::read_link(&login)
+                    .is_ok_and(|target| target == Path::new(SESSION_KEYCHAIN_DB)) =>
+        {
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return false,
+    };
+    let db_exists = managed_exists || migrate_login;
+    if let Err(e) = std::fs::create_dir_all(&keychains) {
+        tracing::warn!(
+            error = %e,
+            "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
+             fail startup with a security error under the relocated HOME"
+        );
+        return false;
+    }
+    let secret_path = session_keychain_secret_path(home);
+    let stored = match read_session_keychain_secret(&secret_path) {
+        Ok(stored) => stored,
+        Err(_) => {
             tracing::warn!(
-                error = %e,
-                "cursor session keychain seed: cannot create Library/Keychains; the CLI may \
-                 fail startup with a security error under the relocated HOME"
+                "cursor session keychain seed: refusing invalid or linked passphrase material"
             );
             return false;
         }
-    }
-    let secret_path = session_keychain_secret_path(home);
-    let stored = std::fs::read_to_string(&secret_path)
-        .ok()
-        .filter(|s| !s.is_empty());
+    };
     let passphrase = match (stored, db_exists) {
         // The stored secret wins: later spawns into the same HOME re-unlock
         // with the passphrase the db was created with.
@@ -415,7 +483,15 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
         // Pre-hardening seeds (acdc77b) derived the passphrase from the
         // session id and left no secret file; keep unlocking those homes so
         // a scratch HOME written before the upgrade never wedges.
-        (None, true) => format!("kranz-scratch-{session_id}"),
+        (None, true)
+            if !session_id.is_empty()
+                && session_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)) =>
+        {
+            format!("kranz-scratch-{session_id}")
+        }
+        (None, true) => return false,
         (None, false) => {
             let fresh = uuid::Uuid::new_v4().simple().to_string();
             if let Err(e) = write_session_keychain_secret(&secret_path, &fresh) {
@@ -429,6 +505,21 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
             fresh
         }
     };
+    let Some(db_text) = db
+        .to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+    else {
+        return false;
+    };
+    let db_text = db_text.replace('\\', "\\\\").replace('"', "\\\"");
+    if migrate_login && std::fs::rename(&login, &db).is_err() {
+        return false;
+    }
+    let restore_legacy = || {
+        if migrate_login && std::fs::symlink_metadata(&login).is_err() {
+            let _ = std::fs::rename(&db, &login);
+        }
+    };
     // Batch A carries the passphrase (stdin script, never argv): create
     // (fresh db only), then unlock LAST — the batch's exit status is the
     // last command's, so success means the db is now unlocked. Paths are
@@ -437,12 +528,12 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
     if !db_exists {
         script.push_str(&format!(
             "create-keychain -p {passphrase} \"{}\"\n",
-            db.display()
+            db_text
         ));
     }
     script.push_str(&format!(
         "unlock-keychain -p {passphrase} \"{}\"\n",
-        db.display()
+        db_text
     ));
     match security_script_in_session_home(home, &script) {
         Ok(output) if output.status.success() => {}
@@ -463,6 +554,7 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
             // The db may still be LOCKED — applying settings now would fall
             // back to an interactive GUI prompt (the failure this ordering
             // exists to prevent). Skip batch B.
+            restore_legacy();
             return false;
         }
         Err(e) => {
@@ -471,14 +563,21 @@ fn ensure_session_login_keychain(home: &Path, session_id: &str) -> bool {
                 "cursor session keychain seed: security failed to spawn; the CLI may fail \
                  startup with a security error under the relocated HOME"
             );
+            restore_legacy();
             return false;
         }
+    }
+    if std::fs::symlink_metadata(&login).is_err()
+        && std::os::unix::fs::symlink(SESSION_KEYCHAIN_DB, &login).is_err()
+    {
+        restore_legacy();
+        return false;
     }
     // Batch B: the db is known-unlocked (batch A just succeeded), so
     // bounding the auto-lock cannot prompt.
     let settings = format!(
         "set-keychain-settings -lut {SESSION_KEYCHAIN_LOCK_SECS} \"{}\"\n",
-        db.display()
+        db_text
     );
     match security_script_in_session_home(home, &settings) {
         Ok(output) if output.status.success() => {}
@@ -521,8 +620,8 @@ fn lock_session_login_keychain(home: &Path) -> std::io::Result<bool> {
     let db = home
         .join("Library")
         .join("Keychains")
-        .join("login.keychain-db");
-    if !db.exists() {
+        .join(SESSION_KEYCHAIN_DB);
+    if !std::fs::symlink_metadata(&db).is_ok_and(|metadata| metadata.is_file()) {
         return Ok(false);
     }
     security_in_session_home(
@@ -1251,6 +1350,13 @@ pub struct CursorSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for CursorSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl CursorSession {
     fn observe(&mut self, event: &AgentEvent) {
         match event {
@@ -1605,6 +1711,28 @@ mod tests {
     /// interactive auth (see the non-interactivity invariant above
     /// [`SESSION_KEYCHAIN_LOCK_SECS`]): `show-keychain-info` only ever
     /// against a db the seed JUST reported unlocked.
+    /// Whether this host's `security` can seed a login keychain under a
+    /// relocated HOME at all, probed by running the seed itself against a
+    /// throwaway HOME. On a host where it cannot (the GitHub macOS runner
+    /// image 20260831.0337.3 refuses it; 20260728.0273.1 did not; a
+    /// sandboxed developer shell refuses the unlock), the keychain tests
+    /// skip with the capability marker instead of reporting a runner
+    /// regression as a defect in the seed. `KRANZ_REQUIRED_CAPABILITIES`
+    /// can still demand it, in which case the skip is a panic that names
+    /// the missing capability.
+    #[cfg(target_os = "macos")]
+    fn keychain_can_be_created() -> bool {
+        let home = tempfile::tempdir().unwrap();
+        if ensure_session_login_keychain(home.path(), "capability-probe") {
+            return true;
+        }
+        crate::test_capability::skip(
+            crate::test_capability::capability::KEYCHAIN,
+            "security cannot create and unlock a login keychain under a relocated HOME",
+        );
+        false
+    }
+
     #[cfg(target_os = "macos")]
     fn security_output(home: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("security")
@@ -1625,14 +1753,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_seeded_empty_when_absent() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
 
-        // The seed's own unlock witness (batch A's exit 0) is the only
-        // trustworthy non-interactive evidence the store is left unlocked —
-        // this db path was never unlocked before, so its credential cache
-        // is empty and the witnessed unlock genuinely consumed the stored
-        // secret (see the ensure doc for why probing lock state through
-        // `security` is unsound).
         assert!(ensure_session_login_keychain(home.path(), "test-session"));
 
         let db = home
@@ -1640,9 +1765,18 @@ mod tests {
             .join("Library")
             .join("Keychains")
             .join("login.keychain-db");
-        let meta = std::fs::symlink_metadata(&db).unwrap();
-        assert!(meta.is_file(), "the seed is a real file, never a link");
+        assert_eq!(
+            std::fs::read_link(&db).unwrap(),
+            Path::new(SESSION_KEYCHAIN_DB)
+        );
+        let backing = db.parent().unwrap().join(SESSION_KEYCHAIN_DB);
+        let meta = std::fs::symlink_metadata(&backing).unwrap();
+        assert!(
+            meta.is_file(),
+            "the backing store is a private regular file"
+        );
         assert!(meta.len() > 0, "security create-keychain writes a real db");
+        assert!(keychain_is_unlocked(&db));
         // The stored secret is the db's real passphrase by construction —
         // one string is both written 0600 and fed to create-keychain — and
         // the witnessed first unlock above consumed exactly it.
@@ -1656,6 +1790,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_never_replaces_an_existing_db() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let keychains = home.path().join("Library").join("Keychains");
         std::fs::create_dir_all(&keychains).unwrap();
@@ -1675,6 +1812,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_secret_is_random_per_session_and_stored_0600() {
+        if !keychain_can_be_created() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         let home_a = tempfile::tempdir().unwrap();
         let home_b = tempfile::tempdir().unwrap();
@@ -1731,6 +1871,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_lock_timeout_is_bounded_and_unlocked() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
 
         assert!(
@@ -1777,11 +1920,23 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_teardown_relocks_the_store() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         assert!(ensure_session_login_keychain(home.path(), "test-session"));
+        let backing = home
+            .path()
+            .join("Library/Keychains")
+            .join(SESSION_KEYCHAIN_DB);
+        assert!(keychain_is_unlocked(&backing));
 
         let ran = lock_session_login_keychain(home.path()).unwrap();
         assert!(ran, "the teardown hook ran lock-keychain on the session db");
+        assert!(
+            !keychain_is_unlocked(&backing),
+            "teardown left the store unlocked"
+        );
 
         let again = lock_session_login_keychain(home.path()).unwrap();
         assert!(
@@ -1813,6 +1968,50 @@ mod tests {
             .success(),
             "the stored secret re-unlocks after teardown"
         );
+        assert!(keychain_is_unlocked(&backing));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn keychain_is_unlocked(path: &Path) -> bool {
+        use std::ffi::{c_char, c_void, CString};
+        #[link(name = "Security", kind = "framework")]
+        unsafe extern "C" {
+            fn SecKeychainOpen(path: *const c_char, keychain: *mut *mut c_void) -> i32;
+            fn SecKeychainGetStatus(keychain: *mut c_void, status: *mut u32) -> i32;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFRelease(value: *const c_void);
+        }
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let mut keychain = std::ptr::null_mut();
+        let mut status = 0;
+        unsafe {
+            assert_eq!(SecKeychainOpen(path.as_ptr(), &mut keychain), 0);
+            let result = SecKeychainGetStatus(keychain, &mut status);
+            CFRelease(keychain);
+            assert_eq!(result, 0);
+        }
+        status & 1 != 0 // kSecUnlockStateStatus, Security/SecKeychain.h
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_keychain_refuses_operator_paths_and_injected_secret_scripts() {
+        if let Some(operator) = crate::agent_env::os_account_home() {
+            assert!(!ensure_session_login_keychain(&operator, "test-session"));
+        }
+        let home = tempfile::tempdir().unwrap();
+        let keychains = home.path().join("Library/Keychains");
+        std::fs::create_dir_all(&keychains).unwrap();
+        let injected = "bad\nlock-keychain\n";
+        std::fs::write(session_keychain_secret_path(home.path()), injected).unwrap();
+        assert!(!ensure_session_login_keychain(home.path(), "test-session"));
+        assert!(!keychains.join(SESSION_KEYCHAIN_DB).exists());
+        assert_eq!(
+            std::fs::read_to_string(session_keychain_secret_path(home.path())).unwrap(),
+            injected
+        );
     }
 
     /// macOS: a pre-hardening scratch HOME (db created with the
@@ -1825,6 +2024,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn cursor_keychain_hardened_legacy_seed_still_unlocks() {
+        if !keychain_can_be_created() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let keychains = home.path().join("Library").join("Keychains");
         std::fs::create_dir_all(&keychains).unwrap();

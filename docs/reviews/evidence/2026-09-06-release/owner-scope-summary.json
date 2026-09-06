@@ -1,0 +1,27 @@
+{
+  "source_commit": "d1eafe037df0dc08dd67e94889937fa66f56f7ac",
+  "tree_id": "dba49abc9433473bcb189dc7feea014283d73035",
+  "tracked_files": 949,
+  "groups": {
+    "artwork": 19,
+    "embedded-dashboard": 3,
+    "fixtures": 25,
+    "knowledge": 11,
+    "licensing-and-dependencies": 12,
+    "mission-records": 160,
+    "other-source-and-docs": 426,
+    "reviews": 25,
+    "role-prompts": 4,
+    "scoping": 31,
+    "tickets-and-discussion": 233
+  },
+  "mission_directories": 52,
+  "advertised_heads": 11,
+  "advertised_pull_refs": 50,
+  "advertised_tags": 0,
+  "reachable_commits": 1461,
+  "reachable_unique_blobs": 5607,
+  "blobs_not_in_main_tree": 4661,
+  "paths_absent_from_main": 95,
+  "owner_approval": "pending"
+}

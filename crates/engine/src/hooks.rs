@@ -50,6 +50,10 @@ pub struct HooksConfig {
     /// Comment label that additionally pre-consents to queueing the drafted
     /// plan (default `kranz:fix-and-queue`).
     pub queue_label: String,
+    /// GitHub logins allowed to request work through PR comments. Empty
+    /// disables comment triggers; a valid webhook signature authenticates
+    /// GitHub, not the commenter's authority to spend or approve work.
+    pub allow_users: Vec<String>,
 }
 
 impl Default for HooksConfig {
@@ -58,6 +62,7 @@ impl Default for HooksConfig {
             secret: None,
             fix_label: DEFAULT_FIX_LABEL.to_string(),
             queue_label: DEFAULT_QUEUE_LABEL.to_string(),
+            allow_users: Vec::new(),
         }
     }
 }
@@ -68,6 +73,7 @@ impl fmt::Debug for HooksConfig {
             .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
             .field("fix_label", &self.fix_label)
             .field("queue_label", &self.queue_label)
+            .field("allow_users", &self.allow_users)
             .finish()
     }
 }
@@ -293,6 +299,14 @@ fn parse_workflow_run(payload: &Value) -> Option<Trigger> {
     if run.get("conclusion")?.as_str()? != "failure" {
         return None;
     }
+    // A fork can name its branch `main` or `kranz/mission-*` too. The
+    // workflow's source repository must be the repository receiving the
+    // webhook before a branch name can authorize an automatic draft.
+    let repository = payload.pointer("/repository/full_name")?.as_str()?;
+    let head_repository = run.pointer("/head_repository/full_name")?.as_str()?;
+    if repository.is_empty() || !repository.eq_ignore_ascii_case(head_repository) {
+        return None;
+    }
     let head_branch = run.get("head_branch")?.as_str()?;
     let default_branch = payload
         .pointer("/repository/default_branch")
@@ -350,6 +364,15 @@ fn parse_comment(event: &str, payload: &Value, cfg: &HooksConfig) -> Option<Trig
     if payload.get("action")?.as_str()? != "created" {
         return None;
     }
+    let actor = payload.pointer("/comment/user/login")?.as_str()?;
+    if actor.is_empty()
+        || !cfg
+            .allow_users
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(actor))
+    {
+        return None;
+    }
     let body = payload.pointer("/comment/body")?.as_str()?;
     let consent = if body.contains(&cfg.queue_label) {
         Consent::PreConsentedQueue
@@ -374,12 +397,6 @@ fn parse_comment(event: &str, payload: &Value, cfg: &HooksConfig) -> Option<Trig
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let actor = payload
-        .pointer("/comment/user/login")
-        .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/sender/login").and_then(Value::as_str))
-        .unwrap_or("unknown");
-
     Some(Trigger {
         kind: TriggerKind::PrComment,
         dedup_id: pr_number.to_string(),

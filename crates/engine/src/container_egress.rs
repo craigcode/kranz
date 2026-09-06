@@ -589,6 +589,17 @@ fn credential_owner(_path: &Path) -> Result<String> {
     ))
 }
 
+/// The `--user <uid>:<gid>` a worker or gate container runs as: the OWNER of
+/// the path it bind-mounts read-write, derived by exactly the same
+/// [`credential_owner`] the relay applies to its credential dir (2026-09-01
+/// adversarial audit, MED-2 — the worker container got none of the relay's
+/// hardening). `None` off unix, and `None` when the path cannot be stat'd:
+/// the argv builder is infallible by design, and a missing `--user` leaves
+/// the pre-audit posture rather than failing a mission on a stat.
+pub(crate) fn mount_owner(path: &Path) -> Option<String> {
+    credential_owner(path).ok()
+}
+
 fn docker_output(runtime: ContainerRuntime, args: &[String]) -> Result<Output> {
     crate::command_exec::run_with_timeout(Path::new(runtime.binary()), args, COMMAND_TIMEOUT)
         .ok_or_else(|| {

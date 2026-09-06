@@ -1361,3 +1361,279 @@ fn merge_no_ff_pre_merge_head_refusal_attempts_no_abort() {
         "local divergent copy\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit 2026-09-01 F-10 / F-11: engine-side git and the NETWORK path.
+//
+// `kranz exec --push` runs `push_mission_branch` on the tree the worker just
+// wrote, with the CLI's full ambient environment and whatever credential the
+// remote is authenticated with. Two things have to hold at once there:
+//
+//  - the repository's own config is the scope a worker can write, so a
+//    `credential.helper`, a `core.sshCommand`, an `insteadOf` rewrite or a
+//    transport hook appearing in it is an ATTACK SIGNAL and the push is
+//    refused, naming every offending key;
+//  - the OPERATOR's `~/.gitconfig` is a different scope and stays in force,
+//    because nulling it is what breaks an https push (no credential helper),
+//    an `insteadOf` convention, and a corporate `http.proxy`.
+// ---------------------------------------------------------------------------
+
+/// A bare repository to push at, wired up as `origin`. A real remote, no
+/// network: `git push` runs the whole push path against it.
+fn bare_remote(dir: &TempDir) -> PathBuf {
+    let bare = dir.path().join("remote.git");
+    std::fs::create_dir(&bare).expect("create bare dir");
+    raw_git(&bare, &["init", "--bare", "-q"]);
+    raw_git(
+        dir.path(),
+        &["remote", "add", "origin", &bare.display().to_string()],
+    );
+    bare
+}
+
+/// A path the payload would create if it ever ran, and the shell one-liner
+/// that creates it. Unix-only: the payload is a `/bin/sh` command.
+#[cfg(unix)]
+fn sentinel_payload(dir: &TempDir) -> (PathBuf, String) {
+    let sentinel = dir.path().join("credential-helper-fired");
+    let payload = format!("!sh -c 'touch \"{}\"'", sentinel.display());
+    (sentinel, payload)
+}
+
+/// Make git actually consult its credential helpers, with `extra` prepended
+/// to the argv. The command's own exit status is irrelevant (there is no
+/// terminal to prompt at); what matters is whether a helper ran.
+#[cfg(unix)]
+fn fire_credential_helper(root: &Path, extra: &[&str]) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(extra)
+        .args(["credential", "fill"])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn git credential fill");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"protocol=https\nhost=example.invalid\n\n")
+        .expect("write credential request");
+    let _ = child.wait();
+}
+
+/// A worker-planted `credential.helper` in the repository's own config
+/// refuses the push, names the key, and never runs the payload.
+#[cfg(unix)]
+#[test]
+fn push_refuses_a_repo_local_credential_helper_and_never_runs_it() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    let bare = bare_remote(&dir);
+    repo.create_branch("kranz/mission-1", None).unwrap();
+    let (sentinel, payload) = sentinel_payload(&dir);
+    raw_git(dir.path(), &["config", "credential.helper", &payload]);
+
+    // Fixture proof: the payload is LIVE. Without this the assertion below
+    // would also pass on a repo where a helper simply never fires.
+    fire_credential_helper(dir.path(), &[]);
+    assert!(
+        sentinel.exists(),
+        "fixture: an unguarded git must run the planted credential helper"
+    );
+    std::fs::remove_file(&sentinel).unwrap();
+    // And the `-c credential.helper=` reset the hardened segment carries for
+    // LOCAL operations really does clear the list, planted helper included.
+    fire_credential_helper(dir.path(), &["-c", "credential.helper="]);
+    assert!(
+        !sentinel.exists(),
+        "an empty credential.helper must reset the helper list"
+    );
+
+    let err = repo
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect_err("a planted credential helper must refuse the push");
+    match err {
+        EngineError::Git(msg) => {
+            assert!(
+                msg.contains("credential.helper"),
+                "the refusal must name the offending key: {msg}"
+            );
+            assert!(
+                msg.contains("attack signal"),
+                "the refusal must say why it is a refusal and not a fix-up: {msg}"
+            );
+        }
+        other => panic!("expected EngineError::Git, got {other:?}"),
+    }
+    assert!(
+        !sentinel.exists(),
+        "the planted credential helper must never execute"
+    );
+    // Nothing reached the remote either.
+    assert!(
+        raw_git(&bare, &["for-each-ref", "--format=%(refname)"])
+            .trim()
+            .is_empty(),
+        "a refused push must not have delivered the branch"
+    );
+}
+
+/// Every armed key is named in one refusal, not just the first — an operator
+/// who removes the one the message named must not have to re-run to discover
+/// the next. `ls-remote` is pre-flighted the same way `push` is.
+#[test]
+fn the_refusal_names_every_armed_key_and_covers_ls_remote() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    bare_remote(&dir);
+    repo.create_branch("kranz/mission-1", None).unwrap();
+    for (key, value) in [
+        ("core.sshCommand", "sh -c evil --"),
+        ("core.askPass", "/tmp/evil-askpass"),
+        ("core.gitProxy", "/tmp/evil-proxy"),
+        ("http.proxy", "http://attacker.invalid:8080"),
+        ("remote.origin.receivepack", "/tmp/evil-receive"),
+        ("url.ext::sh -c evil %S.insteadOf", "https://"),
+        ("protocol.allow", "always"),
+    ] {
+        raw_git(dir.path(), &["config", key, value]);
+    }
+
+    let EngineError::Git(msg) = repo
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect_err("an armed repo config must refuse the push")
+    else {
+        panic!("expected EngineError::Git");
+    };
+    for expected in [
+        "core.sshcommand",
+        "core.askpass",
+        "core.gitproxy",
+        "http.proxy",
+        "remote.origin.receivepack",
+        "insteadof",
+        "protocol.allow",
+    ] {
+        assert!(
+            msg.contains(expected),
+            "the refusal must name {expected}: {msg}"
+        );
+    }
+    // Values can carry secrets (an http.proxy with a password, a credential
+    // username) and the refusal goes to mission logs: keys only.
+    assert!(
+        !msg.contains("attacker.invalid"),
+        "the refusal must name keys, never their values: {msg}"
+    );
+
+    // The same pre-flight guards the read-only network probe.
+    assert!(
+        repo.remote_has_branch("origin", "kranz/mission-1").is_err(),
+        "ls-remote contacts a remote too and must be pre-flighted"
+    );
+}
+
+/// The control case: a clean repository config pushes normally. Without this
+/// the refusal above could pass on a push path that never worked.
+#[test]
+fn a_clean_repository_config_pushes_to_a_bare_remote() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    let bare = bare_remote(&dir);
+    repo.create_branch("kranz/mission-1", None).unwrap();
+
+    repo.push_mission_branch("origin", "kranz/mission-1")
+        .expect("a clean repo config must push");
+    assert!(
+        raw_git(&bare, &["for-each-ref", "--format=%(refname)"])
+            .contains("refs/heads/kranz/mission-1"),
+        "the mission branch must be on the remote"
+    );
+    // And the read-only probe agrees.
+    assert!(repo
+        .remote_has_branch("origin", "kranz/mission-1")
+        .expect("ls-remote against the bare remote"));
+}
+
+/// `.git/config.worktree` is a second writable scope on a linked worktree —
+/// exactly the shape the integration worktree has — and the pre-flight must
+/// see it. A `--local` read would not.
+#[cfg(unix)]
+#[test]
+fn the_preflight_sees_a_planted_worktree_scoped_config() {
+    if !setup() {
+        return;
+    }
+    let (dir, _repo, _) = seeded_repo();
+    let bare = bare_remote(&dir);
+    let wt = dir.path().join("wt");
+    raw_git(
+        dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kranz/mission-1",
+            &wt.display().to_string(),
+        ],
+    );
+    raw_git(dir.path(), &["config", "extensions.worktreeConfig", "true"]);
+    let linked = GitRepo::open(&wt).expect("open the linked worktree");
+    // Control: the linked worktree pushes fine before anything is planted.
+    linked
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect("a clean linked worktree must push");
+    assert!(raw_git(&bare, &["for-each-ref", "--format=%(refname)"])
+        .contains("refs/heads/kranz/mission-1"));
+
+    let (sentinel, payload) = sentinel_payload(&dir);
+    raw_git(
+        &wt,
+        &["config", "--worktree", "credential.helper", &payload],
+    );
+    let err = linked
+        .push_mission_branch("origin", "kranz/mission-1")
+        .expect_err("a worktree-scoped credential helper must refuse the push");
+    assert!(
+        matches!(&err, EngineError::Git(msg) if msg.contains("credential.helper")),
+        "the refusal must name the worktree-scoped key: {err:?}"
+    );
+    assert!(!sentinel.exists(), "the payload must never execute");
+}
+
+/// Audit F-10: the neutralization segment does not merely exist, it blanks
+/// the transport programs a worker can name in the repository's own config.
+/// `remote.<name>.uploadpack` is single-valued, so the empty `-c` override
+/// really does replace a planted value.
+#[test]
+fn a_planted_remote_transport_program_is_blanked_on_local_operations() {
+    if !setup() {
+        return;
+    }
+    let (dir, _repo, _) = seeded_repo();
+    raw_git(
+        dir.path(),
+        &["remote", "add", "origin", "https://example.invalid/r.git"],
+    );
+    raw_git(
+        dir.path(),
+        &["config", "remote.origin.uploadpack", "/tmp/evil-upload"],
+    );
+    // A LOCAL operation on a handle opened the ordinary way still works, and
+    // the handle carries the blanking override (proved at unit level); what
+    // this pins is that enumerating the armed remote does not fail the open.
+    let reopened = GitRepo::open(dir.path()).expect("open must survive an armed remote config");
+    assert!(reopened.is_clean().expect("status on a hardened handle"));
+}

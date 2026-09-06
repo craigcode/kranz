@@ -31,6 +31,7 @@ fn isolate_home() {
 fn cfg_with_secret() -> HooksConfig {
     HooksConfig {
         secret: Some("whsec-test".to_string()),
+        allow_users: vec!["reviewer".to_string()],
         ..HooksConfig::default()
     }
 }
@@ -46,6 +47,7 @@ fn workflow_run_payload(action: &str, conclusion: &str, head_branch: &str) -> Va
             "id": 9876543210_u64,
             "name": "gates",
             "head_branch": head_branch,
+            "head_repository": { "full_name": "octo/hello" },
             "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "conclusion": conclusion,
             "html_url": "https://github.com/octo/hello/actions/runs/9876543210",
@@ -197,9 +199,45 @@ fn ghook_parse_workflow_run_ignores_non_matching_events() {
     .is_none());
 }
 
+#[test]
+fn ghook_workflow_fork_cannot_authorize_a_draft_using_a_trusted_branch_name() {
+    for branch in ["main", "kranz/mission-m-forged"] {
+        let mut payload = workflow_run_payload("completed", "failure", branch);
+        payload["workflow_run"]["head_repository"]["full_name"] = json!("outsider/hello");
+        assert!(hooks::parse_trigger("workflow_run", &payload, &cfg_with_secret()).is_none());
+        payload["workflow_run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("head_repository");
+        assert!(hooks::parse_trigger("workflow_run", &payload, &cfg_with_secret()).is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // parse_trigger — PR comments
 // ---------------------------------------------------------------------------
+
+#[test]
+fn ghook_comment_authority_requires_an_explicit_allowed_author() {
+    for event in ["issue_comment", "pull_request_review_comment"] {
+        for label in ["kranz:fix", "kranz:fix-and-queue"] {
+            let mut payload = if event == "issue_comment" {
+                issue_comment_payload(label, true)
+            } else {
+                review_comment_payload(label)
+            };
+            assert!(hooks::parse_trigger(event, &payload, &HooksConfig::default()).is_none());
+            payload["comment"]["user"]["login"] = json!("outsider");
+            payload["comment"]["author_association"] = json!("NONE");
+            assert!(hooks::parse_trigger(event, &payload, &cfg_with_secret()).is_none());
+            // An allowlisted sender cannot stand in for the comment's author.
+            payload["comment"]["user"] = Value::Null;
+            assert!(hooks::parse_trigger(event, &payload, &cfg_with_secret()).is_none());
+            payload["comment"]["user"] = json!({"login": "ReViEwEr"});
+            assert!(hooks::parse_trigger(event, &payload, &cfg_with_secret()).is_some());
+        }
+    }
+}
 
 #[test]
 fn ghook_parse_comment_fix_label_is_draft_only() {

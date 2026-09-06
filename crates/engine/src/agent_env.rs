@@ -338,7 +338,7 @@ fn link_cargo_cache(name: &str, from: &Path, to: &Path) {
 /// unavailable, and the toolchain env vars themselves remain the explicit
 /// override (handled in [`toolchain_var_value`]).
 #[cfg(unix)]
-fn os_account_home() -> Option<PathBuf> {
+pub(crate) fn os_account_home() -> Option<PathBuf> {
     // getpwuid_r (the reentrant form): the engine is a multi-threaded tokio
     // process, so the static-buffer getpwuid is not sound here. pw_dir points
     // into `buf`; copy it to an owned PathBuf before returning.
@@ -368,7 +368,7 @@ fn os_account_home() -> Option<PathBuf> {
 /// only when the platform-native source is unavailable. The generated child
 /// environment redirects both HOME and USERPROFILE later; this lookup happens
 /// first against the engine's operator environment. See [`os_account_home`].
-fn operator_home() -> Option<PathBuf> {
+pub(crate) fn operator_home() -> Option<PathBuf> {
     #[cfg(unix)]
     if let Some(home) = os_account_home() {
         return Some(home);
@@ -497,6 +497,55 @@ pub fn sanitized_child_env(
         // leaving them unset hangs children in opaque ways (89f05a1 CI).
         redirect_windows_profile_env(&mut env, base_home);
     }
+    for (key, value) in extra {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
+/// The cleared environment a BINARY PROBE spawns with (2026-09-01
+/// adversarial audit, H5).
+///
+/// Every session spawn is `env_clear`'d from the allowlist above; the
+/// discovery and readiness probes were the one exception, so a
+/// repo-named `claudeBinary` or a PATH-precedence shadow of
+/// `claude`/`codex`/`droid`/`kimi`/`cursor` received the operator's whole
+/// environment — `GH_TOKEN`, `SLACK_*`, `AWS_*`, every API key — on its
+/// first `--version` invocation, before any auth decision.
+///
+/// Deliberately NOT [`sanitized_child_env`]: that builder relocates `HOME`
+/// to a scratch dir and seeds a cache-only Cargo home, which would copy the
+/// registry for a `--version` call AND would make every login probe report
+/// "not logged in" (`claude auth status` and its siblings read the
+/// operator's real config). The probe env is therefore the allowlist
+/// WITHOUT the relocation: `PATH`, the real `HOME`/`USERPROFILE`, the
+/// ambient locale/identity vars ([`AMBIENT_LOCALE_VARS`] — `USER` alone is
+/// what the claude CLI's keychain OAuth resolution needs), the system temp
+/// dir, and on Windows the process bootstrap set
+/// ([`AMBIENT_WINDOWS_VARS`]) without which process creation fails.
+/// `extra` carries the ONE ambient auth var a login probe may need, named
+/// by its caller. Nothing else crosses.
+pub(crate) fn probe_child_env(extra: &[(String, String)]) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(key.to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    for key in AMBIENT_LOCALE_VARS {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert((*key).to_string(), value.to_string_lossy().into_owned());
+        }
+    }
+    let temp = std::env::temp_dir().display().to_string();
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        env.insert(key.to_string(), temp.clone());
+    }
+    #[cfg(windows)]
+    extend_windows_process_env(&mut env);
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());
     }
@@ -634,6 +683,34 @@ pub fn contract_command_env(
 /// cannot restore a var mid-assertion.
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Global authority resolution is cached once per process. Fixtures that
+/// relocate HOME must initialize it in a fresh process, without changing the
+/// cached store used by other tests in the workspace.
+#[cfg(test)]
+pub(crate) fn isolated_global_home_test(name: &str) -> bool {
+    if std::env::var("KRANZ_ISOLATED_GLOBAL_HOME_TEST").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture"])
+        .env("KRANZ_ISOLATED_GLOBAL_HOME_TEST", name)
+        .env("RUST_TEST_THREADS", "1")
+        .env_remove("KRANZ_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated fixture {name}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+        "fixture filter matched no test"
+    );
+    true
+}
 
 /// RAII guard: set each `(name, value)` pair on engage, restore the prior
 /// state (set/unset) on drop, all while holding [`ENV_TEST_LOCK`].
@@ -783,11 +860,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sanitized_child_env_windows_redirects_profile_and_temp_to_scratch() {
-        // Create both roots BEFORE poisoning TEMP/TMP. The poison paths must
-        // exist: Rust tests share one process, so another concurrently
-        // running test may legitimately call tempfile while this guard is
-        // engaged. A nonexistent C:\operator-tmp made those unrelated tests
-        // fail nondeterministically on windows-latest.
+        if isolated_global_home_test(
+            "agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch",
+        ) {
+            return;
+        }
+        // Relocate ambient paths in a separate process. Otherwise parallel
+        // tests can create temporary directories under this fixture's roots
+        // and lose them when the fixture completes and deletes those roots.
         let home = tempfile::tempdir().unwrap();
         let operator = tempfile::tempdir().unwrap();
         let operator_temp = operator.path().join("operator-temp");
@@ -812,8 +892,8 @@ mod tests {
             ("APPDATA", &operator_roaming),
             ("LOCALAPPDATA", &operator_local),
         ]);
-        let _parallel_temp =
-            tempfile::tempdir().expect("ambient poison paths must remain usable by parallel tests");
+        let _relocated_temp =
+            tempfile::tempdir().expect("relocated temporary paths must remain usable");
 
         let env = sanitized_child_env(home.path(), &extra(&[]));
 

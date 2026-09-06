@@ -281,26 +281,341 @@ pub fn role_model_tier(cfg: &MissionConfig, role: Role) -> Option<ModelTier> {
     model_tier(kind, &model)
 }
 
+// ---------------------------------------------------------------------------
+// The trust rule for repo-owned config (audit 2026-09-01 H1)
+// ---------------------------------------------------------------------------
+
+/// Which layer of the merge order a config file occupies — and therefore who
+/// is trusted to have written it.
+///
+/// `~/.kranz/config.json` is the OPERATOR's own file.
+/// `<repo>/.kranz/config.json` ships with the repository, so for any repo the
+/// operator did not author it is attacker-controlled input, and under
+/// `workerIsolation: "checkout"` it sits inside the session's writable cwd
+/// where a contained worker can plant it. Without a trust rule that layer
+/// wins the merge and can name the binary kranz executes (`claudeBinary`),
+/// the endpoint the engine POSTs prompts to (`baseUrl`), the ambient
+/// credentials copied into contract commands (`contractEnvPassthrough`), and
+/// the switches that turn containment off — before any sandbox, agent, or
+/// approval gate exists. Every other repo-owned surface already carries a
+/// trust distinction (routing rules are read from the base ref, packs carry a
+/// trust class); this closes the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// `~/.kranz/config.json` — written by the operator.
+    Global,
+    /// `<repo>/.kranz/config.json` — written by whoever authored the repo.
+    Project,
+}
+
+/// The four per-role config keys. Their sub-keys share one rule set, so a
+/// dotted path is normalized with the role name replaced by `<role>`.
+const ROLE_KEYS: [&str; 4] = [
+    "orchestrator",
+    "worker",
+    "validatorScrutiny",
+    "validatorFunctional",
+];
+
+/// Collapse the leading role segment of a dotted config path to the literal
+/// `<role>`, so one table entry covers all four roles.
+fn normalize_key_path(dotted: &str) -> String {
+    let mut segments: Vec<&str> = dotted.split('.').collect();
+    if let Some(first) = segments.first_mut() {
+        if ROLE_KEYS.contains(first) {
+            *first = "<role>";
+        }
+    }
+    segments.join(".")
+}
+
+/// True when `normalized` names `key` or sits underneath it.
+fn path_matches(normalized: &str, key: &str) -> bool {
+    normalized == key
+        || (normalized.len() > key.len()
+            && normalized.starts_with(key)
+            && normalized.as_bytes()[key.len()] == b'.')
+}
+
+/// Operator-only keys: settable from the global layer only, with the reason
+/// the refusal names. Each one either names a program the engine executes, a
+/// URL the engine talks to from outside every sandbox, a credential, or a
+/// containment escape.
+const PROJECT_LAYER_REFUSED: &[(&str, &str)] = &[
+    // Consent-bearing keys. `apply_validated_patch` already refuses these
+    // from the control inbox as a human decision; a file the repository
+    // ships is no more a human decision than a file an agent drops
+    // (2026-09-01 audit follow-up review, F-7 and F-8).
+    ("skipScrutiny", "it removes the scrutiny validation round"),
+    (
+        "skipFunctional",
+        "it removes the functional validation round",
+    ),
+    (
+        "denyPatterns",
+        "it is the Bash deny list every session inherits",
+    ),
+    (
+        "<role>.tools",
+        "it lands in the session's tool allow list, including the read-only validators'",
+    ),
+    (
+        "allowBelowDefaultWorkerModel",
+        "it lifts the worker model floor the operator set",
+    ),
+    (
+        "workerIsolation",
+        "checkout isolation makes the repository root the worker's writable cwd",
+    ),
+    (
+        "claudeBinary",
+        "it names the binary kranz executes, with the operator's full environment and no sandbox",
+    ),
+    (
+        "packDir",
+        "the pack it names supplies shell gate commands the engine runs",
+    ),
+    (
+        "contractEnvPassthrough",
+        "it copies named ambient credentials verbatim into contract-command environments",
+    ),
+    (
+        "dangerouslyAllowAll",
+        "it puts every agent session in bypassPermissions",
+    ),
+    (
+        "validatorAllowUncontainedDegrade",
+        "it reopens the uncontained-validator degrade the containment work closed",
+    ),
+    (
+        "allowValidatorCommands",
+        "it grants validators shell commands with no human step",
+    ),
+    (
+        "localBackendAllowedHosts",
+        "it is the operator's own escape hatch from the local-backend loopback rule",
+    ),
+    // `hooks` is deliberately ABSENT from this list. The github webhook
+    // secret is per-repository by design (`hooks::load_hooks` reads the
+    // project layer, and a test pins that), it lives in a file kranz's own
+    // materialized gitignore keeps untracked, and an attacker who sets it
+    // gains nothing: it is the HMAC key the server checks INBOUND webhooks
+    // against, not a program, an outbound endpoint, or a containment
+    // escape. Its exposure problem is the `config show` one, closed by
+    // redaction there.
+    (
+        "slack",
+        "it carries the Slack bot and app tokens, and the channel mission output is posted to \
+         (the Slack bridge reads the global layer only)",
+    ),
+    (
+        "hookStatus",
+        "the per-run capability token rides its endpoint",
+    ),
+    (
+        "workspace.remote",
+        "it names a remote workspace URL and the env var holding its token",
+    ),
+    ("<role>.acpCommand", "it names the ACP agent program"),
+    ("<role>.acpArgs", "it is argv for the ACP agent program"),
+    (
+        "<role>.baseUrl",
+        "the engine POSTs the assembled prompt to it from outside every sandbox",
+    ),
+    (
+        "<role>.sandbox.extraWrite",
+        "it widens the sandbox write allowlist",
+    ),
+    (
+        "<role>.sandbox.egress",
+        "it widens the sandbox egress allowlist",
+    ),
+    (
+        "<role>.sandbox.provider",
+        "it selects which containment mechanism wraps sessions",
+    ),
+    (
+        "<role>.sandbox.image",
+        "it names the container image sessions run inside",
+    ),
+];
+
+/// Rank a `sandbox.enforce` value so raising and lowering can be told apart:
+/// `off` < `fs` < `fs+net`. An absent or unrecognized value ranks `off`,
+/// which is the compiled-in default.
+fn enforce_rank(value: Option<&serde_json::Value>) -> u8 {
+    match value.and_then(serde_json::Value::as_str) {
+        Some("fs") => 1,
+        Some("fs+net") => 2,
+        _ => 0,
+    }
+}
+
+fn project_layer_refusal(file: &Path, dotted: &str, reason: &str) -> EngineError {
+    EngineError::Config(format!(
+        "{}: the project config layer may not set {dotted:?} — {reason}. \
+         Operator-only keys are settable from the global layer \
+         (~/.kranz/config.json) only.",
+        file.display()
+    ))
+}
+
+/// Refuse a project-layer patch that sets an operator-only key.
+///
+/// `base` is the tree the layers before this one already merged to, which is
+/// what makes the sandbox rule directional: a repository may RAISE
+/// `<role>.sandbox.enforce` (asking for more containment than the operator
+/// configured is always safe) and may never lower it.
+pub fn check_project_layer_keys(
+    patch: &serde_json::Value,
+    base: &serde_json::Value,
+    file: &Path,
+) -> Result<()> {
+    let mut trail: Vec<String> = Vec::new();
+    walk_project_layer(patch, Some(base), file, &mut trail)
+}
+
+fn walk_project_layer(
+    patch: &serde_json::Value,
+    base: Option<&serde_json::Value>,
+    file: &Path,
+    trail: &mut Vec<String>,
+) -> Result<()> {
+    let serde_json::Value::Object(map) = patch else {
+        return Ok(());
+    };
+    for (key, value) in map {
+        trail.push(key.clone());
+        let dotted = trail.join(".");
+        let normalized = normalize_key_path(&dotted);
+
+        if let Some((_, reason)) = PROJECT_LAYER_REFUSED
+            .iter()
+            .find(|(refused, _)| path_matches(&normalized, refused))
+        {
+            return Err(project_layer_refusal(file, &dotted, reason));
+        }
+
+        let base_value = base.and_then(|b| b.get(key));
+
+        if normalized == "<role>.sandbox.enforce"
+            && enforce_rank(Some(value)) < enforce_rank(base_value)
+        {
+            return Err(project_layer_refusal(
+                file,
+                &dotted,
+                "a repository may raise sandbox enforcement, never lower it",
+            ));
+        }
+
+        if normalized == "workerIsolation" && value.as_str() == Some("checkout") {
+            return Err(project_layer_refusal(
+                file,
+                &dotted,
+                "checkout isolation makes the repository root the session's writable cwd, \
+                 which is the containment the worktree default provides",
+            ));
+        }
+
+        walk_project_layer(value, base_value, file, trail)?;
+        trail.pop();
+    }
+    Ok(())
+}
+
+/// Refuse a `claudeBinary` whose resolution depends on where kranz was
+/// invoked, or which the repository itself supplies.
+///
+/// A relative path resolves against the process working directory, so `kranz
+/// ready` run one directory over executes a different program. A path inside
+/// the repository is repo-authored content executed as the operator with the
+/// operator's full environment — the H1 primary path, closed here as well as
+/// at the layer rule so a global-layer typo or an operator-set in-repo path
+/// is caught too.
+pub fn validate_claude_binary(cfg: &MissionConfig, repo_root: &Path) -> Result<()> {
+    let Some(raw) = cfg.claude_binary.as_deref() else {
+        return Ok(());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(EngineError::Config(
+            "claudeBinary must not be empty; omit the key to auto-discover".into(),
+        ));
+    }
+    let candidate = Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return Err(EngineError::Config(format!(
+            "claudeBinary {trimmed:?} must be an absolute path: a relative path resolves \
+             against the process working directory, so which program runs depends on where \
+             kranz was invoked"
+        )));
+    }
+    // Both spellings of the candidate and both spellings of the root are
+    // compared: a not-yet-existing binary cannot be canonicalized (the
+    // planted-then-created case), and on macOS a temp root canonicalizes
+    // through /private while its unresolved form does not, so a single pair
+    // would miss one side of the comparison.
+    let candidate_forms = [
+        candidate.to_path_buf(),
+        std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf()),
+    ];
+    let root_forms = [
+        repo_root.to_path_buf(),
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf()),
+    ];
+    for resolved in &candidate_forms {
+        for root in &root_forms {
+            if resolved.starts_with(root) {
+                return Err(EngineError::Config(format!(
+                    "claudeBinary {trimmed:?} resolves inside the repository at {}: repository \
+                     content must never name the binary kranz executes",
+                    root.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load the effective config for a repo: defaults, then the global file,
 /// then the project file (later layers win). Missing files are fine;
 /// unreadable or unparseable files are a [`EngineError::Config`] naming the
-/// offending path.
+/// offending path. The project layer is additionally held to the
+/// operator-only key rule ([`check_project_layer_keys`]).
 pub fn load(repo_root: &Path) -> Result<MissionConfig> {
-    let mut layers: Vec<PathBuf> = Vec::new();
+    let mut layers: Vec<(PathBuf, Layer)> = Vec::new();
     if let Some(global) = paths::global_config() {
-        layers.push(global);
+        layers.push((global, Layer::Global));
     }
-    layers.push(paths::project_config(repo_root));
-    load_layers(&layers)
+    layers.push((paths::project_config(repo_root), Layer::Project));
+    let cfg = load_layers_with_roles(&layers)?;
+    validate_claude_binary(&cfg, repo_root)?;
+    Ok(cfg)
 }
 
 /// Merge the given config files (in order, later wins) over the compiled-in
 /// defaults. Exposed so callers (and tests) can supply explicit layer paths
 /// instead of the real home directory.
+///
+/// Every layer is treated as [`Layer::Global`]: an explicit-path caller is
+/// the operator (or a test), not a repository. Use
+/// [`load_layers_with_roles`] when a layer's provenance matters.
 pub fn load_layers(layers: &[PathBuf]) -> Result<MissionConfig> {
+    let with_roles: Vec<(PathBuf, Layer)> = layers
+        .iter()
+        .map(|path| (path.clone(), Layer::Global))
+        .collect();
+    load_layers_with_roles(&with_roles)
+}
+
+/// [`load_layers`] with each layer's provenance declared, so the
+/// operator-only key rule ([`check_project_layer_keys`]) can refuse a
+/// repository-owned layer that names the binary kranz executes, the endpoint
+/// it POSTs prompts to, a credential, or a containment escape.
+pub fn load_layers_with_roles(layers: &[(PathBuf, Layer)]) -> Result<MissionConfig> {
     let mut merged = serde_json::to_value(MissionConfig::default())?;
 
-    for path in layers {
+    for (path, layer) in layers {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             // Absent layers are simply skipped; anything else is an error.
@@ -325,6 +640,10 @@ pub fn load_layers(layers: &[PathBuf]) -> Result<MissionConfig> {
                 "config file {} must contain a JSON object at the top level",
                 path.display()
             )));
+        }
+
+        if *layer == Layer::Project {
+            check_project_layer_keys(&patch, &merged, path)?;
         }
 
         deep_merge(&mut merged, &patch);
@@ -354,22 +673,235 @@ pub fn deep_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime `config-change` patches: who may set what (audit 2026-09-01 C1)
+// ---------------------------------------------------------------------------
+
+/// Where a runtime `config-change` patch came from.
+///
+/// The control inbox (`<mission>/control/*.json`) is an unauthenticated
+/// filesystem channel: the only authorization is the ability to create a
+/// file, which under the default `sandbox.enforce: off` posture every worker
+/// session has. A patch that arrives that way must never be able to carry
+/// the consent-bearing keys a human is supposed to decide — the resulting
+/// `config.changed` event is otherwise indistinguishable from an operator's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchSource {
+    /// A human-driven surface: the CLI, the mutation-token REST route, or an
+    /// authorized Slack command.
+    Operator,
+    /// The mission's control inbox, drained by the run loop.
+    Inbox,
+}
+
+/// Keys a running mission may legitimately be re-tuned with, from either
+/// source. This is the complete list the submission surfaces actually
+/// produce: `kranz exec --max-cycles`, `kranz config role` / Slack
+/// `/kranz config` (role backend/model/effort), and the dashboard's role
+/// selection — plus the neighbouring bounds an operator re-tunes with them.
+const RUNTIME_PATCHABLE: &[&str] = &[
+    "maxFixCyclesPerMilestone",
+    "maxRespawns",
+    "maxParallelWorkers",
+    "eventStreamThrottleMs",
+    "planningIdleReleaseMinutes",
+    "autoWork",
+    "consideredAlternativesFeatureThreshold",
+    "consideredAlternativesTouchSetThreshold",
+    "consideredAlternativesHighUsdThreshold",
+    "rubberStampThresholdMs",
+    "allowBelowDefaultWorkerModel",
+    "<role>.model",
+    "<role>.backend",
+    "<role>.reasoningEffort",
+    "<role>.maxTurns",
+    "<role>.maxBudgetUsd",
+    "<role>.contextBudget",
+    "<role>.temperature",
+];
+
+/// Consent-bearing keys: a human decision, so an operator surface may patch
+/// them mid-mission and the inbox may not.
+const OPERATOR_ONLY_PATCHABLE: &[(&str, &str)] = &[
+    (
+        "dangerouslyAllowAll",
+        "it puts every agent session in bypassPermissions",
+    ),
+    ("skipScrutiny", "it removes the scrutiny validation round"),
+    (
+        "skipFunctional",
+        "it removes the functional validation round",
+    ),
+    ("denyPatterns", "it is the Bash deny list"),
+    (
+        "allowValidatorCommands",
+        "it grants validators shell commands",
+    ),
+    (
+        "validatorAllowUncontainedDegrade",
+        "it reopens the uncontained-validator degrade",
+    ),
+];
+
+/// What a patched key is, for [`check_runtime_patch`].
+enum PatchClass {
+    /// Re-tunable at runtime from either source.
+    Runtime,
+    /// Consent-bearing: an operator surface only.
+    Consent(&'static str),
+    /// Not patchable at runtime at all. Seed-time or operator-file config —
+    /// the binary, the endpoints, the containment shape, the pack.
+    Never,
+}
+
+fn classify_patch_key(normalized: &str) -> PatchClass {
+    if RUNTIME_PATCHABLE
+        .iter()
+        .any(|key| path_matches(normalized, key))
+    {
+        return PatchClass::Runtime;
+    }
+    if let Some((_, reason)) = OPERATOR_ONLY_PATCHABLE
+        .iter()
+        .find(|(key, _)| path_matches(normalized, key))
+    {
+        return PatchClass::Consent(reason);
+    }
+    PatchClass::Never
+}
+
+/// Refuse a runtime `config-change` patch that reaches past the keys its
+/// source is allowed to set.
+///
+/// `base` is the current effective config as JSON, which makes the sandbox
+/// rule directional exactly as the layer rule is: raising
+/// `<role>.sandbox.enforce` is fine from either source, lowering it is a
+/// consent act.
+pub fn check_runtime_patch(
+    patch: &serde_json::Value,
+    base: &serde_json::Value,
+    source: PatchSource,
+) -> Result<()> {
+    let mut trail: Vec<String> = Vec::new();
+    walk_runtime_patch(patch, Some(base), source, &mut trail)
+}
+
+fn walk_runtime_patch(
+    patch: &serde_json::Value,
+    base: Option<&serde_json::Value>,
+    source: PatchSource,
+    trail: &mut Vec<String>,
+) -> Result<()> {
+    if let serde_json::Value::Object(map) = patch {
+        for (key, value) in map {
+            trail.push(key.clone());
+            walk_runtime_patch(value, base.and_then(|b| b.get(key)), source, trail)?;
+            trail.pop();
+        }
+        return Ok(());
+    }
+
+    let dotted = trail.join(".");
+    let normalized = normalize_key_path(&dotted);
+
+    // Sandbox enforcement is the one directional key: more containment than
+    // the mission currently has is never a consent act, less always is.
+    if normalized == "<role>.sandbox.enforce" {
+        if enforce_rank(Some(patch)) >= enforce_rank(base) {
+            return Ok(());
+        }
+        return match source {
+            PatchSource::Operator => Ok(()),
+            PatchSource::Inbox => Err(EngineError::Config(format!(
+                "refusing a control-inbox config change to {dotted:?}: lowering sandbox \
+                 enforcement is a consent act, and the control inbox is an \
+                 unauthenticated filesystem channel"
+            ))),
+        };
+    }
+
+    match classify_patch_key(&normalized) {
+        PatchClass::Runtime => Ok(()),
+        PatchClass::Consent(reason) => match source {
+            PatchSource::Operator => Ok(()),
+            PatchSource::Inbox => Err(EngineError::Config(format!(
+                "refusing a control-inbox config change to {dotted:?}: {reason}, so it is a \
+                 human decision — the control inbox is an unauthenticated filesystem \
+                 channel and cannot carry consent"
+            ))),
+        },
+        PatchClass::Never => Err(EngineError::Config(format!(
+            "{dotted:?} is not runtime-patchable: it is seed-time or operator-file \
+             configuration (a program, an endpoint, a credential, or the containment \
+             shape), not a mission knob"
+        ))),
+    }
+}
+
 /// Apply a partial JSON patch to an effective mission config and validate the
 /// merged result exactly as the engine would before accepting it.
 ///
 /// Submission surfaces use this before enqueueing `config-change`, while the
 /// engine repeats the check when it drains the command. The second check is
 /// still required because another queued patch may win the race in between.
+///
+/// This is the OPERATOR entry point (every caller of it is a human-driven,
+/// authorized surface). The run loop's drain path uses
+/// [`apply_validated_patch_from`] with [`PatchSource::Inbox`].
 pub fn apply_validated_patch(
     current: &MissionConfig,
     patch: &serde_json::Value,
 ) -> Result<MissionConfig> {
+    apply_validated_patch_from(current, patch, PatchSource::Operator)
+}
+
+/// [`apply_validated_patch`] with the patch's origin declared, so the
+/// consent-bearing keys can be refused when the patch came off the
+/// unauthenticated control inbox.
+pub fn apply_validated_patch_from(
+    current: &MissionConfig,
+    patch: &serde_json::Value,
+    source: PatchSource,
+) -> Result<MissionConfig> {
     let mut value = serde_json::to_value(current)?;
+    check_runtime_patch(patch, &value, source)?;
     deep_merge(&mut value, patch);
     let merged: MissionConfig = serde_json::from_value(value)
         .map_err(|e| EngineError::Config(format!("patch produces invalid config: {e}")))?;
     validate(&merged)?;
     Ok(merged)
+}
+
+/// The host of an `http(s)://` URL, or `""` when the string is not one.
+/// Userinfo is stripped (`http://user@host/` is `host`) and a bracketed IPv6
+/// literal keeps its own colons (`http://[::1]:8080` is `::1`).
+fn base_url_host(url: &str) -> &str {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return "";
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let after_userinfo = match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+    if let Some(bracketed) = after_userinfo.strip_prefix('[') {
+        return match bracketed.split_once(']') {
+            Some((host, _)) => host,
+            None => "",
+        };
+    }
+    after_userinfo.split(':').next().unwrap_or(after_userinfo)
+}
+
+/// `localhost` or any address in a loopback range (127.0.0.0/8, ::1).
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Validate invariants the engine relies on (plan §6). Returns
@@ -611,21 +1143,34 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
             }
             match role_cfg.base_url.as_deref() {
                 Some(url) if !url.trim().is_empty() => {
-                    let rest = url
-                        .strip_prefix("http://")
-                        .or_else(|| url.strip_prefix("https://"));
-                    let has_host = rest.is_some_and(|rest| {
-                        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-                        let after_userinfo = match authority.rfind('@') {
-                            Some(idx) => &authority[idx + 1..],
-                            None => authority,
-                        };
-                        let host = after_userinfo.split(':').next().unwrap_or(after_userinfo);
-                        !host.is_empty()
-                    });
-                    if !has_host {
+                    if base_url_host(url).is_empty() {
                         return Err(EngineError::Config(format!(
                             "{name}.baseUrl {url:?} is not a valid http/https URL"
+                        )));
+                    }
+                    // Loopback gate, mirroring hookStatus.endpoint: the
+                    // engine POSTs the assembled system + user prompt to
+                    // this URL from the engine process, OUTSIDE every
+                    // sandbox, and takes the reply as the role's model
+                    // output; the readiness probe connects to whatever
+                    // host:port it names and records reachable/unreachable.
+                    // A repo-named remote host is therefore prompt
+                    // exfiltration plus a config-driven internal-network
+                    // oracle. Operators who really do run a shared endpoint
+                    // name its host in the global-layer allowlist.
+                    let host = base_url_host(url);
+                    if !host_is_loopback(host)
+                        && !cfg
+                            .local_backend_allowed_hosts
+                            .iter()
+                            .any(|allowed| allowed.trim().eq_ignore_ascii_case(host))
+                    {
+                        return Err(EngineError::Config(format!(
+                            "{name}.baseUrl host {host:?} is not loopback: the engine POSTs \
+                             the assembled prompt to it from outside every sandbox and takes \
+                             the reply as model output. Use a loopback endpoint, or name the \
+                             host in localBackendAllowedHosts in ~/.kranz/config.json (the \
+                             global layer only)"
                         )));
                     }
                 }
@@ -1555,11 +2100,21 @@ mod tests {
             "valid http baseUrl should be accepted"
         );
 
+        // A well-formed https URL at a NON-loopback host is refused unless
+        // the operator allowlisted the host (audit 2026-09-01, MEDIUM
+        // baseUrl): the engine POSTs the assembled prompt there from outside
+        // every sandbox.
         cfg.worker.base_url = Some("https://models.internal/v1".into());
         assert!(
-            validate(&cfg).is_ok(),
-            "valid https baseUrl should be accepted"
+            validate(&cfg).is_err(),
+            "a remote baseUrl needs the operator's allowlist"
         );
+        cfg.local_backend_allowed_hosts = vec!["models.internal".into()];
+        assert!(
+            validate(&cfg).is_ok(),
+            "valid https baseUrl at an allowlisted host should be accepted"
+        );
+        cfg.local_backend_allowed_hosts.clear();
 
         cfg.worker.base_url = Some("http://127.0.0.1".into());
         assert!(
@@ -1992,6 +2547,10 @@ mod tests {
         let mut cfg = local_worker_cfg();
         cfg.worker.base_url = Some("https://models.internal.example/v1".into());
         cfg.worker.model = "ft:some-model:some-org:some-id".into();
+        // A hosted (non-loopback) endpoint now needs the operator's
+        // global-layer host allowlist — the model id is still free-form, and
+        // the routing behavior below is unchanged.
+        cfg.local_backend_allowed_hosts = vec!["models.internal.example".into()];
         assert!(
             validate(&cfg).is_ok(),
             "a hosted fine-tune endpoint is ordinary local-backend config"

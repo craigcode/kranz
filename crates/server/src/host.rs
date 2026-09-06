@@ -84,6 +84,24 @@ enum HostedMission {
     },
 }
 
+/// What [`MissionHost::try_approve_pending_matching`] did.
+///
+/// `Mismatch` is deliberately not an error: the caller renders an
+/// "awaiting X, not Y" refusal naming both plans, which tells the reviewer
+/// what happened rather than handing them a status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingApproval {
+    /// The parked plan was the expected one and is now committed on the
+    /// mission branch; carries the mission branch name.
+    Approved(String),
+    /// Nothing was parked: never requested, or forfeited by a serve restart
+    /// or an idle release. The caller's own state-aware routing takes over.
+    NothingParked,
+    /// A plan IS parked and it is not the one the caller reviewed. Carries
+    /// the PARKED plan's identity so the refusal can name both.
+    Mismatch { parked: String },
+}
+
 /// Registry of missions this server process hosts (see module docs).
 pub struct MissionHost {
     repo_root: PathBuf,
@@ -1219,6 +1237,53 @@ impl MissionHost {
         }
     }
 
+    /// Approve the parked plan ONLY when it is the plan the caller reviewed.
+    ///
+    /// Threat (follow-up review M-13): [`Self::try_approve_pending`] plus a
+    /// separate identity read is check-then-act across two independent mutex
+    /// takes, and the Slack bridge's slow actions run concurrently on spawned
+    /// tasks, so a `/kranz plan` (or a web-UI approve) landing between the
+    /// two commits a plan the clicker never reviewed. This variant reads the
+    /// identity, compares it, and takes the plan inside ONE acquisition of
+    /// the registry lock.
+    pub async fn try_approve_pending_matching(
+        &self,
+        id: &str,
+        expected_identity: Option<&str>,
+        identity_of: &(dyn Fn(&Plan) -> String + Sync),
+    ) -> Result<PendingApproval, ApiError> {
+        // ONE critical section: read the parked plan, compute its identity,
+        // compare, and take it. Nothing else can park a different plan
+        // between the comparison and the take.
+        let plan = {
+            let map = self.missions.lock().expect("missions registry lock");
+            let Some(HostedMission::Planning { pending_plan, .. }) = map.get(id) else {
+                return Ok(PendingApproval::NothingParked);
+            };
+            let mut parked = pending_plan.lock().expect("pending plan lock");
+            let Some(plan) = parked.as_ref() else {
+                return Ok(PendingApproval::NothingParked);
+            };
+            let identity = identity_of(plan);
+            // `None` = the card names no plan at all (it predates plan-bound
+            // approve). It cannot match, so a parked plan is a mismatch: which
+            // plan its reviewer read is unknowable, and guessing is the bug.
+            if expected_identity != Some(identity.as_str()) {
+                return Ok(PendingApproval::Mismatch { parked: identity });
+            }
+            parked.take().expect("checked directly above")
+        };
+        match self.approve(id, plan.clone()).await {
+            Ok(branch) => Ok(PendingApproval::Approved(branch)),
+            Err(e) => {
+                // Re-park so a retry click can fire, exactly as
+                // `try_approve_pending` does.
+                self.set_pending_plan(id, Some(plan));
+                Err(e)
+            }
+        }
+    }
+
     /// [`Self::try_approve_pending`] with nothing-pending as a 409 — the
     /// REST shape (`POST /api/missions/:id/approve-pending`).
     pub async fn approve_pending(&self, id: &str) -> Result<String, ApiError> {
@@ -1655,8 +1720,21 @@ fn ask_context(repo_root: &Path) -> String {
         for decision in state.recent_decisions.iter().rev().take(3) {
             out.push_str(&format!("  decision: {}\n", one_line(decision)));
         }
+        // Threat (follow-up review H-4): a worker under checkout isolation
+        // can replace this leaf with a symlink, and 500 chars of whatever it
+        // points at (`serve.token`, `~/.ssh/id_ed25519`) would ride into the
+        // ask-session LLM context. The read pins the `.kranz` chain AND the
+        // leaf; a refused read simply contributes no excerpt.
         let report = paths.report_file();
-        if let Ok(text) = std::fs::read_to_string(report) {
+        let mut text = String::new();
+        let read = kranz_engine::paths::open_read_nofollow(&report)
+            .and_then(|mut file| {
+                use std::io::Read as _;
+                file.read_to_string(&mut text)?;
+                Ok(())
+            })
+            .is_ok();
+        if read {
             out.push_str(&format!(
                 "  report excerpt: {}\n",
                 truncate(&one_line(&text), 500)
@@ -2429,6 +2507,79 @@ mod tests {
         assert!(err.message.contains("no approved plan"), "{}", err.message);
         // The engine went back into the registry: planning can continue.
         assert!(host.planning_cell(&id).is_ok());
+    }
+
+    /// M-13 (follow-up review): the Slack bridge used to read the parked
+    /// plan's identity and then call `try_approve_pending`: two independent
+    /// lock takes, with concurrent spawned tasks free to park a different
+    /// plan in between. This variant compares and takes under one
+    /// acquisition, and a refusal must leave the plan parked so the right
+    /// card can still approve it.
+    #[tokio::test]
+    async fn approve_pending_matching_refuses_a_different_plan_without_consuming_it() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+        let id = host.create("ship it", None).await.expect("create mission");
+        let plan: Plan = serde_json::from_value(plan_json()).expect("plan");
+        // Stands in for the Slack bridge's `format::plan_identity`, which
+        // this crate deliberately cannot depend on.
+        let identity_of = |p: &Plan| p.goal.clone();
+
+        assert_eq!(
+            host.try_approve_pending_matching(&id, Some("ship the demo"), &identity_of)
+                .await
+                .unwrap(),
+            PendingApproval::NothingParked,
+            "nothing parked is not an approval"
+        );
+
+        host.set_pending_plan(&id, Some(plan.clone()));
+
+        assert_eq!(
+            host.try_approve_pending_matching(&id, Some("an older plan"), &identity_of)
+                .await
+                .unwrap(),
+            PendingApproval::Mismatch {
+                parked: "ship the demo".to_string()
+            },
+            "a card naming a different plan must be refused, naming the parked one"
+        );
+        assert!(
+            host.pending_plan(&id).is_some(),
+            "a refused approve must not consume the parked plan"
+        );
+
+        assert!(
+            matches!(
+                host.try_approve_pending_matching(&id, None, &identity_of)
+                    .await
+                    .unwrap(),
+                PendingApproval::Mismatch { .. }
+            ),
+            "a card that names no plan cannot match one"
+        );
+        assert!(host.pending_plan(&id).is_some());
+
+        assert_eq!(
+            host.try_approve_pending_matching(&id, Some("ship the demo"), &identity_of)
+                .await
+                .unwrap(),
+            PendingApproval::Approved(format!("kranz/mission-{id}"))
+        );
+        assert!(
+            host.pending_plan(&id).is_none(),
+            "an approve consumes the parked plan"
+        );
+        assert_eq!(
+            host.try_approve_pending_matching(&id, Some("ship the demo"), &identity_of)
+                .await
+                .unwrap(),
+            PendingApproval::NothingParked,
+            "a second click has nothing left to commit"
+        );
     }
 
     #[tokio::test]

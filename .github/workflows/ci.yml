@@ -116,6 +116,34 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
+      # These ACL/handle regressions need no machine-wide host preparation.
+      # Run them first so cleanup failures report native descriptor evidence
+      # without waiting for the slower host and production-gate proofs.
+      - name: Check Windows ACL lease and process cleanup
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          for name in \
+            appcontainer_windows::tests::gitlink_aliases_never_receive_generic_metadata_denies \
+            appcontainer_windows::tests::boundary_parent_rejects_package_delete_child_grants \
+            appcontainer_windows::tests::boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules \
+            appcontainer_windows::tests::boundary_marker_without_shared_baseline_fails_closed \
+            appcontainer_windows::tests::sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance \
+            appcontainer_windows::tests::boundary_inheritance_cleanup_follows_retained_object_after_rename \
+            appcontainer_windows::tests::suspended_child_is_reaped_when_setup_exits_before_job_assignment \
+            appcontainer_windows::tests::recursive_grants_reserve_only_the_isolated_worktree_authority_namespace \
+            agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch \
+            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens; do
+            log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
+            set +e
+            cargo test -p kranz-engine --lib "$name" -- --exact --nocapture >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            test "$status" -eq 0
+            grep -qE 'test result: ok\. [1-9]' "$log"
+          done
       # AppContainer tools probe each local drive root and open NUL during
       # startup. The disposable runner is elevated once here to install
       # Microsoft's exact drive-root metadata ACEs and null-device descriptor;
@@ -196,6 +224,15 @@ jobs:
           before_status="$(git status --porcelain --untracked-files=no)"
           test -z "$before_status"
 
+          regression_log="$RUNNER_TEMP/kranz-linux-disappearing-entry.log"
+          set +e
+          cargo test -p kranz-engine --lib sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries -- --exact --nocapture >"$regression_log" 2>&1
+          status=$?
+          set -e
+          cat "$regression_log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$regression_log"
+
           receipt_log="$RUNNER_TEMP/kranz-linux-bubblewrap-live-receipt.log"
           set +e
           cargo test -p kranz-engine --lib command_exec::tests::linux_bubblewrap_hostile_live_receipt -- --exact --ignored --nocapture >"$receipt_log" 2>&1
@@ -271,7 +308,7 @@ jobs:
           rem Fail loudly rather than guard nothing if the image moves Git.
           where true >nul 2>&1 && (echo GUARD VACUOUS: POSIX coreutils still on PATH & exit /b 1) || echo coreutils absent as intended
           where git >nul 2>&1 || (echo git must stay on PATH & exit /b 1)
-          cargo test -p kranz-engine --lib --no-fail-fast
+          cargo test -p kranz-engine --lib --no-fail-fast || exit /b 1
           cargo test -p kranz-engine --test mission_test --test worktree_isolation --no-fail-fast
 
   # Dedicated macOS job (not folded into the matrix above) so the Seatbelt
@@ -388,6 +425,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Validate macOS CI structure
         run: bash scripts/check-macos-ci.sh
+      - name: Verify acceptance harness without a model
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo build --locked --package kranz-engine --example acceptance_gate
+          python3 scripts/test-acceptance-smoke.py
       - run: cargo check --workspace --locked
 
   # The Tauri desktop shell (apps/dashboard/src-tauri) is a STANDALONE cargo
@@ -526,18 +573,32 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
+      - name: Prepare Linux validator containment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Match the Rust job's ephemeral runner setup: validators require
+          # containment even when the worker profile does not enforce it.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true
       - name: Install Claude Code
         # Pinned to an exact version: this job carries ANTHROPIC_API_KEY, so an
         # unpinned install would auto-pull any newly published (possibly
         # hijacked) release straight into a secret-bearing environment. Bump
         # deliberately.
-        run: npm install --global @anthropic-ai/claude-code@2.1.206
+        run: npm install --global @anthropic-ai/claude-code@2.1.261
       - name: Build kranz
-        run: cargo build --release --locked --package kranz --bin kranz
+        run: |
+          cargo build --release --locked --package kranz --bin kranz
+          cargo build --release --locked --package kranz-engine --example acceptance_gate
       - name: Run flagship live acceptance mission
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           KRANZ_BIN: ${{ github.workspace }}/target/release/kranz
+          KRANZ_ACCEPTANCE_GATE_BIN: ${{ github.workspace }}/target/release/examples/acceptance_gate
           ARTIFACT_DIR: ${{ runner.temp }}/kranz-acceptance-artifacts
         run: bash scripts/acceptance-smoke.sh
       - name: Upload mission record

@@ -13,6 +13,25 @@
 //! The engine [`drain`]s the inbox between worker runs, and a
 //! [`ControlWatcher`] polls [`peek_interrupt`] so an `interrupt` message can
 //! abort the active run.
+//!
+//! # Authenticity (audit 2026-09-01 C1)
+//!
+//! The inbox carries operator consent: `approve-grant`, `approve-revision`,
+//! `answer-question`, and `config-change` all land as events that are
+//! indistinguishable from a human decision. It used to be a plain directory
+//! any process with write access to the repo could drop a file into, which
+//! made forging consent a one-file operation for a worker, a validator, or
+//! any gate command.
+//!
+//! Every file therefore carries a `sig`: a hex HMAC-SHA256 over the mission
+//! id, the file name, and the canonical JSON of the command, keyed by the
+//! repository authority key ([`crate::paths::authority_key_path`]). [`drain`]
+//! and [`peek_interrupt`] verify it with a constant-time compare and
+//! quarantine anything unsigned or wrongly signed to `.bad`, never applying
+//! it. [`acknowledge`] records the acknowledged file's name as the mission's
+//! control mark outside the repository, and any later file whose name is at
+//! or below the mark is quarantined as a replay even when its signature
+//! verifies.
 
 use crate::error::{EngineError, Result};
 use crate::paths::MissionPaths;
@@ -21,6 +40,7 @@ use chrono::Utc;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use subtle::ConstantTimeEq as _;
 
 /// Width of the zero-padded nanosecond prefix — the full `u64` decimal
 /// width, so names sort lexicographically for any conceivable timestamp.
@@ -28,6 +48,111 @@ const TIMESTAMP_WIDTH: usize = 20;
 
 /// Length of the random hex suffix (a `uuid` v4 `simple()` prefix).
 const RAND_LEN: usize = 8;
+
+/// JSON key holding the authenticity tag of a control file.
+const SIG_FIELD: &str = "sig";
+
+/// The bytes a control file's `sig` covers: the mission id and the FILE
+/// NAME, each length-prefixed so no two fields can be re-cut into a
+/// different pair, then the canonical JSON of the command.
+///
+/// Signing the re-serialized `ControlCommand` rather than the raw file bytes
+/// binds the MEANING of the file, not its whitespace, and keeps the signer
+/// and the verifier on one code path: both go `ControlCommand` -> canonical
+/// JSON -> HMAC, so they cannot drift on key order or number formatting.
+///
+/// Binding the name makes a signed file single-use together with the
+/// control mark (`paths::record_control_mark`): names order by creation
+/// time, the engine records the last name it acknowledged, and a captured
+/// file re-dropped later carries a name at or below that mark (follow-up
+/// review F-1).
+fn signed_payload(mission_id: &str, name: &str, cmd: &ControlCommand) -> Result<String> {
+    let body = serde_json::to_string(cmd)?;
+    Ok(format!(
+        "{}:{mission_id}\n{}:{name}\n{body}",
+        mission_id.len(),
+        name.len()
+    ))
+}
+
+/// Hex HMAC-SHA256 of [`signed_payload`] under the repository authority key.
+fn sign(key: &[u8], mission_id: &str, name: &str, cmd: &ControlCommand) -> Result<String> {
+    Ok(crate::hooks::hmac_sha256_hex(
+        key,
+        signed_payload(mission_id, name, cmd)?.as_bytes(),
+    ))
+}
+
+/// A file whose name is at or below the recorded control mark was already
+/// acknowledged once, or predates one that was: a replay, whatever its
+/// signature says. Names are fixed-width, so string order is time order.
+fn is_replayed(repo_root: &Path, mission_id: &str, name: &str) -> bool {
+    crate::paths::read_control_mark(repo_root, mission_id).is_some_and(|mark| name <= mark.as_str())
+}
+
+/// Why a queued file was refused. Distinguishing the two matters: a forged or
+/// unsigned file is quarantined, whereas an operator whose key is temporarily
+/// unreadable must NOT have their inbox renamed away underneath them.
+enum ControlRefusal {
+    /// The file is not an authentic command; quarantine it.
+    Quarantine(String),
+    /// This process cannot verify right now; leave the file queued.
+    Skip(String),
+}
+
+/// Parse and authenticate one control file's contents.
+///
+/// Fails CLOSED on an unsigned file. A control file written by a kranz that
+/// predates signing carries no `sig` and is refused for that reason: the
+/// on-disk format is otherwise unchanged, but an unauthenticated command is
+/// exactly the thing this guard exists to stop, so old files are quarantined
+/// rather than grandfathered.
+fn authenticate(
+    repo_root: &Path,
+    mission_id: &str,
+    name: &str,
+    content: &str,
+) -> std::result::Result<ControlCommand, ControlRefusal> {
+    if is_replayed(repo_root, mission_id, name) {
+        return Err(ControlRefusal::Quarantine(
+            "control command replays a file the engine already acknowledged".to_string(),
+        ));
+    }
+    let mut value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| ControlRefusal::Quarantine(format!("unparseable control command: {e}")))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ControlRefusal::Quarantine("control command is not a JSON object".to_string())
+    })?;
+    let Some(presented) = object.remove(SIG_FIELD) else {
+        return Err(ControlRefusal::Quarantine(
+            "control command carries no signature".to_string(),
+        ));
+    };
+    let Some(presented) = presented.as_str().map(str::to_string) else {
+        return Err(ControlRefusal::Quarantine(
+            "control command signature is not a string".to_string(),
+        ));
+    };
+    let cmd: ControlCommand = serde_json::from_value(value)
+        .map_err(|e| ControlRefusal::Quarantine(format!("unparseable control command: {e}")))?;
+
+    // No key means no verdict, not a pass: skip and stay loud. Quarantining
+    // here would let a transient home-directory problem shred a real inbox.
+    let Some(key) = crate::paths::load_authority_key(repo_root) else {
+        return Err(ControlRefusal::Skip(
+            "no repository authority key available to verify control commands".to_string(),
+        ));
+    };
+    let expected = sign(&key, mission_id, name, &cmd)
+        .map_err(|e| ControlRefusal::Skip(format!("could not recompute signature: {e}")))?;
+    if bool::from(expected.as_bytes().ct_eq(presented.as_bytes())) {
+        Ok(cmd)
+    } else {
+        Err(ControlRefusal::Quarantine(
+            "control command signature does not verify".to_string(),
+        ))
+    }
+}
 
 /// Enqueue one command into the mission's control inbox.
 ///
@@ -38,10 +163,15 @@ const RAND_LEN: usize = 8;
 /// The JSON goes to a sibling tmp file, then atomically renames to
 /// `<zero-padded-nanos>-<8-hex>.json` — readers never see partial files.
 /// Returns the final file path.
+///
+/// The written object is the command plus a `sig` field ([`authenticate`]);
+/// minting the repository authority key on first use is part of enqueuing, so
+/// an operator never has to run a key-setup step before `kranz pause` works.
 pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
-    let mission_dir = paths.open_mission_dir_nofollow(true)?;
-    let dir = paths.control_dir();
-    let control_dir = crate::paths::open_real_subdir(&mission_dir, "control", &dir, true)?;
+    // Sign BEFORE touching the mission tree: a repo with no reachable
+    // authority key must fail loudly at the CLI rather than leave an
+    // unverifiable file the engine would quarantine minutes later.
+    let key = crate::paths::load_or_create_authority_key(&paths.repo_root)?;
 
     let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0).max(0) as u64;
     let rand = uuid::Uuid::new_v4().simple().to_string();
@@ -50,11 +180,24 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
         &rand[..RAND_LEN],
         width = TIMESTAMP_WIDTH
     );
+    // The name is part of what is signed (see `signed_payload`).
+    let signature = sign(&key, &paths.mission_id, &name, cmd)?;
+
+    let mission_dir = paths.open_mission_dir_nofollow(true)?;
+    let dir = paths.control_dir();
+    let control_dir = crate::paths::open_real_subdir(&mission_dir, "control", &dir, true)?;
 
     let final_path = dir.join(&name);
     let tmp_name = format!("{name}.tmp");
 
-    let json = serde_json::to_string(cmd)?;
+    let json = {
+        let mut value = serde_json::to_value(cmd)?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            EngineError::InvalidState("control command is not a JSON object".to_string())
+        })?;
+        object.insert(SIG_FIELD.to_string(), serde_json::Value::String(signature));
+        serde_json::to_string(&value)?
+    };
     {
         use cap_fs_ext::OpenOptionsFollowExt as _;
         use cap_primitives::fs::FollowSymlinks;
@@ -81,10 +224,25 @@ pub fn enqueue(paths: &MissionPaths, cmd: &ControlCommand) -> Result<PathBuf> {
 /// on the next drain is the safe failure mode (duplicates are tolerated
 /// downstream).
 ///
-/// A file that fails to parse is renamed to `<name>.bad` (with a warning) and
-/// skipped so a corrupt file can never block the queue. Non-`.json` files
-/// (tmp files, `.bad` quarantines) are ignored. Returns the commands in
-/// filename (== chronological) order.
+/// A file that fails to parse, or fails to authenticate, is renamed to
+/// `<name>.bad` (with a warning) and skipped so neither a corrupt file nor a
+/// forged one can block the queue. Non-`.json` files (tmp files, `.bad`
+/// quarantines) are ignored. Returns the commands in filename (==
+/// chronological) order.
+///
+/// # Trust model
+///
+/// The authority key lives under the operator's `~/.kranz`, never in the
+/// repository, and never inside a session's working tree. Under an enforced
+/// sandbox it sits in `authority_read_deny_paths`, so a contained session
+/// cannot read it and therefore cannot produce a `sig` this function accepts.
+/// Under the default `sandbox.enforce = off` there is no OS boundary, and the
+/// barrier is the agent CLI's own deny rules (`permissions::AUTHORITY_DENY`
+/// denies `Read`/`Edit`/`Write` on `~/.kranz/**` and on every mission's
+/// `control/**`). That is a weaker barrier than the sandbox and is stated as
+/// such: a session that escapes its own CLI's permission layer can still read
+/// the key. What no longer works is the one-file forgery this closes, where
+/// merely being able to write inside the repo was enough.
 pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
     let mut commands = Vec::new();
     let Some(control_dir) = control_dir(paths, false)? else {
@@ -100,19 +258,31 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
                 continue;
             }
         };
-        match serde_json::from_str::<ControlCommand>(&content) {
+        match authenticate(
+            &paths.repo_root,
+            &paths.mission_id,
+            &name.to_string_lossy(),
+            &content,
+        ) {
             Ok(cmd) => commands.push((path, cmd)),
-            Err(e) => quarantine(&control_dir, &name, &path, &e),
+            Err(ControlRefusal::Quarantine(reason)) => {
+                quarantine(&control_dir, &name, &path, &reason)
+            }
+            Err(ControlRefusal::Skip(reason)) => {
+                tracing::warn!(path = %path.display(), reason = %reason, "cannot verify control file, leaving it queued");
+            }
         }
     }
     Ok(commands)
 }
 
-/// True if any queued file parses to `Msg { interrupt: true }`.
+/// True if any queued file AUTHENTICATES to `Msg { interrupt: true }`.
 ///
 /// Non-destructive: nothing is consumed, deleted, or renamed — the engine's
 /// run-watcher polls this cheaply while a later [`drain`] still returns the
-/// message itself.
+/// message itself. Signature checking belongs here too, not only in [`drain`]:
+/// an unsigned file that aborted the active run would be a denial of service
+/// on every mission, delivered by the same one-file write.
 pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
     let Some(control_dir) = control_dir(paths, false)? else {
         return Ok(false);
@@ -121,11 +291,26 @@ pub fn peek_interrupt(paths: &MissionPaths) -> Result<bool> {
         let Ok(content) = read_control_file(&control_dir, &name) else {
             continue;
         };
-        if let Ok(ControlCommand::Msg {
-            interrupt: true, ..
-        }) = serde_json::from_str::<ControlCommand>(&content)
-        {
-            return Ok(true);
+        match authenticate(
+            &paths.repo_root,
+            &paths.mission_id,
+            &name.to_string_lossy(),
+            &content,
+        ) {
+            Ok(ControlCommand::Msg {
+                interrupt: true, ..
+            }) => return Ok(true),
+            Ok(_) | Err(ControlRefusal::Quarantine(_)) => {}
+            Err(ControlRefusal::Skip(reason)) => {
+                // The brake is unverifiable, not absent. Say so on every
+                // poll: a silent `false` would hide a lost key behind a run
+                // that simply never stops (follow-up review F-3).
+                tracing::warn!(
+                    path = %paths.control_dir().join(&name).display(),
+                    reason = %reason,
+                    "cannot verify a queued control file while checking for an interrupt"
+                );
+            }
         }
     }
     Ok(false)
@@ -150,6 +335,11 @@ pub fn acknowledge(paths: &MissionPaths, path: &Path) -> Result<()> {
         return Err(std::io::Error::from(ErrorKind::NotFound).into());
     };
     control_dir.remove_file(name)?;
+    // The file is gone; move the mark up to its name so the same bytes can
+    // never be drained twice (follow-up review F-1).
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        crate::paths::record_control_mark(&paths.repo_root, &paths.mission_id, name)?;
+    }
     Ok(())
 }
 
@@ -257,14 +447,14 @@ fn read_control_file(dir: &cap_std::fs::Dir, name: &OsStr) -> Result<String> {
     Ok(content)
 }
 
-/// Rename an unparseable command file to `<name>.bad` so it stops blocking
-/// the queue but stays on disk for diagnosis.
-fn quarantine(dir: &cap_std::fs::Dir, name: &OsStr, path: &Path, err: &serde_json::Error) {
+/// Rename an unparseable or inauthentic command file to `<name>.bad` so it
+/// stops blocking the queue but stays on disk for diagnosis.
+fn quarantine(dir: &cap_std::fs::Dir, name: &OsStr, path: &Path, reason: &str) {
     let bad_name = format!("{}.bad", name.to_string_lossy());
     tracing::warn!(
         path = %path.display(),
-        error = %err,
-        "unparseable control command, quarantining as .bad"
+        error = %reason,
+        "refused control command, quarantining as .bad"
     );
     if let Err(e) = dir.rename(name, dir, &bad_name) {
         tracing::warn!(path = %path.display(), error = %e, "failed to quarantine control file");
@@ -351,6 +541,178 @@ mod tests {
         let paths = MissionPaths::new(repo_root, mission_id);
         std::fs::create_dir_all(paths.mission_dir()).unwrap();
         std::fs::write(paths.events_file(), events_lines(mission_id, completed)).unwrap();
+    }
+
+    // -- C1: the inbox authenticates ---------------------------------------
+
+    /// Drop a raw JSON object into the inbox the way an agent process with
+    /// ordinary write access to the repo would: no `enqueue`, no key.
+    fn plant(paths: &MissionPaths, name: &str, body: serde_json::Value) {
+        std::fs::create_dir_all(paths.control_dir()).unwrap();
+        std::fs::write(
+            paths.control_dir().join(name),
+            serde_json::to_string(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn quarantined(paths: &MissionPaths) -> Vec<String> {
+        std::fs::read_dir(paths.control_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bad"))
+            .collect()
+    }
+
+    #[test]
+    fn unsigned_approve_grant_is_quarantined_and_never_drained() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        // Enqueue one real command first so the repo's authority key exists;
+        // without it drain would SKIP rather than quarantine, and the test
+        // would pass for the wrong reason.
+        enqueue(&paths, &ControlCommand::Pause).unwrap();
+        plant(
+            &paths,
+            "00000000000000000001-aaaaaaaa.json",
+            serde_json::json!({ "kind": "approve-grant", "command": "cargo publish" }),
+        );
+
+        let drained = drain(&paths).unwrap();
+        assert!(
+            drained
+                .iter()
+                .all(|(_, cmd)| !matches!(cmd, ControlCommand::ApproveGrant { .. })),
+            "an unsigned approve-grant must never reach the engine"
+        );
+        assert_eq!(
+            quarantined(&paths),
+            vec!["00000000000000000001-aaaaaaaa.json.bad".to_string()],
+        );
+    }
+
+    #[test]
+    fn wrong_key_signature_is_quarantined() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        enqueue(&paths, &ControlCommand::Pause).unwrap();
+        let cmd = ControlCommand::ApproveGrant {
+            command: "cargo publish".to_string(),
+        };
+        let forged = sign(
+            b"not the repository authority key",
+            &paths.mission_id,
+            "00000000000000000002-bbbbbbbb.json",
+            &cmd,
+        )
+        .unwrap();
+        plant(
+            &paths,
+            "00000000000000000002-bbbbbbbb.json",
+            serde_json::json!({
+                "kind": "approve-grant",
+                "command": "cargo publish",
+                "sig": forged,
+            }),
+        );
+
+        assert!(drain(&paths)
+            .unwrap()
+            .iter()
+            .all(|(_, cmd)| !matches!(cmd, ControlCommand::ApproveGrant { .. })));
+        assert_eq!(
+            quarantined(&paths),
+            vec!["00000000000000000002-bbbbbbbb.json.bad".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_correctly_signed_command_drains() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        enqueue(
+            &paths,
+            &ControlCommand::ApproveGrant {
+                command: "cargo publish".to_string(),
+            },
+        )
+        .unwrap();
+
+        let drained = drain(&paths).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            matches!(&drained[0].1, ControlCommand::ApproveGrant { command } if command == "cargo publish"),
+            "{:?}",
+            drained[0].1
+        );
+        assert!(quarantined(&paths).is_empty());
+    }
+
+    #[test]
+    fn signed_fractional_config_values_keep_their_bits() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-fractional");
+        let costs = [
+            0.3917785_f64,
+            f64::from_bits(0.3917785_f64.to_bits() + 1),
+            0.095758,
+        ];
+        for cost in costs {
+            enqueue(
+                &paths,
+                &ControlCommand::ConfigChange {
+                    patch: serde_json::json!({"worker": {"maxBudgetUsd": cost}}),
+                },
+            )
+            .unwrap();
+        }
+        let drained = drain(&paths).unwrap();
+        assert_eq!(drained.len(), costs.len());
+        for ((_, command), expected) in drained.iter().zip(costs) {
+            let ControlCommand::ConfigChange { patch } = command else {
+                panic!("wrong command")
+            };
+            assert_eq!(
+                patch["worker"]["maxBudgetUsd"].as_f64().unwrap().to_bits(),
+                expected.to_bits()
+            );
+        }
+        assert!(quarantined(&paths).is_empty());
+    }
+
+    #[test]
+    fn a_signature_from_another_mission_does_not_transfer() {
+        // The mission id is inside the signed payload, so lifting a valid
+        // file out of mission A's inbox into mission B's must not carry the
+        // approval with it.
+        let tmp = TempDir::new().unwrap();
+        let source = MissionPaths::new(tmp.path(), "m-a");
+        let target = MissionPaths::new(tmp.path(), "m-b");
+        let cmd = ControlCommand::ApproveGrant {
+            command: "cargo publish".to_string(),
+        };
+        let file = enqueue(&source, &cmd).unwrap();
+        let body = std::fs::read_to_string(&file).unwrap();
+        std::fs::create_dir_all(target.control_dir()).unwrap();
+        let name = "00000000000000000003-cccccccc.json";
+        std::fs::write(target.control_dir().join(name), body).unwrap();
+
+        assert!(drain(&target).unwrap().is_empty());
+        assert_eq!(quarantined(&target), vec![format!("{name}.bad")]);
+    }
+
+    #[test]
+    fn an_unsigned_interrupt_never_aborts_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        enqueue(&paths, &ControlCommand::Pause).unwrap();
+        plant(
+            &paths,
+            "00000000000000000004-dddddddd.json",
+            serde_json::json!({ "kind": "msg", "text": "stop", "interrupt": true }),
+        );
+        assert!(!peek_interrupt(&paths).unwrap());
     }
 
     #[test]
@@ -543,5 +905,69 @@ mod tests {
             vec![true, false, true, false, true],
             "rapid enqueues must drain in issue order, never random-suffix order"
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A captured, correctly signed control file re-dropped after the engine
+    /// acknowledged it must not drain again (follow-up review F-1).
+    #[test]
+    fn an_acknowledged_control_file_cannot_be_replayed() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        let cmd = ControlCommand::ApproveGrant {
+            command: "cargo publish".to_string(),
+        };
+        let path = enqueue(&paths, &cmd).unwrap();
+        let captured = std::fs::read(&path).unwrap();
+
+        let drained = drain(&paths).unwrap();
+        assert_eq!(drained.len(), 1);
+        acknowledge(&paths, &path).unwrap();
+
+        std::fs::write(&path, &captured).unwrap();
+        let again = drain(&paths).unwrap();
+        assert!(
+            again.is_empty(),
+            "a replayed control file drained: {again:?}"
+        );
+        let bad = std::fs::read_dir(paths.control_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".bad"))
+            .count();
+        assert_eq!(bad, 1, "the replay must be quarantined");
+
+        // A fresh enqueue after the mark still works: the mark is a floor,
+        // not a lock.
+        let fresh = enqueue(&paths, &ControlCommand::Pause).unwrap();
+        assert!(
+            fresh.file_name().unwrap().to_string_lossy()
+                > path.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(drain(&paths).unwrap().len(), 1);
+    }
+
+    /// The signature binds the file name: the same signed body under a newer
+    /// name does not verify.
+    #[test]
+    fn a_signed_body_moved_to_a_new_name_does_not_verify() {
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        let path = enqueue(&paths, &ControlCommand::Pause).unwrap();
+        let captured = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            paths
+                .control_dir()
+                .join("99999999999999999999-ffffffff.json"),
+            &captured,
+        )
+        .unwrap();
+        assert!(drain(&paths).unwrap().is_empty());
     }
 }

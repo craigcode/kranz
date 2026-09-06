@@ -55,8 +55,14 @@ pub enum Action {
     /// action: `user_id` (the clicker) is gated by the spend allowlist and
     /// `response_url` delivers a not-authorized ephemeral, mirroring the
     /// `/kranz approve` slash twin.
+    ///
+    /// `plan_identity` is the plan the CARD displayed
+    /// ([`crate::format::plan_identity`]); the bridge refuses when the parked
+    /// plan is a different one (M2). `None` from the `/kranz approve` slash
+    /// twin, which reviews nothing and so claims nothing.
     Approve {
         mission_id: String,
+        plan_identity: Option<String>,
         user_id: Option<String>,
         response_url: Option<String>,
     },
@@ -66,6 +72,7 @@ pub enum Action {
     /// execution through the hosted registry instead of queueing.
     ApproveStart {
         mission_id: String,
+        plan_identity: Option<String>,
         user_id: Option<String>,
         response_url: Option<String>,
     },
@@ -523,16 +530,24 @@ fn route_interactive(payload: &Value) -> Action {
                             response_url,
                         }
                     }
-                    ButtonKind::Start => Action::ApproveStart {
-                        mission_id: value,
-                        user_id,
-                        response_url,
-                    },
-                    ButtonKind::Approve => Action::Approve {
-                        mission_id: value,
-                        user_id,
-                        response_url,
-                    },
+                    ButtonKind::Start => {
+                        let (mission_id, plan_identity) = parse_approve_button_value(&value);
+                        Action::ApproveStart {
+                            mission_id,
+                            plan_identity,
+                            user_id,
+                            response_url,
+                        }
+                    }
+                    ButtonKind::Approve => {
+                        let (mission_id, plan_identity) = parse_approve_button_value(&value);
+                        Action::Approve {
+                            mission_id,
+                            plan_identity,
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::Merge => Action::Merge {
                         mission_id: value,
                         user_id,
@@ -548,6 +563,24 @@ fn route_interactive(payload: &Value) -> Action {
         }
     }
     Action::Ignore
+}
+
+/// Split an approve/start button value `<mission-id>:<plan-identity>`.
+/// Mission ids never contain `:`, so the first colon splits cleanly. A value
+/// with no colon is a card posted before approve buttons were plan-bound: it
+/// yields `None` for the identity, and [`crate::approve_flow`] refuses it
+/// rather than guessing which plan the reviewer was looking at (M2).
+fn parse_approve_button_value(value: &str) -> (String, Option<String>) {
+    match value.split_once(':') {
+        Some((mission_id, identity)) => {
+            let identity = identity.trim();
+            (
+                mission_id.trim().to_string(),
+                (!identity.is_empty()).then(|| identity.to_string()),
+            )
+        }
+        None => (value.trim().to_string(), None),
+    }
 }
 
 fn parse_revision_button_value(value: &str) -> Option<(String, u32)> {
@@ -1451,7 +1484,7 @@ mod tests {
                 "user": { "id": "Uclicker" },
                 "response_url": "https://hooks.slack/b",
                 "actions": [
-                    { "action_id": APPROVE_ACTION_ID, "value": "m-42", "type": "button" }
+                    { "action_id": APPROVE_ACTION_ID, "value": "m-42:planid0000000000", "type": "button" }
                 ]
             }
         });
@@ -1463,6 +1496,7 @@ mod tests {
             routed.action,
             Action::Approve {
                 mission_id: "m-42".into(),
+                plan_identity: Some("planid0000000000".into()),
                 user_id: Some("Uclicker".into()),
                 response_url: Some("https://hooks.slack/b".into()),
             }
@@ -1479,7 +1513,7 @@ mod tests {
                 "user": { "id": "Uclicker" },
                 "response_url": "https://hooks.slack/s",
                 "actions": [
-                    { "action_id": START_ACTION_ID, "value": "m-42", "type": "button" }
+                    { "action_id": START_ACTION_ID, "value": "m-42:planid0000000000", "type": "button" }
                 ]
             }
         });
@@ -1488,8 +1522,37 @@ mod tests {
             routed.action,
             Action::ApproveStart {
                 mission_id: "m-42".into(),
+                plan_identity: Some("planid0000000000".into()),
                 user_id: Some("Uclicker".into()),
                 response_url: Some("https://hooks.slack/s".into()),
+            }
+        );
+    }
+
+    /// M2: a card posted before approve buttons were plan-bound carries a
+    /// bare mission id. It still routes (the mission is unambiguous), but it
+    /// claims no plan, and `approve_flow` refuses it rather than guessing.
+    #[test]
+    fn a_bare_mission_id_button_value_routes_with_no_plan_identity() {
+        let env = json!({
+            "type": "interactive",
+            "envelope_id": "env-old",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Uclicker" },
+                "response_url": "https://hooks.slack/b",
+                "actions": [
+                    { "action_id": APPROVE_ACTION_ID, "value": "m-42", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::Approve {
+                mission_id: "m-42".into(),
+                plan_identity: None,
+                user_id: Some("Uclicker".into()),
+                response_url: Some("https://hooks.slack/b".into()),
             }
         );
     }

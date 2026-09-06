@@ -428,6 +428,13 @@ pub struct DroidSession {
     exit: Option<SessionExit>,
 }
 
+#[cfg(unix)]
+impl Drop for DroidSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
 impl DroidSession {
     fn observe(&mut self, event: &AgentEvent) {
         match event {

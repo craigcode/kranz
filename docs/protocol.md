@@ -20,6 +20,12 @@ unhealthy root stays distinguishable from an unknown repo id (404).
 Unknown `/api/*` paths always return JSON and never fall through to the
 dashboard SPA.
 
+The additive `feature.progress` event records a sequential feature’s pinned
+`baseSha` and cumulative commit receipts. Folded state exposes the optional
+`featureBaseShas` map; it is absent for legacy logs without these events.
+See the [contract change](reviews/2026-09-05-feature-progress-contract.md) for
+retry, recovery, and upgrade semantics.
+
 ## REST
 
 | Method/Path | Response |
@@ -83,7 +89,16 @@ ticket pipeline — never a prompt loop, never a run, never a land (ticket
 NOT the mutation token, and refuses CLOSED when no secret is configured.
 Config (additive, `.kranz/config.json` — gitignored, so the secret is never
 committed): `hooks.secret`, `hooks.fixLabel` (default `kranz:fix`),
-`hooks.queueLabel` (default `kranz:fix-and-queue`). In a multi-repository
+`hooks.queueLabel` (default `kranz:fix-and-queue`), and `hooks.allowUsers`
+(GitHub logins explicitly allowed to request work through PR comments,
+compared case-insensitively). An absent or empty `allowUsers` disables comment
+triggers; HMAC verification authenticates GitHub's delivery, not the comment
+author's authority. For example, set `"allowUsers": ["your-github-login"]`
+inside the local `hooks` object to enable your own comment triggers.
+Workflow-failure triggers remain independent of this comment allowlist, but
+must originate in the receiving repository; a fork's matching branch name
+does not authorize a draft.
+In a multi-repository
 serve the repo-scoped twin `/api/repos/:repoId/hooks/github` verifies against
 THAT repository's config and identity.
 
@@ -129,9 +144,10 @@ ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
 cannot present the token, so that route authenticates with its own per-repo
 HMAC signature and refuses closed when unconfigured (see §Webhooks).
 The token is generated at serve start (or passed in by the embedding Tauri
-shell), printed to the operator, and appended by `--open` as `#token=<t>` in
-the launched URL; the dashboard stores it (sessionStorage) and shows a
-paste-token field when a mutation is attempted without one. Missing/wrong
+shell) and printed to the operator. `--open` launches the bare URL with no
+token in it (a URL is argv, and argv is world-readable); the dashboard shows
+a paste-token field when a mutation is attempted without one and stores the
+pasted token in sessionStorage. Missing/wrong
 token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
 binding + CORS stop the network and the browser; the token stops other local
 processes and link-borne CSRF from creating or steering missions that spend

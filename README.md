@@ -15,8 +15,11 @@ review?" into data.
 Built in Rust with Claude Code as the default runtime. Role-specific backends
 also support Codex CLI, Factory Droid, Kimi Code, Cursor, ACP-compatible
 agents, and OpenAI-compatible local inference. Claude sessions can use a
-repository's `CLAUDE.md`, `.claude/skills`, `.mcp.json`, and hooks. Git is the
-source of truth; an append-only event log makes every mission `kill -9`-safe.
+repository's `CLAUDE.md` and `.claude/skills`; a repository's own
+`.claude/settings.json`, hooks, and `.mcp.json` are never loaded, because they
+run commands before the model's first turn (only the operator's user-level
+settings apply). Git is the source of truth; an append-only, hash-chained event
+log makes every mission `kill -9`-safe.
 
 ```
 ┌───────────┐   plan/judge    ┌────────────────────────────────┐
