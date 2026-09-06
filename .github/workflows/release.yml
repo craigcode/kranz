@@ -51,6 +51,9 @@ jobs:
           fi
 
       - name: Audit current public tree
+        env:
+          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-tree.sh
 
       # Keep the scanner version and archive checksum explicit. The generic
@@ -73,6 +76,9 @@ jobs:
           echo "$bin_dir" >> "$GITHUB_PATH"
 
       - name: Scan all reachable history for secrets and operator metadata
+        env:
+          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-history.sh
 
       - run: cargo fmt --all --check

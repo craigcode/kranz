@@ -27,6 +27,17 @@ Complete `docs/public-readiness.md`. In particular:
   and
 - no release tag already exists for the chosen version.
 
+Supply the owner's private vocabulary as one case-sensitive UTF-8 literal per line
+in a file outside the checkout (`KRANZ_PUBLIC_AUDIT_MARKERS_FILE`), or through
+`KRANZ_PUBLIC_AUDIT_MARKERS`. Blank lines and `#` comments are ignored. Set
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` for both candidate audits; missing, empty or
+unreadable input fails. These checks print counts rather than vocabulary or
+matched content. The history check examines every reachable object, including
+deleted blobs, commit messages and identity headers, and refuses shallow history.
+Configure the repository Actions secret `KRANZ_PUBLIC_AUDIT_MARKERS` with the
+same reviewed vocabulary; the release workflow requires it for both audits.
+The fixed built-in marker checks and Gitleaks remain separate checks.
+
 These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
 branches, tags, crates, formulas, or releases.
 
@@ -66,8 +77,8 @@ cargo fmt --all --check
 cargo build --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
-scripts/audit-public-tree.sh
-scripts/audit-public-history.sh
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-tree.sh
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-history.sh
 ```
 
 Run the full dashboard gate from `apps/dashboard` and the locked Tauri check

@@ -31,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Audit tracked public content
         run: scripts/audit-public-tree.sh
+      - name: Prove required operator-marker audits fail closed
+        run: python3 scripts/test-audit-operator-markers.py
       - name: Audit reachable history metadata
         env:
           KRANZ_SKIP_GITLEAKS: "1"

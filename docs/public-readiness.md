@@ -37,6 +37,10 @@ hardening changes. Keep the repository private until every item below is true.
 - `scripts/audit-public-tree.sh` passes on the exact proposed public commit.
 - `scripts/audit-public-history.sh` passes with every branch, tag, and GitHub
   pull-request ref fetched.
+- Both audits pass with `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the owner's
+  reviewed private vocabulary supplied outside the checkout. The matching
+  `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret is configured. Ordinary CI's
+  built-in-marker scan does not substitute for this owner-supplied vocabulary.
 - Mission records, tickets, fixtures, and review documents have received a
   human confidentiality/licensing review; automated secret scans do not detect
   external-party identifiers, private prompts, or proprietary prose reliably.
@@ -105,6 +109,10 @@ release. They must never silently become the supported distribution.
   `patterns_allowed` to a personal-account repository after it is public.
 - The `release` environment requires the repository owner to approve the
   publish job.
+  The 2026-09-06 preparation attempt to add that rule was rejected by GitHub
+  because the current plan does not support required reviewers for this
+  private repository. Keep the release switch off; after separately approved
+  public visibility, configure and verify the rule before enabling releases.
 - The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` remains
   `false` until every item in this document is complete; set it to `true` only
   after the protected release environment is verified.

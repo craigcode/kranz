@@ -21,6 +21,7 @@ verified_against:
   - scripts/check-rust-notices.sh
   - scripts/check-package-licenses.sh
   - scripts/package-release.py
+  - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
 
@@ -62,6 +63,14 @@ the binary and notice payload for all five release targets. The dashboard
 build generates its bundled dependency notices; the embedded-bundle freshness
 check covers that file too. `kranz licenses` exposes the project and dependency
 notices from a copied executable outside a checkout.
+
+Public-release audits additionally require an owner-supplied marker vocabulary.
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` fails on missing/empty input; tree checks
+scan tracked paths and content, while history checks inspect all reachable
+objects and refuse shallow clones. Output contains counts, not private terms
+or matching content. Ordinary CI exercises this behavior with synthetic
+positive/negative fixtures; the release workflow consumes the reviewed Actions
+secret. The built-in-marker scan alone is not an owner-vocabulary receipt.
 
 The `knowledge-refresh` job checks out full history, then runs
 `cargo run --locked --package kranz -- knowledge-refresh`. Full history is
