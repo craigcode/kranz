@@ -43,6 +43,17 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
     }
 
     match cli.command {
+        Command::Licenses => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(include_bytes!("../LICENSE"))?;
+            out.write_all(b"\n\n")?;
+            out.write_all(include_bytes!("../assets/THIRD_PARTY_NOTICES.txt"))?;
+            out.write_all(b"\n\nEmbedded dashboard dependency notices\n")?;
+            out.write_all(include_bytes!(
+                "../assets/dashboard/dist/THIRD_PARTY_NOTICES.txt"
+            ))?;
+            Ok(0)
+        }
         Command::Init {
             gates,
             register,
@@ -213,9 +224,15 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 cmd_export_traces(&repo, &mission)?
             };
             match out {
-                Some(path) => std::fs::write(&path, &jsonl).with_context(|| {
-                    format!("writing export-traces output to {}", path.display())
-                })?,
+                // No-follow + refuse a symlinked destination: a bare
+                // `fs::write` truncates through a link an agent can plant at
+                // a plausible `--out` path.
+                Some(path) => {
+                    kranz_engine::trace_export::write_export_output(&path, jsonl.as_bytes())
+                        .with_context(|| {
+                            format!("writing export-traces output to {}", path.display())
+                        })?
+                }
                 None => print!("{jsonl}"),
             }
             Ok(0)
@@ -233,9 +250,13 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 cmd_export_corpus(&repo, &mission)?
             };
             match out {
-                Some(path) => std::fs::write(&path, &jsonl).with_context(|| {
-                    format!("writing export-corpus output to {}", path.display())
-                })?,
+                // Same no-follow write as export-traces above.
+                Some(path) => {
+                    kranz_engine::trace_export::write_export_output(&path, jsonl.as_bytes())
+                        .with_context(|| {
+                            format!("writing export-corpus output to {}", path.display())
+                        })?
+                }
                 None => print!("{jsonl}"),
             }
             Ok(0)
@@ -2288,8 +2309,10 @@ pub(crate) fn effective_require_read_token(bind_is_loopback: bool, read_auth: bo
 
 /// Every `POST /api/...` requires the mutation token (protocol "Authority:
 /// mutation token"): generated per serve (or pinned via `--token` for
-/// scripting), printed for the operator, and handed to `--open`'s browser as
-/// a `#token=<t>` fragment the dashboard stores. The read-only token
+/// scripting) and printed for the operator to paste into the dashboard's own
+/// TokenPrompt. `--open` launches the BARE url and hands the browser no
+/// token at all (follow-up review M-10). See the `if open` block below for
+/// why neither token belongs in the opener's argv. The read-only token
 /// (`--read-token` / `$KRANZ_READ_TOKEN`) is generated alongside and stored
 /// in its own file — it authenticates gated GETs and the WS upgrade but
 /// never a mutation, so it is the one safe to hand to dashboards and agents.
@@ -2399,6 +2422,12 @@ async fn cmd_serve(
     println!("kranz server on {url}");
     println!("mutation token: {token}");
     println!("read token: {read_token} (GETs/WS only — safe for dashboards and agents)");
+    if open {
+        println!(
+            "opening the bare URL; no token rides in the opener's argv. Paste the \
+             mutation token above when the dashboard asks for one"
+        );
+    }
     match &dashboard_assets {
         Some(DashboardAssets::Embedded) => println!(
             "serving embedded dashboard ({})",
@@ -2421,9 +2450,30 @@ async fn cmd_serve(
 
     if open {
         // Give the server a moment to bind before pointing a browser at it.
-        // The fragment hands the token to the dashboard without it ever
-        // appearing in a request line or server log.
-        let url = format!("{url}#token={token}");
+        //
+        // BEHAVIOUR (follow-up review M-10): the opened URL carries NO token
+        // at all: not the mutation token, and not the read token either.
+        // Two reasons, and the second is the one that changed:
+        //
+        // Threat: `open`/`xdg-open` is a separate process whose argv any
+        // local process can read (`ps`, `/proc/<pid>/cmdline`). A fragment
+        // keeps a token out of request lines and server logs, but a fragment
+        // is still argv, so putting the read token there downgraded the
+        // disclosure rather than eliminating it.
+        //
+        // Correctness: the dashboard has ONE token slot
+        // (apps/dashboard/src/lib/token.ts). Seeding it with the read token
+        // wedges the UI the moment the operator mutates anything: the
+        // server 401s, `awaitToken()` CLEARS the slot, and when
+        // `require_read_token` is on (a non-loopback bind, or read auth
+        // configured) every subsequent GET 401s too and the WS reconnect-
+        // loops. The fragment is already stripped by `history.replaceState`,
+        // so a reload does not recover it.
+        //
+        // So: open bare, and let the dashboard's own TokenPrompt ask. The
+        // pasted mutation token authenticates reads as well as writes, which
+        // is the single-slot shape the dashboard actually has.
+        let url = url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(600)).await;
             open_browser(&url);
@@ -3310,7 +3360,10 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
-        let err = cmd_release(&repo, "m-1", "http://127.0.0.1:4560", None)
+        // A loopback URL can discover an operator token from the developer's
+        // running server. A non-loopback documentation address has no ambient
+        // token source, so this exercises the missing-token error without I/O.
+        let err = cmd_release(&repo, "m-1", "http://192.0.2.1:4560", None)
             .await
             .unwrap_err();
         let msg = err.to_string();

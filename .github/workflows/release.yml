@@ -53,6 +53,9 @@ jobs:
           fi
 
       - name: Audit current public tree
+        env:
+          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-tree.sh
 
       # Keep the scanner version and archive checksum explicit. The generic
@@ -75,6 +78,9 @@ jobs:
           echo "$bin_dir" >> "$GITHUB_PATH"
 
       - name: Scan all reachable history for secrets and operator metadata
+        env:
+          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-history.sh
 
       - run: cargo fmt --all --check
@@ -84,6 +90,13 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
 
       - run: cargo build --workspace --locked
+
+      - name: Verify package licenses and dependency notices
+        run: |
+          cargo install cargo-about --locked --version 0.9.2 --features cli
+          bash scripts/check-rust-notices.sh
+          bash scripts/check-package-licenses.sh
+          python3 scripts/test-package-release.py
 
       - name: Build strict public API documentation
         env:
@@ -203,25 +216,15 @@ jobs:
       - name: Build kranz CLI
         run: cargo build --release --locked -p kranz --bin kranz --target "${{ matrix.target }}"
 
-      - name: Stage asset (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+      - name: Package binary and license notices
+        run: python scripts/package-release.py --binary "target/${{ matrix.target }}/release/${{ matrix.bin }}" --asset "${{ matrix.asset }}"
 
-      - name: Stage asset (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}.exe"
-
-      - name: Attest binary build provenance
+      - name: Attest release archive build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/${{ matrix.asset }}*
 
-      - name: Upload staged binary
+      - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.asset }}

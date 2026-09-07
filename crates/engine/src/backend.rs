@@ -159,6 +159,7 @@ pub enum AgentEvent {
         text: String,
         is_error: bool,
         usage: TokenUsage,
+        /// Cost attributable to this result, not a cumulative session total.
         cost_usd: Option<f64>,
         num_turns: Option<u32>,
         raw: serde_json::Value,

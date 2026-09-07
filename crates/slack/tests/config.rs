@@ -56,8 +56,21 @@ fn set_home(dir: &std::path::Path) {
 }
 
 /// Write a `~/.kranz/config.json` under `home` with the given raw JSON.
-fn write_global_config(home: &std::path::Path, json: &str) {
-    let dir = home.join(".kranz");
+/// The global kranz directory the ENGINE resolves: `$KRANZ_HOME` when set
+/// (the wrapped dogfood suite sets it), else the `HOME` this test pinned.
+/// Writing anywhere else would test the wrong file.
+fn global_dir() -> std::path::PathBuf {
+    kranz_engine::paths::global_kranz_dir().expect("a global kranz dir resolves")
+}
+
+/// Remove any global config left by an earlier scenario so the next one
+/// starts from "no file".
+fn fresh_home(_home: &std::path::Path) {
+    let _ = std::fs::remove_file(global_dir().join("config.json"));
+}
+
+fn write_global_config(_home: &std::path::Path, json: &str) {
+    let dir = global_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), json).unwrap();
 }
@@ -74,11 +87,16 @@ fn from_config_scenarios() {
     // Ensure a clean baseline regardless of the outer environment.
     clear(SLACK_KEYS);
 
+    // One HOME for every scenario. The engine resolves its global directory
+    // once per process (`kranz_engine::paths::global_kranz_dir`), so the
+    // scenarios cannot each bring their own; they reset the file instead.
+    let home = TempDir::new().unwrap();
+    set_home(home.path());
+
     let result = std::panic::catch_unwind(|| {
         // --- 1. Unconfigured: empty HOME, no env → None ------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             assert!(
                 SlackConfig::from_config(repo_root).unwrap().is_none(),
@@ -88,8 +106,7 @@ fn from_config_scenarios() {
 
         // --- 2. From env only -------------------------------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path()); // empty ~/.kranz — env supplies everything
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             std::env::set_var("KRANZ_SLACK_BOT_TOKEN", "xoxb-from-env");
             std::env::set_var("KRANZ_SLACK_APP_TOKEN", "xapp-from-env");
@@ -115,8 +132,7 @@ fn from_config_scenarios() {
 
         // --- 3. From ~/.kranz/config.json only --------------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             write_global_config(
                 home.path(),
@@ -146,8 +162,7 @@ fn from_config_scenarios() {
 
         // --- 4. Env wins over file, per field ---------------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             write_global_config(
                 home.path(),
@@ -170,8 +185,7 @@ fn from_config_scenarios() {
 
         // --- 5. Partial (missing channel) → None ------------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             write_global_config(
                 home.path(),
@@ -185,8 +199,7 @@ fn from_config_scenarios() {
 
         // --- 6. Config file with no `slack` key → None ------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             write_global_config(home.path(), r#"{ "worker": { "model": "sonnet" } }"#);
             assert!(SlackConfig::from_config(repo_root).unwrap().is_none());
@@ -194,8 +207,7 @@ fn from_config_scenarios() {
 
         // --- 7. Malformed config file → Err -----------------------------
         {
-            let home = TempDir::new().unwrap();
-            set_home(home.path());
+            fresh_home(home.path());
             clear(SLACK_KEYS);
             write_global_config(home.path(), "{ not valid json");
             assert!(

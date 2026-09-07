@@ -27,6 +27,17 @@ Complete `docs/public-readiness.md`. In particular:
   and
 - no release tag already exists for the chosen version.
 
+Supply the owner's private vocabulary as one case-sensitive UTF-8 literal per line
+in a file outside the checkout (`KRANZ_PUBLIC_AUDIT_MARKERS_FILE`), or through
+`KRANZ_PUBLIC_AUDIT_MARKERS`. Blank lines and `#` comments are ignored. Set
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` for both candidate audits; missing, empty or
+unreadable input fails. These checks print counts rather than vocabulary or
+matched content. The history check examines every reachable object, including
+deleted blobs, commit messages and identity headers, and refuses shallow history.
+Configure the repository Actions secret `KRANZ_PUBLIC_AUDIT_MARKERS` with the
+same reviewed vocabulary; the release workflow requires it for both audits.
+The fixed built-in marker checks and Gitleaks remain separate checks.
+
 These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
 branches, tags, crates, formulas, or releases.
 
@@ -66,14 +77,29 @@ cargo fmt --all --check
 cargo build --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
-scripts/audit-public-tree.sh
-scripts/audit-public-history.sh
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-tree.sh
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-history.sh
 ```
 
 Run the full dashboard gate from `apps/dashboard` and the locked Tauri check
 from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull
 request must pass every required GitHub check on the exact commit that will be
 tagged.
+
+The manually dispatched live-smoke job additionally needs the repository's
+`ANTHROPIC_API_KEY` secret. Its Linux setup installs and probes bubblewrap and
+enables user namespaces on the disposable hosted runner before spending model
+tokens. Validator containment remains required; local OAuth rehearsal evidence
+does not establish that the remote job's credentials or host setup work.
+
+The final acceptance audit also executes generated code. Build the test-only
+adapter with `cargo build --locked -p kranz-engine --example acceptance_gate`
+and set `KRANZ_ACCEPTANCE_GATE_BIN` to that executable when invoking
+`scripts/acceptance-smoke.sh`. It uses the existing production gate runner with
+`fs` enforcement, a sanitized environment, and mission authority read-denies;
+there is no unsandboxed fallback. The filesystem tier permits networking,
+including the localhost listener required by the HTTP contract. The offline
+harness tests use the debug example by default and require Seatbelt on macOS or working bubblewrap on Linux.
 
 ## 3. Rehearse crate packaging honestly
 
@@ -112,13 +138,19 @@ git push origin vX.Y.Z
 
 The tag starts `.github/workflows/release.yml`. It rechecks version/main
 alignment, all reachable history, Rust/dashboard gates, documentation, and
-dependency policy before building. Each platform binary receives a GitHub
-build-provenance attestation. The final protected-environment job assembles the
-binaries, SPDX JSON SBOM, and `SHA256SUMS`; an owner must approve that job before
+dependency policy before building. It also verifies upstream license text
+and the committed dependency notices using pinned cargo-about 0.9.2. Each
+platform archive contains the executable, MIT license, Rust/dashboard
+dependency notices, and the build toolchain's Rust library copyright inventory.
+Archives receive GitHub build-provenance attestations. The final
+protected-environment job assembles the archives, SPDX JSON SBOM and
+`SHA256SUMS`; an owner must approve that job before
 GitHub creates the release.
 
 After approval, verify all assets, checksums, attestations, generated notes,
-and `kranz --version` on clean Linux, macOS, and Windows hosts. A failed matrix
+and `kranz --version` on clean Linux, macOS, and Windows hosts. Also inspect
+the extracted notices, run `kranz licenses` outside a source checkout, and
+check `/THIRD_PARTY_NOTICES.txt` from the served embedded dashboard. A failed matrix
 or missing evidence means no release—delete the draft/tag only through the
 documented operator recovery process.
 

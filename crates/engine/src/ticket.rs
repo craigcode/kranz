@@ -29,22 +29,96 @@
 
 use crate::error::{EngineError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// Default priority when frontmatter omits it (1 high … 3 low).
 const DEFAULT_PRIORITY: u8 = 2;
 
-/// Heading [`Ticket::mission_goal`] appends before a set task class, and
-/// [`parse_task_class_from_goal`] looks for on the way back out.
+/// Heading [`Ticket::mission_goal`] appends before the task class (empty
+/// when the ticket declares none), and [`parse_task_class_from_goal`] looks
+/// for on the way back out.
 const TASK_CLASS_HEADING: &str = "## Task class\n";
+
+/// Ceiling on the per-ticket `max-budget-usd` override (audit M10). Ticket
+/// bytes are unauthenticated tree data — a worker commit or a PR-comment
+/// webhook can write them — and the value raises the orchestrator's own
+/// spend cap, so a ticket may lower or moderately raise the default
+/// ($20, [`crate::types::MissionConfig::default`]) but never name an
+/// unbounded one.
+pub const MAX_TICKET_BUDGET_USD: f64 = 100.0;
+
+/// Longest accepted `task-class` value.
+const MAX_TASK_CLASS_LEN: usize = 64;
+
+/// Every frontmatter key the parser recognizes, in both accepted spellings.
+/// Unknown keys stay ignored for forward compatibility, but are warned about
+/// rather than dropped in silence (audit M10) — a misspelled authority-
+/// bearing key must not read as "accepted".
+const KNOWN_FRONTMATTER_KEYS: &[&str] = &[
+    "title",
+    "priority",
+    "repo-refs",
+    "reporefs",
+    "blocked-by",
+    "blockedby",
+    "task-class",
+    "taskclass",
+    "review-artifact",
+    "reviewartifact",
+    "review-output",
+    "reviewoutput",
+    "trigger",
+    "traced-from-mission",
+    "tracedfrommission",
+    "defer-until",
+    "deferuntil",
+    "schedule",
+    "state",
+    "state-note",
+    "statenote",
+    "max-budget-usd",
+    "maxbudgetusd",
+];
+
+/// Whether `key` is a frontmatter key this parser recognizes. Public so the
+/// allowlist is testable as the list it is, rather than only through the
+/// match arms that consume it.
+pub fn is_known_frontmatter_key(key: &str) -> bool {
+    KNOWN_FRONTMATTER_KEYS.contains(&key)
+}
+
+/// Normalize and validate a `task-class` value: one lowercase identifier of
+/// `[a-z0-9]` and `-`, bounded length. The class selects standards rules and
+/// the executor tier, so a value carrying spaces, path segments, or newlines
+/// is dropped (`None`) rather than passed on — the routing table is
+/// operator-configured, so the SHAPE is checked here and membership stays
+/// the table's business.
+fn parse_task_class_value(slug: &str, raw: &str) -> Option<String> {
+    let value = crate::routing::normalize_task_class(raw);
+    if value.is_empty() {
+        return None;
+    }
+    let well_formed = value.len() <= MAX_TASK_CLASS_LEN
+        && value.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !well_formed {
+        tracing::warn!(slug, value = %value, "invalid ticket task-class; ignoring");
+        return None;
+    }
+    Some(value)
+}
 
 /// Recover the task class [`Ticket::mission_goal`] folded in, from a mission
 /// `goal` string. [`crate::orchestrator::MissionEngine::create`] calls this
 /// to route the executor tier for a mission seeded from a ticket, since by
 /// the time `create` runs it only has the folded goal, not the `Ticket`.
 pub fn parse_task_class_from_goal(goal: &str) -> Option<String> {
-    // The engine-authored appendix is last. `rfind` prevents ticket prose
-    // containing a lookalike heading from shadowing the governed value.
+    // The engine-authored appendix is last and ALWAYS present (empty when
+    // the ticket sets no class), so `rfind` lands on engine bytes even when
+    // ticket prose carries a lookalike heading.
     let idx = goal.rfind(TASK_CLASS_HEADING)?;
     let rest = &goal[idx + TASK_CLASS_HEADING.len()..];
     let line = rest.lines().next()?.trim();
@@ -397,8 +471,7 @@ impl Ticket {
                 "repo-refs" | "reporefs" => repo_refs = value.list(),
                 "blocked-by" | "blockedby" => blocked_by = value.list(),
                 "task-class" | "taskclass" => {
-                    let v = value.scalar().trim().to_string();
-                    task_class = if v.is_empty() { None } else { Some(v) };
+                    task_class = parse_task_class_value(slug, &value.scalar());
                 }
                 "review-artifact" | "reviewartifact" => {
                     let v = value.scalar().trim().to_string();
@@ -448,15 +521,34 @@ impl Ticket {
                     let v = value.scalar().trim().to_string();
                     state_note = if v.is_empty() { None } else { Some(v) };
                 }
-                "maxbudgetusd" | "max-budget-usd" => {
-                    if let Ok(b) = value.scalar().parse::<f64>() {
-                        max_budget_usd = Some(b);
-                    } else {
+                // Clamped to [`MAX_TICKET_BUDGET_USD`]: the value raises the
+                // orchestrator's own spend cap and the ticket that carries
+                // it is unauthenticated tree data (audit M10). A negative,
+                // zero, or non-finite budget is not a lower cap, it is
+                // nonsense — dropped, so the configured default stands.
+                "maxbudgetusd" | "max-budget-usd" => match value.scalar().parse::<f64>() {
+                    Ok(b) if b.is_finite() && b > 0.0 => {
+                        if b > MAX_TICKET_BUDGET_USD {
+                            tracing::warn!(
+                                slug,
+                                requested = b,
+                                ceiling = MAX_TICKET_BUDGET_USD,
+                                "ticket maxBudgetUsd exceeds the ceiling; clamping"
+                            );
+                        }
+                        max_budget_usd = Some(b.min(MAX_TICKET_BUDGET_USD));
+                    }
+                    _ => {
                         tracing::warn!(slug, value = %value.scalar(), "invalid ticket maxBudgetUsd; ignoring");
                     }
+                },
+                // Unknown keys are ignored (forward compatibility) but
+                // named in the log: an authority-bearing key that is a
+                // typo away from a real one must not read as accepted.
+                other => {
+                    debug_assert!(!is_known_frontmatter_key(other));
+                    tracing::warn!(slug, key = %other, "unknown ticket frontmatter key; ignoring");
                 }
-                // Unknown keys are ignored (forward compatibility).
-                _ => {}
             }
         }
 
@@ -505,6 +597,12 @@ impl Ticket {
     }
 
     /// Load and parse a ticket file; the slug is the file stem.
+    ///
+    /// The read is NO-FOLLOW ([`crate::paths::open_read_nofollow`]): tickets
+    /// live in a worker-writable tree and this loader runs unsandboxed in
+    /// both the CLI and `kranz serve`, so a symlinked `<slug>.md` would
+    /// otherwise hand a reader any file the process can open (audit: server
+    /// leaf reads follow symlinks).
     pub fn load(path: &Path) -> Result<Ticket> {
         let slug = path
             .file_stem()
@@ -513,7 +611,8 @@ impl Ticket {
                 EngineError::Config(format!("ticket path has no file stem: {}", path.display()))
             })?
             .to_string();
-        let text = std::fs::read_to_string(path)?;
+        let mut text = String::new();
+        crate::paths::open_read_nofollow(path)?.read_to_string(&mut text)?;
         Ticket::parse(&slug, &text)
     }
 
@@ -604,14 +703,23 @@ impl Ticket {
             out.push_str(&crate::review_artifact::render_goal_section(&contract));
         }
 
-        if let Some(task_class) = self.task_class.as_deref().map(str::trim) {
-            if !task_class.is_empty() {
-                out.push('\n');
-                out.push_str(TASK_CLASS_HEADING);
-                out.push_str(task_class);
-                out.push('\n');
-            }
-        }
+        // The engine's block is appended UNCONDITIONALLY, empty when the
+        // ticket declares no class (audit H10). Skipping it for an unset
+        // class left `parse_task_class_from_goal`'s `rfind` to land on a
+        // lookalike heading in ticket prose — which a PR comment can write
+        // through the webhook — and a forged class drops every
+        // task-class-scoped enforced rule from the approval pin. With the
+        // block always last, the recovery reads engine bytes or nothing.
+        let task_class = self
+            .task_class
+            .as_deref()
+            .map(str::trim)
+            .filter(|class| !class.is_empty())
+            .unwrap_or_default();
+        out.push('\n');
+        out.push_str(TASK_CLASS_HEADING);
+        out.push_str(task_class);
+        out.push('\n');
 
         out
     }

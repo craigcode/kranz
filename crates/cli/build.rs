@@ -108,6 +108,7 @@ fn content_type(path: &Path) -> &'static str {
         Some("js") => "application/javascript",
         Some("json") => "application/json",
         Some("svg") => "image/svg+xml",
+        Some("txt") => "text/plain; charset=utf-8",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }

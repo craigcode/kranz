@@ -484,6 +484,7 @@ impl WorkspaceProvider for RemoteWorkspaceProvider {
                 detail: None,
                 container: None,
                 remote: None,
+                gate_env: spec.gate_env.clone(),
             });
         };
 
@@ -539,6 +540,7 @@ impl WorkspaceProvider for RemoteWorkspaceProvider {
                 injected_env_names: env_names,
                 poll,
             }),
+            gate_env: spec.gate_env.clone(),
         })
     }
 
@@ -835,10 +837,12 @@ mod tests {
     }
 
     fn spec(root: &std::path::Path, contract: Option<WorkspaceContract>) -> ProvisionSpec {
+        let runtime_dir = root.join(".kranz").join("missions").join("m-test");
         ProvisionSpec {
             mission_id: "m-test".to_string(),
             repo_root: root.to_path_buf(),
-            runtime_dir: root.join(".kranz").join("missions").join("m-test"),
+            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(&runtime_dir, &[]),
+            runtime_dir,
             base_sha: Some("deadbeefcafe".to_string()),
             contract,
         }

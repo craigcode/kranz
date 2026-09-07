@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-01
+last_verified: 2026-09-06
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
@@ -13,10 +13,15 @@ verified_against:
   - crates/engine/src/contract_sweep.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/runner.rs
+  - crates/engine/src/judgement.rs
   - crates/cli/src/commands.rs
   - crates/engine/src/knowledge.rs
   - crates/engine/src/test_capability.rs
   - .github/workflows/ci.yml
+  - scripts/check-rust-notices.sh
+  - scripts/check-package-licenses.sh
+  - scripts/package-release.py
+  - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
 
@@ -50,6 +55,22 @@ full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
 tests, and lint.
+
+The supply-chain job also checks the four package MIT notices, regenerates
+the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
+generic-license fallbacks without upstream source text. Archive tests verify
+the binary and notice payload for all five release targets. The dashboard
+build generates its bundled dependency notices; the embedded-bundle freshness
+check covers that file too. `kranz licenses` exposes the project and dependency
+notices from a copied executable outside a checkout.
+
+Public-release audits additionally require an owner-supplied marker vocabulary.
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` fails on missing/empty input; tree checks
+scan tracked paths and content, while history checks inspect all reachable
+objects and refuse shallow clones. Output contains counts, not private terms
+or matching content. Ordinary CI exercises this behavior with synthetic
+positive/negative fixtures; the release workflow consumes the reviewed Actions
+secret. The built-in-marker scan alone is not an owner-vocabulary receipt.
 
 The `knowledge-refresh` job checks out full history, then runs
 `cargo run --locked --package kranz -- knowledge-refresh`. Full history is
@@ -115,6 +136,12 @@ Two mechanisms, because printing alone is not enough:
   libtest's capture where stdout does not, and each lane prints the ledger
   after the suite, so a green run still shows what it did not exercise.
 
+Container gate launches and timeout cleanup use the same allowlisted host
+runtime context. The worker's sanitized environment crosses only through
+explicit container flags, so a contract's `DOCKER_HOST` cannot redirect the
+host runtime. Explicit empty proxy variables also prevent Docker's client
+configuration from injecting proxy credentials into the payload.
+
 ## Empty-deliverable safety net
 
 `final_gate()` in [orchestrator.rs](../../../crates/engine/src/orchestrator.rs)
@@ -140,7 +167,11 @@ Once all milestones complete, `final_gate()` runs the mission's
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown
   the `diff_stat(base, "HEAD")` where `base` is the pinned `base_sha` (falls
   back to `base_branch` only for legacy missions with no pinned sha).
-  Unparseable or missing verdicts fail conservatively.
+  Unparseable, missing, or duplicated verdicts fail conservatively. Decision
+  turns parse with `runner::parse_decision`, which takes the whole trimmed
+  reply or the content of exactly one fenced block. The old greedy
+  first-`{`-to-last-`}` span is gone: it read a JSON object the model had quoted
+  and explicitly disowned (the 2026-09-01 adversarial audit, H10).
 
 Empty findings → `complete_mission()`. Otherwise findings route through
 `convert_findings`: a waive-all answer completes the mission; a fix answer
@@ -154,6 +185,16 @@ failing-command evidence attached, spending no fix cycle. The guard in
 `convert_findings` honors this verdict only for findings whose
 `class == "command-assertion"`; a mislabelled non-command finding falls
 through to the normal fix/waive handling.
+
+## What a validator is allowed to run
+
+A validator session's `Bash(<command>*)` allow list comes from the approved
+contract's `command` strings plus config `allowValidatorCommands` and operator
+grants, folded in by `permissions::for_role`. The commands a worker REPORTS it
+ran are not in it: that field is model-authored JSON with no human step between
+the report and the rule, so feeding it in let a worker mint an allow rule for
+the read-only role. Those commands still reach the validator prompt, labelled
+as the untrusted claim they are (the 2026-09-01 adversarial audit).
 
 ## Merge pre-gate
 
@@ -201,8 +242,11 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
   `scrub_json_value` over every string leaf before the line reaches
   `events.jsonl`; the `append_with_redaction_audits` wrapper then emits
   `secret.redacted` audit events carrying only `rule_id` + `fingerprint` +
-  `location` (never the raw value). Worker messages also pass through
-  `scrub_and_truncate` ([runner.rs](../../../crates/engine/src/runner.rs)).
+  `location` (never the raw value). The line's integrity fields are computed
+  after the scrub, so the chain covers the redacted bytes that land on disk and
+  a redaction is never mistaken for tampering. Worker messages also pass
+  through `scrub_and_truncate`
+  ([runner.rs](../../../crates/engine/src/runner.rs)).
 - **Merge pre-gate:** step 2 above.
 - **`kranz scan`** ([commands.rs](../../../crates/cli/src/commands.rs) `cmd_scan`):
   `kranz scan --range main..HEAD` (or `--staged`, or default `HEAD`); prints

@@ -477,6 +477,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                 detail: None,
                 container: None,
                 remote: None,
+                gate_env: spec.gate_env.clone(),
             });
         };
 
@@ -625,6 +626,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                 assigned_ports,
             }),
             remote: None,
+            gate_env: spec.gate_env.clone(),
         })
     }
 
@@ -816,8 +818,21 @@ impl WorkspaceProvider for LocalContainerProvider {
                         .compose_file
                         .parent()
                         .unwrap_or(handle.cwd.as_path());
+                    // `disk.prune` is the FOURTH contract-declared command
+                    // lane, and it was the one left running on the host with
+                    // the engine's full ambient environment (follow-up
+                    // review, M-3) — the same repo-authored
+                    // `.kranz/workspace.json` the other three lanes were
+                    // cleared for. It goes through the same cleared builder:
+                    // one env discipline for every command the contract can
+                    // name.
+                    let env = crate::workspace_gate::gate_command_env(
+                        &handle.gate_env,
+                        &handle.env,
+                        handle.contract.as_ref(),
+                    );
                     let (code, tail) =
-                        crate::command_exec::run_shell_command_with_code(cwd, prune, &handle.env)
+                        crate::command_exec::run_shell_command_with_code_cleared(cwd, prune, &env)
                             .await;
                     if code != Some(0) {
                         return Err(EngineError::InvalidState(format!(
@@ -891,10 +906,12 @@ mod tests {
     use std::sync::Mutex;
 
     fn spec(root: &Path, mission_id: &str, contract: Option<WorkspaceContract>) -> ProvisionSpec {
+        let runtime_dir = root.join(".kranz").join("missions").join(mission_id);
         ProvisionSpec {
             mission_id: mission_id.to_string(),
             repo_root: root.to_path_buf(),
-            runtime_dir: root.join(".kranz").join("missions").join(mission_id),
+            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(&runtime_dir, &[]),
+            runtime_dir,
             base_sha: Some("deadbeefcafe".to_string()),
             contract,
         }
@@ -1516,6 +1533,68 @@ mod tests {
         );
     }
 
+    /// M-3 (follow-up review): `disk.prune` is the FOURTH contract-declared
+    /// command lane and was the one still running on the host with the
+    /// engine's full ambient environment, from the same repo-authored
+    /// `.kranz/workspace.json` the other three lanes were cleared for. It now
+    /// goes through the same cleared builder: undeclared ambient credentials
+    /// do not cross, and `HOME` is the mission's shared gate home rather than
+    /// the operator's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_prune_runs_with_the_same_cleared_gate_env_as_the_other_lanes() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "KRANZ_SECRET_TEST",
+            "must-not-reach-disk-prune",
+        )]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = Arc::new(FakeRuntime::default());
+        let provider = LocalContainerProvider::with_hooks(fake.hooks());
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "readiness": ["true"],
+                "services": [
+                    {
+                        "name": "api",
+                        "start": "sleep infinity",
+                        "healthCheck": "true",
+                        "port": { "policy": "dynamic" }
+                    }
+                ],
+                "disk": {
+                  "prune": "printf '%s|%s' \"$KRANZ_SECRET_TEST\" \"$HOME\" > prune-env.txt"
+                }
+            }"#,
+        );
+        let handle = provider
+            .provision(&spec(dir.path(), "m-prune", Some(contract)))
+            .await
+            .expect("provision");
+        let gate_home = handle.gate_env.home.clone();
+        provider
+            .teardown(handle, TeardownMode::Destroy)
+            .await
+            .expect("destroy");
+
+        let recorded = std::fs::read_to_string(
+            dir.path()
+                .join(".kranz/missions/m-prune/workspace/prune-env.txt"),
+        )
+        .expect("the prune command ran");
+        let (secret, home) = recorded.split_once('|').expect("both values recorded");
+        assert!(
+            secret.is_empty(),
+            "an undeclared ambient credential reached disk.prune: {recorded:?}"
+        );
+        assert_eq!(
+            home,
+            gate_home.to_str().expect("utf-8 gate home"),
+            "disk.prune must run with the mission's shared gate HOME, not the operator's"
+        );
+    }
+
     #[tokio::test]
     async fn provision_without_a_contract_starts_no_containers_and_needs_no_runtime() {
         // Production hooks on a possibly runtime-less host: a contract-less
@@ -1589,7 +1668,9 @@ mod tests {
     /// CI ubuntu-latest has Docker. CI runners are ephemeral, so a failed
     /// assertion mid-test may leave a project behind.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn container_workspace_smoke_provisions_isolates_and_destroys() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         if !sandbox_container::host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
@@ -1622,8 +1703,10 @@ mod tests {
             return;
         }
 
-        let dir_a = tempfile::tempdir().expect("tempdir a");
-        let dir_b = tempfile::tempdir().expect("tempdir b");
+        // Desktop VMs share the checkout, not necessarily /var/folders.
+        let parent = std::env::current_dir().unwrap();
+        let dir_a = tempfile::tempdir_in(&parent).expect("tempdir a");
+        let dir_b = tempfile::tempdir_in(&parent).expect("tempdir b");
         let provider = LocalContainerProvider::new();
         let handle_a = provider
             .provision(&spec(dir_a.path(), "m-smoke-a", Some(fake_contract())))
@@ -1678,7 +1761,12 @@ mod tests {
             .expect("destroy b");
         for project in [&project_a, &project_b] {
             let output = std::process::Command::new(runtime.binary())
-                .args(["compose", "-p", project, "ps", "-q"])
+                .args([
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    &format!("label=com.docker.compose.project={project}"),
+                ])
                 .stdin(std::process::Stdio::null())
                 .output()
                 .expect("spawn compose ps");

@@ -88,6 +88,26 @@ fn open_lessons_dir(repo_root: &Path, create: bool) -> Result<Dir> {
         .map_err(|_| unsafe_lessons_path(&repo_root.join(".kranz/lessons")))
 }
 
+/// The working-tree text of one lesson file, read through the same
+/// no-follow discipline the renderer uses, or `None` when it is absent or
+/// unreadable.
+///
+/// Exists so the provenance check ([`crate::judgement::lesson_provenance_clean`])
+/// can compare the bytes the renderer WILL read against the blob in the
+/// commit it verified. Provenance answers "which commit added this path";
+/// only this comparison answers "are these the bytes that commit carried"
+/// (audit H7).
+pub(crate) fn read_lesson_from_worktree(repo_root: &Path, filename: &str) -> Option<String> {
+    if filename.is_empty()
+        || filename.contains(['/', '\\'])
+        || Path::new(filename).components().count() != 1
+    {
+        return None;
+    }
+    let lessons = open_lessons_dir(repo_root, false).ok()?;
+    read_existing_regular(&lessons, filename).ok().flatten()
+}
+
 fn ensure_absent_or_regular(dir: &Dir, name: &str) -> Result<()> {
     match dir.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),

@@ -58,6 +58,7 @@ fn plan_ready_block_kit() {
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
             assertion_count: 2,
+            plan_identity: "planid0000000000".into(),
         },
         None,
     );
@@ -247,6 +248,7 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
         goal: "Rate-limit the notes API".into(),
         milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
         assertion_count: 2,
+        plan_identity: "planid0000000000".into(),
         considered_alternatives: Some(PlanAlternativesReview {
             chosen: "small vertical slice".into(),
             rejected: vec![
@@ -287,8 +289,9 @@ fn plan_review_block_kit_has_start_and_queue_buttons() {
         .iter()
         .find(|e| e["action_id"] == APPROVE_ACTION_ID)
         .expect("approve & queue button");
-    assert_eq!(start["value"], "m-42");
-    assert_eq!(queue["value"], "m-42");
+    // M2: the value binds the click to the PLAN this card showed.
+    assert_eq!(start["value"], "m-42:planid0000000000");
+    assert_eq!(queue["value"], "m-42:planid0000000000");
     // The whole thing must serialize (it goes straight into a postMessage body).
     assert!(serde_json::to_string(&blocks).is_ok());
 }
@@ -338,6 +341,7 @@ fn plan_ready_deep_link_present_only_when_url_set() {
         goal: "g".into(),
         milestone_titles: vec![],
         assertion_count: 1,
+        plan_identity: "planid0000000000".into(),
     };
     assert!(actions_button_urls(&build_plan_ready(&p, None)).is_empty());
     assert_eq!(

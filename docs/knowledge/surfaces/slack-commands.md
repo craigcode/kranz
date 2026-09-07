@@ -2,12 +2,15 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-24
+last_verified: 2026-09-03
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
   - crates/slack/src/bridge.rs
+  - crates/slack/src/dispatch.rs
+  - crates/slack/src/approve_flow.rs
   - crates/slack/src/format.rs
+  - crates/slack/src/host.rs
   - crates/slack/src/config.rs
   - cargo test -p kranz-slack
 ---
@@ -111,13 +114,52 @@ drives it in production) so tests can drive it over an in-memory stream.
 
 `format::escape_mrkdwn` escapes `&`, `<`, `>` (ampersand first, so output isn't
 double-escaped) so Slack renders user text literally instead of parsing
-`<!channel>`, `<@Uxxx>`, or `<url|label>` link/mention markup. It is applied to
-every untrusted field: revision instructions, ticket slug/title, todo/roadmap
-content, running-mission and unmerged rows in `/kranz status`, and the
-`instanceName` label. **plain_text fields (headers) must NOT be escaped** — they
-render verbatim and the entities would show literally. Field lengths are capped
-by `clip`/`clip_to` (`MAX_FIELD` 2500, `MAX_HEADER` 150) to stay under Block
-Kit's per-text limits.
+`<!channel>`, `<@Uxxx>`, or `<url|label>` link/mention markup. It is **not
+idempotent**: escape once, at the interpolation, then `clip`.
+
+What is escaped, precisely (mrkdwn `section`/`context` text only):
+
+- Revision instructions, todo/roadmap content, running-mission and unmerged
+  rows in `/kranz status`, and the `instanceName` label.
+- Since the 2026-09-01 adversarial audit: the needs-context questions, the
+  blocked milestone id and reason, the completion card (summary, diff stat,
+  PR handoff, branch and mission id), the new-mission ack (goal and opening
+  reply), the planning reply, the `/kranz status <id>` body, and merge-gate
+  output.
+- Since that audit's follow-up review: the plan-review card's **considered
+  alternatives** (`chosen`, and each rejected `approach`/`trade_off`), on the
+  same card that carries the two real gated approve buttons (M-11); the
+  `/kranz ticket list` rows (`slug`, `state`, `title`, `blocked_by`) and the
+  `/kranz ticket show` mrkdwn body (`state`, `blocked_by`, `goal`, the
+  orchestrator's needs-context questions, the planner's wrong-plan reason)
+  (M-12); and every value interpolated into a `bridge::error_blocks` message
+  from `dispatch.rs` and `approve_flow.rs` (host/engine error strings,
+  mission ids, ticket slugs, branch names and plan identities), through the
+  single-value funnel `bridge::esc`.
+
+`bridge::error_blocks` itself is a LITERAL-TEXT funnel and never escapes:
+callers frame their own backticks, `*bold*` and `>` quotes, so the escaping
+belongs at the interpolation, which is what `bridge::esc` is for.
+
+**plain_text fields (headers) must NOT be escaped**: they render verbatim and
+the entities would show literally. That is why `/kranz ticket show`'s header
+(slug then title) is deliberately unescaped while its body is escaped.
+
+Approve buttons carry `<mission-id>:<plan-identity>` (a short sha256 of the
+plan's canonical JSON). `approve_flow` commits through
+`PlanningHost::approve_pending_if`, which compares the clicked card's identity
+against the parked plan and takes the plan under ONE host lock acquisition.
+The check and the commit are not separable, so a concurrent `/kranz plan` or
+web-UI approve cannot slip a different plan in between (M-13). A mismatch is
+refused naming both plans; a card that carries no identity at all (one posted
+before the buttons were plan-bound) is refused the same way whenever a plan is
+parked; and a card that named a plan which is no longer parked is refused
+rather than falling through to starting the mission. The check runs on button
+clicks only: the `/kranz approve` slash twin reviews no card, so it claims no
+plan and takes the unbound approve.
+
+Field lengths are capped by `clip`/`clip_to` (`MAX_FIELD` 2500, `MAX_HEADER`
+150) to stay under Block Kit's per-text limits.
 
 Everything in `format.rs` is a pure `data -> serde_json::Value` transform; the
 button `action_id` constants (`APPROVE_ACTION_ID`, …) and modal `callback_id`s

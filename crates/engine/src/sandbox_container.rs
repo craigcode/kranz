@@ -101,6 +101,57 @@ impl ContainerRuntime {
             ContainerRuntime::AppleContainer => "container",
         }
     }
+
+    /// Host-side client configuration, separate from the environment forwarded
+    /// into the container. A scratch HOME hides Docker/Colima contexts; copying
+    /// the worker environment here can also retarget the daemon during teardown.
+    pub(crate) fn client_env(self) -> std::collections::HashMap<String, String> {
+        let mut keys = vec![
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "SSH_AUTH_SOCK",
+            "USERPROFILE",
+            "SystemRoot",
+            "ComSpec",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        ];
+        match self {
+            Self::Docker => keys.extend([
+                "DOCKER_HOST",
+                "DOCKER_CONTEXT",
+                "DOCKER_CONFIG",
+                "DOCKER_TLS",
+                "DOCKER_TLS_VERIFY",
+                "DOCKER_CERT_PATH",
+                "DOCKER_API_VERSION",
+            ]),
+            Self::Podman => {
+                keys.extend(["CONTAINER_HOST", "CONTAINER_CONNECTION", "CONTAINER_SSHKEY"])
+            }
+            Self::Nerdctl => {
+                keys.extend(["CONTAINERD_ADDRESS", "CONTAINERD_NAMESPACE", "NERDCTL_TOML"])
+            }
+            Self::AppleContainer => {}
+        }
+        keys.into_iter()
+            .filter_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .map(|value| (key.to_string(), value))
+            })
+            .collect()
+    }
 }
 
 /// Detect the preferred available container runtime on this host's PATH.
@@ -493,15 +544,66 @@ fn container_host_path(path: &Path) -> String {
     rendered.into_owned()
 }
 
-/// `run --rm -i --read-only` — the shared prologue: the writable set is
-/// exactly the declared mounts; everything else is denied by the runtime.
-fn run_prologue() -> Vec<String> {
-    vec![
+/// Process-count bound for a worker/gate container. Generous next to the
+/// relay's 64 (a `cargo build -j` or an `npm ci` legitimately forks wide)
+/// but finite: without it a fork bomb inside the container takes the HOST
+/// down, since the container shares the host's pid resources.
+const CONTAINER_PIDS_LIMIT: &str = "512";
+
+/// `run --rm -i --read-only` plus the hardening the egress relay already
+/// gets — the shared prologue: the writable set is exactly the declared
+/// mounts; everything else is denied by the runtime.
+///
+/// Cross-tier drift closed (2026-09-01 adversarial audit, MED-2): the relay
+/// and its loader run `--user`, `--cap-drop ALL`,
+/// `--security-opt no-new-privileges` and `--pids-limit`
+/// (`crate::container_egress`), while the worker and gate containers ran
+/// with none of them. That left the agent as uid 0 inside the container
+/// with Docker's default capability set — `CAP_DAC_OVERRIDE`, `CAP_CHOWN`,
+/// `CAP_FOWNER`, `CAP_SETUID`, `CAP_MKNOD`, `CAP_NET_RAW` — writing into
+/// bind mounts that land at the IDENTICAL host path, so container-root
+/// writes appeared in the operator's tree as uid 0 and a setuid-root binary
+/// could be planted in a host-visible directory.
+///
+/// `--user` maps to the OWNER of the session cwd (the same derivation
+/// `container_egress::credential_owner` applies to the relay's credential
+/// dir), so writes through the rw mounts land as the operator, not root.
+/// Unix only: there is no uid/gid to map on other hosts, and the container
+/// provider already refuses Windows outright.
+fn run_prologue(inputs: &SandboxInputs) -> Vec<String> {
+    let mut out = vec![
         "run".to_string(),
         "--rm".to_string(),
         "-i".to_string(),
         "--read-only".to_string(),
-    ]
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--pids-limit".to_string(),
+        CONTAINER_PIDS_LIMIT.to_string(),
+    ];
+    if let Some(owner) = crate::container_egress::mount_owner(&inputs.session_cwd) {
+        out.push("--user".to_string());
+        out.push(owner);
+    }
+    // Docker config can inject proxy credentials into containers automatically.
+    // Only the explicit sandbox/contract environment may supply these values.
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "FTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ftp_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        out.extend(["-e".to_string(), format!("{key}=")]);
+    }
+    out
 }
 
 /// The declared write/audit mount set: `session_cwd` (rw), `mission_dir`
@@ -515,16 +617,51 @@ fn run_prologue() -> Vec<String> {
 /// working directory's own mount; nested mounts stack deepest-last.
 fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
     let mut mounts: Vec<(String, bool)> = Vec::new();
+    let denied_dirs: Vec<_> = crate::sandbox::authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|path| crate::sandbox::absolutize(path))
+        .collect();
+    let denied_files: Vec<_> = crate::sandbox::authority_read_deny_paths(inputs)
+        .iter()
+        .map(|path| crate::sandbox::absolutize(path))
+        .collect();
     let mut add_mount = |path: &Path, ro: bool| {
-        let host = container_host_path(path);
+        let path = crate::sandbox::absolutize(path);
+        // Docker's nested binds win over an enclosing tmpfs. extraWrite
+        // must never reopen the operator authority directory.
+        if denied_dirs.iter().any(|dir| path.starts_with(dir))
+            || denied_files.iter().any(|file| path.starts_with(file))
+        {
+            return;
+        }
+        let host = container_host_path(&path);
         if !mounts.iter().any(|(existing, _)| existing == &host) {
             mounts.push((host, ro));
         }
     };
     add_mount(&inputs.session_cwd, false);
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions") && path.is_dir())
+    {
+        // Checkout-mode workers must not write other missions' inboxes or
+        // audit logs through the broad session mount.
+        add_mount(missions, true);
+    }
     add_mount(&inputs.mission_dir, true);
     add_mount(&inputs.tmpdir, false);
     for extra in &inputs.extra_write {
+        if inputs
+            .mission_dir
+            .parent()
+            .filter(|p| p.ends_with("missions"))
+            .is_some_and(|missions| {
+                crate::sandbox::absolutize(extra).starts_with(crate::sandbox::absolutize(missions))
+            })
+        {
+            continue;
+        }
         add_mount(extra, false);
     }
     for (host, ro) in mounts {
@@ -533,23 +670,110 @@ fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
     }
 }
 
-/// Authority material must stay unreadable inside the container: the
-/// session_cwd mount otherwise carries the repo's `.kranz/serve.token`
-/// (mutation authority over `kranz serve` on loopback) and `config.json`
-/// (Slack/remote-workspace credentials) in with it. Mask each file that
-/// exists at spawn time with a /dev/null bind — the container analogue of
-/// the tier-2 read deny (crate::sandbox::authority_read_deny_paths derives
-/// the same set from the mission dir for the process sandboxes; here the
-/// session mount is the only path that can carry them). A token file
-/// created AFTER spawn is a residual gap the Seatbelt profile lacks.
+/// Whether `path` lies under one of the WRITABLE mounts
+/// [`push_policy_mounts`] declares (`session_cwd`, the scratch `tmpdir`, each
+/// `extra_write`). Only those can carry a host write out of the container, so
+/// only those need a write-deny bind stacked over them — and binding anything
+/// else would newly EXPOSE a path the container could not otherwise reach
+/// (follow-up review, L-11).
+fn under_writable_mount(path: &Path, inputs: &SandboxInputs) -> bool {
+    let candidate = crate::sandbox::absolutize(path);
+    std::iter::once(&inputs.session_cwd)
+        .chain(std::iter::once(&inputs.tmpdir))
+        .chain(inputs.extra_write.iter())
+        .any(|root| candidate.starts_with(crate::sandbox::absolutize(root)))
+}
+
+/// Replace mounted authority directories with private read-only views that
+/// exclude credentials, including files created or replaced after launch.
+/// Keep engine-owned policy and Git metadata readable but immutable.
 fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
-    let session_root = crate::sandbox::absolutize(&inputs.session_cwd);
-    for name in ["serve.token", "serve.read.token", "config.json"] {
-        let authority = session_root.join(".kranz").join(name);
-        if authority.exists() {
-            // Same colon hazard as a `-v` spec: normalize the verbatim form.
-            out.push("-v".to_string());
-            out.push(format!("/dev/null:{}:ro", container_host_path(&authority)));
+    let masks: Vec<_> = crate::sandbox::authority_directory_masks(inputs)
+        .into_iter()
+        .filter(|mask| {
+            mask.path.ancestors().any(|ancestor| {
+                let path = container_host_path(ancestor);
+                out.windows(2).any(|pair| {
+                    pair[0] == "-v"
+                        && (pair[1] == mount_arg(&path, false) || pair[1] == mount_arg(&path, true))
+                })
+            })
+        })
+        .collect();
+    let masked_paths: std::collections::BTreeSet<_> =
+        masks.iter().map(|mask| mask.path.clone()).collect();
+    // Do not expose an otherwise-unmounted host directory just to hide its
+    // secrets. Gate containers, in particular, only mount Cargo's bin/.
+    // Replace direct mounts of each masked directory. Docker rejects two
+    // mounts at one destination, and a nested bind would reopen a shadow.
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < out.len() {
+        if out[index] == "-v" && index + 1 < out.len() {
+            let mount = &out[index + 1];
+            if masks.iter().any(|mask| {
+                let path = container_host_path(&mask.path);
+                mount == &mount_arg(&path, false) || mount == &mount_arg(&path, true)
+            }) {
+                index += 2;
+                continue;
+            }
+        }
+        filtered.push(out[index].clone());
+        index += 1;
+    }
+    *out = filtered;
+    for mask in &masks {
+        out.push("--tmpfs".to_string());
+        out.push(format!(
+            "{}:ro,noexec,nosuid,nodev,mode=755",
+            container_host_path(&mask.path)
+        ));
+        for path in &mask.visible_entries {
+            // A deeper private view owns this mountpoint. Rebinding its
+            // host directory here would duplicate the destination in Docker.
+            if masked_paths.contains(path) {
+                continue;
+            }
+            let path = container_host_path(path);
+            // Keep an existing narrower policy mount (e.g. missions ro or
+            // session scratch rw); all other visible entries are read-only.
+            if !out.windows(2).any(|pair| {
+                pair[0] == "-v"
+                    && (pair[1] == mount_arg(&path, false) || pair[1] == mount_arg(&path, true))
+            }) {
+                out.push("-v".to_string());
+                out.push(mount_arg(&path, true));
+            }
+        }
+    }
+
+    // These paths remain readable but immutable. Never stack a host bind
+    // over a private authority view, which would restore hidden content.
+    let writes = crate::sandbox::authority_write_denies(inputs);
+    let git = crate::sandbox::git_metadata_write_denies(inputs);
+    for path in writes
+        .files
+        .iter()
+        .chain(writes.dirs.iter())
+        .chain(git.files.iter())
+        .chain(git.dirs.iter())
+    {
+        if !under_writable_mount(path, inputs)
+            || path.is_symlink()
+            || !path.exists()
+            || masks
+                .iter()
+                .any(|mask| crate::sandbox::absolutize(path).starts_with(&mask.path))
+        {
+            continue;
+        }
+        let host = container_host_path(path);
+        if !out
+            .windows(2)
+            .any(|pair| pair[0] == "-v" && pair[1] == mount_arg(&host, true))
+        {
+            out.extend(["-v".to_string(), mount_arg(&host, true)]);
         }
     }
 }
@@ -573,8 +797,17 @@ fn push_workdir_and_scratch_env(out: &mut Vec<String>, inputs: &SandboxInputs) {
 /// Which toolchain-cache posture [`push_toolchain_caches`] mounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolchainMount {
-    /// Agent sessions: the whole Cargo home crosses read-only (registry +
-    /// shims + credentials alike — the session posture landed with tier 3).
+    /// Agent sessions: the CACHE SUBDIRS of the Cargo home cross read-only,
+    /// never the root (2026-09-01 adversarial audit, H12). The pre-audit
+    /// session posture mounted `$CARGO_HOME` whole with a matching `-e`,
+    /// which carried `credentials.toml` and the legacy extensionless
+    /// `credentials` — crates.io registry auth — into the container, while
+    /// the tier-2 process sandbox explicitly read-DENIES exactly those two
+    /// filenames. Tier 3, the tier `resolve_validator_containment_target`
+    /// calls "already the stronger containment", was therefore strictly
+    /// weaker than tier 2 for registry credentials. Session mode now gets
+    /// the [`ToolchainMount::Gate`] treatment plus the shared caches:
+    /// `<cargo>/bin`, `<cargo>/registry`, `<cargo>/git`.
     Session,
     /// Engine-run gates: the real Cargo root NEVER crosses — the gate's
     /// `CARGO_HOME` is a seeded cache-only home precisely because the real
@@ -596,6 +829,7 @@ enum ToolchainMount {
 /// ro it is: a cache MISS (uncached crate) fails visibly inside the
 /// container rather than writing through to the operator's cache.
 fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
+    let global = crate::sandbox::global_authority_dir();
     for (var, default_subdir) in [
         ("RUSTUP_HOME", ".rustup"),
         ("CARGO_HOME", ".cargo"),
@@ -607,15 +841,45 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
                 std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(default_subdir))
             });
         if let Some(host) = host {
-            if mode == ToolchainMount::Gate && var == "CARGO_HOME" {
-                // Gate mode: the credential-bearing root stays out; only the
-                // shim dir crosses (see ToolchainMount::Gate). No -e either —
-                // the gate env's cache-only CARGO_HOME is forwarded instead.
-                let bin = host.join("bin");
-                if bin.is_dir() {
-                    let mounted = container_host_path(&bin);
-                    out.push("-v".to_string());
-                    out.push(mount_arg(&mounted, true));
+            if global
+                .as_ref()
+                .is_some_and(|dir| crate::sandbox::absolutize(&host).starts_with(dir))
+            {
+                continue;
+            }
+            if var == "CARGO_HOME" {
+                // The credential-bearing ROOT never crosses in either mode
+                // (H12): `credentials.toml` and the legacy extensionless
+                // `credentials` live there, and the process tier read-denies
+                // both. Only leaf dirs are mounted, so the container's
+                // CARGO_HOME contains exactly what was mounted into it and
+                // nothing else.
+                //
+                // Gate mode takes the shim dir alone and forwards the gate
+                // env's own cache-only CARGO_HOME instead of emitting one.
+                // Session mode adds the shared registry/git caches (without
+                // them a container session cold-bootstraps the whole
+                // registry into scratch — the m-533143 ENOSPC shape) and
+                // names the same path in `-e`: with the root unmounted, that
+                // env value resolves to a CACHE-ONLY home inside the
+                // container, assembled from the ro leaf mounts.
+                let leaves: &[&str] = match mode {
+                    ToolchainMount::Gate => &["bin"],
+                    ToolchainMount::Session => &["bin", "registry", "git"],
+                };
+                let mut mounted_any = false;
+                for leaf in leaves {
+                    let dir = host.join(leaf);
+                    if dir.is_dir() {
+                        let mounted = container_host_path(&dir);
+                        out.push("-v".to_string());
+                        out.push(mount_arg(&mounted, true));
+                        mounted_any = true;
+                    }
+                }
+                if mode == ToolchainMount::Session && mounted_any {
+                    out.push("-e".to_string());
+                    out.push(format!("CARGO_HOME={}", container_host_path(&host)));
                 }
                 continue;
             }
@@ -669,15 +933,15 @@ pub fn container_run_args(
     args: &[String],
     proxy_url: Option<&str>,
 ) -> Vec<String> {
-    let mut out = run_prologue();
+    let mut out = run_prologue(inputs);
     if let Some(name) = &spec.name {
         out.push("--name".to_string());
         out.push(name.clone());
     }
     push_policy_mounts(&mut out, inputs);
-    push_authority_masks(&mut out, inputs);
     push_workdir_and_scratch_env(&mut out, inputs);
     push_toolchain_caches(&mut out, ToolchainMount::Session);
+    push_authority_masks(&mut out, inputs);
     if inputs.enforce == crate::types::SandboxEnforce::FsNet && !inputs.egress.is_empty() {
         if let (Some(network), Some(_)) = (&spec.network, proxy_url) {
             out.push("--network".to_string());
@@ -755,13 +1019,13 @@ pub fn container_gate_run_args(
     env: &std::collections::HashMap<String, String>,
     container_name: &str,
 ) -> Vec<String> {
-    let mut out = run_prologue();
+    let mut out = run_prologue(inputs);
     out.push("--name".to_string());
     out.push(container_name.to_string());
     push_policy_mounts(&mut out, inputs);
-    push_authority_masks(&mut out, inputs);
     push_workdir_and_scratch_env(&mut out, inputs);
     push_toolchain_caches(&mut out, ToolchainMount::Gate);
+    push_authority_masks(&mut out, inputs);
     push_network(&mut out, inputs, None);
     let mut forwarded: Vec<(&String, &String)> = env.iter().collect();
     forwarded.sort_by_key(|(key, _)| *key);
@@ -889,6 +1153,13 @@ mod tests {
         }
     }
 
+    fn live_fixture() -> tempfile::TempDir {
+        // Desktop VMs share the checkout but often not macOS /var/folders.
+        // A host-only temp path can otherwise create a different empty VM
+        // directory and make a mount test pass/fail for the wrong reason.
+        tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+    }
+
     #[test]
     fn container_run_args_fs_net_with_empty_egress_disables_network() {
         let args = container_run_args(
@@ -961,7 +1232,9 @@ mod tests {
             "missing boundary state must disable networking: {args:?}"
         );
         assert!(
-            !args.iter().any(|a| a.starts_with("HTTPS_PROXY=")),
+            args.iter()
+                .filter(|a| a.starts_with("HTTPS_PROXY="))
+                .all(|a| a == "HTTPS_PROXY="),
             "a relay env must not be emitted without its internal network: {args:?}"
         );
     }
@@ -991,6 +1264,9 @@ mod tests {
         let mission = dir.path().join("mission");
         let scratch = dir.path().join("scratch");
         let cargo = dir.path().join("cargo");
+        for path in [&session, &mission, &scratch, &cargo] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         let inputs = SandboxInputs {
             enforce: SandboxEnforce::Fs,
             session_cwd: session.clone(),
@@ -1013,7 +1289,7 @@ mod tests {
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--read-only".to_string()));
         assert!(joined.contains(&mount_arg(&abs(&session), false)));
-        assert!(joined.contains(&mount_arg(&abs(&mission), true)));
+        assert!(joined.contains(&format!("--tmpfs {}:ro,", abs(&mission))));
         assert!(joined.contains(&mount_arg(&abs(&scratch), false)));
         assert!(joined.contains(&mount_arg(&abs(&cargo), false)));
         assert!(joined.contains(&format!("-w {}", abs(&session))));
@@ -1047,17 +1323,233 @@ mod tests {
         let joined = args.join(" ");
         let abs = |p: &std::path::Path| container_host_path(p);
 
-        for masked in [&masked_token_file, &config] {
+        assert!(joined.contains(&format!("--tmpfs {}:ro,", abs(&kranz_dir))));
+        for name in ["serve.token", "serve.read.token", "config.json"] {
             assert!(
-                joined.contains(&format!("/dev/null:{}:ro", abs(masked))),
-                "missing /dev/null mask for {}: {args:?}",
-                masked.display()
+                !joined.contains(&abs(&kranz_dir.join(name))),
+                "authority must stay outside the private view: {args:?}"
             );
         }
-        // Absent files are not masked — a bind target must exist.
+    }
+
+    /// MED-3 (2026-09-01 adversarial audit): the mask set was a hand-copied
+    /// three-name list that had already drifted from the process tier,
+    /// missing `domain-terms.local`, the `hook-status/` projection, and the
+    /// mission `control/` inbox — which the `:ro` mission mount made
+    /// READABLE inside the container, the exact posture
+    /// `authority_read_deny_dirs` exists to close. Driving the masks off the
+    /// process tier's own sets is what stops the two drifting again.
+    #[test]
+    fn container_run_args_mask_the_whole_process_tier_authority_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let kranz = session.join(".kranz");
+        let mission = kranz.join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("control")).unwrap();
+        std::fs::create_dir_all(kranz.join("hook-status")).unwrap();
+        std::fs::create_dir_all(kranz.join("missions").join("m-other")).unwrap();
+        std::fs::create_dir_all(kranz.join("queue")).unwrap();
+        for name in ["serve.token", "config.json", "domain-terms.local"] {
+            std::fs::write(kranz.join(name), "secret").unwrap();
+        }
+        let mut inputs = inputs(SandboxEnforce::Fs);
+        inputs.session_cwd = session;
+        inputs.mission_dir = mission.clone();
+
+        let args = container_run_args(&inputs, &spec(), Path::new("claude"), &[], None);
+        let joined = args.join(" ");
+        let abs = |p: &std::path::Path| container_host_path(p);
+
+        for name in [
+            "serve.token",
+            "config.json",
+            "domain-terms.local",
+            "hook-status",
+        ] {
+            assert!(
+                !joined.contains(&abs(&kranz.join(name))),
+                "authority must not be rebound: {args:?}"
+            );
+        }
+        assert!(joined.contains(&format!("--tmpfs {}:ro,", abs(&kranz))));
+        assert!(joined.contains(&format!("--tmpfs {}:ro,", abs(&mission))));
+        assert!(!joined.contains(&abs(&mission.join("control"))));
+        // The WRITE-deny half is readable-but-unwritable, never shadowed
+        // (follow-up review, H-1): the engine-owned stores and the sibling
+        // mission dir stay legible while the rw session mount cannot carry a
+        // write back to them.
+        for readable in [kranz.join("queue"), kranz.join("missions")] {
+            assert!(
+                joined.contains(&mount_arg(&abs(&readable), true)),
+                "missing :ro self-bind for {}: {args:?}",
+                readable.display()
+            );
+        }
+    }
+
+    /// H-1 (follow-up review): the WRITE-deny sets were folded into the two
+    /// CONTENT-DESTROYING idioms — `/dev/null` file binds and empty `:ro`
+    /// tmpfs shadows — so every TRACKED file under `.kranz/tickets/` and
+    /// `.kranz/lessons/` read as deleted inside a checkout-mode container.
+    /// The worker's own "commit your work" step then recorded the deletion of
+    /// the whole ticket backlog onto the mission branch. The other two tiers
+    /// implement the same deny as READABLE-but-unwritable (bwrap self
+    /// ro-bind, a Windows ACE that keeps `FILE_GENERIC_READ`); this tier now
+    /// does too, with the masks reserved for the READ-deny sets.
+    #[test]
+    fn container_run_args_keep_write_denied_kranz_content_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Checkout mode: session_cwd IS the repo root, the hostile shape —
+        // and the tracked ticket/lesson stores ride in on the rw session
+        // mount.
+        let session = dir.path().join("repo");
+        let kranz = session.join(".kranz");
+        let mission = kranz.join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("control")).unwrap();
+        std::fs::create_dir_all(kranz.join("hook-status")).unwrap();
+        std::fs::create_dir_all(kranz.join("tickets")).unwrap();
+        std::fs::create_dir_all(kranz.join("lessons")).unwrap();
+        std::fs::create_dir_all(kranz.join("queue")).unwrap();
+        std::fs::create_dir_all(kranz.join("missions").join("m-other")).unwrap();
+        std::fs::write(kranz.join("tickets").join("some-ticket.md"), "# tracked").unwrap();
+        std::fs::write(kranz.join("merge-gates.json"), "{}").unwrap();
+        std::fs::write(kranz.join("secret-allowlist"), "OK_TOKEN\n").unwrap();
+        for name in ["serve.token", "config.json"] {
+            std::fs::write(kranz.join(name), "secret").unwrap();
+        }
+        let mut inputs = inputs(SandboxEnforce::Fs);
+        inputs.session_cwd = session;
+        inputs.mission_dir = mission.clone();
+
+        let args = container_run_args(&inputs, &spec(), Path::new("claude"), &[], None);
+        let joined = args.join(" ");
+        let abs = |p: &std::path::Path| container_host_path(p);
+
+        // Write-denied CONTENT: readable, unwritable — never masked.
+        for readable in [
+            kranz.join("tickets"),
+            kranz.join("lessons"),
+            kranz.join("queue"),
+            kranz.join("missions"),
+        ] {
+            assert!(
+                joined.contains(&mount_arg(&abs(&readable), true)),
+                "{} must be a :ro self-bind, not a mask: {args:?}",
+                readable.display()
+            );
+            assert!(
+                !joined.contains(&format!("--tmpfs {}:ro", abs(&readable))),
+                "{} must not be shadowed by an empty tmpfs: {args:?}",
+                readable.display()
+            );
+        }
+        for readable in [
+            kranz.join("merge-gates.json"),
+            kranz.join("secret-allowlist"),
+        ] {
+            assert!(
+                joined.contains(&mount_arg(&abs(&readable), true)),
+                "{} must be a :ro self-bind: {args:?}",
+                readable.display()
+            );
+            assert!(
+                !joined.contains(&format!("/dev/null:{}:ro", abs(&readable))),
+                "{} must not read as zero bytes: {args:?}",
+                readable.display()
+            );
+        }
+
+        // Read-denied entries never cross the private directory views.
+        for hidden in [
+            kranz.join("serve.token"),
+            kranz.join("config.json"),
+            mission.join("control"),
+            kranz.join("hook-status"),
+        ] {
+            assert!(
+                !joined.contains(&abs(&hidden)),
+                "read-denied entry was mounted: {args:?}"
+            );
+        }
+    }
+
+    /// MED-2 (2026-09-01 adversarial audit): the worker and gate containers
+    /// got none of the hardening the egress relay already gets, so the agent
+    /// ran as uid 0 with Docker's default capability set while its rw binds
+    /// landed at the IDENTICAL host path.
+    #[test]
+    fn container_run_args_harden_the_worker_like_the_egress_relay() {
+        // A REAL session dir: `--user` is derived by stat'ing the rw mount,
+        // so a fixture path that does not exist would silently drop the flag.
+        let session = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(SandboxEnforce::Fs);
+        inputs.session_cwd = session.path().to_path_buf();
+        let args = container_run_args(&inputs, &spec(), Path::new("claude"), &[], None);
+
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--cap-drop" && w[1] == "ALL"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--pids-limit" && w[1] == CONTAINER_PIDS_LIMIT));
+        #[cfg(unix)]
+        {
+            // The owner of the rw session mount, so container writes land as
+            // the operator rather than as root in the operator's own tree.
+            let expected = crate::container_egress::mount_owner(session.path())
+                .expect("a stat-able path yields an owner");
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--user" && w[1] == expected),
+                "missing --user {expected}: {args:?}"
+            );
+        }
+    }
+
+    /// H12 (2026-09-01 adversarial audit): session mode mounted the whole
+    /// `$CARGO_HOME` read-only with a matching `-e`, carrying
+    /// `credentials.toml` (crates.io registry auth) into the container —
+    /// while the tier-2 process sandbox explicitly read-DENIES exactly that
+    /// file. Tier 3 was therefore weaker than tier 2 for registry
+    /// credentials. Only the cache leaves cross now.
+    #[test]
+    fn container_run_args_never_mount_the_real_cargo_root_for_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        let cargo = home.path().join(".cargo");
+        for leaf in ["bin", "registry", "git"] {
+            std::fs::create_dir_all(cargo.join(leaf)).unwrap();
+        }
+        std::fs::write(cargo.join("credentials.toml"), "[registry]\ntoken=\"x\"\n").unwrap();
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("CARGO_HOME", cargo.to_str().unwrap()),
+            ("HOME", home.path().to_str().unwrap()),
+        ]);
+
+        let mut out = Vec::new();
+        push_toolchain_caches(&mut out, ToolchainMount::Session);
+        let joined = out.join(" ");
+        let root = container_host_path(&cargo);
+
         assert!(
-            !joined.contains("serve.read.token"),
-            "absent authority files must not be masked: {args:?}"
+            !joined.contains(&mount_arg(&root, true)),
+            "the credential-bearing Cargo root must never be mounted: {out:?}"
+        );
+        for leaf in ["bin", "registry", "git"] {
+            let mounted = container_host_path(&cargo.join(leaf));
+            assert!(
+                joined.contains(&mount_arg(&mounted, true)),
+                "the {leaf} cache leaf must still cross read-only: {out:?}"
+            );
+        }
+        // The env still names a CARGO_HOME, but with the root unmounted it
+        // resolves to a cache-only home assembled from the leaf mounts.
+        assert!(
+            out.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == format!("CARGO_HOME={root}")),
+            "session mode must forward the cache-only CARGO_HOME: {out:?}"
         );
     }
 
@@ -1120,15 +1612,16 @@ mod tests {
         // The session mount policy, unchanged.
         assert!(args.contains(&"--read-only".to_string()));
         assert!(joined.contains(&mount_arg(&abs(&gate), false)));
-        assert!(joined.contains(&mount_arg(&abs(&mission), true)));
+        assert!(joined.contains(&format!("--tmpfs {}:ro,", abs(&mission))));
         assert!(joined.contains(&mount_arg(&abs(&scratch), false)));
         assert!(joined.contains(&mount_arg(&abs(&extra), false)));
         assert!(joined.contains(&format!("-w {}", abs(&gate))));
         assert!(joined.contains(&format!("-e HOME={}", abs(&scratch))));
         assert!(joined.contains(&format!("-e TMPDIR={}", abs(&scratch))));
         assert!(
-            joined.contains(&format!("/dev/null:{}:ro", abs(&masked_token_file))),
-            "authority material must stay /dev/null-masked: {args:?}"
+            joined.contains(&format!("--tmpfs {}:ro,", abs(&kranz_dir)))
+                && !joined.contains(&abs(&masked_token_file)),
+            "authority material must stay outside the private directory: {args:?}"
         );
 
         // The gate deltas: named container, sh -c payload after the image.
@@ -1243,8 +1736,11 @@ mod tests {
             .expect("fs+net must pass a --network flag");
         assert_eq!(network[1], "none");
         assert!(
-            !fs_net.iter().any(|a| a.starts_with("HTTPS_PROXY=")),
-            "gates are never wired through the egress proxy: {fs_net:?}"
+            fs_net
+                .iter()
+                .filter(|a| a.starts_with("HTTPS_PROXY="))
+                .all(|a| a == "HTTPS_PROXY="),
+            "offline gates must suppress inherited proxy configuration: {fs_net:?}"
         );
 
         let fs = container_gate_run_args(
@@ -1305,9 +1801,9 @@ mod tests {
             return;
         };
 
-        let session = tempfile::tempdir().unwrap();
-        let mission = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
+        let session = live_fixture();
+        let mission = live_fixture();
+        let scratch = live_fixture();
         let kranz_dir = session.path().join(".kranz");
         std::fs::create_dir_all(&kranz_dir).unwrap();
         std::fs::write(kranz_dir.join("serve.token"), "secret").unwrap();
@@ -1334,7 +1830,7 @@ mod tests {
             &[
                 "-c".to_string(),
                 format!(
-                    "echo ok > {} && cat {} && echo nope > /etc/nope.txt",
+                    "echo ok > {} && ! cat {} && echo nope > /etc/nope.txt",
                     ok_file.display(),
                     kranz_dir.join("serve.token").display()
                 ),
@@ -1360,6 +1856,187 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains("secret"),
             "the /dev/null mask must hide serve.token content inside the container"
+        );
+    }
+
+    #[test]
+    fn container_authority_directory_mask_covers_absent_and_future_tokens() {
+        if crate::agent_env::isolated_global_home_test("sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens") { return; }
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::agent_env::EnvTestGuard::engage(&[(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path().to_str().unwrap(),
+        )]);
+        let global = home.path().join(".kranz");
+        assert!(!global.exists());
+        let mut inputs = inputs(SandboxEnforce::Fs);
+        inputs.extra_write.extend([
+            home.path().to_path_buf(),
+            global.clone(),
+            global.join("serve"),
+        ]);
+        for args in [
+            container_run_args(&inputs, &spec(), Path::new("sh"), &[], None),
+            container_gate_run_args(&inputs, &spec(), "true", &Default::default(), "test"),
+        ] {
+            assert!(
+                args.windows(2).any(|pair| pair[0] == "--tmpfs"
+                    && pair[1]
+                        == format!(
+                            "{}:ro,noexec,nosuid,nodev,mode=755",
+                            container_host_path(&global)
+                        )),
+                "authority mask missing: {args:?}"
+            );
+            assert!(
+                !args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-v"
+                        && pair[1].starts_with(&container_host_path(&global))),
+                "nested mounts must not reopen global authority: {args:?}"
+            );
+        }
+        // Building argv must never create placeholder credentials or mutate HOME.
+        assert!(!global.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_authority_directory_hides_tokens_created_after_start() {
+        if crate::agent_env::isolated_global_home_test("sandbox_container::tests::container_authority_directory_hides_tokens_created_after_start") { return; }
+        use std::io::{BufRead as _, Write as _};
+        let Some(runtime) = detect() else {
+            eprintln!("no container runtime; skipping live authority test");
+            return;
+        };
+        let dir = live_fixture();
+        let home = dir.path().join("operator");
+        let session = dir.path().join("session");
+        let mission = session.join(".kranz/missions/m-test");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&home).unwrap();
+        let authority_target = dir.path().join("private-authority");
+        std::fs::create_dir(&authority_target).unwrap();
+        std::os::unix::fs::symlink(&authority_target, home.join(".kranz")).unwrap();
+        std::fs::create_dir_all(&mission).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let authority = home.join(".kranz/serve/later.token");
+        let global_config = home.join(".kranz/config.json");
+        let cargo = home.join(".cargo");
+        std::fs::create_dir(&cargo).unwrap();
+        let repo_token_path = session.join(".kranz/serve.token");
+        let repo_read_token_path = session.join(".kranz/serve.read.token");
+        let repo_config = session.join(".kranz/config.json");
+        let cargo_credentials = cargo.join("credentials.toml");
+        let policy = session.join(".kranz/merge-gates.json");
+        std::fs::write(&repo_token_path, "original-token").unwrap();
+        std::fs::write(&policy, "visible-policy").unwrap();
+        let input = SandboxInputs {
+            enforce: SandboxEnforce::FsNet,
+            session_cwd: session.clone(),
+            mission_dir: mission,
+            tmpdir: scratch,
+            extra_write: vec![home.clone(), home.join(".kranz/serve")],
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let args = {
+            let _env = crate::agent_env::EnvTestGuard::engage(&[
+                ("HOME", home.to_str().unwrap()),
+                ("CARGO_HOME", cargo.to_str().unwrap()),
+            ]);
+            container_run_args(
+                &input,
+                &ContainerSpec {
+                    runtime,
+                    network: None,
+                    name: None,
+                    image: DEFAULT_IMAGE.to_string(),
+                },
+                Path::new("sh"),
+                &[
+                    "-c".to_string(),
+                    "printf 'ready\\n'; read -r proceed; test -s \"$1\" || exit 2; \
+                     for secret in \"$2\" \"$3\" \"$4\" \"$5\" \"$6\" \"$7\"; do \
+                     if cat \"$secret\"; then exit 3; fi; \
+                     if printf forged > \"$secret\"; then exit 4; fi; done; \
+                     if rm \"$9\"; then exit 5; fi; \
+                     test \"$(cat \"$8\")\" = visible-policy || exit 8; \
+                     printf work > \"$1-worker\""
+                        .to_string(),
+                    "test".to_string(),
+                    session.join("host-witness").display().to_string(),
+                    authority.display().to_string(),
+                    global_config.display().to_string(),
+                    repo_token_path.display().to_string(),
+                    repo_read_token_path.display().to_string(),
+                    repo_config.display().to_string(),
+                    cargo_credentials.display().to_string(),
+                    policy.display().to_string(),
+                    home.join(".kranz").display().to_string(),
+                ],
+                None,
+            )
+        };
+        // Keep Docker's HOME/context stable while other tests relocate HOME.
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
+        let mut child = std::process::Command::new(runtime.binary())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        if line != "ready\n" {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "container did not start: {line:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // The host creates both the directory and its tokens after the worker
+        // is running. A visible witness proves its ordinary bind is live.
+        std::fs::create_dir(authority.parent().unwrap()).unwrap();
+        std::fs::write(&authority, "fake-authority").unwrap();
+        std::fs::write(&global_config, "fake-config").unwrap();
+        for path in [&repo_read_token_path, &repo_config, &cargo_credentials] {
+            assert!(
+                !path.exists(),
+                "mount setup created a placeholder credential"
+            );
+            std::fs::write(path, "fake-authority").unwrap();
+        }
+        let rotated = session.join(".kranz/rotated.tmp");
+        std::fs::write(&rotated, "rotated-token").unwrap();
+        std::fs::rename(rotated, &repo_token_path).unwrap();
+        std::fs::write(session.join("host-witness"), "visible").unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"continue\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(session.join("host-witness-worker").exists());
+        assert!(
+            home.join(".kranz").is_symlink(),
+            "authority alias was replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_token_path).unwrap(),
+            "rotated-token"
+        );
+        for path in [&repo_read_token_path, &repo_config, &cargo_credentials] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "fake-authority");
+        }
+        assert_eq!(
+            std::fs::read_to_string(global_config).unwrap(),
+            "fake-config"
         );
     }
 }

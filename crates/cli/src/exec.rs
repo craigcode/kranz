@@ -422,6 +422,22 @@ async fn run_and_reconcile(
     // the kranz/* guard — this never pushes main or force-pushes. A push failure
     // keeps stdout `pushed=false` and returns [`EXIT_PUSH_FAILED`] (distinct
     // from the mission's own exit code) so CI can detect a delivery miss.
+    //
+    // `GitRepo::open` is hardened (audit H3): the tree being pushed is the one
+    // the worker just wrote, so an unhardened handle would run a planted
+    // `pre-push` hook outside every sandbox with the CLI's full ambient
+    // environment, including whatever credential the remote is authenticated
+    // with.
+    //
+    // The push is a NETWORK operation, so the hardening splits (audit F-10 /
+    // F-11): the operator's own `~/.gitconfig` stays in force — nulling it
+    // would leave an https push with no credential helper, no `insteadOf`
+    // rewrite and no `http.proxy` — while `push_mission_branch` REFUSES
+    // outright if this repository's own config, the scope the worker can
+    // write, carries a credential helper, an ssh command, a URL rewrite or a
+    // transport hook. Such a key in that scope is an attack signal, not a
+    // setting to work around, and the refusal surfaces here as a push
+    // failure naming every offending key.
     let mut pushed = false;
     let mut push_failed = false;
     if let (Some(remote), MissionStatus::Complete) = (&push, status) {

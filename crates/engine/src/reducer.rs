@@ -48,6 +48,24 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
         }
 
         EventKind::PlanApproved { plan, base_sha } => {
+            // Status guard, the sibling of `expect_pending_grant` below
+            // (audit 2026-09-01 H6). `approve_plan` only ever emits this from
+            // `Planning`, so a `plan.approved` folded on top of a running,
+            // blocked, or completed mission did not come from the approval
+            // path: it is a late forgery appended to the log, and applying it
+            // would replace the milestone set, the contract, the touch set,
+            // and the command grants wholesale. Ignored rather than a fold
+            // error, so one bad line cannot make an existing mission
+            // permanently unreadable.
+            if state.mission.status != MissionStatus::Planning {
+                tracing::warn!(
+                    seq = event.seq,
+                    status = ?state.mission.status,
+                    "ignoring plan.approved outside Planning status"
+                );
+                state.last_seq = event.seq;
+                return Ok(());
+            }
             state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();
@@ -198,6 +216,31 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature_mut(state, feature_id)?.status = FeatureStatus::Active;
         }
 
+        EventKind::FeatureProgress {
+            feature_id,
+            base_sha,
+            commits,
+        } => {
+            if feature_mut(state, feature_id)?.status != FeatureStatus::Active {
+                return Err(EngineError::InvalidState(format!(
+                    "feature.progress for inactive feature '{feature_id}'"
+                )));
+            }
+            if state
+                .feature_base_shas
+                .get(feature_id)
+                .is_some_and(|existing| existing != base_sha)
+            {
+                return Err(EngineError::InvalidState(format!(
+                    "feature.progress changed the baseline for '{feature_id}'"
+                )));
+            }
+            state
+                .feature_base_shas
+                .insert(feature_id.clone(), base_sha.clone());
+            record_feature_commits(feature_mut(state, feature_id)?, commits);
+        }
+
         EventKind::WorkerSpawned {
             run_id,
             role,
@@ -293,9 +336,14 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             feature_id,
             commits,
         } => {
+            let cumulative = state.feature_base_shas.contains_key(feature_id);
             let feature = feature_mut(state, feature_id)?;
             feature.status = FeatureStatus::Complete;
-            feature.commits.extend(commits.iter().cloned());
+            if cumulative {
+                record_feature_commits(feature, commits);
+            } else {
+                feature.commits.extend(commits.iter().cloned());
+            }
         }
 
         EventKind::FeatureFailed {
@@ -303,6 +351,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             commits,
             ..
         } => {
+            let cumulative = state.feature_base_shas.contains_key(feature_id);
             let feature = feature_mut(state, feature_id)?;
             feature.status = FeatureStatus::Failed;
             // Record any commits the failure landed on the mission branch:
@@ -310,7 +359,11 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // to tell a failed-COMMITLESS feature (re-proposable — the
             // m-eee81f auth-death wedge) from failed-with-real-work (started;
             // a duplicate fixfeature.created must reject).
-            feature.commits.extend(commits.iter().cloned());
+            if cumulative {
+                record_feature_commits(feature, commits);
+            } else {
+                feature.commits.extend(commits.iter().cloned());
+            }
         }
 
         EventKind::FeatureSkipped { feature_id, .. } => {
@@ -500,6 +553,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                     let mut successor = feature.clone();
                     successor.status = FeatureStatus::Pending;
                     ms.features[idx] = successor;
+                    state.feature_base_shas.remove(&feature.id);
                 }
             } else {
                 // One fix-cycle increment per validation round: the first
@@ -772,6 +826,18 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
 /// Newest-last cap on `MissionState::recent_decisions`.
 const MAX_RECENT_DECISIONS: usize = 10;
 
+fn record_feature_commits(feature: &mut Feature, commits: &[String]) {
+    for commit in commits {
+        if !feature
+            .commits
+            .iter()
+            .any(|existing| existing.split_whitespace().next() == commit.split_whitespace().next())
+        {
+            feature.commits.push(commit.clone());
+        }
+    }
+}
+
 fn initial_state(event: &Event) -> Result<MissionState> {
     let EventKind::MissionCreated {
         goal,
@@ -786,6 +852,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         )));
     };
     Ok(MissionState {
+        feature_base_shas: BTreeMap::new(),
         mission: Mission {
             id: event.mission_id.clone(),
             goal: goal.clone(),

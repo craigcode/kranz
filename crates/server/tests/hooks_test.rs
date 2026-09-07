@@ -125,7 +125,7 @@ fn init_hook_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
         std::fs::create_dir_all(&kranz).unwrap();
         std::fs::write(
             kranz.join("config.json"),
-            json!({ "hooks": { "secret": secret } }).to_string(),
+            json!({ "hooks": { "secret": secret, "allowUsers": ["reviewer"] } }).to_string(),
         )
         .unwrap();
     }
@@ -245,6 +245,7 @@ fn workflow_run_payload(conclusion: &str, head_branch: &str) -> Value {
             "id": 9876543210_u64,
             "name": "gates",
             "head_branch": head_branch,
+            "head_repository": { "full_name": "octo/hello" },
             "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "conclusion": conclusion,
             "html_url": "https://github.com/octo/hello/actions/runs/9876543210",
@@ -322,6 +323,27 @@ async fn ghook_ci_failure_drafts_one_ticket_and_second_event_dedupes() {
 
     assert_eq!(trigger_tickets_in(&root), vec![slug.to_string()]);
     assert_eq!(MissionPaths::list_missions(&root), vec![mission_id]);
+}
+
+#[tokio::test]
+async fn ghook_signed_outsider_comment_cannot_draft_or_queue_work() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_hook_repo(Some(SECRET));
+    let app = hook_app(&root, 0);
+    let mut payload = pr_comment_payload("kranz:fix-and-queue");
+    payload["comment"]["user"]["login"] = json!("outsider");
+    payload["comment"]["author_association"] = json!("NONE");
+    let response = app
+        .oneshot(hook_post("issue_comment", Some(SECRET), &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(response).await["outcome"], "ignored");
+    assert!(trigger_tickets_in(&root).is_empty());
+    assert!(MissionPaths::list_missions(&root).is_empty());
+    assert!(kranz_engine::queue::list(&root).is_empty());
 }
 
 #[tokio::test]

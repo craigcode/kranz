@@ -443,6 +443,7 @@ export interface MissionConfig {
 
 export interface MissionState {
   mission: Mission;
+  featureBaseShas?: Record<string, string>;
   runs: Record<string, WorkerRun>;
   totals: TokenUsage;
   totalCostUsd: number;
@@ -528,6 +529,7 @@ export type EventKind =
   | { type: 'question.cleared'; payload: { questionId: string; why: string } }
   | { type: 'milestone.started'; payload: { milestoneId: string; startSha: string } }
   | { type: 'feature.started'; payload: { featureId: string } }
+  | { type: 'feature.progress'; payload: { featureId: string; baseSha: string; commits: string[] } }
   | { type: 'worker.spawned'; payload: { runId: string; role: Role; featureId?: string; milestoneId?: string; sdkSessionId: string; model: string; promptHash: string; transcriptPath: string } }
   | { type: 'worker.message'; payload: { runId: string; tag: WorkerMessageTag; content: string } }
   | { type: 'worker.completed'; payload: { runId: string; result: RunResult; tokens: TokenUsage; costUsd?: number; report?: WorkerReport } }

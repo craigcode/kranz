@@ -59,6 +59,14 @@
 //!   permission request IS the ask; auto-approving without one would weaken
 //!   the seam).
 //!
+//! - **Missing wire fields fail CLOSED.** ACP v1 leaves `title` optional and
+//!   `rawInput` free-form, so a call can arrive with no subject at all; every
+//!   glob then matches nothing and the deny list would silently vacate. When
+//!   a deny pattern's tool name covers the call's kind but the subject is
+//!   empty, the call is refused and the reason names the missing field. Same
+//!   for a read-only session when the peer omits `kind` (it arrives as
+//!   `"other"`, which `MUTATING_KINDS` cannot classify).
+//!
 //! A refusal picks the first `reject_once` (else `reject_always`) option the
 //! peer offered, falling back to the `cancelled` outcome when it offered
 //! none; an approval picks the first `allow_once` (else `allow_always`,
@@ -322,27 +330,63 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     !anchored_end || rest.is_empty()
 }
 
+/// Split one claude-shaped permission pattern (`Bash(git push*)`, `Write`,
+/// …) into its tool name and subject glob. A bare name carries the glob `*`.
+fn split_pattern(pattern: &str) -> (&str, &str) {
+    match pattern.split_once('(') {
+        Some((name, rest)) => (name.trim(), rest.strip_suffix(')').unwrap_or(rest)),
+        None => (pattern.trim(), "*"),
+    }
+}
+
+/// Whether one permission pattern's tool name maps to this ACP `kind` at
+/// all, regardless of subject. Separate from [`pattern_matches`] because a
+/// pattern that COVERS a call but cannot be evaluated against it is a
+/// refusal, not a pass.
+fn pattern_covers_kind(pattern: &str, kind: &str) -> bool {
+    let (name, _) = split_pattern(pattern);
+    TOOL_NAME_KINDS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .is_some_and(|(_, kinds)| kinds.contains(&kind))
+}
+
 /// Whether one claude-shaped permission pattern (`Bash(git push*)`,
 /// `Write`, …) covers an ACP tool call of `kind` with `subject`.
 fn pattern_matches(pattern: &str, kind: &str, subject: &str) -> bool {
-    let (name, glob) = match pattern.split_once('(') {
-        Some((name, rest)) => (name.trim(), rest.strip_suffix(')').unwrap_or(rest)),
-        None => (pattern.trim(), "*"),
-    };
-    let kinds = TOOL_NAME_KINDS
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, kinds)| *kinds);
-    match kinds {
-        Some(kinds) if kinds.contains(&kind) => wildcard_match(glob, subject),
-        _ => false,
+    let (_, glob) = split_pattern(pattern);
+    if pattern_covers_kind(pattern, kind) {
+        wildcard_match(glob, subject)
+    } else {
+        false
     }
 }
 
 /// The seam: decide one permission request from the [`SessionSpec`]. Deny
 /// rules are evaluated before the read-only posture so the recorded reason
 /// names the most specific rule that fired.
+///
+/// Fails CLOSED on missing wire fields. ACP v1 leaves `title` optional and
+/// `rawInput` free-form, so a peer can send a tool call with no subject at
+/// all; every glob then matches nothing and the deny list silently vacates.
+/// The same holds for the read-only posture when the peer omits `kind`
+/// (it arrives as `"other"`, which `MUTATING_KINDS` cannot classify). In
+/// both cases the guard cannot be evaluated, so the call is refused and the
+/// reason names the field the peer left out.
 fn decide_permission(spec: &SessionSpec, call: &ToolCallInfo) -> PermissionDecision {
+    if call.subject.trim().is_empty() {
+        if let Some(pattern) = spec
+            .disallowed_tools
+            .iter()
+            .find(|pattern| pattern_covers_kind(pattern, &call.kind))
+        {
+            return PermissionDecision::Deny(format!(
+                "tool call carries no subject (no rawInput command or path, no locations[0].path, \
+                 no title), so deny pattern {pattern:?} for ACP kind {:?} cannot be evaluated",
+                call.kind
+            ));
+        }
+    }
     for pattern in &spec.disallowed_tools {
         if pattern_matches(pattern, &call.kind, &call.subject) {
             return PermissionDecision::Deny(format!(
@@ -350,11 +394,20 @@ fn decide_permission(spec: &SessionSpec, call: &ToolCallInfo) -> PermissionDecis
             ));
         }
     }
-    if !spec.writable && MUTATING_KINDS.contains(&call.kind.as_str()) {
-        return PermissionDecision::Deny(format!(
-            "read-only session (writable: false): ACP kind {:?} mutates the filesystem",
-            call.kind
-        ));
+    if !spec.writable {
+        let kind = call.kind.trim();
+        if kind.is_empty() || kind == "other" {
+            return PermissionDecision::Deny(format!(
+                "read-only session (writable: false): tool call carries no usable ACP kind \
+                 ({kind:?}), so whether it mutates the filesystem cannot be decided"
+            ));
+        }
+        if MUTATING_KINDS.contains(&kind) {
+            return PermissionDecision::Deny(format!(
+                "read-only session (writable: false): ACP kind {:?} mutates the filesystem",
+                call.kind
+            ));
+        }
     }
     PermissionDecision::Allow
 }
@@ -636,6 +689,13 @@ pub struct AcpSession {
     saw_result: bool,
     saw_success_result: bool,
     exit: Option<SessionExit>,
+}
+
+#[cfg(unix)]
+impl Drop for AcpSession {
+    fn drop(&mut self) {
+        crate::backend_claude::kill_unreaped_group(&self.child);
+    }
 }
 
 impl AcpSession {
@@ -1471,6 +1531,85 @@ mod tests {
             subject: "/repo/src/main.rs".to_string(),
         };
         assert_eq!(decide_permission(&ro, &read), PermissionDecision::Allow);
+    }
+
+    /// The permission seam used to fail OPEN when the peer omitted the
+    /// subject: `wildcard_match("git push*", "")` is false, so no deny fired
+    /// and the decision was Allow. Every glob-carrying deny rule was
+    /// bypassable that way, by a peer that need not even be hostile.
+    #[test]
+    fn backend_acp_permission_denies_when_the_subject_is_missing() {
+        let spec = spec_with(true, &["Bash(git push*)"]);
+        let no_subject = ToolCallInfo {
+            kind: "execute".to_string(),
+            title: String::new(),
+            subject: String::new(),
+        };
+        assert!(
+            matches!(
+                decide_permission(&spec, &no_subject),
+                PermissionDecision::Deny(ref reason)
+                    if reason.contains("no subject") && reason.contains("Bash(git push*)")
+            ),
+            "got {:?}",
+            decide_permission(&spec, &no_subject)
+        );
+
+        // Whitespace is no subject either.
+        let blank_subject = ToolCallInfo {
+            subject: "   ".to_string(),
+            ..no_subject.clone()
+        };
+        assert!(matches!(
+            decide_permission(&spec, &blank_subject),
+            PermissionDecision::Deny(_)
+        ));
+
+        // Precise: a deny list that does not cover this call's kind is not
+        // made to fire by a missing subject.
+        let read_no_subject = ToolCallInfo {
+            kind: "read".to_string(),
+            ..no_subject.clone()
+        };
+        assert_eq!(
+            decide_permission(&spec_with(true, &["Bash(git push*)"]), &read_no_subject),
+            PermissionDecision::Allow
+        );
+    }
+
+    /// Read-only posture: `MUTATING_KINDS` cannot classify a call whose kind
+    /// the peer omitted (it arrives as `"other"`), so the containment claim
+    /// cannot be checked and the call is refused.
+    #[test]
+    fn backend_acp_read_only_denies_an_unclassifiable_kind() {
+        let ro = spec_with(false, &[]);
+        for kind in ["", "other"] {
+            let call = ToolCallInfo {
+                kind: kind.to_string(),
+                title: "do something".to_string(),
+                subject: "/repo/src/main.rs".to_string(),
+            };
+            assert!(
+                matches!(
+                    decide_permission(&ro, &call),
+                    PermissionDecision::Deny(ref reason) if reason.contains("kind")
+                ),
+                "kind {kind:?} got {:?}",
+                decide_permission(&ro, &call)
+            );
+        }
+        // A writable session still allows an unclassified kind: the read-only
+        // posture is the only thing that turns on the kind.
+        let writable = spec_with(true, &[]);
+        let other = ToolCallInfo {
+            kind: "other".to_string(),
+            title: "think".to_string(),
+            subject: "think".to_string(),
+        };
+        assert_eq!(
+            decide_permission(&writable, &other),
+            PermissionDecision::Allow
+        );
     }
 
     #[test]

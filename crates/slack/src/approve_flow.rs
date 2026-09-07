@@ -4,13 +4,14 @@
 //! dispatch side of this flow hangs off.
 
 use crate::bridge::{
-    approve_mission, error_blocks, mission_status, no_host_blocks, not_authorized_blocks_for,
+    approve_mission, error_blocks, esc, mission_status, no_host_blocks, not_authorized_blocks_for,
     post_thread_note, reply_ephemeral, retire_plan_card, SharedThreads,
 };
 use crate::client::SlackClient;
 use crate::config::SlackConfig;
-use crate::host::SharedHost;
+use crate::host::{ApprovePendingOutcome, SharedHost};
 use kranz_engine::types::MissionStatus;
+use serde_json::Value;
 use std::path::Path;
 
 /// Shared approve path for the slash command and both buttons.
@@ -33,6 +34,7 @@ pub(crate) async fn approve_flow(
     threads: &SharedThreads,
     host: Option<&SharedHost>,
     mission_id: &str,
+    plan_identity: Option<&str>,
     user_id: Option<&str>,
     response_url: Option<&str>,
     start: bool,
@@ -43,20 +45,94 @@ pub(crate) async fn approve_flow(
         return;
     }
 
-    // `approve_pending` consumes the host-parked plan. `None` = no host, or
-    // nothing parked — fall through to the state-aware routing below. On a
-    // transient failure (e.g. a turn in flight) the host re-parked the plan,
-    // so the retry click finds it again.
-    let approved = match host {
-        None => None,
-        Some(host) => match host.approve_pending(mission_id).await {
+    // Consume the host-parked plan. `None` = no host, or nothing parked, so
+    // fall through to the state-aware routing below. On a transient failure
+    // (e.g. a turn in flight) the host re-parked the plan, so the retry
+    // click finds it again.
+    //
+    // A button click carries the identity of the plan its card DISPLAYED,
+    // and it must still be the plan parked host-side; otherwise a card the
+    // reviewer scrolled back to would commit whatever a later `/kranz plan`
+    // parked (M2). Threat (follow-up review M-13): reading the parked
+    // identity and then approving is check-then-act across two host lock
+    // takes, and `Approve`/`ApproveStart`/`RequestPlan` all run concurrently
+    // on spawned tasks, so the check and the commit go through
+    // `approve_pending_if`, which does both under ONE lock. The slash twin
+    // reviews no card, claims no plan, and keeps the unbound approve.
+    let approved = match (button, host) {
+        (_, None) => None,
+        (true, Some(host)) => match host.approve_pending_if(mission_id, plan_identity).await {
+            Ok(ApprovePendingOutcome::Approved(branch)) => Some((branch, host)),
+            Ok(ApprovePendingOutcome::StalePlan { parked }) => {
+                let blocks = stale_plan_refusal(mission_id, plan_identity, Some(&parked))
+                    .unwrap_or_else(|| {
+                        // Unreachable: a StalePlan always names a parked plan
+                        // that differs from the card's. Refuse anyway rather
+                        // than fall through to starting a mission.
+                        error_blocks(&format!(
+                            "Couldn't confirm which plan `{}` is awaiting; nothing was \
+                             approved. Run `/kranz plan {}` and approve from the new card.",
+                            esc(mission_id),
+                            esc(mission_id)
+                        ))
+                    });
+                reply_ephemeral(cfg, client, response_url, &blocks).await;
+                return;
+            }
+            Ok(ApprovePendingOutcome::NothingParked) => {
+                // Threat (follow-up review M-13, the related LOW): a click
+                // that NAMED a plan, with nothing parked, means the plan this
+                // reviewer read is gone: approved from the web UI, released,
+                // or forfeited by a restart. Falling through here started a
+                // mission on a plan they never reviewed. Only an unbound
+                // click (a card that names no plan) may take the state-aware
+                // routing.
+                if let Some(card) = plan_identity {
+                    reply_ephemeral(
+                        cfg,
+                        client,
+                        response_url,
+                        &error_blocks(&format!(
+                            "The plan this card reviewed (`{card}`) is no longer parked for \
+                             `{mission}`: it was approved or released elsewhere, so nothing \
+                             was approved or started here. Run `/kranz plan {mission}` and \
+                             approve from the new card.",
+                            card = esc(card),
+                            mission = esc(mission_id)
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+                None
+            }
+            Err(e) => {
+                reply_ephemeral(
+                    cfg,
+                    client,
+                    response_url,
+                    &error_blocks(&format!(
+                        "Couldn't approve `{}`: {}",
+                        esc(mission_id),
+                        esc(&e)
+                    )),
+                )
+                .await;
+                return;
+            }
+        },
+        (false, Some(host)) => match host.approve_pending(mission_id).await {
             Ok(branch) => branch.map(|branch| (branch, host)),
             Err(e) => {
                 reply_ephemeral(
                     cfg,
                     client,
                     response_url,
-                    &error_blocks(&format!("Couldn't approve `{mission_id}`: {e}")),
+                    &error_blocks(&format!(
+                        "Couldn't approve `{}`: {}",
+                        esc(mission_id),
+                        esc(&e)
+                    )),
                 )
                 .await;
                 return;
@@ -80,8 +156,9 @@ pub(crate) async fn approve_flow(
                         threads,
                         mission_id,
                         &format!(
-                            ":rocket: Plan approved and execution started (branch `{branch}`) — \
-                         progress posts in this thread; deep inspection in the web UI."
+                            ":rocket: Plan approved and execution started (branch `{}`) — \
+                         progress posts in this thread; deep inspection in the web UI.",
+                            esc(&branch)
                         ),
                     )
                     .await;
@@ -92,9 +169,12 @@ pub(crate) async fn approve_flow(
                         client,
                         response_url,
                         &error_blocks(&format!(
-                            "Approved `{mission_id}` (branch `{branch}`) but starting failed: \
-                             {e}. Queue it with `/kranz approve {mission_id}` or run \
-                             `kranz work`."
+                            "Approved `{mission}` (branch `{branch}`) but starting failed: \
+                             {error}. Queue it with `/kranz approve {mission}` or run \
+                             `kranz work`.",
+                            mission = esc(mission_id),
+                            branch = esc(&branch),
+                            error = esc(&e)
                         )),
                     )
                     .await;
@@ -124,8 +204,9 @@ pub(crate) async fn approve_flow(
                         threads,
                         mission_id,
                         &format!(
-                            ":white_check_mark: Plan approved and queued (branch `{branch}`) — \
-                         the `kranz work` dispatcher runs it next."
+                            ":white_check_mark: Plan approved and queued (branch `{}`) — \
+                         the `kranz work` dispatcher runs it next.",
+                            esc(&branch)
                         ),
                     )
                     .await;
@@ -136,7 +217,10 @@ pub(crate) async fn approve_flow(
                         client,
                         response_url,
                         &error_blocks(&format!(
-                            "Approved `{mission_id}` (branch `{branch}`) but queueing failed: {e}"
+                            "Approved `{}` (branch `{}`) but queueing failed: {}",
+                            esc(mission_id),
+                            esc(&branch),
+                            esc(&e)
                         )),
                     )
                     .await;
@@ -156,8 +240,9 @@ pub(crate) async fn approve_flow(
                 client,
                 response_url,
                 &error_blocks(&format!(
-                    "No reviewed plan is pending for `{mission_id}` — run \
-                     `/kranz plan {mission_id}` first, then approve from the plan message."
+                    "No reviewed plan is pending for `{mission}` — run \
+                     `/kranz plan {mission}` first, then approve from the plan message.",
+                    mission = esc(mission_id)
                 )),
             )
             .await;
@@ -170,7 +255,8 @@ pub(crate) async fn approve_flow(
                 client,
                 response_url,
                 &error_blocks(&format!(
-                    "Mission `{mission_id}` is {status:?} — nothing to approve or queue."
+                    "Mission `{}` is {status:?} — nothing to approve or queue.",
+                    esc(mission_id)
                 )),
             )
             .await;
@@ -202,8 +288,9 @@ pub(crate) async fn approve_flow(
                             threads,
                             mission_id,
                             &format!(
-                                ":rocket: Execution started for `{mission_id}` — progress posts \
-                             in this thread."
+                                ":rocket: Execution started for `{}` — progress posts \
+                             in this thread.",
+                                esc(mission_id)
                             ),
                         )
                         .await;
@@ -213,7 +300,11 @@ pub(crate) async fn approve_flow(
                             cfg,
                             client,
                             response_url,
-                            &error_blocks(&format!("Couldn't start `{mission_id}`: {e}")),
+                            &error_blocks(&format!(
+                                "Couldn't start `{}`: {}",
+                                esc(mission_id),
+                                esc(&e)
+                            )),
                         )
                         .await;
                     }
@@ -228,8 +319,9 @@ pub(crate) async fn approve_flow(
                                 client,
                                 response_url,
                                 &error_blocks(&format!(
-                                    "`{mission_id}` is already executing — steer it by replying \
-                                 in its thread; nothing was queued."
+                                    "`{}` is already executing — steer it by replying \
+                                 in its thread; nothing was queued.",
+                                    esc(mission_id)
                                 )),
                             )
                             .await;
@@ -240,7 +332,11 @@ pub(crate) async fn approve_flow(
                                 cfg,
                                 client,
                                 response_url,
-                                &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
+                                &error_blocks(&format!(
+                                    "Couldn't queue `{}`: {}",
+                                    esc(mission_id),
+                                    esc(&e)
+                                )),
                             )
                             .await;
                             return;
@@ -255,8 +351,9 @@ pub(crate) async fn approve_flow(
                         client,
                         response_url,
                         &error_blocks(&format!(
-                            "`{mission_id}` is already executing — steer it by replying in its \
-                         thread; nothing was queued."
+                            "`{}` is already executing — steer it by replying in its \
+                         thread; nothing was queued.",
+                            esc(mission_id)
                         )),
                     )
                     .await;
@@ -272,8 +369,9 @@ pub(crate) async fn approve_flow(
                             client,
                             response_url,
                             &error_blocks(&format!(
-                                ":white_check_mark: Queued `{mission_id}` — the `kranz work` \
-                                 dispatcher runs it next."
+                                ":white_check_mark: Queued `{}` — the `kranz work` \
+                                 dispatcher runs it next.",
+                                esc(mission_id)
                             )),
                         )
                         .await;
@@ -284,7 +382,11 @@ pub(crate) async fn approve_flow(
                             cfg,
                             client,
                             response_url,
-                            &error_blocks(&format!("Couldn't queue `{mission_id}`: {e}")),
+                            &error_blocks(&format!(
+                                "Couldn't queue `{}`: {}",
+                                esc(mission_id),
+                                esc(&e)
+                            )),
                         )
                         .await;
                     }
@@ -296,9 +398,247 @@ pub(crate) async fn approve_flow(
                 cfg,
                 client,
                 response_url,
-                &error_blocks(&format!("Couldn't read `{mission_id}`: {e}")),
+                &error_blocks(&format!("Couldn't read `{}`: {}", esc(mission_id), esc(&e))),
             )
             .await;
+        }
+    }
+}
+
+/// Refuse an approve whose card does not name the plan currently parked, in
+/// the same "awaiting X, not Y" shape `enqueue_revision_control` uses for
+/// the revision buttons. `None` = go ahead.
+///
+/// Cases, in order:
+/// - nothing parked: not this check's business — the flow's own state-aware
+///   routing already explains a missing plan honestly.
+/// - the card names no plan: a card posted before approve buttons carried a
+///   plan identity. Refuse: which plan its reviewer read is unknowable, and
+///   guessing is exactly the bug.
+/// - identities differ: the plan was re-requested after this card was
+///   posted. Refuse and name both.
+fn stale_plan_refusal(
+    mission_id: &str,
+    card: Option<&str>,
+    parked: Option<&str>,
+) -> Option<Vec<Value>> {
+    let parked = parked?;
+    match card {
+        Some(card) if card == parked => None,
+        Some(card) => Some(error_blocks(&format!(
+            "That card is stale: mission `{mission}` is awaiting plan `{parked}`, not \
+             `{card}`. The plan was re-requested after this card was posted, so approving \
+             here would commit a plan you haven't reviewed. Scroll to the newest plan card \
+             (or run `/kranz plan {mission}` again) and approve there.",
+            mission = esc(mission_id),
+            parked = esc(parked),
+            card = esc(card)
+        ))),
+        None => Some(error_blocks(&format!(
+            "That card predates plan-bound approve, so it cannot say which plan you \
+             reviewed. Run `/kranz plan {}` and approve from the new card.",
+            esc(mission_id)
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(blocks: &[Value]) -> String {
+        blocks[0]["text"]["text"].as_str().unwrap().to_string()
+    }
+
+    /// M2: the load-bearing case. Card A shows plan v1; a re-plan parks v2;
+    /// clicking card A must not commit v2.
+    #[test]
+    fn a_stale_cards_approve_is_refused_naming_both_plans() {
+        let blocks = stale_plan_refusal("m-42", Some("aaaaaaaaaaaaaaaa"), Some("bbbbbbbbbbbbbbbb"))
+            .expect("stale card must be refused");
+        let text = text_of(&blocks);
+        assert!(text.contains("stale"), "{text}");
+        assert!(text.contains("awaiting plan `bbbbbbbbbbbbbbbb`"), "{text}");
+        assert!(text.contains("not `aaaaaaaaaaaaaaaa`"), "{text}");
+    }
+
+    #[test]
+    fn a_current_cards_approve_is_allowed_through() {
+        assert!(
+            stale_plan_refusal("m-42", Some("aaaaaaaaaaaaaaaa"), Some("aaaaaaaaaaaaaaaa"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_plan_identity_is_refused_when_a_plan_is_parked() {
+        let blocks = stale_plan_refusal("m-42", None, Some("bbbbbbbbbbbbbbbb"))
+            .expect("an unbound card must be refused");
+        assert!(text_of(&blocks).contains("predates plan-bound approve"));
+    }
+
+    /// Nothing parked is the flow's own business (no host, forfeited by a
+    /// restart, never requested); this check must not pre-empt its honest,
+    /// state-aware reply.
+    #[test]
+    fn nothing_parked_falls_through_to_the_state_aware_routing() {
+        assert!(stale_plan_refusal("m-42", Some("aaaaaaaaaaaaaaaa"), None).is_none());
+        assert!(stale_plan_refusal("m-42", None, None).is_none());
+    }
+
+    /// M-12 (follow-up review): the refusal interpolates a mission id the
+    /// operator typed and identities off a card, into a live mrkdwn section.
+    #[test]
+    fn the_stale_refusal_escapes_every_interpolation() {
+        let blocks = stale_plan_refusal(
+            "<!channel> m-42",
+            Some("<https://evil.example/a|Approve & start>"),
+            Some("bbbbbbbbbbbbbbbb"),
+        )
+        .expect("a mismatch must be refused");
+        let text = text_of(&blocks);
+        assert!(!text.contains("<!channel>"), "live broadcast ping: {text}");
+        assert!(
+            !text.contains("<https://evil.example/a|"),
+            "live link: {text}"
+        );
+        assert!(text.contains("&lt;!channel&gt;"), "payload lost: {text}");
+    }
+
+    /// M-13 (follow-up review): the contract every `PlanningHost` must
+    /// satisfy: a click whose card names a different plan (or names none)
+    /// is refused WITHOUT approving anything, and only a matching card
+    /// commits. Pinned against the trait's own default so a host that does
+    /// not override it still behaves.
+    mod approve_pending_if {
+        use crate::host::{ApprovePendingOutcome, BoxFuture, PlanOutcome, PlanningHost};
+        use kranz_engine::draft::DraftOutcome;
+        use serde_json::Value;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Fake {
+            parked: Option<String>,
+            approves: AtomicUsize,
+        }
+
+        impl Fake {
+            fn with(parked: Option<&str>) -> Self {
+                Fake {
+                    parked: parked.map(str::to_string),
+                    approves: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl PlanningHost for Fake {
+            fn create<'a>(&'a self, _goal: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn planning_turn<'a>(
+                &'a self,
+                _id: &'a str,
+                _text: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<String>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn request_plan<'a>(
+                &'a self,
+                _id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<PlanOutcome>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn approve_pending<'a>(
+                &'a self,
+                _id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+                self.approves.fetch_add(1, Ordering::SeqCst);
+                let parked = self.parked.clone();
+                Box::pin(async move { Ok(parked.map(|_| "kranz/mission-m-42".to_string())) })
+            }
+            fn pending_plan_identity<'a>(
+                &'a self,
+                _id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+                let parked = self.parked.clone();
+                Box::pin(async move { Ok(parked) })
+            }
+            fn start<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn release<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn draft<'a>(&'a self, _slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn approve_ticket<'a>(
+                &'a self,
+                _slug: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<String>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn merge<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
+                Box::pin(async { unreachable!() })
+            }
+            fn ask<'a>(
+                &'a self,
+                _q: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<crate::host::AskOutcome>> {
+                Box::pin(async { unreachable!() })
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stale_card_is_refused_and_nothing_is_approved() {
+            let host = Fake::with(Some("bbbbbbbbbbbbbbbb"));
+            let outcome = host
+                .approve_pending_if("m-42", Some("aaaaaaaaaaaaaaaa"))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ApprovePendingOutcome::StalePlan {
+                    parked: "bbbbbbbbbbbbbbbb".to_string()
+                }
+            );
+            assert_eq!(
+                host.approves.load(Ordering::SeqCst),
+                0,
+                "a refused click must not approve anything"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_card_naming_no_plan_is_refused_while_one_is_parked() {
+            let host = Fake::with(Some("bbbbbbbbbbbbbbbb"));
+            assert!(matches!(
+                host.approve_pending_if("m-42", None).await.unwrap(),
+                ApprovePendingOutcome::StalePlan { .. }
+            ));
+            assert_eq!(host.approves.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn the_matching_card_commits_and_an_empty_cache_reports_nothing_parked() {
+            let host = Fake::with(Some("aaaaaaaaaaaaaaaa"));
+            assert_eq!(
+                host.approve_pending_if("m-42", Some("aaaaaaaaaaaaaaaa"))
+                    .await
+                    .unwrap(),
+                ApprovePendingOutcome::Approved("kranz/mission-m-42".to_string())
+            );
+
+            let empty = Fake::with(None);
+            assert_eq!(
+                empty
+                    .approve_pending_if("m-42", Some("aaaaaaaaaaaaaaaa"))
+                    .await
+                    .unwrap(),
+                ApprovePendingOutcome::NothingParked
+            );
         }
     }
 }

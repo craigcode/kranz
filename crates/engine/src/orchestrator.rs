@@ -554,6 +554,18 @@ impl MissionEngine {
         write_kranz_gitignore(&paths)?;
 
         let events = EventLog::read_events(&paths.events_file())?;
+        // Rollback check BEFORE the fold (audit 2026-09-01 H6). Truncating
+        // `events.jsonl` at a line boundary leaves a perfectly valid log:
+        // contiguous seqs, matching mission ids, intact hash chain. What it
+        // does is roll the mission back past a `grant.denied`, a
+        // `milestone.failed`, or a `validation.finding` — and resume used to
+        // fold the shortened file as truth and then OVERWRITE `state.json`
+        // with the result, destroying the only other copy of the high-water
+        // mark. `state.json` is repo-writable too, so this is a detector, not
+        // a boundary: an attacker who truncates the log must now also match
+        // the snapshot, and the honest name for that is "harder", not
+        // "impossible".
+        crate::event_log::check_no_rollback(&paths, &events)?;
         let state = reducer::fold(&events)?;
 
         // The most recent orchestrator session's sdk id (events are in seq
@@ -610,17 +622,9 @@ impl MissionEngine {
                 }
             }
         }
-        // A leaked mission integration worktree (M7 tier 1) is the same story:
-        // it exists only while a lock-holding engine has one set up, so with
-        // the lock now held it is a crash leak. Reap it the same way.
-        for integration_path in [
-            mission_worktree_path(&repo_root, mission_id),
-            legacy_mission_worktree_path(mission_id),
-        ] {
-            if integration_path.exists() {
-                let _ = repo.remove_worktree(&integration_path);
-            }
-        }
+        // Keep the integration worktree: a blocked checkpoint or interrupted
+        // worker may have left its only repair there. Setup validates and
+        // reuses it under this mission's single-writer lock.
         let _ = repo.prune_worktrees();
         for milestone in &state.mission.milestones {
             for feature in &milestone.features {
@@ -2656,14 +2660,12 @@ impl MissionEngine {
         }
 
         // Integration worktree lifetime: torn down once the mission reaches
-        // a status the resume/reconcile path already accounts for (terminal,
-        // or an error that ends this process) — never on Blocked/Paused,
-        // where the mission may resume and wants its worktree intact
-        // (a leaked one is reaped by `resume()`'s crash sweep regardless).
+        // a terminal status — Blocked/Paused and errors retain uncommitted
+        // work for operator inspection and the next resume.
         if worktree_mode {
             let should_teardown = match &result {
                 Ok(status) => is_terminal_status(*status),
-                Err(_) => true,
+                Err(_) => false,
             };
             if should_teardown {
                 self.teardown_mission_worktree();
@@ -3307,6 +3309,13 @@ impl MissionEngine {
             self.emit(EventKind::FeatureStarted { feature_id })?;
         }
 
+        let feature_id = self.state.mission.milestones[mi].features[fi].id.clone();
+        let feature_base_sha = match self.state.feature_base_shas.get(&feature_id) {
+            Some(base) => base.clone(),
+            None => self.active_repo().head_sha()?,
+        };
+        self.record_feature_progress(mi, fi, &feature_base_sha)?;
+
         let mut guidance: Option<String> = None;
         loop {
             // Snapshot everything the runner needs (avoids borrowing state
@@ -3319,7 +3328,6 @@ impl MissionEngine {
             let egress_grants = self.state.mission.egress_grants.clone();
             let deny_exceptions = self.state.mission.deny_exceptions.clone();
             let touch_set = self.state.mission.touch_set.clone();
-            let pre_run_sha = self.active_repo().head_sha()?;
 
             // Interrupt wiring: a control watcher polls the inbox and fires
             // the notify on `Msg { interrupt: true }`; run_session aborts the
@@ -3404,8 +3412,20 @@ impl MissionEngine {
             // Fold the runner's events into state even when the run errored
             // (worker.spawned may already be on disk).
             let caught = self.catch_up();
+            // The worker may have planted executable Git configuration or
+            // hooks. Refresh verification handles before any engine-side Git
+            // read/checkpoint, including control commands drained below. Open
+            // fresh handles so newly configured filter drivers are enumerated.
+            self.repo = GitRepo::open(&self.paths.repo_root)?.with_hooks_disabled()?;
+            if let Some((root, repo)) = &mut self.active_tree {
+                *repo = GitRepo::open(&*root)?.with_hooks_disabled()?;
+            }
             let outcome = outcome?;
             caught?;
+
+            // Persist worker-created commits before processing controls. A
+            // terminal failure or park must not lose their attribution.
+            self.record_feature_progress(mi, fi, &feature_base_sha)?;
 
             // Interrupt (or any queued command) → events now, so the
             // judgement digest reflects them.
@@ -3444,15 +3464,10 @@ impl MissionEngine {
             if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
                 return Ok(()); // orchestrator chose fail-feature
             }
-            let commits: Vec<String> = self
-                .active_repo()
-                .commits_between(&pre_run_sha, "HEAD")?
-                .iter()
-                .map(|c| format!("{} {}", c.sha, c.subject))
-                .collect();
+            let commits = self.record_feature_progress(mi, fi, &feature_base_sha)?;
             let diff_stat = self
                 .active_repo()
-                .diff_stat(&pre_run_sha, "HEAD")
+                .diff_stat(&feature_base_sha, "HEAD")
                 .unwrap_or_default();
 
             // Worker-deny grant (grant-request-decision-flow): a worker command
@@ -3546,6 +3561,46 @@ impl MissionEngine {
                 }
             }
         }
+    }
+
+    fn record_feature_progress(
+        &mut self,
+        mi: usize,
+        fi: usize,
+        base_sha: &str,
+    ) -> Result<Vec<String>> {
+        let feature = &self.state.mission.milestones[mi].features[fi];
+        let feature_id = feature.id.clone();
+        let mut commits = feature.commits.clone();
+        if !self.active_repo().is_ancestor(base_sha, "HEAD")? {
+            return Err(EngineError::InvalidState(format!(
+                "feature '{feature_id}' baseline is no longer an ancestor of HEAD"
+            )));
+        }
+        for receipt in &commits {
+            let sha = receipt.split_whitespace().next().unwrap_or("");
+            if !self.active_repo().is_ancestor(sha, "HEAD")? {
+                return Err(EngineError::InvalidState(format!(
+                    "feature '{feature_id}' recorded commit is no longer on HEAD: {sha}"
+                )));
+            }
+        }
+        for commit in self.active_repo().commits_between(base_sha, "HEAD")? {
+            if !commits
+                .iter()
+                .any(|receipt| receipt.split_whitespace().next() == Some(commit.sha.as_str()))
+            {
+                commits.push(format!("{} {}", commit.sha, commit.subject));
+            }
+        }
+        if !self.state.feature_base_shas.contains_key(&feature_id) || commits != feature.commits {
+            self.emit(EventKind::FeatureProgress {
+                feature_id,
+                base_sha: base_sha.to_string(),
+                commits: commits.clone(),
+            })?;
+        }
+        Ok(commits)
     }
 
     // -----------------------------------------------------------------------
@@ -4438,13 +4493,41 @@ impl MissionEngine {
         }
 
         let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
-        // Idempotent: a stale integration worktree from a prior crash must be
-        // gone before checking the branch out again (git refuses to check the
-        // same branch out twice).
-        let _ = self.repo.remove_worktree(&path);
-        let _ = self
-            .repo
-            .remove_worktree(&legacy_mission_worktree_path(&self.state.mission.id));
+        for retained in [
+            path.clone(),
+            legacy_mission_worktree_path(&self.state.mission.id),
+        ] {
+            let metadata = match std::fs::symlink_metadata(&retained) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // A stale path is not authority to reuse an arbitrary repository
+            // or symlink. Verify ownership and branch without changing either.
+            let canonical = std::fs::canonicalize(&retained)?;
+            let registered = self
+                .repo
+                .list_worktrees()?
+                .iter()
+                .any(|entry| std::fs::canonicalize(entry).is_ok_and(|path| path == canonical));
+            if !metadata.is_dir() || metadata.file_type().is_symlink() || !registered {
+                return Err(EngineError::Git(format!(
+                    "retained integration path {} is not this repository's worktree; preserved for inspection",
+                    retained.display()
+                )));
+            }
+            let wt_repo = GitRepo::open(&retained)?;
+            if canonical_root(wt_repo.git_common_dir()?)
+                != canonical_root(self.repo.git_common_dir()?)
+                || wt_repo.current_branch()? != mission_branch
+            {
+                return Err(EngineError::Git(format!(
+                    "retained integration worktree {} has unexpected repository or branch; preserved for inspection",
+                    retained.display()
+                )));
+            }
+            return Ok((retained, wt_repo));
+        }
         let _ = self.repo.prune_worktrees();
 
         self.repo.add_worktree_checkout(&path, &mission_branch)?;
@@ -4456,7 +4539,13 @@ impl MissionEngine {
     /// [`Self::setup_mission_worktree`]. Best-effort and idempotent, mirroring
     /// the parallel-batch cleanup guard: failures are logged, never fatal.
     fn teardown_mission_worktree(&self) {
-        let path = mission_worktree_path(&self.paths.repo_root, &self.state.mission.id);
+        let path = self
+            .active_tree
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| {
+                mission_worktree_path(&self.paths.repo_root, &self.state.mission.id)
+            });
         if let Err(e) = self.repo.remove_worktree(&path) {
             tracing::warn!(path = %path.display(), error = %e, "mission worktree cleanup failed");
         }
@@ -8276,9 +8365,15 @@ fn unexecuted_pty_assertions<'a>(
         .collect()
 }
 
-/// De-duplicated, first-seen-order commands run by this milestone's workers,
-/// gathered from each feature's `worker_runs` reports so validators can
-/// re-run what workers already cited as evidence.
+/// De-duplicated, first-seen-order commands this milestone's workers CLAIM
+/// they ran, gathered from each feature's `worker_runs` reports.
+///
+/// Untrusted, model-authored strings: the validator prompt names them so the
+/// validator knows what to check, and [`crate::runner::run_validator_in`]
+/// deliberately keeps them out of the permission profile. A worker cannot
+/// widen the read-only role's Bash allow list by reporting a command it
+/// would like the validator to be able to run (audit-exec M1); widening
+/// takes the approved contract, `allowValidatorCommands`, or a human grant.
 pub(crate) fn worker_commands_for_milestone(
     state: &MissionState,
     milestone: &Milestone,
@@ -8464,7 +8559,10 @@ fn write_kranz_gitignore(paths: &MissionPaths) -> Result<()> {
 /// and validate, or the event must not be appended (the reducer would poison
 /// every future fold of the log).
 fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> Result<()> {
-    config::apply_validated_patch(current, patch).map(|_| ())
+    // PatchSource::Inbox: this is the drain path, and the control inbox is an
+    // unauthenticated filesystem channel — consent-bearing keys are refused
+    // here even though an operator surface may set them (audit C1).
+    config::apply_validated_patch_from(current, patch, config::PatchSource::Inbox).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -9537,11 +9635,10 @@ pub(crate) mod tests {
         engine.teardown_mission_worktree();
     }
 
-    /// A mission integration worktree left behind by a crashed engine (never
-    /// torn down) is reaped by `resume()`'s crash-recovery sweep, the same
-    /// way per-feature worktrees are (orchestrator.rs:~408-414, M7 tier 1).
+    /// Recovery must keep the only copy of an uncommitted repair, including
+    /// its index and untracked files, while leaving the primary untouched.
     #[test]
-    fn resume_reaps_leaked_integration_worktree() {
+    fn resume_preserves_uncommitted_integration_repair() {
         let Some((_dir, root)) = lessons_test_repo() else {
             return;
         };
@@ -9551,7 +9648,19 @@ pub(crate) mod tests {
                 .unwrap();
         let mission_id = engine.state.mission.id.clone();
 
-        let (path, _wt_repo) = engine.setup_mission_worktree().expect("setup");
+        let (path, wt_repo) = engine.setup_mission_worktree().expect("setup");
+        let primary_readme = std::fs::read(root.join("README.md")).unwrap();
+        let original_head = wt_repo.head_sha().unwrap();
+        std::fs::write(path.join("README.md"), "staged repair\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(path.join("README.md"), "unstaged repair\n").unwrap();
+        std::fs::write(path.join("new-repair.txt"), "untracked repair\n").unwrap();
+        let original_status = wt_repo.porcelain_status().unwrap();
         assert_eq!(path, mission_worktree_path(&root, &mission_id));
         assert!(path.exists(), "integration worktree dir must exist");
 
@@ -9568,17 +9677,83 @@ pub(crate) mod tests {
         drop(engine);
 
         let resumed = MissionEngine::resume(backend, &root, &mission_id, LockForce::No)
-            .expect("resume should reap the leaked integration worktree and succeed");
+            .expect("resume should retain the integration repair");
 
         let after = resumed.repo.list_worktrees().unwrap();
         assert!(
-            !after.iter().any(|p| worktree_entry_is(p, &canon_path)),
-            "integration worktree still listed after resume: {after:?}"
+            after.iter().any(|p| worktree_entry_is(p, &canon_path)),
+            "integration worktree lost after resume: {after:?}"
         );
-        assert!(
-            !path.exists(),
-            "integration worktree dir must be pruned after resume"
+        let (reused_path, reused_repo) = resumed.setup_mission_worktree().unwrap();
+        assert_eq!(reused_path, path);
+        assert_eq!(reused_repo.head_sha().unwrap(), original_head);
+        assert_eq!(reused_repo.porcelain_status().unwrap(), original_status);
+        let staged = std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["show", ":README.md"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert_eq!(staged.stdout, b"staged repair\n");
+        assert_eq!(
+            std::fs::read_to_string(path.join("README.md")).unwrap(),
+            "unstaged repair\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(path.join("new-repair.txt")).unwrap(),
+            "untracked repair\n"
+        );
+        assert_eq!(resumed.repo.current_branch().unwrap(), "main");
+        assert_eq!(
+            std::fs::read(root.join("README.md")).unwrap(),
+            primary_readme
+        );
+        resumed.teardown_mission_worktree();
+    }
+
+    #[test]
+    fn integration_recovery_refuses_wrong_branch_without_discarding_files() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let (path, wt_repo) = engine.setup_mission_worktree().unwrap();
+        wt_repo.create_branch("unexpected-branch", None).unwrap();
+        wt_repo.checkout("unexpected-branch").unwrap();
+        std::fs::write(path.join("repair.txt"), "retain me\n").unwrap();
+        let error = engine.setup_mission_worktree().unwrap_err().to_string();
+        assert!(error.contains("unexpected repository or branch"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path.join("repair.txt")).unwrap(),
+            "retain me\n"
+        );
+        assert_eq!(wt_repo.current_branch().unwrap(), "unexpected-branch");
+        assert_eq!(engine.repo.current_branch().unwrap(), "main");
+        engine.teardown_mission_worktree();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_recovery_refuses_symlink_without_touching_target() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let path = mission_worktree_path(&root, engine.mission_id());
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("repair.txt"), "retain me\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+        let error = engine.setup_mission_worktree().unwrap_err().to_string();
+        assert!(error.contains("not this repository's worktree"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("repair.txt")).unwrap(),
+            "retain me\n"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     /// `mission_worktree_path` never collides with a per-feature
@@ -9982,6 +10157,7 @@ pub(crate) mod tests {
         runs.insert("run-1".to_string(), run);
         runs.insert("run-2".to_string(), second_run);
         let state = MissionState {
+            feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".to_string(),
                 goal: String::new(),
@@ -10361,6 +10537,56 @@ pub(crate) mod tests {
             mock.started_specs().len(),
             2,
             "only the auth preflight and worker should run; no orchestrator judgement turn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sequential_worker_git_checks_disable_newly_planted_fsmonitor() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let payload_dir = tempfile::tempdir().unwrap();
+        let marker = payload_dir.path().join("executed-fsmonitor");
+        let payload = payload_dir.path().join("fsmonitor.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "\n[core]\n\tfsmonitor = /bin/sh '{}'\n",
+            payload.display()
+        ));
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report("worker done"))
+                .writes_file(".git/config", &config)
+                .with_exit(SessionExit::Aborted),
+        ]));
+        let cfg = MissionConfig {
+            worker_isolation: WorkerIsolation::Checkout,
+            max_respawns: 0,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(mock.clone(), &root, "goal", cfg).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+        engine.run_feature(0, 0).await.unwrap();
+        assert_eq!(mock.started_specs().len(), 1);
+        assert!(
+            !marker.exists(),
+            "the engine executed worker-authored Git configuration"
+        );
+        // Prove that the payload was actually installed and executable.
+        GitRepo::open_unhardened(&root).unwrap().is_clean().unwrap();
+        assert!(
+            marker.exists(),
+            "ordinary git must execute the fixture payload"
         );
     }
 
@@ -11788,6 +12014,154 @@ pub(crate) mod tests {
             "frontier tier must still block at the cap: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn current_repair_budget_survives_config_change_replay_and_session_reseed() {
+        use crate::backend_mock::{MockBackend, MockScript};
+
+        let (_dir, root) = lessons_test_repo().expect("git fixture");
+        let mut replies = vec!["Planning observed a two-round repair cap.".to_string()];
+        replies.extend((0..5).map(|_| tier_escalation_fix_reply()));
+        let mock = Arc::new(MockBackend::with_scripts(vec![projection_orch_script(
+            replies,
+        )]));
+        let cfg = MissionConfig {
+            skip_functional: true,
+            validator_allow_uncontained_degrade: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        let mut engine = MissionEngine::create(mock.clone(), &root, "goal", cfg).unwrap();
+        assert_eq!(engine.state.config.max_fix_cycles_per_milestone, 2);
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Frontier);
+        engine
+            .planning_turn("plan with the current policy")
+            .await
+            .unwrap();
+        engine.approve_plan(flight_rules_pin_plan(vec![])).unwrap();
+        engine
+            .emit(EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: engine.repo.head_sha().unwrap(),
+            })
+            .unwrap();
+
+        for used in 1..=2 {
+            mock.push_script(tier_escalation_finding_script("a real defect"));
+            engine.validation_round(0).await.unwrap();
+            assert_eq!(engine.state.mission.milestones[0].fix_cycles, used);
+        }
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::ConfigChange {
+                patch: serde_json::json!({"maxFixCyclesPerMilestone": 3}),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        let injected = mock.injected_messages();
+        let third_round = injected[0].last().unwrap();
+        assert!(
+            third_round.contains("fixCycles 2, repair cap 3, remaining 1"),
+            "{third_round}"
+        );
+        assert!(third_round.contains("Current policy supersedes planning/research observations."));
+        assert!(third_round
+            .contains("it does not justify a waiver or establish that the contract is met."));
+        assert_eq!(engine.state.mission.milestones[0].fix_cycles, 3);
+        let features_after_third = engine.state.mission.milestones[0].features.len();
+        assert_eq!(
+            features_after_third, 4,
+            "one plan feature and three repairs"
+        );
+
+        // The same session asks for a fourth round: block without inventing
+        // a waiver or emitting another feature. Frontier has no escalation.
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].features.len(),
+            features_after_third
+        );
+
+        control::enqueue(
+            &engine.paths,
+            &ControlCommand::ConfigChange {
+                patch: serde_json::json!({"maxFixCyclesPerMilestone": 1}),
+            },
+        )
+        .unwrap();
+        engine.drain_control().await.unwrap();
+        mock.push_script(tier_escalation_finding_script("a real defect"));
+        engine.validation_round(0).await.unwrap();
+        assert_eq!(
+            engine.state.mission.milestones[0].status,
+            MilestoneStatus::Blocked
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].features.len(),
+            features_after_third
+        );
+        assert!(mock.injected_messages()[0]
+            .last()
+            .unwrap()
+            .contains("fixCycles 3, repair cap 1, remaining 0"));
+
+        let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::ConfigChanged { .. }))
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::MilestoneCompleted { .. } | EventKind::TierEscalated { .. }
+        )));
+        engine.state = crate::reducer::fold(&events).unwrap();
+        assert_eq!(engine.state.mission.milestones[0].fix_cycles, 3);
+
+        engine.force_reseed();
+        mock.push_script(projection_orch_script(vec!["ready".into()]));
+        engine.orch_turn("decide after replay").await.unwrap();
+        let specs = mock.started_specs();
+        let PromptMode::Streaming(seed) = &specs.last().unwrap().prompt else {
+            panic!("expected reseeded streaming session");
+        };
+        assert!(
+            seed.contains("fixCycles 3, repair cap 1, remaining 0"),
+            "{seed}"
+        );
+        assert!(seed.contains("APPROVED PLAN (plan.json)"));
+        assert!(mock.injected_messages().last().unwrap()[0]
+            .contains("fixCycles 3, repair cap 1, remaining 0"));
+
+        // Exercise the single-shot execution seam with the same replayed
+        // state and recording backend; no real Codex process is required.
+        mock.push_script(MockScript::single_shot_json(
+            &serde_json::json!({"summary": "ready"}),
+        ));
+        engine
+            .orch_single_shot_turn("decide in a fresh context")
+            .await
+            .unwrap();
+        let specs = mock.started_specs();
+        let PromptMode::SingleShot(prompt) = &specs.last().unwrap().prompt else {
+            panic!("expected single-shot session");
+        };
+        assert!(
+            prompt.contains("fixCycles 3, repair cap 1, remaining 0"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Current policy supersedes planning/research observations."));
     }
 
     /// Escalating the executor must never touch the validator role configs —

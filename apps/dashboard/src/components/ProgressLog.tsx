@@ -56,6 +56,11 @@ function describe(e: MissionEvent, state: MissionState | null): { text: string; 
       return { text: `Milestone ${e.payload.milestoneId} started`, tone: 'info' };
     case 'feature.started':
       return { text: `Feature ${e.payload.featureId} started`, tone: 'info' };
+    case 'feature.progress':
+      return {
+        text: `Feature ${e.payload.featureId}: ${e.payload.commits.length} commit(s) recorded`,
+        tone: 'plain',
+      };
     case 'worker.spawned': {
       const target = e.payload.featureId ?? e.payload.milestoneId;
       return {
