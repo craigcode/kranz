@@ -63,7 +63,22 @@ this limitation; a QR demonstration is not a locked-phone acceptance result.
 
 ## Then prove the live Kranz round trip
 
-Stop the fixture server. Before this session, prepare a real disposable mission
+Stop the fixture server. Give the rehearsal a fresh operator directory so the
+normal multi-repository catalog cannot expose other projects through this
+serve instance. In every terminal that prepares or runs the disposable mission
+or starts its Kranz server, use the same session-specific directory:
+
+```sh
+export KRANZ_HOME="/absolute/path/to/even-g2-session/operator"
+mkdir -p "$KRANZ_HOME"
+```
+
+Choose a new directory for this session; do not copy the normal operator
+configuration or register production repositories in it. Set up any required
+backend access through its normal operator channel, keeping secrets out of the
+fixture source and receipt.
+
+Before this session, prepare a real disposable mission
 whose approved plan deliberately reaches a bounded question or grant; obtain
 its mission id and keep its worker/orchestrator running. For a question, use
 `Which output format?` with `JSON` and `Text`; ask the worker to create the
@@ -84,7 +99,8 @@ KRANZ_API_TARGET=http://127.0.0.1:4561 npm run dev
 ```
 
 Generate a new QR with the live URL (remove `?demo=1`). Paste this disposable
-serve instance's mutation token into the phone companion's password field.
+serve instance's mutation token (printed in its startup terminal) into the phone
+companion's password field.
 Never put it in the QR, a screenshot, a command line or this receipt. If the
 host exposes several repositories, use `?repo=<disposable-repo-id>` and verify
 that exact identity on the decision and confirmation screens.
