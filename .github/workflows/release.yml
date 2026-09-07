@@ -137,7 +137,7 @@ jobs:
       - run: npm run test
         working-directory: apps/even-g2
 
-      - run: npm run build
+      - run: npm run pack
         working-directory: apps/even-g2
 
       - run: npm run lint

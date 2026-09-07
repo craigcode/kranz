@@ -32,11 +32,34 @@ function text(value: string, max: number): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`
 }
 
+// Decision text is never shortened or whitespace-normalized. Until device
+// typography is proven, only short printable ASCII fits this bounded surface.
+function fits(value: string, max: number): boolean {
+  return value.trim().length > 0 && value.length <= max && /^[\x20-\x7e]+$/.test(value)
+}
+
+function decisionUnavailable(card: MissionCard): string | undefined {
+  if (!fits(card.summary.repoDisplayName ?? card.summary.repoId ?? 'repository', 28)
+      || !fits(card.summary.id, 20)) return 'Repository or mission identity needs a larger screen.'
+  const question = openQuestion(card.state)
+  if (question) {
+    if (!question.options?.length) return 'Free-text answer required.'
+    if (!fits(question.text, 56) || !question.options.every((option) => fits(option, 28))) {
+      return 'This question cannot be fully reviewed here.'
+    }
+    return undefined
+  }
+  const grant = card.state?.pendingGrantRequest
+  if (grant && !fits(grant.command, 56)) return 'This grant cannot be fully reviewed here.'
+  return undefined
+}
+
 function openQuestion(state?: MissionState): PendingQuestion | undefined {
   return state?.pendingQuestions?.[0]
 }
 
 export function actionsFor(card: MissionCard): DecisionAction[] {
+  if (decisionUnavailable(card)) return []
   const question = openQuestion(card.state)
   if (question && question.options && question.options.length > 0) {
     return question.options.map((answer, option) => ({
@@ -76,17 +99,16 @@ function summaryPriority(status: string): number {
 }
 
 function details(card: MissionCard, action?: DecisionAction): string {
+  const unavailable = decisionUnavailable(card)
+  if (unavailable) return `${unavailable}\n\nUse dashboard or Slack.`
   const question = openQuestion(card.state)
   if (question) {
-    if (!question.options || question.options.length === 0) {
-      return `QUESTION\n${text(question.text, 150)}\n\nFree-text answer required. Use dashboard or Slack.`
-    }
-    return `QUESTION\n${text(question.text, 135)}\n\n> ${text(action?.label ?? '', 54)}`
+    return `QUESTION\n${question.text}\n\n> ${action?.label ?? ''}`
   }
   const grant = card.state?.pendingGrantRequest
   if (grant) {
     const kind = (grant.kind ?? 'command').replace('-', ' ')
-    return `${kind.toUpperCase()} GRANT\n${text(grant.command, 145)}\n\n> ${action?.label ?? ''}`
+    return `${kind.toUpperCase()} GRANT\n${grant.command}\n\n> ${action?.label ?? ''}`
   }
   if (card.loadError) return `STATE UNAVAILABLE\n${text(card.loadError, 170)}`
   return `${card.summary.status.toUpperCase()}\n${text(card.summary.goal, 180)}`
@@ -99,6 +121,7 @@ export class KranzGlassesController {
   private actionIndex = 0
   private result = ''
   private error = ''
+  private busy = false
 
   constructor(
     private readonly api: KranzApi,
@@ -119,7 +142,7 @@ export class KranzGlassesController {
     }
     if (this.mode === 'result') {
       return {
-        title: 'KRANZ · SENT',
+        title: 'KRANZ · QUEUED',
         body: this.result,
         footer: 'tap: refresh',
         mode: this.mode,
@@ -150,7 +173,7 @@ export class KranzGlassesController {
       return {
         title: this.mode === 'submitting' ? 'KRANZ · SENDING' : 'KRANZ · CONFIRM',
         body: action
-          ? `${text(action.label, 64)}\n${text(card.summary.repoDisplayName ?? card.summary.repoId ?? 'repository', 38)}\n\n${text(card.summary.goal, 110)}`
+          ? `${card.summary.repoDisplayName ?? card.summary.repoId ?? 'repository'}\n${card.summary.id}\n${details(card, action)}`
           : 'Nothing actionable on this mission.',
         footer: this.mode === 'submitting' ? 'please wait' : 'tap: SEND · swipe: cancel',
         mode: this.mode,
@@ -158,7 +181,7 @@ export class KranzGlassesController {
     }
     return {
       title: `KRANZ · ${text(card.summary.repoDisplayName ?? card.summary.repoId ?? '', 22)}`,
-      body: details(card, action),
+      body: `${card.summary.id}\n${details(card, action)}`,
       footer: actions.length > 0 ? 'swipe: choice · tap: review' : 'tap: missions',
       mode: this.mode,
     }
@@ -169,6 +192,16 @@ export class KranzGlassesController {
   }
 
   async refresh(): Promise<void> {
+    if (this.busy) return
+    this.busy = true
+    try {
+      await this.loadMissions()
+    } finally {
+      this.busy = false
+    }
+  }
+
+  private async loadMissions(): Promise<void> {
     this.mode = 'loading'
     await this.render()
     try {
@@ -208,9 +241,25 @@ export class KranzGlassesController {
   }
 
   async input(input: Input): Promise<void> {
+    // Ignore taps during bridge writes, reads and POSTs; queueing them would
+    // turn a double tap into consent to a frame the operator has not seen.
+    if (this.busy) return
+    this.busy = true
+    try {
+      await this.handleInput(input)
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error)
+      this.mode = 'error'
+      await this.render()
+    } finally {
+      this.busy = false
+    }
+  }
+
+  private async handleInput(input: Input): Promise<void> {
     if (this.mode === 'loading' || this.mode === 'submitting') return
     if (this.mode === 'error' || this.mode === 'result' || this.cards.length === 0) {
-      if (input === 'select') await this.refresh()
+      if (input === 'select') await this.loadMissions()
       return
     }
     if (this.mode === 'confirm' && (input === 'next' || input === 'previous' || input === 'back')) {
@@ -266,6 +315,11 @@ export class KranzGlassesController {
     this.mode = 'submitting'
     await this.render()
     try {
+      const current = await this.api.missionState(card.summary.id)
+      const unchanged = action.kind === 'question-answer'
+        ? JSON.stringify(openQuestion(current)) === JSON.stringify(openQuestion(card.state))
+        : JSON.stringify(current.pendingGrantRequest) === JSON.stringify(card.state?.pendingGrantRequest)
+      if (!unchanged) throw new Error('Decision changed. Tap to refresh and review again.')
       if (action.kind === 'question-answer') {
         await this.api.answerQuestion(
           card.summary.id,

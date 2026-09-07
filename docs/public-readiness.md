@@ -32,6 +32,16 @@ Making Kranz public exposes every reachable Git object and every existing
 GitHub release asset. It is an operator action, separate from merging ordinary
 hardening changes. Keep the repository private until every item below is true.
 
+## Even G2 companion scope
+
+The owner intends to include the Even Realities feature at go-live. The
+experimental source/QR client needs its [physical acceptance receipt](even-g2-acceptance.md)
+and exact-candidate CI. An installable Even Hub app additionally needs the
+[production distribution work](even-g2-distribution.md); building an `.ehpk`
+does not establish that it can connect to Kranz. Include the chosen scope,
+third-party notices and new files in the final owner review and release audits.
+Neither scope changes the current private-repository/publication hold.
+
 ## Repository content
 
 - `scripts/audit-public-tree.sh` passes on the exact proposed public commit.

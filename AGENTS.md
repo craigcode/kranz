@@ -36,7 +36,7 @@ cd apps/dashboard && npx tsc -b && npm run test && npm run build && npm run sync
 # hash can pass here and still fail in CI.
 
 # Experimental Even G2 client (when apps/even-g2 changed):
-cd apps/even-g2 && npm run test && npm run build && npm run lint
+cd apps/even-g2 && npm ci && npm audit --audit-level=high && npm run test && npm run pack && npm run lint
 
 # Operate:
 kranz serve                     # dashboard + REST/WS on 127.0.0.1:4560

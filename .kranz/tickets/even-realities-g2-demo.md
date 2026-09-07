@@ -28,6 +28,12 @@ any mutation that cannot be fully reviewed on 576x288 stay out of scope.
 Do not publish the `.ehpk` yet. A production Even Hub package needs a separate
 HTTPS relay/origin design and must never embed or URL-encode a serve token.
 
+## Operator session
+
+Follow [the hardware runbook](../../docs/even-g2-acceptance.md). Record actual
+device results; CI and package construction are not a physical receipt.
+Production install scope is tracked separately in `even-g2-production-distribution`.
+
 ## Acceptance hints
 
 - `npm ci`, test, build, lint, and simulator start pass under `apps/even-g2`.

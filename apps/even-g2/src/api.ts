@@ -53,7 +53,9 @@ export class HttpKranzApi implements KranzApi {
     const headers = new Headers(init?.headers)
     const authority = mutationToken()
     if (authority !== null) headers.set('x-kranz-token', authority)
-    const response = await this.fetchImpl(`${this.base}${path}`, { ...init, headers })
+    const response = await this.fetchImpl(`${this.base}${path}`, {
+      ...init, headers, signal: AbortSignal.timeout(8_000), redirect: 'error',
+    })
     if (!response.ok) throw await responseError(response)
     const contentType = response.headers.get('content-type') ?? ''
     if (!contentType.includes('application/json')) {

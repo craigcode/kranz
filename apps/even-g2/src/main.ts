@@ -65,13 +65,13 @@ async function paceBridgeWrites(): Promise<void> {
 }
 
 function frameText(frame: DisplayFrame): string {
-  return `${frame.title}\n\n${frame.body}\n\n${frame.footer}`.trim()
+  return `${frame.title}\n${frame.body}\n${frame.footer}`.trim()
 }
 
 async function renderGlasses(frame: DisplayFrame): Promise<void> {
   const content = frameText(frame)
   mirrorElement.textContent = content
-  rendering = rendering.then(async () => {
+  rendering = rendering.catch(() => undefined).then(async () => {
     await paceBridgeWrites()
     if (!pageCreated) {
       const main = new TextContainerProperty({
@@ -104,7 +104,7 @@ async function renderGlasses(frame: DisplayFrame): Promise<void> {
       lastBridgeWriteAt = Date.now()
       return
     }
-    await bridge.textContainerUpgrade(
+    const updated = await bridge.textContainerUpgrade(
       new TextContainerUpgrade({
         containerID: 1,
         containerName: 'kranz',
@@ -112,6 +112,7 @@ async function renderGlasses(frame: DisplayFrame): Promise<void> {
         textColor: 4,
       }),
     )
+    if (!updated) throw new Error('Glasses display update failed; refresh before deciding')
     lastBridgeWriteAt = Date.now()
   })
   await rendering

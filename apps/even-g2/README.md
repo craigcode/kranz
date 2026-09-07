@@ -48,7 +48,8 @@ before making a decision. The token is stored only in `sessionStorage` and is
 sent in `x-kranz-token`; it is never placed in the URL.
 
 Live development refuses to start unless an unauthenticated `/api/repos` probe
-gets `401`. This matters because Vite is LAN-facing for phone sideloading: a
+gets `401`. Each proxied request requires a token header and repeats that probe
+to detect a server restarted without read authentication. This matters because Vite is LAN-facing for phone sideloading: a
 loopback Kranz serve without `--read-auth` would otherwise become a tokenless
 LAN read proxy.
 
@@ -73,7 +74,10 @@ trusted loopback proxy to Kranz.
 - double-tap: exit.
 
 Every mutation requires a review screen followed by a separate confirmation
-tap. A server rejection is shown without retrying or silently treating the
+tap. Input is ignored while a screen is drawing or a request is in flight.
+The selected request is fetched again before sending; changed requests need
+a fresh review. `QUEUED` means the server accepted the decision into its inbox,
+not that the mission has resumed. A server rejection is shown without retrying or silently treating the
 decision as accepted.
 
 ## Packaging boundary
@@ -83,6 +87,18 @@ first slice is a development sideload, not a production Even Hub publication.
 A hosted package needs a separately designed HTTPS relay/origin policy so it
 can reach a Kranz server without weakening Kranz's Host, CORS, and token
 boundaries. Do not publish the package with a baked-in serve token.
+
+Decisions must fit without abbreviation: question/command at most 56 printable
+ASCII characters, each answer at most 28, repository label at most 28, mission
+id at most 20. Other decisions defer to the dashboard or Slack. Mission lists
+are snapshots (up to eight prioritized missions), not a live notification feed.
+
+See [hardware acceptance](../../docs/even-g2-acceptance.md) for the device
+checklist and [distribution scope](../../docs/even-g2-distribution.md) for
+the remaining production work. Development sideloads carry the token over
+HTTP on the LAN: use a private trusted network and a disposable repository,
+then stop both servers. The token grants full serve mutation authority; it
+is not a wearable-scoped credential.
 
 The app follows the official MIT-licensed Even Hub minimal/text-heavy starter
 patterns. See [NOTICE.md](NOTICE.md).
