@@ -1400,6 +1400,7 @@ mod tests {
             command_grants: Vec::new(),
             touch_set: vec!["src/**".to_string()],
             standards_manifest: Some(Box::new(pin)),
+            reviewer_independence: None,
         };
         let finding = |rule: &PinnedRule| Finding {
             subject: format!("flight-rule:{}", rule.id),
@@ -2105,6 +2106,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 

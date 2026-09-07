@@ -838,6 +838,7 @@ impl MissionEngine {
                 Role::ValidatorFunctional => &mut cfg.validator_functional,
             };
             role_cfg.model = config::effective_model(role, kind, &role_cfg.model);
+            role_cfg.backend = Some(kind.as_str().to_string());
         };
 
         match requested {
@@ -878,6 +879,12 @@ impl MissionEngine {
                     }
                     Err(err) => {
                         set_effective_model(&mut cfg, BackendKind::Claude);
+                        // Preserve an explicitly configured Claude model, but
+                        // never send a failed provider's model id to Claude.
+                        if config::model_tier(BackendKind::Claude, &cfg.role(role).model).is_none()
+                        {
+                            cfg = self.claude_fallback_cfg_for_role(role);
+                        }
                         SelectedBackend {
                             backend: Arc::clone(&self.backend),
                             kind: BackendKind::Claude,
@@ -1026,14 +1033,14 @@ impl MissionEngine {
             Role::Orchestrator | Role::ValidatorScrutiny => "opus",
             Role::Worker | Role::ValidatorFunctional => "sonnet",
         };
-        match role {
-            Role::Orchestrator => cfg.orchestrator.model = fallback_model.to_string(),
-            Role::Worker => cfg.worker.model = fallback_model.to_string(),
-            Role::ValidatorScrutiny => cfg.validator_scrutiny.model = fallback_model.to_string(),
-            Role::ValidatorFunctional => {
-                cfg.validator_functional.model = fallback_model.to_string()
-            }
-        }
+        let role_cfg = match role {
+            Role::Orchestrator => &mut cfg.orchestrator,
+            Role::Worker => &mut cfg.worker,
+            Role::ValidatorScrutiny => &mut cfg.validator_scrutiny,
+            Role::ValidatorFunctional => &mut cfg.validator_functional,
+        };
+        role_cfg.model = fallback_model.to_string();
+        role_cfg.backend = Some("claude".into());
         cfg
     }
 
@@ -1164,6 +1171,11 @@ impl MissionEngine {
                 self.state.mission.status
             )));
         }
+        crate::reviewer_independence::validate_config(&self.state.config)?;
+        crate::reviewer_independence::pin_plan(
+            &mut plan,
+            crate::reviewer_independence::configured_policy(&self.state.config),
+        )?;
         if plan.milestones.is_empty() {
             return Err(EngineError::InvalidState(
                 "plan has no milestones".to_string(),
@@ -2276,7 +2288,11 @@ impl MissionEngine {
     /// `feature.skipped`, and features the revision adds are appended via
     /// `fixfeature.created`. The full revised plan is written + committed as
     /// `revised-plan.md`, and an `orchestrator.decision` summarizes the change.
-    pub fn approve_revised_plan(&mut self, plan: Plan) -> Result<()> {
+    pub fn approve_revised_plan(&mut self, mut plan: Plan) -> Result<()> {
+        crate::reviewer_independence::pin_plan(
+            &mut plan,
+            self.state.mission.reviewer_independence,
+        )?;
         // State gate: re-planning is for live missions only.
         match self.state.mission.status {
             MissionStatus::Running | MissionStatus::Blocked => {}
@@ -5180,6 +5196,47 @@ impl MissionEngine {
         Some(rendered)
     }
 
+    fn block_reviewer_independence(&mut self, milestone_id: &str, detail: String) -> Result<()> {
+        let reason = format!(
+            "reviewer independence blocked: {detail}; restore a compatible reviewer/worker \
+             pairing or start a newly approved mission; the approved requirement cannot be waived"
+        );
+        self.emit_decision(&reason, None)?;
+        self.emit(EventKind::MilestoneBlocked {
+            milestone_id: milestone_id.to_string(),
+            reason,
+        })?;
+        Ok(())
+    }
+
+    /// Called for the resolved primary, retry and confirmation before any
+    /// validator snapshot or paid session. The approved pin, not live config,
+    /// selects which roles must satisfy the requirement.
+    fn check_reviewer_independence(
+        &mut self,
+        milestone_id: &str,
+        role: Role,
+        backend: BackendKind,
+        cfg: &MissionConfig,
+    ) -> Result<bool> {
+        match crate::reviewer_independence::check_dispatch(
+            &self.state,
+            role,
+            backend,
+            &cfg.role(role).model,
+        ) {
+            Ok(Some(detail)) => {
+                self.emit_decision("reviewer independence satisfied", Some(detail))?;
+                Ok(true)
+            }
+            Ok(None) => Ok(true),
+            Err(detail) => {
+                self.block_reviewer_independence(milestone_id, detail)?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Milestone validation: scrutiny then functional validators (v1:
     /// sequential; each skippable by config). Findings go to the conversion
     /// turn, where the orchestrator turns each into a fix feature or waives
@@ -5189,6 +5246,17 @@ impl MissionEngine {
         self.emit(EventKind::MilestoneValidating {
             milestone_id: milestone_id.clone(),
         })?;
+        if let Some(policy) = self.state.mission.reviewer_independence {
+            if (policy.scrutiny && self.state.config.skip_scrutiny)
+                || (policy.functional && self.state.config.skip_functional)
+            {
+                self.block_reviewer_independence(
+                    &milestone_id,
+                    "a required reviewer is disabled by live config".into(),
+                )?;
+                return Ok(());
+            }
+        }
 
         // Golden-data reset between rounds (design D-D): when the workspace
         // contract's data block opts in (`resetBetweenRounds`) and declares
@@ -5343,6 +5411,10 @@ impl MissionEngine {
             let backend = Arc::clone(&selected.backend);
             let cfg = selected.cfg;
 
+            if !self.check_reviewer_independence(&milestone_id, role, selected_kind, &cfg)? {
+                return Ok(());
+            }
+
             // Validator snapshot (the follow-up to ticket
             // validator-immutability-proof): the validator never sees the
             // real checkout — it runs in a throwaway copy (HEAD + the
@@ -5479,6 +5551,9 @@ impl MissionEngine {
                 } else {
                     (cfg.clone(), Arc::clone(&backend))
                 };
+                if !self.check_reviewer_independence(&milestone_id, role, retry_kind, &retry_cfg)? {
+                    return Ok(());
+                }
                 // The retry is a fresh validator session: its own throwaway
                 // snapshot (the real checkout provably untouched by the
                 // primary — the isolation guarantees it, the tripwire
@@ -5804,6 +5879,14 @@ impl MissionEngine {
             None,
         )?;
         let confirm_cfg = self.claude_fallback_cfg_for_role(role);
+        if !self.check_reviewer_independence(
+            milestone_id,
+            role,
+            BackendKind::Claude,
+            &confirm_cfg,
+        )? {
+            return Ok(None);
+        }
         let confirm_backend = Arc::clone(&self.backend);
         // The confirmation is a fresh validator session: its own throwaway
         // snapshot (the real checkout provably untouched by the local
@@ -7528,6 +7611,7 @@ impl MissionEngine {
             .count();
         let run_id = format!("orch-{}", orch_count + 1);
         let run_meta = runner::RunMeta {
+            backend: Some(cfg.backend_kind(Role::Orchestrator)),
             run_id,
             role: Role::Orchestrator,
             feature_id: None,
@@ -7701,6 +7785,7 @@ impl MissionEngine {
             .open(self.paths.transcript_file(&run_id))?;
 
         self.emit(EventKind::WorkerSpawned {
+            backend: Some(BackendKind::Claude),
             run_id: run_id.clone(),
             role: Role::Orchestrator,
             feature_id: None,
@@ -7919,6 +8004,7 @@ impl MissionEngine {
                     // re-serialization — dropping it would silently rewrite
                     // the approved consent artifact.
                     standards_manifest: mission.standards_manifest.clone().map(Box::new),
+                    reviewer_independence: mission.reviewer_independence,
                 };
                 Ok(serde_json::to_string_pretty(&plan)?)
             }
@@ -8570,6 +8656,10 @@ fn preview_config_patch(current: &MissionConfig, patch: &serde_json::Value) -> R
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "reviewer_independence_tests.rs"]
+mod reviewer_independence_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::judgement::lesson_orch_script;
@@ -8816,6 +8906,7 @@ pub(crate) mod tests {
             command_grants: vec![],
             touch_set,
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -10095,6 +10186,7 @@ pub(crate) mod tests {
             questions: None,
         };
         let run = WorkerRun {
+            backend: None,
             id: "run-1".to_string(),
             role: Role::Worker,
             feature_id: Some("f1".to_string()),
@@ -10174,6 +10266,7 @@ pub(crate) mod tests {
                 egress_grants: vec![],
                 executor_route: None,
                 standards_manifest: None,
+                reviewer_independence: None,
             },
             runs,
             totals: TokenUsage::default(),
@@ -10733,6 +10826,7 @@ pub(crate) mod tests {
         });
         engine
             .emit(EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "run-worker".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -12261,6 +12355,7 @@ pub(crate) mod tests {
         // reference as a corruption guard, so the run must exist).
         engine
             .emit(EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".to_string(),
                 role: Role::Worker,
                 feature_id: None,
@@ -12426,6 +12521,7 @@ pub(crate) mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 standards_manifest: None,
+                reviewer_independence: None,
             })
             .expect("approve plan");
         engine
@@ -12436,6 +12532,7 @@ pub(crate) mod tests {
             .unwrap();
         engine
             .emit(EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -15662,6 +15759,7 @@ pub(crate) mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         };
 
         engine.approve_plan(plan.clone()).unwrap();

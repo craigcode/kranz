@@ -45,6 +45,51 @@ its proving test.
 
 ## Surface inventory
 
+### Reviewer independence (`reviewerIndependence`)
+
+Set before creating a mission, for example:
+
+```json
+{
+  "worker": {"backend": "codex", "model": "gpt-5.6-sol"},
+  "validatorScrutiny": {"backend": "claude", "model": "opus"},
+  "reviewerIndependence": {"scrutiny": true, "functional": false}
+}
+```
+
+Both switches default to false. Each enabled role must use a known model family
+different from **every worker attempt recorded in the mission**, including
+repairs, failed attempts, parallel workers and discarded pool candidates. This
+conservative scope also covers earlier milestones' influence. A mixed-family
+worker pool may therefore require a third family for review.
+
+The engine includes the policy in the plan preview and pins it in `plan.json`
+and `plan.approved`. Runtime patches cannot change it; plan revisions must retain
+it. The separate mission pin remains authoritative after config changes and
+restart. A skipped required reviewer, unknown worker provenance or a same-family
+resolved reviewer blocks the milestone with a durable explanation, before the
+reviewer launches. Fix the pairing and rerun validation, or approve a new mission
+with a different policy. There is no automatic waiver.
+
+Every new `worker.spawned` event records the **resolved** backend and model.
+The check runs after backend discovery/fallback and again for retry and local
+PASS confirmation sessions. A missing Droid reviewer may fall back to Claude
+only if Claude still differs from all recorded workers. A missing worker backend
+that falls back to Claude is recorded as Claude, regardless of the original
+configuration. Different versions, effort settings, CLIs or billing accounts
+within one family do not count as independence.
+
+The conservative catalog recognizes Claude, GPT, GLM and Kimi through supported
+dispatch identifiers. Unmapped identifiers and automatic selection fail closed;
+local endpoints and ACP cannot currently establish a family for this strict gate.
+This records requested dispatch identity, not provider-side attestation or proof
+of statistically independent errors. Existing containment requirements still
+apply: the example keeps reviewers on Claude so the process wrapper is available.
+No independence setting opts into uncontained validation.
+
+Old plans and logs omit the optional fields and retain their prior behavior.
+Regression coverage: `cargo test --workspace reviewer_independence`.
+
 ### 1. Role permission profiles and worker deny-rule grants (`crates/engine/src/permissions.rs`)
 
 - **Composition: extends.** Config `denyPatterns` are appended to the

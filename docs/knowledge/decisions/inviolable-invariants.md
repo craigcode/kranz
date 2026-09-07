@@ -2,8 +2,9 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - crates/engine/src/control.rs
   - crates/engine/src/paths.rs
@@ -62,6 +63,16 @@ sweep) uses the pinned sha, never the moving branch name.
 WHY: incident m-660ffc — a contract's `git diff main` assertion raced a commit
 landing on the base branch mid-mission (design.md deviation 6). Re-resolving the
 base anywhere after approval reintroduces that race.
+
+## Approved reviewer independence survives fallback
+
+An enabled `reviewerIndependence` role must retain a known different model family
+from every recorded worker attempt. The approved plan owns this policy; live
+config and plan revisions cannot relax it. Each resolved reviewer, retry and
+confirmation is checked before launch; unknown identity, same-family fallback
+or a skipped required role blocks the milestone. Containment remains a separate
+requirement. [Implementation](../../../crates/engine/src/reviewer_independence.rs);
+[configuration](../../config-composition.md#reviewer-independence-reviewerindependence).
 
 ## The event log is append-only, single-writer, redact-at-write, sealed
 

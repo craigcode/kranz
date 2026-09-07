@@ -172,6 +172,7 @@ fn completed_mission_events(
                     command_grants: vec![],
                     touch_set: vec![],
                     standards_manifest: None,
+                    reviewer_independence: None,
                 },
                 base_sha: None,
             },

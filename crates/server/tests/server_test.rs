@@ -59,6 +59,7 @@ fn sample_plan() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -88,6 +89,7 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
     })
     .unwrap();
     log.append(EventKind::WorkerSpawned {
+        backend: None,
         run_id: "run-1".into(),
         role: Role::Worker,
         feature_id: Some("f-1-1".into()),

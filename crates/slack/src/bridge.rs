@@ -3008,6 +3008,7 @@ mod tests {
                     command_grants: vec![],
                     touch_set: vec![],
                     standards_manifest: None,
+                    reviewer_independence: None,
                 },
                 base_sha: None,
             },
@@ -3089,6 +3090,7 @@ mod tests {
         append(
             4,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),
@@ -3159,6 +3161,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -3227,6 +3230,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 

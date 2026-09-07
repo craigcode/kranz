@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Optional reviewer-independence requirements are pinned at plan approval and
+  checked against recorded worker model families after backend resolution,
+  fallback and retry. Unknown identities or skipped required reviewers block.
+- Run records and provenance exports now identify the resolved backend;
+  fallback no longer leaves the requested backend in new run evidence.
+
 ## 0.2.0 - 2026-09-05
 
 - Security: Linux sandbox private-workspace rebinds preserve Git metadata

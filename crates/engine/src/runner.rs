@@ -169,6 +169,7 @@ pub struct RunMeta {
     pub feature_id: Option<String>,
     pub milestone_id: Option<String>,
     pub model: String,
+    pub backend: Option<crate::types::BackendKind>,
     pub prompt_hash: String,
     /// The effective executor route + deciding rule (ticket
     /// `routing-rules-config`), stamped onto `worker.spawned`. The caller
@@ -294,6 +295,7 @@ pub async fn run_session_to(
         .clone()
         .unwrap_or_else(|| spec.session_id.clone());
     log.record(EventKind::WorkerSpawned {
+        backend: run_meta.backend,
         run_id: run_meta.run_id.clone(),
         role: run_meta.role,
         feature_id: run_meta.feature_id.clone(),
@@ -1224,6 +1226,7 @@ fn build_worker_spec(
     }
 
     let run_meta = RunMeta {
+        backend: Some(cfg.backend_kind(role)),
         run_id,
         role,
         feature_id: Some(feature.id.clone()),
@@ -1551,6 +1554,7 @@ pub async fn run_validator_in(
     );
 
     let run_meta = RunMeta {
+        backend: Some(cfg.backend_kind(kind)),
         run_id: uuid::Uuid::new_v4().to_string(),
         role: kind,
         feature_id: None,

@@ -370,6 +370,7 @@ mod tests {
             egress_grants: vec![],
             executor_route: None,
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 

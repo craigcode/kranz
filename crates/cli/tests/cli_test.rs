@@ -99,6 +99,7 @@ fn sample_plan() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -664,6 +665,7 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
                 feature_id: "f-1-1".to_string(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-1".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -767,6 +769,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 feature_id: "f-1-1".to_string(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-pass".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -807,6 +810,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 feature_id: "f-1-2".to_string(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-fail".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-2".to_string()),
@@ -910,6 +914,7 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                 feature_id: "f-1-1".to_string(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-a-pass".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -990,6 +995,7 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
                 feature_id: "f-1-1".to_string(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-pass".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -1027,6 +1033,7 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
                 commits: vec!["abc feature one".to_string()],
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "w-cand".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),
@@ -1606,6 +1613,7 @@ fn seed_open_question(repo: &Path, mission: &str) {
                 start_sha: "abc1234".into(),
             },
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),
@@ -2045,6 +2053,7 @@ fn renderer_tags_worker_lines_and_truncates() {
         1,
         "m-1",
         EventKind::WorkerSpawned {
+            backend: None,
             run_id: "w-1".to_string(),
             role: Role::Worker,
             feature_id: Some("f-1-2".to_string()),

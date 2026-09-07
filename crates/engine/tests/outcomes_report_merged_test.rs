@@ -163,6 +163,7 @@ fn completed_mission_events(
             mission_id,
             terminal_ms - 2_000,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".into(),
                 role: Role::Worker,
                 feature_id: None,

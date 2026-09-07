@@ -72,6 +72,7 @@ pub mod queue;
 pub mod reducer;
 pub mod report_render;
 pub mod review_artifact;
+pub mod reviewer_independence;
 pub mod routing;
 pub mod routing_rules;
 pub mod sandbox;

@@ -2827,6 +2827,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         };
         let first = plan_identity(&plan);
         assert_eq!(first, plan_identity(&plan.clone()), "stable for one plan");

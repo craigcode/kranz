@@ -2,7 +2,7 @@
 title: The two readiness axes — AMM projection and contract/consent health
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-18
+last_verified: 2026-09-07
 verified_against:
   - crates/cli/src/ready.rs
   - crates/cli/src/amm.rs

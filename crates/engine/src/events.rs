@@ -173,6 +173,9 @@ pub enum EventKind {
         #[serde(rename = "sdkSessionId")]
         sdk_session_id: String,
         model: String,
+        /// Actual dispatch backend after resolution/fallback; absent in old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<crate::types::BackendKind>,
         /// Quantization of the model weights used for this run (provenance).
         #[serde(default = "default_quant")]
         quant: String,
@@ -1201,6 +1204,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -2090,6 +2094,7 @@ mod tests {
     fn dispatch_pool_worker_spawned_candidate_is_additive() {
         fn spawned(candidate: Option<CandidateLink>) -> EventKind {
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),
@@ -2154,6 +2159,7 @@ mod tests {
     fn routing_rules_config_worker_spawned_executor_route_is_additive() {
         fn spawned(executor_route: Option<crate::types::ExecutorRoute>) -> EventKind {
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),

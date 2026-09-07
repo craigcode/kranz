@@ -264,11 +264,13 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
     fn spawn(run_id: &str, feature_id: &str) -> crate::events::EventKind {
         crate::events::EventKind::WorkerSpawned {
+            backend: None,
             run_id: run_id.to_string(),
             role: Role::Worker,
             feature_id: Some(feature_id.to_string()),

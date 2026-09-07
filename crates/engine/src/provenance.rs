@@ -35,15 +35,14 @@
 //! seq and carries the ladder position fields verbatim for any reader that
 //! wants to re-derive pipeline structure.
 //!
-//! WHY `backend` is the one DERIVED field: `worker.spawned` records the
-//! model, quant, weight hash, and prompt hash verbatim, but not the backend
-//! that drove the session — the backend is a property of the mission's
-//! config. The fold tracks the config the log itself records
+//! `backend` comes from the resolved `worker.spawned` identity when present,
+//! so fallback and pool dispatch remain visible. Older logs omitted it: for
+//! those alone the fold tracks the config the log itself records
 //! (`mission.created`'s [`crate::types::MissionConfig`], evolved by each
 //! `config.changed` patch through the reducer's OWN deep-merge, so the
 //! replay can never drift from the state fold) and derives each spawn's
-//! backend from the config in force AT THAT SEQ: a mid-mission backend flip
-//! shows in exactly the spawns after it. An invalid patch fails the replay
+//! backend from the config in force AT THAT SEQ. That legacy derivation cannot
+//! establish the actual backend after fallback. An invalid patch fails the replay
 //! exactly as it fails the reducer's fold — a log the reducer would reject
 //! is corruption, not a provenance gap.
 //!
@@ -146,9 +145,8 @@ pub struct SessionLink {
     pub seq: u64,
     pub run_id: String,
     pub role: Role,
-    /// DERIVED, not recorded (module docs): the backend the mission's
-    /// recorded config named for this role at this seq. `None` only when the
-    /// log carries no `mission.created` before the spawn (a hand-cut log).
+    /// Recorded resolved backend, or config-derived for legacy spawns only.
+    /// `None` when neither a dispatch identity nor preceding config exists.
     pub backend: Option<String>,
     pub model: String,
     pub quant: String,
@@ -508,14 +506,17 @@ pub fn provenance_chain(
                 weight_hash,
                 prompt_hash,
                 transcript_path,
+                backend,
                 ..
             } => chain.sessions.push(SessionLink {
                 seq: event.seq,
                 run_id: run_id.clone(),
                 role: *role,
-                backend: config
-                    .as_ref()
-                    .map(|config| config.backend_kind(*role).as_str().to_string()),
+                backend: backend.map(|kind| kind.as_str().to_string()).or_else(|| {
+                    config
+                        .as_ref()
+                        .map(|cfg| cfg.backend_kind(*role).as_str().to_string())
+                }),
                 model: model.clone(),
                 quant: quant.clone(),
                 weight_hash: weight_hash.clone(),
@@ -595,6 +596,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -639,6 +641,7 @@ mod tests {
 
     fn worker_spawned(run_id: &str, role: Role, model: &str, prompt_hash: &str) -> EventKind {
         EventKind::WorkerSpawned {
+            backend: None,
             run_id: run_id.to_string(),
             role,
             feature_id: None,

@@ -1784,6 +1784,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -1922,6 +1923,7 @@ mod tests {
                         3,
                         20,
                         EventKind::WorkerSpawned {
+                            backend: None,
                             run_id: "r-1".into(),
                             role: Role::Worker,
                             feature_id: Some("f-1-1".into()),
@@ -2017,6 +2019,7 @@ mod tests {
                         2,
                         10,
                         EventKind::WorkerSpawned {
+                            backend: None,
                             run_id: "r-1".into(),
                             role: Role::Worker,
                             feature_id: None,
@@ -2490,6 +2493,7 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 standards_manifest: None,
+                reviewer_independence: None,
             }
         }
 
@@ -2518,6 +2522,7 @@ mod tests {
 
         fn worker_spawned(run_id: &str) -> EventKind {
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: run_id.into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),

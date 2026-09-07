@@ -2,8 +2,9 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/config.rs
@@ -43,6 +44,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Validator** — the checking roles: **scrutiny** (adversarial review) and
   **functional** (runs the contract's command gates). Configurable floors apply
   to autonomous runs.
+- **Reviewer independence** — optional approval-pinned requirement that a reviewer
+  use a known model family different from every recorded worker attempt; backend
+  fallback, retries and restart must preserve it. See
+  [config composition](../config-composition.md#reviewer-independence-reviewerindependence).
 - **base_sha** — the base branch tip pinned at approval. All contract/final-gate
   diffs are taken against it; it is never re-resolved later.
 - **Plan identity** — a short sha256 over a plan's canonical JSON. A Slack

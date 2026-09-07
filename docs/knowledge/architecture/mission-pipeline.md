@@ -2,8 +2,9 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
   - crates/engine/src/types.rs
@@ -35,6 +36,13 @@ resolves the global kranz dir (`$KRANZ_HOME`, else `~/.kranz`), which holds the
 per-repository authority key, seal floors, and high-water marks. They live
 outside the repo because that is the one place an agent with repo write access
 cannot reach.
+
+`plan.approved` also pins optional `reviewerIndependence` requirements. They
+fold into the mission separately from live config; revisions cannot replace
+them. New `worker.spawned` records carry resolved backend provenance alongside
+the model, including sequential, buffered parallel and pool runs. Missing
+provenance never satisfies a strict review requirement. See
+[config composition](../../config-composition.md#reviewer-independence-reviewerindependence).
 
 ## Log rules (event_log.rs)
 

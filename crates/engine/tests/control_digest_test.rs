@@ -429,6 +429,7 @@ fn plan() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -461,6 +462,7 @@ fn digest_events() -> Vec<Event> {
         ev(
             5,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-1".to_string(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".to_string()),

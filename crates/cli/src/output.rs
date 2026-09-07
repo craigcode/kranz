@@ -139,6 +139,19 @@ pub fn render_status(state: &MissionState) -> String {
 pub fn render_plan(plan: &Plan) -> String {
     let mut out = String::new();
     out.push_str(&format!("PLAN — {}\n", sanitize_untrusted(&plan.goal)));
+    if let Some(policy) = plan.reviewer_independence {
+        for (required, role) in [
+            (policy.scrutiny, "scrutiny"),
+            (policy.functional, "functional"),
+        ] {
+            if required {
+                out.push_str(&format!(
+                    "reviewer independence: {role} must use a known model family \
+                    different from every recorded worker attempt; fallback cannot weaken this\n"
+                ));
+            }
+        }
+    }
 
     out.push_str("validation contract:\n");
     if plan.validation_contract.is_empty() {
@@ -1439,6 +1452,7 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 standards_manifest: None,
+                reviewer_independence: None,
             };
             let text = render_plan(&plan);
             assert!(
@@ -1562,6 +1576,7 @@ mod tests {
                 vec![
                     created("do the thing\n\n## Task class\nexecution-class\n"),
                     EventKind::WorkerSpawned {
+                        backend: None,
                         run_id: "r-1".into(),
                         role: kranz_engine::types::Role::Worker,
                         feature_id: None,
@@ -1951,6 +1966,7 @@ mod tests {
                 command_grants: vec![],
                 touch_set: vec![],
                 standards_manifest: None,
+                reviewer_independence: None,
             }
         }
 
@@ -1977,6 +1993,7 @@ mod tests {
 
         fn worker_spawned(run_id: &str, role: Role, model: &str, prompt_hash: &str) -> EventKind {
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: run_id.to_string(),
                 role,
                 feature_id: None,
@@ -2387,6 +2404,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         };
         let events = vec![
             Event {

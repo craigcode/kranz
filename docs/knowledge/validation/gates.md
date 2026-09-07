@@ -2,8 +2,9 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
@@ -230,6 +231,16 @@ define their own language/toolchain commands; see
 The engine **never pushes** ([AGENTS.md](../../../AGENTS.md) rule 4); a human
 runs `git push`. A non-blocking `StaleBaseWarning` fires when the pinned base
 trails ≥1 merge commit already on the live base.
+
+## Reviewer independence
+
+Optional approval-pinned `reviewerIndependence` requirements are checked against
+recorded worker backend/model identities after reviewer resolution and before
+every primary, retry and confirmation launch. Unknown identity, same-family
+fallback or skipping a required reviewer blocks with an event-log explanation;
+config changes and replay cannot erase the approval pin. Existing validator
+containment remains mandatory. See [config composition](../../config-composition.md#reviewer-independence-reviewerindependence)
+and [the gate](../../../crates/engine/src/reviewer_independence.rs).
 
 ## Secret scanning — three layers
 

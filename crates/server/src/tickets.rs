@@ -568,6 +568,7 @@ Ship the thing.
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 

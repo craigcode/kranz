@@ -104,6 +104,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // it was approved with — the mission's standards authority from
             // here on.
             state.mission.standards_manifest = plan.standards_manifest.as_deref().cloned();
+            state.mission.reviewer_independence = plan.reviewer_independence;
             state.mission.status = MissionStatus::Approved;
             state.latest_plan_revision = 0;
             state.pending_revision = None;
@@ -250,6 +251,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             executor_route: _,
             sdk_session_id,
             model,
+            backend,
             quant,
             weight_hash,
             prompt_hash,
@@ -278,6 +280,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.runs.insert(
                 run_id.clone(),
                 WorkerRun {
+                    backend: *backend,
                     id: run_id.clone(),
                     role: *role,
                     feature_id: feature_id.clone(),
@@ -868,6 +871,7 @@ fn initial_state(event: &Event) -> Result<MissionState> {
             deny_exceptions: Vec::new(),
             egress_grants: Vec::new(),
             standards_manifest: None,
+            reviewer_independence: None,
             // The seed-time route record (ticket routing-rules-config): the
             // folded task class exists only on THIS event's goal, so the
             // decision is derived here, once — deterministically equal to
@@ -942,6 +946,11 @@ fn take_pending_question(
 }
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
+    if plan.reviewer_independence != state.mission.reviewer_independence {
+        return Err(EngineError::Config(
+            "plan.revised cannot replace the approved reviewerIndependence policy".into(),
+        ));
+    }
     ensure_contract_extends(
         &state.mission.validation_contract,
         &plan.validation_contract,
@@ -1363,6 +1372,7 @@ mod hook_gate_projection_tests {
         event(
             seq,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: run_id.to_string(),
                 role: Role::Worker,
                 feature_id: None,
@@ -1483,6 +1493,7 @@ mod routing_abstraction_tests {
         event(
             seq,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: run_id.to_string(),
                 role: Role::Worker,
                 feature_id: None,

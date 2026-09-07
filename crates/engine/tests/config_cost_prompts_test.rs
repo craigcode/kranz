@@ -264,6 +264,7 @@ fn plan_with(features_per_milestone: &[usize]) -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -342,6 +343,7 @@ fn spawned(
     milestone_id: Option<&str>,
 ) -> EventKind {
     EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role,
         feature_id: feature_id.map(str::to_string),

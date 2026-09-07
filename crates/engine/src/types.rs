@@ -92,6 +92,9 @@ pub struct Mission {
     /// snapshot; additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standards_manifest: Option<StandardsPin>,
+    /// Operator policy pinned by plan approval, never replaced by live config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_independence: Option<ReviewerIndependence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +135,9 @@ pub struct Plan {
     /// `large_enum_variant` budget on `PlanRequest::Ready`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standards_manifest: Option<Box<StandardsPin>>,
+    /// Engine-owned review requirement, copied from configuration at approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_independence: Option<ReviewerIndependence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +493,9 @@ pub struct WorkerRun {
     /// Claude Code session id (UUID chosen by the engine, used for --resume).
     pub sdk_session_id: String,
     pub model: String,
+    /// Resolved dispatch backend, including fallback. Unknown in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendKind>,
     /// Quantization of the model weights used for this run (provenance).
     #[serde(default = "default_quant")]
     pub quant: String,
@@ -1180,7 +1189,8 @@ pub struct CandidateSpec {
 }
 
 /// Which [`AgentBackend`](crate::backend::AgentBackend) drives a role's sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     Claude,
     Codex,
@@ -1506,6 +1516,29 @@ pub struct HookStatusConfig {
     pub endpoint: String,
 }
 
+/// Require a known model family different from every recorded worker attempt.
+/// Dispatch identity does not prove statistically independent mistakes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct ReviewerIndependence {
+    pub scrutiny: bool,
+    pub functional: bool,
+}
+
+impl ReviewerIndependence {
+    pub fn is_empty(&self) -> bool {
+        !self.scrutiny && !self.functional
+    }
+
+    pub fn requires(&self, role: Role) -> bool {
+        match role {
+            Role::ValidatorScrutiny => self.scrutiny,
+            Role::ValidatorFunctional => self.functional,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MissionConfig {
@@ -1515,6 +1548,10 @@ pub struct MissionConfig {
     pub validator_functional: RoleConfig,
     pub skip_scrutiny: bool,
     pub skip_functional: bool,
+    /// Require a different model family for the selected reviewer roles.
+    /// Pinned at approval; cannot be changed through runtime config patches.
+    #[serde(default, skip_serializing_if = "ReviewerIndependence::is_empty")]
+    pub reviewer_independence: ReviewerIndependence,
     pub max_fix_cycles_per_milestone: u32,
     pub max_respawns: u32,
     pub max_parallel_workers: u32,
@@ -1701,6 +1738,7 @@ impl Default for MissionConfig {
             },
             skip_scrutiny: false,
             skip_functional: false,
+            reviewer_independence: ReviewerIndependence::default(),
             max_fix_cycles_per_milestone: 2,
             max_respawns: 2,
             max_parallel_workers: 1,

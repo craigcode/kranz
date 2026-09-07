@@ -907,6 +907,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// Validate invariants the engine relies on (plan §6). Returns
 /// [`EngineError::Config`] describing the first violation found.
 pub fn validate(cfg: &MissionConfig) -> Result<()> {
+    crate::reviewer_independence::validate_config(cfg)?;
     let roles = [
         ("orchestrator", &cfg.orchestrator),
         ("worker", &cfg.worker),
