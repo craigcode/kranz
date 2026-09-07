@@ -5,6 +5,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added an experimental Even Realities G2 thin client (`apps/even-g2`) that
+  renders mission status from the existing REST API and lets an operator
+  approve or deny a pending grant or pick a structured question's answer,
+  each behind a review screen and a separate confirmation tap. Development
+  sideload only; the physical-device receipt is tracked in the
+  `even-realities-g2-demo` ticket.
+
 ## 0.2.0 - 2026-09-05
 
 - Security: Linux sandbox private-workspace rebinds preserve Git metadata

@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 verified_against:
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
@@ -54,7 +54,9 @@ MSRV lane runs
 full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
-tests, and lint.
+tests, and lint. The Even G2 lane runs install, high-severity audit, tests,
+package construction (including type/build checks and license notices), and lint.
+Physical glasses acceptance remains a separate operator receipt.
 
 The supply-chain job also checks the four package MIT notices, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects

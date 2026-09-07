@@ -1,0 +1,31 @@
+{
+  "name": "kranz-even-g2",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:demo": "vite --mode demo",
+    "build": "tsc -b && vite build && node scripts/copy-notices.mjs",
+    "lint": "oxlint",
+    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.14",
+    "preview": "vite preview",
+    "simulate": "node node_modules/@evenrealities/evenhub-simulator/bin/index.js http://localhost:5174/?demo=1 --automation-port 9898",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "0.0.14"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "0.1.14",
+    "@evenrealities/evenhub-simulator": "0.9.3",
+    "@types/node": "^26.2.0",
+    "oxlint": "^1.78.0",
+    "typescript": "~5.9.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  }
+}
