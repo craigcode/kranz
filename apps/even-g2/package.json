@@ -21,9 +21,9 @@
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "0.1.14",
-    "@evenrealities/evenhub-simulator": "0.9.3",
-    "@types/node": "^26.2.0",
-    "oxlint": "^1.78.0",
+    "@evenrealities/evenhub-simulator": "0.9.5",
+    "@types/node": "^26.4.1",
+    "oxlint": "^1.81.0",
     "typescript": "~5.9.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10"
