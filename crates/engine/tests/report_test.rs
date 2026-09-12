@@ -29,6 +29,7 @@ fn plan() -> Plan {
                 statement: "the build succeeds".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test --workspace".into()),
+                negative_control: None,
                 pty_script: None,
             },
             Assertion {
@@ -36,6 +37,7 @@ fn plan() -> Plan {
                 statement: "the widget reads honestly".into(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                negative_control: None,
                 pty_script: None,
             },
         ],

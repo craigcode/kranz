@@ -24,7 +24,7 @@
 //! The agent backend is constructed lazily on first use, so a read-only
 //! `kranz serve` never needs a `claude` binary installed.
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorCode};
 use crate::ServerState;
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, State};
@@ -329,6 +329,7 @@ impl MissionHost {
                     ApiError::conflict(
                         "host.maxConcurrentRepos is saturated; retry when another repository finishes",
                     )
+                    .with_code(ApiErrorCode::RepositoryBusy)
                 })
             })
             .transpose()
@@ -690,7 +691,12 @@ impl MissionHost {
                         .insert(id.to_string(), new_planning(new_cell(engine)));
                 }
                 // Resume path: dropping `engine` releases the mission lock.
-                return Err(ApiError::from(e));
+                return Err(match e {
+                    e @ EngineError::LockHeld(_) => {
+                        ApiError::from(e).with_code(ApiErrorCode::RepositoryBusy)
+                    }
+                    other => other.into(),
+                });
             }
         };
 
@@ -736,7 +742,14 @@ impl MissionHost {
         // suite this handler future is dropped, but the detached blocking
         // merge keeps mutating the primary tree — a hold living here would
         // be released early, letting a dispatcher claim the busy repo.
-        let repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id)?;
+        let repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id).map_err(
+            |error| match error {
+                error @ EngineError::LockHeld(_) => {
+                    ApiError::from(error).with_code(ApiErrorCode::RepositoryBusy)
+                }
+                other => other.into(),
+            },
+        )?;
         let events = EventLog::read_events(&paths.events_file())?;
         let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
         if state.mission.status != MissionStatus::Complete {
@@ -1064,9 +1077,7 @@ impl MissionHost {
             }
             match self.drain_once().await {
                 Ok(_) => return true,
-                Err(e)
-                    if e.message
-                        .starts_with("host.maxConcurrentRepos is saturated") => {}
+                Err(e) if e.code == Some(ApiErrorCode::RepositoryBusy) => {}
                 Err(e) => tracing::error!(error = %e.message, "autoWork drain failed"),
             }
         }
@@ -1285,10 +1296,10 @@ impl MissionHost {
             PendingApproval::Approved(branch) => Ok(branch),
             PendingApproval::NothingParked => Err(ApiError::conflict(format!(
                 "mission '{id}' has no reviewed plan pending — refresh the plan preview before approving"
-            ))),
+            )).with_code(ApiErrorCode::StalePlan)),
             PendingApproval::Mismatch { .. } => Err(ApiError::conflict(
                 "reviewed plan identity is missing or stale — refresh the plan preview before approving",
-            )),
+            ).with_code(ApiErrorCode::StalePlan)),
         }
     }
 
@@ -1563,6 +1574,7 @@ impl MissionHost {
                  `kranz plan --mission {id}`, or start execution via POST \
                  /api/missions/{id}/start"
             ))
+            .with_code(ApiErrorCode::MissionNotHosted)
         } else {
             ApiError::not_found(format!("unknown mission '{id}'"))
         }
@@ -2094,6 +2106,7 @@ fn try_lock(
 
 fn turn_in_flight() -> ApiError {
     ApiError::conflict("a turn is in flight for this mission — wait for it to finish")
+        .with_code(ApiErrorCode::TurnInFlight)
 }
 
 /// Seed replies (fresh session / resume-ack / re-seed) happened first in the
@@ -2200,16 +2213,21 @@ pub(crate) async fn approve_mission(
 /// or `200 {"pending":false}`. The parked plan from the last Ready
 /// request-plan — what the approve affordances (buttons, ring) will commit.
 pub(crate) async fn pending_plan_route(
+    axum::Extension(reads): axum::Extension<crate::read_work::ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let id = valid_id(&server, &id)?;
-    Ok(Json(match server.host.pending_plan(&id) {
-        Some(plan) => {
-            json!({ "pending": true, "planIdentity": plan_identity(&plan), "plan": plan })
-        }
-        None => json!({ "pending": false }),
-    }))
+    reads
+        .run(move || {
+            let id = valid_id(&server, &id)?;
+            Ok(Json(match server.host.pending_plan(&id) {
+                Some(plan) => {
+                    json!({ "pending": true, "planIdentity": plan_identity(&plan), "plan": plan })
+                }
+                None => json!({ "pending": false }),
+            }))
+        })
+        .await
 }
 
 /// `POST /api/missions/:id/approve-pending` — body
@@ -2321,9 +2339,10 @@ pub(crate) async fn drain_queue_route(
 /// `GET /api/queue` → `200 {"entries":[...], "busyWith": <id|null>, "drain": {...}}`.
 /// See [`MissionHost::queue_state`]. Tokenless: read-only.
 pub(crate) async fn queue_state_route(
+    axum::Extension(reads): axum::Extension<crate::read_work::ReadWork>,
     State(server): State<Arc<ServerState>>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(server.host.queue_state()))
+    reads.run(move || Ok(Json(server.host.queue_state()))).await
 }
 
 /// Validate the URL id with the same traversal rules as the read endpoints.
@@ -2455,6 +2474,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_api_error_codes_match_dashboard_wire_fixtures() {
+        use http_body_util::BodyExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MissionPaths::new(dir.path(), "m-fixture");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        std::fs::write(paths.events_file(), "").unwrap();
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let mut host = MissionHost::with_backend(dir.path().to_path_buf(), backend);
+        host.global_run_permits = Some(Arc::new(Semaphore::new(0)));
+
+        // Exercise real host refusal paths, then the same IntoResponse used by
+        // Axum. Both languages consume this fixture; client-only mocks cannot
+        // silently invent a wire shape the server never emits.
+        let errors = [
+            ("mission_not_hosted", host.not_hosted("m-fixture")),
+            ("turn_in_flight", turn_in_flight()),
+            ("repository_busy", host.try_global_run_permit().unwrap_err()),
+            (
+                "stale_plan",
+                host.approve_pending("m-fixture", None).await.unwrap_err(),
+            ),
+            ("legacy", ApiError::conflict("mission is not hosted")),
+        ];
+        let mut actual = Vec::new();
+        for (name, error) in errors {
+            let response = error.into_response();
+            let status = response.status().as_u16();
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            actual.push(json!({ "name": name, "status": status, "body": body }));
+        }
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../apps/dashboard/src/lib/fixtures/api-errors.json"
+        ))
+        .unwrap();
+        assert_eq!(json!(actual), fixture);
+    }
+
+    #[tokio::test]
     async fn contended_planning_mutex_is_409_for_turns_and_start() {
         let Some((_dir, root)) = init_repo() else {
             return;
@@ -2473,6 +2533,7 @@ mod tests {
             .expect_err("turn must 409");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("turn is in flight"), "{}", err.message);
+        assert_eq!(err.code, Some(ApiErrorCode::TurnInFlight));
 
         let err = host
             .request_plan(&id)
@@ -2643,6 +2704,7 @@ mod tests {
 
         let err = host.start(&id).await.expect_err("start must 409 when busy");
         assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, Some(ApiErrorCode::RepositoryBusy));
         assert!(
             err.message.contains("busy"),
             "expected busy conflict, got: {}",
@@ -2670,6 +2732,7 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert!(error.message.contains("maxConcurrentRepos"));
+        assert_eq!(error.code, Some(ApiErrorCode::RepositoryBusy));
         assert!(
             host.planning_cell(&id).is_ok(),
             "refused start must restore the hosted engine"

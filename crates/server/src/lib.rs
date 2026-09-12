@@ -19,11 +19,12 @@ mod error;
 mod hooks;
 mod host;
 mod multi;
+mod read_work;
 mod rest;
 mod tickets;
 mod ws;
 
-pub use error::ApiError;
+pub use error::{ApiError, ApiErrorCode};
 pub use host::{MissionHost, PendingApproval};
 pub use multi::{
     load_host_config, HostConfig, MultiRepoHost, RepoActivity, RepoConfig, RepoContext,
@@ -233,28 +234,27 @@ pub fn router_with_read_authority_and_addr(
     require_read_token: bool,
 ) -> Router {
     let catalog = Arc::clone(&multi_host);
+    let catalog_reads = read_work::ReadWork::default();
     let mut app = Router::new().route("/api/health", get(rest::health)).route(
         "/api/repos",
         get(move || {
             let catalog = Arc::clone(&catalog);
-            async move {
-                let summaries = tokio::task::spawn_blocking(move || catalog.summaries())
-                    .await
-                    .map_err(|error| {
-                        ApiError::internal(format!("repository summary task failed: {error}"))
-                    })?;
-                Ok::<_, ApiError>(Json(summaries))
-            }
+            let reads = catalog_reads.clone();
+            async move { reads.run(move || Ok(Json(catalog.summaries()))).await }
         }),
     );
 
+    // The unscoped compatibility alias shares capacity with its scoped repo.
+    let mut repo_reads = std::collections::HashMap::new();
     for context in multi_host.contexts() {
         let prefix = format!("/api/repos/{}", context.id());
         match context.host().cloned() {
             Some(host) => {
+                let reads = read_work::ReadWork::default();
+                repo_reads.insert(context.id().to_string(), reads.clone());
                 app = app.nest(
                     &prefix,
-                    repo_context_router(context, host, bind_addr, bind_is_loopback),
+                    repo_context_router(context, host, bind_addr, bind_is_loopback, reads),
                 );
             }
             None => {
@@ -275,9 +275,13 @@ pub fn router_with_read_authority_and_addr(
     if let Some(context) = multi_host.compatibility_context() {
         match context.host().cloned() {
             Some(host) => {
+                let reads = repo_reads
+                    .entry(context.id().to_string())
+                    .or_default()
+                    .clone();
                 app = app.nest(
                     "/api",
-                    repo_context_router(context, host, bind_addr, bind_is_loopback),
+                    repo_context_router(context, host, bind_addr, bind_is_loopback, reads),
                 );
             }
             // An explicit `defaultRepo` is not health-filtered; the whole
@@ -399,6 +403,7 @@ fn repo_context_router(
     host: Arc<MissionHost>,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
+    reads: read_work::ReadWork,
 ) -> Router {
     let state = Arc::new(ServerState {
         repo_root: context.root().to_path_buf(),
@@ -406,7 +411,9 @@ fn repo_context_router(
         bind_addr,
         bind_is_loopback,
     });
-    repo_api_routes().with_state(state)
+    repo_api_routes()
+        .layer(axum::Extension(reads))
+        .with_state(state)
 }
 
 fn repo_api_routes() -> Router<Arc<ServerState>> {

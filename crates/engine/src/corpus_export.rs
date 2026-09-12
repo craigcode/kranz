@@ -416,6 +416,7 @@ fn escalation_records(mission_id: &str, events: &[Event]) -> Vec<EscalationRecor
         let EventKind::MilestoneBlocked {
             milestone_id,
             reason,
+            ..
         } = &block.kind
         else {
             continue;
@@ -442,12 +443,14 @@ fn escalation_records(mission_id: &str, events: &[Event]) -> Vec<EscalationRecor
                 let decided = mission_events[i];
                 let EventKind::MilestoneUnblocked {
                     reason: unblock_reason,
+                    block_context,
                     ..
                 } = &decided.kind
                 else {
                     unreachable!("matched only milestone.unblocked above")
                 };
-                if crate::escalation_metrics::is_engine_lift(unblock_reason) {
+                if crate::escalation_metrics::is_engine_lift(unblock_reason, block_context.as_ref())
+                {
                     continue;
                 }
                 let latency = (decided.ts - block.ts).num_milliseconds();
@@ -687,6 +690,7 @@ mod tests {
             ev(
                 12,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "divergence on f-1-1: candidates disagree".to_string(),
                 },
@@ -694,6 +698,7 @@ mod tests {
             ev(
                 13,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "kept candidate 0".to_string(),
                     validator_guidance: None,
@@ -753,6 +758,7 @@ mod tests {
             ev(
                 22,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "workspace gate: bootstrap failed".to_string(),
                 },
@@ -760,6 +766,7 @@ mod tests {
             ev(
                 23,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
                     validator_guidance: None,

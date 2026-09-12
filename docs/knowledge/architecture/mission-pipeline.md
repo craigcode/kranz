@@ -8,6 +8,9 @@ verified_against:
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
   - crates/engine/src/types.rs
+  - crates/engine/src/cost.rs
+  - crates/engine/src/outcomes.rs
+  - crates/engine/src/workspace_gate.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/control.rs
   - crates/engine/src/orchestrator.rs
@@ -44,6 +47,14 @@ them. New `worker.spawned` records carry resolved backend provenance alongside
 the model, including sequential, buffered parallel and pool runs. Missing
 provenance never satisfies a strict review requirement. See
 [config composition](../../config-composition.md#reviewer-independence-reviewerindependence).
+
+Accounting groups token use and estimates missing cost from the recorded run
+backend; reported cost, including zero, remains authoritative. Legacy runs
+retain each consumer's existing configuration fallback. Milestone block/lift
+events now carry optional typed ownership and causes. A present context controls
+automatic workspace recovery; only old events without it use the historical
+message fallback. Display wording cannot grant a new typed block an automatic
+lift.
 
 ## Log rules (event_log.rs)
 

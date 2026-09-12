@@ -356,6 +356,7 @@ mod tests {
                 statement: "tests pass".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".into()),
+                negative_control: None,
                 pty_script: None,
             }],
             milestones: vec![],

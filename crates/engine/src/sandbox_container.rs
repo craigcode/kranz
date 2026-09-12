@@ -688,6 +688,19 @@ fn under_writable_mount(path: &Path, inputs: &SandboxInputs) -> bool {
 /// exclude credentials, including files created or replaced after launch.
 /// Keep engine-owned policy and Git metadata readable but immutable.
 fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
+    // Pin writable metadata directory nodes before authority views. A
+    // worktree parent can cover its session's .kranz directory; later masks
+    // must remain the last word there. Preserve any explicit policy mount,
+    // including read-only mounts, and never duplicate a Docker destination.
+    for node in crate::sandbox::git_metadata_mount_nodes(inputs) {
+        let node = container_host_path(&node);
+        if !out.windows(2).any(|pair| {
+            pair[0] == "-v"
+                && (pair[1] == mount_arg(&node, false) || pair[1] == mount_arg(&node, true))
+        }) {
+            out.extend(["-v".to_string(), mount_arg(&node, false)]);
+        }
+    }
     let masks: Vec<_> = crate::sandbox::authority_directory_masks(inputs)
         .into_iter()
         .filter(|mask| {
@@ -756,7 +769,7 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
         .files
         .iter()
         .chain(writes.dirs.iter())
-        .chain(git.files.iter())
+        .chain(git.files.iter().filter(|path| path.is_file()))
         .chain(git.dirs.iter())
     {
         if !under_writable_mount(path, inputs)
@@ -2038,5 +2051,48 @@ mod tests {
             std::fs::read_to_string(global_config).unwrap(),
             "fake-config"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_mount_tests {
+    use super::*;
+
+    #[test]
+    fn git_config_mount_nodes_preserve_existing_readonly_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let root = crate::sandbox::absolutize(root.path());
+        let git = root.join(".git");
+        std::fs::create_dir(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\nrepositoryformatversion = 0\n").unwrap();
+        let inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: root.clone(),
+            mission_dir: root.join(".kranz/missions/m-fixture"),
+            tmpdir: root.join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let root = container_host_path(&root);
+        let git = container_host_path(&git);
+        let mut args = vec![
+            "-v".into(),
+            mount_arg(&root, false),
+            "-v".into(),
+            mount_arg(&git, true),
+        ];
+        push_authority_masks(&mut args, &inputs);
+        let duplicates = args
+            .windows(2)
+            .filter(|part| {
+                part[0] == "-v"
+                    && (part[1] == mount_arg(&git, false) || part[1] == mount_arg(&git, true))
+            })
+            .count();
+        assert_eq!(duplicates, 1, "{args:?}");
+        assert!(args
+            .windows(2)
+            .any(|part| part[0] == "-v" && part[1] == mount_arg(&git, true)));
     }
 }

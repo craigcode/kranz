@@ -15,6 +15,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+#[path = "git_process.rs"]
+mod process;
+
 /// One commit in a [`GitRepo::commits_between`] listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
@@ -161,7 +164,7 @@ struct ConfiguredDrivers {
 /// a long-running host accumulates one empty 4KB directory per kranz process.
 /// Cheap, and the alternative — a predictable reusable path — trades that for
 /// a pre-seating race.
-fn empty_global_config_path() -> Result<&'static Path> {
+pub(crate) fn empty_global_config_path() -> Result<&'static Path> {
     static PATH: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
         std::sync::OnceLock::new();
     match PATH.get_or_init(create_empty_global_config) {
@@ -578,10 +581,11 @@ impl GitRepo {
         let out = self.spawn_git(
             &[
                 "config",
+                "--no-includes",
                 "--name-only",
                 "--get-regexp",
                 "-z",
-                "^(filter|merge|remote|includeif)\\.",
+                "^(filter|merge|remote|include|includeif)\\.",
             ]
             .iter()
             .map(OsString::from)
@@ -605,6 +609,14 @@ impl GitRepo {
         })?;
         let mut drivers = ConfiguredDrivers::default();
         for key in stdout.split('\0').filter(|entry| !entry.is_empty()) {
+            // An ordinary include can point outside protected Git metadata,
+            // including into the worker's writable source tree. Protecting
+            // only config/config.worktree cannot pin that dependency graph.
+            if key == "include.path" {
+                return Err(EngineError::Git(
+                    "refusing git operation: ordinary repository config includes cannot be protected; move repository settings into config or config.worktree".into(),
+                ));
+            }
             let Some((section, rest)) = key.split_once('.') else {
                 continue;
             };
@@ -656,10 +668,14 @@ impl GitRepo {
     /// needed to close the concurrent mutation race completely.
     fn refuse_new_exec_configuration(&self, initial: &[String]) -> Result<()> {
         let current = self.build_exec_disable_flags()?;
+        let known: std::collections::HashSet<&str> = initial
+            .chunks_exact(2)
+            .map(|pair| pair[1].as_str())
+            .collect();
         let unexpected: Vec<&str> = current
             .chunks_exact(2)
             .map(|pair| pair[1].as_str())
-            .filter(|entry| !initial.iter().any(|known| known == entry))
+            .filter(|entry| !known.contains(entry))
             .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
             .collect();
         if !unexpected.is_empty() {
@@ -697,6 +713,9 @@ impl GitRepo {
             // because nothing is nulling the global scope for it.
             return Ok(());
         }
+        // Repository includes are unsupported even on the network path.
+        // Operator-global includes remain visible to the actual transport.
+        self.configured_drivers()?;
         // Each pattern is matched against the key git prints, which lowercases
         // the section and the final subkey but preserves a subsection's case
         // (probed 2026-09-02) — hence `sshcommand`, `insteadof`.
@@ -770,6 +789,47 @@ impl GitRepo {
         } else {
             self.root.join(path)
         })
+    }
+
+    /// Actual repository config inputs after include refusal. Used before an
+    /// enforced child starts; this read alone is not a concurrent-write guard.
+    pub(crate) fn config_protection_paths(&self) -> Result<(PathBuf, PathBuf, bool)> {
+        let common = self.git_common_dir()?;
+        let git_dir = PathBuf::from(self.run(&["rev-parse", "--git-dir"])?.trim());
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            self.root.join(git_dir)
+        };
+        // The common config enables this scope. A key in config.worktree
+        // cannot hide that fact by overriding the effective query result.
+        let out = self.probe_os(&[
+            OsString::from("config"),
+            OsString::from("--file"),
+            git_path_arg(&std::path::absolute(common.join("config"))?).into_os_string(),
+            OsString::from("--no-includes"),
+            OsString::from("--bool"),
+            OsString::from("--get"),
+            OsString::from("extensions.worktreeConfig"),
+        ])?;
+        let enabled = if out.status.success() {
+            match std::str::from_utf8(&out.stdout).map(str::trim) {
+                Ok("true") => true,
+                Ok("false") => false,
+                _ => {
+                    return Err(EngineError::Git(
+                        "invalid worktree configuration scope".into(),
+                    ))
+                }
+            }
+        } else if out.status.code() == Some(1) {
+            false
+        } else {
+            return Err(EngineError::Git(
+                "cannot determine worktree configuration scope".into(),
+            ));
+        };
+        Ok((git_dir, common, enabled))
     }
 
     /// Mission-significant refs for the tamper fingerprint: the CONTENT of
@@ -2190,12 +2250,12 @@ impl GitRepo {
         } else {
             cmd.args(args);
         }
-        cmd.current_dir(&self.root)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| {
-                EngineError::Git(format!("failed to invoke git {}: {e}", render_args(args)))
-            })
+        cmd.current_dir(&self.root).stdin(Stdio::null());
+        process::output(
+            cmd,
+            process::Limits::for_command(args, user_config == UserConfig::KeptForNetwork),
+        )
+        .map_err(|e| EngineError::Git(format!("failed to invoke git {}: {e}", render_args(args))))
     }
 
     /// Run git, demanding success; returns raw stdout (callers trim as needed).

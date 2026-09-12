@@ -19,6 +19,42 @@ use std::path::Path;
 const TOKENS_PER_MTOK: f64 = 1_000_000.0;
 const GPT_5_6_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
+/// Resolve immutable dispatch evidence before consulting legacy configuration.
+/// Old logs have no per-run backend: callers retain their historical config
+/// source (creation config for outcomes, folded config for calibration).
+/// Without either source, the original Claude default is preserved.
+pub(crate) fn resolved_run_backend(
+    recorded: Option<BackendKind>,
+    role: Role,
+    legacy_config: Option<&MissionConfig>,
+) -> BackendKind {
+    recorded.unwrap_or_else(|| {
+        legacy_config
+            .map(|cfg| cfg.backend_kind(role))
+            .unwrap_or(BackendKind::Claude)
+    })
+}
+
+/// CLI-reported cost, including an explicit zero, takes precedence over an
+/// estimate. Missing cost uses the actual resolved backend when available.
+pub(crate) fn resolved_run_cost(
+    recorded: Option<f64>,
+    usage: &TokenUsage,
+    model: &str,
+    backend: BackendKind,
+) -> f64 {
+    recorded.unwrap_or_else(|| usage_cost_usd_for_backend(usage, model, backend))
+}
+
+fn worker_run_cost(run: &WorkerRun, config: &MissionConfig) -> f64 {
+    resolved_run_cost(
+        run.cost_usd,
+        &run.tokens,
+        &run.model,
+        resolved_run_backend(run.backend, run.role, Some(config)),
+    )
+}
+
 /// Default model id for the Codex backend, importable engine-wide.
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 
@@ -661,11 +697,7 @@ fn mission_total_cost(state: &MissionState) -> f64 {
     state
         .runs
         .values()
-        .map(|r| {
-            r.cost_usd.unwrap_or_else(|| {
-                usage_cost_usd_for_backend(&r.tokens, &r.model, state.config.backend_kind(r.role))
-            })
-        })
+        .map(|run| worker_run_cost(run, &state.config))
         .sum()
 }
 
@@ -858,11 +890,7 @@ const LOW_CONFIDENCE_HIGH_MULT: f64 = 15.0;
 /// - orchestrator overhead per feature: total orchestrator run cost / total
 ///   features.
 fn mission_actuals(state: &MissionState) -> EstimateParams {
-    let run_cost = |run: &WorkerRun| {
-        run.cost_usd.unwrap_or_else(|| {
-            usage_cost_usd_for_backend(&run.tokens, &run.model, state.config.backend_kind(run.role))
-        })
-    };
+    let run_cost = |run: &WorkerRun| worker_run_cost(run, &state.config);
     let mean_run_cost = |roles: &[Role]| -> f64 {
         let costs: Vec<f64> = state
             .runs
@@ -1226,6 +1254,7 @@ mod tests {
                 ts: chrono::Utc::now(),
                 mission_id: "m-1".into(),
                 kind: EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "r".into(),
                 },
@@ -1416,3 +1445,7 @@ mod tests {
         assert_eq!(state.executor_tier(), crate::types::ExecutorTier::Frontier);
     }
 }
+
+#[cfg(test)]
+#[path = "resolved_accounting_tests.rs"]
+mod resolved_accounting_tests;

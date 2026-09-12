@@ -1438,6 +1438,7 @@ mod tests {
                     statement: "holds\u{1b}[2A".into(),
                     check: AssertionCheck::Command,
                     command: Some("cargo test\u{1b}[K".into()),
+                    negative_control: None,
                     pty_script: None,
                 }],
                 considered_alternatives: None,
@@ -2081,15 +2082,18 @@ mod tests {
                 worker_spawned("r-2", Role::Worker, "my-local-model", "dddd11112222"),
                 worker_spawned("r-3", Role::ValidatorScrutiny, "sonnet", "ffff33334444"),
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "fix-cycle cap".into(),
                 },
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "user skipped findings".into(),
                     validator_guidance: None,
                 },
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "workspace gate now passing: bootstrap and readiness ok".into(),
                     validator_guidance: None,
@@ -2390,6 +2394,7 @@ mod tests {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                negative_control: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

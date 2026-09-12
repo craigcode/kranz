@@ -9,6 +9,7 @@
 //! measured and no second source of truth is introduced.
 
 use crate::events::{Event, EventKind};
+use crate::types::{BlockCause, BlockContext};
 use serde::Serialize;
 
 /// Per-repo contract/consent health, folded from every mission's
@@ -37,8 +38,8 @@ pub struct ContractHealth {
     pub blocked: BlockedCauses,
 }
 
-/// `milestone.blocked` reasons classified by their emit-site templates
-/// (orchestrator.rs). A cause is counted exactly once per blocked event.
+/// `milestone.blocked` causes, using typed context when present and emit-site
+/// templates for legacy logs. Each blocked event contributes exactly once.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedCauses {
@@ -57,13 +58,34 @@ pub struct BlockedCauses {
     /// Validator "altered the checkout" (the validator.tamper immutability
     /// assertion — ticket validator-immutability-proof).
     pub validator_tamper: u64,
-    /// Anything else (operator blocks, legacy reasons).
+    pub workspace_check: u64,
+    pub reviewer_independence: u64,
+    pub validation: u64,
+    pub authentication: u64,
+    pub operator: u64,
+    /// Anything else (unknown typed causes or unclassified legacy reasons).
     pub other: u64,
 }
 
-/// Classify one `milestone.blocked` reason string. Order matters only for
-/// defense; the emit-site templates are mutually exclusive in practice.
-fn classify_block(reason: &str) -> &'static str {
+/// Typed causes are authoritative; message classification is retained only
+/// for events written before blockContext existed.
+fn classify_block(reason: &str, context: Option<&BlockContext>) -> &'static str {
+    if let Some(context) = context {
+        return match context.cause {
+            BlockCause::WorkspaceCheck => "workspace-check",
+            BlockCause::Grant => "grant",
+            BlockCause::SecretScan => "secret-scan",
+            BlockCause::ContractBug => "contract-bug",
+            BlockCause::FixCycleCap => "fix-cycle-cap",
+            BlockCause::UntrustedValidator => "untrusted-validator",
+            BlockCause::ValidatorTamper => "validator-tamper",
+            BlockCause::ReviewerIndependence => "reviewer-independence",
+            BlockCause::Validation => "validation",
+            BlockCause::Authentication => "authentication",
+            BlockCause::Operator => "operator",
+            BlockCause::Unknown => "other",
+        };
+    }
     if reason.starts_with("validator command denied:") || reason.starts_with("egress denied:") {
         "grant"
     } else if reason.contains("refused by secret scan") {
@@ -105,13 +127,22 @@ fn fold_mission(health: &mut ContractHealth, events: &[Event]) {
                     waived_here = true;
                 }
             }
-            EventKind::MilestoneBlocked { reason, .. } => match classify_block(reason) {
+            EventKind::MilestoneBlocked {
+                reason,
+                block_context,
+                ..
+            } => match classify_block(reason, block_context.as_ref()) {
                 "grant" => health.blocked.grant += 1,
                 "secret-scan" => health.blocked.secret_scan += 1,
                 "contract-bug" => health.blocked.contract_bug += 1,
                 "fix-cycle-cap" => health.blocked.fix_cycle_cap += 1,
                 "untrusted-validator" => health.blocked.untrusted_validator += 1,
                 "validator-tamper" => health.blocked.validator_tamper += 1,
+                "workspace-check" => health.blocked.workspace_check += 1,
+                "reviewer-independence" => health.blocked.reviewer_independence += 1,
+                "validation" => health.blocked.validation += 1,
+                "authentication" => health.blocked.authentication += 1,
+                "operator" => health.blocked.operator += 1,
                 _ => health.blocked.other += 1,
             },
             _ => {}
@@ -181,6 +212,39 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    #[test]
+    fn typed_block_context_health_classification_is_independent_of_reason_text() {
+        for (cause, expected) in [
+            (BlockCause::ValidatorTamper, "validator-tamper"),
+            (BlockCause::ReviewerIndependence, "reviewer-independence"),
+            (BlockCause::WorkspaceCheck, "workspace-check"),
+            (BlockCause::Unknown, "other"),
+        ] {
+            let context = BlockContext::engine(cause);
+            for reason in ["fix-cycle cap reached", "new message"] {
+                assert_eq!(classify_block(reason, Some(&context)), expected);
+            }
+        }
+        assert_eq!(
+            classify_block("fix-cycle cap reached", None),
+            "fix-cycle-cap"
+        );
+        let mut health = ContractHealth::default();
+        let event = Event {
+            seq: 1,
+            ts: chrono::Utc::now(),
+            mission_id: "m-typed".into(),
+            kind: EventKind::MilestoneBlocked {
+                milestone_id: "ms-1".into(),
+                reason: "new wording".into(),
+                block_context: Some(BlockContext::engine(BlockCause::ValidatorTamper)),
+            },
+        };
+        fold_mission(&mut health, &[event]);
+        assert_eq!(health.blocked.validator_tamper, 1);
+        assert_eq!(health.blocked.other, 0);
+    }
+
     /// Seed a mission's `events.jsonl` with the given kinds, in order.
     fn seed_mission(repo_root: &std::path::Path, id: &str, kinds: Vec<EventKind>) {
         let paths = MissionPaths::new(repo_root, id);
@@ -208,6 +272,7 @@ mod tests {
 
     fn blocked(reason: &str) -> EventKind {
         EventKind::MilestoneBlocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: reason.into(),
         }
@@ -223,6 +288,7 @@ mod tests {
                     statement: "s".into(),
                     check: AssertionCheck::Command,
                     command: Some("true".into()),
+                    negative_control: None,
                     pty_script: None,
                 })
                 .collect(),

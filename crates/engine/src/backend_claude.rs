@@ -840,6 +840,16 @@ impl AgentBackend for ClaudeBackend {
         #[cfg(windows)]
         let mut appcontainer_lease = None;
 
+        if let Some(resolved) = &spec.sandbox {
+            crate::sandbox::validate_git_config_protection(
+                &resolved.inputs,
+                matches!(
+                    resolved.backend,
+                    crate::sandbox::SandboxBackend::Bubblewrap
+                        | crate::sandbox::SandboxBackend::Container
+                ),
+            )?;
+        }
         let mut command = match &spec.sandbox {
             Some(resolved)
                 if resolved.backend == crate::sandbox::SandboxBackend::Seatbelt

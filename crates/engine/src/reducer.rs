@@ -66,6 +66,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 state.last_seq = event.seq;
                 return Ok(());
             }
+            crate::contract_controls::validate(&plan.validation_contract)?;
             state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();
@@ -946,6 +947,7 @@ fn take_pending_question(
 }
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
+    crate::contract_controls::validate(&plan.validation_contract)?;
     if plan.reviewer_independence != state.mission.reviewer_independence {
         return Err(EngineError::Config(
             "plan.revised cannot replace the approved reviewerIndependence policy".into(),
@@ -1038,7 +1040,11 @@ fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Res
                 old.id
             )));
         };
-        if old.statement != new.statement || old.check != new.check || old.command != new.command {
+        if old.statement != new.statement
+            || old.check != new.check
+            || old.command != new.command
+            || old.negative_control != new.negative_control
+        {
             return Err(EngineError::InvalidState(format!(
                 "plan.revised weakens or changes validation assertion '{}'",
                 old.id
@@ -1295,6 +1301,131 @@ pub fn read_snapshot(path: &Path) -> Result<MissionState> {
     let mut content = String::new();
     crate::paths::open_read_nofollow(path)?.read_to_string(&mut content)?;
     Ok(serde_json::from_str(&content)?)
+}
+
+#[cfg(test)]
+mod negative_control_tests {
+    use super::*;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-controls".into(),
+            kind,
+        }
+    }
+
+    fn plan() -> Plan {
+        serde_json::from_value(serde_json::json!({
+            "goal": "control tests",
+            "validationContract": [{
+                "id": "a-1", "statement": "reject the defect", "check": "command", "command": "sh check.sh",
+                "negativeControl": {
+                    "checkerFiles": [{"path": "check.sh", "content": "check"}],
+                    "validFiles": [{"path": "value.txt", "content": "valid"}],
+                    "defectiveFiles": [{"path": "value.txt", "content": "defect"}],
+                    "expectedFailure": "wrong-value"
+                }
+            }],
+            "milestones": [{"title": "one", "features": [{"title": "change", "spec": "change", "validationCriteria": []}]}]
+        })).unwrap()
+    }
+
+    fn approved(plan: &Plan) -> Result<MissionState> {
+        fold(&[
+            event(
+                1,
+                EventKind::MissionCreated {
+                    goal: plan.goal.clone(),
+                    base_branch: "main".into(),
+                    mission_branch: "kranz/mission-m-controls".into(),
+                    config: MissionConfig::default(),
+                },
+            ),
+            event(
+                2,
+                EventKind::PlanApproved {
+                    plan: plan.clone(),
+                    base_sha: Some("base".into()),
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn negative_control_replay_and_revision_validation_agree() {
+        let plan = plan();
+        let state = approved(&plan).unwrap();
+        dry_run_revised_plan(&state, &plan, 1).unwrap();
+        let mut added = plan.clone();
+        let mut extra = added.validation_contract[0].clone();
+        extra.id = "a-2".into();
+        added.validation_contract.push(extra);
+        crate::planning::validate_revised_plan_for_gate(&state.mission, &added).unwrap();
+        dry_run_revised_plan(&state, &added, 1).unwrap();
+        for mutation in ["removed", "changed", "invalid-new"] {
+            let mut revised = plan.clone();
+            match mutation {
+                "removed" => revised.validation_contract[0].negative_control = None,
+                "changed" => {
+                    revised.validation_contract[0]
+                        .negative_control
+                        .as_mut()
+                        .unwrap()
+                        .expected_failure = "other-defect".into()
+                }
+                _ => {
+                    revised = added.clone();
+                    revised.validation_contract[1]
+                        .negative_control
+                        .as_mut()
+                        .unwrap()
+                        .timeout_seconds = 0;
+                }
+            }
+            assert!(
+                crate::planning::validate_revised_plan_for_gate(&state.mission, &revised).is_err(),
+                "pre-emit {mutation}"
+            );
+            assert!(
+                dry_run_revised_plan(&state, &revised, 1).is_err(),
+                "fold {mutation}"
+            );
+        }
+        let mut malformed = plan;
+        malformed.validation_contract[0]
+            .negative_control
+            .as_mut()
+            .unwrap()
+            .timeout_seconds = 0;
+        assert!(
+            approved(&malformed).is_err(),
+            "new malformed control cannot enter via plan.approved replay"
+        );
+    }
+
+    #[test]
+    fn negative_control_checks_preserve_legacy_pty_revision_replay() {
+        let mut old = plan();
+        old.validation_contract = serde_json::from_value(serde_json::json!([{
+            "id": "pty", "statement": "legacy terminal check", "check": "pty-script",
+            "ptyScript": {"command": "old", "steps": []}
+        }]))
+        .unwrap();
+        let state = approved(&old).unwrap();
+        assert!(state.mission.validation_contract[0]
+            .negative_control
+            .is_none());
+        let mut revised = old;
+        revised.validation_contract[0]
+            .pty_script
+            .as_mut()
+            .unwrap()
+            .command = "new".into();
+        crate::planning::validate_revised_plan_for_gate(&state.mission, &revised).unwrap();
+        dry_run_revised_plan(&state, &revised, 1).unwrap();
+    }
 }
 
 #[cfg(test)]

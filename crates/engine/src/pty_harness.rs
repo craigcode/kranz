@@ -1097,6 +1097,7 @@ mod tests {
             statement: "the REPL echoes input back".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            negative_control: None,
             pty_script: Some(PtyScript {
                 command: command.to_string(),
                 steps,
@@ -1245,6 +1246,7 @@ mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("true".to_string()),
+                negative_control: None,
                 pty_script: None,
             },
             Assertion {
@@ -1252,6 +1254,7 @@ mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                negative_control: None,
                 pty_script: None,
             },
         ];
@@ -1274,6 +1277,7 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            negative_control: None,
             pty_script: None,
         }];
         let run = run_pty_assertions(
@@ -1313,6 +1317,7 @@ mod tests {
             statement: "the REPL echoes input back".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            negative_control: None,
             pty_script: Some(PtyScript {
                 command: "./repl".to_string(),
                 steps: Vec::new(),

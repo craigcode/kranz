@@ -381,6 +381,7 @@ async fn approve_pending_requires_the_displayed_preview_after_a_replacement() {
         let (status, refused) = post_json(&app, &approve_url, Some(TOKEN), request).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert!(refused["error"].as_str().unwrap().contains("refresh"));
+        assert_eq!(refused["code"], "stale_plan");
         let (_, pending) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
         assert_eq!(pending["planIdentity"], preview_b["planIdentity"]);
         assert_eq!(pending["plan"], preview_b["plan"]);

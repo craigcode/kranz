@@ -7,13 +7,44 @@
 // with a "back to conversation" link on both steps.
 
 import { useKranzStore } from '../lib/store';
-import type { CostEstimate } from '../lib/types';
+import type { CostEstimate, NegativeControl } from '../lib/types';
 
 /** Verbatim mirror of crates/cli/src/output.rs render_cost_estimate. */
 function renderCostEstimate(e: CostEstimate): string {
   return (
     `estimated $${e.lowUsd.toFixed(2)}-$${e.highUsd.toFixed(2)} ` +
     `(expected ~$${e.expectedUsd.toFixed(2)}; rough estimate — live usage is authoritative)`
+  );
+}
+
+function NegativeControlReview({ assertionId, control }: { assertionId: string; control: NegativeControl }) {
+  const groups = [
+    { label: 'Checker files', files: control.checkerFiles },
+    { label: 'Valid fixture files', files: control.validFiles },
+    { label: 'Defective fixture files', files: control.defectiveFiles },
+  ];
+  return (
+    <section className="contract-control" aria-label={`Negative control for ${assertionId}`}>
+      <strong>Negative control</strong>
+      <p className="dim">Advisory control configuration; results are recorded with gate evidence.</p>
+      <p>
+        The command above runs against both disposable fixtures: the valid case must pass,
+        and the defective case must report the expected failure. Checker files must match their pinned source.
+      </p>
+      <p>Expected failure: <code>{control.expectedFailure}</code></p>
+      <p className="dim">Timeout: {control.timeoutSeconds ?? 60}s per fixture (maximum 180s).</p>
+      {groups.map(({ label, files }) => (
+        <div className="contract-control-files" key={label}>
+          <div>{label}</div>
+          {files.map((file) => (
+            <details key={file.path}>
+              <summary><code>{file.path}</code> — review contents</summary>
+              {file.content === '' ? <p className="dim">Empty file</p> : <pre>{file.content}</pre>}
+            </details>
+          ))}
+        </div>
+      ))}
+    </section>
   );
 }
 
@@ -130,7 +161,7 @@ export function PlanReview() {
               <li key={a.id} className="contract-row">
                 <span className="mono contract-id">[{a.id}]</span>
                 <span className="contract-check dim">({a.check})</span>
-                <span className="contract-statement">
+                <div className="contract-statement">
                   {a.statement}
                   {a.command !== undefined && a.command !== '' && (
                     <>
@@ -138,7 +169,10 @@ export function PlanReview() {
                       <code className="mono">{a.command}</code>
                     </>
                   )}
-                </span>
+                  {a.negativeControl !== undefined && (
+                    <NegativeControlReview assertionId={a.id} control={a.negativeControl} />
+                  )}
+                </div>
               </li>
             ))}
           </ul>

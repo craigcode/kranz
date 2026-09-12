@@ -396,8 +396,9 @@ pub fn provenance_chain(
             EventKind::MilestoneUnblocked {
                 milestone_id,
                 reason,
+                block_context,
                 ..
-            } if !crate::escalation_metrics::is_engine_lift(reason) => {
+            } if !crate::escalation_metrics::is_engine_lift(reason, block_context.as_ref()) => {
                 chain.decisions.push(DecisionLink {
                     seq: event.seq,
                     kind: DecisionKind::MilestoneUnblock,
@@ -512,10 +513,10 @@ pub fn provenance_chain(
                 seq: event.seq,
                 run_id: run_id.clone(),
                 role: *role,
-                backend: backend.map(|kind| kind.as_str().to_string()).or_else(|| {
-                    config
-                        .as_ref()
-                        .map(|cfg| cfg.backend_kind(*role).as_str().to_string())
+                backend: (backend.is_some() || config.is_some()).then(|| {
+                    crate::cost::resolved_run_backend(*backend, *role, config.as_ref())
+                        .as_str()
+                        .to_string()
                 }),
                 model: model.clone(),
                 quant: quant.clone(),
@@ -738,15 +739,18 @@ mod tests {
                 worker_spawned("r-2", Role::Worker, "my-local-model", "dddd11112222"),
                 worker_spawned("r-3", Role::ValidatorScrutiny, "sonnet", "ffff33334444"),
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "fix-cycle cap".into(),
                 },
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "user skipped findings".into(),
                     validator_guidance: None,
                 },
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
                     validator_guidance: None,

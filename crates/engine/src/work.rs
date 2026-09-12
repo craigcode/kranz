@@ -633,6 +633,7 @@ mod tests {
                     base_sha: None,
                 },
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "needs input".to_string(),
                 },
@@ -1371,6 +1372,7 @@ mod tests {
                                     base_sha: None,
                                 },
                                 EventKind::MilestoneBlocked {
+                                    block_context: None,
                                     milestone_id: "ms-1".to_string(),
                                     reason: "needs input".to_string(),
                                 },

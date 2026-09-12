@@ -505,6 +505,7 @@ pub(crate) fn validate_revised_plan_for_gate(mission: &Mission, plan: &Plan) -> 
             empty.title
         )));
     }
+    crate::contract_controls::validate(&plan.validation_contract)?;
     validate_contract_extends(&mission.validation_contract, &plan.validation_contract)?;
     validate_vec_extends(
         "commandGrants",
@@ -552,7 +553,11 @@ fn validate_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> R
                 old.id
             )));
         };
-        if old.statement != new.statement || old.check != new.check || old.command != new.command {
+        if old.statement != new.statement
+            || old.check != new.check
+            || old.command != new.command
+            || old.negative_control != new.negative_control
+        {
             return Err(EngineError::InvalidState(format!(
                 "revised plan changes validation assertion '{}'",
                 old.id
@@ -614,6 +619,70 @@ pub(crate) fn assign_assertion_ids(contract: &mut [Assertion]) {
 
 /// JSON Schema for [`Plan`] (camelCase), embedded in the request_plan turn.
 fn plan_schema() -> serde_json::Value {
+    let control_files = serde_json::json!({
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            }
+        }
+    });
+    let negative_control = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["checkerFiles", "validFiles", "defectiveFiles", "expectedFailure"],
+        "properties": {
+            "checkerFiles": control_files.clone(),
+            "validFiles": control_files.clone(),
+            "defectiveFiles": control_files,
+            "expectedFailure": { "type": "string" },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 180, "default": 60 }
+        }
+    });
+    let validation_contract = serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "statement", "check"],
+            "properties": {
+                "id": { "type": "string" },
+                "statement": { "type": "string" },
+                "check": { "type": "string", "enum": ["command", "agent-judgement", "pty-script"] },
+                "command": { "type": "string" },
+                "negativeControl": negative_control,
+                "ptyScript": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command", "steps"],
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeoutSecs": { "type": "integer" },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["op"],
+                                "properties": {
+                                    "op": { "type": "string", "enum": ["send", "expect"] },
+                                    "text": { "type": "string" },
+                                    "pattern": { "type": "string" },
+                                    "regex": { "type": "boolean" },
+                                    "timeoutMs": { "type": "integer" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -662,44 +731,7 @@ fn plan_schema() -> serde_json::Value {
                     "candidateKnowledgeUpdates": { "type": "array", "items": { "type": "string" } }
                 }
             },
-            "validationContract": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["id", "statement", "check"],
-                    "properties": {
-                        "id": { "type": "string" },
-                        "statement": { "type": "string" },
-                        "check": { "type": "string", "enum": ["command", "agent-judgement", "pty-script"] },
-                        "command": { "type": "string" },
-                        "ptyScript": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["command", "steps"],
-                            "properties": {
-                                "command": { "type": "string" },
-                                "timeoutSecs": { "type": "integer" },
-                                "steps": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "required": ["op"],
-                                        "properties": {
-                                            "op": { "type": "string", "enum": ["send", "expect"] },
-                                            "text": { "type": "string" },
-                                            "pattern": { "type": "string" },
-                                            "regex": { "type": "boolean" },
-                                            "timeoutMs": { "type": "integer" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            "validationContract": validation_contract,
             "milestones": {
                 "type": "array",
                 "minItems": 1,
@@ -791,7 +823,100 @@ mod tests {
             check: AssertionCheck::AgentJudgement,
             command: None,
             pty_script: None,
+            negative_control: None,
         }
+    }
+
+    fn controlled_assertion() -> Assertion {
+        serde_json::from_value(serde_json::json!({
+            "id": "a-1", "statement": "reject the defect", "check": "command", "command": "sh check.sh",
+            "negativeControl": {
+                "checkerFiles": [{"path": "check.sh", "content": "check"}],
+                "validFiles": [{"path": "src/value.txt", "content": "valid"}],
+                "defectiveFiles": [{"path": "src/value.txt", "content": "defect"}],
+                "expectedFailure": "wrong-value"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn negative_control_schema_is_optional_and_carries_reviewable_fixtures() {
+        let schema = plan_schema();
+        let item = &schema["properties"]["validationContract"]["items"];
+        assert!(!item["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("negativeControl")));
+        let spec = &item["properties"]["negativeControl"];
+        for group in ["checkerFiles", "validFiles", "defectiveFiles"] {
+            assert!(spec["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(group)));
+            assert_eq!(
+                spec["properties"][group]["items"]["required"],
+                serde_json::json!(["path", "content"])
+            );
+        }
+        assert_eq!(spec["properties"]["timeoutSeconds"]["default"], 60);
+        assert_eq!(spec["properties"]["timeoutSeconds"]["maximum"], 180);
+        let controlled = controlled_assertion();
+        assert_eq!(
+            controlled
+                .negative_control
+                .as_ref()
+                .unwrap()
+                .timeout_seconds,
+            60
+        );
+        crate::contract_controls::validate(&[controlled]).unwrap();
+        assert!(serde_json::to_value(assertion("old"))
+            .unwrap()
+            .get("negativeControl")
+            .is_none());
+    }
+
+    #[test]
+    fn negative_control_revision_pins_every_approved_control_field() {
+        let old = controlled_assertion();
+        validate_contract_extends(std::slice::from_ref(&old), std::slice::from_ref(&old)).unwrap();
+        let mutations = [
+            (
+                "checkerFiles",
+                serde_json::json!([{"path": "check.sh", "content": "changed checker"}]),
+            ),
+            (
+                "validFiles",
+                serde_json::json!([{"path": "src/value.txt", "content": "different valid"}]),
+            ),
+            (
+                "defectiveFiles",
+                serde_json::json!([{"path": "src/value.txt", "content": "other defect"}]),
+            ),
+            ("expectedFailure", serde_json::json!("another-defect")),
+            ("timeoutSeconds", serde_json::json!(90)),
+        ];
+        for (field, value) in mutations {
+            let mut changed = serde_json::to_value(&old).unwrap();
+            changed["negativeControl"][field] = value;
+            let changed: Assertion = serde_json::from_value(changed).unwrap();
+            assert!(
+                validate_contract_extends(std::slice::from_ref(&old), &[changed]).is_err(),
+                "changed {field}"
+            );
+        }
+        let mut removed = old.clone();
+        removed.negative_control = None;
+        assert!(validate_contract_extends(
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&removed)
+        )
+        .is_err());
+        assert!(
+            validate_contract_extends(&[removed], &[old]).is_err(),
+            "adding a control to an existing assertion changes its approved identity"
+        );
     }
 
     #[test]
@@ -822,6 +947,7 @@ mod tests {
                 check: AssertionCheck::Command,
                 command: Some("true".into()),
                 pty_script: None,
+                negative_control: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "m".into(),

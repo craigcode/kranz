@@ -405,6 +405,7 @@ fn plan() -> Plan {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                negative_control: None,
                 pty_script: None,
             },
             Assertion {
@@ -412,6 +413,7 @@ fn plan() -> Plan {
                 statement: "docs are accurate".to_string(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                negative_control: None,
                 pty_script: None,
             },
         ],

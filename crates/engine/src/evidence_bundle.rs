@@ -1138,10 +1138,12 @@ mod tests {
                 worker_spawned("r-2", Role::Worker, "my-local-model"),
                 worker_spawned("r-3", Role::ValidatorScrutiny, "sonnet"),
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "fix-cycle cap".into(),
                 },
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "user skipped findings".into(),
                     validator_guidance: None,

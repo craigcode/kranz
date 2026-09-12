@@ -10,6 +10,70 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Typed source and cause of a milestone block or its resolution. A present
+/// context is authoritative; unknown values never inherit legacy prose meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockContext {
+    #[serde(default)]
+    pub owner: BlockOwner,
+    #[serde(default)]
+    pub cause: BlockCause,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockOwner {
+    WorkspaceGate,
+    Engine,
+    Operator,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockCause {
+    WorkspaceCheck,
+    Grant,
+    SecretScan,
+    ContractBug,
+    FixCycleCap,
+    UntrustedValidator,
+    ValidatorTamper,
+    ReviewerIndependence,
+    Validation,
+    Authentication,
+    Operator,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl BlockContext {
+    pub const WORKSPACE_GATE: Self = Self {
+        owner: BlockOwner::WorkspaceGate,
+        cause: BlockCause::WorkspaceCheck,
+    };
+
+    pub const OPERATOR: Self = Self {
+        owner: BlockOwner::Operator,
+        cause: BlockCause::Operator,
+    };
+
+    pub const fn engine(cause: BlockCause) -> Self {
+        Self {
+            owner: BlockOwner::Engine,
+            cause,
+        }
+    }
+
+    pub fn is_workspace_gate(self) -> bool {
+        self == Self::WORKSPACE_GATE
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mission
 // ---------------------------------------------------------------------------
@@ -556,6 +620,10 @@ pub struct Assertion {
     /// `skip_serializing_if` keeps old plans byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pty_script: Option<PtyScript>,
+    /// Explicit, approval-pinned valid/defective controls for this command.
+    /// Absent in legacy plans; controls produce advisory evidence only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_control: Option<crate::contract_controls::ControlSpec>,
 }
 
 /// One scripted terminal session against an interactive target — the

@@ -256,13 +256,13 @@ struct ParallelDecision {
 /// Agent-authored assertion commands may mutate every writable byte they can
 /// reach, so they never run in the primary checkout. Cleanup is RAII and
 /// forceful because a timed-out or failing command may leave the tree dirty.
-struct ApprovalLintWorktree {
+pub(crate) struct ApprovalLintWorktree {
     repo: GitRepo,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 impl ApprovalLintWorktree {
-    fn create(repo: &GitRepo, path: &Path, base_sha: &str) -> Result<Self> {
+    pub(crate) fn create(repo: &GitRepo, path: &Path, base_sha: &str) -> Result<Self> {
         let _ = repo.remove_worktree(path);
         let _ = std::fs::remove_dir_all(path);
         if let Some(parent) = path.parent() {
@@ -1189,6 +1189,7 @@ impl MissionEngine {
                 empty.title
             )));
         }
+        crate::contract_controls::validate(&plan.validation_contract)?;
 
         // Resolve the moving base branch exactly once, before any base-owned
         // contract/policy read or mission-branch side effect. Every approval
@@ -1377,6 +1378,14 @@ impl MissionEngine {
             }
         };
 
+        let control_reports = crate::contract_controls::evaluate(
+            &self.repo,
+            &self.paths,
+            &base_sha,
+            &plan.validation_contract,
+            &self.state.config,
+        );
+
         // Git first: if anything fails here, no event was emitted and
         // approve_plan can simply be retried.
         if !self.repo.branch_exists(&branch)? {
@@ -1399,11 +1408,12 @@ impl MissionEngine {
         // (still pristine) repo root; passes-on-base graduates the lint
         // report. Advisory only, exactly like the lint: approval never
         // blocks on these.
-        let gate_reports = contract_gates::contract_gate_reports(
+        let mut gate_reports = contract_gates::contract_gate_reports(
             &plan.validation_contract,
             Some(&contract_lint_report),
             &self.paths.repo_root,
         );
+        gate_reports.extend(control_reports);
 
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
@@ -1742,6 +1752,7 @@ impl MissionEngine {
             if let Some(mi) = first_incomplete(&self.state) {
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 self.emit(EventKind::MilestoneUnblocked {
+                    block_context: Some(BlockContext::OPERATOR),
                     milestone_id,
                     reason: format!("revision {revision} approved"),
                     validator_guidance: None,
@@ -1879,6 +1890,7 @@ impl MissionEngine {
                         _ => "validator command",
                     };
                     self.emit(EventKind::MilestoneBlocked {
+                        block_context: Some(BlockContext::engine(BlockCause::Grant)),
                         milestone_id: pending.milestone_id.clone(),
                         reason: format!("{boundary} denied: `{}` — {reason}", pending.command),
                     })?;
@@ -2309,6 +2321,7 @@ impl MissionEngine {
                 "revised plan has no milestones".to_string(),
             ));
         }
+        crate::contract_controls::validate(&plan.validation_contract)?;
 
         // (1) The completed milestones, in current order, must be reproduced
         // unchanged and first in the revised plan.
@@ -3049,6 +3062,7 @@ impl MissionEngine {
         match action.as_str() {
             "unblock-raise-cap" | "unblock-skip-findings" => {
                 self.emit(EventKind::MilestoneUnblocked {
+                    block_context: Some(BlockContext::OPERATOR),
                     milestone_id,
                     reason: if note.is_empty() { action } else { note },
                     validator_guidance,
@@ -3075,6 +3089,7 @@ impl MissionEngine {
                     validation_criteria: Vec::new(),
                 });
                 self.emit(EventKind::MilestoneUnblocked {
+                    block_context: Some(BlockContext::OPERATOR),
                     milestone_id: milestone_id.clone(),
                     reason,
                     validator_guidance,
@@ -3088,6 +3103,7 @@ impl MissionEngine {
                 // milestone untagged. Failed/skipped features keep their
                 // status — rewriting them as skipped would falsify history.
                 self.emit(EventKind::MilestoneUnblocked {
+                    block_context: Some(BlockContext::OPERATOR),
                     milestone_id: milestone_id.clone(),
                     reason: "milestone skipped by orchestrator decision".to_string(),
                     validator_guidance: None,
@@ -3473,6 +3489,7 @@ impl MissionEngine {
                     None,
                 )?;
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::Authentication)),
                     milestone_id,
                     reason: format!(
                         "backend {} unauthenticated — {reauth}; feature {} stays active and \
@@ -3712,6 +3729,7 @@ impl MissionEngine {
             if self.state.mission.milestones[mi].status != MilestoneStatus::Blocked {
                 let reason = self.pool_judgement_block_reason(&feature.id);
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::Validation)),
                     milestone_id,
                     reason,
                 })?;
@@ -4165,6 +4183,7 @@ impl MissionEngine {
         // no code path completes the unit from a candidate).
         let reason = self.pool_judgement_block_reason(&feature.id);
         self.emit(EventKind::MilestoneBlocked {
+            block_context: Some(BlockContext::engine(BlockCause::Validation)),
             milestone_id,
             reason,
         })?;
@@ -4253,6 +4272,7 @@ impl MissionEngine {
                     .join(", ");
                 let milestone_id = self.state.mission.milestones[mi].id.clone();
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::SecretScan)),
                     milestone_id,
                     reason: format!(
                         "dirty-tree checkpoint for {feature_id} refused by secret scan; the \
@@ -5634,6 +5654,7 @@ impl MissionEngine {
                 );
                 self.emit_decision(&reason, None)?;
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::UntrustedValidator)),
                     milestone_id,
                     reason,
                 })?;
@@ -5773,6 +5794,7 @@ impl MissionEngine {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::ContractBug)),
                     milestone_id,
                     reason: format!(
                         "orchestrator marked finding(s) {subjects} as author-broken command \
@@ -5812,6 +5834,7 @@ impl MissionEngine {
                         Some(text),
                     )?;
                     self.emit(EventKind::MilestoneBlocked {
+                        block_context: Some(BlockContext::engine(BlockCause::FixCycleCap)),
                         milestone_id,
                         reason: format!(
                             "{} validation finding(s) but the fix-cycle cap ({}) is reached",
@@ -5957,6 +5980,7 @@ impl MissionEngine {
             );
             self.emit_decision(&reason, None)?;
             self.emit(EventKind::MilestoneBlocked {
+                block_context: Some(BlockContext::engine(BlockCause::UntrustedValidator)),
                 milestone_id: milestone_id.to_string(),
                 reason,
             })?;
@@ -6137,6 +6161,7 @@ impl MissionEngine {
                 );
                 self.emit_decision(&reason, None)?;
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::Validation)),
                     milestone_id: milestone_id.to_string(),
                     reason,
                 })?;
@@ -6187,6 +6212,7 @@ impl MissionEngine {
         );
         self.emit_decision(&reason, None)?;
         self.emit(EventKind::MilestoneBlocked {
+            block_context: Some(BlockContext::engine(BlockCause::ValidatorTamper)),
             milestone_id: milestone_id.to_string(),
             reason,
         })?;
@@ -6232,6 +6258,7 @@ impl MissionEngine {
         );
         self.emit_decision(&reason, None)?;
         self.emit(EventKind::MilestoneBlocked {
+            block_context: Some(BlockContext::engine(BlockCause::ValidatorTamper)),
             milestone_id: milestone_id.to_string(),
             reason,
         })?;
@@ -8075,6 +8102,165 @@ pub(crate) mod tests {
         MissionEngine::create(backend, root, "goal", cfg).expect("create engine")
     }
 
+    fn negative_control_plan() -> Plan {
+        let mut plan = flight_rules_pin_plan(vec!["delivered.txt".into()]);
+        plan.validation_contract = serde_json::from_value(serde_json::json!([{
+            "id": "a-control", "statement": "reject wrong output", "check": "command", "command": "cd .",
+            "negativeControl": {
+                "checkerFiles": [{"path": "README.md", "content": "unmatched approved checker\n"}],
+                "validFiles": [{"path": "value.txt", "content": "valid"}],
+                "defectiveFiles": [{"path": "value.txt", "content": "defect"}],
+                "expectedFailure": "wrong-value"
+            }
+        }])).unwrap();
+        plan
+    }
+
+    #[test]
+    fn negative_control_approval_rejects_malformed_spec_before_git_or_events() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        let head = engine.repo.head_sha().unwrap();
+        let event_count = EventLog::read_events(&engine.paths.events_file())
+            .unwrap()
+            .len();
+        let mut plan = negative_control_plan();
+        plan.validation_contract[0]
+            .negative_control
+            .as_mut()
+            .unwrap()
+            .timeout_seconds = 0;
+        assert!(engine
+            .approve_plan(plan)
+            .unwrap_err()
+            .to_string()
+            .contains("negative control"));
+        assert_eq!(engine.repo.head_sha().unwrap(), head);
+        assert_eq!(engine.repo.current_branch().unwrap(), "main");
+        assert!(!engine
+            .repo
+            .branch_exists(&engine.state.mission.mission_branch)
+            .unwrap());
+        assert!(!engine.paths.plan_file().exists());
+        assert_eq!(
+            EventLog::read_events(&engine.paths.events_file())
+                .unwrap()
+                .len(),
+            event_count
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_control_evidence_is_fresh_advisory_and_legacy_optional() {
+        for controls in [false, true] {
+            let Some((_dir, root)) = lessons_test_repo() else {
+                return;
+            };
+            let backend = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script("NONE"),
+            ]));
+            let mut engine =
+                MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+            let mut plan = negative_control_plan();
+            if !controls {
+                plan.validation_contract.clear();
+            }
+            let base_sha = engine.repo.head_sha().unwrap();
+            engine.approve_plan(plan).unwrap();
+            let plan_md = std::fs::read_to_string(engine.paths.plan_md_file()).unwrap();
+            assert_eq!(plan_md.contains("negative-control:a-control"), controls);
+            if controls {
+                assert!(plan_md.contains("INCONCLUSIVE"));
+            }
+            engine.primary_branch_at_start = Some("main".into());
+            engine.active_tree = Some(engine.setup_mission_worktree().unwrap());
+            engine
+                .emit(EventKind::MilestoneStarted {
+                    milestone_id: "ms-1".into(),
+                    start_sha: engine.active_repo().head_sha().unwrap(),
+                })
+                .unwrap();
+            let delivered = engine.active_root().join("delivered.txt");
+            std::fs::write(&delivered, "real deliverable\n").unwrap();
+            let revision = engine
+                .active_repo()
+                .commit_paths(&[&delivered], "[f-1-1] deliver")
+                .unwrap();
+            engine
+                .emit(EventKind::FeatureCompleted {
+                    feature_id: "f-1-1".into(),
+                    commits: vec![revision.clone()],
+                })
+                .unwrap();
+            engine
+                .emit(EventKind::MilestoneCompleted {
+                    milestone_id: "ms-1".into(),
+                    tag: None,
+                })
+                .unwrap();
+            assert_eq!(
+                engine.final_gate().await.unwrap(),
+                Some(MissionStatus::Complete),
+                "inconclusive controls remain advisory"
+            );
+            let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+            let receipts: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    EventKind::GateResult {
+                        gate,
+                        surface,
+                        artefact_ref,
+                        verdict,
+                        ..
+                    } if gate == "negative-control:a-control" => {
+                        assert_eq!(*verdict, crate::gate::GateVerdict::Fail);
+                        let reference = artefact_ref
+                            .strip_prefix("file:")
+                            .expect("durable evidence reference");
+                        let evidence: serde_json::Value = serde_json::from_str(
+                            &std::fs::read_to_string(engine.paths.mission_dir().join(reference))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(evidence["status"], "inconclusive");
+                        Some((
+                            *surface,
+                            artefact_ref.clone(),
+                            evidence["sourceRevision"].as_str().unwrap().to_string(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if controls {
+                assert_eq!(receipts.len(), 2);
+                assert_eq!(receipts[0].0, crate::gate::GateSurface::Approval);
+                assert_eq!(receipts[0].2, base_sha);
+                assert_eq!(receipts[1].0, crate::gate::GateSurface::FinalGate);
+                assert_eq!(receipts[1].2, revision);
+                assert_ne!(
+                    receipts[0].1, receipts[1].1,
+                    "final evidence cannot reuse the approval receipt"
+                );
+            } else {
+                assert!(receipts.is_empty());
+            }
+            assert_eq!(engine.repo.head_sha().unwrap(), base_sha);
+            assert_eq!(
+                std::fs::read_to_string(root.join("README.md")).unwrap(),
+                "seed\n"
+            );
+            assert!(!root.join("delivered.txt").exists());
+            engine.teardown_mission_worktree();
+            engine.active_tree = None;
+        }
+    }
+
     #[test]
     fn flight_rules_pin_approve_plan_pins_manifest_and_emits_resolved() {
         let Some((_dir, root)) = lessons_test_repo() else {
@@ -9884,7 +10070,7 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("trusted report"))),
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason , ..} if milestone_id == "ms-1" && reason.contains("trusted report"))),
             "failed validator must block validation, not count as clean: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -9960,6 +10146,7 @@ pub(crate) mod tests {
             check: AssertionCheck::AgentJudgement,
             command: None,
             pty_script: None,
+            negative_control: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -10359,15 +10546,29 @@ pub(crate) mod tests {
             // equivalent DACL/LPAC behavior is covered by the native hostile
             // AppContainer proof.
             let profile = crate::sandbox::generate_profile(&sandbox.inputs);
+            let read_rules: String = profile
+                .split("(deny file-read*")
+                .skip(1)
+                .map(|block| block.split("\n)\n").next().unwrap_or_default())
+                .collect();
             let readme = format!("(literal \"{}\")", root.join("README.md").display());
             assert!(
-                profile.contains(&readme),
+                read_rules.contains(&readme),
                 "the real checkout's source files are read-denied:\n{profile}"
             );
             let git_dir = format!("\"{}\"", root.join(".git").display());
             assert!(
-                !profile.contains(&git_dir),
+                !read_rules.contains(&git_dir),
                 "the shared git dir stays readable (the inspection surface):\n{profile}"
+            );
+            let write_rules: String = profile
+                .split("(deny file-write*")
+                .skip(1)
+                .map(|block| block.split("\n)\n").next().unwrap_or_default())
+                .collect();
+            assert!(
+                write_rules.contains(&git_dir),
+                "the shared git directory node stays write-protected:\n{profile}"
             );
         }
         assert!(validator_snapshot_leftovers(&engine).is_empty());
@@ -10464,7 +10665,7 @@ pub(crate) mod tests {
             "tamper event names the drifted file: {tamper:?}"
         );
         assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("escaped its snapshot"))),
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason , ..} if milestone_id == "ms-1" && reason.contains("escaped its snapshot"))),
             "the block reason names the isolation failure: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -10514,7 +10715,7 @@ pub(crate) mod tests {
 
         let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
         assert!(
-            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("trusted report"))),
+            events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason , ..} if milestone_id == "ms-1" && reason.contains("trusted report"))),
             "the untrusted round blocks: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -10757,6 +10958,7 @@ pub(crate) mod tests {
                 steps: Vec::new(),
                 timeout_secs: None,
             }),
+            negative_control: None,
         };
         let contract = vec![
             pty("a-pty"),
@@ -10767,6 +10969,7 @@ pub(crate) mod tests {
                 check: AssertionCheck::Command,
                 command: Some("true".to_string()),
                 pty_script: None,
+                negative_control: None,
             },
         ];
         let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
@@ -10864,6 +11067,7 @@ pub(crate) mod tests {
             check: AssertionCheck::Command,
             command: Some("true".to_string()),
             pty_script: None,
+            negative_control: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -10984,6 +11188,7 @@ pub(crate) mod tests {
             check: AssertionCheck::AgentJudgement,
             command: None,
             pty_script: None,
+            negative_control: None,
         }];
         // The local backend cannot apply the resolved sandbox profile, so
         // mandatory validator containment fails closed without the explicit
@@ -11192,7 +11397,7 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason } if milestone_id == "ms-1" && reason.contains("cannot green the gate unconfirmed"))),
+                .any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, reason , ..} if milestone_id == "ms-1" && reason.contains("cannot green the gate unconfirmed"))),
             "an untrusted confirmation blocks honestly: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
@@ -14189,7 +14394,7 @@ pub(crate) mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                EventKind::MilestoneBlocked { milestone_id, reason }
+                EventKind::MilestoneBlocked { milestone_id, reason , ..}
                 if milestone_id == "ms-1" && reason.contains("candidate for judgement")
             )),
             "the milestone must park for judgement: {:?}",
@@ -14838,7 +15043,7 @@ pub(crate) mod tests {
         }
         assert!(events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::MilestoneBlocked { milestone_id, reason }
+            EventKind::MilestoneBlocked { milestone_id, reason , ..}
             if milestone_id == "ms-1" && reason.contains("1/2 candidate stream(s)")
         )));
     }
@@ -15211,7 +15416,7 @@ pub(crate) mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                EventKind::MilestoneBlocked { milestone_id, reason }
+                EventKind::MilestoneBlocked { milestone_id, reason , ..}
                 if milestone_id == "ms-1" && reason.contains("candidate for judgement")
             )),
             "agreement never un-parks the judgement: {:?}",

@@ -836,6 +836,10 @@ fn resolve_gate_sandbox_target(
     if sandbox_cfg.enforce == SandboxEnforce::Off {
         return disabled(None);
     }
+    crate::sandbox::validate_git_config_protection(
+        &gate_sandbox_inputs(sandbox_cfg, gate_cwd, mission_dir, scratch_home),
+        sandbox_cfg.provider == SandboxProvider::Container || target_os == "linux",
+    )?;
     if sandbox_cfg.provider == SandboxProvider::Container {
         // Ticket container-gate-wrapper: engine-run gates join the agent
         // sessions INSIDE the mission container. The fail postures mirror

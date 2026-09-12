@@ -43,7 +43,7 @@ use crate::error::{EngineError, Result};
 use crate::event_log::EventLog;
 use crate::events::{Event, EventKind};
 use crate::orchestrator::{first_incomplete, MissionEngine};
-use crate::types::{MilestoneStatus, MissionStatus};
+use crate::types::{BlockContext, MilestoneStatus, MissionStatus};
 use std::collections::HashMap;
 
 /// `orchestrator.decision` summary prefixes the report and the workspace
@@ -52,17 +52,15 @@ use std::collections::HashMap;
 pub const BOOTSTRAP_SUMMARY_PREFIX: &str = "workspace bootstrap:";
 pub const READINESS_SUMMARY_PREFIX: &str = "workspace readiness:";
 
-/// Every block reason this gate emits starts here; the pass path lifts
-/// gate-owned blocks by matching it (a block from ANY other cause is left
-/// to the normal unblock flow). `pub(crate)` so the golden-data skew/reset
-/// reasons (workspace_data.rs) provably share the prefix the lift matches.
+/// Legacy block ownership marker; only events without BlockContext use this
+/// prefix for recovery. Golden-data skew/reset reasons (workspace_data.rs)
+/// retain the same display prefix.
 pub(crate) const GATE_REASON_PREFIX: &str = "workspace gate:";
 
 /// The `milestone.unblocked` reason [`WorkspaceGate::lift_gate_block`] emits
 /// when a previously failed gate passes — an ENGINE-owned unblock, not an
-/// operator decision. `pub(crate)` so the flight-surgeon fold
-/// (escalation_metrics.rs) excludes exactly this unblock from the operator
-/// intervention count by matching the same constant the lift emits.
+/// operator decision. Legacy events use this exact text for classification;
+/// new events carry the workspace-gate BlockContext.
 pub(crate) const GATE_LIFT_REASON: &str = "workspace gate now passing: bootstrap and readiness ok";
 
 /// Outcome of one bootstrap command / readiness check.
@@ -156,6 +154,7 @@ impl MissionEngine {
         }
         let milestone_id = self.state.mission.milestones[mi].id.clone();
         self.emit(EventKind::MilestoneBlocked {
+            block_context: Some(BlockContext::WORKSPACE_GATE),
             milestone_id,
             reason,
         })?;
@@ -181,6 +180,7 @@ impl MissionEngine {
         let events = EventLog::read_events(&self.paths.events_file())?;
         if latest_block_is_gate_owned(&events, &milestone_id) {
             self.emit(EventKind::MilestoneUnblocked {
+                block_context: Some(BlockContext::WORKSPACE_GATE),
                 milestone_id,
                 reason: GATE_LIFT_REASON.to_string(),
                 validator_guidance: None,
@@ -491,7 +491,11 @@ fn latest_block_is_gate_owned(events: &[Event], milestone_id: &str) -> bool {
         EventKind::MilestoneBlocked {
             milestone_id: id,
             reason,
-        } if id == milestone_id => Some(reason.starts_with(GATE_REASON_PREFIX)),
+            block_context,
+        } if id == milestone_id => Some(match block_context {
+            Some(context) => context.is_workspace_gate(),
+            None => reason.starts_with(GATE_REASON_PREFIX),
+        }),
         EventKind::MilestoneUnblocked {
             milestone_id: id, ..
         } if id == milestone_id => Some(false),
@@ -534,6 +538,7 @@ mod tests {
         ev(
             seq,
             EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: milestone_id.to_string(),
                 reason: reason.to_string(),
             },
@@ -779,6 +784,7 @@ mod tests {
             ev(
                 2,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "workspace gate now passing".to_string(),
                     validator_guidance: None,
@@ -803,6 +809,7 @@ mod tests {
             ev(
                 2,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "workspace gate now passing".to_string(),
                     validator_guidance: None,
@@ -813,3 +820,7 @@ mod tests {
         assert!(!latest_block_is_gate_owned(&events, "ms-1"));
     }
 }
+
+#[cfg(test)]
+#[path = "block_context_tests.rs"]
+mod block_context_tests;

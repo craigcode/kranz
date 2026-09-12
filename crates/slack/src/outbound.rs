@@ -130,6 +130,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
         EventKind::MilestoneBlocked {
             milestone_id,
             reason,
+            ..
         } => Some(Outbound::Blocked(Blocked {
             mission_id: state.mission.id.clone(),
             milestone_id: milestone_id.clone(),
@@ -303,6 +304,7 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                negative_control: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -342,6 +344,7 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                negative_control: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -452,6 +455,7 @@ mod tests {
     fn milestone_blocked_classifies_blocked() {
         let out = classify(
             &ev(EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "fix-cycle cap exceeded".into(),
             }),

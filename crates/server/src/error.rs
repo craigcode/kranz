@@ -1,18 +1,31 @@
-//! Uniform JSON error responses: every failure body is `{"error": "..."}`
-//! with an appropriate status code. Handlers never panic on corrupt input —
+//! Uniform JSON error responses: every failure body carries `{"error": "..."}`
+//! with an appropriate status and an optional stable `code` for recovery.
+//! Handlers never panic on corrupt input —
 //! corrupt logs / files surface as error responses.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use kranz_engine::error::EngineError;
+use serde::Serialize;
 use serde_json::json;
 use std::io::ErrorKind;
+
+/// Stable recovery hints for clients. Human-readable messages remain separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiErrorCode {
+    MissionNotHosted,
+    TurnInFlight,
+    RepositoryBusy,
+    StalePlan,
+}
 
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    pub code: Option<ApiErrorCode>,
 }
 
 impl ApiError {
@@ -20,6 +33,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -27,6 +41,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -34,6 +49,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -42,6 +58,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -51,6 +68,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -58,6 +76,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -67,13 +86,23 @@ impl ApiError {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
+            code: None,
         }
+    }
+
+    pub fn with_code(mut self, code: ApiErrorCode) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = json!(code);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 

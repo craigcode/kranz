@@ -600,6 +600,7 @@ mod tests {
             statement: "the login endpoint rejects an expired token".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            negative_control: None,
             pty_script: None,
         }
     }

@@ -338,6 +338,7 @@ pub fn map_mission(events: &[Event]) -> Vec<MissionSpan> {
             EventKind::MilestoneBlocked {
                 milestone_id,
                 reason,
+                ..
             } => {
                 if let Some(open) = open_milestones.remove(milestone_id) {
                     spans.push(finished_milestone_span(
@@ -877,6 +878,7 @@ mod tests {
                 3,
                 20,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".to_string(),
                     reason: "too many fix cycles".to_string(),
                 },

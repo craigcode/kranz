@@ -5,7 +5,7 @@
 // frames append to a capped ring buffer used by the log/conversation views.
 
 import { create } from 'zustand';
-import { api, ApiError, httpOrigin, isNotHosted } from './api';
+import { api, httpOrigin, isNotHosted, isStalePlan } from './api';
 import { repoIdFromHash } from './routes';
 import { MissionSocket } from './ws';
 import type {
@@ -154,6 +154,9 @@ interface KranzStore {
 
 let socket: MissionSocket | null = null;
 let repoGeneration = 0;
+let missionGeneration = 0;
+let missionsRequest = 0;
+let ticketsRequest = 0;
 
 function capEvents(events: MissionEvent[]): MissionEvent[] {
   return events.length > EVENT_BUFFER_CAP
@@ -199,6 +202,15 @@ export function mergePauseEvents(
 export const PLAN_NOT_READY_NOTICE = 'not ready to emit — answer above, then request the plan again';
 
 export const useKranzStore = create<KranzStore>()((set, get) => {
+  /** A mission id alone cannot distinguish A → B → A. Capture the connection
+   *  lifetime so responses from an earlier visit cannot update this one. */
+  function missionScope(): () => boolean {
+    const repo = repoGeneration;
+    const mission = missionGeneration;
+    const id = get().missionId;
+    return () => repoGeneration === repo && missionGeneration === mission && get().missionId === id;
+  }
+
   function patchPlanning(partial: Partial<PlanningSlice>): void {
     set((s) => ({ planning: { ...s.planning, ...partial } }));
   }
@@ -241,17 +253,17 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
   async function runPlanningTurn(text: string): Promise<void> {
     const id = get().missionId;
     if (id === null) return;
-    const generation = repoGeneration;
+    const isCurrent = missionScope();
     patchPlanning({ busy: 'turn', busySince: Date.now(), error: null });
     pushLocal('user', text);
     try {
       const { reply } = await api.planningTurn(id, text);
-      if (repoGeneration !== generation || get().missionId !== id) return;
+      if (!isCurrent()) return;
       if (reply.trim() !== '') pushLocal('reply', reply);
       patchPlanning({ busy: null, busySince: null });
       drainPlanningQueue();
     } catch (err) {
-      if (repoGeneration !== generation || get().missionId !== id) return;
+      if (!isCurrent()) return;
       failPlanning(err);
     }
   }
@@ -260,10 +272,12 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     switch (frame.type) {
       case 'snapshot':
       case 'state':
-        set((s) => ({
-          state: frame.state,
-          lastSeq: Math.max(s.lastSeq ?? 0, frame.seq),
-        }));
+        set((s) => {
+          // A reconnect REST refresh can finish before the socket's older
+          // initial snapshot arrives. Keep the newest authoritative fold.
+          if (s.state !== null && frame.seq < s.state.lastSeq) return {};
+          return { state: frame.state, lastSeq: Math.max(s.lastSeq ?? 0, frame.seq) };
+        });
         break;
       case 'event':
         set((s) => {
@@ -306,6 +320,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     selectRepo: (repoId: string | null) => {
       if (get().repoId === repoId) return;
       repoGeneration += 1;
+      missionGeneration += 1;
       socket?.close();
       socket = null;
       set({
@@ -332,6 +347,8 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
 
     loadMissions: async () => {
       const generation = repoGeneration;
+      const request = ++missionsRequest;
+      const connection = missionGeneration;
       set({ missionsError: null });
       // For the vanished-mission check below: only let the fresh list rule
       // on a connection that already existed when the fetch STARTED — a
@@ -339,31 +356,35 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       const connectedAtStart = get().missionId;
       try {
         const missions = await api.missions();
-        if (repoGeneration !== generation) return;
+        if (repoGeneration !== generation || missionsRequest !== request) return;
         set({ missions });
         // The connected mission vanishing from a fresh list means it was
         // deleted out-of-band (`kranz clean` in a terminal, another tab, or
         // a delete POST whose response was lost): tear the socket down, or
         // it reconnect-loops against the server's 404 forever.
         const id = get().missionId;
-        if (id !== null && id === connectedAtStart && !missions.some((m) => m.id === id)) {
+        if (
+          missionGeneration === connection && id !== null && id === connectedAtStart
+          && !missions.some((m) => m.id === id)
+        ) {
           get().disconnect();
         }
       } catch (err) {
-        if (repoGeneration !== generation) return;
+        if (repoGeneration !== generation || missionsRequest !== request) return;
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
     },
 
     loadTickets: async () => {
       const generation = repoGeneration;
+      const request = ++ticketsRequest;
       set({ ticketsError: null });
       try {
         const tickets = await api.tickets();
-        if (repoGeneration !== generation) return;
+        if (repoGeneration !== generation || ticketsRequest !== request) return;
         set({ tickets });
       } catch (err) {
-        if (repoGeneration !== generation) return;
+        if (repoGeneration !== generation || ticketsRequest !== request) return;
         set({ ticketsError: err instanceof Error ? err.message : String(err) });
       }
     },
@@ -439,9 +460,9 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
 
     connectMission: (id: string) => {
       if (get().missionId === id && socket) return;
+      missionGeneration += 1;
       socket?.close();
       socket = null;
-      const generation = repoGeneration;
       set({
         draftingSlug: null,
         missionId: id,
@@ -455,6 +476,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         startingRun: false,
         startRunError: null,
       });
+      const isCurrent = missionScope();
 
       // Seed the event log over REST so history predating the WS snapshot
       // is visible; overlaps with replayed frames are deduped by seq. Pause
@@ -463,7 +485,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       api
         .events(id)
         .then((seeded) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           set((s) => ({
             events: mergeEvents(seeded, s.events),
             pauseEvents: mergePauseEvents(s.pauseEvents, seeded),
@@ -479,10 +501,12 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         repoId: get().repoId ?? repoIdFromHash(),
         // Only ask for a replay once we hold a state to apply events onto;
         // otherwise request a fresh snapshot.
-        getSince: () => (get().state !== null ? get().lastSeq : null),
-        onFrame: applyFrame,
+        getSince: () => (isCurrent() && get().state !== null ? get().lastSeq : null),
+        onFrame: (frame) => {
+          if (isCurrent()) applyFrame(frame);
+        },
         onStatus: (connection) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           if (connection === 'gone') {
             // The socket proved the mission 404s (deleted out-of-band —
             // `kranz clean`, another tab) and stopped reconnecting for
@@ -497,7 +521,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
             api
               .missionState(id)
               .then((fresh) => {
-                if (repoGeneration !== generation || get().missionId !== id) return;
+                if (!isCurrent()) return;
                 set((s) =>
                   s.state === null || fresh.lastSeq >= s.state.lastSeq
                     ? { state: fresh, lastSeq: Math.max(s.lastSeq ?? 0, fresh.lastSeq) }
@@ -512,7 +536,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
                 const bufTail = buffered.length > 0 ? buffered[buffered.length - 1].seq : 0;
                 if (fresh.lastSeq > bufTail) {
                   return api.events(id, bufTail).then((missing) => {
-                    if (repoGeneration !== generation || get().missionId !== id) return;
+                    if (!isCurrent()) return;
                     set((s) => ({
                       events: mergeEvents(s.events, missing),
                       pauseEvents: mergePauseEvents(s.pauseEvents, missing),
@@ -528,6 +552,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     },
 
     disconnect: () => {
+      missionGeneration += 1;
       socket?.close();
       socket = null;
       set({
@@ -571,12 +596,12 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       if (id === null) return;
       const p = get().planning;
       if (p.busy !== null || p.notHosted) return;
-      const generation = repoGeneration;
+      const isCurrent = missionScope();
       patchPlanning({ busy: 'plan-request', busySince: Date.now(), error: null });
       api
         .requestPlan(id)
         .then((res) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           if (res.ready) {
             patchPlanning({
               busy: null,
@@ -594,7 +619,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
           drainPlanningQueue();
         })
         .catch((err: unknown) => {
-          if (repoGeneration === generation && get().missionId === id) failPlanning(err);
+          if (isCurrent()) failPlanning(err);
         });
     },
 
@@ -610,17 +635,17 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         });
         return;
       }
+      const isCurrent = missionScope();
       patchPlanning({ error: null, approving: true });
-      const generation = repoGeneration;
       api
         .approvePending(id, review.planIdentity)
         .then(({ branch }) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           patchPlanning({ approving: false, approvedBranch: branch });
         })
         .catch((err: unknown) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
-          if (err instanceof ApiError && err.status === 409) {
+          if (!isCurrent()) return;
+          if (isStalePlan(err)) {
             patchPlanning({ review: null, approvedBranch: null });
           }
           patchPlanning({ approving: false });
@@ -631,18 +656,18 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     startMission: () => {
       const id = get().missionId;
       if (id === null) return;
-      const generation = repoGeneration;
+      const isCurrent = missionScope();
       patchPlanning({ starting: true, error: null });
       api
         .startMission(id)
         .then(() => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           // The WS state frame flips mission.status to running; the live
           // mission view takes over from there.
           patchPlanning({ starting: false, review: null, approvedBranch: null });
         })
         .catch((err: unknown) => {
-          if (repoGeneration !== generation || get().missionId !== id) return;
+          if (!isCurrent()) return;
           patchPlanning({ starting: false });
           failPlanning(err);
         });
@@ -653,15 +678,15 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
     startRun: async () => {
       const id = get().missionId;
       if (id === null) return;
-      const generation = repoGeneration;
+      const isCurrent = missionScope();
       set({ startingRun: true, startRunError: null });
       try {
         await api.startMission(id);
-        if (repoGeneration === generation && get().missionId === id) {
+        if (isCurrent()) {
           set({ startingRun: false });
         }
       } catch (err) {
-        if (repoGeneration === generation && get().missionId === id) {
+        if (isCurrent()) {
           set({ startingRun: false, startRunError: err instanceof Error ? err.message : String(err) });
         }
       }

@@ -4,24 +4,32 @@
 //! no-cache discipline.
 
 use crate::error::ApiError;
+use crate::read_work::ReadWork;
 use crate::ServerState;
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use kranz_engine::ticket::Ticket;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// `GET /api/tickets` — a summary row per parseable ticket under
 /// `.kranz/tickets/`: slug, priority, pipeline state, title, and blockedBy.
-pub(crate) async fn list_tickets(State(server): State<Arc<ServerState>>) -> Json<Value> {
-    let rows: Vec<Value> = Ticket::list(server.host.repo_root())
-        .iter()
-        .map(|ticket| ticket_summary_json(server.host.repo_root(), ticket))
-        .collect();
-    Json(Value::Array(rows))
+pub(crate) async fn list_tickets(
+    Extension(reads): Extension<ReadWork>,
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<Value>, ApiError> {
+    reads
+        .run(move || {
+            let rows: Vec<Value> = Ticket::list(server.host.repo_root())
+                .iter()
+                .map(|ticket| ticket_summary_json(server.host.repo_root(), ticket))
+                .collect();
+            Ok(Json(Value::Array(rows)))
+        })
+        .await
 }
 
 /// `GET /api/tickets/:slug` — the full parsed ticket plus `needsContext`
@@ -30,20 +38,25 @@ pub(crate) async fn list_tickets(State(server): State<Arc<ServerState>>) -> Json
 /// invalid/traversal slug (checked at the route boundary before any
 /// filesystem access), 404 for a slug with no ticket file.
 pub(crate) async fn get_ticket(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(slug): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    Ticket::ensure_valid_slug(&slug)
-        .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
+    reads
+        .run(move || {
+            Ticket::ensure_valid_slug(&slug)
+                .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
 
-    let path = Ticket::tickets_dir(server.host.repo_root()).join(format!("{slug}.md"));
-    if !path.is_file() {
-        return Err(ApiError::not_found(format!("unknown ticket '{slug}'")));
-    }
-    let ticket = Ticket::load(&path)
-        .map_err(|e| ApiError::internal(format!("failed to parse ticket '{slug}': {e}")))?;
+            let path = Ticket::tickets_dir(server.host.repo_root()).join(format!("{slug}.md"));
+            if !path.is_file() {
+                return Err(ApiError::not_found(format!("unknown ticket '{slug}'")));
+            }
+            let ticket = Ticket::load(&path)
+                .map_err(|e| ApiError::internal(format!("failed to parse ticket '{slug}': {e}")))?;
 
-    Ok(Json(ticket_full_json(server.host.repo_root(), &ticket)))
+            Ok(Json(ticket_full_json(server.host.repo_root(), &ticket)))
+        })
+        .await
 }
 
 /// `POST /api/tickets/:slug/draft` — long-running: mirrors `POST
@@ -555,6 +568,7 @@ Ship the thing.
                 check: AssertionCheck::Command,
                 command: Some("cargo test".into()),
                 pty_script: None,
+                negative_control: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "M1".into(),

@@ -1071,6 +1071,7 @@ mod tests {
             statement: format!("statement for {id}"),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            negative_control: None,
             pty_script: None,
         }
     }

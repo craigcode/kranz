@@ -1935,3 +1935,30 @@ fn hardened_local_git_drops_ambient_authority() {
     );
     assert!(!marker.exists(), "local Git inherited ambient authority");
 }
+
+#[test]
+fn ordinary_repository_includes_are_refused_after_open_on_local_and_network_paths() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    let included = dir.path().join("ordinary.cfg");
+    std::fs::write(&included, "[user]\nname = Fixture\n").unwrap();
+    raw_git(
+        dir.path(),
+        &["config", "include.path", included.to_str().unwrap()],
+    );
+    for error in [
+        repo.is_clean().unwrap_err(),
+        repo.remote_has_branch("unused-fixture-remote", "kranz/fixture")
+            .unwrap_err(),
+        GitRepo::open(dir.path()).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("ordinary repository config includes"),
+            "{error}"
+        );
+    }
+}

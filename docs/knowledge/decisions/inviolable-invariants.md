@@ -11,6 +11,7 @@ verified_against:
   - AGENTS.md
   - docs/design.md
   - crates/engine/src/git_ops.rs
+  - crates/engine/src/git_process.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/orchestrator/finalization.rs
@@ -136,10 +137,13 @@ system config scope for local operations. Engine diffs also disable external
 diff programs and text converters. Local Git runs with a cleared, allowlisted
 environment. Every invocation rechecks the original driver boundary, retaining
 its overrides across clones and driver removal while refusing new driver names
-and conditional includes. This preflight does not eliminate a concurrent write
-between the config check and Git's own read; enforced config write-denies or an
-immutable view remain necessary to close that race. Explicit network operations
-retain their separately guarded operator credential path.
+and repository ordinary/conditional includes. Enforced sessions and gates
+protect configuration files, Git indirection and metadata directory nodes;
+unprotectable writable layouts fail closed. Unsandboxed host writers can still
+race a preflight read. Explicit network operations retain their separately
+guarded operator credential path. Every Git subprocess has a deadline and
+separate raw stdout/stderr limits; overflow is an error, never a successful
+truncated result. See [Git execution boundary](../../git-execution-boundary.md).
 `open_unhardened` is the explicit escape hatch, with no engine caller, and
 `ensure_identity` pins the operator's resolved `user.name`/`user.email` into
 local scope so hardened invocations do not restamp commits.

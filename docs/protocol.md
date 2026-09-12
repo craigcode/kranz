@@ -28,6 +28,24 @@ retry, recovery, and upgrade semantics.
 
 ## REST
 
+Error responses retain their HTTP status and `error` text. Planning conflicts
+may additionally carry a stable `code`: `mission_not_hosted`, `turn_in_flight`,
+`repository_busy`, or `stale_plan`. Clients should use a present code even when
+it is unknown; message-based fallback applies only when the field is absent
+(older servers). Explanatory wording is not the recovery contract.
+
+Expensive reads and parsing run in a bounded blocking-work pool. At capacity,
+GETs return `503` with `{"error":"repository readers are busy; retry shortly"}`.
+Repository aliases share their pool. WebSocket polling defers a busy poll
+without advancing its cursor; each successful poll still authenticates the
+complete log prefix. See [server read work](reviews/2026-09-12-server-read-work.md).
+
+Command assertions may include optional
+[`negativeControl`](contract-controls.md) definitions. Milestone block/lift
+events may include optional `blockContext` with typed `owner` and `cause`; see
+the [block context contract](reviews/2026-09-12-block-causes-contract.md).
+Absent fields retain legacy behavior.
+
 | Method/Path | Response |
 |---|---|
 | `GET /api/missions` | `[{ "id", "status", "goal", "createdAt", "merged" }]` (folds each log; tolerate corrupt ones with `"status":"failed"` + `"error"`; `status` now also includes `"approved"` for an approved mission with no run activity yet — additive, backward-compatible). `merged` is a cheap `git merge-base --is-ancestor` probe of the mission branch tip against the LIVE base branch tip (not the pinned `base_sha`): `true` once the base has absorbed the mission's commits (Landed), `false` while still unmerged (Delivered), `null`/absent when there is no mission branch yet or a ref fails to resolve — a per-mission git failure degrades only that row, never the whole list |

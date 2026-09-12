@@ -31,6 +31,17 @@ fn default_quant() -> String {
     "n/a".to_string()
 }
 
+// Missing field means a legacy event; explicit null is not an escape hatch
+// from typed ownership. Deserialize the present value as a context, not Option.
+fn deserialize_block_context<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BlockContext>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BlockContext::deserialize(deserializer).map(Some)
+}
+
 /// Serialized as `"type": "<dotted.name>", "payload": { ... }`.
 // large_enum_variant: MissionCreated carries the full MissionConfig (~456B).
 // It occurs once per mission and events are I/O-bound; boxing would ripple
@@ -792,6 +803,14 @@ pub enum EventKind {
         #[serde(rename = "milestoneId")]
         milestone_id: String,
         reason: String,
+        /// Absent only in legacy logs; present unknown values fail closed.
+        #[serde(
+            rename = "blockContext",
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_block_context"
+        )]
+        block_context: Option<BlockContext>,
     },
 
     #[serde(rename = "milestone.unblocked")]
@@ -800,6 +819,14 @@ pub enum EventKind {
         milestone_id: String,
         /// e.g. "raised fix-cycle cap", "user skipped findings"
         reason: String,
+        /// Absent only in legacy logs; present unknown values fail closed.
+        #[serde(
+            rename = "blockContext",
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_block_context"
+        )]
+        block_context: Option<BlockContext>,
         /// Operator guidance carried verbatim into the next validator task
         /// (and its retry). Folded into milestone state so it survives a
         /// process restart; replaced by each new unblock, cleared on
@@ -1584,6 +1611,7 @@ mod tests {
         // The new field serializes when present (camelCase wire name) and is
         // omitted when absent (byte-identical to old logs).
         let with = EventKind::MilestoneUnblocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: "r".into(),
             validator_guidance: Some("FMT FIRST".into()),
@@ -1591,6 +1619,7 @@ mod tests {
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["payload"]["validatorGuidance"], "FMT FIRST");
         let without = EventKind::MilestoneUnblocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: "r".into(),
             validator_guidance: None,

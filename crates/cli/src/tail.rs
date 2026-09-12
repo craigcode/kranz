@@ -513,6 +513,7 @@ impl EventRenderer {
             EventKind::MilestoneBlocked {
                 milestone_id,
                 reason,
+                ..
             } => (
                 format!("milestone {milestone_id}"),
                 ansi::RED,

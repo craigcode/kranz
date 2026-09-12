@@ -190,12 +190,15 @@ pub(crate) fn grant_kind_str(kind: &crate::types::GrantKind) -> &'static str {
     }
 }
 
-/// True when a `milestone.unblocked` reason is the engine-owned workspace-gate
-/// lift rather than an operator decision. `pub(crate)` so the provenance
+/// True for an engine-owned workspace-gate lift. Typed context is authoritative;
+/// only legacy events without context use the historical exact reason. `pub(crate)` so the provenance
 /// replay excludes the same lift from its human-decision chain — one
 /// classification rule, no drift between the two folds.
-pub(crate) fn is_engine_lift(reason: &str) -> bool {
-    reason == crate::workspace_gate::GATE_LIFT_REASON
+pub(crate) fn is_engine_lift(reason: &str, context: Option<&crate::types::BlockContext>) -> bool {
+    match context {
+        Some(context) => context.is_workspace_gate(),
+        None => reason == crate::workspace_gate::GATE_LIFT_REASON,
+    }
 }
 
 /// Pair each `grant.requested` (in seq order) with the `grant.approved` /
@@ -312,7 +315,11 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
             | EventKind::PlanRevisionRejected { .. } => {
                 interventions += 1;
             }
-            EventKind::MilestoneUnblocked { reason, .. } if !is_engine_lift(reason) => {
+            EventKind::MilestoneUnblocked {
+                reason,
+                block_context,
+                ..
+            } if !is_engine_lift(reason, block_context.as_ref()) => {
                 interventions += 1;
             }
             _ => {}
@@ -913,6 +920,7 @@ mod tests {
                 "m-1",
                 0,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "workspace gate: bootstrap failed".into(),
                 },
@@ -924,6 +932,7 @@ mod tests {
                 "m-1",
                 1_000,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
                     validator_guidance: None,
@@ -934,6 +943,7 @@ mod tests {
                 "m-1",
                 2_000,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "fix-cycle cap".into(),
                 },
@@ -944,6 +954,7 @@ mod tests {
                 "m-1",
                 3_000,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "user skipped findings".into(),
                     validator_guidance: None,

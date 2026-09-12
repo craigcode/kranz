@@ -15,6 +15,7 @@ impl MissionEngine {
         );
         self.emit_decision(&reason, None)?;
         self.emit(EventKind::MilestoneBlocked {
+            block_context: Some(BlockContext::engine(BlockCause::ReviewerIndependence)),
             milestone_id: milestone_id.to_string(),
             reason,
         })?;
@@ -184,6 +185,7 @@ impl MissionEngine {
                     Some(reason.clone()),
                 )?;
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::Validation)),
                     milestone_id: last_milestone_id,
                     reason,
                 })?;
@@ -414,9 +416,37 @@ impl MissionEngine {
         }
         prepared_standard_reports.extend(self.judge_standards_rules(&contextual_rules).await?);
 
+        let control_reports = if contract.iter().any(|a| a.negative_control.is_some()) {
+            let repo = self.active_repo().clone();
+            let paths = self.paths.clone();
+            let assertions = contract.clone();
+            let config = self.state.config.clone();
+            // Dropping the awaiting mission signals the admitted evaluator to
+            // finish its bounded active case and stop before any further work.
+            let cancellation = crate::contract_controls::CancellationGuard::default();
+            let cancelled = cancellation.flag();
+            tokio::task::spawn_blocking(move || -> Result<Vec<crate::gate::GateReport>> {
+                let revision = repo.rev_parse("HEAD")?;
+                Ok(crate::contract_controls::evaluate_cancellable(
+                    &repo,
+                    &paths,
+                    &revision,
+                    &assertions,
+                    &config,
+                    &cancelled,
+                ))
+            })
+            .await
+            .map_err(|error| {
+                EngineError::Other(format!("negative-control evaluation task failed: {error}"))
+            })??
+        } else {
+            Vec::new()
+        };
+
         // The pipeline is scoped to this block: it is not Send (Box<dyn
         // Gate>), so it must be fully dropped before the next await below.
-        let (floor_reports, pack_reports) = {
+        let (mut floor_reports, pack_reports) = {
             let mut pipeline = crate::gate::GatePipeline::new();
             contract_gates::register_contract_gates(
                 &mut pipeline,
@@ -437,6 +467,9 @@ impl MissionEngine {
             let (floor, pack) = final_gate_reports.split_at(floor_gate_count);
             (floor.to_vec(), pack.to_vec())
         };
+        // Controls are advisory contract evidence. Append only after the
+        // pipeline split so they cannot become standards-pack enforcement.
+        floor_reports.extend(control_reports);
         // First-class gate results (ticket gate-results-first-class-events,
         // KRZ-312): one gate.result event per evaluation, recorded for the
         // WHOLE ladder — floor then pack, concatenated back into pipeline
@@ -721,6 +754,7 @@ impl MissionEngine {
                 )),
             )?;
             self.emit(EventKind::MilestoneBlocked {
+                block_context: Some(BlockContext::engine(BlockCause::Validation)),
                 milestone_id: last_milestone_id,
                 reason: format!(
                     "authorized manual attestation required for Flight Rules rule(s): {rules}"
@@ -770,6 +804,7 @@ impl MissionEngine {
                     Some(format!("{detail}\n\n{text}")),
                 )?;
                 self.emit(EventKind::MilestoneBlocked {
+                    block_context: Some(BlockContext::engine(BlockCause::ContractBug)),
                     milestone_id: last_milestone_id,
                     reason: format!(
                         "contract command assertion(s) {subjects} appear buggy (false \
@@ -823,6 +858,7 @@ impl MissionEngine {
                 let specs = synthesize_fix_specs(protected_only);
                 if self.fix_cycle_exhausted(li) && !self.escalate_or_block(&last_milestone_id)? {
                     self.emit(EventKind::MilestoneBlocked {
+                        block_context: Some(BlockContext::engine(BlockCause::FixCycleCap)),
                         milestone_id: last_milestone_id,
                         reason: format!(
                             "{} non-waivable final-gate finding(s) failed but the fix-cycle cap ({}) is reached",
@@ -857,6 +893,7 @@ impl MissionEngine {
                         Some(text),
                     )?;
                     self.emit(EventKind::MilestoneBlocked {
+                        block_context: Some(BlockContext::engine(BlockCause::FixCycleCap)),
                         milestone_id: last_milestone_id,
                         reason: format!(
                             "{} final-gate finding(s) but the fix-cycle cap ({}) is reached",

@@ -550,6 +550,7 @@ fn assertion(id: &str, statement: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        negative_control: None,
         pty_script: None,
     }
 }
@@ -2125,6 +2126,7 @@ fn gate_block_reason(events: &[Event], milestone_id: &str) -> String {
             EventKind::MilestoneBlocked {
                 milestone_id: id,
                 reason,
+                ..
             } if id == milestone_id => Some(reason.clone()),
             _ => None,
         })
@@ -4363,6 +4365,7 @@ async fn declared_pty_script_that_never_executes_cannot_green() {
         statement: "the REPL echoes input back".to_string(),
         check: AssertionCheck::PtyScript,
         command: None,
+        negative_control: None,
         pty_script: None,
     }];
 
@@ -4453,6 +4456,7 @@ async fn cancelling_pty_validation_stops_writes_before_mission_unlock() {
         statement: "the target completes".into(),
         check: AssertionCheck::PtyScript,
         command: None,
+        negative_control: None,
         pty_script: Some(PtyScript {
             command: "printf '%s' $$ > pty.pid; exec sleep 30".into(),
             steps: vec![PtyStep::Expect {
@@ -4526,6 +4530,7 @@ async fn declared_pty_script_executes_and_passes_greens() {
         statement: "the REPL echoes input back".to_string(),
         check: AssertionCheck::PtyScript,
         command: None,
+        negative_control: None,
         pty_script: Some(PtyScript {
             command: "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
                  printf 'bye\\n'; exit 0;; *) printf 'echo:%s\\n> ' \"$line\";; esac; done"

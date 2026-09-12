@@ -123,6 +123,23 @@ export interface Assertion {
   /** The scripted terminal session when `check` is `pty-script` (engine
    * `pty_harness`; absent for every other check). */
   ptyScript?: PtyScript;
+  /** Optional paired fixtures for the assertion's own command. Configuration
+   *  alone is not evidence that either control has run or passed. */
+  negativeControl?: NegativeControl;
+}
+
+export interface NegativeControlFile {
+  path: string;
+  content: string;
+}
+
+export interface NegativeControl {
+  checkerFiles: NegativeControlFile[];
+  validFiles: NegativeControlFile[];
+  defectiveFiles: NegativeControlFile[];
+  expectedFailure: string;
+  /** Seconds per fixture: defaults to 60; the engine rejects values over 180. */
+  timeoutSeconds?: number;
 }
 
 /** One scripted terminal session declared by a `pty-script` assertion. */

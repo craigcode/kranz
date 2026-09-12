@@ -90,6 +90,7 @@ fn assertion(id: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        negative_control: None,
         pty_script: None,
     }
 }

@@ -51,6 +51,7 @@ fn plan() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            negative_control: None,
             pty_script: None,
         }],
         milestones: vec![
@@ -975,6 +976,7 @@ fn unknown_ids_are_invalid_state() {
             feature: fix_feature("fx"),
         },
         EventKind::MilestoneBlocked {
+            block_context: None,
             milestone_id: "ms-99".into(),
             reason: "r".into(),
         },
@@ -1162,6 +1164,7 @@ fn blocked_and_unblocked_transition_milestone_and_mission() {
         &ev(
             4,
             EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "fix cycles exceeded".into(),
             },
@@ -1176,6 +1179,7 @@ fn blocked_and_unblocked_transition_milestone_and_mission() {
         &ev(
             5,
             EventKind::MilestoneUnblocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "user raised cap".into(),
                 validator_guidance: None,
@@ -1214,6 +1218,7 @@ fn unblock_guidance_folds_replaces_and_clears_on_completion() {
         &ev(
             4,
             EventKind::MilestoneUnblocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "try again".into(),
                 validator_guidance: Some("FMT FIRST".into()),
@@ -1233,6 +1238,7 @@ fn unblock_guidance_folds_replaces_and_clears_on_completion() {
         &ev(
             5,
             EventKind::MilestoneUnblocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "and again".into(),
                 validator_guidance: None,
@@ -1249,6 +1255,7 @@ fn unblock_guidance_folds_replaces_and_clears_on_completion() {
         &ev(
             6,
             EventKind::MilestoneUnblocked {
+                block_context: None,
                 milestone_id: "ms-1".into(),
                 reason: "third".into(),
                 validator_guidance: Some("check a3".into()),
@@ -1310,10 +1317,12 @@ fn every_status_value_is_reachable() {
             milestone_id: "ms-1".into(),
         }, // ms Validating
         EventKind::MilestoneBlocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: "r".into(),
         }, // Blocked x2
         EventKind::MilestoneUnblocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: "r".into(),
             validator_guidance: None,
@@ -2359,10 +2368,12 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
                 }
             }
             Action::Blocked(m) => EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: ms(*m),
                 reason: "r".into(),
             },
             Action::Unblocked(m) => EventKind::MilestoneUnblocked {
+                block_context: None,
                 milestone_id: ms(*m),
                 reason: "r".into(),
                 validator_guidance: None,
@@ -3150,6 +3161,7 @@ fn grant_denied_folds_after_its_milestone_is_dropped_but_blocking_it_would_brick
         &ev(
             next + 2,
             EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: "ms-2".to_string(),
                 reason: "would brick".to_string(),
             },
@@ -3630,6 +3642,7 @@ fn plan_three_milestones() -> Plan {
             statement: "cargo test passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            negative_control: None,
             pty_script: None,
         }],
         milestones: vec![
@@ -4391,6 +4404,7 @@ fn divergence_event_old_logs_fold_cleanly() {
         ev(
             8,
             EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: "ms-1".to_string(),
                 reason: "dispatch pool: 2/2 candidate stream(s) recorded for unit f-1-1; …"
                     .to_string(),

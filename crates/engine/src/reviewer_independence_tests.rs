@@ -649,6 +649,7 @@ async fn reviewer_independence_legacy_no_policy_skip_keeps_existing_completion_b
     deliver_feature(&mut engine, BackendKind::Claude, "sonnet");
     engine
         .emit(EventKind::MilestoneBlocked {
+            block_context: None,
             milestone_id: "ms-1".into(),
             reason: "operator decision needed".into(),
         })
@@ -681,6 +682,7 @@ async fn reviewer_independence_final_command_mutation_retires_review_across_resu
             statement: "exercise a mutating gate".into(),
             check: AssertionCheck::Command,
             command: Some(command),
+            negative_control: None,
             pty_script: None,
         });
         let scripts = vec![MockScript::single_shot_json(&serde_json::json!({
@@ -840,6 +842,7 @@ async fn reviewer_independence_pending_only_revision_preserves_completed_prefix_
         statement: "additional requirement".into(),
         check: AssertionCheck::Command,
         command: Some("true".into()),
+        negative_control: None,
         pty_script: None,
     });
     let mut revised_events = EventLog::read_events(&engine.paths.events_file()).unwrap();

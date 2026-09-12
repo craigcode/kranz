@@ -293,8 +293,8 @@ pub struct MissionOutcomes {
     /// [`crate::ticket::parse_task_class_from_goal`]; None when the goal
     /// carries no class heading (the "unclassified" row).
     pub task_class: Option<String>,
-    /// Token usage summed per backend (as routed by the mission.created
-    /// config for each run's role) — the context-reuse split's input.
+    /// Token usage summed by recorded dispatch backend, falling back to the
+    /// creation config only for legacy runs — the context-reuse split's input.
     pub token_sums: Vec<BackendTokenSum>,
     /// The mission's divergence ledger (KRZ-304) — `None` when the mission
     /// recorded no divergence events at all (missions without pools:
@@ -574,6 +574,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         let EventKind::MilestoneBlocked {
             milestone_id,
             reason,
+            ..
         } = &e.kind
         else {
             continue;
@@ -672,9 +673,8 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         }
     }
 
-    // Cost: Σ recorded costUsd, falling back to token pricing with the
-    // spawned run's model and the config's backend for that role (mirrors
-    // cost::mission_total_cost — including $0 for the local tier).
+    // Cost: recorded costUsd, then token pricing with the actual spawned
+    // backend/model. Creation config is only a legacy-log fallback.
     let config = mission_events.iter().find_map(|e| match &e.kind {
         EventKind::MissionCreated { config, .. } => Some(config),
         _ => None,
@@ -685,24 +685,23 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         EventKind::MissionCreated { goal, .. } => crate::ticket::parse_task_class_from_goal(goal),
         _ => None,
     });
-    let mut run_models: std::collections::HashMap<&str, (&str, crate::types::Role)> =
-        std::collections::HashMap::new();
+    let mut run_models = std::collections::HashMap::new();
     for e in &mission_events {
         if let EventKind::WorkerSpawned {
             run_id,
             role,
             model,
+            backend,
             ..
         } = &e.kind
         {
-            run_models.insert(run_id.as_str(), (model.as_str(), *role));
+            run_models.insert(run_id.as_str(), (model.as_str(), *role, *backend));
         }
     }
     let mut cost_usd = 0.0;
     // Token usage summed per backend (keyed by its as_str for deterministic
-    // output) — the context-reuse split's per-mission input. The backend is
-    // the one the mission.created config routes the run's role to, the same
-    // rule the cost fallback prices with.
+    // output) — the context-reuse split's per-mission input. Backend identity
+    // uses the same resolution as cost, including legacy fallback.
     let mut token_sums: std::collections::BTreeMap<&'static str, BackendTokenSum> =
         std::collections::BTreeMap::new();
     for e in &mission_events {
@@ -713,15 +712,12 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             ..
         } = &e.kind
         {
-            let (model, role) = run_models
+            let (model, role, recorded_backend) = run_models
                 .get(run_id.as_str())
                 .copied()
-                .unwrap_or(("", crate::types::Role::Worker));
-            let backend = config
-                .map(|c| c.backend_kind(role))
-                .unwrap_or(crate::types::BackendKind::Claude);
-            cost_usd += recorded
-                .unwrap_or_else(|| crate::cost::usage_cost_usd_for_backend(tokens, model, backend));
+                .unwrap_or(("", crate::types::Role::Worker, None));
+            let backend = crate::cost::resolved_run_backend(recorded_backend, role, config);
+            cost_usd += crate::cost::resolved_run_cost(*recorded, tokens, model, backend);
             let sum = token_sums
                 .entry(backend.as_str())
                 .or_insert(BackendTokenSum {
@@ -1671,6 +1667,7 @@ mod tests {
                 "m-1",
                 0,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "waiting".into(),
                 },
@@ -1680,6 +1677,7 @@ mod tests {
                 "m-1",
                 10,
                 EventKind::MilestoneUnblocked {
+                    block_context: None,
                     milestone_id: "ms-1".into(),
                     reason: "cap raised".into(),
                     validator_guidance: None,
@@ -1690,6 +1688,7 @@ mod tests {
                 "m-1",
                 20,
                 EventKind::MilestoneBlocked {
+                    block_context: None,
                     milestone_id: "ms-2".into(),
                     reason: "still stuck".into(),
                 },

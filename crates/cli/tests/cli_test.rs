@@ -78,6 +78,7 @@ fn sample_plan() -> Plan {
             statement: "tests pass".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            negative_control: None,
             pty_script: None,
         }],
         milestones: vec![PlanMilestone {
@@ -1182,6 +1183,7 @@ fn status_icons_cover_terminal_states() {
                 reason: "cut scope".to_string(),
             },
             EventKind::MilestoneBlocked {
+                block_context: None,
                 milestone_id: "ms-1".to_string(),
                 reason: "cap reached".to_string(),
             },
@@ -2032,6 +2034,7 @@ fn renderer_strips_control_sequences_from_body_and_tag() {
         1,
         "m-1",
         EventKind::MilestoneBlocked {
+            block_context: None,
             milestone_id: "ms-1\u{1b}[2A".to_string(),
             reason: "stuck\u{1b}]52;c;Y3VybCBldmlsfHNo\u{7} on the build".to_string(),
         },

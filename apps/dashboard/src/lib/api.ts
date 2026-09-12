@@ -63,17 +63,30 @@ export function scopedApiPath(path: string, repoId = repoIdFromHash()): string {
 /** Error carrying the HTTP status + the server's `{"error":...}` text. */
 export class ApiError extends Error {
   readonly status: number;
+  /** Preserved even when unknown so new server codes never trigger a legacy
+   *  message-based recovery path. */
+  readonly code: string | undefined;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
 /** True for 409 "not hosted" — this mission is being planned from a terminal. */
 export function isNotHosted(err: unknown): boolean {
-  return err instanceof ApiError && err.status === 409 && /not hosted/i.test(err.message);
+  return err instanceof ApiError && err.status === 409 && (
+    err.code === undefined ? /not hosted/i.test(err.message) : err.code === 'mission_not_hosted'
+  );
+}
+
+/** Older servers used an undifferentiated 409 for pending-plan conflicts. */
+export function isStalePlan(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409 && (
+    err.code === undefined || err.code === 'stale_plan'
+  );
 }
 
 /** True for a 401 surfaced by `{ tokenGate: false }` — a token is required
@@ -84,16 +97,19 @@ export function isTokenRequired(err: unknown): boolean {
 
 async function errorFrom(res: Response, fallback: string): Promise<ApiError> {
   let message = fallback;
+  let code: string | undefined;
   try {
     const body: unknown = await res.json();
-    if (typeof body === 'object' && body !== null && 'error' in body) {
-      const text = (body as { error: unknown }).error;
-      if (typeof text === 'string' && text !== '') message = text;
+    if (typeof body === 'object' && body !== null) {
+      if ('error' in body && typeof body.error === 'string' && body.error !== '') message = body.error;
+      // A present but unknown/malformed code must not opt into the legacy
+      // prose interpretation. Only an absent field identifies an old server.
+      if ('code' in body) code = typeof body.code === 'string' ? body.code : '';
     }
   } catch {
     /* keep the fallback */
   }
-  return new ApiError(res.status, message);
+  return new ApiError(res.status, message, code);
 }
 
 const STALE_SERVE_MESSAGE = 'endpoint unavailable — server restart needed?';

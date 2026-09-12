@@ -1351,11 +1351,189 @@ pub(crate) fn tty_deny_block(paths: &[PathBuf]) -> String {
     block
 }
 
+/// Refuse Git configurations whose complete input set this sandbox cannot
+/// protect. The enforcement protects against contained children; a separate
+/// unsandboxed host process can still change the repository concurrently.
+pub(crate) fn validate_git_config_protection(
+    inputs: &SandboxInputs,
+    mount_based: bool,
+) -> crate::error::Result<()> {
+    let writable = write_allowlist(inputs);
+    let neutral_config = absolutize(crate::git_ops::empty_global_config_path()?);
+    if writable.iter().any(|root| neutral_config.starts_with(root)) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot grant sandbox writes over the engine's neutral Git configuration; narrow the overlapping session, scratch, or extraWrite root".into(),
+        ));
+    }
+    let Some(marker) = git_marker(&inputs.session_cwd) else {
+        return Ok(());
+    };
+    let root = marker.parent().expect("git marker has a parent");
+    let repo = crate::git_ops::GitRepo::open(root)?;
+    let (git_dir, common, worktree_enabled) = repo.config_protection_paths()?;
+    let described = git_metadata_dirs(&inputs.session_cwd);
+    if [&git_dir, &common].iter().any(|dir| {
+        !described
+            .iter()
+            .any(|path| absolutize(path) == absolutize(dir))
+    }) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot protect Git metadata redirected outside the session's Git layout; remove repository environment overrides before running an enforced session".into(),
+        ));
+    }
+    let masks = authority_directory_masks(inputs);
+    let mut graph_dirs = vec![git_dir.clone(), common.clone()];
+    graph_dirs.extend(git_metadata_mount_nodes(inputs));
+    if graph_dirs.iter().any(|dir| {
+        let dir = absolutize(dir);
+        // A shared Git directory outside writable roots remains read-only;
+        // its existing read-only authority view needs no writable node bind.
+        if !writable.iter().any(|root| dir.starts_with(root)) {
+            return false;
+        }
+        masks.iter().any(|mask| {
+            dir.starts_with(&mask.path)
+                && ![&inputs.session_cwd, &inputs.tmpdir].iter().any(|private| {
+                    let private = absolutize(private);
+                    private != mask.path
+                        && private.starts_with(&mask.path)
+                        && dir.starts_with(private)
+                })
+        })
+    }) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot protect Git metadata through an authority directory; keep the Git directory outside .kranz and credential stores".into(),
+        ));
+    }
+    let mut sources = vec![common.join("config")];
+    if marker.is_file() {
+        sources.push(marker.clone());
+        sources.push(git_dir.join("commondir"));
+    }
+    if worktree_enabled {
+        sources.push(git_dir.join("config.worktree"));
+    }
+    for source in sources {
+        let writable_source = writable
+            .iter()
+            .any(|root| absolutize(&source).starts_with(root));
+        // A symlink input (or replaceable symlink ancestor) defeats a path-only
+        // deny. System aliases outside writable roots, such as /var, are fine.
+        for ancestor in source.ancestors() {
+            if std::fs::symlink_metadata(ancestor).is_ok_and(|meta| meta.file_type().is_symlink())
+                && (ancestor == source
+                    || writable.iter().any(|root| {
+                        ancestor
+                            .parent()
+                            .map(absolutize)
+                            .map(|parent| parent.join(ancestor.file_name().unwrap_or_default()))
+                            .is_some_and(|path| path.starts_with(root))
+                    }))
+            {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect Git configuration through symlink {}; use regular Git metadata paths", ancestor.display()
+                )));
+            }
+        }
+        match std::fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() != 1 {
+                        return Err(crate::error::EngineError::Backend(format!(
+                            "cannot protect multiply linked Git configuration {}; replace it with a private regular file", source.display()
+                        )));
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && (!mount_based || !writable_source) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect absent active Git configuration {} with a mount sandbox; create the intended regular config file before running, or disable extensions.worktreeConfig", source.display()
+                )));
+            }
+            _ => {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect Git configuration {}; expected a regular file",
+                    source.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_marker(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|path| path.join(".git"))
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+/// Follow only the two bounded Git indirection files to describe denies. The
+/// execution boundary validates the layout using Git itself before spawning.
+fn git_metadata_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let Some(marker) = git_marker(cwd) else {
+        return vec![cwd.join(".git")];
+    };
+    let read = |path: &Path| {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| crate::paths::read_regular_file_bounded(file, 16384).ok())
+    };
+    if marker.is_dir() {
+        return vec![marker];
+    }
+    let Some(link) = read(&marker) else {
+        return Vec::new();
+    };
+    let Some(path) = link.trim().strip_prefix("gitdir: ") else {
+        return Vec::new();
+    };
+    let dir = absolutize(&marker.parent().unwrap().join(path));
+    let mut dirs = vec![dir.clone()];
+    if let Some(common) = read(&dir.join("commondir")) {
+        dirs.push(absolutize(&dir.join(common.trim())));
+    }
+    dirs
+}
+
+/// Pin writable metadata directory nodes as mountpoints, so renaming a parent
+/// cannot replace a protected config path. The directories stay writable for
+/// Git's index/ref lock files; named configuration inputs are mounted read-only.
+pub(crate) fn git_metadata_mount_nodes(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let writable = write_allowlist(inputs);
+    let mut nodes = std::collections::BTreeSet::new();
+    let mut dirs = git_metadata_dirs(&inputs.session_cwd);
+    if let Some(marker) = git_marker(&inputs.session_cwd).filter(|path| path.is_file()) {
+        dirs.push(
+            marker
+                .parent()
+                .expect("git marker has a parent")
+                .to_path_buf(),
+        );
+    }
+    for dir in dirs {
+        for path in absolutize(&dir).ancestors() {
+            if writable
+                .iter()
+                .any(|root| path.starts_with(root) && path != root)
+                && path.is_dir()
+            {
+                nodes.insert(path.to_path_buf());
+            }
+        }
+    }
+    nodes.into_iter().collect()
+}
+
 /// The `.git` metadata a sandboxed session must never write (2026-09-01
 /// adversarial audit H3 support).
 ///
 /// The engine runs git IN the tree the worker controls: `commit_dirty_paths`
-/// checkpoints after every feature on an UNHARDENED handle
+/// checkpoints after every feature on a hardened handle
 /// (`orchestrator.rs`), and `push_mission_branch` pushes from the CLI. A
 /// worker that plants `.git/hooks/pre-commit`, sets `core.fsmonitor` /
 /// `core.sshCommand` in `.git/config`, or rewrites the WORKTREE GITLINK to
@@ -1384,16 +1562,21 @@ pub(crate) fn tty_deny_block(paths: &[PathBuf]) -> String {
 /// Reads stay allowed throughout: git cannot operate without reading its
 /// own config, and secrecy was never this tier's promise.
 pub(crate) fn git_metadata_write_denies(inputs: &SandboxInputs) -> WriteDenySet {
-    let mut files = Vec::new();
+    let mut files = git_metadata_mount_nodes(inputs);
     let mut dirs = Vec::new();
     for cwd in [inputs.session_cwd.clone(), absolutize(&inputs.session_cwd)] {
-        let git = cwd.join(".git");
-        files.push(git.clone());
-        files.push(git.join("config"));
-        files.push(git.join("config.worktree"));
-        dirs.push(git.join("hooks"));
-        dirs.push(git.join("info"));
-        dirs.push(git.join("modules"));
+        files.push(cwd.join(".git"));
+        if let Some(marker) = git_marker(&cwd) {
+            files.push(marker);
+        }
+        for git in git_metadata_dirs(&cwd) {
+            files.push(git.join("config"));
+            files.push(git.join("config.worktree"));
+            files.push(git.join("commondir"));
+            dirs.push(git.join("hooks"));
+            dirs.push(git.join("info"));
+            dirs.push(git.join("modules"));
+        }
     }
     WriteDenySet {
         files: sorted_dedup(files),
@@ -1737,8 +1920,8 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     }
 
     // `.git` metadata write deny (2026-09-01 adversarial audit, H3 support —
-    // see git_metadata_write_denies): the engine checkpoints with an
-    // unhardened git handle in the tree the worker controls, so the hook and
+    // see git_metadata_write_denies): the engine checkpoints with a
+    // hardened git handle in the tree the worker controls, so the hook and
     // config surface that turns the next engine-side `git commit` into host
     // execution is denied. Narrow by design — the worker's own role is to
     // commit, so the index, objects, refs and logs stay writable.
@@ -1987,16 +2170,10 @@ pub fn bubblewrap_args(
     // Private authority directory views below close both reads and writes,
     // including authority files created after launch. These extra ro-binds
     // cover readable policy and Git metadata outside those views. For that
-    // Git-only surface, a path absent at spawn remains unbound until the
-    // next session (Seatbelt also denies future paths explicitly).
-    //
-    // One deliberate exclusion: a `.git` that is a DIRECTORY (checkout mode)
-    // is never ro-bound as a whole — that would close the index, objects and
-    // refs the worker's own `git commit` writes. Only the gitlink FILE form
-    // and the named config/hook paths beneath it are bound, so the bwrap
-    // tier cannot stop a replace of the `.git` directory NODE itself. The
-    // Seatbelt and Windows tiers deny that literal; bwrap's remainder is
-    // recorded here rather than papered over.
+    // Git configuration surface, active absent inputs are refused before
+    // spawn. Inactive config.worktree cannot become active while the main
+    // config is immutable. Writable self-binds pin metadata directory nodes
+    // against rename without closing the index/object/ref lockfile paths.
     // Do not directly bind READ-denied paths: their private directory view
     // owns the destination. A host bind stacked over a mask would restore
     // the credential the mask is meant to hide.
@@ -2015,6 +2192,11 @@ pub fn bubblewrap_args(
         let abs = lexical_absolute(path);
         masked_files.contains(&abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
     };
+    let git_mount_nodes = git_metadata_mount_nodes(inputs);
+    for node in &git_mount_nodes {
+        let node = node.display().to_string();
+        out.extend(["--bind".to_string(), node.clone(), node]);
+    }
     let authority_writes = authority_write_denies(inputs);
     let git_writes = git_metadata_write_denies(inputs);
     let write_ro_binds: std::collections::BTreeSet<String> = authority_writes
@@ -2096,6 +2278,13 @@ pub fn bubblewrap_args(
             {
                 let path = private.display().to_string();
                 out.extend(["--bind".to_string(), path.clone(), path.clone()]);
+                for node in git_mount_nodes
+                    .iter()
+                    .filter(|node| node.starts_with(&private))
+                {
+                    let node = node.display().to_string();
+                    out.extend(["--bind".to_string(), node.clone(), node]);
+                }
                 // Host-source binds replace every nested mount. Restore the
                 // write denies this private root just covered, before deeper
                 // authority masks hide their secrets. Rebinding denied host
@@ -5710,3 +5899,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git_config_protection_tests.rs"]
+mod git_config_protection_tests;

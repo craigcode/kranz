@@ -2,12 +2,13 @@
 //! from disk — no caching; the engine process owns truth.
 
 use crate::error::ApiError;
+use crate::read_work::ReadWork;
 use crate::ServerState;
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use kranz_engine::contract_lint::ContractLintReport;
 use kranz_engine::cost;
 use kranz_engine::event_log::EventLog;
@@ -37,55 +38,62 @@ pub(crate) async fn health() -> Json<Value> {
 /// `GET /api/missions` — fold each mission's log into a summary row. A
 /// corrupt (or unreadable) log yields that entry with `"status": "failed"`
 /// and an `"error"` field instead of failing the whole list.
-pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Json<Value> {
-    let index_contents = read_missions_index(&server.repo_root).await;
-    let mut ids = MissionPaths::list_missions(&server.repo_root);
-    for id in kranz_engine::mission_catalog::mission_index_ids(&index_contents) {
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids.sort();
-    // Opened once for the whole list; a failure here just means every row's
-    // `merged` degrades to null (no git ancestry to probe).
-    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root).ok();
-    let mut rows = Vec::new();
-    for id in ids {
-        let paths = MissionPaths::new(&server.repo_root, &id);
-        if !paths.events_file().is_file() {
-            rows.push(json!({
-                "id": id,
-                "status": "deleted",
-                "goal": "deleted mission (no data recorded)",
-            }));
-            continue;
-        }
-        // The events file exists — but trust it only when no path component
-        // is a symlink (P1 mission-path-no-follow): a symlinked mission dir
-        // surfaces as a clear error row, never a read into another
-        // repository's tree.
-        if let Err(error) = paths.require_no_follow() {
-            rows.push(json!({ "id": id, "status": "failed", "error": error.to_string() }));
-            continue;
-        }
-        let row = match fold_log(&paths) {
-            Ok(state) => {
-                let merged = repo
-                    .as_ref()
-                    .and_then(|repo| merged_bit(repo, &state.mission));
-                json!({
-                    "id": id,
-                    "status": state.mission.status,
-                    "goal": state.mission.goal,
-                    "createdAt": state.mission.created_at,
-                    "merged": merged,
-                })
+pub(crate) async fn list_missions(
+    Extension(reads): Extension<ReadWork>,
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<Value>, ApiError> {
+    reads
+        .run(move || {
+            let index_contents = read_missions_index_sync(&server.repo_root);
+            let mut ids = MissionPaths::list_missions(&server.repo_root);
+            for id in kranz_engine::mission_catalog::mission_index_ids(&index_contents) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
             }
-            Err(error) => json!({ "id": id, "status": "failed", "error": error }),
-        };
-        rows.push(row);
-    }
-    Json(Value::Array(rows))
+            ids.sort();
+            // Opened once for the whole list; a failure here just means every row's
+            // `merged` degrades to null (no git ancestry to probe).
+            let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root).ok();
+            let mut rows = Vec::new();
+            for id in ids {
+                let paths = MissionPaths::new(&server.repo_root, &id);
+                if !paths.events_file().is_file() {
+                    rows.push(json!({
+                        "id": id,
+                        "status": "deleted",
+                        "goal": "deleted mission (no data recorded)",
+                    }));
+                    continue;
+                }
+                // The events file exists — but trust it only when no path component
+                // is a symlink (P1 mission-path-no-follow): a symlinked mission dir
+                // surfaces as a clear error row, never a read into another
+                // repository's tree.
+                if let Err(error) = paths.require_no_follow() {
+                    rows.push(json!({ "id": id, "status": "failed", "error": error.to_string() }));
+                    continue;
+                }
+                let row = match fold_log(&paths) {
+                    Ok(state) => {
+                        let merged = repo
+                            .as_ref()
+                            .and_then(|repo| merged_bit(repo, &state.mission));
+                        json!({
+                            "id": id,
+                            "status": state.mission.status,
+                            "goal": state.mission.goal,
+                            "createdAt": state.mission.created_at,
+                            "merged": merged,
+                        })
+                    }
+                    Err(error) => json!({ "id": id, "status": "failed", "error": error }),
+                };
+                rows.push(row);
+            }
+            Ok(Json(Value::Array(rows)))
+        })
+        .await
 }
 
 /// `GET /api/missions/outcomes` — flight-surgeon outcomes fold (autonomy
@@ -93,11 +101,16 @@ pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Jso
 /// per-request from the event logs by [`kranz_engine::outcomes::compute_outcomes`].
 /// No caching, no second source of truth.
 pub(crate) async fn mission_outcomes(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
 ) -> Result<Json<kranz_engine::outcomes::Outcomes>, ApiError> {
-    let outcomes = kranz_engine::outcomes::compute_outcomes(&server.repo_root)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(outcomes))
+    reads
+        .run(move || {
+            let outcomes = kranz_engine::outcomes::compute_outcomes(&server.repo_root)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(Json(outcomes))
+        })
+        .await
 }
 
 /// `GET /api/escalation-metrics` — the flight-surgeon console (ticket
@@ -109,21 +122,32 @@ pub(crate) async fn mission_outcomes(
 /// [`kranz_engine::escalation_metrics::compute_escalation_metrics`]. Read-gated
 /// like every other GET; no caching, no second source of truth.
 pub(crate) async fn escalation_metrics(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
 ) -> Result<Json<kranz_engine::escalation_metrics::EscalationMetrics>, ApiError> {
-    let metrics = kranz_engine::escalation_metrics::compute_escalation_metrics(&server.repo_root)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(metrics))
+    reads
+        .run(move || {
+            let metrics =
+                kranz_engine::escalation_metrics::compute_escalation_metrics(&server.repo_root)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(Json(metrics))
+        })
+        .await
 }
 
 /// Cross-mission Flight Rules effectiveness fold (KRZ-348). Read-only and
 /// recomputed from event logs plus traced defect ticket links on every call.
 pub(crate) async fn standards_metrics(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
 ) -> Result<Json<kranz_engine::standards_metrics::StandardsMetricsReport>, ApiError> {
-    Ok(Json(kranz_engine::standards_metrics::compute(
-        &server.repo_root,
-    )?))
+    reads
+        .run(move || {
+            Ok(Json(kranz_engine::standards_metrics::compute(
+                &server.repo_root,
+            )?))
+        })
+        .await
 }
 
 /// `GET /api/cost-per-merged-change?windowDays=30` — cost per merged change
@@ -137,31 +161,36 @@ pub(crate) async fn standards_metrics(
 /// review); the same folded JSON the CLI's `kranz outcomes --all`
 /// aggregates per catalog repo.
 pub(crate) async fn cost_per_merged_change(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<kranz_engine::outcomes::CostPerMergedChange>, ApiError> {
-    let window_days = match params.get("windowDays") {
-        Some(raw) => {
-            let parsed = raw
-                .parse::<u64>()
-                .map_err(|_| ApiError::bad_request("windowDays must be a non-negative integer"))?;
-            if parsed > kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS {
-                return Err(ApiError::bad_request(format!(
-                    "windowDays must be at most {} days",
-                    kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS
-                )));
-            }
-            parsed
-        }
-        None => kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
-    };
-    let report = kranz_engine::outcomes::compute_cost_per_merged_change(
-        &server.repo_root,
-        window_days,
-        chrono::Utc::now(),
-    )
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(report))
+    reads
+        .run(move || {
+            let window_days = match params.get("windowDays") {
+                Some(raw) => {
+                    let parsed = raw.parse::<u64>().map_err(|_| {
+                        ApiError::bad_request("windowDays must be a non-negative integer")
+                    })?;
+                    if parsed > kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS {
+                        return Err(ApiError::bad_request(format!(
+                            "windowDays must be at most {} days",
+                            kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS
+                        )));
+                    }
+                    parsed
+                }
+                None => kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS,
+            };
+            let report = kranz_engine::outcomes::compute_cost_per_merged_change(
+                &server.repo_root,
+                window_days,
+                chrono::Utc::now(),
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(Json(report))
+        })
+        .await
 }
 
 /// `<repo>/.kranz/missions/index.md` contents, or `""` if the file is absent
@@ -170,28 +199,31 @@ pub(crate) async fn cost_per_merged_change(
 /// No-follow, like every other repo file this crate reads: the catalog lives
 /// in a worker-writable tree and a symlinked `index.md` must read as absent,
 /// not as whatever it points at.
-async fn read_missions_index(repo_root: &Path) -> String {
+fn read_missions_index_sync(repo_root: &Path) -> String {
     let path = MissionPaths::new(repo_root, "_")
         .missions_dir()
         .join("index.md");
-    read_file_or_404(&path, || "no mission index".into())
-        .await
-        .unwrap_or_default()
+    read_file_or_404_sync(&path, "no mission index".into()).unwrap_or_default()
 }
 
 /// `GET /api/missions/:id/state` — full [`MissionState`], folded from
 /// events.jsonl (NOT the state.json cache). 404 for an unknown mission.
 pub(crate) async fn mission_state(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<MissionState>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    let events_path = paths.events_file();
-    if !events_path.is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let events = EventLog::read_events(&events_path)?;
-    Ok(Json(reducer::fold(&events)?))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            let events_path = paths.events_file();
+            if !events_path.is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let events = EventLog::read_events(&events_path)?;
+            Ok(Json(reducer::fold(&events)?))
+        })
+        .await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,15 +306,20 @@ fn fold_standards_view(
 /// Typed Flight Rules read model. No configured standards is represented by
 /// `{}` so old missions add no empty warning surface.
 pub(crate) async fn mission_standards(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<MissionStandardsView>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let events = EventLog::read_events(&paths.events_file())?;
-    Ok(Json(fold_standards_view(&id, &events)?))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let events = EventLog::read_events(&paths.events_file())?;
+            Ok(Json(fold_standards_view(&id, &events)?))
+        })
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,204 +406,208 @@ pub(crate) async fn post_standards_waiver(
 ///   from the top-level `lifecycle`, which describes the local execution
 ///   cwd (worktree active/pending/removed), not the provider workspace.
 pub(crate) async fn mission_workspace(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let events = EventLog::read_events(&paths.events_file())?;
-    let state = reducer::fold(&events)?;
-    let isolation = state.config.isolation();
-    let cwd = match isolation {
-        WorkerIsolation::Worktree => mission_worktree_path(&server.repo_root, &id),
-        WorkerIsolation::Checkout => server.repo_root.clone(),
-    };
-    let worktree_active = isolation == WorkerIsolation::Worktree && cwd.is_dir();
-    let lifecycle = match isolation {
-        WorkerIsolation::Checkout => "primary-checkout",
-        WorkerIsolation::Worktree if worktree_active => "active",
-        WorkerIsolation::Worktree
-            if matches!(
+    reads.run(move || {
+        let paths = mission_paths(&server, &id)?;
+        if !paths.events_file().is_file() {
+            return Err(unknown_mission(&id));
+        }
+        let events = EventLog::read_events(&paths.events_file())?;
+        let state = reducer::fold(&events)?;
+        let isolation = state.config.isolation();
+        let cwd = match isolation {
+            WorkerIsolation::Worktree => mission_worktree_path(&server.repo_root, &id),
+            WorkerIsolation::Checkout => server.repo_root.clone(),
+        };
+        let worktree_active = isolation == WorkerIsolation::Worktree && cwd.is_dir();
+        let lifecycle = match isolation {
+            WorkerIsolation::Checkout => "primary-checkout",
+            WorkerIsolation::Worktree if worktree_active => "active",
+            WorkerIsolation::Worktree
+                if matches!(
+                    state.mission.status,
+                    MissionStatus::Planning | MissionStatus::Approved
+                ) =>
+            {
+                "pending"
+            }
+            WorkerIsolation::Worktree => "removed",
+        };
+        let preflight = events.iter().rev().find_map(|event| match &event.kind {
+            EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
+                Some(json!({
+                    "status": if summary == PREFLIGHT_CLEAR_SUMMARY { "clear" } else { "issues" },
+                    "summary": summary,
+                    "eventSeq": event.seq,
+                }))
+            }
+            _ => None,
+        });
+        let preflight = preflight.unwrap_or_else(|| {
+            let pending = matches!(
                 state.mission.status,
                 MissionStatus::Planning | MissionStatus::Approved
-            ) =>
-        {
-            "pending"
-        }
-        WorkerIsolation::Worktree => "removed",
-    };
-    let preflight = events.iter().rev().find_map(|event| match &event.kind {
-        EventKind::OrchestratorDecision { summary, .. } if summary.starts_with("preflight:") => {
-            Some(json!({
-                "status": if summary == PREFLIGHT_CLEAR_SUMMARY { "clear" } else { "issues" },
-                "summary": summary,
-                "eventSeq": event.seq,
-            }))
-        }
-        _ => None,
-    });
-    let preflight = preflight.unwrap_or_else(|| {
-        let pending = matches!(
-            state.mission.status,
-            MissionStatus::Planning | MissionStatus::Approved
-        );
-        json!({
-            "status": if pending { "pending" } else { "clear" },
-            "summary": if pending {
-                "environment preflight has not run yet"
-            } else {
-                "no advisory preflight issues recorded"
-            },
-            "eventSeq": Value::Null,
-        })
-    });
-
-    // Workspace contract presence (D-H): base-branch-owned `.kranz/
-    // workspace.json` read from the repo root — a derived read like the rest
-    // of this projection; an unreadable/invalid contract degrades to absent
-    // here (draft/approve is the fail-closed surface).
-    let workspace_contract =
-        kranz_engine::workspace_contract::load_workspace_contract(&server.repo_root)
-            .ok()
-            .flatten();
-
-    // Bootstrap/readiness gate outcomes (D-C/D-H), derived from the gate's
-    // orchestrator.decision events — ADDITIVE fields: null when there is no
-    // contract or the gate has not run yet, and consumers must degrade on
-    // null/absent. A later run's outcome supersedes an earlier one (same
-    // latest-wins derivation as `preflight` above).
-    let gate_outcome = |prefix: &str| {
-        events
-            .iter()
-            .rev()
-            .find_map(|event| match &event.kind {
-                EventKind::OrchestratorDecision { summary, .. } if summary.starts_with(prefix) => {
-                    Some(json!({
-                        "summary": summary,
-                        "eventSeq": event.seq,
-                    }))
-                }
-                _ => None,
+            );
+            json!({
+                "status": if pending { "pending" } else { "clear" },
+                "summary": if pending {
+                    "environment preflight has not run yet"
+                } else {
+                    "no advisory preflight issues recorded"
+                },
+                "eventSeq": Value::Null,
             })
-            .unwrap_or(Value::Null)
-    };
-    let (bootstrap, readiness) = if workspace_contract.is_some() {
-        (
-            gate_outcome(kranz_engine::workspace_gate::BOOTSTRAP_SUMMARY_PREFIX),
-            gate_outcome(kranz_engine::workspace_gate::READINESS_SUMMARY_PREFIX),
-        )
-    } else {
-        (Value::Null, Value::Null)
-    };
+        });
 
-    // Approval-time provider pin (D-B), mirrored from folded state; null on
-    // missions approved before pinning existed — consumers must degrade on
-    // null, same as the gate outcome fields above.
-    let pin = match &state.workspace_pin {
-        Some(pin) => json!(pin),
-        None => Value::Null,
-    };
+        // Workspace contract presence (D-H): base-branch-owned `.kranz/
+        // workspace.json` read from the repo root — a derived read like the rest
+        // of this projection; an unreadable/invalid contract degrades to absent
+        // here (draft/approve is the fail-closed surface).
+        let workspace_contract =
+            kranz_engine::workspace_contract::load_workspace_contract(&server.repo_root)
+                .ok()
+                .flatten();
 
-    // Preview placeholders (D-E): the contract's URL templates, UNFILLED —
-    // surfaced only once a readiness PASS is on the log, never implying a
-    // reachable URL while the services behind it are unproven. The REMOTE
-    // kind instead surfaces the substrate-reported URLs recorded on
-    // `workspace.provisioned` (name-matched, with the substrate's auth
-    // report) — same readiness-pass gate, never a fabricated URL.
-    let readiness_passed = events.iter().any(|event| {
-        matches!(
-            &event.kind,
-            EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
-        )
-    });
-    // The latest remote-kind provisioned event (latest-wins, the same
-    // derivation idiom as preflight/gate outcomes above).
-    let remote_provision = events.iter().rev().find_map(|event| match &event.kind {
-        EventKind::WorkspaceProvisioned {
-            provider,
-            takeover,
-            previews,
-            ..
-        } if provider == "remote" => Some((takeover.clone(), previews.clone())),
-        _ => None,
-    });
-    let remote_pinned = matches!(
-        &state.workspace_pin,
-        Some(pin) if pin.provider == "remote"
-    );
-    let previews = if remote_pinned {
-        match (&remote_provision, readiness_passed) {
-            (Some((_, Some(previews))), true) if !previews.is_empty() => json!(previews),
-            _ => Value::Null,
-        }
-    } else {
-        match (&workspace_contract, readiness_passed) {
-            (Some(contract), true) if !contract.previews.is_empty() => {
-                json!(contract
-                    .previews
-                    .iter()
-                    .map(|p| json!({
-                        "name": p.name,
-                        "urlTemplate": p.url_template,
-                    }))
-                    .collect::<Vec<_>>())
+        // Bootstrap/readiness gate outcomes (D-C/D-H), derived from the gate's
+        // orchestrator.decision events — ADDITIVE fields: null when there is no
+        // contract or the gate has not run yet, and consumers must degrade on
+        // null/absent. A later run's outcome supersedes an earlier one (same
+        // latest-wins derivation as `preflight` above).
+        let gate_outcome = |prefix: &str| {
+            events
+                .iter()
+                .rev()
+                .find_map(|event| match &event.kind {
+                    EventKind::OrchestratorDecision { summary, .. } if summary.starts_with(prefix) => {
+                        Some(json!({
+                            "summary": summary,
+                            "eventSeq": event.seq,
+                        }))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Value::Null)
+        };
+        let (bootstrap, readiness) = if workspace_contract.is_some() {
+            (
+                gate_outcome(kranz_engine::workspace_gate::BOOTSTRAP_SUMMARY_PREFIX),
+                gate_outcome(kranz_engine::workspace_gate::READINESS_SUMMARY_PREFIX),
+            )
+        } else {
+            (Value::Null, Value::Null)
+        };
+
+        // Approval-time provider pin (D-B), mirrored from folded state; null on
+        // missions approved before pinning existed — consumers must degrade on
+        // null, same as the gate outcome fields above.
+        let pin = match &state.workspace_pin {
+            Some(pin) => json!(pin),
+            None => Value::Null,
+        };
+
+        // Preview placeholders (D-E): the contract's URL templates, UNFILLED —
+        // surfaced only once a readiness PASS is on the log, never implying a
+        // reachable URL while the services behind it are unproven. The REMOTE
+        // kind instead surfaces the substrate-reported URLs recorded on
+        // `workspace.provisioned` (name-matched, with the substrate's auth
+        // report) — same readiness-pass gate, never a fabricated URL.
+        let readiness_passed = events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::WorkspaceReadinessReport { outcome, .. } if outcome == "ready"
+            )
+        });
+        // The latest remote-kind provisioned event (latest-wins, the same
+        // derivation idiom as preflight/gate outcomes above).
+        let remote_provision = events.iter().rev().find_map(|event| match &event.kind {
+            EventKind::WorkspaceProvisioned {
+                provider,
+                takeover,
+                previews,
+                ..
+            } if provider == "remote" => Some((takeover.clone(), previews.clone())),
+            _ => None,
+        });
+        let remote_pinned = matches!(
+            &state.workspace_pin,
+            Some(pin) if pin.provider == "remote"
+        );
+        let previews = if remote_pinned {
+            match (&remote_provision, readiness_passed) {
+                (Some((_, Some(previews))), true) if !previews.is_empty() => json!(previews),
+                _ => Value::Null,
             }
+        } else {
+            match (&workspace_contract, readiness_passed) {
+                (Some(contract), true) if !contract.previews.is_empty() => {
+                    json!(contract
+                        .previews
+                        .iter()
+                        .map(|p| json!({
+                            "name": p.name,
+                            "urlTemplate": p.url_template,
+                        }))
+                        .collect::<Vec<_>>())
+                }
+                _ => Value::Null,
+            }
+        };
+
+        // Human takeover (D-E): for local-worktree the plain truth — work locally
+        // in the workspace cwd, no SSH/remote fiction (the provider isolates
+        // source only, D-H). For remote, the substrate's reported SSH/web URL —
+        // honest and substrate-sourced — null until a remote provision lands.
+        // Keyed to the pin; null when no pin names the provider (older missions)
+        // or a future provider has no line yet.
+        let takeover = match &state.workspace_pin {
+            Some(pin) if pin.provider == "local-worktree" => json!(format!(
+                "work locally in the workspace cwd ({})",
+                cwd.to_string_lossy()
+            )),
+            Some(pin) if pin.provider == "remote" => match &remote_provision {
+                Some((Some(takeover), _)) => json!(takeover),
+                _ => Value::Null,
+            },
             _ => Value::Null,
-        }
-    };
+        };
 
-    // Human takeover (D-E): for local-worktree the plain truth — work locally
-    // in the workspace cwd, no SSH/remote fiction (the provider isolates
-    // source only, D-H). For remote, the substrate's reported SSH/web URL —
-    // honest and substrate-sourced — null until a remote provision lands.
-    // Keyed to the pin; null when no pin names the provider (older missions)
-    // or a future provider has no line yet.
-    let takeover = match &state.workspace_pin {
-        Some(pin) if pin.provider == "local-worktree" => json!(format!(
-            "work locally in the workspace cwd ({})",
-            cwd.to_string_lossy()
-        )),
-        Some(pin) if pin.provider == "remote" => match &remote_provision {
-            Some((Some(takeover), _)) => json!(takeover),
-            _ => Value::Null,
-        },
-        _ => Value::Null,
-    };
+        // The last known provider lifecycle transition (ticket
+        // workspace-idle-hibernate), folded from `workspace.teardown` state —
+        // additive: null when no teardown carried an outcome; consumers must
+        // degrade on null, same as the fields above.
+        let workspace_lifecycle = match &state.workspace_lifecycle {
+            Some(lifecycle) => json!(lifecycle),
+            None => Value::Null,
+        };
 
-    // The last known provider lifecycle transition (ticket
-    // workspace-idle-hibernate), folded from `workspace.teardown` state —
-    // additive: null when no teardown carried an outcome; consumers must
-    // degrade on null, same as the fields above.
-    let workspace_lifecycle = match &state.workspace_lifecycle {
-        Some(lifecycle) => json!(lifecycle),
-        None => Value::Null,
-    };
-
-    Ok(Json(json!({
-        "isolation": isolation,
-        "cwd": cwd.to_string_lossy(),
-        "lifecycle": lifecycle,
-        "worktreeActive": worktree_active,
-        "sandboxes": [
-            sandbox_summary("worker", &state.config.worker),
-            sandbox_summary("scrutiny", &state.config.validator_scrutiny),
-            sandbox_summary("functional", &state.config.validator_functional),
-        ],
-        "preflight": preflight,
-        "pin": pin,
-        "previews": previews,
-        "takeover": takeover,
-        "workspaceLifecycle": workspace_lifecycle,
-        "contract": {
-            "present": workspace_contract.is_some(),
-            "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),
-            "previews": workspace_contract.as_ref().map_or(0, |c| c.previews.len()),
-            "bootstrap": bootstrap,
-            "readiness": readiness,
-        },
-    })))
+        Ok(Json(json!({
+            "isolation": isolation,
+            "cwd": cwd.to_string_lossy(),
+            "lifecycle": lifecycle,
+            "worktreeActive": worktree_active,
+            "sandboxes": [
+                sandbox_summary("worker", &state.config.worker),
+                sandbox_summary("scrutiny", &state.config.validator_scrutiny),
+                sandbox_summary("functional", &state.config.validator_functional),
+            ],
+            "preflight": preflight,
+            "pin": pin,
+            "previews": previews,
+            "takeover": takeover,
+            "workspaceLifecycle": workspace_lifecycle,
+            "contract": {
+                "present": workspace_contract.is_some(),
+                "services": workspace_contract.as_ref().map_or(0, |c| c.services.len()),
+                "previews": workspace_contract.as_ref().map_or(0, |c| c.previews.len()),
+                "bootstrap": bootstrap,
+                "readiness": readiness,
+            },
+        })))
+    })
+    .await
 }
 
 fn sandbox_summary(role: &str, config: &RoleConfig) -> Value {
@@ -589,22 +630,27 @@ fn sandbox_enforce_label(enforce: SandboxEnforce) -> &'static str {
 /// `GET /api/missions/:id/events?since=<seq>` — events with `seq > since`
 /// (all events when `since` is omitted).
 pub(crate) async fn mission_events(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    let events_path = paths.events_file();
-    if !events_path.is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let since = match params.get("since") {
-        None => 0,
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| ApiError::bad_request(format!("invalid 'since' value: '{raw}'")))?,
-    };
-    Ok(Json(EventLog::read_events_after(&events_path, since)?))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            let events_path = paths.events_file();
+            if !events_path.is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let since = match params.get("since") {
+                None => 0,
+                Some(raw) => raw.parse::<u64>().map_err(|_| {
+                    ApiError::bad_request(format!("invalid 'since' value: '{raw}'"))
+                })?,
+            };
+            Ok(Json(EventLog::read_events_after(&events_path, since)?))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/plan` — contents of plan.json; 404 until the plan
@@ -613,14 +659,17 @@ pub(crate) async fn mission_plan(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    let content = read_file_or_404(&paths.plan_file(), || {
-        format!("mission '{id}' has no approved plan yet")
+    crate::read_work::run(move || {
+        let paths = mission_paths(&server, &id)?;
+        let content = read_file_or_404_sync(
+            &paths.plan_file(),
+            format!("mission '{id}' has no approved plan yet"),
+        )?;
+        let plan: Value = serde_json::from_str(&content)
+            .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
+        Ok(Json(plan))
     })
-    .await?;
-    let plan: Value = serde_json::from_str(&content)
-        .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
-    Ok(Json(plan))
+    .await
 }
 
 /// `GET /api/missions/:id/plan.md` — rendered plan markdown; 404 until
@@ -629,66 +678,74 @@ pub(crate) async fn mission_plan_md(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    let markdown = read_file_or_404(&paths.plan_md_file(), || {
-        format!("mission '{id}' has no approved plan yet")
+    crate::read_work::run(move || {
+        let paths = mission_paths(&server, &id)?;
+        let markdown = read_file_or_404_sync(
+            &paths.plan_md_file(),
+            format!("mission '{id}' has no approved plan yet"),
+        )?;
+        Ok(Json(json!({ "markdown": markdown })))
     })
-    .await?;
-    Ok(Json(json!({ "markdown": markdown })))
+    .await
 }
 
 /// `GET /api/missions/:id/revision-diff` — pending revision review artifact.
 /// Returns 404 when no proposed revision is awaiting approval.
 pub(crate) async fn mission_revision_diff(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let state = fold_log(&paths).map_err(ApiError::internal)?;
-    let Some(pending) = state.pending_revision.as_ref() else {
-        return Err(ApiError::not_found(format!(
-            "mission '{id}' has no pending revision"
-        )));
-    };
-    let current = read_file_or_404(&paths.plan_md_file(), || {
-        format!("mission '{id}' has no approved plan yet")
-    })
-    .await?;
-    // Preview the same calibrated estimate approval will commit, so the
-    // dashboard's revision diff shows the range that actually lands (M1).
-    let calibration = cost::calibrate(&paths.repo_root);
-    let estimate = cost::apply_shape(
-        cost::estimate(&pending.plan, &state.config, &calibration.params),
-        &pending.plan,
-        &calibration,
-    );
-    // Preview only: this endpoint does not re-lint the contract against the
-    // base (mid-mission, the base tree is no longer necessarily pristine).
-    let no_lint = ContractLintReport {
-        results: Vec::new(),
-        tree_clean_at_base: true,
-    };
-    let revised = render_plan_markdown(
-        &pending.plan,
-        &state.mission,
-        &estimate,
-        kranz_engine::cost::estimate_two_path(estimate, &state.config, &calibration.params)
-            .as_ref(),
-        None,
-        calibration.missions_used,
-        &no_lint,
-        &[],
-        &state.config.worker_candidates,
-    );
-    Ok(Json(json!({
-        "revision": pending.revision,
-        "instructions": pending.instructions,
-        "markdown": revised,
-        "diff": simple_line_diff("plan.md", "revised-plan.md", &current, &revised),
-    })))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let state = fold_log(&paths).map_err(ApiError::internal)?;
+            let Some(pending) = state.pending_revision.as_ref() else {
+                return Err(ApiError::not_found(format!(
+                    "mission '{id}' has no pending revision"
+                )));
+            };
+            let current = read_file_or_404_sync(
+                &paths.plan_md_file(),
+                format!("mission '{id}' has no approved plan yet"),
+            )?;
+            // Preview the same calibrated estimate approval will commit, so the
+            // dashboard's revision diff shows the range that actually lands (M1).
+            let calibration = cost::calibrate(&paths.repo_root);
+            let estimate = cost::apply_shape(
+                cost::estimate(&pending.plan, &state.config, &calibration.params),
+                &pending.plan,
+                &calibration,
+            );
+            // Preview only: this endpoint does not re-lint the contract against the
+            // base (mid-mission, the base tree is no longer necessarily pristine).
+            let no_lint = ContractLintReport {
+                results: Vec::new(),
+                tree_clean_at_base: true,
+            };
+            let revised = render_plan_markdown(
+                &pending.plan,
+                &state.mission,
+                &estimate,
+                kranz_engine::cost::estimate_two_path(estimate, &state.config, &calibration.params)
+                    .as_ref(),
+                None,
+                calibration.missions_used,
+                &no_lint,
+                &[],
+                &state.config.worker_candidates,
+            );
+            Ok(Json(json!({
+                "revision": pending.revision,
+                "instructions": pending.instructions,
+                "markdown": revised,
+                "diff": simple_line_diff("plan.md", "revised-plan.md", &current, &revised),
+            })))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/report.md` — rendered mission report markdown;
@@ -697,62 +754,75 @@ pub(crate) async fn mission_report_md(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    let markdown = read_file_or_404(&paths.report_file(), || {
-        format!("mission '{id}' has no report yet")
+    crate::read_work::run(move || {
+        let paths = mission_paths(&server, &id)?;
+        let markdown = read_file_or_404_sync(
+            &paths.report_file(),
+            format!("mission '{id}' has no report yet"),
+        )?;
+        Ok(Json(json!({ "markdown": markdown })))
     })
-    .await?;
-    Ok(Json(json!({ "markdown": markdown })))
+    .await
 }
 
 /// `GET /api/missions/:id/diff-stat` — `git diff --stat` of the pinned
 /// `base_sha` against the mission branch tip; 404 until the plan is
 /// approved (`base_sha` set) and the mission branch exists.
 pub(crate) async fn mission_diff_stat(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let state = fold_log(&paths).map_err(ApiError::internal)?;
-    let Some(base_sha) = state.mission.base_sha else {
-        return Err(ApiError::not_found(format!(
-            "mission '{id}' has no pinned base yet"
-        )));
-    };
-    let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root)?;
-    if !repo.branch_exists(&state.mission.mission_branch)? {
-        return Err(ApiError::not_found(format!(
-            "mission '{id}' has no mission branch yet"
-        )));
-    }
-    let tip = repo.rev_parse(&state.mission.mission_branch)?;
-    let diff_stat = repo.diff_stat(&base_sha, &tip)?;
-    Ok(Json(json!({
-        "diffStat": diff_stat,
-        "baseSha": base_sha,
-        "tip": tip,
-    })))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let state = fold_log(&paths).map_err(ApiError::internal)?;
+            let Some(base_sha) = state.mission.base_sha else {
+                return Err(ApiError::not_found(format!(
+                    "mission '{id}' has no pinned base yet"
+                )));
+            };
+            let repo = kranz_engine::git_ops::GitRepo::open(&server.repo_root)?;
+            if !repo.branch_exists(&state.mission.mission_branch)? {
+                return Err(ApiError::not_found(format!(
+                    "mission '{id}' has no mission branch yet"
+                )));
+            }
+            let tip = repo.rev_parse(&state.mission.mission_branch)?;
+            let diff_stat = repo.diff_stat(&base_sha, &tip)?;
+            Ok(Json(json!({
+                "diffStat": diff_stat,
+                "baseSha": base_sha,
+                "tip": tip,
+            })))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/pr-handoff` — optional GitHub PR handoff for a
 /// COMPLETE-but-unmerged mission. Never pushes; may return a copyable
 /// `git push` or a `gh pr create` command.
 pub(crate) async fn mission_pr_handoff(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let handoff = kranz_engine::pr_handoff::assess_mission(&server.repo_root, &id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(
-        serde_json::to_value(handoff).map_err(|e| ApiError::internal(e.to_string()))?,
-    ))
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let handoff = kranz_engine::pr_handoff::assess_mission(&server.repo_root, &id)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(Json(
+                serde_json::to_value(handoff).map_err(|e| ApiError::internal(e.to_string()))?,
+            ))
+        })
+        .await
 }
 
 /// `POST /api/missions/:id/pr-handoff/create` — run `gh pr create` only when
@@ -775,15 +845,20 @@ pub(crate) async fn mission_pr_create(
 /// `GET /api/missions/:id/readiness` — backend readiness probe (same enum as
 /// pre-drain gating). Tokenless read.
 pub(crate) async fn mission_readiness(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = mission_paths(&server, &id)?;
-    let report = kranz_engine::backend_readiness::probe_mission(&server.repo_root, &id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(
-        serde_json::to_value(report).map_err(|e| ApiError::internal(e.to_string()))?,
-    ))
+    reads
+        .run(move || {
+            let _ = mission_paths(&server, &id)?;
+            let report = kranz_engine::backend_readiness::probe_mission(&server.repo_root, &id)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(Json(
+                serde_json::to_value(report).map_err(|e| ApiError::internal(e.to_string()))?,
+            ))
+        })
+        .await
 }
 
 /// `POST /api/hook-status` — the hook-status lane's ONLY write (ticket
@@ -839,20 +914,24 @@ pub(crate) async fn post_hook_status(
 /// hook-derived signals for folded mission state (the fold is untouched —
 /// nothing in this lane can change a mission's terminal state).
 pub(crate) async fn mission_hook_status(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !paths.events_file().is_file() {
-        return Err(unknown_mission(&id));
-    }
-    let runs = kranz_engine::hook_status::read_mission_signals(&server.repo_root, &id);
-    Ok(Json(json!({
-        "missionId": id,
-        "authoritative": false,
-        "note": "hook-derived lifecycle signals; observability only, never folded mission state",
-        "runs": runs,
-    })))
+    reads.run(move || {
+        let paths = mission_paths(&server, &id)?;
+        if !paths.events_file().is_file() {
+            return Err(unknown_mission(&id));
+        }
+        let runs = kranz_engine::hook_status::read_mission_signals(&server.repo_root, &id);
+        Ok(Json(json!({
+            "missionId": id,
+            "authoritative": false,
+            "note": "hook-derived lifecycle signals; observability only, never folded mission state",
+            "runs": runs,
+        })))
+    })
+    .await
 }
 
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
@@ -861,21 +940,24 @@ pub(crate) async fn run_transcript(
     State(server): State<Arc<ServerState>>,
     UrlPath((id, run_id)): UrlPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let paths = mission_paths(&server, &id)?;
-    if !safe_id(&run_id) {
-        return Err(ApiError::not_found(format!("unknown run '{run_id}'")));
-    }
-    let content = read_file_or_404(&paths.transcript_file(&run_id), || {
-        format!("no transcript for run '{run_id}'")
+    crate::read_work::run(move || {
+        let paths = mission_paths(&server, &id)?;
+        if !safe_id(&run_id) {
+            return Err(ApiError::not_found(format!("unknown run '{run_id}'")));
+        }
+        let content = read_file_or_404_sync(
+            &paths.transcript_file(&run_id),
+            format!("no transcript for run '{run_id}'"),
+        )?;
+        // Tolerate torn/garbage lines (a live transcript may end mid-write).
+        let values: Vec<Value> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        Ok(Json(Value::Array(values)))
     })
-    .await?;
-    // Tolerate torn/garbage lines (a live transcript may end mid-write).
-    let values: Vec<Value> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    Ok(Json(Value::Array(values)))
+    .await
 }
 
 /// `POST /api/missions/:id/control` — enqueue a [`ControlCommand`] into the
@@ -1275,53 +1357,44 @@ fn simple_line_diff(old_name: &str, new_name: &str, old: &str, new: &str) -> Str
 // Cap concurrent file work as well as bytes per response. The permit moves
 // into the blocking task so cancellation cannot release capacity prematurely.
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
-static ARTIFACT_READS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::OnceLock::new();
 
+#[cfg(test)]
 async fn read_file_or_404(
     path: &Path,
     not_found_msg: impl FnOnce() -> String,
 ) -> Result<String, ApiError> {
     let path = path.to_path_buf();
     let missing = not_found_msg();
-    let permit = ARTIFACT_READS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError {
-            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            message: "artifact readers are busy; retry shortly".into(),
-        })?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let file = match kranz_engine::paths::open_read_nofollow(&path) {
-            Ok(file) => file,
-            Err(kranz_engine::error::EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-                return Err(ApiError::not_found(missing));
+    crate::read_work::run(move || read_file_or_404_sync(&path, missing)).await
+}
+
+fn read_file_or_404_sync(path: &Path, missing: String) -> Result<String, ApiError> {
+    let file = match kranz_engine::paths::open_read_nofollow(path) {
+        Ok(file) => file,
+        Err(kranz_engine::error::EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+            return Err(ApiError::not_found(missing));
+        }
+        Err(kranz_engine::error::EngineError::InvalidState(_)) => {
+            return Err(ApiError::not_found(missing));
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "failed to read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    kranz_engine::paths::read_regular_file_bounded(file, MAX_ARTIFACT_BYTES).map_err(|e| {
+        if e.kind() == ErrorKind::FileTooLarge {
+            ApiError {
+                status: axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                code: None,
+                message: format!("artifact exceeds the {MAX_ARTIFACT_BYTES}-byte read limit"),
             }
-            Err(kranz_engine::error::EngineError::InvalidState(_)) => {
-                return Err(ApiError::not_found(missing));
-            }
-            Err(e) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        kranz_engine::paths::read_regular_file_bounded(file, MAX_ARTIFACT_BYTES).map_err(|e| {
-            if e.kind() == ErrorKind::FileTooLarge {
-                ApiError {
-                    status: axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                    message: format!("artifact exceeds the {MAX_ARTIFACT_BYTES}-byte read limit"),
-                }
-            } else {
-                ApiError::internal(format!("failed to read {}: {e}", path.display()))
-            }
-        })
+        } else {
+            ApiError::internal(format!("failed to read {}: {e}", path.display()))
+        }
     })
-    .await
-    .map_err(|error| ApiError::internal(format!("artifact reader failed: {error}")))?
 }
 
 #[cfg(test)]

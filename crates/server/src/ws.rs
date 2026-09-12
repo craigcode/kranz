@@ -18,6 +18,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use kranz_engine::event_log::EventLog;
 use kranz_engine::events::{Event, EventKind};
 use kranz_engine::paths::MissionPaths;
@@ -38,6 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// `GET /api/missions/:id/ws?since=<seq>`
 pub(crate) async fn ws_handler(
+    Extension(read_work): Extension<crate::read_work::ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -51,13 +53,6 @@ pub(crate) async fn ws_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let paths = match mission_paths(&server, &id) {
-        Ok(paths) => paths,
-        Err(e) => return e.into_response(),
-    };
-    if !paths.events_file().is_file() {
-        return ApiError::not_found(format!("unknown mission '{id}'")).into_response();
-    }
     // Align with REST `GET .../events?since=`: reject unparsable values
     // instead of silently falling back to a full snapshot.
     let since = match params.get("since") {
@@ -70,18 +65,40 @@ pub(crate) async fn ws_handler(
             }
         },
     };
-    ws.on_upgrade(move |socket| session(socket, paths, since))
+    let paths = match read_work
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(ApiError::not_found(format!("unknown mission '{id}'")));
+            }
+            Ok(paths)
+        })
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => return error.into_response(),
+    };
+    ws.on_upgrade(move |socket| session(socket, paths, since, read_work))
 }
 
-async fn session(mut socket: WebSocket, paths: MissionPaths, since: Option<u64>) {
+async fn session(
+    mut socket: WebSocket,
+    paths: MissionPaths,
+    since: Option<u64>,
+    read_work: crate::read_work::ReadWork,
+) {
     let events_path = paths.events_file();
 
     // Initial fold. On a corrupt/unreadable log: close cleanly, never panic.
-    let Ok(events) = EventLog::read_events(&events_path) else {
-        close(&mut socket).await;
-        return;
-    };
-    let Ok(mut state) = reducer::fold(&events) else {
+    let initial_path = events_path.clone();
+    let Ok((events, mut state)) = read_work
+        .run(move || {
+            let events = EventLog::read_events(&initial_path)?;
+            let state = reducer::fold(&events)?;
+            Ok((events, state))
+        })
+        .await
+    else {
         close(&mut socket).await;
         return;
     };
@@ -113,8 +130,14 @@ async fn session(mut socket: WebSocket, paths: MissionPaths, since: Option<u64>)
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let new_events = match EventLog::read_events_after(&events_path, last_seq) {
+                let read_path = events_path.clone();
+                let new_events = match read_work.run(move || {
+                    Ok(EventLog::read_events_after(&read_path, last_seq)?)
+                }).await {
                     Ok(events) => events,
+                    // A busy reader pool is temporary. Keep the validated state
+                    // and retry next tick without advancing the sequence.
+                    Err(error) if error.status == StatusCode::SERVICE_UNAVAILABLE => continue,
                     // Mission dir disappeared or the log became unreadable.
                     Err(_) => {
                         close(&mut socket).await;
@@ -127,7 +150,11 @@ async fn session(mut socket: WebSocket, paths: MissionPaths, since: Option<u64>)
                     }
                     // Incremental fold; full re-fold (up to this seq) on error.
                     if reducer::apply(&mut state, event).is_err() {
-                        match refold_at(&events_path, event.seq) {
+                        let refold_path = events_path.clone();
+                        let seq = event.seq;
+                        match read_work.run(move || {
+                            Ok(refold_at(&refold_path, seq)?)
+                        }).await {
                             Ok(rebuilt) => state = rebuilt,
                             Err(_) => {
                                 close(&mut socket).await;

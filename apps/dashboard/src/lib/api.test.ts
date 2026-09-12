@@ -5,8 +5,9 @@ vi.mock('./token', () => ({
   awaitToken: vi.fn(),
 }));
 
-import { api, getJson, postJson, ApiError, isTokenRequired } from './api';
+import { api, getJson, postJson, ApiError, isNotHosted, isStalePlan, isTokenRequired } from './api';
 import { awaitToken, resolveToken } from './token';
+import wireFixtures from './fixtures/api-errors.json?raw';
 
 function htmlResponse(): Response {
   return new Response('<!doctype html><html><body>app</body></html>', {
@@ -28,6 +29,63 @@ function unauthorizedResponse(): Response {
     headers: { 'content-type': 'application/json' },
   });
 }
+
+describe('stable HTTP error codes', () => {
+  const fixtures: Array<{ name: string; status: number; body: { error: string; code?: string } }> =
+    JSON.parse(wireFixtures);
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+    window.location.hash = '';
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  // Rust's http_api_error_codes_match_dashboard_wire_fixtures exercises the
+  // host refusal paths and pins these exact HTTP bodies through IntoResponse.
+  it.each(fixtures)('consumes the server’s $name wire response', async (fixture) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(fixture.body), {
+      status: fixture.status, headers: { 'content-type': 'application/json' },
+    }));
+    const error = await postJson('/api/missions/A/start', {}).catch(err => err);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: fixture.status, message: fixture.body.error, code: fixture.body.code });
+    expect(isNotHosted(error)).toBe(fixture.name === 'mission_not_hosted' || fixture.name === 'legacy');
+    expect(isStalePlan(error)).toBe(fixture.name === 'stale_plan' || fixture.name === 'legacy');
+  });
+
+  it('uses the code even when the human wording changes', () => {
+    expect(isNotHosted(new ApiError(409, 'Resume elsewhere.', 'mission_not_hosted'))).toBe(true);
+    expect(isStalePlan(new ApiError(409, 'Review again.', 'stale_plan'))).toBe(true);
+  });
+
+  it.each(['turn_in_flight', 'repository_busy', 'future_code', ''])('never falls back to prose for code %j', (code) => {
+    const error = new ApiError(409, 'mission is not hosted; refresh the plan preview', code);
+    expect(isNotHosted(error)).toBe(false);
+    expect(isStalePlan(error)).toBe(false);
+  });
+
+  it('preserves unknown codes received from a newer server', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      error: 'mission is not hosted', code: 'future_code',
+    }), { status: 409 }));
+    const error = await getJson('/api/missions').catch(err => err);
+    expect(error).toMatchObject({ code: 'future_code' });
+    expect(isNotHosted(error)).toBe(false);
+  });
+
+  it('does not interpret a malformed code as an absent legacy code', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      error: 'mission is not hosted', code: null,
+    }), { status: 409 }));
+    const error = await getJson('/api/missions').catch(err => err);
+    expect(isNotHosted(error)).toBe(false);
+    expect(isStalePlan(error)).toBe(false);
+  });
+});
 
 describe('getJson / postJson non-JSON guard', () => {
   beforeEach(() => {

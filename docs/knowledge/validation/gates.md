@@ -10,6 +10,7 @@ verified_against:
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/orchestrator/finalization.rs
   - crates/engine/src/command_exec.rs
+  - crates/engine/src/contract_controls.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/merge_gate.rs
   - crates/engine/src/scrub.rs
@@ -148,6 +149,13 @@ host runtime. Explicit empty proxy variables also prevent Docker's client
 configuration from injecting proxy credentials into the payload.
 
 ## Empty-deliverable safety net
+
+Selected command assertions can carry explicit valid/defective controls.
+Approval and final validation run the same approved command in read-only,
+contained disposable checkouts and record fresh advisory evidence. A positive
+behavioral-check receipt is required: setup errors, zero tests and timeouts
+remain inconclusive. Controls never replace ordinary validation or the
+empty-deliverable gate. See [critical assertion controls](../../contract-controls.md).
 
 `final_gate()` in [finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)
 (feature f-2-2) counts `commits_between(base, "HEAD")` filtered by

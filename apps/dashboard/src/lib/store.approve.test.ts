@@ -90,6 +90,24 @@ describe('approvePlan', () => {
     expect(useKranzStore.getState().planning.error).toContain('Request the plan again');
   });
 
+  it.each(['turn_in_flight', 'repository_busy', 'future_code'])('keeps the preview on coded %s refusal', async (code) => {
+    vi.mocked(api.approvePending).mockRejectedValueOnce(new ApiError(409, 'retry shortly', code));
+    useKranzStore.getState().approvePlan();
+    await vi.waitFor(() => {
+      expect(useKranzStore.getState().planning.approving).toBe(false);
+    });
+    expect(useKranzStore.getState().planning.review?.planIdentity).toBe('reviewed-plan-a');
+    expect(useKranzStore.getState().planning.error).toBe('retry shortly');
+  });
+
+  it('clears the preview on stale_plan even with different wording', async () => {
+    vi.mocked(api.approvePending).mockRejectedValueOnce(new ApiError(409, 'Review again.', 'stale_plan'));
+    useKranzStore.getState().approvePlan();
+    await vi.waitFor(() => {
+      expect(useKranzStore.getState().planning.review).toBeNull();
+    });
+  });
+
   it('calls api.approvePending with the mission id and the displayed plan identity', async () => {
     vi.mocked(api.approvePending).mockResolvedValueOnce({
       branch: 'kranz/mission-m-test',
