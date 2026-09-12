@@ -1433,6 +1433,8 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "clap",
  "crossterm",

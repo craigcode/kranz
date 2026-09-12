@@ -296,10 +296,15 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ready"], true);
+    let identity = body["planIdentity"]
+        .as_str()
+        .expect("preview identity")
+        .to_string();
 
     let (status, body) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["pending"], true);
+    assert_eq!(body["planIdentity"], identity);
     assert_eq!(body["plan"]["milestones"][0]["features"][0]["title"], "F1");
 
     // approve-pending commits the SAME files the body-approve path does…
@@ -307,7 +312,7 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
         &app,
         &format!("/api/missions/{id}/approve-pending"),
         Some(TOKEN),
-        json!({}),
+        json!({ "planIdentity": identity }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -330,6 +335,76 @@ async fn pending_plan_parks_on_ready_and_approve_pending_commits() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_pending_requires_the_displayed_preview_after_a_replacement() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let mut replacement = plan_json();
+    replacement["milestones"][0]["features"][0]["spec"] =
+        json!("different work approved separately");
+    let orch = MockScript::streaming(vec![mock_init("orch-stale"), mock_result_text("seed")])
+        .responding(vec![
+            turn(&plan_json().to_string()),
+            turn(&replacement.to_string()),
+        ]);
+    let app = hosted_app(&root, Arc::new(MockBackend::with_scripts(vec![orch])));
+    let (status, body) = post_json(
+        &app,
+        "/api/missions",
+        Some(TOKEN),
+        json!({ "goal": "review exact work" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap();
+    let preview_url = format!("/api/missions/{id}/planning/request-plan");
+    let approve_url = format!("/api/missions/{id}/approve-pending");
+
+    let (status, preview_a) = post_json(&app, &preview_url, Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{preview_a}");
+    assert_eq!(preview_a["ready"], true);
+    let (status, preview_b) = post_json(&app, &preview_url, Some(TOKEN), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{preview_b}");
+    assert_eq!(preview_b["ready"], true);
+    assert_ne!(preview_a["planIdentity"], preview_b["planIdentity"]);
+
+    // Tab A still displays A while the host now parks B. Missing identities
+    // (old clients), stale identities, and their start=true twin fail closed.
+    for request in [
+        json!({ "start": true }),
+        json!({ "planIdentity": preview_a["planIdentity"], "start": true }),
+    ] {
+        let (status, refused) = post_json(&app, &approve_url, Some(TOKEN), request).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("refresh"));
+        let (_, pending) = get_json(&app, &format!("/api/missions/{id}/pending-plan")).await;
+        assert_eq!(pending["planIdentity"], preview_b["planIdentity"]);
+        assert_eq!(pending["plan"], preview_b["plan"]);
+        assert!(!MissionPaths::new(&root, id).plan_file().exists());
+        let (_, state) = get_json(&app, &format!("/api/missions/{id}/state")).await;
+        assert_eq!(state["mission"]["status"], "planning");
+    }
+
+    let (status, approved) = post_json(
+        &app,
+        &approve_url,
+        Some(TOKEN),
+        json!({ "planIdentity": preview_b["planIdentity"], "start": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["started"], false);
+    let committed: Plan =
+        serde_json::from_slice(&std::fs::read(MissionPaths::new(&root, id).plan_file()).unwrap())
+            .unwrap();
+    assert_eq!(
+        kranz_engine::planning::plan_identity(&committed),
+        preview_b["planIdentity"].as_str().unwrap(),
+    );
 }
 
 #[tokio::test]

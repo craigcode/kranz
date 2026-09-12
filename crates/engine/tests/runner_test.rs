@@ -133,6 +133,7 @@ fn session_spec(prompt: PromptMode) -> SessionSpec {
 
 fn worker_meta(run_id: &str) -> RunMeta {
     RunMeta {
+        backend: None,
         run_id: run_id.to_string(),
         role: Role::Worker,
         feature_id: Some("f-1".to_string()),
@@ -1753,6 +1754,7 @@ async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
             buffered.first(),
             Some(EventKind::WorkerSpawned {
                 role: Role::Worker,
+                backend: Some(kranz_engine::types::BackendKind::Claude),
                 ..
             })
         ),

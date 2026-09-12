@@ -728,6 +728,7 @@ mod tests {
             command_grants: Vec::new(),
             touch_set: Vec::new(),
             standards_manifest: Some(Box::new(pin(rules))),
+            reviewer_independence: None,
         }
     }
 
@@ -1257,6 +1258,7 @@ mod tests {
                         command_grants: Vec::new(),
                         touch_set: Vec::new(),
                         standards_manifest: None,
+                        reviewer_independence: None,
                     },
                     base_sha: None,
                 },

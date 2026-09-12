@@ -49,7 +49,7 @@ beforeEach(() => {
       ...INITIAL_STORE_STATE,
       planning: {
         ...INITIAL_STORE_STATE.planning,
-        review: { plan: plan(), estimate: estimate() },
+        review: { planIdentity: 'reviewed-plan-a', plan: plan(), estimate: estimate() },
       },
     },
     true,
@@ -57,6 +57,18 @@ beforeEach(() => {
 });
 
 describe('PlanReview', () => {
+  it('displays the reviewer requirements pinned by the preview', () => {
+    const reviewed = plan();
+    reviewed.reviewerIndependence = { scrutiny: true, functional: false };
+    useKranzStore.setState((s) => ({
+      planning: { ...s.planning, review: { ...s.planning.review!, plan: reviewed } },
+    }));
+    render(<PlanReview />);
+    expect(screen.getByLabelText('Reviewer independence')).toBeTruthy();
+    expect(screen.getByText('Scrutiny: required · Functional: not required')).toBeTruthy();
+    expect(screen.getByText(/different from every worker attempt/)).toBeTruthy();
+  });
+
   it('flight_rules_dashboard_groups_exact_consent_by_rfc_with_digest_and_waiver_posture', () => {
     const governed = plan();
     governed.standardsManifest = {
@@ -83,7 +95,7 @@ describe('PlanReview', () => {
       ],
     };
     useKranzStore.setState((state) => ({
-      planning: { ...state.planning, review: { plan: governed, estimate: estimate() } },
+      planning: { ...state.planning, review: { planIdentity: 'reviewed-plan-a', plan: governed, estimate: estimate() } },
     }));
 
     render(<PlanReview />);

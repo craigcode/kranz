@@ -2012,6 +2012,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         };
         let json = serde_json::to_string(&plan).expect("serialize");
         assert!(!json.contains("standardsManifest"), "{json}");

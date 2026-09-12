@@ -2,9 +2,10 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-07
+last_verified: 2026-09-12
 verified_against:
   - .kranz/lessons/index.md
+  - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
@@ -19,7 +20,9 @@ absorb it. Per the [scoping decision](../scoping/repo-knowledge-store.md)
 
 ## Where the lessons live
 
-- Index: [`.kranz/lessons/index.md`](../../.kranz/lessons/index.md) — newest-first.
+- Index: [`.kranz/lessons/index.md`](../../.kranz/lessons/index.md) — appended in
+  capture order, oldest first. Planning injection selects the newest
+  provenance-clean lessons first.
 - One file per mission: `.kranz/lessons/<mission>.md`.
 - Injected into planning via the engine's lessons channel, with its own byte
   budget, separate from the shipped ranked knowledge-vault block.

@@ -51,6 +51,23 @@ pub fn render_plan_markdown(
         mission.mission_branch, mission.base_branch
     );
 
+    if let Some(policy) = plan.reviewer_independence {
+        let roles = [
+            policy.scrutiny.then_some("scrutiny"),
+            policy.functional.then_some("functional"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" and ");
+        let _ = writeln!(
+            md,
+            "## Reviewer independence\n\nRequired for {roles}: a known model \
+            family different from every recorded worker attempt. Pinned at approval; fallback, \
+            retry, unknown provenance or a skipped required reviewer cannot weaken it.\n"
+        );
+    }
+
     let _ = writeln!(md, "## Cost estimate\n");
     let provenance = if missions_used == 0 {
         "built-in defaults — no completed missions yet".to_string()

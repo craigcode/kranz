@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-03
+last_verified: 2026-09-12
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -12,6 +12,9 @@ verified_against:
   - crates/slack/src/format.rs
   - crates/slack/src/host.rs
   - crates/slack/src/config.rs
+  - crates/cli/src/host_bridge.rs
+  - crates/server/src/host.rs
+  - crates/engine/src/planning.rs
   - cargo test -p kranz-slack
 ---
 
@@ -145,10 +148,13 @@ belongs at the interpolation, which is what `bridge::esc` is for.
 the entities would show literally. That is why `/kranz ticket show`'s header
 (slug then title) is deliberately unescaped while its body is escaped.
 
-Approve buttons carry `<mission-id>:<plan-identity>` (a short sha256 of the
-plan's canonical JSON). `approve_flow` commits through
+Approve buttons carry `<mission-id>:<plan-identity>` (the full sha256 of the
+plan's canonical JSON, shared with dashboard previews through
+`planning::plan_identity`). `approve_flow` commits through
 `PlanningHost::approve_pending_if`, which compares the clicked card's identity
-against the parked plan and takes the plan under ONE host lock acquisition.
+against the parked plan and commits while holding the engine and pending-plan
+locks. Failed approval leaves the original plan parked without a later restore
+that could overwrite a replacement.
 The check and the commit are not separable, so a concurrent `/kranz plan` or
 web-UI approve cannot slip a different plan in between (M-13). A mismatch is
 refused naming both plans; a card that carries no identity at all (one posted

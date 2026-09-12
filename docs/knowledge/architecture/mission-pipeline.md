@@ -2,14 +2,16 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-06
+last_verified: 2026-09-12
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
   - crates/engine/src/types.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/control.rs
   - crates/engine/src/orchestrator.rs
+  - crates/engine/src/orchestrator/finalization.rs
   - crates/engine/src/digest.rs
   - crates/engine/src/findings.rs
   - crates/engine/src/queue.rs
@@ -35,6 +37,13 @@ resolves the global kranz dir (`$KRANZ_HOME`, else `~/.kranz`), which holds the
 per-repository authority key, seal floors, and high-water marks. They live
 outside the repo because that is the one place an agent with repo write access
 cannot reach.
+
+`plan.approved` also pins optional `reviewerIndependence` requirements. They
+fold into the mission separately from live config; revisions cannot replace
+them. New `worker.spawned` records carry resolved backend provenance alongside
+the model, including sequential, buffered parallel and pool runs. Missing
+provenance never satisfies a strict review requirement. See
+[config composition](../../config-composition.md#reviewer-independence-reviewerindependence).
 
 ## Log rules (event_log.rs)
 
@@ -135,7 +144,9 @@ Conceptual stages and where they live:
   reconcile the eventual terminal state even after the queue entry is claimed.
 - **Drain / run** — `MissionEngine::run` → `run_loop` (below).
 - **Deliver** — workers commit on the mission branch; `final_gate` +
-  `complete_mission` write the report and emit `mission.completed`.
+  `complete_mission` in
+  [finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)
+  verify completion eligibility, write the report, and emit `mission.completed`.
 - **Gated merge / land** — [`merge::merge_mission`](../../../crates/engine/src/merge.rs)
   refuses a dirty tracked tree, secret-scans the diff, runs the gate suite, then
   merges `--no-ff` into the base branch. It never pushes. The one push path,
@@ -164,19 +175,30 @@ records `start_sha`; then the next feature runs or the milestone enters
 So the loop walks **milestones → features → workers → validators → judgement**:
 `run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
 judgement turn), then refreshes protected Git handles before inspecting the
-delivered tree so newly configured executable drivers are disabled. Sequential
+delivered tree. Every local Git invocation rechecks the handle's original
+driver boundary and refuses new driver names or conditional includes. Sequential
 features pin their baseline in `feature.progress` before execution and retain
 cumulative commit receipts across retries and process resume. Removed recorded
 commits fail closed; a failed feature with retained work cannot be implicitly
 replaced as a commitless proposal. The additive schema and legacy behavior are
 recorded in the [contract change](../../reviews/2026-09-05-feature-progress-contract.md).
-`validation_round` runs scrutiny + functional validators (each
-skippable) plus a deterministic out-of-contract-write sweep, converts findings
-to fix-features or waives them (blocking at `max_fix_cycles_per_milestone`);
+`validation_round` runs scrutiny + functional validators (skippable only when
+the approved policy permits) plus a deterministic out-of-contract-write sweep,
+converts findings to fix-features or waives them (blocking at
+`max_fix_cycles_per_milestone`);
 `final_gate` fails an empty deliverable outright, runs `check:"command"`
 assertions itself and sends `agent-judgement` assertions to the orchestrator
 against the `base_sha..HEAD` diff. Roles: `Orchestrator`, `Worker`,
 `ValidatorScrutiny`, `ValidatorFunctional`.
+
+With approved reviewer requirements, milestone closure (including a model's
+skip), the final gate, and mission completion all require successful compatible
+review evidence from the latest relevant validation round. New work, changed
+review context, or validator tamper invalidates that evidence; a revision that
+only changes pending work preserves unaffected completed-prefix reviews. Final
+gates and lesson preparation must preserve a clean reviewed checkout. Detected
+drift starts a new durable validation epoch and blocks completion until review
+runs again. Missions without an approved requirement retain their legacy path.
 
 Every execution turn receives a freshly rendered durable-state digest,
 including the current repair cap, used cycles and remaining rounds per

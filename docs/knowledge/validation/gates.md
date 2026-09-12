@@ -2,11 +2,14 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-07
+last_verified: 2026-09-12
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
   - crates/engine/src/orchestrator.rs
+  - crates/engine/src/orchestrator/finalization.rs
+  - crates/engine/src/command_exec.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/merge_gate.rs
   - crates/engine/src/scrub.rs
@@ -146,10 +149,11 @@ configuration from injecting proxy credentials into the payload.
 
 ## Empty-deliverable safety net
 
-`final_gate()` in [orchestrator.rs](../../../crates/engine/src/orchestrator.rs)
+`final_gate()` in [finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)
 (feature f-2-2) counts `commits_between(base, "HEAD")` filtered by
-`!contract_sweep::is_meta_commit` — meta commits are the `[kranz]`-prefixed
-engine commits (plan/report; see
+`!contract_sweep::is_meta_commit_with_paths` — a meta exemption requires both
+an engine subject and permitted mission-artifact paths. A worker cannot hide
+source changes merely by using a `[kranz]` subject (see
 [contract_sweep.rs](../../../crates/engine/src/contract_sweep.rs)). If **zero**
 non-meta feature commits landed, it emits `MissionFailed` ("Refusing to
 COMPLETE on an empty deliverable diff") and returns `Failed`. This runs FIRST,
@@ -161,11 +165,13 @@ deliverable ([AGENTS.md](../../../AGENTS.md) rule 8).
 Once all milestones complete, `final_gate()` runs the mission's
 `validation_contract`:
 
-- **`command` assertions** are engine-run via `run_shell_command` in
-  `active_root()` with `runner::contract_env(base_sha)`, which exports
+- **`command` assertions** are engine-run via `run_shell_command_sandboxed` in
+  `active_root()` with the sanitized `contract_command_env(base_sha)`, which exports
   `KRANZ_BASE_SHA` set to the sha pinned at approval (never the live base
-  branch). 10-minute timeout (`COMMAND_TIMEOUT`). A non-zero exit → critical
-  finding.
+  branch). When enforcement is enabled, the resolved worker sandbox also wraps
+  the gate; `off` keeps the environment-only posture. The timeout is 10 minutes
+  (`COMMAND_TIMEOUT`). A non-zero exit produces a critical, non-waivable
+  `command-assertion` finding.
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown
   the `diff_stat(base, "HEAD")` where `base` is the pinned `base_sha` (falls
   back to `base_branch` only for legacy missions with no pinned sha).
@@ -175,9 +181,13 @@ Once all milestones complete, `final_gate()` runs the mission's
   first-`{`-to-last-`}` span is gone: it read a JSON object the model had quoted
   and explicitly disowned (the 2026-09-01 adversarial audit, H10).
 
-Empty findings → `complete_mission()`. Otherwise findings route through
-`convert_findings`: a waive-all answer completes the mission; a fix answer
-reopens the last milestone with fix features (until the fix-cycle cap, then
+Empty findings → `complete_mission()`, subject to the approved review-evidence
+and checkout-integrity checks below. Otherwise findings route through
+`convert_findings`: only waivable findings can be cleared by model judgement.
+Command failures and enforced Flight Rules findings reject model waivers; an
+enforced rule's separately authenticated human waiver must already match its
+exact evidence, and a missing manual attestation parks for operator action.
+A fix answer reopens the last milestone with fix features (until the fix-cycle cap, then
 `MilestoneBlocked`). A third route exists only for `command-assertion`
 findings: if the orchestrator judges a failing command assertion
 author-broken (a false negative — the requirement is genuinely met, verified
@@ -232,6 +242,23 @@ define their own language/toolchain commands; see
 The engine **never pushes** ([AGENTS.md](../../../AGENTS.md) rule 4); a human
 runs `git push`. A non-blocking `StaleBaseWarning` fires when the pinned base
 trails ≥1 merge commit already on the live base.
+
+## Reviewer independence
+
+Optional approval-pinned `reviewerIndependence` requirements are checked against
+recorded worker backend/model identities after reviewer resolution and before
+every primary, retry and confirmation launch. Unknown identity, same-family
+fallback or skipping a required reviewer blocks with an event-log explanation;
+config changes and replay cannot erase the approval pin. Before milestone
+closure (including a skip), final gates, and mission completion, each required
+role must also have a successful compatible run in the latest relevant
+validation round. Later work, changed review context, or tamper invalidates that
+evidence. A pending-only plan revision preserves unaffected completed-prefix
+reviews. Final gates and lesson preparation must leave the clean reviewed
+checkout unchanged; detected drift records a fresh validation epoch and blocks
+until the required reviews run again. Existing validator containment remains
+mandatory. See [config composition](../../config-composition.md#reviewer-independence-reviewerindependence)
+and [the gate](../../../crates/engine/src/reviewer_independence.rs).
 
 ## Secret scanning — three layers
 

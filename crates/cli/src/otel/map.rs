@@ -617,6 +617,7 @@ mod tests {
             seq,
             secs,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: run_id.to_string(),
                 role,
                 feature_id: feature_id.map(|s| s.to_string()),
@@ -1196,6 +1197,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         };
         let events = vec![
             created(1, 0),

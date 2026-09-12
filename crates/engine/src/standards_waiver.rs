@@ -919,6 +919,7 @@ mod tests {
                 command_grants: Vec::new(),
                 touch_set: vec!["crates/**".to_string()],
                 standards_manifest: Some(Box::new(record_pin())),
+                reviewer_independence: None,
             },
             base_sha: Some(base_sha.to_string()),
         })

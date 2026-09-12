@@ -2,8 +2,9 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-07
+last_verified: 2026-09-12
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - crates/engine/src/control.rs
   - crates/engine/src/paths.rs
@@ -12,6 +13,7 @@ verified_against:
   - crates/engine/src/git_ops.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/orchestrator.rs
+  - crates/engine/src/orchestrator/finalization.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/merge_gate.rs
   - crates/engine/src/sandbox.rs
@@ -62,6 +64,20 @@ sweep) uses the pinned sha, never the moving branch name.
 WHY: incident m-660ffc — a contract's `git diff main` assertion raced a commit
 landing on the base branch mid-mission (design.md deviation 6). Re-resolving the
 base anywhere after approval reintroduces that race.
+
+## Approved reviewer independence survives fallback
+
+An enabled `reviewerIndependence` role must retain a known different model family
+from every recorded worker attempt. The approved plan owns this policy; live
+config and plan revisions cannot relax it. Each resolved reviewer, retry and
+confirmation is checked before launch; unknown identity, same-family fallback
+or a skipped required role blocks the milestone. Closure also requires a
+successful compatible review from the latest relevant validation round: neither
+a skip nor a replayed completion status substitutes for that evidence. Final
+gates and lesson preparation must preserve the reviewed checkout; detected drift
+starts a fresh validation epoch and blocks. Containment remains a separate
+requirement. [Implementation](../../../crates/engine/src/reviewer_independence.rs);
+[configuration](../../config-composition.md#reviewer-independence-reviewerindependence).
 
 ## The event log is append-only, single-writer, redact-at-write, sealed
 
@@ -117,8 +133,13 @@ that cover its directory. A key an agent can read or replace proves nothing.
 handle that neutralizes executable git configuration (hooks, `core.fsmonitor`,
 filter drivers, custom merge drivers, `gpg.program`) and ignores user and
 system config scope for local operations. Engine diffs also disable external
-diff programs and text converters. Protected handles are refreshed after a
-worker returns, before its output is inspected.
+diff programs and text converters. Local Git runs with a cleared, allowlisted
+environment. Every invocation rechecks the original driver boundary, retaining
+its overrides across clones and driver removal while refusing new driver names
+and conditional includes. This preflight does not eliminate a concurrent write
+between the config check and Git's own read; enforced config write-denies or an
+immutable view remain necessary to close that race. Explicit network operations
+retain their separately guarded operator credential path.
 `open_unhardened` is the explicit escape hatch, with no engine caller, and
 `ensure_identity` pins the operator's resolved `user.name`/`user.email` into
 local scope so hardened invocations do not restamp commits.
@@ -132,7 +153,7 @@ opt-in at a handful of sites; the sites that forgot were the hole (the
 ## A mission must deliver (empty-deliverable gate)
 
 Before any contract assertion, `final_gate`
-([orchestrator.rs](../../../crates/engine/src/orchestrator.rs)) counts non-meta
+([finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)) counts non-meta
 commits in `base_sha..HEAD`; if that count is 0 the mission terminates
 `Failed` with an explicit reason. A green contract can never override this — it
 runs first. WHY: a run that produced nothing must fail honestly, never COMPLETE

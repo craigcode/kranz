@@ -67,11 +67,13 @@ fn plan() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
 fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> EventKind {
     EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role: if feature_id.is_some() {
             Role::Worker
@@ -1866,6 +1868,7 @@ fn approved_status_guard_never_overwrites_terminal_status() {
         &ev(
             next_seq,
             EventKind::WorkerSpawned {
+                backend: None,
                 run_id: "r-after-failure".to_string(),
                 role: Role::ValidatorScrutiny,
                 feature_id: None,
@@ -2237,6 +2240,7 @@ fn prop_plan() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -3384,6 +3388,7 @@ fn provenance_backcompat_defaults_quant_and_omits_weight_hash() {
 #[test]
 fn weight_hash_round_trips_through_serde_and_reducer_fold() {
     let with_provenance = EventKind::WorkerSpawned {
+        backend: None,
         run_id: "r-1".to_string(),
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
@@ -3452,6 +3457,7 @@ fn local_worker_spawned_from_stubbed_gguf(run_id: &str, gguf_bytes: &[u8]) -> (S
     assert_eq!(weight_hash.len(), 64, "sha256 hex digest is 64 chars");
 
     let kind = EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
@@ -3644,6 +3650,7 @@ fn plan_three_milestones() -> Plan {
         command_grants: vec![],
         touch_set: vec![],
         standards_manifest: None,
+        reviewer_independence: None,
     }
 }
 
@@ -4247,6 +4254,7 @@ fn gate_result_event_is_record_only_in_the_fold() {
 #[test]
 fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
     let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
@@ -4342,6 +4350,7 @@ fn dispatch_pool_candidate_links_fold_without_respawn_charge() {
 #[test]
 fn divergence_event_old_logs_fold_cleanly() {
     let candidate_spawn = |run_id: &str, index: u32, backend: &str| EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),
@@ -4414,6 +4423,7 @@ fn divergence_event_old_logs_fold_cleanly() {
 #[test]
 fn divergence_event_records_fold_and_resolution_is_idempotent() {
     let spawn = |run_id: &str, index: u32| EventKind::WorkerSpawned {
+        backend: None,
         run_id: run_id.to_string(),
         role: Role::Worker,
         feature_id: Some("f-1-1".to_string()),

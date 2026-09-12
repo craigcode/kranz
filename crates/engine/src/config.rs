@@ -337,62 +337,110 @@ fn path_matches(normalized: &str, key: &str) -> bool {
             && normalized.as_bytes()[key.len()] == b'.')
 }
 
-/// Operator-only keys: settable from the global layer only, with the reason
-/// the refusal names. Each one either names a program the engine executes, a
-/// URL the engine talks to from outside every sandbox, a credential, or a
-/// containment escape.
-const PROJECT_LAYER_REFUSED: &[(&str, &str)] = &[
+/// A sensitive key declares both boundaries here: repository-file input and
+/// runtime changes. Ordinary tuning keys remain in `RUNTIME_PATCHABLE`;
+/// unclassified runtime keys always fail closed.
+#[derive(Clone, Copy)]
+enum ProjectPolicy {
+    OperatorOnly,
+    SandboxFloor,
+    ReviewerFloor,
+}
+
+#[derive(Clone, Copy)]
+enum PatchClass {
+    Runtime,
+    Consent,
+    SandboxFloor,
+    Never,
+}
+
+struct ConfigTrustRule {
+    key: &'static str,
+    project: ProjectPolicy,
+    runtime: PatchClass,
+    reason: &'static str,
+}
+
+impl ConfigTrustRule {
+    const fn operator_only(key: &'static str, runtime: PatchClass, reason: &'static str) -> Self {
+        Self {
+            key,
+            project: ProjectPolicy::OperatorOnly,
+            runtime,
+            reason,
+        }
+    }
+}
+
+const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
     // Consent-bearing keys. `apply_validated_patch` already refuses these
     // from the control inbox as a human decision; a file the repository
     // ships is no more a human decision than a file an agent drops
     // (2026-09-01 audit follow-up review, F-7 and F-8).
-    ("skipScrutiny", "it removes the scrutiny validation round"),
-    (
+    ConfigTrustRule::operator_only(
+        "skipScrutiny",
+        PatchClass::Consent,
+        "it removes the scrutiny validation round",
+    ),
+    ConfigTrustRule::operator_only(
         "skipFunctional",
+        PatchClass::Consent,
         "it removes the functional validation round",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "denyPatterns",
+        PatchClass::Consent,
         "it is the Bash deny list every session inherits",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "<role>.tools",
+        PatchClass::Never,
         "it lands in the session's tool allow list, including the read-only validators'",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "allowBelowDefaultWorkerModel",
+        PatchClass::Runtime,
         "it lifts the worker model floor the operator set",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "workerIsolation",
+        PatchClass::Never,
         "checkout isolation makes the repository root the worker's writable cwd",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "claudeBinary",
+        PatchClass::Never,
         "it names the binary kranz executes, with the operator's full environment and no sandbox",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "packDir",
+        PatchClass::Never,
         "the pack it names supplies shell gate commands the engine runs",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "contractEnvPassthrough",
+        PatchClass::Never,
         "it copies named ambient credentials verbatim into contract-command environments",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "dangerouslyAllowAll",
+        PatchClass::Consent,
         "it puts every agent session in bypassPermissions",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "validatorAllowUncontainedDegrade",
+        PatchClass::Consent,
         "it reopens the uncontained-validator degrade the containment work closed",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "allowValidatorCommands",
+        PatchClass::Consent,
         "it grants validators shell commands with no human step",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "localBackendAllowedHosts",
+        PatchClass::Never,
         "it is the operator's own escape hatch from the local-backend loopback rule",
     ),
     // `hooks` is deliberately ABSENT from this list. The github webhook
@@ -403,51 +451,88 @@ const PROJECT_LAYER_REFUSED: &[(&str, &str)] = &[
     // against, not a program, an outbound endpoint, or a containment
     // escape. Its exposure problem is the `config show` one, closed by
     // redaction there.
-    (
+    ConfigTrustRule::operator_only(
         "slack",
+        PatchClass::Never,
         "it carries the Slack bot and app tokens, and the channel mission output is posted to \
          (the Slack bridge reads the global layer only)",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "hookStatus",
+        PatchClass::Never,
         "the per-run capability token rides its endpoint",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "workspace.remote",
+        PatchClass::Never,
         "it names a remote workspace URL and the env var holding its token",
     ),
-    ("<role>.acpCommand", "it names the ACP agent program"),
-    ("<role>.acpArgs", "it is argv for the ACP agent program"),
-    (
+    ConfigTrustRule::operator_only(
+        "<role>.acpCommand",
+        PatchClass::Never,
+        "it names the ACP agent program",
+    ),
+    ConfigTrustRule::operator_only(
+        "<role>.acpArgs",
+        PatchClass::Never,
+        "it is argv for the ACP agent program",
+    ),
+    ConfigTrustRule::operator_only(
         "<role>.baseUrl",
+        PatchClass::Never,
         "the engine POSTs the assembled prompt to it from outside every sandbox",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "<role>.sandbox.extraWrite",
+        PatchClass::Never,
         "it widens the sandbox write allowlist",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "<role>.sandbox.egress",
+        PatchClass::Never,
         "it widens the sandbox egress allowlist",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "<role>.sandbox.provider",
+        PatchClass::Never,
         "it selects which containment mechanism wraps sessions",
     ),
-    (
+    ConfigTrustRule::operator_only(
         "<role>.sandbox.image",
+        PatchClass::Never,
         "it names the container image sessions run inside",
     ),
+    ConfigTrustRule {
+        key: "<role>.sandbox.enforce",
+        project: ProjectPolicy::SandboxFloor,
+        runtime: PatchClass::SandboxFloor,
+        reason: "a repository may raise sandbox enforcement, never lower it",
+    },
+    ConfigTrustRule {
+        key: "reviewerIndependence",
+        project: ProjectPolicy::ReviewerFloor,
+        runtime: PatchClass::Never,
+        reason: "a repository may strengthen reviewer independence, never weaken it",
+    },
 ];
+
+fn config_trust_rule(normalized: &str) -> Option<&'static ConfigTrustRule> {
+    CONFIG_TRUST_RULES
+        .iter()
+        .find(|rule| path_matches(normalized, rule.key))
+}
 
 /// Rank a `sandbox.enforce` value so raising and lowering can be told apart:
 /// `off` < `fs` < `fs+net`. An absent or unrecognized value ranks `off`,
 /// which is the compiled-in default.
 fn enforce_rank(value: Option<&serde_json::Value>) -> u8 {
-    match value.and_then(serde_json::Value::as_str) {
-        Some("fs") => 1,
-        Some("fs+net") => 2,
-        _ => 0,
+    use serde::Deserialize as _;
+    // Serde also accepts maps for unit enum variants. Rank the same typed
+    // value config deserialization sees, rather than treating those as Off.
+    match value.and_then(|value| SandboxEnforce::deserialize(value).ok()) {
+        Some(SandboxEnforce::Fs) => 1,
+        Some(SandboxEnforce::FsNet) => 2,
+        Some(SandboxEnforce::Off) | None => 0,
     }
 }
 
@@ -465,14 +550,50 @@ fn project_layer_refusal(file: &Path, dotted: &str, reason: &str) -> EngineError
 /// `base` is the tree the layers before this one already merged to, which is
 /// what makes the sandbox rule directional: a repository may RAISE
 /// `<role>.sandbox.enforce` (asking for more containment than the operator
-/// configured is always safe) and may never lower it.
+/// configured is always safe) and may never lower it. Likewise, it may add
+/// independent reviewer requirements but cannot remove the operator's floor.
 pub fn check_project_layer_keys(
     patch: &serde_json::Value,
     base: &serde_json::Value,
     file: &Path,
 ) -> Result<()> {
+    if !patch.is_object() || !base.is_object() {
+        return Err(EngineError::Config(format!(
+            "{}: project config changes require JSON objects at the top level",
+            file.display()
+        )));
+    }
     let mut trail: Vec<String> = Vec::new();
     walk_project_layer(patch, Some(base), file, &mut trail)
+}
+
+fn check_project_reviewer_floor(
+    policy: &serde_json::Value,
+    base: Option<&serde_json::Value>,
+    file: &Path,
+    dotted: &str,
+    reason: &str,
+) -> Result<()> {
+    for role in ["scrutiny", "functional"] {
+        let required = base
+            .and_then(|policy| policy.get(role))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        // Object omissions inherit through deep_merge; replacing the whole
+        // policy or explicitly disabling a role removes the operator's floor.
+        let retained = policy.is_object()
+            && policy
+                .get(role)
+                .is_none_or(|value| value.as_bool() == Some(true));
+        if required && !retained {
+            return Err(project_layer_refusal(
+                file,
+                &format!("{dotted}.{role}"),
+                reason,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn walk_project_layer(
@@ -489,32 +610,43 @@ fn walk_project_layer(
         let dotted = trail.join(".");
         let normalized = normalize_key_path(&dotted);
 
-        if let Some((_, reason)) = PROJECT_LAYER_REFUSED
-            .iter()
-            .find(|(refused, _)| path_matches(&normalized, refused))
-        {
-            return Err(project_layer_refusal(file, &dotted, reason));
-        }
-
         let base_value = base.and_then(|b| b.get(key));
-
-        if normalized == "<role>.sandbox.enforce"
-            && enforce_rank(Some(value)) < enforce_rank(base_value)
-        {
-            return Err(project_layer_refusal(
-                file,
-                &dotted,
-                "a repository may raise sandbox enforcement, never lower it",
-            ));
+        // Serde accepts positional arrays for structs. Replacing a role or
+        // sandbox that way would skip this object walk while still changing
+        // protected fields. A positional base would also hide its floor.
+        let protected_container = CONFIG_TRUST_RULES.iter().any(|rule| {
+            (normalized != rule.key && path_matches(rule.key, &normalized))
+                || (normalized == rule.key && matches!(rule.project, ProjectPolicy::ReviewerFloor))
+        });
+        if protected_container {
+            if base_value.is_some_and(|base| !base.is_object()) {
+                return Err(EngineError::Config(format!(
+                    "{}: cannot safely merge project config over non-object inherited field {dotted:?}; protected config containers must be JSON objects",
+                    file.display()
+                )));
+            }
+            if !value.is_object() {
+                return Err(EngineError::Config(format!(
+                    "{}: project config field {dotted:?} must be a JSON object; positional arrays and scalar replacements bypass protected child checks",
+                    file.display()
+                )));
+            }
         }
-
-        if normalized == "workerIsolation" && value.as_str() == Some("checkout") {
-            return Err(project_layer_refusal(
-                file,
-                &dotted,
-                "checkout isolation makes the repository root the session's writable cwd, \
-                 which is the containment the worktree default provides",
-            ));
+        if let Some(rule) = config_trust_rule(&normalized) {
+            match rule.project {
+                ProjectPolicy::OperatorOnly => {
+                    return Err(project_layer_refusal(file, &dotted, rule.reason));
+                }
+                ProjectPolicy::SandboxFloor if normalized == rule.key => {
+                    if enforce_rank(Some(value)) < enforce_rank(base_value) {
+                        return Err(project_layer_refusal(file, &dotted, rule.reason));
+                    }
+                }
+                ProjectPolicy::ReviewerFloor if normalized == rule.key => {
+                    check_project_reviewer_floor(value, base_value, file, &dotted, rule.reason)?;
+                }
+                _ => {}
+            }
         }
 
         walk_project_layer(value, base_value, file, trail)?;
@@ -710,7 +842,6 @@ const RUNTIME_PATCHABLE: &[&str] = &[
     "consideredAlternativesTouchSetThreshold",
     "consideredAlternativesHighUsdThreshold",
     "rubberStampThresholdMs",
-    "allowBelowDefaultWorkerModel",
     "<role>.model",
     "<role>.backend",
     "<role>.reasoningEffort",
@@ -720,54 +851,23 @@ const RUNTIME_PATCHABLE: &[&str] = &[
     "<role>.temperature",
 ];
 
-/// Consent-bearing keys: a human decision, so an operator surface may patch
-/// them mid-mission and the inbox may not.
-const OPERATOR_ONLY_PATCHABLE: &[(&str, &str)] = &[
-    (
-        "dangerouslyAllowAll",
-        "it puts every agent session in bypassPermissions",
-    ),
-    ("skipScrutiny", "it removes the scrutiny validation round"),
-    (
-        "skipFunctional",
-        "it removes the functional validation round",
-    ),
-    ("denyPatterns", "it is the Bash deny list"),
-    (
-        "allowValidatorCommands",
-        "it grants validators shell commands",
-    ),
-    (
-        "validatorAllowUncontainedDegrade",
-        "it reopens the uncontained-validator degrade",
-    ),
-];
-
-/// What a patched key is, for [`check_runtime_patch`].
-enum PatchClass {
-    /// Re-tunable at runtime from either source.
-    Runtime,
-    /// Consent-bearing: an operator surface only.
-    Consent(&'static str),
-    /// Not patchable at runtime at all. Seed-time or operator-file config —
-    /// the binary, the endpoints, the containment shape, the pack.
-    Never,
-}
-
-fn classify_patch_key(normalized: &str) -> PatchClass {
+fn classify_patch_key(normalized: &str) -> (PatchClass, &'static str) {
+    if let Some(rule) = config_trust_rule(normalized) {
+        // Only the enforcement scalar is directional. Unknown descendants
+        // retain the existing default-deny runtime policy.
+        let class = match rule.runtime {
+            PatchClass::SandboxFloor if normalized != rule.key => PatchClass::Never,
+            class => class,
+        };
+        return (class, rule.reason);
+    }
     if RUNTIME_PATCHABLE
         .iter()
         .any(|key| path_matches(normalized, key))
     {
-        return PatchClass::Runtime;
+        return (PatchClass::Runtime, "");
     }
-    if let Some((_, reason)) = OPERATOR_ONLY_PATCHABLE
-        .iter()
-        .find(|(key, _)| path_matches(normalized, key))
-    {
-        return PatchClass::Consent(reason);
-    }
-    PatchClass::Never
+    (PatchClass::Never, "")
 }
 
 /// Refuse a runtime `config-change` patch that reaches past the keys its
@@ -804,25 +904,23 @@ fn walk_runtime_patch(
     let dotted = trail.join(".");
     let normalized = normalize_key_path(&dotted);
 
-    // Sandbox enforcement is the one directional key: more containment than
-    // the mission currently has is never a consent act, less always is.
-    if normalized == "<role>.sandbox.enforce" {
-        if enforce_rank(Some(patch)) >= enforce_rank(base) {
-            return Ok(());
+    let (class, reason) = classify_patch_key(&normalized);
+    match class {
+        PatchClass::SandboxFloor => {
+            if enforce_rank(Some(patch)) >= enforce_rank(base) {
+                return Ok(());
+            }
+            match source {
+                PatchSource::Operator => Ok(()),
+                PatchSource::Inbox => Err(EngineError::Config(format!(
+                    "refusing a control-inbox config change to {dotted:?}: lowering sandbox \
+                     enforcement is a consent act, and the control inbox is an \
+                     unauthenticated filesystem channel"
+                ))),
+            }
         }
-        return match source {
-            PatchSource::Operator => Ok(()),
-            PatchSource::Inbox => Err(EngineError::Config(format!(
-                "refusing a control-inbox config change to {dotted:?}: lowering sandbox \
-                 enforcement is a consent act, and the control inbox is an \
-                 unauthenticated filesystem channel"
-            ))),
-        };
-    }
-
-    match classify_patch_key(&normalized) {
         PatchClass::Runtime => Ok(()),
-        PatchClass::Consent(reason) => match source {
+        PatchClass::Consent => match source {
             PatchSource::Operator => Ok(()),
             PatchSource::Inbox => Err(EngineError::Config(format!(
                 "refusing a control-inbox config change to {dotted:?}: {reason}, so it is a \
@@ -907,6 +1005,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// Validate invariants the engine relies on (plan §6). Returns
 /// [`EngineError::Config`] describing the first violation found.
 pub fn validate(cfg: &MissionConfig) -> Result<()> {
+    crate::reviewer_independence::validate_config(cfg)?;
     let roles = [
         ("orchestrator", &cfg.orchestrator),
         ("worker", &cfg.worker),

@@ -1637,3 +1637,301 @@ fn a_planted_remote_transport_program_is_blanked_on_local_operations() {
     let reopened = GitRepo::open(dir.path()).expect("open must survive an armed remote config");
     assert!(reopened.is_clean().expect("status on a hardened handle"));
 }
+
+// Audit 2026-09-11 F2: the original handle survives worker execution, so its
+// construction-time list cannot authorize later driver names.
+#[cfg(unix)]
+fn harmless_filter_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = root.join(".git/filter-fixture.sh");
+    let marker = root.join(".git/filter-fixture-fired");
+    let quoted_marker = marker.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf 'fixture' > '{quoted_marker}'\ncat\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (script, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn local_operations_refuse_a_new_filter_on_the_original_handle_and_its_clone() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, initial_sha) = seeded_repo();
+    let clone = repo.with_hooks_disabled().unwrap();
+    let (script, marker) = harmless_filter_fixture(dir.path());
+    write(&dir, ".gitattributes", "*.txt filter=late.driver\n");
+    write(&dir, "late.txt", "unmodified delivery bytes\n");
+    raw_git(
+        dir.path(),
+        &[
+            "config",
+            "filter.late.driver.clean",
+            script.to_str().unwrap(),
+        ],
+    );
+    raw_git(dir.path(), &["hash-object", "--path=late.txt", "late.txt"]);
+    assert!(marker.exists(), "the harmless filter fixture must be armed");
+    std::fs::remove_file(&marker).unwrap();
+    let config_before = std::fs::read(dir.path().join(".git/config")).unwrap();
+
+    for err in [
+        repo.is_clean().unwrap_err(),
+        clone.commit_dirty_paths("must refuse").unwrap_err(),
+        repo.checkout("main").unwrap_err(),
+    ] {
+        let detail = err.to_string();
+        assert!(
+            detail.contains("changed after opening the handle"),
+            "{detail}"
+        );
+        assert!(detail.contains("filter.late.driver.clean"), "{detail}");
+        assert!(
+            !detail.contains(script.to_str().unwrap()),
+            "values must stay private"
+        );
+    }
+    assert!(!marker.exists(), "engine Git must never run the new filter");
+    assert_eq!(
+        raw_git(dir.path(), &["rev-parse", "HEAD"]).trim(),
+        initial_sha
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".git/config")).unwrap(),
+        config_before
+    );
+
+    // Opening again explicitly establishes a new boundary. Its overrides
+    // must still suppress the reviewed driver and preserve exact file bytes.
+    let reopened = GitRepo::open(dir.path()).unwrap();
+    reopened.add_all_and_commit("delivery").unwrap();
+    assert!(!marker.exists());
+    assert_eq!(
+        reopened.show_file("HEAD", "late.txt").unwrap().unwrap(),
+        b"unmodified delivery bytes\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".git/config")).unwrap(),
+        config_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_driver_remains_disabled_when_its_command_changes_after_open() {
+    if !setup() {
+        return;
+    }
+    let (dir, _, _) = seeded_repo();
+    raw_git(dir.path(), &["config", "filter.existing.clean", "cat"]);
+    let repo = GitRepo::open(dir.path()).unwrap();
+    let (script, marker) = harmless_filter_fixture(dir.path());
+    raw_git(
+        dir.path(),
+        &["config", "filter.existing.clean", script.to_str().unwrap()],
+    );
+    write(&dir, ".gitattributes", "*.txt filter=existing\n");
+    write(&dir, "late.txt", "exact bytes\n");
+    repo.add_all_and_commit("delivery").unwrap();
+    assert!(!marker.exists());
+    assert_eq!(
+        repo.show_file("HEAD", "late.txt").unwrap().unwrap(),
+        b"exact bytes\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inactive_conditional_includes_cannot_arm_a_worktree_child_checkout() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    write(&dir, ".gitattributes", "*.txt filter=conditional\n");
+    write(&dir, "conditional.txt", "exact bytes\n");
+    let sha = repo.add_all_and_commit("conditional attributes").unwrap();
+    let (script, marker) = harmless_filter_fixture(dir.path());
+    let included = dir.path().join(".git/conditional.cfg");
+    raw_git(
+        dir.path(),
+        &[
+            "config",
+            "--file",
+            included.to_str().unwrap(),
+            "filter.conditional.smudge",
+            script.to_str().unwrap(),
+        ],
+    );
+    raw_git(
+        dir.path(),
+        &[
+            "config",
+            "includeIf.onbranch:kranz/conditional.path",
+            included.to_str().unwrap(),
+        ],
+    );
+    let current_filters = Command::new("git")
+        .args(["config", "--get-regexp", "^filter\\."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        current_filters.status.code(),
+        Some(1),
+        "the include is inactive on main"
+    );
+    let wt = dir.path().join("conditional-worktree");
+    for error in [
+        repo.add_worktree(&wt, "kranz/conditional", &sha)
+            .unwrap_err(),
+        GitRepo::open(dir.path()).unwrap_err(),
+    ] {
+        assert!(error
+            .to_string()
+            .contains("conditional repository config includes"));
+    }
+    assert!(!marker.exists(), "no child checkout may execute the filter");
+    assert!(!wt.exists());
+    assert_eq!(raw_git(dir.path(), &["rev-parse", "HEAD"]).trim(), sha);
+
+    // Positive fixture: the ordinary command changes branch context within
+    // its own child checkout and activates the previously invisible driver.
+    raw_git(
+        dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "kranz/conditional",
+            wt.to_str().unwrap(),
+            &sha,
+        ],
+    );
+    assert!(
+        marker.exists(),
+        "the harmless conditional smudge fixture must run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_handle_refuses_new_worktree_scoped_drivers() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, initial_sha) = seeded_repo();
+    let wt = dir.path().join("linked");
+    repo.add_worktree(&wt, "kranz/linked", &initial_sha)
+        .unwrap();
+    let linked = GitRepo::open(&wt).unwrap();
+    raw_git(dir.path(), &["config", "extensions.worktreeConfig", "true"]);
+    let (script, marker) = harmless_filter_fixture(dir.path());
+    raw_git(
+        &wt,
+        &[
+            "config",
+            "--worktree",
+            "filter.late.clean",
+            script.to_str().unwrap(),
+        ],
+    );
+    let err = linked.is_clean().unwrap_err().to_string();
+    assert!(err.contains("filter.late.clean"), "{err}");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn unreadable_driver_configuration_fails_closed_after_open() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    std::fs::write(dir.path().join(".git/config"), b"[invalid fixture syntax\n").unwrap();
+    let err = repo.is_clean().unwrap_err().to_string();
+    assert!(
+        err.contains("cannot enumerate executable repository configuration"),
+        "{err}"
+    );
+    assert!(!err.contains("invalid fixture syntax"));
+}
+
+#[test]
+fn driver_names_that_cannot_be_overridden_fail_closed() {
+    if !setup() {
+        return;
+    }
+    for key in ["filter.name=other.clean", "merge.name=other.driver"] {
+        let (dir, repo, _) = seeded_repo();
+        raw_git(dir.path(), &["config", key, "false"]);
+        for err in [
+            repo.is_clean().unwrap_err(),
+            GitRepo::open(dir.path()).unwrap_err(),
+        ] {
+            assert!(err
+                .to_string()
+                .contains("driver name cannot be safely overridden"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hardened_local_git_drops_ambient_authority() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const CHILD_ROOT: &str = "KRANZ_GIT_ENV_FIXTURE_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let repo = GitRepo::open(PathBuf::from(root)).unwrap();
+        assert!(repo.is_clean().unwrap());
+        repo.resolved_identity().unwrap();
+        return;
+    }
+    if !setup() {
+        return;
+    }
+    let (dir, _, _) = seeded_repo();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let bin = dir.path().join(".git/fixture-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = dir.path().join(".git/ambient-authority-received");
+    let quote = |path: &Path| path.display().to_string().replace('\'', "'\\''");
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ -n \"${{KRANZ_GIT_ENV_SENTINEL-}}${{GIT_CONFIG_COUNT-}}${{GIT_CONFIG_PARAMETERS-}}\" ]; then\n  printf 'fixture' > '{}'\n  exit 91\nfi\nexec '{}' \"$@\"\n",
+            quote(&marker),
+            quote(&real_git)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut path = vec![bin];
+    path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hardened_local_git_drops_ambient_authority",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, dir.path())
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .env("KRANZ_GIT_ENV_SENTINEL", "harmless-test-sentinel")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "filter.injected.clean")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists(), "local Git inherited ambient authority");
+}

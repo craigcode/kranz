@@ -416,23 +416,47 @@ impl Ticket {
         goal: Option<&str>,
         context: Option<&str>,
     ) -> Result<PathBuf> {
-        Self::ensure_valid_slug(slug)?;
-        let dir = Self::tickets_dir(repo_root);
-        let path = dir.join(format!("{slug}.md"));
-        if path.exists() {
-            return Err(EngineError::InvalidState(format!(
-                "ticket '{slug}' already exists at {}",
-                path.display()
-            )));
-        }
-        std::fs::create_dir_all(&dir)?;
         let body = Self::ticket_template(title, goal, context);
-        Self::parse(slug, &body).map_err(|e| {
-            EngineError::Other(format!(
-                "internal error: scaffolded ticket does not parse: {e}"
-            ))
+        Self::create_markdown(repo_root, slug, &body)
+    }
+
+    /// Create a complete ticket without following links or replacing an
+    /// existing entry. Retain directory capabilities through the write so a
+    /// concurrent parent rename cannot redirect it outside the ticket tree.
+    pub fn create_markdown(repo_root: &Path, slug: &str, body: &str) -> Result<PathBuf> {
+        use cap_fs_ext::OpenOptionsFollowExt as _;
+        use cap_primitives::fs::FollowSymlinks;
+        use cap_std::ambient_authority;
+        use cap_std::fs::{Dir, OpenOptions};
+        use std::io::Write as _;
+
+        Self::ensure_valid_slug(slug)?;
+        Self::parse(slug, body)?;
+        let mut dir = Dir::open_ambient_dir(repo_root, ambient_authority())?;
+        let mut path = repo_root.to_path_buf();
+        for segment in [".kranz", "tickets"] {
+            path.push(segment);
+            dir = crate::paths::open_real_subdir(&dir, segment, &path, true)?;
+        }
+        let name = format!("{slug}.md");
+        path.push(&name);
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = dir.open_with(&name, &options).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                EngineError::InvalidState(format!(
+                    "ticket '{slug}' already exists at {}",
+                    path.display()
+                ))
+            } else {
+                error.into()
+            }
         })?;
-        std::fs::write(&path, body)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_data()?;
         Ok(path)
     }
 

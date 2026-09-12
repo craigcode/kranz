@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-05
+last_verified: 2026-09-12
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -42,7 +42,7 @@ write better code are not built. A skill file is exactly that primitive —
 it is prompt material the consumer CLI loads to change how the next
 session writes code.
 
-Kranz already has four evidence homes for repeated knowledge. None of
+Kranz already has these evidence homes for repeated knowledge. None of
 them is a skill directory:
 
 | Home | What it is |
@@ -53,7 +53,7 @@ them is a skill directory:
 | Flight Rules (M5.5) | SHOULD/MUST governance with pin, waiver, and evidence |
 | `kranz export-corpus` | Provenance-tagged traces for *backend* fine-tune, not skills |
 
-A fifth channel that writes `.claude/skills`, Codex skill sinks, or
+An additional channel that writes `.claude/skills`, Codex skill sinks, or
 equivalent runtime dirs would be context-management and would cross the
 ticket's own constraint (never write those dirs without a separate
 explicit human approval). The honest form of that constraint is: do not

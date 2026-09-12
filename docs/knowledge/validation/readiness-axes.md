@@ -2,7 +2,7 @@
 title: The two readiness axes — AMM projection and contract/consent health
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-08-18
+last_verified: 2026-09-12
 verified_against:
   - crates/cli/src/ready.rs
   - crates/cli/src/amm.rs
@@ -23,7 +23,8 @@ kranz-native:
    axis the whitepaper cannot see: approval-time contract-lint pass rate,
    validation-finding waivers per mission, and the milestone.blocked cause
    histogram (grant / secret-scan / contract-bug / fix-cycle-cap /
-   untrusted-validator / other), folded from mission event logs.
+   untrusted-validator / validator-tamper / other), folded from mission event
+   logs.
 
 The second axis exists because the evidence says so: every hard bite in the
 validator-repair era (m-9e4ef3's five blocks, the a7 hang, the m-66aff8
@@ -34,10 +35,10 @@ scorecard that omits it measures everything except the thing that hurts.
 
 ## Mapping rules
 
-- **Map, never adopt.** Factory's 5/19/36/60/100 point thresholds are
-  marketing numbers that drift whenever the paper revises. They live in ONE
-  table (amm.rs `LADDER`); levels are ordinal labels; `MAPPING_VERSION`
-  bumps on any change so `--json` consumers can pin.
+- **Map, never adopt.** The mapping uses native readiness signals instead of
+  Factory's 5/19/36/60/100 point thresholds. The required dimensions live in
+  ONE table (amm.rs `LADDER`); levels are ordinal labels; `MAPPING_VERSION`
+  bumps on ladder changes so `--json` consumers can pin.
 - **L4+ requires the second axis.** A repo cannot reach "orchestrated"
   without mission history (the contract-health axis must exist to be read),
   and L5 requires the machinery to be *quiet*: lint pass ≥ 0.8, waivers per
@@ -46,8 +47,10 @@ scorecard that omits it measures everything except the thing that hurts.
 - **No second source of truth.** contract_health is a pure projection over
   events the engine already records (orchestrator.decision headlines,
   milestone.blocked reason templates). It measures nothing new.
-- **Absent, not zero.** Repos without mission history omit the axis
-  (`contractHealth` is skipped in JSON) — a vacuous zero would be a lie.
+- **Absent, not zero.** Repos without readable mission history omit the axis
+  (`contractHealth` is skipped in JSON); corrupt logs and mission paths reached
+  through symlinks are excluded. The result describes the readable history,
+  rather than treating missing evidence as a clean record.
 
 ## Dogfood
 

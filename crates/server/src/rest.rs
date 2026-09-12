@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -39,7 +38,7 @@ pub(crate) async fn health() -> Json<Value> {
 /// corrupt (or unreadable) log yields that entry with `"status": "failed"`
 /// and an `"error"` field instead of failing the whole list.
 pub(crate) async fn list_missions(State(server): State<Arc<ServerState>>) -> Json<Value> {
-    let index_contents = read_missions_index(&server.repo_root);
+    let index_contents = read_missions_index(&server.repo_root).await;
     let mut ids = MissionPaths::list_missions(&server.repo_root);
     for id in kranz_engine::mission_catalog::mission_index_ids(&index_contents) {
         if !ids.contains(&id) {
@@ -171,18 +170,13 @@ pub(crate) async fn cost_per_merged_change(
 /// No-follow, like every other repo file this crate reads: the catalog lives
 /// in a worker-writable tree and a symlinked `index.md` must read as absent,
 /// not as whatever it points at.
-fn read_missions_index(repo_root: &Path) -> String {
+async fn read_missions_index(repo_root: &Path) -> String {
     let path = MissionPaths::new(repo_root, "_")
         .missions_dir()
         .join("index.md");
-    let Ok(mut file) = kranz_engine::paths::open_read_nofollow(&path) else {
-        return String::new();
-    };
-    let mut content = String::new();
-    match file.read_to_string(&mut content) {
-        Ok(_) => content,
-        Err(_) => String::new(),
-    }
+    read_file_or_404(&path, || "no mission index".into())
+        .await
+        .unwrap_or_default()
 }
 
 /// `GET /api/missions/:id/state` — full [`MissionState`], folded from
@@ -622,7 +616,8 @@ pub(crate) async fn mission_plan(
     let paths = mission_paths(&server, &id)?;
     let content = read_file_or_404(&paths.plan_file(), || {
         format!("mission '{id}' has no approved plan yet")
-    })?;
+    })
+    .await?;
     let plan: Value = serde_json::from_str(&content)
         .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
     Ok(Json(plan))
@@ -637,7 +632,8 @@ pub(crate) async fn mission_plan_md(
     let paths = mission_paths(&server, &id)?;
     let markdown = read_file_or_404(&paths.plan_md_file(), || {
         format!("mission '{id}' has no approved plan yet")
-    })?;
+    })
+    .await?;
     Ok(Json(json!({ "markdown": markdown })))
 }
 
@@ -659,7 +655,8 @@ pub(crate) async fn mission_revision_diff(
     };
     let current = read_file_or_404(&paths.plan_md_file(), || {
         format!("mission '{id}' has no approved plan yet")
-    })?;
+    })
+    .await?;
     // Preview the same calibrated estimate approval will commit, so the
     // dashboard's revision diff shows the range that actually lands (M1).
     let calibration = cost::calibrate(&paths.repo_root);
@@ -703,7 +700,8 @@ pub(crate) async fn mission_report_md(
     let paths = mission_paths(&server, &id)?;
     let markdown = read_file_or_404(&paths.report_file(), || {
         format!("mission '{id}' has no report yet")
-    })?;
+    })
+    .await?;
     Ok(Json(json!({ "markdown": markdown })))
 }
 
@@ -869,7 +867,8 @@ pub(crate) async fn run_transcript(
     }
     let content = read_file_or_404(&paths.transcript_file(&run_id), || {
         format!("no transcript for run '{run_id}'")
-    })?;
+    })
+    .await?;
     // Tolerate torn/garbage lines (a live transcript may end mid-write).
     let values: Vec<Value> = content
         .lines()
@@ -1273,33 +1272,56 @@ fn simple_line_diff(old_name: &str, new_name: &str, old: &str, new: &str) -> Str
 /// engine's no-follow open now — the same helper `EventLog` uses. A refusal
 /// is a 404, like a missing file: the API says nothing about what the link
 /// pointed at.
-fn read_file_or_404(
+// Cap concurrent file work as well as bytes per response. The permit moves
+// into the blocking task so cancellation cannot release capacity prematurely.
+const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+static ARTIFACT_READS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+async fn read_file_or_404(
     path: &Path,
     not_found_msg: impl FnOnce() -> String,
 ) -> Result<String, ApiError> {
-    let mut file = match kranz_engine::paths::open_read_nofollow(path) {
-        Ok(file) => file,
-        Err(kranz_engine::error::EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-            return Err(ApiError::not_found(not_found_msg()))
-        }
-        Err(kranz_engine::error::EngineError::InvalidState(detail)) => {
-            return Err(ApiError::not_found(detail))
-        }
-        Err(e) => {
-            return Err(ApiError::internal(format!(
-                "failed to read {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    let mut content = String::new();
-    match file.read_to_string(&mut content) {
-        Ok(_) => Ok(content),
-        Err(e) => Err(ApiError::internal(format!(
-            "failed to read {}: {e}",
-            path.display()
-        ))),
-    }
+    let path = path.to_path_buf();
+    let missing = not_found_msg();
+    let permit = ARTIFACT_READS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: "artifact readers are busy; retry shortly".into(),
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let file = match kranz_engine::paths::open_read_nofollow(&path) {
+            Ok(file) => file,
+            Err(kranz_engine::error::EngineError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                return Err(ApiError::not_found(missing));
+            }
+            Err(kranz_engine::error::EngineError::InvalidState(_)) => {
+                return Err(ApiError::not_found(missing));
+            }
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        kranz_engine::paths::read_regular_file_bounded(file, MAX_ARTIFACT_BYTES).map_err(|e| {
+            if e.kind() == ErrorKind::FileTooLarge {
+                ApiError {
+                    status: axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    message: format!("artifact exceeds the {MAX_ARTIFACT_BYTES}-byte read limit"),
+                }
+            } else {
+                ApiError::internal(format!("failed to read {}: {e}", path.display()))
+            }
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("artifact reader failed: {error}")))?
 }
 
 #[cfg(test)]
@@ -1318,6 +1340,36 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn artifact_reads_reject_oversized_and_nonregular_inputs() {
+        let repo = TempDir::new().unwrap();
+        let paths = MissionPaths::new(repo.path(), "m-bounded");
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let path = paths.report_file();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::MAX_ARTIFACT_BYTES + 1)
+            .unwrap();
+        let error = super::read_file_or_404(&path, || "missing".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = super::read_file_or_404(&path, || "missing".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "complete report").unwrap();
+        assert_eq!(
+            super::read_file_or_404(&path, || "missing".into())
+                .await
+                .unwrap(),
+            "complete report"
+        );
+    }
 
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -1400,6 +1452,7 @@ mod tests {
             command_grants: Vec::new(),
             touch_set: vec!["src/**".to_string()],
             standards_manifest: Some(Box::new(pin)),
+            reviewer_independence: None,
         };
         let finding = |rule: &PinnedRule| Finding {
             subject: format!("flight-rule:{}", rule.id),
@@ -2105,6 +2158,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 

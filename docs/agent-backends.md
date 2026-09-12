@@ -35,3 +35,10 @@ Binary overrides such as `KRANZ_CLAUDE_BIN`, `KRANZ_CODEX_BIN`,
 bad override fails loudly rather than falling back to another executable.
 Role-specific backend and model selection lives in `.kranz/config.json`; use
 `kranz config show` to inspect the effective merged configuration.
+
+Different CLIs can serve the same model family. To require a different family
+for scrutiny or functional review, configure
+[`reviewerIndependence`](config-composition.md#reviewer-independence-reviewerindependence)
+before creating the mission. Approval pins the requirement; resolved backend
+fallback must still satisfy it, and unknown identities block rather than count
+as independent review. Validator containment remains a separate requirement.

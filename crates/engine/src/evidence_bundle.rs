@@ -1010,6 +1010,7 @@ mod tests {
             command_grants: vec![],
             touch_set: vec![],
             standards_manifest: None,
+            reviewer_independence: None,
         }
     }
 
@@ -1045,6 +1046,7 @@ mod tests {
 
     fn worker_spawned(run_id: &str, role: Role, model: &str) -> EventKind {
         EventKind::WorkerSpawned {
+            backend: None,
             run_id: run_id.to_string(),
             role,
             feature_id: None,

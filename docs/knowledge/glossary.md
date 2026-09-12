@@ -2,11 +2,13 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-07
+last_verified: 2026-09-12
 verified_against:
+  - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/config.rs
+  - crates/engine/src/planning.rs
   - crates/engine/src/control.rs
   - crates/engine/src/event_log.rs
   - crates/engine/src/paths.rs
@@ -43,11 +45,18 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Validator** — the checking roles: **scrutiny** (adversarial review) and
   **functional** (runs the contract's command gates). Configurable floors apply
   to autonomous runs.
+- **Reviewer independence** — optional approval-pinned requirement that a reviewer
+  use a known model family different from every recorded worker attempt; backend
+  fallback, retries and restart must preserve it. Completion requires successful
+  compatible review evidence from the latest relevant validation round. See
+  [config composition](../config-composition.md#reviewer-independence-reviewerindependence).
 - **base_sha** — the base branch tip pinned at approval. All contract/final-gate
   diffs are taken against it; it is never re-resolved later.
-- **Plan identity** — a short sha256 over a plan's canonical JSON. A Slack
-  approve button carries `<mission-id>:<plan-identity>`, so a stale card
-  cannot commit a plan nobody reviewed. See
+- **Plan identity** — the full sha256 over a plan's canonical JSON, shared by
+  dashboard previews and Slack cards. Approval submits the displayed identity,
+  so a stale preview cannot commit a replacement plan. The shared implementation
+  is `planning::plan_identity`; missing or stale preview identities require a
+  refreshed review. See
   [slack-commands](surfaces/slack-commands.md).
 - **Event log** — `events.jsonl`, the append-only single-writer source of truth.
   `fold(events)` == `MissionState`; `state.json` is only a cache. Every line a

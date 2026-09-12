@@ -120,10 +120,18 @@ pub struct GitRepo {
     root: PathBuf,
     /// `Some(argv)` when every git invocation from this handle must run with
     /// executable configuration disabled (see [`GitRepo::with_hooks_disabled`]):
-    /// the complete `-c key=value` argv segment, built once at
-    /// handle-construction time. `None` keeps the repo's executable config —
+    /// the initial `-c key=value` argv segment. Each local command reads the
+    /// current driver names again and refuses newly armed names before it
+    /// runs. `None` keeps the repo's executable config —
     /// worker-side git behavior is deliberately unchanged.
     exec_disable_flags: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct ConfiguredDrivers {
+    filters: std::collections::BTreeSet<String>,
+    merges: std::collections::BTreeSet<String>,
+    remotes: std::collections::BTreeSet<String>,
 }
 
 /// An EMPTY REGULAR FILE this process owns, for `GIT_CONFIG_GLOBAL`.
@@ -259,6 +267,56 @@ fn hardened_config_env(user_config: UserConfig) -> Result<Vec<(&'static str, OsS
     })
 }
 
+/// Local Git has no reason to receive the host's API keys or transport
+/// credentials. Keep process bootstrap, explicit commit identity, and Git's
+/// repository/index selectors, which callers may use for isolated operations.
+/// Identity-only config reads additionally retain the operator's config paths.
+fn clear_local_git_env(cmd: &mut Command, user_config: UserConfig) {
+    const KEEP: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+    ];
+    cmd.env_clear();
+    for key in KEEP {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    if user_config == UserConfig::Visible {
+        for key in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut env = std::collections::HashMap::new();
+        crate::agent_env::extend_windows_process_env(&mut env);
+        cmd.envs(env);
+    }
+}
+
 /// git on Windows cannot parse VERBATIM paths (`\\?\C:\...`, which
 /// `std::fs::canonicalize` returns there — and the engine canonicalizes
 /// repo roots for the no-follow guards): `git worktree add //?/C:/...`
@@ -301,8 +359,13 @@ impl GitRepo {
     /// [`Self::open_unhardened`] is the explicit escape hatch for a caller
     /// that genuinely needs the repository's own executable config.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let repo = Self::open_unhardened(root)?;
-        repo.with_hooks_disabled()
+        let repo = GitRepo {
+            root: root.into(),
+            exec_disable_flags: None,
+        }
+        .with_hooks_disabled()?;
+        repo.verify_repository()?;
+        Ok(repo)
     }
 
     /// Open `root` as a git repository WITHOUT the executable-config
@@ -318,13 +381,18 @@ impl GitRepo {
             root: root.into(),
             exec_disable_flags: None,
         };
-        let out = repo.probe(&["rev-parse", "--git-dir"])?;
+        repo.verify_repository()?;
+        Ok(repo)
+    }
+
+    fn verify_repository(&self) -> Result<()> {
+        let out = self.probe(&["rev-parse", "--git-dir"])?;
         if out.status.success() {
-            Ok(repo)
+            Ok(())
         } else {
             Err(EngineError::Git(format!(
                 "not a git repository: {} ({})",
-                repo.root.display(),
+                self.root.display(),
                 failure_detail(&out)
             )))
         }
@@ -343,10 +411,9 @@ impl GitRepo {
     /// leaving planted filter drivers and `gpg.program` executable).
     ///
     /// [`Self::open`] now returns a hardened handle already, so on an
-    /// ordinary handle this is an IDEMPOTENT no-op clone (kept so the
-    /// existing explicit call sites read as the assertions they are). It
-    /// still does the enumeration when called on an
-    /// [`Self::open_unhardened`] handle.
+    /// ordinary handle this keeps the initial driver boundary (including
+    /// across clones). Each local invocation checks that boundary again;
+    /// re-wrapping must not authorize a driver introduced by a worker.
     ///
     /// The gated merge path uses this: its scratch worktree's gitdir points
     /// into the primary `.git`, so mission-authored gate/test code can plant
@@ -366,17 +433,18 @@ impl GitRepo {
     /// is disabled.
     pub fn with_hooks_disabled(&self) -> Result<GitRepo> {
         if let Some(flags) = &self.exec_disable_flags {
-            // Already a verification handle: re-wrapping is a clone, never a
-            // second enumeration (idempotent).
+            // Preserve the original boundary; do not authorize new drivers.
             return Ok(GitRepo {
                 root: self.root.clone(),
                 exec_disable_flags: Some(flags.clone()),
             });
         }
-        Ok(GitRepo {
+        let mut hardened = GitRepo {
             root: self.root.clone(),
-            exec_disable_flags: Some(self.build_exec_disable_flags()?),
-        })
+            exec_disable_flags: Some(Vec::new()),
+        };
+        hardened.exec_disable_flags = Some(hardened.build_exec_disable_flags()?);
+        Ok(hardened)
     }
 
     /// The complete `-c key=value` argv segment [`Self::probe_os`] prepends to
@@ -481,7 +549,8 @@ impl GitRepo {
             flags.push("-c".to_string());
             flags.push((*kv).to_string());
         }
-        for name in self.configured_filter_drivers()? {
+        let drivers = self.configured_drivers()?;
+        for name in &drivers.filters {
             for sub in ["clean", "smudge", "process"] {
                 flags.push("-c".to_string());
                 flags.push(format!("filter.{name}.{sub}="));
@@ -489,11 +558,11 @@ impl GitRepo {
             flags.push("-c".to_string());
             flags.push(format!("filter.{name}.required=false"));
         }
-        for name in self.enumerated_subsections("^merge\\..*\\.driver$", "merge.")? {
+        for name in &drivers.merges {
             flags.push("-c".to_string());
             flags.push(format!("merge.{name}.driver=false"));
         }
-        for name in self.configured_remote_programs()? {
+        for name in &drivers.remotes {
             for sub in ["uploadpack", "receivepack"] {
                 flags.push("-c".to_string());
                 flags.push(format!("remote.{name}.{sub}="));
@@ -502,79 +571,104 @@ impl GitRepo {
         Ok(flags)
     }
 
-    /// Remotes whose config names a program to run on the far side
-    /// (`remote.<name>.uploadpack` / `.receivepack`), for
-    /// [`Self::build_exec_disable_flags`]' blanking overrides. Both keys are
-    /// single-valued, so an empty `-c` override really does replace the
-    /// planted value (probed 2026-09-02) — unlike `insteadOf`.
-    ///
-    /// Enumeration failures fail CLOSED, for the same reason the filter
-    /// enumeration does: a handle that cannot name the armed programs cannot
-    /// promise the surface is disabled.
-    fn configured_remote_programs(&self) -> Result<Vec<String>> {
-        self.enumerated_subsections("^remote\\..*\\.(uploadpack|receivepack)$", "remote.")
-    }
-
-    /// The filter-driver names configured for this repository (any config
-    /// scope), for [`Self::build_exec_disable_flags`]' neutralizing
-    /// overrides. `git config --get-regexp` exits 1 when nothing matches
-    /// (the common case — no drivers configured); any other failure is an
-    /// error.
-    ///
-    /// `-z` output is `key\nvalue\0` per entry, so the key runs to the
-    /// first newline. A subsection name can legally contain spaces; such a
-    /// name is SKIPPED here, which is safe rather than a hole:
-    /// `.gitattributes` attribute settings are whitespace-delimited, so a
-    /// whitespace-carrying driver name can never be armed. Dotted names
-    /// (`filter.weird.name.clean`) re-split at the LAST dot, so they
-    /// round-trip into `-c` keys exactly as git prints them.
-    fn configured_filter_drivers(&self) -> Result<Vec<String>> {
-        self.enumerated_subsections("^filter\\.", "filter.")
-    }
-
-    /// The subsection names of every config key matching `pattern`, with
-    /// `prefix` stripped and the trailing subkey removed — the shared body
-    /// of [`Self::configured_filter_drivers`] and
-    /// [`Self::configured_remote_programs`].
-    ///
-    /// Runs on this handle, so under [`UserConfig::Ignored`]: the user and
-    /// system scopes are already nulled for it, which is what makes the
-    /// enumeration REPO-LOCAL without needing `--local` (and therefore
-    /// covers `.git/config`, a `config.worktree`, and a linked worktree's
-    /// gitdir config in one read — probed 2026-09-02).
-    fn enumerated_subsections(&self, pattern: &str, prefix: &str) -> Result<Vec<String>> {
-        let out = self.probe(&["config", "--get-regexp", "-z", pattern])?;
+    /// One pure config read covers local, included and worktree config. It
+    /// carries no `-c` overrides, so it sees driver names as configured rather
+    /// than the names from the handle's previous defensive argv segment.
+    fn configured_drivers(&self) -> Result<ConfiguredDrivers> {
+        let out = self.spawn_git(
+            &[
+                "config",
+                "--name-only",
+                "--get-regexp",
+                "-z",
+                "^(filter|merge|remote|includeif)\\.",
+            ]
+            .iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>(),
+            UserConfig::Ignored,
+            ExecFlags::None,
+        )?;
         if !out.status.success() {
-            // Exit 1 is "no matches" (the common case); anything else is a
-            // real failure and must not silently yield an unneutralized set.
             if out.status.code() == Some(1) {
-                return Ok(Vec::new());
+                return Ok(ConfiguredDrivers::default());
             }
+            // Do not include config values (or a malformed source line) in
+            // the refusal: repository config can contain credentials.
             return Err(EngineError::Git(format!(
-                "git config --get-regexp {pattern} failed ({}): {}",
-                out.status,
-                failure_detail(&out)
+                "refusing git operation: cannot enumerate executable repository configuration ({})",
+                out.status
             )));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut names = std::collections::BTreeSet::new();
-        for entry in stdout.split('\0') {
-            if entry.is_empty() {
+        let stdout = std::str::from_utf8(&out.stdout).map_err(|_| {
+            EngineError::Git("refusing git operation: repository configuration is not UTF-8".into())
+        })?;
+        let mut drivers = ConfiguredDrivers::default();
+        for key in stdout.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((section, rest)) = key.split_once('.') else {
+                continue;
+            };
+            let Some((name, subkey)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            // A checkout/worktree command can activate an include in a child
+            // Git process after this read, without any concurrent writer.
+            // Refuse even currently inactive conditions: their future driver
+            // set cannot be pinned by enumerating the current context.
+            if section == "includeif" && subkey == "path" {
+                return Err(EngineError::Git(
+                    "refusing git operation: conditional repository config includes cannot be safely overridden across branch or worktree changes"
+                        .into(),
+                ));
+            }
+            if name.is_empty() {
                 continue;
             }
-            let key = entry.split('\n').next().unwrap_or("");
-            let Some(rest) = key.strip_prefix(prefix) else {
-                continue;
+            let names = match section {
+                "filter" => &mut drivers.filters,
+                "merge" if subkey == "driver" => &mut drivers.merges,
+                "remote" if matches!(subkey, "uploadpack" | "receivepack") => &mut drivers.remotes,
+                _ => continue,
             };
-            let Some((name, _subkey)) = rest.rsplit_once('.') else {
-                continue;
-            };
-            if name.is_empty() || name.chars().any(char::is_whitespace) {
-                continue;
+            // `-c` splits at the first '='. Such a subsection cannot be
+            // overridden by key=value argv, and control bytes cannot safely
+            // appear in refusal diagnostics. Never silently skip either.
+            if name.contains('=') || name.chars().any(char::is_control) {
+                return Err(EngineError::Git(
+                    "refusing git operation: repository driver name cannot be safely overridden"
+                        .into(),
+                ));
             }
             names.insert(name.to_string());
         }
-        Ok(names.into_iter().collect())
+        Ok(drivers)
+    }
+
+    /// A worker may add a driver after this handle (or its clone) was opened.
+    /// Refuse those new names. Keep the original overrides even for removed
+    /// drivers, so removing and restoring a known name cannot disarm them.
+    /// The repository's config is never rewritten to enforce this boundary.
+    ///
+    /// Residual: this preflight is not a config snapshot. A hostile process
+    /// able to write git config concurrently can race the read and Git's own
+    /// later read. Clearing the local command environment reduces authority
+    /// in that case; enforced write-denies or filesystem virtualization are
+    /// needed to close the concurrent mutation race completely.
+    fn refuse_new_exec_configuration(&self, initial: &[String]) -> Result<()> {
+        let current = self.build_exec_disable_flags()?;
+        let unexpected: Vec<&str> = current
+            .chunks_exact(2)
+            .map(|pair| pair[1].as_str())
+            .filter(|entry| !initial.iter().any(|known| known == entry))
+            .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+            .collect();
+        if !unexpected.is_empty() {
+            return Err(EngineError::Git(format!(
+                "refusing git operation: executable repository configuration changed after opening the handle: {}. Review the repository config before opening a new handle",
+                unexpected.join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse a NETWORK operation when the REPOSITORY's own config carries a
@@ -2065,6 +2159,15 @@ impl GitRepo {
     ) -> Result<Output> {
         let mut cmd = Command::new("git");
         if let Some(flags) = &self.exec_disable_flags {
+            if user_config == UserConfig::Ignored
+                && exec_flags != ExecFlags::None
+                && !args.first().is_some_and(|arg| arg == "config")
+            {
+                self.refuse_new_exec_configuration(flags)?;
+            }
+            if user_config != UserConfig::KeptForNetwork {
+                clear_local_git_env(&mut cmd, user_config);
+            }
             // `-c` must precede the subcommand; the segment neutralizes every
             // executable config surface this handle promises to cover (see
             // with_hooks_disabled / build_exec_disable_flags).

@@ -13,6 +13,14 @@ use crate::report_render::extract_research;
 use crate::runner;
 use crate::types::*;
 
+/// Content identity carried from a plan preview to its approval on every client.
+/// Serializing the typed plan fixes field order and includes all consent-bearing
+/// fields. Plans contain only infallibly serializable structs, strings and lists.
+pub fn plan_identity(plan: &Plan) -> String {
+    let json = serde_json::to_vec(plan).expect("Plan serialization cannot fail");
+    crate::standards_waiver::sha256_hex(&json)
+}
+
 impl MissionEngine {
     /// Demand the plan JSON (types::Plan, camelCase). Lenient parse with one
     /// retry demanding bare JSON; a plan parses to [`PlanRequest::Ready`]
@@ -55,6 +63,16 @@ impl MissionEngine {
         } else {
             retry
         }))
+    }
+
+    fn review_policy_preview(&self, mut plan: Plan) -> Result<PlanRequest> {
+        let policy = if self.state.mission.status == crate::types::MissionStatus::Planning {
+            crate::reviewer_independence::configured_policy(&self.state.config)
+        } else {
+            self.state.mission.reviewer_independence
+        };
+        crate::reviewer_independence::pin_plan(&mut plan, policy)?;
+        Ok(PlanRequest::Ready(plan))
     }
 
     /// The Flight Rules planning projection (KRZ-345, design D-D/D-G):
@@ -120,7 +138,7 @@ impl MissionEngine {
     /// standards ⇒ the plan passes through untouched, byte-identical.
     async fn standards_fixed_point(&mut self, plan: Plan) -> Result<PlanRequest> {
         let Some(seed_projection) = self.planning_standards_projection(None)? else {
-            return Ok(PlanRequest::Ready(plan));
+            return self.review_policy_preview(plan);
         };
         let mut delivered: std::collections::BTreeSet<(String, u64)> =
             seed_projection.delivered().into_iter().collect();
@@ -131,7 +149,7 @@ impl MissionEngine {
                 // Standards stopped governing between the seed and now (the
                 // configured pack changed mid-planning): nothing the planner
                 // saw can be missing — approval re-resolves the truth.
-                return Ok(PlanRequest::Ready(plan));
+                return self.review_policy_preview(plan);
             };
             let delta: Vec<crate::pack::projection::ProjectedRule> = current
                 .rules
@@ -140,7 +158,7 @@ impl MissionEngine {
                 .cloned()
                 .collect();
             if delta.is_empty() {
-                return Ok(PlanRequest::Ready(plan));
+                return self.review_policy_preview(plan);
             }
             if revisions == MAX_STANDARDS_REVISION_TURNS {
                 // The touch set kept activating unseen policy past the
@@ -244,13 +262,13 @@ impl MissionEngine {
         let text = self.orch_turn(&message).await?;
         if let Some(plan) = runner::parse_report::<Plan>(&text) {
             self.pending_research = extract_research(&text);
-            return Ok(PlanRequest::Ready(plan));
+            return self.review_policy_preview(plan);
         }
         let retry = self.orch_turn(JSON_RETRY_MSG).await?;
         match runner::parse_report::<Plan>(&retry) {
             Some(plan) => {
                 self.pending_research = extract_research(&retry);
-                Ok(PlanRequest::Ready(plan))
+                self.review_policy_preview(plan)
             }
             None => Ok(PlanRequest::NotReady(if retry.trim().is_empty() {
                 text
@@ -471,6 +489,11 @@ fn plan_feature_count(plan: &Plan) -> usize {
 }
 
 pub(crate) fn validate_revised_plan_for_gate(mission: &Mission, plan: &Plan) -> Result<()> {
+    if plan.reviewer_independence != mission.reviewer_independence {
+        return Err(EngineError::Config(
+            "revised plan cannot change the approved reviewerIndependence policy".into(),
+        ));
+    }
     if plan.milestones.is_empty() {
         return Err(EngineError::InvalidState(
             "revised plan has no milestones".to_string(),
@@ -726,6 +749,41 @@ fn plan_schema() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reviewed_plan_identity_binds_work_permissions_and_reviewer_policy() {
+        let value = serde_json::json!({
+            "goal": "ship it", "validationContract": [], "milestones": []
+        });
+        let plan: Plan = serde_json::from_value(value.clone()).unwrap();
+        let identity = plan_identity(&plan);
+        assert_eq!(identity.len(), 64);
+        assert_eq!(identity, plan_identity(&plan.clone()));
+        for (field, changed) in [
+            ("goal", serde_json::json!("ship another thing")),
+            ("commandGrants", serde_json::json!(["cargo test"])),
+            ("touchSet", serde_json::json!(["crates/"])),
+            (
+                "reviewerIndependence",
+                serde_json::json!({"scrutiny": true, "functional": false}),
+            ),
+            (
+                "validationContract",
+                serde_json::json!([{
+                    "id": "a-1", "statement": "new requirement", "check": "agent-judgement"
+                }]),
+            ),
+        ] {
+            let mut changed_plan = value.clone();
+            changed_plan[field] = changed;
+            let changed_plan: Plan = serde_json::from_value(changed_plan).unwrap();
+            assert_ne!(
+                identity,
+                plan_identity(&changed_plan),
+                "identity must bind {field}"
+            );
+        }
+    }
+
     fn assertion(id: &str) -> Assertion {
         Assertion {
             id: id.to_string(),
@@ -792,6 +850,7 @@ mod tests {
             // key: the pin is engine-authored at approval (KRZ-342 D-E), and
             // `None` keeps the serialized shape (and this test) unchanged.
             standards_manifest: None,
+            reviewer_independence: None,
         };
         let value = serde_json::to_value(&plan).unwrap();
         let schema = plan_schema();

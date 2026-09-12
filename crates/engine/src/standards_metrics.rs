@@ -463,6 +463,7 @@ mod tests {
             command_grants: Vec::new(),
             touch_set: Vec::new(),
             standards_manifest: Some(Box::new(pin.clone())),
+            reviewer_independence: None,
         };
         let mut events = vec![
             event(

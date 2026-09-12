@@ -53,11 +53,9 @@ impl PlanningHost for HostedPlanning {
         Box::pin(async move { self.0.try_approve_pending(id).await.map_err(plain) })
     }
 
-    /// The atomic identity-checked approve (follow-up review M-13): ONE
-    /// acquisition of the host's registry lock reads the parked plan's
-    /// identity, compares it with the clicked card's, and takes the plan, so
-    /// a concurrent `/kranz plan` or web-UI approve cannot slip a
-    /// different plan in between. Overrides the trait's racy default.
+    /// The shared identity-checked approval holds the engine and pending-plan
+    /// locks through commit, so a concurrent re-plan cannot replace the plan
+    /// or be overwritten by a failed approval. Overrides the trait's default.
     fn approve_pending_if<'a>(
         &'a self,
         id: &'a str,
@@ -66,11 +64,7 @@ impl PlanningHost for HostedPlanning {
         Box::pin(async move {
             let outcome = self
                 .0
-                .try_approve_pending_matching(
-                    id,
-                    expected_identity,
-                    &kranz_slack::format::plan_identity,
-                )
+                .try_approve_pending_matching(id, expected_identity)
                 .await
                 .map_err(plain)?;
             Ok(match outcome {
@@ -92,7 +86,7 @@ impl PlanningHost for HostedPlanning {
                 .0
                 .pending_plan(id)
                 .as_ref()
-                .map(kranz_slack::format::plan_identity))
+                .map(kranz_engine::planning::plan_identity))
         })
     }
 
