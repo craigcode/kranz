@@ -176,6 +176,7 @@ export interface Plan {
   consideredAlternatives?: ConsideredAlternatives;
   touchSet?: string[];
   standardsManifest?: StandardsPin;
+  reviewerIndependence?: { scrutiny: boolean; functional: boolean };
 }
 
 export interface PinnedRule {
@@ -508,7 +509,7 @@ export interface CostEstimate {
 
 /** POST /api/missions/:id/planning/request-plan response. */
 export type PlanRequestResponse =
-  | { ready: true; plan: Plan; estimate: CostEstimate }
+  | { ready: true; plan: Plan; planIdentity: string; estimate: CostEstimate }
   | { ready: false; reply: string };
 
 // ---------------------------------------------------------------------------

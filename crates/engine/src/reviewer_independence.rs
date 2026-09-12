@@ -2,7 +2,149 @@
 
 use crate::config;
 use crate::error::{EngineError, Result};
-use crate::types::{BackendKind, MissionConfig, MissionState, Plan, ReviewerIndependence, Role};
+use crate::events::{Event, EventKind};
+use crate::types::{
+    BackendKind, MissionConfig, MissionState, Plan, ReviewerIndependence, Role, RunResult,
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompletionBlocked {
+    pub milestone_id: String,
+    pub detail: String,
+}
+
+/// Closing work is a policy decision even when the model calls it a skip.
+/// Use the latest validation round and its actual successful runs, never a
+/// completion status or the pre-dispatch independence decision as evidence.
+/// The event order binds the review to the milestone's latest recorded work;
+/// new work, changed review context or an integrity failure needs a fresh round.
+/// Logs without an approval-pinned policy retain their original behavior.
+pub fn check_completion(
+    state: &MissionState,
+    events: &[Event],
+    milestone_id: Option<&str>,
+) -> std::result::Result<(), CompletionBlocked> {
+    let Some(policy) = state
+        .mission
+        .reviewer_independence
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(());
+    };
+    for milestone in state
+        .mission
+        .milestones
+        .iter()
+        .filter(|m| milestone_id.is_none_or(|id| id == m.id))
+    {
+        let blocked = |detail| CompletionBlocked {
+            milestone_id: milestone.id.clone(),
+            detail,
+        };
+        let round = events
+            .iter()
+            .rposition(|event| {
+                matches!(&event.kind,
+                    EventKind::MilestoneValidating { milestone_id } if milestone_id == &milestone.id
+                )
+            })
+            .ok_or_else(|| blocked("no recorded validation round for this milestone".into()))?;
+        let belongs = |id: &str| milestone.features.iter().any(|feature| feature.id == id);
+        let round_events = &events[round + 1..];
+        if round_events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::PlanRevised { .. }))
+        {
+            // Revisions preserve completed-prefix work. Reconstruct only on
+            // this uncommon path to distinguish a pending-only revision from
+            // a change to the goal, contract or scope the reviewer judged.
+            let reviewed = crate::reducer::fold(&events[..=round])
+                .map_err(|error| blocked(format!("cannot reconstruct reviewed plan: {error}")))?;
+            let context = |state: &MissionState| {
+                serde_json::to_value((
+                    &state.mission.goal,
+                    &state.mission.validation_contract,
+                    &state.mission.command_grants,
+                    &state.mission.touch_set,
+                    state
+                        .mission
+                        .milestones
+                        .iter()
+                        .find(|m| m.id == milestone.id)
+                        .map(|m| {
+                            (
+                                &m.title,
+                                m.features
+                                    .iter()
+                                    .map(|f| (&f.title, &f.spec, &f.validation_criteria))
+                                    .collect::<Vec<_>>(),
+                            )
+                        }),
+                ))
+                .map_err(|error| blocked(format!("cannot compare reviewed plan: {error}")))
+            };
+            if context(&reviewed)? != context(state)? {
+                return Err(blocked(
+                    "plan revision changed the reviewed milestone context".into(),
+                ));
+            }
+        }
+        if round_events.iter().any(|event| match &event.kind {
+            EventKind::FeatureStarted { feature_id }
+            | EventKind::FeatureProgress { feature_id, .. }
+            | EventKind::FeatureCompleted { feature_id, .. }
+            | EventKind::FeatureFailed { feature_id, .. } => belongs(feature_id),
+            EventKind::WorkerSpawned {
+                role: Role::Worker,
+                feature_id,
+                ..
+            } => feature_id.as_deref().is_none_or(belongs),
+            EventKind::FixFeatureCreated { milestone_id, .. }
+            | EventKind::MilestoneStarted { milestone_id, .. }
+            | EventKind::ValidatorTamper { milestone_id, .. } => milestone_id == &milestone.id,
+            _ => false,
+        }) {
+            return Err(blocked(
+                "review evidence is stale after work, plan or checkout-integrity changes".into(),
+            ));
+        }
+        for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+            if !policy.requires(role) {
+                continue;
+            }
+            // A failed later attempt must not borrow a previous PASS. The
+            // runner records Pass only for a parsed report and clean exit;
+            // tamper is checked separately above because it lands afterward.
+            let run_id = round_events
+                .iter()
+                .rev()
+                .find_map(|event| match &event.kind {
+                    EventKind::WorkerSpawned {
+                        run_id,
+                        role: run_role,
+                        milestone_id: Some(id),
+                        ..
+                    } if *run_role == role && id == &milestone.id => Some(run_id),
+                    _ => None,
+                });
+            let run = run_id
+                .and_then(|id| state.runs.get(id))
+                .filter(|run| run.result == Some(RunResult::Pass))
+                .ok_or_else(|| {
+                    blocked(format!(
+                        "{role:?} has no successful review of the latest milestone work"
+                    ))
+                })?;
+            let backend = run.backend.ok_or_else(|| {
+                blocked(format!(
+                    "{role:?} review has no recorded backend provenance"
+                ))
+            })?;
+            check_dispatch(state, role, backend, &run.model).map_err(blocked)?;
+        }
+    }
+    Ok(())
+}
 
 /// A deliberately conservative catalog. A CLI, billing lane, version, effort
 /// or model alias alone is not a new family. Unmapped/automatic selections are

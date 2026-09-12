@@ -76,6 +76,16 @@ describe('getJson / postJson non-JSON guard', () => {
 
     await expect(postJson('/api/missions', { goal: 'x' })).resolves.toEqual({ id: 'm-1' });
   });
+
+  it('binds approve-pending to the reviewed identity while leaving start separate', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ branch: 'approved', started: false }));
+    await api.approvePending('m-reviewed', 'the-reviewed-plan-sha256');
+    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe('/api/missions/m-reviewed/approve-pending');
+    expect(JSON.parse(init!.body as string)).toEqual({
+      planIdentity: 'the-reviewed-plan-sha256', start: false,
+    });
+  });
 });
 
 describe('401 token gate', () => {

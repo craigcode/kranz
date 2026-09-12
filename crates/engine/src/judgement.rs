@@ -286,6 +286,16 @@ impl MissionEngine {
 
     /// Fallible body of [`Self::capture_lesson`].
     async fn try_capture_lesson(&mut self) -> Result<Option<Vec<PathBuf>>> {
+        let Some(body) = self.prepare_lesson().await? else {
+            return Ok(None);
+        };
+        self.write_prepared_lesson(&body).map(Some)
+    }
+
+    /// Prepare the lesson without changing the checkout, so finalization
+    /// can verify review identity after its last model turn and before any
+    /// intentional metadata writes.
+    pub(crate) async fn prepare_lesson(&mut self) -> Result<Option<String>> {
         let message = format!(
             "MISSION GOAL:\n{}\n\nThe mission has just completed. Distill at most ONE \
              reusable lesson that a FUTURE mission in THIS repository would need — as a \
@@ -298,18 +308,16 @@ impl MissionEngine {
         if trimmed.is_empty() || is_none_reply(trimmed) {
             return Ok(None);
         }
+        Ok(Some(normalize_lesson_body(trimmed)))
+    }
 
+    pub(crate) fn write_prepared_lesson(&self, body: &str) -> Result<Vec<PathBuf>> {
         // Written under active_paths (the integration worktree in worktree
         // mode) because these files are folded into write_mission_report's
         // commit, which commits via active_repo — see that method's doc note.
         let active_paths = self.active_paths();
         let mission_id = self.state.mission.id.clone();
-        let body = normalize_lesson_body(trimmed);
-        Ok(Some(lessons::write_lesson(
-            &active_paths.repo_root,
-            &mission_id,
-            &body,
-        )?))
+        lessons::write_lesson(&active_paths.repo_root, &mission_id, body)
     }
 
     // -----------------------------------------------------------------------

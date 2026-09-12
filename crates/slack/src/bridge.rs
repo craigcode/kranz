@@ -2709,11 +2709,15 @@ pub(crate) fn scaffold_ticket(repo_root: &Path, title: &str) -> Result<()> {
     use kranz_engine::ticket::Ticket;
     let slug = slugify(title);
     let dir = Ticket::tickets_dir(repo_root);
-    std::fs::create_dir_all(&dir).context("creating tickets dir")?;
     let path = dir.join(format!("{slug}.md"));
-    if path.exists() {
-        tracing::info!(slug = %slug, "ticket already exists; not overwriting");
-        return Ok(());
+    match kranz_engine::paths::open_read_nofollow(&path) {
+        Ok(_) => {
+            tracing::info!(slug = %slug, "ticket already exists; not overwriting");
+            return Ok(());
+        }
+        Err(kranz_engine::error::EngineError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let body = format!(
         "---\ntitle: {title}\npriority: 2\nschedule: once\n---\n\n\
@@ -2722,7 +2726,8 @@ pub(crate) fn scaffold_ticket(repo_root: &Path, title: &str) -> Result<()> {
          ## Scoping answers\n- Test command: \n- Conventions: \n- Out of scope: \n\n\
          ## Acceptance hints\n- \n",
     );
-    std::fs::write(&path, body).with_context(|| format!("writing ticket {}", path.display()))?;
+    Ticket::create_markdown(repo_root, &slug, &body)
+        .with_context(|| format!("writing ticket {}", path.display()))?;
     tracing::info!(slug = %slug, "ticket scaffolded from Slack slash command");
     Ok(())
 }

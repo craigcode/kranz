@@ -27,6 +27,294 @@ fn layer(dir: &tempfile::TempDir, name: &str, body: serde_json::Value) -> PathBu
     path
 }
 
+fn dotted_patch(key: &str, value: serde_json::Value) -> serde_json::Value {
+    key.split('.')
+        .rev()
+        .fold(value, |value, segment| json!({segment: value}))
+}
+
+/// Exercise both public policy checks against an independent matrix. The
+/// child cases pin subtree matching, including every normalized role.
+#[test]
+fn sensitive_keys_and_children_preserve_project_operator_and_inbox_policies() {
+    let base = serde_json::to_value(MissionConfig::default()).unwrap();
+    let source_file = std::path::Path::new("project.json");
+    let mut cases = vec![
+        ("skipScrutiny".to_owned(), true, false),
+        ("skipFunctional".to_owned(), true, false),
+        ("denyPatterns".to_owned(), true, false),
+        ("dangerouslyAllowAll".to_owned(), true, false),
+        ("allowValidatorCommands".to_owned(), true, false),
+        ("validatorAllowUncontainedDegrade".to_owned(), true, false),
+        // Existing exception: project files cannot relax this floor, while
+        // either runtime source may tune it. Consolidation must not widen it.
+        ("allowBelowDefaultWorkerModel".to_owned(), true, true),
+    ];
+    for key in [
+        "workerIsolation",
+        "claudeBinary",
+        "packDir",
+        "contractEnvPassthrough",
+        "localBackendAllowedHosts",
+        "slack",
+        "hookStatus",
+        "workspace.remote",
+    ] {
+        cases.push((key.to_owned(), false, false));
+    }
+    for role in [
+        "orchestrator",
+        "worker",
+        "validatorScrutiny",
+        "validatorFunctional",
+    ] {
+        for leaf in [
+            "tools",
+            "acpCommand",
+            "acpArgs",
+            "baseUrl",
+            "sandbox.extraWrite",
+            "sandbox.egress",
+            "sandbox.provider",
+            "sandbox.image",
+        ] {
+            cases.push((format!("{role}.{leaf}"), false, false));
+        }
+    }
+    for (key, operator_allowed, inbox_allowed) in cases {
+        for suffix in ["", ".child"] {
+            let dotted = format!("{key}{suffix}");
+            let patch = dotted_patch(&dotted, json!(null));
+            assert!(
+                config::check_project_layer_keys(&patch, &base, source_file).is_err(),
+                "project: {dotted}"
+            );
+            for (source, allowed) in [
+                (PatchSource::Operator, operator_allowed),
+                (PatchSource::Inbox, inbox_allowed),
+            ] {
+                assert_eq!(
+                    config::check_runtime_patch(&patch, &base, source).is_ok(),
+                    allowed,
+                    "{source:?}: {dotted}"
+                );
+            }
+        }
+        let adjacent = dotted_patch(&format!("{key}Extra"), json!(null));
+        config::check_project_layer_keys(&adjacent, &base, source_file).unwrap_or_else(|error| {
+            panic!("a shared name prefix is not a child of {key}: {error}")
+        });
+        assert!(config::check_runtime_patch(&adjacent, &base, PatchSource::Operator).is_err());
+    }
+}
+
+#[test]
+fn directional_trust_policies_preserve_all_role_floors_and_reviewer_runtime_refusal() {
+    let source_file = std::path::Path::new("project.json");
+    for role in [
+        "orchestrator",
+        "worker",
+        "validatorScrutiny",
+        "validatorFunctional",
+    ] {
+        let key = format!("{role}.sandbox.enforce");
+        let base = dotted_patch(&key, json!("fs"));
+        for (value, project_allowed, inbox_allowed) in [
+            (json!("fs+net"), true, true),
+            (json!("fs"), true, true),
+            (json!("off"), false, false),
+        ] {
+            let patch = dotted_patch(&key, value);
+            assert_eq!(
+                config::check_project_layer_keys(&patch, &base, source_file).is_ok(),
+                project_allowed,
+                "project: {key}"
+            );
+            assert_eq!(
+                config::check_runtime_patch(&patch, &base, PatchSource::Inbox).is_ok(),
+                inbox_allowed,
+                "inbox: {key}"
+            );
+            config::check_runtime_patch(&patch, &base, PatchSource::Operator).unwrap();
+        }
+        let child = dotted_patch(&format!("{key}.child"), json!(true));
+        for source in [PatchSource::Operator, PatchSource::Inbox] {
+            assert!(
+                config::check_runtime_patch(&child, &base, source).is_err(),
+                "{source:?}: {key}.child"
+            );
+        }
+    }
+    let base = json!({"reviewerIndependence": {"scrutiny": true, "functional": true}});
+    for key in [
+        "reviewerIndependence",
+        "reviewerIndependence.scrutiny",
+        "reviewerIndependence.functional",
+        "reviewerIndependence.scrutiny.child",
+    ] {
+        let patch = dotted_patch(key, json!(null));
+        assert!(
+            config::check_project_layer_keys(&patch, &base, source_file).is_err(),
+            "project: {key}"
+        );
+        for source in [PatchSource::Operator, PatchSource::Inbox] {
+            assert!(
+                config::check_runtime_patch(&patch, &base, source).is_err(),
+                "{source:?}: {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn project_role_sequences_cannot_replace_guarded_fields() {
+    let role_sequence = json!([
+        "sonnet",
+        "high",
+        null,
+        null,
+        ["Bash"],
+        null,
+        null,
+        null,
+        [],
+        null,
+        null,
+        ["off", "process", null, [], []]
+    ]);
+    let role: kranz_engine::types::RoleConfig = serde_json::from_value(role_sequence.clone())
+        .expect("fixture: serde accepts positional role structs");
+    assert_eq!(role.tools, ["Bash"]);
+    assert_eq!(role.sandbox.enforce, SandboxEnforce::Off);
+
+    let dir = tempfile::tempdir().unwrap();
+    let global = layer(
+        &dir,
+        "global.json",
+        json!({"worker": {"sandbox": {"enforce": "fs+net"}}}),
+    );
+    let project = layer(&dir, "project.json", json!({"worker": role_sequence}));
+    let error =
+        config::load_layers_with_roles(&[(global, Layer::Global), (project, Layer::Project)])
+            .expect_err("a positional role replacement must not bypass protected fields");
+    assert!(error.to_string().contains("worker"));
+
+    let mut inherited_sequence = role_sequence;
+    inherited_sequence[11][0] = json!("fs+net");
+    let global = layer(&dir, "global.json", json!({"worker": inherited_sequence}));
+    let project = layer(
+        &dir,
+        "project.json",
+        json!({"worker": {"model": "sonnet", "reasoningEffort": "high"}}),
+    );
+    let error =
+        config::load_layers_with_roles(&[(global, Layer::Global), (project, Layer::Project)])
+            .expect_err("an object patch must not erase the sandbox in a positional base role");
+    assert!(error
+        .to_string()
+        .contains("non-object inherited field \"worker\""));
+}
+
+#[test]
+fn project_objects_cannot_erase_a_positional_reviewer_floor() {
+    let sequence = json!([true, true]);
+    let policy: kranz_engine::types::ReviewerIndependence =
+        serde_json::from_value(sequence.clone())
+            .expect("fixture: serde accepts positional reviewer policy structs");
+    assert!(policy.scrutiny && policy.functional);
+    let dir = tempfile::tempdir().unwrap();
+    let global = layer(
+        &dir,
+        "global.json",
+        json!({"reviewerIndependence": sequence}),
+    );
+    let project = layer(
+        &dir,
+        "project.json",
+        json!({"reviewerIndependence": {"scrutiny": false, "functional": false}}),
+    );
+    let error =
+        config::load_layers_with_roles(&[(global, Layer::Global), (project, Layer::Project)])
+            .expect_err(
+                "a positional base policy must not hide the operator's floor from project checks",
+            );
+    assert!(error
+        .to_string()
+        .contains("non-object inherited field \"reviewerIndependence\""));
+}
+
+#[test]
+fn project_trust_checks_refuse_nonobject_roots_and_protected_containers() {
+    let base = serde_json::to_value(MissionConfig::default()).unwrap();
+    let source_file = std::path::Path::new("project.json");
+    for value in [json!([]), json!(null), json!("replacement")] {
+        assert!(config::check_project_layer_keys(&value, &base, source_file).is_err());
+        for key in [
+            "orchestrator",
+            "worker",
+            "validatorScrutiny",
+            "validatorFunctional",
+            "orchestrator.sandbox",
+            "worker.sandbox",
+            "validatorScrutiny.sandbox",
+            "validatorFunctional.sandbox",
+            "workspace",
+            "reviewerIndependence",
+        ] {
+            let patch = dotted_patch(key, value.clone());
+            let error = config::check_project_layer_keys(&patch, &base, source_file).unwrap_err();
+            assert!(error.to_string().contains(key), "{key}: {error}");
+
+            let inherited = dotted_patch(key, value.clone());
+            let patch = dotted_patch(key, json!({}));
+            let error =
+                config::check_project_layer_keys(&patch, &inherited, source_file).unwrap_err();
+            assert!(
+                error.to_string().contains("non-object inherited field"),
+                "{key}: {error}"
+            );
+        }
+    }
+    // Leaf lists still follow their declared policy; this shape check must
+    // not ban ordinary arrays merely because a JSON patch contains one.
+    config::check_project_layer_keys(
+        &json!({"routing": {"taskClassRules": []}}),
+        &base,
+        source_file,
+    )
+    .unwrap();
+    config::check_runtime_patch(
+        &json!({"allowValidatorCommands": []}),
+        &base,
+        PatchSource::Operator,
+    )
+    .unwrap();
+}
+
+#[test]
+fn project_sandbox_floor_matches_serde_enum_representations() {
+    let inherited = json!({"fs+net": null});
+    let enforce: SandboxEnforce = serde_json::from_value(inherited.clone())
+        .expect("fixture: serde accepts a map for a unit enum variant");
+    assert_eq!(enforce, SandboxEnforce::FsNet);
+    let dir = tempfile::tempdir().unwrap();
+    let global = layer(
+        &dir,
+        "global.json",
+        json!({"worker": {"sandbox": {"enforce": inherited}}}),
+    );
+    let project = layer(
+        &dir,
+        "project.json",
+        json!({"worker": {"sandbox": {"enforce": "off"}}}),
+    );
+    assert!(
+        config::load_layers_with_roles(&[(global, Layer::Global), (project, Layer::Project)])
+            .is_err(),
+        "a map-encoded inherited sandbox mode must retain the same floor as its string form"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // H1: operator-only keys, and which layer may set them
 // ---------------------------------------------------------------------------
@@ -120,6 +408,61 @@ fn project_layer_may_raise_sandbox_enforcement_but_never_lower_it() {
         config::load_layers_with_roles(&[(global, Layer::Global), (off, Layer::Project)]).is_err(),
         "a repo must not turn the operator's sandbox off"
     );
+}
+
+#[test]
+fn project_layer_reviewer_independence_may_strengthen_but_never_weaken_operator_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    for role in ["scrutiny", "functional"] {
+        let global = layer(
+            &dir,
+            "global.json",
+            json!({"reviewerIndependence": {role: true}}),
+        );
+        for policy in [json!({role: false}), json!(null), json!([])] {
+            let project = layer(
+                &dir,
+                "project.json",
+                json!({"reviewerIndependence": policy}),
+            );
+            let error = config::load_layers_with_roles(&[
+                (global.clone(), Layer::Global),
+                (project.clone(), Layer::Project),
+            ])
+            .unwrap_err()
+            .to_string();
+            let field = if policy.is_object() {
+                format!("reviewerIndependence.{role}")
+            } else {
+                // Malformed containers fail at the shape boundary before
+                // their individual reviewer flags can be compared.
+                "reviewerIndependence".to_string()
+            };
+            assert!(error.contains(&field), "{error}");
+            assert!(error.contains(&project.display().to_string()), "{error}");
+        }
+        for policy in [json!({}), json!({"scrutiny": true, "functional": true})] {
+            let project = layer(
+                &dir,
+                "project.json",
+                json!({"reviewerIndependence": policy}),
+            );
+            let cfg = config::load_layers_with_roles(&[
+                (global.clone(), Layer::Global),
+                (project, Layer::Project),
+            ])
+            .unwrap();
+            let actual = serde_json::to_value(cfg.reviewer_independence).unwrap();
+            assert_eq!(actual[role], true);
+        }
+    }
+    let project = layer(
+        &dir,
+        "project.json",
+        json!({"reviewerIndependence": {"scrutiny": true, "functional": true}}),
+    );
+    let cfg = config::load_layers_with_roles(&[(project, Layer::Project)]).unwrap();
+    assert!(cfg.reviewer_independence.scrutiny && cfg.reviewer_independence.functional);
 }
 
 #[test]

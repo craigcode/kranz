@@ -145,10 +145,10 @@ belongs at the interpolation, which is what `bridge::esc` is for.
 the entities would show literally. That is why `/kranz ticket show`'s header
 (slug then title) is deliberately unescaped while its body is escaped.
 
-Approve buttons carry `<mission-id>:<plan-identity>` (a short sha256 of the
+Approve buttons carry `<mission-id>:<plan-identity>` (the full sha256 of the
 plan's canonical JSON). `approve_flow` commits through
 `PlanningHost::approve_pending_if`, which compares the clicked card's identity
-against the parked plan and takes the plan under ONE host lock acquisition.
+against the parked plan and commits while holding the engine and pending-plan locks.
 The check and the commit are not separable, so a concurrent `/kranz plan` or
 web-UI approve cannot slip a different plan in between (M-13). A mismatch is
 refused naming both plans; a card that carries no identity at all (one posted

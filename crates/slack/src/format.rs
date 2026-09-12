@@ -10,7 +10,6 @@
 //! `actions` block carrying `button` elements. Button `action_id`s are the
 //! contract the inbound router keys on (see [`crate::inbound`]).
 
-use kranz_engine::types::Plan;
 use serde_json::{json, Value};
 
 /// `action_id` of the "approve & queue" button. The inbound router matches this
@@ -442,27 +441,8 @@ const MAX_FIELD: usize = 2500;
 /// Block Kit `header` text objects are plain_text capped at 150 chars.
 const MAX_HEADER: usize = 150;
 
-/// Characters of the plan digest carried in an approve button's value.
-/// 16 hex chars is 64 bits: far past accidental collision for the handful of
-/// plans one mission ever produces, and short enough to leave the whole
-/// button value well inside Slack's 2,000-byte `value` cap.
-const PLAN_IDENTITY_LEN: usize = 16;
-
-/// The identity of one plan: a short sha256 over its canonical JSON.
-///
-/// Plans carry no revision counter, so their CONTENT is their identity. This
-/// is what an Approve button binds to (M2): the card commits the plan it
-/// displayed, not whatever is parked host-side by the time someone scrolls
-/// back and clicks. Re-plan the same mission and the identity changes, which
-/// is exactly the case a stale card must fail on.
-pub fn plan_identity(plan: &Plan) -> String {
-    // A `Plan` is plain structs, strings and vectors, so serialization is
-    // deterministic and cannot fail; the fallback would only ever match
-    // another unserializable plan.
-    let json = serde_json::to_string(plan).unwrap_or_default();
-    let digest = kranz_engine::standards_waiver::sha256_hex(json.as_bytes());
-    digest[..PLAN_IDENTITY_LEN].to_string()
-}
+/// Shared content identity binding an approval card to its reviewed plan.
+pub use kranz_engine::planning::plan_identity;
 
 /// The `value` an approve/start button carries: `<mission-id>:<identity>`.
 /// The same shape the grant, revision and question buttons already use, so a
@@ -2831,7 +2811,7 @@ mod tests {
         };
         let first = plan_identity(&plan);
         assert_eq!(first, plan_identity(&plan.clone()), "stable for one plan");
-        assert_eq!(first.len(), PLAN_IDENTITY_LEN);
+        assert_eq!(first.len(), 64);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
 
         let mut replanned = plan.clone();

@@ -50,9 +50,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   [config composition](../config-composition.md#reviewer-independence-reviewerindependence).
 - **base_sha** — the base branch tip pinned at approval. All contract/final-gate
   diffs are taken against it; it is never re-resolved later.
-- **Plan identity** — a short sha256 over a plan's canonical JSON. A Slack
-  approve button carries `<mission-id>:<plan-identity>`, so a stale card
-  cannot commit a plan nobody reviewed. See
+- **Plan identity** — the full sha256 over a plan's canonical JSON, shared by
+  dashboard previews and Slack cards. Approval submits the displayed identity,
+  so a stale preview cannot commit a replacement plan. See
   [slack-commands](surfaces/slack-commands.md).
 - **Event log** — `events.jsonl`, the append-only single-writer source of truth.
   `fold(events)` == `MissionState`; `state.json` is only a cache. Every line a

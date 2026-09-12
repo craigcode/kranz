@@ -264,7 +264,6 @@ impl MissionPaths {
 /// [`MissionPaths::open_ticket_file_read_nofollow`]). `NotFound` passes
 /// through as `io` (callers keep missing-file handling); every other
 /// failure maps to the mission-refusal error.
-#[cfg(unix)]
 fn open_file_nofollow_under<P: AsRef<Path>>(
     dir: &Dir,
     name: P,
@@ -274,7 +273,14 @@ fn open_file_nofollow_under<P: AsRef<Path>>(
     use cap_primitives::fs::FollowSymlinks;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    dir.open_with(name, &options)
+    // Opening a FIFO for reading would block before metadata can reject it.
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OpenOptionsSyncExt as _;
+        options.nonblock(true);
+    }
+    let file = dir
+        .open_with(name, &options)
         .map(|file| file.into_std())
         .map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
@@ -282,7 +288,50 @@ fn open_file_nofollow_under<P: AsRef<Path>>(
             } else {
                 unsafe_mission_dir_path(display_path)
             }
-        })
+        })?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(unsafe_mission_dir_path(display_path));
+    }
+    Ok(file)
+}
+
+/// Read one regular file beneath an already-pinned directory. The name must
+/// be a single component; nested callers must pin each directory separately.
+pub fn read_regular_file_under(dir: &Dir, name: &Path, max_bytes: u64) -> Result<String> {
+    let mut components = name.components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(unsafe_mission_dir_path(name));
+    }
+    Ok(read_regular_file_bounded(
+        open_file_nofollow_under(dir, name, name)?,
+        max_bytes,
+    )?)
+}
+
+/// Bound both the initial size and bytes actually read, including growth
+/// after opening. Oversized artifacts fail instead of returning partial text.
+pub fn read_regular_file_bounded(file: std::fs::File, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let too_large = || std::io::Error::new(ErrorKind::FileTooLarge, "file exceeds read limit");
+    if metadata.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
 }
 
 /// One [`MissionPaths::open_mission_dir_nofollow`] step: refuse a `name` that
@@ -437,8 +486,7 @@ pub(crate) fn open_parent_nofollow(path: &Path) -> Result<(Dir, OsString)> {
 /// `/var`, which is itself a system symlink) keep the weaker
 /// canonicalize-then-walk tier: those regions are outside the mission
 /// threat model, and canonicalizing them is the only way macOS tempdirs
-/// resolve at all. Off-unix there is no `O_NOFOLLOW`; fall back to
-/// check-then-open (Windows symlink creation needs privileges).
+/// resolve at all. Off-unix the capability API supplies the no-follow open.
 pub fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -484,8 +532,8 @@ pub fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
     }
     #[cfg(not(unix))]
     {
-        ensure_absent_or_regular_file(path)?;
-        Ok(std::fs::File::open(path)?)
+        let (parent, name) = open_parent_nofollow(path)?;
+        open_file_nofollow_under(&parent, name, path)
     }
 }
 

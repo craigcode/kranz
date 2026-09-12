@@ -43,6 +43,14 @@ its proving test.
    lacking the prefix or a recorded exception (the exceptions are F2/F5
    below).
 
+Sensitive keys declare project and runtime permissions together in
+`CONFIG_TRUST_RULES`. When composing a project layer, containers for protected
+fields must be JSON objects in both the inherited config and the project patch;
+positional struct arrays are refused even when serde could deserialize them.
+Leaf lists retain their declared policies. Sandbox enforcement comparisons use
+the deserialized `SandboxEnforce`, so every supported enum representation receives
+the same safety rank. These boundaries are covered by `config_trust_test`.
+
 ## Surface inventory
 
 ### Reviewer independence (`reviewerIndependence`)
@@ -63,6 +71,10 @@ repairs, failed attempts, parallel workers and discarded pool candidates. This
 conservative scope also covers earlier milestones' influence. A mixed-family
 worker pool may therefore require a third family for review.
 
+Project configuration may enable additional reviewer requirements but cannot
+disable a role required by the operator's global configuration. Omitted roles
+inherit the earlier layer's requirements.
+
 The engine includes the policy in the plan preview and pins it in `plan.json`
 and `plan.approved`. Runtime patches cannot change it; plan revisions must retain
 it. The separate mission pin remains authoritative after config changes and
@@ -70,6 +82,16 @@ restart. A skipped required reviewer, unknown worker provenance or a same-family
 resolved reviewer blocks the milestone with a durable explanation, before the
 reviewer launches. Fix the pairing and rerun validation, or approve a new mission
 with a different policy. There is no automatic waiver.
+
+Milestone closure (including a model-selected skip) and final completion also
+require successful reviewer runs from the latest validation round. New recorded
+work, a revision changing the reviewed context, or a checkout-integrity failure
+invalidates that evidence. Revisions limited to pending milestones preserve the
+completed prefix's review when the global goal, contract and scope stay unchanged.
+Replaying an older `milestone.completed` event cannot substitute for review.
+Final gates start from a clean checkpoint and must preserve its checkout identity;
+a gate that edits or commits deliverable work blocks and requires fresh review,
+including after resume.
 
 Every new `worker.spawned` event records the **resolved** backend and model.
 The check runs after backend discovery/fallback and again for retry and local

@@ -5,7 +5,7 @@
 // frames append to a capped ring buffer used by the log/conversation views.
 
 import { create } from 'zustand';
-import { api, httpOrigin, isNotHosted } from './api';
+import { api, ApiError, httpOrigin, isNotHosted } from './api';
 import { repoIdFromHash } from './routes';
 import { MissionSocket } from './ws';
 import type {
@@ -49,7 +49,7 @@ export interface PlanningSlice {
   /** 409 "not hosted": this mission is being planned from a terminal. */
   notHosted: boolean;
   /** request-plan came back ready:true — the PlanReview panel takes over. */
-  review: { plan: Plan; estimate: CostEstimate } | null;
+  review: { plan: Plan; planIdentity: string; estimate: CostEstimate } | null;
   /** True while POST approve-pending is in flight. */
   approving: boolean;
   /** Branch returned by approve; consent #2 (start) is still pending. */
@@ -581,7 +581,8 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
             patchPlanning({
               busy: null,
               busySince: null,
-              review: { plan: res.plan, estimate: res.estimate },
+              review: { plan: res.plan, planIdentity: res.planIdentity, estimate: res.estimate },
+              approvedBranch: null,
             });
             return;
           }
@@ -601,16 +602,27 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       const id = get().missionId;
       const review = get().planning.review;
       if (id === null || review === null || get().planning.approving) return;
+      if (!review.planIdentity) {
+        patchPlanning({
+          review: null,
+          approvedBranch: null,
+          error: 'Plan identity is missing. Request the plan again and review it before approving.',
+        });
+        return;
+      }
       patchPlanning({ error: null, approving: true });
       const generation = repoGeneration;
       api
-        .approvePending(id)
+        .approvePending(id, review.planIdentity)
         .then(({ branch }) => {
           if (repoGeneration !== generation || get().missionId !== id) return;
           patchPlanning({ approving: false, approvedBranch: branch });
         })
         .catch((err: unknown) => {
           if (repoGeneration !== generation || get().missionId !== id) return;
+          if (err instanceof ApiError && err.status === 409) {
+            patchPlanning({ review: null, approvedBranch: null });
+          }
           patchPlanning({ approving: false });
           failPlanning(err);
         });

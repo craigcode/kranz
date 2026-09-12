@@ -28,7 +28,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use cap_fs_ext::DirExt as _;
+use cap_std::{ambient_authority, fs::Dir};
+use kranz_engine::error::EngineError;
 use kranz_engine::ticket::Ticket;
+
+const MAX_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SPEC_ENTRIES: usize = 1024;
+const MAX_SPEC_DEPTH: usize = 32;
 
 /// The parts of an OpenSpec change that survive the crossing.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,14 +68,72 @@ report success.";
 /// OpenSpec change or is half-written, and guessing which would import an
 /// empty goal.
 pub fn read_change(dir: &Path, slug_override: Option<&str>) -> Result<OpenSpecChange> {
+    read_change_pinned(open_change_root(None, dir)?, dir, slug_override)
+}
+
+fn open_change_root(repo: Option<&Path>, dir: &Path) -> Result<Dir> {
+    if let Some(repo) = repo {
+        let absolute_dir = std::path::absolute(dir)?;
+        let canonical_repo = repo.canonicalize()?;
+        // Locate the trusted root by identity, not just spelling (/var and
+        // /private/var, or a checkout alias, may name the same repository).
+        // Canonicalization only locates that anchor; the untrusted suffix is
+        // always opened from the pinned repository, never its resolved path.
+        if let Some(anchor) = absolute_dir.ancestors().find(|ancestor| {
+            ancestor
+                .canonicalize()
+                .is_ok_and(|path| path == canonical_repo)
+        }) {
+            let relative = absolute_dir.strip_prefix(anchor)?;
+            let mut root = Dir::open_ambient_dir(&canonical_repo, ambient_authority())?;
+            for component in relative.components() {
+                let std::path::Component::Normal(name) = component else {
+                    bail!("import path must stay beneath its repository anchor");
+                };
+                root = root.open_dir_nofollow(name).with_context(|| {
+                    format!(
+                        "could not open change directory {} without following links",
+                        dir.display()
+                    )
+                })?;
+            }
+            return Ok(root);
+        }
+    }
+    // An explicitly selected external change has its own trusted parent.
+    // Repository-local imports instead pin every source ancestor above.
+    let parent = dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = dir
+        .file_name()
+        .context("change directory must have a name")?;
+    Dir::open_ambient_dir(parent, ambient_authority())?
+        .open_dir_nofollow(name)
+        .with_context(|| {
+            format!(
+                "could not open change directory {} without following links",
+                dir.display()
+            )
+        })
+}
+
+fn read_change_pinned(
+    root: Dir,
+    dir: &Path,
+    slug_override: Option<&str>,
+) -> Result<OpenSpecChange> {
+    let mut remaining = MAX_IMPORT_BYTES;
     let proposal_path = dir.join("proposal.md");
-    let proposal = std::fs::read_to_string(&proposal_path).with_context(|| {
-        format!(
-            "no OpenSpec proposal at {}; an OpenSpec change directory holds proposal.md \
+    let proposal =
+        read_text(&root, Path::new("proposal.md"), &mut remaining).with_context(|| {
+            format!(
+                "no OpenSpec proposal at {}; an OpenSpec change directory holds proposal.md \
              (plus optional design.md, specs/, tasks.md)",
-            proposal_path.display()
-        )
-    })?;
+                proposal_path.display()
+            )
+        })?;
 
     let dir_name = dir
         .file_name()
@@ -94,11 +159,11 @@ pub fn read_change(dir: &Path, slug_override: Option<&str>) -> Result<OpenSpecCh
         dir.display()
     ));
 
-    if let Some(design) = read_optional(&dir.join("design.md"))? {
+    if let Some(design) = read_optional(&root, Path::new("design.md"), &mut remaining)? {
         context.push_str(&format!("\n### Design notes (design.md)\n\n{design}\n"));
     }
 
-    for (path, spec) in read_specs(&dir.join("specs"))? {
+    for (path, spec) in read_specs(&root, &dir.join("specs"), &mut remaining)? {
         context.push_str(&format!(
             "\n### Requirements as intent ({})\n\n{spec}\n",
             path.display()
@@ -115,61 +180,100 @@ pub fn read_change(dir: &Path, slug_override: Option<&str>) -> Result<OpenSpecCh
 
 /// Import a change directory as `.kranz/tickets/<slug>.md`.
 ///
-/// Reuses [`Ticket::scaffold`], so slug validation and the refusal to
+/// Reuses [`Ticket::create_markdown`], so slug validation and the refusal to
 /// overwrite an existing ticket stay in one place: an operator who has
 /// already edited an imported ticket does not lose that work to a re-import.
 pub fn import_change(repo: &Path, dir: &Path, slug_override: Option<&str>) -> Result<PathBuf> {
-    let change = read_change(dir, slug_override)?;
-    let path = Ticket::scaffold(
-        repo,
-        &change.slug,
-        &change.title,
-        Some(&change.goal),
-        Some(&change.context),
-    )?;
-    let scaffolded = std::fs::read_to_string(&path)?;
-    let with_hints = scaffolded.replace(
-        "## Acceptance hints\n",
-        &format!("## Acceptance hints\n\n{ACCEPTANCE_PLACEHOLDER}\n"),
-    );
-    std::fs::write(&path, with_hints)?;
-    Ok(path)
+    let change = read_change_pinned(open_change_root(Some(repo), dir)?, dir, slug_override)?;
+    let mut body =
+        Ticket::ticket_template(&change.title, Some(&change.goal), Some(&change.context));
+    body.push_str(&format!("\n{ACCEPTANCE_PLACEHOLDER}\n"));
+    Ok(Ticket::create_markdown(repo, &change.slug, &body)?)
 }
 
-fn read_optional(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
+fn read_text(dir: &Dir, name: &Path, remaining: &mut u64) -> kranz_engine::error::Result<String> {
+    let text = kranz_engine::paths::read_regular_file_under(dir, name, *remaining)?;
+    *remaining -= text.len() as u64;
+    Ok(text)
+}
+
+fn read_optional(dir: &Dir, name: &Path, remaining: &mut u64) -> Result<Option<String>> {
+    match read_text(dir, name, remaining) {
         Ok(text) if text.trim().is_empty() => Ok(None),
         Ok(text) => Ok(Some(text.trim().to_string())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(anyhow::Error::from(error))
-            .with_context(|| format!("could not read {}", path.display())),
+            .with_context(|| format!("could not read {}", name.display())),
     }
 }
 
 /// Every `.md` under `specs/`, sorted, so an import is reproducible rather
 /// than ordered by whatever the filesystem returns.
-fn read_specs(specs_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
+fn read_specs(
+    root: &Dir,
+    specs_path: &Path,
+    remaining: &mut u64,
+) -> Result<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
-    collect_markdown(specs_dir, &mut found)?;
+    let specs = match root.open_dir_nofollow("specs") {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => return Err(error).context("could not open specs without following links"),
+    };
+    let mut remaining_entries = MAX_SPEC_ENTRIES;
+    collect_markdown(
+        &specs,
+        specs_path,
+        &mut found,
+        remaining,
+        &mut remaining_entries,
+        0,
+    )?;
     found.sort_by(|(left, _), (right, _)| left.cmp(right));
     Ok(found)
 }
 
-fn collect_markdown(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(anyhow::Error::from(error))
-                .with_context(|| format!("could not read {}", dir.display()));
+fn collect_markdown(
+    dir: &Dir,
+    display_path: &Path,
+    out: &mut Vec<(PathBuf, String)>,
+    remaining_bytes: &mut u64,
+    remaining_entries: &mut usize,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_SPEC_DEPTH {
+        bail!("OpenSpec specs exceed the directory depth limit ({MAX_SPEC_DEPTH})");
+    }
+    for entry in dir.entries()? {
+        let entry = entry?;
+        if *remaining_entries == 0 {
+            bail!("OpenSpec specs exceed the entry limit ({MAX_SPEC_ENTRIES})");
         }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_markdown(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            if let Some(text) = read_optional(&path)? {
+        *remaining_entries -= 1;
+        let name = PathBuf::from(entry.file_name());
+        let path = display_path.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            bail!("refusing linked OpenSpec input {}", path.display());
+        }
+        if kind.is_dir() {
+            let child = dir.open_dir_nofollow(&name).with_context(|| {
+                format!("could not open {} without following links", path.display())
+            })?;
+            collect_markdown(
+                &child,
+                &path,
+                out,
+                remaining_bytes,
+                remaining_entries,
+                depth + 1,
+            )?;
+        } else if name.extension().is_some_and(|ext| ext == "md") {
+            // A removed or unreadable entry is an incomplete import, not an
+            // optional file: propagate the error instead of silently omitting it.
+            let text = read_text(dir, &name, remaining_bytes)?;
+            if !text.trim().is_empty() {
+                let text = text.trim().to_owned();
                 out.push((path, text));
             }
         }
@@ -207,6 +311,145 @@ fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_refuse_links_at_every_untrusted_component() {
+        use std::os::unix::fs::symlink;
+        for component in [
+            "root",
+            "proposal.md",
+            "design.md",
+            "specs",
+            "specs/theme.md",
+            "specs/nested",
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = write_change(repo.path());
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("sentinel.md");
+            std::fs::write(&sentinel, "synthetic outside content").unwrap();
+            let selected = if component == "root" {
+                let linked = repo.path().join("linked-change");
+                symlink(&dir, &linked).unwrap();
+                linked
+            } else {
+                let path = dir.join(component);
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).unwrap();
+                } else if path.exists() {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                let target = if component == "specs" || component == "specs/nested" {
+                    outside.path()
+                } else {
+                    &sentinel
+                };
+                symlink(target, path).unwrap();
+                dir
+            };
+            assert!(
+                import_change(repo.path(), &selected, Some("example")).is_err(),
+                "{component}"
+            );
+            assert!(
+                !repo.path().join(".kranz/tickets/example.md").exists(),
+                "{component}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).unwrap(),
+                "synthetic outside content"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_source_ancestors_cannot_redirect_imports() {
+        let repo = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let change = write_change(external.path());
+        std::os::unix::fs::symlink(
+            external.path().join("openspec"),
+            repo.path().join("openspec"),
+        )
+        .unwrap();
+        let indirect = repo.path().join("openspec/changes/dark mode");
+        assert!(import_change(repo.path(), &indirect, Some("indirect")).is_err());
+        assert!(!repo.path().join(".kranz/tickets/indirect.md").exists());
+        // Explicitly naming an external change remains supported.
+        assert!(import_change(repo.path(), &change, Some("explicit")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_alias_does_not_turn_repository_inputs_into_external_authority() {
+        let repo = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        write_change(external.path());
+        let alias = aliases.path().join("checkout");
+        std::os::unix::fs::symlink(repo.path(), &alias).unwrap();
+        write_change(repo.path());
+        let source = alias.join("openspec/changes/dark mode");
+        assert!(import_change(repo.path(), &source, Some("local")).is_ok());
+        std::fs::remove_dir_all(repo.path().join("openspec")).unwrap();
+        std::os::unix::fs::symlink(
+            external.path().join("openspec"),
+            repo.path().join("openspec"),
+        )
+        .unwrap();
+        assert!(import_change(repo.path(), &source, Some("indirect")).is_err());
+        assert!(!repo.path().join(".kranz/tickets/indirect.md").exists());
+    }
+
+    #[test]
+    fn imports_bound_aggregate_bytes_and_directory_depth() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = write_change(repo.path());
+        let file = std::fs::File::create(dir.join("design.md")).unwrap();
+        file.set_len(MAX_IMPORT_BYTES).unwrap();
+        assert!(
+            read_change(&dir, None).is_err(),
+            "proposal and design together exceed the budget"
+        );
+        std::fs::remove_file(dir.join("design.md")).unwrap();
+        let mut nested = dir.join("specs");
+        for _ in 0..=MAX_SPEC_DEPTH {
+            nested.push("nested");
+        }
+        std::fs::create_dir_all(nested).unwrap();
+        assert!(read_change(&dir, None)
+            .unwrap_err()
+            .to_string()
+            .contains("depth limit"));
+    }
+
+    #[test]
+    fn imports_bound_entry_count_even_for_empty_directories() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = write_change(repo.path());
+        for index in 0..MAX_SPEC_ENTRIES {
+            std::fs::create_dir(dir.join("specs").join(index.to_string())).unwrap();
+        }
+        assert!(read_change(&dir, None)
+            .unwrap_err()
+            .to_string()
+            .contains("entry limit"));
+    }
+
+    #[test]
+    fn nested_regular_specs_are_imported_in_path_order() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = write_change(repo.path());
+        std::fs::create_dir(dir.join("specs/aaa")).unwrap();
+        std::fs::write(dir.join("specs/aaa/first.md"), "First nested requirement").unwrap();
+        let change = read_change(&dir, None).unwrap();
+        assert!(
+            change.context.find("First nested requirement").unwrap()
+                < change.context.find("SHALL").unwrap()
+        );
+    }
 
     fn write_change(root: &Path) -> PathBuf {
         let dir = root.join("openspec").join("changes").join("dark mode");

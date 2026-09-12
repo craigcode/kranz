@@ -13,6 +13,14 @@ use crate::report_render::extract_research;
 use crate::runner;
 use crate::types::*;
 
+/// Content identity carried from a plan preview to its approval on every client.
+/// Serializing the typed plan fixes field order and includes all consent-bearing
+/// fields. Plans contain only infallibly serializable structs, strings and lists.
+pub fn plan_identity(plan: &Plan) -> String {
+    let json = serde_json::to_vec(plan).expect("Plan serialization cannot fail");
+    crate::standards_waiver::sha256_hex(&json)
+}
+
 impl MissionEngine {
     /// Demand the plan JSON (types::Plan, camelCase). Lenient parse with one
     /// retry demanding bare JSON; a plan parses to [`PlanRequest::Ready`]
@@ -740,6 +748,41 @@ fn plan_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_plan_identity_binds_work_permissions_and_reviewer_policy() {
+        let value = serde_json::json!({
+            "goal": "ship it", "validationContract": [], "milestones": []
+        });
+        let plan: Plan = serde_json::from_value(value.clone()).unwrap();
+        let identity = plan_identity(&plan);
+        assert_eq!(identity.len(), 64);
+        assert_eq!(identity, plan_identity(&plan.clone()));
+        for (field, changed) in [
+            ("goal", serde_json::json!("ship another thing")),
+            ("commandGrants", serde_json::json!(["cargo test"])),
+            ("touchSet", serde_json::json!(["crates/"])),
+            (
+                "reviewerIndependence",
+                serde_json::json!({"scrutiny": true, "functional": false}),
+            ),
+            (
+                "validationContract",
+                serde_json::json!([{
+                    "id": "a-1", "statement": "new requirement", "check": "agent-judgement"
+                }]),
+            ),
+        ] {
+            let mut changed_plan = value.clone();
+            changed_plan[field] = changed;
+            let changed_plan: Plan = serde_json::from_value(changed_plan).unwrap();
+            assert_ne!(
+                identity,
+                plan_identity(&changed_plan),
+                "identity must bind {field}"
+            );
+        }
+    }
 
     fn assertion(id: &str) -> Assertion {
         Assertion {

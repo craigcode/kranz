@@ -44,6 +44,21 @@ export function PlanReview() {
 
         <p className="plan-review-goal">{plan.goal}</p>
 
+        <section aria-label="Reviewer independence">
+          <div className="section-label">Reviewer independence</div>
+          <p>
+            Scrutiny: {plan.reviewerIndependence?.scrutiny ? 'required' : 'not required'}
+            {' · '}
+            Functional: {plan.reviewerIndependence?.functional ? 'required' : 'not required'}
+          </p>
+          {(plan.reviewerIndependence?.scrutiny || plan.reviewerIndependence?.functional) && (
+            <p className="dim">
+              Required reviewers must use a known model family different from every worker attempt.
+              This requirement is pinned by approval.
+            </p>
+          )}
+        </section>
+
         {plan.consideredAlternatives !== undefined && (
           <section aria-label="Considered alternatives">
             <div className="section-label">Considered alternatives</div>
