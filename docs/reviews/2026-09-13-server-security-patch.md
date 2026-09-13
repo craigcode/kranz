@@ -139,3 +139,14 @@ was still `Approved`, rather than `Paused`. The test now waits, within the
 existing timeout, for the observed paused state and then for the pending user
 message before enqueuing Resume. Completion, event order, paused-time reporting,
 and inbox cleanup assertions remain. No engine runtime behavior changed.
+
+macOS CI on `274bfd0` reproduced the earlier Git-protection failure. The Kimi
+fallback-discovery fixture now re-executes only itself in a child process, so
+its temporary `HOME` and `PATH` cannot affect the parallel unit suite. The
+parent verifies both successful exit and one executed test. The linked-worktree
+test also holds the shared environment-test lock while reading authority masks,
+which excludes the other fixtures using that lock to change `HOME`. A mutex
+only around the Kimi writer would not protect unrelated readers. All discovery
+and Git-protection assertions remain; no sandbox runtime behavior was changed.
+The failing CI log does not identify the exact concurrent writer, so the earlier
+Kimi attribution remains a hypothesis rather than a confirmed diagnosis.
