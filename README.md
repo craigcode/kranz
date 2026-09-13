@@ -94,22 +94,22 @@ cargo install --path kranz/crates/cli --locked
 If you already have a checkout, run `cargo install --path crates/cli --locked`
 from its root.
 
-**With Cargo — a versioned release.** Request v0.2.0 explicitly so Cargo cannot
+**With Cargo — a versioned release.** Request v0.2.1 explicitly so Cargo cannot
 silently install the older `0.0.1` placeholder:
 
 ```sh
-cargo install kranz --version 0.2.0 --locked
+cargo install kranz --version 0.2.1 --locked
 ```
 
-If crates.io reports that `0.2.0` is unavailable, use the source install above.
+If crates.io reports that `0.2.1` is unavailable, use the source install above.
 Cargo builds the CLI's three library dependencies automatically. Check the
 [published crate versions](https://crates.io/crates/kranz/versions) for registry
 availability; a public GitHub repository does not publish a crate automatically.
 
-**Prebuilt binaries.** No public release archives are available yet. Use the
-source or versioned Cargo install above. Future archives will appear on the
-[GitHub Releases page](https://github.com/craigcode/kranz/releases), with checksums
-and license notices. `kranz licenses` prints the bundled project, Rust dependency,
+**Prebuilt binaries.** Check the
+[GitHub Releases page](https://github.com/craigcode/kranz/releases) for platform
+archives, checksums, and license notices. If the requested version has no
+archives yet, use the source or versioned Cargo install above. `kranz licenses` prints the bundled project, Rust dependency,
 and dashboard notices.
 
 Homebrew distribution is intentionally deferred until the v0.2.0 Cargo and

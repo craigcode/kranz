@@ -30,7 +30,15 @@ fn app(root: &Path, reads: ReadWork) -> Router {
     });
     Router::new()
         .route("/api/health", axum::routing::get(crate::rest::health))
-        .nest("/api", crate::repo_api_routes().with_state(state))
+        .nest(
+            "/api",
+            crate::repo_api_routes(crate::TokenGate {
+                authority: crate::MutationAuthority::new("read-work-mutation").unwrap(),
+                read_authority: "read-work-observer".into(),
+                require_read_token: false,
+            })
+            .with_state(state),
+        )
         .layer(Extension(reads))
 }
 

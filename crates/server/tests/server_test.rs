@@ -36,6 +36,23 @@ fn authority(token: &str) -> kranz_server::MutationAuthority {
     kranz_server::MutationAuthority::new(token).unwrap()
 }
 
+async fn exchange_read_token(app: &axum::Router, credential: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/read-token")
+                .header(kranz_server::TOKEN_HEADER, credential)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    body["token"].as_str().unwrap().to_owned()
+}
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1922,7 @@ async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
         false, // non-loopback bind: LAN origins allowed
         true,  // read token required
     );
+    let token = exchange_read_token(&app, token).await;
     let addr = spawn_server(app).await;
     let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={token}");
 
@@ -2005,8 +2023,20 @@ async fn read_auth_loopback_rejects_tokenless_get() {
         "header token must be accepted"
     );
 
+    let read = exchange_read_token(&app, READ_AUTH_TOKEN).await;
     let addr = spawn_server(app).await;
-    let tokened_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={READ_AUTH_TOKEN}");
+    let mutation_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={READ_AUTH_TOKEN}");
+    let rejected = tokio::time::timeout(
+        WAIT,
+        connect_async(ws_request(&mutation_url, Some("http://localhost:5173"))),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rejected.is_err(),
+        "mutation authority must not authenticate via a WS URL"
+    );
+    let tokened_url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={read}");
     let upgraded = tokio::time::timeout(
         WAIT,
         connect_async(ws_request(&tokened_url, Some("http://localhost:5173"))),
@@ -2086,8 +2116,9 @@ async fn read_auth_off_loopback_reads_tokenless() {
 #[tokio::test]
 async fn read_auth_loopback_keeps_strict_loopback_origin() {
     let (_tmp, app) = read_auth_app(true, true);
+    let read = exchange_read_token(&app, READ_AUTH_TOKEN).await;
     let addr = spawn_server(app).await;
-    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={READ_AUTH_TOKEN}");
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={read}");
 
     let lan_origin = tokio::time::timeout(
         WAIT,

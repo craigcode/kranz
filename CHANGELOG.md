@@ -3,6 +3,20 @@
 Notable user-visible changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.1 - 2026-09-13
+
+- Security: non-JSON POST bodies with no Content-Length, including chunked
+  requests, now receive HTTP 415. Known-empty requests remain supported.
+- Security: GitHub webhook and hook-status authentication exceptions belong
+  only to their registered POST routes; similar path suffixes stay protected.
+- Security: gated reads and WebSocket upgrades no longer accept mutation
+  tokens in query strings. Native clients can continue using x-kranz-token.
+  The dashboard exchanges its header credential at GET /api/read-token and
+  sends only read authority in WebSocket URLs, including after reconnect.
+  Custom browser clients must use a read token or adopt that exchange.
+- Added a security-review index linking historical findings, remediation,
+  regression evidence, and recorded limitations.
+
 ## 0.2.0 - 2026-09-13
 
 - Fixed Windows validator snapshots failing to replay uncommitted edits when

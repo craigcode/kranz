@@ -31,7 +31,7 @@ pub use multi::{
     RepoSlackConfig, RepoSummary, SlackChannelRoute,
 };
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -267,8 +267,9 @@ pub fn router_with_multi_repo_host_and_addr(
 /// (docs/protocol.md "Authority: mutation token"). `read_authority`
 /// authenticates GET/HEAD (and the WS upgrade) wherever the read gate is
 /// armed, but is never accepted on a mutating route — it is the token safe
-/// to hand to dashboards and agents. `None` keeps the single-token posture:
-/// gated reads then present the operator's mutation token, as before.
+/// to hand to dashboards and agents. If absent or equal to mutation authority,
+/// a distinct read token is generated. Clients obtain it from `/api/read-token`
+/// using either valid token in the header; mutation tokens remain header-only.
 pub fn router_with_read_authority_and_addr(
     multi_host: Arc<MultiRepoHost>,
     static_assets: Option<DashboardStatic>,
@@ -278,16 +279,28 @@ pub fn router_with_read_authority_and_addr(
     bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
+    let gate = TokenGate {
+        read_authority: read_authority
+            .filter(|read| !read.is_empty() && !token_matches(read, authority.as_str()))
+            .unwrap_or_else(generate_token),
+        authority,
+        require_read_token,
+    };
+    let exchange_gate = gate.clone();
+    let mut repos = Router::new();
     let catalog = Arc::clone(&multi_host);
     let catalog_reads = read_work::ReadWork::default();
-    let mut app = Router::new().route("/api/health", get(rest::health)).route(
-        "/api/repos",
-        get(move || {
-            let catalog = Arc::clone(&catalog);
-            let reads = catalog_reads.clone();
-            async move { reads.run(move || Ok(Json(catalog.summaries()))).await }
-        }),
-    );
+    let mut app = Router::new()
+        .route("/api/health", get(rest::health))
+        .route(
+            "/api/repos",
+            get(move || {
+                let catalog = Arc::clone(&catalog);
+                let reads = catalog_reads.clone();
+                async move { reads.run(move || Ok(Json(catalog.summaries()))).await }
+            }),
+        )
+        .route("/api/read-token", get(read_token).with_state(exchange_gate));
 
     // The unscoped compatibility alias shares capacity with its scoped repo.
     let mut repo_reads = std::collections::HashMap::new();
@@ -297,9 +310,16 @@ pub fn router_with_read_authority_and_addr(
             Some(host) => {
                 let reads = read_work::ReadWork::default();
                 repo_reads.insert(context.id().to_string(), reads.clone());
-                app = app.nest(
+                repos = repos.nest(
                     &prefix,
-                    repo_context_router(context, host, bind_addr, bind_is_loopback, reads),
+                    repo_context_router(
+                        context,
+                        host,
+                        bind_addr,
+                        bind_is_loopback,
+                        reads,
+                        gate.clone(),
+                    ),
                 );
             }
             None => {
@@ -324,9 +344,16 @@ pub fn router_with_read_authority_and_addr(
                     .entry(context.id().to_string())
                     .or_default()
                     .clone();
-                app = app.nest(
+                repos = repos.nest(
                     "/api",
-                    repo_context_router(context, host, bind_addr, bind_is_loopback, reads),
+                    repo_context_router(
+                        context,
+                        host,
+                        bind_addr,
+                        bind_is_loopback,
+                        reads,
+                        gate.clone(),
+                    ),
                 );
             }
             // An explicit `defaultRepo` is not health-filtered; the whole
@@ -350,6 +377,13 @@ pub fn router_with_read_authority_and_addr(
             .route("/api/{*path}", any(api_not_found)),
     };
 
+    // Catalog, unavailable repositories, and API misses are protected too.
+    // Healthy repositories apply the same gate before adding their two
+    // independently authenticated POST routes.
+    let app = app
+        .layer(middleware::from_fn_with_state(gate, require_mutation_token))
+        .merge(repos);
+
     let app = match static_assets {
         Some(DashboardStatic::Dir(dir)) => {
             let index = dir.join("index.html");
@@ -365,23 +399,15 @@ pub fn router_with_read_authority_and_addr(
     // the JSON gate wraps the token gate, so even rejections carry CORS
     // headers for approved origins and a non-JSON POST is rejected before the
     // token is examined.
-    app.layer(middleware::from_fn_with_state(
-        TokenGate {
-            authority,
-            read_authority,
-            require_read_token,
-        },
-        require_mutation_token,
-    ))
-    .layer(middleware::from_fn(require_json_api_posts))
-    .layer(middleware::from_fn_with_state(
-        HostGate { bind_is_loopback },
-        require_host,
-    ))
-    .layer(cors_layer(bind_addr))
-    // Outermost: every response — including gate rejections — carries the
-    // cache policy, so no rejection HTML can poison a browser cache either.
-    .layer(middleware::from_fn(cache_response_headers))
+    app.layer(middleware::from_fn(require_json_api_posts))
+        .layer(middleware::from_fn_with_state(
+            HostGate { bind_is_loopback },
+            require_host,
+        ))
+        .layer(cors_layer(bind_addr))
+        // Outermost: every response — including gate rejections — carries the
+        // cache policy, so no rejection HTML can poison a browser cache either.
+        .layer(middleware::from_fn(cache_response_headers))
 }
 
 async fn api_not_found() -> impl IntoResponse {
@@ -449,6 +475,7 @@ fn repo_context_router(
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
     reads: read_work::ReadWork,
+    gate: TokenGate,
 ) -> Router {
     let state = Arc::new(ServerState {
         repo_root: context.root().to_path_buf(),
@@ -456,12 +483,12 @@ fn repo_context_router(
         bind_addr,
         bind_is_loopback,
     });
-    repo_api_routes()
+    repo_api_routes(gate)
         .layer(axum::Extension(reads))
         .with_state(state)
 }
 
-fn repo_api_routes() -> Router<Arc<ServerState>> {
+fn repo_api_routes(gate: TokenGate) -> Router<Arc<ServerState>> {
     Router::new()
         .route(
             "/missions",
@@ -496,18 +523,6 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
         .route(
             "/missions/{id}/runs/{run_id}/transcript",
             get(rest::run_transcript),
-        )
-        // The hook-status lane (ticket agent-hooks-status-signals): the
-        // POST is the lane's ONLY write, authenticated by the per-run
-        // capability token (exempt from the mutation-token gate below, like
-        // the GitHub webhook's HMAC route); the GET is an ordinary
-        // tokenless-loopback read. The body limit is the lane's own
-        // 16 KiB bound — the relay's body is a handful of small fields.
-        .route(
-            "/hook-status",
-            post(rest::post_hook_status).route_layer(axum::extract::DefaultBodyLimit::max(
-                kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES,
-            )),
         )
         .route("/missions/{id}/hook-status", get(rest::mission_hook_status))
         .route("/missions/{id}/control", post(rest::post_control))
@@ -555,7 +570,17 @@ fn repo_api_routes() -> Router<Arc<ServerState>> {
         .route("/tickets/{slug}/approve", post(tickets::approve_ticket))
         .route("/queue", get(host::queue_state_route))
         .route("/queue/drain", post(host::drain_queue_route))
+        .route_layer(middleware::from_fn_with_state(gate, require_mutation_token))
+        // Only these POST routes authenticate independently: GitHub HMAC
+        // and per-run hook capability. Keep exceptions local to registration;
+        // a future route with a similar suffix must still require authority.
         .route("/hooks/github", post(hooks::github_hook))
+        .route(
+            "/hook-status",
+            post(rest::post_hook_status).route_layer(axum::extract::DefaultBodyLimit::max(
+                kranz_engine::hook_status::SIGNAL_BODY_MAX_BYTES,
+            )),
+        )
 }
 
 fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Response {
@@ -827,21 +852,13 @@ fn host_ip(host: &str) -> Option<std::net::IpAddr> {
 /// forces every browser POST into the preflighted path that
 /// [`cors_layer`] guards.
 ///
-/// An EMPTY body (no `Content-Length`, or `Content-Length: 0`) is exempt
-/// from the content-type check: it carries no payload for a drive-by page
-/// to control, so relaxing the mime requirement here doesn't reopen the
-/// CSRF vector above — bodyless POSTs still have to clear
-/// [`require_mutation_token`] downstream, which is the gate actually
-/// closing it. (A chunked/streaming request that omits `Content-Length`
-/// but streams a non-empty body is not treated as empty here — that's an
-/// accepted non-goal, not a bypass this middleware promises to catch.)
+/// A body already known to be empty is exempt. Unknown-length streams must
+/// declare JSON even if they later end without data. This uses the body's
+/// end-of-stream signal without buffering or consuming a request; missing
+/// Content-Length (including chunked requests) is not proof of emptiness.
 async fn require_json_api_posts(request: Request, next: Next) -> Response {
     if request.method() == Method::POST && request.uri().path().starts_with("/api/") {
-        let is_empty_body = request
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .is_none_or(|value| value == "0");
+        let is_empty_body = request.body().is_end_stream();
         let is_json = request
             .headers()
             .get(header::CONTENT_TYPE)
@@ -860,12 +877,12 @@ async fn require_json_api_posts(request: Request, next: Next) -> Response {
 }
 
 /// Token gate state: mandatory mutation authority plus whether non-loopback
-/// binds also require it on GET / WS upgrade, and the optional read-only token
+/// binds also require it on GET / WS upgrade, and the distinct read-only token
 /// accepted on gated reads only.
 #[derive(Clone)]
 struct TokenGate {
     authority: MutationAuthority,
-    read_authority: Option<String>,
+    read_authority: String,
     require_read_token: bool,
 }
 
@@ -876,23 +893,11 @@ struct HostGate {
     bind_is_loopback: bool,
 }
 
-/// Require the per-serve mutation token on every `POST /api/...` (protocol
-/// "Authority: mutation token"). When [`TokenGate::require_read_token`] is
-/// set (non-loopback bind), GETs / HEADs under `/api/` (except `/api/health`)
-/// require a token too — via the `x-kranz-token` header or a `?token=`
-/// query. The query form exists ONLY for the browser WS upgrade (no way to
-/// set headers on `new WebSocket`) and is honored solely on token-gated
-/// reads: POSTs are header-only, so mutation authority never rides in a URL
-/// that can land in shell history or an intermediary's access log.
-/// A configured [`TokenGate::read_authority`] authenticates those same gated
-/// READS (header or query) but is never accepted on a mutating route: it is
-/// the token safe to hand to dashboards and agents, while the mutation token
-/// stays the operator's alone.
-///
-/// Rationale: the 127.0.0.1 bind + CORS allowlist stop the network and the
-/// browser; the token stops other local processes and link-borne CSRF from
-/// creating or steering missions that spend money. Off-loopback, tokenless
-/// reads would expose mission state to the LAN, so reads are gated too.
+/// Require mutation authority on protected POST routes. Gated GET/HEAD reads
+/// accept either token in the header, but only read authority in a query.
+/// Browser WebSockets obtain that read authority through [`read_token`];
+/// rejecting mutation tokens in URLs also protects non-WebSocket reads.
+/// Hook routes apply their own authentication at registration instead.
 async fn require_mutation_token(
     State(gate): State<TokenGate>,
     request: Request,
@@ -901,30 +906,11 @@ async fn require_mutation_token(
     let expected = gate.authority.as_str();
     let path = request.uri().path();
     let is_health = path == "/api/health";
-    // The GitHub webhook route authenticates with its own per-repo HMAC
-    // (`X-Hub-Signature-256` against `hooks.secret`) and refuses closed
-    // when unconfigured — GitHub cannot present the mutation token.
-    let is_github_hook = path.ends_with("/hooks/github");
-    // The hook-status signal POST authenticates with its own per-RUN
-    // capability token (validated against the registration in the handler —
-    // worker-readable files never carry the serve token). Scoped to POSTs so
-    // a read-gated GET of the projection still requires the read token.
-    let is_hook_signal_post = request.method() == Method::POST && path.ends_with("/hook-status");
     let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-    let needs_auth = path.starts_with("/api/")
-        && !is_health
-        && !is_github_hook
-        && !is_hook_signal_post
-        && (request.method() == Method::POST || (gate.require_read_token && is_read));
+    let needs_auth =
+        !is_health && (request.method() == Method::POST || (gate.require_read_token && is_read));
     if needs_auth {
-        // The read-only token authenticates reads ONLY — never a mutation.
-        let read_ok = |presented: &str| {
-            is_read
-                && gate
-                    .read_authority
-                    .as_deref()
-                    .is_some_and(|read| token_matches(presented, read))
-        };
+        let read_ok = |presented: &str| is_read && token_matches(presented, &gate.read_authority);
         let header_ok = request
             .headers()
             .get(TOKEN_HEADER)
@@ -941,7 +927,7 @@ async fn require_mutation_token(
                         matches!(parts.next(), Some("token"))
                             && parts.next().is_some_and(|v| {
                                 let decoded = percent_decode_token(v);
-                                token_matches(&decoded, expected) || read_ok(&decoded)
+                                read_ok(&decoded)
                             })
                     })
                 })
@@ -955,6 +941,28 @@ async fn require_mutation_token(
         }
     }
     next.run(request).await
+}
+
+/// Exchange either header credential for read-only authority. This handler
+/// always checks its own header, including on otherwise tokenless loopback
+/// reads. Query credentials never grant access to the exchange response.
+async fn read_token(State(gate): State<TokenGate>, request: Request) -> Response {
+    let valid = request
+        .headers()
+        .get(TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|presented| {
+            token_matches(presented, gate.authority.as_str())
+                || token_matches(presented, &gate.read_authority)
+        });
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid token" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "token": gate.read_authority })).into_response()
 }
 
 /// Constant-time token equality: off-loopback binds expose the token gate

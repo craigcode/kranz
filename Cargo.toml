@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/engine", "crates/cli", "crates/server", "crates/slack"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # README quick-start floor; inherited by every member crate and checked in CI.
 rust-version = "1.88"
@@ -18,9 +18,9 @@ keywords = ["agent", "orchestration", "mission-control", "validation", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
-kranz-engine = { version = "0.2.0", path = "crates/engine" }
-kranz-server = { version = "0.2.0", path = "crates/server" }
-kranz-slack = { version = "0.2.0", path = "crates/slack" }
+kranz-engine = { version = "0.2.1", path = "crates/engine" }
+kranz-server = { version = "0.2.1", path = "crates/server" }
+kranz-slack = { version = "0.2.1", path = "crates/slack" }
 serde = { version = "1", features = ["derive"] }
 # Event integrity requires serialized floats to survive parsing bit-for-bit.
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
