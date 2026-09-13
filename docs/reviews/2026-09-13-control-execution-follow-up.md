@@ -87,3 +87,39 @@ Investigation notes:
   before the final complete Linux rerun. The final full-suite result above is
   Linux execution evidence; the native macOS evidence is the focused regressions
   and full workspace compile/lint gates.
+
+## CI compatibility follow-up
+
+The first PR run exposed checkout authentication metadata, rather than stale
+knowledge claims: `actions/checkout` v7 persisted credentials through repository
+`includeIf` directives. Hardened Git refused these during knowledge probes and
+before the wrapped macOS suite could start. All 14 checkouts in the CI workflow
+now use `persist-credentials: false`; none of those jobs needs authenticated Git
+after checkout. The production include refusal remains unchanged.
+
+Secret-scan and release checkouts also disable persisted credentials. Their
+later authenticated fetches use step-scoped `GH_TOKEN` through GitHub CLI's
+credential helper for that command only; no token enters Git arguments or
+repository configuration. Trusted-base scanner selection and the release
+script's fresh-main comparison remain intact. Shell and structural checks,
+isolated credential-protocol validation, and local release fixtures passed,
+including stale-main rejection and unchanged repository configuration.
+
+The Windows ACL fixture also expected a recursive write grant to succeed when
+its `.git` pointer redirected metadata inside that writable tree. The fixture
+now retains that layout as a refusal assertion and places the positive case's
+Git metadata outside the writable root. This changes the test's setup, not the
+production boundary. Rust 1.98 additionally introduced a denied Clippy warning
+for fixed-size chunk iteration; Git's existing key/value-pair scan now uses
+`as_chunks` with the same entries and remainder behavior.
+
+Source review confirmed these changes preserve the Git and sandbox invariants.
+The invariants note and its dependent lessons index were reverified on September
+13; no knowledge dates were changed to conceal failed Git probes.
+
+Local validation parsed the workflow, checked every checkout's setting and
+knowledge's full-history fetch, passed the macOS CI structure check, and verified
+all ten knowledge notes. A disposable repository also proved that the current
+binary passes without persisted authentication, refuses a checkout-shaped
+conditional include, and passes again when that include is absent. Hosted CI
+must still rerun against the corrected workflow.

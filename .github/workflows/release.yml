@@ -20,10 +20,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch every ref exposed by a public GitHub repository
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch --force --prune origin \
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            fetch --force --prune origin \
             '+refs/heads/*:refs/remotes/origin/*' \
             '+refs/tags/*:refs/tags/*' \
             '+refs/pull/*:refs/remotes/pull/*'
@@ -41,6 +45,8 @@ jobs:
             apps/even-g2/package-lock.json
 
       - name: Verify tag, versions, changelog, and current main
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: scripts/check-release-version.sh
 
       - name: Verify public release switch
@@ -185,6 +191,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -240,6 +248,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Generate SPDX JSON SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0

@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-12
+last_verified: 2026-09-13
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs

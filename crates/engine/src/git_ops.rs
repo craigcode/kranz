@@ -669,11 +669,15 @@ impl GitRepo {
     fn refuse_new_exec_configuration(&self, initial: &[String]) -> Result<()> {
         let current = self.build_exec_disable_flags()?;
         let known: std::collections::HashSet<&str> = initial
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[1].as_str())
             .collect();
         let unexpected: Vec<&str> = current
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[1].as_str())
             .filter(|entry| !known.contains(entry))
             .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))

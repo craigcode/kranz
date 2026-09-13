@@ -66,7 +66,13 @@ if ! grep -Fq "## ${workspace_version} -" CHANGELOG.md; then
 fi
 
 if [ "${KRANZ_RELEASE_SKIP_MAIN_CHECK:-0}" != 1 ]; then
-  git fetch --no-tags origin main
+  if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GH_TOKEN:-}" ]; then
+    # CI supplies authentication only to this fetch, never repository config.
+    git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+      fetch --no-tags origin main
+  else
+    git fetch --no-tags origin main
+  fi
   release_sha="$(git rev-parse 'HEAD^{commit}')"
   main_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
   if [ "$release_sha" != "$main_sha" ]; then

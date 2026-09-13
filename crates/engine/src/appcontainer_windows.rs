@@ -4443,6 +4443,15 @@ mod tests {
         };
         std::fs::write(cwd.join(".git"), "gitdir: trusted").unwrap();
         let shared_git = root.path().join("repo/.git");
+        assert!(
+            validate_recursive_roots(&inputs, &[cwd.clone(), scratch.clone()], &[], &shared_git)
+                .is_err(),
+            "a recursive write grant must not cover redirected Git metadata"
+        );
+        let gitdir = shared_git.join("worktrees/test");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
         validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[], &shared_git).unwrap();
         assert!(validate_recursive_roots(&inputs, &[cwd.join(".git")], &[], &shared_git).is_err());
         for forbidden in [
