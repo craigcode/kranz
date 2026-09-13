@@ -153,6 +153,15 @@ Kimi attribution remains a hypothesis rather than a confirmed diagnosis.
 
 ## Release verification and v0.2.2
 
+Linux PR #53 CI on `34ebb24` failed the synchronized Git-config race fixture:
+bubblewrap could no longer find a temporary Cargo registry directory captured
+while another unit fixture changed `CARGO_HOME`. This live sandbox test now
+holds the existing environment-test lock from profile construction through
+child completion, excluding the guarded Cargo-home writers and their teardown.
+The exact concurrent writer is not identified by the log. All three repository
+layouts, prohibited-write attempts, normal commit, and synchronization
+assertions remain; runtime containment and its fail-closed behavior are unchanged.
+
 PR #52 and merged commit `0542e80` passed every CI and CodeQL check. The
 annotated v0.2.1 tag points to that commit. Release run 34788843394 then failed
 `sandbox_preflight_emits_no_macos_profile_issue_on_linux`: the release runner

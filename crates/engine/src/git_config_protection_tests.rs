@@ -220,6 +220,12 @@ fn git_race_engine_fixture() {
 #[test]
 fn git_config_protection_synchronized_writer_cannot_race_engine_git() {
     use std::os::unix::fs::PermissionsExt;
+    // Profile construction reads HOME and CARGO_HOME; keep their directories
+    // stable through the contained writer's spawn and completion. Other unit
+    // fixtures relocate and remove those paths while holding this same lock.
+    let _env_lock = crate::agent_env::ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     #[cfg(target_os = "macos")]
     let supported = Command::new("sandbox-exec")
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
