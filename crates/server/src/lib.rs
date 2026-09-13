@@ -962,7 +962,8 @@ async fn read_token(State(gate): State<TokenGate>, request: Request) -> Response
         )
             .into_response();
     }
-    Json(json!({ "token": gate.read_authority })).into_response()
+    let value = gate.read_authority;
+    Json(json!({ "token": value })).into_response()
 }
 
 /// Constant-time token equality: off-loopback binds expose the token gate

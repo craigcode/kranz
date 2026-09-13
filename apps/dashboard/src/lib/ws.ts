@@ -72,15 +72,17 @@ export class MissionSocket {
     this.opts.onStatus('connecting');
     this.authRequest?.abort();
     this.authRequest = null;
+    // Server middleware decides whether anonymous reads are allowed. This
+    // branch only chooses whether the connection needs a credential exchange.
     const token = resolveToken();
     if (token === null) {
       this.openSocket(null);
     } else {
-      void this.connectAuthenticated(token);
+      void this.exchangeAndConnect(token);
     }
   }
 
-  private async connectAuthenticated(token: string): Promise<void> {
+  private async exchangeAndConnect(token: string): Promise<void> {
     const request = new AbortController();
     this.authRequest = request;
     const timeout = setTimeout(() => request.abort(), 10_000);

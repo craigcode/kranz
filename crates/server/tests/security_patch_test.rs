@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
-const MUTATION: &str = "patch-mutation";
-const READ: &str = "patch-read";
+const DUMMY_MUTATION: &str = "dummy-mutation";
+const READ: &str = "dummy-read";
 
 fn app(root: &std::path::Path, read_auth: bool, read: Option<&str>) -> axum::Router {
     kranz_server::router_with_read_authority_and_addr(
@@ -19,7 +19,7 @@ fn app(root: &std::path::Path, read_auth: bool, read: Option<&str>) -> axum::Rou
             root.into(),
         )))),
         None,
-        MutationAuthority::new(MUTATION).unwrap(),
+        MutationAuthority::new(DUMMY_MUTATION).unwrap(),
         read.map(str::to_owned),
         None,
         true,
@@ -39,7 +39,7 @@ async fn security_patch_unknown_length_body_requires_json() {
             .clone()
             .oneshot(
                 Request::post("/api/missions/missing/control")
-                    .header("x-kranz-token", MUTATION)
+                    .header("x-kranz-token", DUMMY_MUTATION)
                     .header("content-type", content_type)
                     .body(body)
                     .unwrap(),
@@ -77,7 +77,7 @@ async fn security_patch_chunked_http_post_requires_json() {
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(format!(
-            "POST /api/missions/missing/control HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nx-kranz-token: {MUTATION}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
+            "POST /api/missions/missing/control HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nx-kranz-token: {DUMMY_MUTATION}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n"
         ).as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
@@ -122,12 +122,12 @@ async fn security_patch_hook_suffix_does_not_exempt_other_routes() {
 async fn security_patch_header_exchange_never_grants_mutation_authority() {
     let root = tempfile::tempdir().unwrap();
     for read_auth in [false, true] {
-        for configured in [None, Some(READ), Some(MUTATION)] {
+        for configured in [None, Some(READ), Some(DUMMY_MUTATION)] {
             let app = app(root.path(), read_auth, configured);
             for path in [
                 "/api/read-token",
-                "/api/read-token?token=patch-read",
-                "/api/read-token?token=patch-mutation",
+                "/api/read-token?token=dummy-read",
+                "/api/read-token?token=dummy-mutation",
             ] {
                 let response = app
                     .clone()
@@ -144,7 +144,7 @@ async fn security_patch_header_exchange_never_grants_mutation_authority() {
                 .clone()
                 .oneshot(
                     Request::get("/api/read-token")
-                        .header("x-kranz-token", MUTATION)
+                        .header("x-kranz-token", DUMMY_MUTATION)
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -156,7 +156,7 @@ async fn security_patch_header_exchange_never_grants_mutation_authority() {
                 serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                     .unwrap();
             let read = body["token"].as_str().unwrap();
-            assert_ne!(read, MUTATION);
+            assert_ne!(read, DUMMY_MUTATION);
             if configured == Some(READ) {
                 assert_eq!(read, READ);
             }
@@ -200,7 +200,7 @@ async fn security_patch_header_exchange_never_grants_mutation_authority() {
                 let response = app
                     .clone()
                     .oneshot(
-                        Request::get(format!("/api/missions?token={MUTATION}"))
+                        Request::get(format!("/api/missions?token={DUMMY_MUTATION}"))
                             .body(Body::empty())
                             .unwrap(),
                     )

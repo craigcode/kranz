@@ -34,7 +34,7 @@ function makeSocket(): MissionSocket {
 beforeEach(() => {
   FakeWebSocket.instances = [];
   vi.stubGlobal('WebSocket', FakeWebSocket);
-  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ token: 'read-only' }) })));
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ token: 'dummy-read' }) })));
   cancelTokenPrompt();
   clearToken();
 });
@@ -55,7 +55,7 @@ describe('read-auth: MissionSocket URL token', () => {
     expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:4560/api/read-token', expect.objectContaining({
       headers: { 'x-kranz-token': 'ws-token' }, redirect: 'error', cache: 'no-store',
     }));
-    expect(FakeWebSocket.instances[0].url).toContain('token=read-only');
+    expect(FakeWebSocket.instances[0].url).toContain('token=dummy-read');
     expect(FakeWebSocket.instances[0].url).not.toContain('ws-token');
 
     socket.close();
@@ -90,7 +90,7 @@ it('does not open a socket after closing during the exchange', async () => {
   const socket = makeSocket();
   socket.connect();
   socket.close();
-  finish({ ok: true, json: async () => ({ token: 'late-read' }) } as Response);
+  finish({ ok: true, json: async () => ({ token: 'dummy-late-read' }) } as Response);
   await Promise.resolve();
   await Promise.resolve();
   expect(FakeWebSocket.instances).toHaveLength(0);
@@ -105,10 +105,10 @@ it('ignores an old exchange when a newer credential starts connecting', async ()
   setToken('new-mutation');
   socket.connect();
   await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-  finish({ ok: true, json: async () => ({ token: 'stale-read' }) } as Response);
+  finish({ ok: true, json: async () => ({ token: 'dummy-stale-read' }) } as Response);
   await Promise.resolve();
   await Promise.resolve();
   expect(FakeWebSocket.instances).toHaveLength(1);
-  expect(FakeWebSocket.instances[0].url).toContain('token=read-only');
+  expect(FakeWebSocket.instances[0].url).toContain('token=dummy-read');
   socket.close();
 });

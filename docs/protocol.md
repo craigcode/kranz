@@ -204,7 +204,7 @@ session root with a `/dev/null` bind.
 
 ### Browser read-token exchange
 
-`GET /api/read-token` returns `{"token":"<read-only token>"}` after validating
+`GET /api/read-token` returns `{"token":"<read-token-placeholder>"}` after validating
 an `x-kranz-token` header containing either the mutation token or the read token.
 This process-wide route is not repository-scoped. It always requires a valid
 header, even when loopback reads are otherwise anonymous; a query credential

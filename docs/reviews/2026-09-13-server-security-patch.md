@@ -62,3 +62,15 @@ architecture (route-local exceptions, unchanged public signatures), security
 (no body buffering or disk work; one small exchange per authenticated socket
 connection). This is a self-review, not an independent audit. Remote platform
 checks and publication are recorded by the release PR and tag workflow.
+
+
+## First CI review
+
+The trusted secret scanner flagged dummy fixture credentials and source
+expressions, rather than live secrets. Fixtures now use explicit dummy names;
+response construction separates the value from its serialized field. No
+scanner rule or allowlist was changed. CodeQL modeled a client helper named
+as authentication as a security check controlled by browser input. The helper
+is now named for its actual operation, exchange-and-connect; server middleware
+remains the authority. The real WebSocket tests prove tokenless gated reads
+and mutation-query credentials are rejected independently of any client branch.

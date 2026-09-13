@@ -1922,9 +1922,9 @@ async fn ws_lan_mode_accepts_ip_origin_and_native_clients_with_token() {
         false, // non-loopback bind: LAN origins allowed
         true,  // read token required
     );
-    let token = exchange_read_token(&app, token).await;
+    let read = exchange_read_token(&app, token).await;
     let addr = spawn_server(app).await;
-    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={token}");
+    let url = format!("ws://{addr}/api/missions/{MISSION_ID}/ws?token={read}");
 
     // Same-origin LAN dashboard: IP-literal Origin + query token.
     let lan_origin = tokio::time::timeout(

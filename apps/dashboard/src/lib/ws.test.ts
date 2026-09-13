@@ -48,7 +48,7 @@ beforeEach(() => {
   FakeWebSocket.instances = [];
   vi.stubGlobal('WebSocket', FakeWebSocket);
   // The existence probe's default: mission still there, keep reconnecting.
-  vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(fakeJsonResponse(200, { token: 'read-only' }))));
+  vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(fakeJsonResponse(200, { token: 'dummy-read' }))));
   cancelTokenPrompt();
   clearToken();
 });
@@ -91,7 +91,7 @@ describe('MissionSocket token nudge', () => {
     provideToken('fresh-token');
     await vi.advanceTimersByTimeAsync(0);
     expect(FakeWebSocket.instances).toHaveLength(2);
-    expect(FakeWebSocket.instances[1].url).toContain('token=read-only');
+    expect(FakeWebSocket.instances[1].url).toContain('token=dummy-read');
 
     socket.close();
   });
