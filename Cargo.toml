@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/cli", "crates/server", "crates/slack"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+# README quick-start floor; inherited by every member crate and checked in CI.
+rust-version = "1.88"
+license = "MIT"
+description = "Git-native mission control for governed, validated AI coding-agent work."
+readme = "README.md"
+# release.yml and the Homebrew formula template reference this same craigcode/kranz
+# slug (see docs/releasing.md).
+repository = "https://github.com/craigcode/kranz"
+homepage = "https://github.com/craigcode/kranz"
+keywords = ["agent", "orchestration", "mission-control", "validation", "ai"]
+categories = ["development-tools", "command-line-utilities"]
+
+[workspace.dependencies]
+kranz-engine = { version = "0.2.0", path = "crates/engine" }
+kranz-server = { version = "0.2.0", path = "crates/server" }
+kranz-slack = { version = "0.2.0", path = "crates/slack" }
+serde = { version = "1", features = ["derive"] }
+# Event integrity requires serialized floats to survive parsing bit-for-bit.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.11"
+subtle = "2"
+regex = "1"
+globset = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cap-std = "4"
+cap-primitives = "4"
+cap-fs-ext = "4"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.7", features = ["fs", "cors"] }
+futures = "0.3"
+futures-util = "0.3"
+ratatui = "0.30"
+crossterm = "0.29"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Pinned directly so main() can install ONE process-level CryptoProvider:
+# the dependency graph enables both of rustls's provider features (reqwest
+# pulls aws-lc-rs, the OTLP client pulls ring), and rustls 0.23 panics at
+# the first TLS connection rather than guessing. See crates/cli/src/main.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "reqwest-client", "reqwest-rustls"] }

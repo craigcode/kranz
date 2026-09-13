@@ -1,0 +1,34 @@
+{
+  "type": "interactive",
+  "envelope_id": "c2f6b8d3-0a4e-5b21-9d3c-8f7a1e2b3c4d",
+  "accepts_response_payload": false,
+  "payload": {
+    "type": "block_actions",
+    "user": { "id": "U0263M3QW", "username": "craig", "team_id": "T024BE7LD" },
+    "api_app_id": "A0123456789",
+    "token": "verification-token-redacted",
+    "container": { "type": "message", "message_ts": "1700000000.000200", "channel_id": "C0G9QF9GW" },
+    "trigger_id": "241582872338.3.abc",
+    "team": { "id": "T024BE7LD", "domain": "acme" },
+    "channel": { "id": "C0G9QF9GW", "name": "kranz" },
+    "message": {
+      "type": "message",
+      "subtype": "bot_message",
+      "ts": "1700000000.000200",
+      "bot_id": "B0G9QF9C6",
+      "text": "Delivered — m-42"
+    },
+    "response_url": "https://hooks.slack.com/actions/T024BE7LD/5678/efgh",
+    "actions": [
+      {
+        "action_id": "kranz_merge",
+        "block_id": "def",
+        "text": { "type": "plain_text", "text": "Merge", "emoji": true },
+        "value": "m-42",
+        "style": "primary",
+        "type": "button",
+        "action_ts": "1700000456.000000"
+      }
+    ]
+  }
+}

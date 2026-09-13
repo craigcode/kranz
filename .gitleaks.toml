@@ -1,0 +1,86 @@
+[extend]
+useDefault = true
+
+# Synthetic scrubber fixtures, reviewed before the one-commit import. A commit
+# fingerprint cannot refer to the commit containing its own ignore entry.
+# Require BOTH the exact file and exact detected bytes, scoped to the rule.
+# New values in these files remain findings; no path- or rule-wide exemptions.
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/hooks_test.rs:319"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/hooks_test\.rs\z''']
+regexes = ['''\Aghp_abcdefghij1234567890ABCD\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:171"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\AabcdEFGHijklMNOPqrstUVWX1234\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:184"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\Ask-AbCdEfGhIjKlMnOpQrStUvWx0123\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:388"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\Aabcd1234efgh5678\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:423"
+targetRules = ["private-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\A-----BEGIN RSA PRIVATE KEY-----\\nMIIEpAIBAAKCAQEA7x8\\nQIDAQAB\\n-----END RSA PRIVATE KEY-----\\nafter";
+    let out = scrub\(text\);
+    assert_eq!\(out, "before\\n\[REDACTED\]\\nafter"\);
+\}
+
+#\[test\]
+fn private_key_begin_line_redacted_when_end_missing\(\) \{
+    let text = "x\\n-----BEGIN OPENSSH PRIVATE KEY-----\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:467"
+targetRules = ["gcp-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\AAIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6z\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:492"
+targetRules = ["stripe-access-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\Ask_live_4eC39HqLyjWDarjtT1zdp7dc\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:493"
+targetRules = ["stripe-access-token"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\Ark_live_51H8xAbCdEfGhIjKlMnOpQrS\z''']
+
+[[allowlists]]
+description = "Synthetic scrubber fixture at crates/engine/tests/scrub_test.rs:555"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''\Acrates/engine/tests/scrub_test\.rs\z''']
+regexes = ['''\AaB3xQ9zK7mP2wR5tY8uV1nJ4kL6dF0sGhWqZ7xC\z''']

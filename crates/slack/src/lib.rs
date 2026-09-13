@@ -1,0 +1,181 @@
+#![allow(rustdoc::private_intra_doc_links)]
+
+//! Kranz Slack Socket Mode bridge (design: docs/backlog-and-slack.md).
+//!
+//! Socket Mode means the bridge opens an **outbound** websocket to Slack (the
+//! `wss://` URL comes from `apps.connections.open`, authorized by an app-level
+//! token), so there is no public URL and no inbound port — the localhost trust
+//! model is preserved. The bridge:
+//!
+//! - **posts** mission notifications to a channel (plan ready, ticket needs
+//!   context, milestone blocked, mission complete/failed), one Slack thread per
+//!   mission, threading persisted so restarts re-thread; and
+//! - **handles** inbound interactions over the same socket (approve button →
+//!   queue, threaded reply → orchestrator guidance, `/kranz ticket <title>` →
+//!   scaffold a ticket).
+//!
+//! The bridge is **opt-in**: unless a bot token, app token, and channel are all
+//! configured (env or `~/.kranz/config.json`), [`serve_slack`] logs and returns
+//! immediately.
+//!
+//! ## Wiring into the CLI
+//!
+//! `kranz serve --slack` should spawn the bridge alongside the REST/WS server.
+//! The single entry point is:
+//!
+//! ```no_run
+//! # async fn wire(repo_root: std::path::PathBuf, host: Option<kranz_slack::SharedHost>) -> anyhow::Result<()> {
+//! let shutdown = async { /* your Ctrl-C / server-shutdown future */ };
+//! kranz_slack::serve_slack(&repo_root, host, shutdown).await?;
+//! # Ok(()) }
+//! ```
+//!
+//! `serve_slack` runs until `shutdown` resolves (or returns immediately when the
+//! bridge is unconfigured), so spawn it on its own task and fire `shutdown` when
+//! the server stops.
+
+pub(crate) mod approve_flow;
+pub mod bridge;
+pub mod catalog;
+pub mod client;
+pub(crate) mod commands;
+pub mod config;
+pub(crate) mod dispatch;
+pub mod format;
+pub mod health;
+pub mod host;
+pub mod inbound;
+pub mod outbound;
+pub mod outbound_engine;
+pub mod threads;
+
+pub use catalog::{SlackCatalog, SlackRepo, SlackRoute};
+pub use client::SlackClient;
+pub use config::{NotifyFlags, SlackConfig};
+pub use host::{AskOutcome, PlanOutcome, PlanningHost, SharedHost};
+
+use anyhow::Result;
+use std::path::Path;
+
+/// Start the Slack bridge for `repo_root`, running until `shutdown` resolves.
+///
+/// Resolves the config ([`SlackConfig::from_config`]); if the bridge is
+/// unconfigured, logs `slack not configured` and returns `Ok(())` immediately.
+/// Otherwise runs the outbound tailing loop and the inbound Socket Mode loop
+/// concurrently, both watching `shutdown`.
+///
+/// `shutdown` is any future that resolves when the host wants the bridge to
+/// stop (e.g. a Ctrl-C signal or a server-shutdown broadcast). It is fanned out
+/// to both loops via a shared notify, so a single trigger stops both.
+/// `host` is the hosted-engine registry adapter (`kranz serve --slack` passes
+/// one over the same `MissionHost` the web UI uses); `None` degrades the
+/// planning-conversation / plan-review / approve-and-start surfaces to honest
+/// refusals that point at the CLI.
+pub async fn serve_slack(
+    repo_root: &Path,
+    host: Option<SharedHost>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let Some(cfg) = SlackConfig::from_config(repo_root)? else {
+        tracing::info!("slack not configured; bridge disabled");
+        return Ok(());
+    };
+    tracing::info!(channel = %cfg.channel, "starting slack bridge");
+
+    let client = SlackClient::new(&cfg)?;
+    let threads = bridge::SharedThreads::load(repo_root)?;
+
+    // Fan the single shutdown future out to both loops via a notify.
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let out_notify = notify.clone();
+    let in_notify = notify.clone();
+    let out_shutdown = async move { out_notify.notified().await };
+    let in_shutdown = async move { in_notify.notified().await };
+
+    let repo_out = repo_root.to_path_buf();
+    let repo_in = repo_root.to_path_buf();
+    let cfg_out = cfg.clone();
+    let cfg_in = cfg;
+    let client_out = client.clone();
+    let client_in = client;
+    let threads_out = threads.clone();
+    let threads_in = threads;
+
+    let outbound =
+        outbound_engine::run_bridge(cfg_out, client_out, repo_out, threads_out, out_shutdown);
+    let inbound = bridge::run_socket(cfg_in, client_in, repo_in, threads_in, host, in_shutdown);
+
+    // Wait for the external shutdown, then fire the notify so both loops stop.
+    tokio::pin!(shutdown);
+    tokio::join!(
+        async {
+            shutdown.await;
+            notify.notify_waiters();
+        },
+        outbound,
+        inbound,
+    );
+    Ok(())
+}
+
+/// Start one Socket Mode bridge for an operator-owned repository catalog.
+/// Each healthy repository keeps its own outbound cursor while inbound
+/// envelopes are resolved once through [`SlackCatalog`].
+pub async fn serve_slack_catalog(
+    catalog: SlackCatalog,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let repos: Vec<_> = catalog
+        .repos()
+        .filter(|repo| repo.is_healthy() && repo.primary_route().is_some())
+        .collect();
+    let Some(first) = repos.first() else {
+        anyhow::bail!("Slack catalog has no healthy repository with a channel route");
+    };
+    let first_route = first.primary_route().expect("filtered above");
+    let Some(base_cfg) =
+        SlackConfig::from_config_for_channel(&first.root, &first_route.channel_id)?
+    else {
+        tracing::info!("slack not configured; bridge disabled");
+        return Ok(());
+    };
+    let client = SlackClient::new(&base_cfg)?;
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut tasks = Vec::new();
+
+    for repo in repos {
+        let route = repo.primary_route().expect("filtered above");
+        let mut cfg = base_cfg.clone();
+        cfg.channel = route.channel_id.clone();
+        cfg.allow_users =
+            SlackConfig::merge_repo_allow_users(&base_cfg.allow_users, &repo.allow_users);
+        cfg.dashboard_url = cfg
+            .dashboard_url
+            .as_deref()
+            .map(|base| format::dashboard_repo_url(base, &repo.id));
+        let threads = catalog.scoped_threads(&repo.id, &route.team_id, &route.channel_id);
+        let task_stop = stop.clone();
+        tasks.push(tokio::spawn(outbound_engine::run_bridge(
+            cfg,
+            client.clone(),
+            repo.root.clone(),
+            threads,
+            async move { task_stop.notified().await },
+        )));
+    }
+
+    let inbound_stop = stop.clone();
+    let inbound = tokio::spawn(bridge::run_catalog_socket(
+        base_cfg,
+        client,
+        catalog,
+        async move { inbound_stop.notified().await },
+    ));
+    shutdown.await;
+    stop.notify_waiters();
+    for task in tasks {
+        let _ = task.await;
+    }
+    let _ = inbound.await;
+    Ok(())
+}

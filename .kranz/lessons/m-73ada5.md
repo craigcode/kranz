@@ -1,0 +1,3 @@
+When a command-type validation-contract assertion must prove ABSENCE (e.g. "no committed file leaks an email/home path"), never use a leadi…
+
+When a command-type validation-contract assertion must prove ABSENCE (e.g. "no committed file leaks an email/home path"), never use a leading shell `!` for negation — Kranz executes each assertion command without a shell, so `! grep ...` fails preflight with `'!' not found on PATH` and the assertion may not enforce anything. Encode the negation in the command's own exit code instead: use `grep -L`, or commit a `check-*.sh` wrapper inside the touch set that returns 0 on absence.

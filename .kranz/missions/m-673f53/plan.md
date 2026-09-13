@@ -1,0 +1,119 @@
+# Mission plan — m-673f53
+
+**Goal:** Ship the pipeline view: one dashboard screen with one row per work item rendering the nine-stage model (chips, inline plan+estimate at Reviewable, report+diff+UNMERGED at Delivered, one primary action per row), plus the D-A Queue verb rename and ticket capture from both the dashboard form and a Slack /kranz ticket new modal.
+
+Branch `kranz/mission-m-673f53` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$13.04 – $65.22** (expected ~$26.09). Rough estimate — live usage is authoritative; based on 17 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** GET /api/tickets and GET /api/tickets/:slug expose the ticket's originating mission id (missionId) whenever a mission was recorded for it, so a ticket row can fold in its mission-backed stages; and POST /api/tickets creates a ticket file from {slug,title,goal,context}, rejecting an invalid slug (400) and a duplicate slug (409), after which the new ticket appears in GET /api/tickets. 
+  `cargo test -p kranz-server pipeline`
+- **[a2]** The CLI exposes `kranz ticket queue <slug>` as the canonical ticket-queueing verb (same behaviour and blocked-by gate as the old approve), with `kranz ticket approve` retained as a working deprecated alias. 
+  `cargo test -p kranz queue_alias`
+- **[a3]** Slack routing exposes `/kranz queue <slug>` as a ticket-queueing verb (approve retained as deprecated alias) and `/kranz ticket new <slug> <title...>` that opens a goal/context modal whose view_submission creates the ticket through serve. 
+  `cargo test -p kranz-slack pipeline`
+- **[a4]** A pure stage-derivation function maps every backing state — ticket state (new/drafting/needs-context/review/queued) and, once a mission exists, mission status plus the merged bit — to exactly one of the nine stages (Captured, Drafting, Needs you, Reviewable, Queued, Running, Delivered, Landed, Failed) with the stage's designated primary action, including the Delivered (complete+unmerged) vs Landed (complete+merged) split. 
+  `npm --prefix apps/dashboard test -- pipelineStage`
+- **[a5]** The pipeline view renders one row per work item with its stage chip, a single primary action, the UNMERGED badge only at Delivered, the isBlocked badge at Captured/Reviewable, and ticket-queueing labelled 'Queue' (never 'Approve'); it is the dashboard's default screen and the old two-separate-lists default (MissionPicker + BacklogPanel as the landing view) is gone. 
+  `npm --prefix apps/dashboard test -- PipelineView`
+- **[a6]** The dashboard typechecks and builds cleanly (tsc -b && vite build) with the new pipeline view, artifacts, actions, and new-ticket form in place. 
+  `npm --prefix apps/dashboard run build`
+- **[a7]** The whole Rust workspace test suite passes — the new REST projection, create endpoint, and renamed verbs introduce no regressions in the engine, server, CLI, or Slack crates. 
+  `cargo test --workspace`
+- **[a8]** The pipeline view is a single flat list that replaces the two disconnected lists: every row shows one obvious primary action for its stage (Captured→Draft, Reviewable→Queue with Reshape offered secondarily, Delivered→Merge-link/Iterate, Landed→Iterate, Failed→Redraft), no row requires nested navigation to reach its gate, and 'Approve' survives only on the plan-approval gate — never on ticket-queueing. *(agent judgement)*
+- **[a9]** Inline artifacts render at the right stages from the existing REST endpoints: plan.md plus its persisted cost estimate at Reviewable, and report.md plus the diff-stat at Delivered; Reviewable and Delivered are readable in place without leaving the pipeline screen. *(agent judgement)*
+- **[a10]** Iterate (offered at Delivered and Landed) creates a follow-up ticket pre-seeded with the finished mission's report and the operator's one-line direction via POST /api/tickets; Merge at Delivered is a non-mutating 'Merge-link' affordance that deep-links to the mission (no merge is performed this mission); Reshape at Reviewable links to the ticket's draft surface. *(agent judgement)*
+
+## Milestone 1 — Backend pipeline foundation & Queue verb rename
+
+### 1.1 Expose the originating mission on ticket REST projections
+
+In crates/server/src/tickets.rs, both ticket_summary_json (used by GET /api/tickets) and ticket_full_json (used by GET /api/tickets/:slug) must include a new field `missionId`: the mission id recorded for the ticket, obtained via kranz_engine::ticket::Ticket::mission_for(repo_root, slug) (returns Option<String>). Serialize it as JSON `missionId` (camelCase, null/absent when no mission recorded). This is the join key the dashboard pipeline view uses to fold a ticket's mission-backed stages (Running/Delivered/Landed) and pull its report/diff/merged bit; GET /api/missions already returns id, status, goal, createdAt, and the merged bit, so no aggregate endpoint is needed. Also update the TypeScript contract mirror in apps/dashboard/src/lib/types.ts: add `missionId?: string` to both TicketSummary and Ticket interfaces (keep the CONTRACT MIRROR discipline noted at the top of that file). Do not change any other ticket field. Add Rust tests in crates/server/src/tickets.rs whose names begin with `pipeline_` proving: (1) a ticket with a recorded mission id surfaces it as `missionId` in both the summary and full projections; (2) a ticket with no recorded mission omits it or serializes null. Use the existing test scaffolding patterns in the crate (a temp repo dir with a scaffolded ticket and a written status file via Ticket::record_mission).
+
+Done when:
+- A `pipeline_`-prefixed test asserts GET /api/tickets summary JSON for a ticket with a recorded mission contains missionId equal to that mission id
+- A `pipeline_`-prefixed test asserts GET /api/tickets/:slug full JSON contains the same missionId
+- A `pipeline_`-prefixed test asserts a ticket with no recorded mission yields null/absent missionId in both projections
+- apps/dashboard/src/lib/types.ts TicketSummary and Ticket both declare missionId as an optional string
+
+### 1.2 POST /api/tickets create endpoint
+
+Add a token-gated `POST /api/tickets` handler in crates/server/src/tickets.rs and register its route in crates/server/src/lib.rs alongside the existing ticket routes (mirror how the mutating draft/approve routes are wired and gated — the same token gate those use). Request body JSON: {"slug":string, "title":string, "goal":string (optional), "context":string (optional)}. It must scaffold `.kranz/tickets/<slug>.md` by reusing the engine's existing ticket-new logic — prefer calling the same code path the CLI uses (kranz_cli::backlog::cmd_ticket_new or the underlying engine::ticket helper it delegates to); if that function lives in the CLI crate and is not reachable from the server, factor the pure scaffold logic into crates/engine/src/ticket.rs and call it from both, rather than duplicating the template. Validation: reject an invalid slug with 400 (use Ticket::ensure_valid_slug), reject an already-existing slug with 409, and on success write goal/context into the scaffolded ticket and return 201 with the created ticket's summary JSON (same shape as a GET /api/tickets row, including state=new and missionId absent). The goal/context must actually land in the ticket body so a subsequent GET /api/tickets/:slug returns them. Add Rust tests named with a `pipeline_` prefix in crates/server/src/tickets.rs proving: create succeeds and the ticket then appears in the list with state new; invalid slug → 400; duplicate slug → 409; goal/context round-trip through GET /api/tickets/:slug.
+
+Done when:
+- A `pipeline_`-prefixed test posts a valid body and asserts 201 plus the ticket appearing in GET /api/tickets with state new
+- A `pipeline_`-prefixed test asserts an invalid slug returns 400 and a duplicate slug returns 409
+- A `pipeline_`-prefixed test asserts goal and context supplied at create time are readable via GET /api/tickets/:slug
+- The endpoint is registered in crates/server/src/lib.rs and gated by the same token mechanism as the other ticket mutations
+
+### 1.3 D-A Queue verb rename in CLI and Slack
+
+Implement decision D-A (docs/scoping/pipeline-view.md): 'Queue' is the ticket-queueing verb; 'Approve' is reserved for plan approval. Do NOT touch the plan-approval path. CLI (crates/cli/src/, see backlog.rs and the command/arg definitions in cli.rs/commands.rs): add `kranz ticket queue <slug>` performing exactly what `kranz ticket approve <slug>` does today (same kranz_engine::deps::approve_ticket gate, same blocked-by behaviour, same output), and keep `kranz ticket approve` working as a deprecated alias (a one-line deprecation note to stderr is fine). Slack (crates/slack/src/inbound.rs): add a `/kranz queue <slug>` subcommand routing to the same Action the current `/kranz approve <slug>` routes to (see the approve handling around the strip_ci_prefix(text, "approve") branch), and keep `/kranz approve <slug>` as a deprecated alias. Both queue verbs must remain spend/allowlist-gated identically to approve. Add tests: in the CLI crate (package name `kranz`) name them with a `queue_alias` substring proving `ticket queue` resolves to the same action/behaviour as `ticket approve` and that `approve` still parses; in crates/slack/src/inbound.rs name them with a `pipeline_` prefix proving `/kranz queue <slug>` routes to the queue/approve Action and `/kranz approve <slug>` still routes to it as the deprecated alias.
+
+Done when:
+- A CLI test whose name contains `queue_alias` asserts `kranz ticket queue <slug>` parses to the same command as `kranz ticket approve <slug>`
+- A CLI test asserts `kranz ticket approve` still parses (deprecated alias retained)
+- A `pipeline_`-prefixed Slack test asserts `/kranz queue <slug>` routes to the ticket-queueing Action
+- A `pipeline_`-prefixed Slack test asserts `/kranz approve <slug>` still routes to the same Action as a deprecated alias
+
+
+## Milestone 2 — The pipeline view — one screen, nine stages
+
+### 2.1 Stage-derivation model and WorkItem type
+
+Create apps/dashboard/src/lib/pipelineStage.ts exporting: (1) a `PipelineStage` union of the nine stage keys — 'captured' | 'drafting' | 'needs-you' | 'reviewable' | 'queued' | 'running' | 'delivered' | 'landed' | 'failed'; (2) a `WorkItem` type that represents one row and can originate from either a ticket (with its optional joined mission) OR a ticketless mission; (3) a pure function `pipelineStage(item: WorkItem): PipelineStage` and a `primaryAction(stage)` (or a combined descriptor) naming the one primary action per stage. Mapping rules, per docs/scoping/pipeline-view.md 'The stage model': ticket state new→captured, drafting→drafting, needs-context→needs-you, review→reviewable, queued→queued. Once the ticket has a missionId (or the item is a ticketless mission), the mission status governs the tail: running/paused/blocked/validating→running; complete & merged===false→delivered; complete & merged===true→landed; failed (mission) or ticket state failed→failed. The Delivered-vs-Landed split MUST use the mission's merged bit from GET /api/missions (true=landed, false/null=delivered). Primary actions per stage: captured→Draft, drafting→(none / watch), needs-you→Answer+redraft, reviewable→Queue (Reshape offered secondarily), queued→(none / reorder-later), running→(none / steer via detail), delivered→Merge-link + Iterate, landed→Iterate, failed→Redraft. Add apps/dashboard/src/lib/pipelineStage.test.ts (filename contains 'pipelineStage') exhaustively asserting the mapping for every backing state including both Delivered (unmerged) and Landed (merged), and that primaryAction returns the documented action for each stage. Do not build any React component in this feature — pure logic + types + tests only.
+
+Done when:
+- pipelineStage.test.ts asserts each ticket state (new, drafting, needs-context, review, queued) maps to its stage
+- pipelineStage.test.ts asserts a complete mission with merged=false maps to 'delivered' and merged=true maps to 'landed'
+- pipelineStage.test.ts asserts running/paused/blocked/validating map to 'running' and failed maps to 'failed'
+- pipelineStage.test.ts asserts primaryAction returns the documented primary action for each of the nine stages
+
+### 2.2 PipelineView screen as the default route
+
+Create apps/dashboard/src/components/PipelineView.tsx: one flat list, one row per work item. Data: fetch GET /api/tickets and GET /api/missions (reuse the existing store/api helpers in apps/dashboard/src/lib/), then build WorkItem rows = every ticket (joining its mission by missionId to obtain mission status + merged), UNION every mission that has no originating ticket (so nothing is hidden — e.g. missions created via `kranz new`). Determine each row's stage via pipelineStage() from the sibling feature and render: a stage chip (reuse the existing status-pill / status-dot styling in styles.css), the slug or mission id (mono), the title/goal, and exactly ONE primary action button per row for its stage. Wire the live actions that already have backends: Captured→'Draft' (existing draftTicket), Reviewable→'Queue for run' (existing approve/queue path — the button copy MUST read 'Queue', never 'Approve'; carry the existing blocked-by disable+title behaviour). For stages whose mutation is not built this mission, render the affordance as a non-mutating link: Delivered/Landed→'Iterate' and 'Merge' (Merge deep-links to the mission detail #/m/<id>), Reviewable→'Reshape' (links to the ticket detail #/backlog/<slug>), Failed→'Redraft' (links to draft). Show the isBlocked badge at Captured and Reviewable (reuse ticket-blocker-badge). Make this component the dashboard's DEFAULT screen: update apps/dashboard/src/App.tsx so the '' route renders PipelineView instead of MissionPicker, and remove the two-separate-lists landing (MissionPicker + BacklogPanel as the default view) — keep the mission detail (#/m/:id), ticket detail (#/backlog/:slug), and new (#/new) routes working, and keep RunQueueButton available on the pipeline screen. Do NOT implement inline plan/report artifacts here (next feature). Add apps/dashboard/src/components/PipelineView.test.tsx (filename contains 'PipelineView') asserting: rows render one per work item from a mocked tickets+missions fetch; each row shows exactly one primary action for its stage; the Reviewable action button text is 'Queue'/'Queue for run' and no ticket-queueing control reads 'Approve'; ticketless missions appear as rows; and mounting App at the default hash renders the pipeline (not the old MissionPicker landing).
+
+Done when:
+- PipelineView.test.tsx asserts one row per work item is rendered from mocked GET /api/tickets + GET /api/missions, including a ticketless mission
+- PipelineView.test.tsx asserts each row renders exactly one primary action appropriate to its stage
+- PipelineView.test.tsx asserts the Reviewable ticket-queueing button reads 'Queue' (or 'Queue for run') and no queueing control reads 'Approve'
+- PipelineView.test.tsx asserts the default hash route renders PipelineView and not the previous two-list MissionPicker landing
+
+### 2.3 Inline artifacts, UNMERGED badge, and Iterate-to-ticket
+
+Extend PipelineView (building on the previous feature) with the inline reading surfaces and the Iterate mutation. Reviewable rows: fetch and render the plan inline from GET /api/missions/:id/plan.md (markdown via the existing renderMarkdown helper) together with the persisted cost estimate (the estimate lives in the plan header / is available from the plan endpoints — surface low/expected/high USD). Delivered rows (mission complete & merged===false): render the report inline from GET /api/missions/:id/report.md and the diff summary from GET /api/missions/:id/diff-stat, and show a mandatory 'UNMERGED' badge; Landed rows (merged===true) must NOT show the UNMERGED badge. Keep these readable in place (an expandable/inline section on the row — no navigation away). Iterate action (Delivered and Landed): one tap creates a follow-up ticket via POST /api/tickets (built in milestone 1), pre-seeded with the finished mission's report as context plus a one-line direction the operator types inline; on success route to the new ticket/row. Merge stays a non-mutating deep-link to #/m/<id> (no merge performed this mission). Add assertions to PipelineView.test.tsx (or a sibling test whose filename contains 'PipelineView'): the UNMERGED badge appears for a complete+unmerged mission row and is absent for a complete+merged row; a Reviewable row requests plan.md and shows the estimate; a Delivered row requests report.md and diff-stat; clicking Iterate with a typed direction issues POST /api/tickets carrying the report-derived context.
+
+Done when:
+- A PipelineView test asserts the UNMERGED badge renders for a complete mission with merged=false and is absent when merged=true
+- A PipelineView test asserts a Reviewable row fetches plan.md and displays the persisted estimate (low/expected/high)
+- A PipelineView test asserts a Delivered row fetches report.md and diff-stat and renders them inline
+- A PipelineView test asserts clicking Iterate with a one-line direction POSTs to /api/tickets with the mission's report seeded into the new ticket's context
+
+
+## Milestone 3 — Ticket capture on both surfaces
+
+### 3.1 Dashboard new-ticket form
+
+Add a new-ticket capture form to the dashboard that POSTs to POST /api/tickets (built in milestone 1). Create apps/dashboard/src/components/NewTicket.tsx with fields: slug, title, goal (multiline), context (multiline). Reach it from the pipeline view via a clear '+ new ticket' affordance (mirror the existing '+ new mission' button styling in the picker title area / styles.css). On submit call the create endpoint through the existing api/store helpers; surface a 400 (invalid slug) and 409 (duplicate slug) inline as a readable error (reuse picker-error styling and the TokenPrompt 401 flow already global in App.tsx); on success navigate to the new ticket's row/detail so the operator sees it captured. Wire a route for it (e.g. hash '#/new-ticket') in App.tsx or render it inline from the pipeline screen — either is fine as long as it is reachable in one tap from the pipeline view and does not disturb the existing '#/new' new-mission route. Add apps/dashboard/src/components/NewTicket.test.tsx (filename contains 'NewTicket') asserting: submitting valid fields issues POST /api/tickets with the entered slug/title/goal/context; a 409 response renders a duplicate-slug error without navigating; a successful create navigates to the created ticket.
+
+Done when:
+- NewTicket.test.tsx asserts a valid submission issues POST /api/tickets carrying slug, title, goal, and context
+- NewTicket.test.tsx asserts a 409 duplicate-slug response renders an inline error and does not navigate away
+- NewTicket.test.tsx asserts a successful create routes to the new ticket
+- The new-ticket form is reachable in one action from the pipeline view and the existing '#/new' new-mission route is unchanged
+
+### 3.2 Slack /kranz ticket new modal
+
+Implement `/kranz ticket new <slug> <title...>` in the Slack bridge using the existing modal pattern (crates/slack/src/inbound.rs route_view_submission + the new-mission/config modal precedent, and crates/slack/src/bridge.rs which opens views inline because trigger_id expires ~3s after the slash). Flow: the slash command `/kranz ticket new <slug> <title...>` opens a modal (a distinct callback_id, e.g. a NEW_TICKET_CALLBACK_ID constant) with multiline inputs for goal and context, carrying the slug and title (pre-filled from the command text) through so the view_submission can reconstruct them; the view_submission routes to a new Action (e.g. Action::NewTicketModal / an extension of the existing NewTicket action) that creates the ticket by POSTing to serve's POST /api/tickets endpoint — the bridge must NOT scaffold on the socket loop; follow the hosted-action pattern noted for other spend/hosted verbs (synchronous ack/gate phase kept separate from the POST-to-serve phase, per the crate's existing draft/new handling). Keep the current single-line `/kranz ticket <title>` scaffold behaviour working (do not break existing tests). Add tests in crates/slack/src/inbound.rs named with a `pipeline_` prefix proving: `/kranz ticket new <slug> <title...>` produces the open-modal Action with the slug/title carried; and a matching view_submission payload (the new callback_id, with goal/context values) routes to the create-ticket Action carrying slug, title, goal, and context.
+
+Done when:
+- A `pipeline_`-prefixed Slack test asserts `/kranz ticket new <slug> <title...>` routes to an open-modal Action carrying the slug and title
+- A `pipeline_`-prefixed Slack test asserts the modal's view_submission (its callback_id) routes to a create-ticket Action carrying slug, title, goal, and context
+- A `pipeline_`-prefixed Slack test asserts the existing single-line `/kranz ticket <title>` behaviour still routes as before
+

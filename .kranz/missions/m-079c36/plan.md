@@ -1,0 +1,181 @@
+# Mission plan — m-079c36
+
+**Goal:** M7 tier 1: when workerIsolation=worktree, every worker and validator session runs in a dedicated git worktree and all mission-branch mutations happen in a mission integration worktree, so the primary checkout never changes branches and is byte-untouched across an entire mission; workerIsolation=checkout preserves today's behavior byte-for-byte and is the default this mission.
+
+Branch `kranz/mission-m-079c36` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$10.97 – $54.84** (expected ~$21.94). Rough estimate — live usage is authoritative; based on 26 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** With workerIsolation=worktree, the primary checkout is left byte-untouched across an entire mission (plan approval through completion): its HEAD sha, its current branch, and its tracked-tree porcelain status are identical before the mission starts and after it ends. 
+  `cargo test --workspace --test worktree_isolation primary_checkout_untouched_in_worktree_mode 2>&1 | grep -qE 'test result: ok\.'`
+- **[a2]** With workerIsolation=worktree, a sequential worker session is spawned with a cwd that is the mission integration worktree directory, never the primary repo root. 
+  `cargo test --workspace --test worktree_isolation worker_session_cwd_is_worktree 2>&1 | grep -qE 'test result: ok\.'`
+- **[a3]** With workerIsolation=worktree, validator sessions are spawned with a cwd inside a git worktree, never the primary repo root. 
+  `cargo test --workspace --test worktree_isolation validator_session_cwd_is_worktree 2>&1 | grep -qE 'test result: ok\.'`
+- **[a4]** The workerIsolation config key parses from camelCase JSON, defaults to "checkout" when absent, accepts exactly "worktree" and "checkout", and is rejected by config loading/validation for any other value. 
+  `cargo test --workspace --test worktree_isolation worker_isolation_config 2>&1 | grep -qE 'test result: ok\.'`
+- **[a5]** With workerIsolation=checkout (the default), the sequential run path is behaviorally unchanged: workers run with cwd = primary repo root and the mission branch is checked out in the primary tree, exactly as before this mission. 
+  `cargo test --workspace --test worktree_isolation checkout_mode_runs_worker_in_primary_root 2>&1 | grep -qE 'test result: ok\.'`
+- **[a6]** With workerIsolation=worktree, the mission branch accumulates the mission's feature commits/merges (deliverables land on the mission branch) even though the primary checkout never checked that branch out. 
+  `cargo test --workspace --test worktree_isolation mission_branch_carries_deliverables_in_worktree_mode 2>&1 | grep -qE 'test result: ok\.'`
+- **[a7]** With workerIsolation=worktree, KRANZ_BASE_SHA still reaches the worker session env, the validator session env, and the final-gate contract-command env (the base-sha pin is not regressed by the worktree routing). 
+  `cargo test --workspace --test worktree_isolation base_sha_reaches_sessions_in_worktree_mode 2>&1 | grep -qE 'test result: ok\.'`
+- **[a8]** With workerIsolation=worktree, the mission integration worktree and every per-feature worktree/branch are removed and pruned by mission end, leaving no leaked worktrees registered on the repo. 
+  `cargo test --workspace --test worktree_isolation worktrees_removed_at_mission_end_in_worktree_mode 2>&1 | grep -qE 'test result: ok\.'`
+- **[a9]** With workerIsolation=worktree, no code path in run(), approve_plan, the parallel merge-back, validation, or the final gate checks out the mission branch in, commits to, or otherwise mutates the tracked contents of the primary checkout; the primary tree is used only for gitignored runtime state (events.jsonl/state.json/runs/control). *(agent judgement)*
+- **[a10]** The entire workspace test suite passes, so the worktree routing introduces no regressions elsewhere in the engine. 
+  `cargo test --workspace 2>&1 | grep -qE 'test result: ok\.'`
+
+## Milestone 1 — Isolation config + mission integration-worktree primitive
+
+### 1.1 Add workerIsolation config (worktree|checkout, default checkout)
+
+Add a new mission-config key `workerIsolation` to select how worker/validator sessions are isolated. This feature ONLY adds the config surface; nothing consumes it yet.
+
+Files: crates/engine/src/types.rs (MissionConfig + a new enum), crates/engine/src/config.rs (validation + tests), and a NEW integration test file crates/engine/tests/worktree_isolation.rs.
+
+1. In types.rs, define `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "lowercase")] pub enum WorkerIsolation { Worktree, Checkout }` with `impl Default for WorkerIsolation { fn default() -> Self { WorkerIsolation::Checkout } }`. Add a field to `MissionConfig`: `pub worker_isolation: WorkerIsolation` (serde will render it as camelCase `workerIsolation` because MissionConfig already uses `#[serde(rename_all = "camelCase", default)]`). Add `worker_isolation: WorkerIsolation::Checkout` to MissionConfig's `Default` impl (the block starting near types.rs:383). Add a helper `impl MissionConfig { pub fn isolation(&self) -> WorkerIsolation { self.worker_isolation } }` if convenient, but a public field is sufficient.
+
+2. Confirm config loading works with the existing deep-merge/from_value path in config.rs (an unknown enum string will fail `serde_json::from_value` and surface as `EngineError::Config("merged configuration does not deserialize: ...")` — that is the desired rejection). You do NOT need to add a bespoke branch to `config::validate` unless a clearer error message is wanted; if you add one, keep it consistent with the existing messages.
+
+3. Default MUST be `checkout` this mission (a soak precedes flipping the default to worktree in a later mission). Do not change any runtime behavior.
+
+Encode these tests in crates/engine/tests/worktree_isolation.rs (public API only: `kranz_engine::config::load_layers`, `kranz_engine::types::MissionConfig`, `WorkerIsolation`). All test fn names for this feature MUST start with `worker_isolation_config` so a single filter selects them:
+- `worker_isolation_config_defaults_to_checkout`: `MissionConfig::default().worker_isolation == WorkerIsolation::Checkout`, and a config file that omits the key still yields `Checkout` (write a temp `{"maxRespawns":3}` layer, load via `load_layers`, assert Checkout).
+- `worker_isolation_config_parses_worktree`: a temp layer `{"workerIsolation":"worktree"}` loads to `WorkerIsolation::Worktree`.
+- `worker_isolation_config_serializes_camel_case`: `serde_json::to_value(MissionConfig::default())["workerIsolation"] == "checkout"`.
+- `worker_isolation_config_rejects_unknown`: a temp layer `{"workerIsolation":"sandbox"}` makes `load_layers` return `Err`.
+
+Run `cargo test --workspace --test worktree_isolation worker_isolation_config 2>&1 | grep -qE 'test result: ok\.'` and the full `cargo test --workspace` before reporting.
+
+Done when:
+- `WorkerIsolation` enum exists with variants worktree|checkout and Default = Checkout, and MissionConfig has a `worker_isolation` field serialized as camelCase `workerIsolation` defaulting to checkout
+- Tests named `worker_isolation_config_*` in crates/engine/tests/worktree_isolation.rs prove: default is checkout, an omitted key stays checkout, "worktree" parses, camelCase serialization emits "checkout", and an unknown value is rejected by load_layers
+- No runtime behavior changes: the full `cargo test --workspace` suite passes
+
+### 1.2 Mission integration-worktree lifecycle primitive
+
+Provide the primitive that later features use to run all mission-branch work in a dedicated worktree instead of the primary checkout. This feature adds git plumbing + an orchestrator helper and its own unit tests; it does NOT yet re-route run()/workers/validators (that is the next milestone).
+
+Files: crates/engine/src/git_ops.rs, crates/engine/src/orchestrator.rs, and tests in crates/engine/tests/worktree_isolation.rs (and/or a git_ops test).
+
+1. In git_ops.rs, add a method to check out an EXISTING branch into a new worktree (the existing `add_worktree` uses `-b` to create a NEW branch, which is wrong for the mission branch which already exists): 
+`pub fn add_worktree_checkout(&self, path: &Path, branch: &str) -> Result<()>` running `git worktree add <path> <branch>` (no `-b`). Mirror the existing `add_worktree` guards: reject a flag-shaped `branch` (leading '-') before spawning git; build the arg vector with OsString and `path.as_os_str()`; shell out via the existing `run_os`. Document that the branch must not already be checked out in another worktree (git enforces this).
+
+2. In orchestrator.rs, add a helper (near `parallel_worktree_path` at ~:3350) `fn mission_worktree_path(mission_id: &str) -> PathBuf` returning a stable per-mission integration-worktree directory OUTSIDE the repo tree, namespaced like the parallel ones (reuse the same temp-dir base `parallel_worktree_path` uses; e.g. `<tmp>/kranz-worktrees/<mission>/_integration`). It must not collide with any `parallel_worktree_path(mission_id, feature_id)`.
+
+3. Add an orchestrator method `fn setup_mission_worktree(&self) -> Result<(PathBuf, GitRepo)>` that: ensures the mission branch exists (create it off `state.mission.base_sha` — or `base_branch` when base_sha is None — if missing, WITHOUT checking it out in the primary tree), removes any stale integration worktree at `mission_worktree_path` (idempotent via the existing `remove_worktree`), then `add_worktree_checkout`s the mission branch into that path, and returns the path plus a `GitRepo::open(path)`. Add `fn teardown_mission_worktree(&self)` that removes the integration worktree and calls `prune_worktrees()`, best-effort and idempotent (log warnings on failure like the parallel cleanup guard at ~:1749-1762). Do NOT call these from run() yet.
+
+4. Extend the existing crash-recovery sweep in `resume()` (~:400-416) so it also removes a leaked integration worktree (`mission_worktree_path`) and prunes — mirroring how it already reaps `kranz/wt/<mission>/*`.
+
+Tests (public API is limited, so it is fine to put these as `#[cfg(test)]` unit tests inside orchestrator.rs/git_ops.rs where private helpers are reachable, PLUS at least one black-box test in crates/engine/tests/worktree_isolation.rs using `kranz_engine::git_ops::GitRepo` on a temp repo):
+- git_ops: `add_worktree_checkout` puts an existing branch into a new worktree whose HEAD equals that branch's tip; a flag-shaped branch is rejected; a second checkout of the same branch fails (git's rule).
+- setup/teardown: setup creates the worktree on the mission branch without moving the primary checkout's branch; teardown removes it and `list_worktrees()` no longer contains it.
+
+Run the full `cargo test --workspace` before reporting.
+
+Done when:
+- git_ops has `add_worktree_checkout(path, branch)` that checks out an existing branch into a new worktree (no `-b`), guards flag-shaped branch names, and is proven by a test to create a worktree at the branch tip and to reject a flag-shaped branch
+- orchestrator has `mission_worktree_path`, `setup_mission_worktree`, and `teardown_mission_worktree`; setup creates the integration worktree on the mission branch WITHOUT changing the primary checkout's current branch, and teardown removes+prunes it (proven by a test using GitRepo::list_worktrees on a temp repo)
+- The resume() crash-recovery sweep also reaps a leaked integration worktree; the full `cargo test --workspace` suite passes
+
+
+## Milestone 2 — Route all mission-branch work through the integration worktree in worktree mode
+
+### 2.1 Sequential worker + run() loop route to the integration worktree
+
+Wire the integration-worktree primitive into the sequential run path so that, in worktree mode, run() never checks out the mission branch in the primary tree and the sequential worker runs in the integration worktree. Gate EVERYTHING on `state.config.worker_isolation == WorkerIsolation::Worktree`; the checkout-mode path must stay byte-for-byte identical to today.
+
+Context (verified seams): run() is orchestrator.rs:1064; it re-asserts the mission-branch checkout in the PRIMARY tree at :1086-1103. `run_feature` (:1341) calls `runner::run_worker(...)` (:1369) which sets cwd = paths.repo_root (runner.rs:527). After the run, `run_feature` inspects `self.repo` (primary) via is_clean (:1395), commits_between (:1398-1403), diff_stat (:1404-1407), and resolve_dirty_tree commits via `self.repo.add_all_and_commit` (:1477-1478). `runner::run_worker_in` (runner.rs:554) already exists to override the worker cwd.
+
+Implement an 'active tree' abstraction on the orchestrator:
+1. Add fields to hold the current mission tree for a run, e.g. `active_root: PathBuf` and `active_repo: GitRepo`, plus accessors `fn active_root(&self) -> &Path` and `fn active_repo(&self) -> &GitRepo`. In CHECKOUT mode these equal `self.paths.repo_root` and `self.repo`. In WORKTREE mode they equal the integration worktree path and its GitRepo (from `setup_mission_worktree`).
+2. At the top of run(): if worktree mode, replace the primary-tree branch re-assert (:1086-1103) with a call that ensures the mission branch exists and sets up the integration worktree (`setup_mission_worktree`), and set the active tree to it. Ensure `teardown_mission_worktree` runs when run() returns a terminal status (and is best-effort on early returns) — but do NOT tear down on Blocked/Paused/Reviewable returns where the mission may resume (the resume() sweep and next run() reconcile). In CHECKOUT mode, keep the existing :1086-1103 behavior exactly.
+3. In `run_feature`: when worktree mode, spawn the worker via `runner::run_worker_in(..., self.active_root(), ...)` so cwd is the integration worktree; in checkout mode keep the existing `runner::run_worker`. Replace the post-run `self.repo` mission-branch operations used for judging/committing in run_feature and resolve_dirty_tree — is_clean, commits_between, diff_stat, add_all_and_commit — with `self.active_repo()` so they operate on the integration worktree. `pre_run_sha`/HEAD reads (:1357, :1400) must also use `active_repo()`.
+4. Runtime state (events.jsonl, state.json, control/, runs/) stays under the PRIMARY `self.paths` (it is gitignored, so it is correct and stable there) — do not move it.
+
+Do not touch validators, the parallel merge, the final gate, or artifact commits in this feature (later features). Leave backend.rs untouched (SessionSpec.cwd already exists); if you believe a contract-file change is needed, report it instead of editing.
+
+Encode in crates/engine/tests/worktree_isolation.rs (use the mock backend the existing orchestrator tests use — study crates/engine/src/orchestrator.rs tests and crates/engine/src/backend_mock.rs for the harness pattern; run a small single-feature mock mission on a temp git repo):
+- `worker_session_cwd_is_worktree`: in worktree mode, the worker's spawned SessionSpec.cwd (capture it via the mock backend) is the integration worktree path and is NOT `paths.repo_root`.
+- `checkout_mode_runs_worker_in_primary_root`: in checkout mode (default), the worker cwd equals `paths.repo_root` and the primary checkout is on the mission branch after the run — asserting the legacy behavior is preserved.
+Run `cargo test --workspace --test worktree_isolation worker_session_cwd_is_worktree`, `... checkout_mode_runs_worker_in_primary_root`, and the full `cargo test --workspace`, each `2>&1 | grep -qE 'test result: ok\.'`, before reporting.
+
+Done when:
+- In worktree mode, run() sets up the integration worktree and does NOT check out the mission branch in the primary tree; the sequential worker is spawned with cwd = integration worktree (proven by `worker_session_cwd_is_worktree`)
+- All run_feature/resolve_dirty_tree mission-branch git operations (HEAD/pre_run_sha, is_clean, commits_between, diff_stat, commit) use the active (integration) repo in worktree mode
+- In checkout mode the sequential path is unchanged: worker cwd = repo_root and the mission branch is checked out in the primary tree (proven by `checkout_mode_runs_worker_in_primary_root`); the full `cargo test --workspace` suite passes
+
+### 2.2 Validators, parallel merges, milestone tags, and final gate route to the integration worktree
+
+Route the remaining mission-branch-consuming operations to the active (integration) tree in worktree mode, gated on `worker_isolation == Worktree`; checkout mode must remain byte-identical.
+
+Context (verified seams): validators are spawned from `validation_round` (~:2122) via `runner::run_validator` (runner.rs:723) whose spec cwd is hardcoded `paths.repo_root` (runner.rs:807). The final-gate contract commands run via `run_shell_command(self.paths.repo_root.as_path(), ...)` (orchestrator.rs:2483) and build env via `runner::contract_env(base_sha)` (:2466). The parallel merge-back uses `self.repo.merge_no_ff(&ws.branch)` (:1922) and reads `self.repo.head_sha()`/`commits_between` around it (:1921-1929). Milestone tag uses `self.repo.tag(...)` (:2308). Per-feature worktrees fork off the milestone start sha and are cleaned by the guard at :1749-1762 (unchanged by this feature).
+
+1. Add `runner::run_validator_in(..., session_cwd: &Path, ...)` mirroring `run_worker_in`: identical to `run_validator` except `cwd` = `session_cwd` (keep `contract_env(base_sha)` at runner.rs:824 so KRANZ_BASE_SHA is preserved). In `validation_round`, call `run_validator_in(..., self.active_root(), ...)` in worktree mode; keep `run_validator` (or call with repo_root) in checkout mode. Apply to BOTH scrutiny and functional validators and the codex-fallback retry (:2213).
+2. Parallel merge-back and milestone tag: replace `self.repo` at the merge sites (:1921-1929 head_sha/commits_between and :1922 merge_no_ff) and the tag site (:2308) with `self.active_repo()`. In worktree mode the integration worktree holds the mission branch, so `merge_no_ff` of a per-feature branch lands the merge there; in checkout mode `active_repo()` == `self.repo` so behavior is unchanged. (Per-feature worktrees, their creation off start_sha, and their cleanup guard are unchanged.)
+3. Final gate: run the contract commands in `self.active_root()` instead of `self.paths.repo_root` (orchestrator.rs:2483) so they see the merged mission-branch tree in worktree mode; keep passing `contract_env(base_sha)` unchanged so `$KRANZ_BASE_SHA` and any `git diff $KRANZ_BASE_SHA` in a contract still resolve correctly.
+4. Also re-point any remaining `self.repo` reads on the run/validation/final-gate path that are meant to reflect mission-branch state (e.g. head_sha/diff used to summarize a validation round) to `active_repo()`. Do not change reads that are intentionally about the base/primary. Do not touch backend.rs; report if a contract-file change seems required.
+
+Encode in crates/engine/tests/worktree_isolation.rs (mock backend, temp repo):
+- `validator_session_cwd_is_worktree`: in worktree mode, a spawned validator's SessionSpec.cwd is a git worktree path, not `paths.repo_root`.
+- `base_sha_reaches_sessions_in_worktree_mode`: in worktree mode, the worker session env, the validator session env, and the final-gate command env all contain `KRANZ_BASE_SHA` equal to the pinned base sha. (Model this on the existing base-sha env tests around orchestrator.rs:5021-5054 and runner::contract_env.)
+Run `cargo test --workspace --test worktree_isolation validator_session_cwd_is_worktree`, `... base_sha_reaches_sessions_in_worktree_mode`, and the full `cargo test --workspace`, each `2>&1 | grep -qE 'test result: ok\.'`, before reporting.
+
+Done when:
+- A `run_validator_in` variant exists and validators (scrutiny, functional, and the codex fallback) run with cwd = integration worktree in worktree mode (proven by `validator_session_cwd_is_worktree`), while preserving KRANZ_BASE_SHA in the validator env
+- Parallel merge-back, milestone tagging, and the final-gate contract commands operate on the active (integration) tree in worktree mode; in checkout mode all of these are byte-identical to before
+- KRANZ_BASE_SHA reaches worker, validator, and final-gate envs in worktree mode (proven by `base_sha_reaches_sessions_in_worktree_mode`); the full `cargo test --workspace` suite passes
+
+### 2.3 Committed artifacts + approval route to the worktree; deliverables stay readable
+
+Make plan/report/index commits happen on the mission branch WITHOUT touching the primary checkout, keep the primary off the mission branch from approval onward (worktree mode), and preserve operator visibility of deliverables. Gate on `worker_isolation == Worktree`; checkout mode stays byte-identical.
+
+Context (verified seams): `.kranz/missions/<id>/plan.json`, `plan.md`, `report.md`, and `.kranz/missions/index.md` are the ONLY committed mission artifacts (git ls-files confirms); `events.jsonl`, `events.jsonl.lock`, `state.json`, `runs/`, `control/` are gitignored runtime state. `approve_plan` (:690-765) creates+checks out the mission branch in the primary tree (:713-716), writes the artifacts under `self.paths` (primary), and commits them via `self.repo.commit_paths` (:756). `write_mission_report` writes report.md under `self.paths.mission_dir()` and commits via `self.repo.commit_paths` (:2688-2716). run()'s doc note (:1058-1063) says it leaves the primary on the mission branch so deliverables are visible in the working tree — that visibility must be preserved another way once the primary stays on base.
+
+1. approve_plan (worktree mode): create the mission branch off the pinned base WITHOUT `checkout` in the primary tree. To commit the plan artifacts onto the branch, set up a short-lived integration worktree (reuse `setup_mission_worktree`), write `plan.json`/`plan.md`/`index.md` into that worktree's `.kranz/...` paths, commit them there via that worktree's GitRepo (`commit_paths`), then tear the worktree down (`teardown_mission_worktree`). The pinned `base_sha` computation (:721) must be unchanged (resolve base once at approval; never re-resolve). Emit `PlanApproved { base_sha }` exactly as today. In checkout mode, keep approve_plan exactly as-is (checkout + commit in primary).
+2. write_mission_report and any milestone-time index/artifact writes (worktree mode): write and commit the artifacts in the ACTIVE integration worktree via `self.active_repo()` (during run() the integration worktree is already set up), using paths rooted at the integration worktree rather than the primary repo root. Provide a small helper to compute an artifact path under an arbitrary repo root (mirror `Paths` join logic: `<root>/.kranz/missions/<id>/report.md`, etc.) so you can target the integration worktree's tree.
+3. Deliverable visibility: in worktree mode, in addition to committing the canonical `plan.md` and `report.md` on the mission branch, ALSO write human-readable copies to the PRIMARY runtime dir `self.paths.mission_dir()/plan.md` and `/report.md` (these are untracked on the base branch — confirm they are readable via the primary tree after the mission). This replaces the old 'leave primary on the mission branch' visibility mechanism. Do not commit these primary-side copies.
+4. Update the run() doc note (:1058-1063) to describe the new worktree-mode behavior (primary stays on base; deliverables readable via the runtime dir; canonical copies on the mission branch).
+
+Do not touch backend.rs; report if a contract-file change seems required.
+
+Encode in crates/engine/tests/worktree_isolation.rs (mock backend, temp repo; run a full mock mission from approval through completion):
+- `primary_checkout_untouched_in_worktree_mode`: capture the primary checkout's `current_branch()`, `head_sha()`, and `status --porcelain --untracked-files=no` (tracked-tree) BEFORE approve_plan; run approve_plan + run() to completion in worktree mode; assert all three are byte-identical afterward (the primary never left its original branch and no tracked file changed). Use `GitRepo` read methods and/or a raw `git -C` porcelain check.
+- `mission_branch_carries_deliverables_in_worktree_mode`: after the mission, the mission branch tip contains the committed plan.json and report.md and the feature's commits, and the primary HEAD is unchanged from before the mission.
+Run `cargo test --workspace --test worktree_isolation primary_checkout_untouched_in_worktree_mode`, `... mission_branch_carries_deliverables_in_worktree_mode`, and the full `cargo test --workspace`, each `2>&1 | grep -qE 'test result: ok\.'`, before reporting.
+
+Done when:
+- In worktree mode, approve_plan creates the mission branch and commits plan.json/plan.md/index.md onto it WITHOUT checking out or committing in the primary tree; base_sha is still pinned once at approval and PlanApproved is emitted unchanged
+- In worktree mode, report.md (and milestone/index artifacts) are committed on the mission branch via the integration worktree, and human-readable plan.md/report.md copies are also written (untracked) to the primary runtime dir so deliverables remain readable after the mission
+- `primary_checkout_untouched_in_worktree_mode` proves the primary checkout's branch, HEAD sha, and tracked-tree status are byte-identical across approval-through-completion; `mission_branch_carries_deliverables_in_worktree_mode` proves the mission branch carries the deliverables; checkout mode is unchanged and the full `cargo test --workspace` suite passes
+
+
+## Milestone 3 — End-to-end guarantees, cleanup, and regression
+
+### 3.1 End-to-end worktree guarantees + checkout-mode regression + leak-free cleanup
+
+Add the end-to-end tests that lock in the mission's headline guarantees and prove no regression. This feature is primarily test-authoring against the machinery built in earlier milestones; if a test exposes a real defect, fix the minimal engine code responsible (still gated on worktree mode) and report it.
+
+All tests go in crates/engine/tests/worktree_isolation.rs using the mock backend + a temp git repo, mirroring the existing orchestrator mock-mission test harness (see orchestrator.rs #[cfg(test)] tests and backend_mock.rs). Run each full multi-feature/multi-milestone mock mission from approval to a terminal status.
+
+Encode:
+- `worktrees_removed_at_mission_end_in_worktree_mode`: after a completed worktree-mode mission (include at least one milestone that runs the parallel path by setting maxParallelWorkers>1 with >=2 independent features, AND at least one sequential feature), `GitRepo::list_worktrees()` contains ONLY the primary working tree — the integration worktree and every `kranz/wt/<mission>/*` per-feature worktree have been removed, and `prune_worktrees` leaves no dangling admin records.
+- `checkout_mode_matches_legacy_sequential` (or extend a5's test): run the SAME mock mission in checkout mode and assert the legacy invariants hold — worker cwd = repo_root, the mission branch is checked out in the primary tree during the run, and the primary tree ends on the mission branch (documented legacy behavior). This is the regression guard proving default behavior is untouched.
+- Strengthen/duplicate as needed so that assertions a1, a6, a7 also hold under a MULTI-feature, MULTI-milestone mission (not just a single feature), including a run that exercises the parallel batch path in worktree mode (its merges land on the mission branch in the integration worktree, primary still byte-untouched).
+
+Also verify the broad suite: ensure `cargo test --workspace` is fully green (this is contract a10).
+
+Do not touch backend.rs; report if a contract-file change seems required. If earlier features left any `self.repo` usage on the run/validation/final-gate/artifact path that should have been `active_repo()` (causing a primary-tree mutation in worktree mode), fix it here and note it in the report.
+
+Done when:
+- `worktrees_removed_at_mission_end_in_worktree_mode` proves that after a mission exercising BOTH the sequential and parallel paths in worktree mode, only the primary working tree remains registered (integration + per-feature worktrees removed and pruned)
+- A checkout-mode regression test proves the legacy sequential behavior (worker cwd = repo_root, mission branch checked out in primary, primary ends on the mission branch) is unchanged
+- Multi-feature/multi-milestone worktree-mode runs (including the parallel batch path) keep the primary checkout byte-untouched (a1), land deliverables/commits on the mission branch (a6), and preserve KRANZ_BASE_SHA in all session/gate envs (a7); the full `cargo test --workspace` suite passes (a10)
+

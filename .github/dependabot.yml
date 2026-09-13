@@ -1,0 +1,81 @@
+# Dependabot version updates. Security updates are separate (repo settings →
+# Dependabot alerts) and fire immediately regardless of these schedules.
+# Shape: weekly, grouped minor/patch per ecosystem, low PR cap — major bumps
+# still arrive as individual PRs and deserve a human eye (runtime against the
+# real agent CLIs is only covered by the manual smoke job).
+version: 2
+updates:
+  # Actions are SHA-pinned for supply-chain reasons; dependabot preserves the
+  # pin and updates the version comment — this is what keeps pinning cheap.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Root cargo workspace (crates/*); Cargo.lock is committed, and the msrv CI
+  # job catches any dep that quietly raises its floor.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Tauri standalone workspace (apps/dashboard/src-tauri): its own committed
+  # Cargo.lock, and the macOS `tauri` CI job compiles it, so bot bumps can't
+  # merge blind. Separate entry because dependabot scopes cargo per-directory.
+  - package-ecosystem: cargo
+    directory: /apps/dashboard/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Dashboard deps are few; group them so the trickle stays one PR.
+  - package-ecosystem: npm
+    directory: /apps/dashboard
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Even Hub SDK/simulator drift affects a real device contract, so keep its
+  # lockfile independent from the dashboard and review its updates together.
+  - package-ecosystem: npm
+    directory: /apps/even-g2
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Dockerfile base images are digest-pinned. Dependabot refreshes those
+  # immutable pins without changing the human-readable rolling tags.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2

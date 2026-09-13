@@ -1,0 +1,295 @@
+# Tickets — using the backlog
+
+How to capture work as tickets, turn them into drafted plans, and execute
+them on demand. This is the usage companion to the design doc
+(docs/backlog-and-slack.md §tickets); commands verified against the CLI.
+
+## Where tickets live
+
+One ticket = one plain markdown file in the repo at `.kranz/tickets/<slug>.md`:
+
+```markdown
+---
+title: Persist the serve mutation token to a 0600 file
+priority: 2
+schedule: once
+---
+
+## Goal
+One self-sufficient paragraph: the outcome, stated imperatively.
+
+## Context
+What a fresh worker needs: file paths, incidents, constraints, prior lessons.
+
+## Scoping answers
+Left empty at creation. If a draft comes back NEEDS-CONTEXT, the
+orchestrator's questions are appended to the ticket — answer them here
+and re-draft.
+
+## Acceptance hints
+Concrete testable outcomes. Any named test uses a passed-count guard —
+`grep -qE 'result: ok\. [1-9][0-9]* passed'` — never a bare test-name
+filter (a zero-match filter exits 0).
+```
+
+Tickets are ordinary versioned files: they diff, merge, and review like
+code. Pipeline state (NEW → REVIEW → QUEUED → done) lives in a sidecar
+state file, not the markdown — editing a ticket never corrupts its state.
+Slugs are validated (ascii alphanumerics, `-`, `_`, `.`; no traversal).
+
+A ticket can also declare `blocked-by: [slug, ...]` in its frontmatter to
+depend on other tickets — see §Dependencies (`blocked-by`) below. Tickets
+drafted by the GitHub webhook trigger (`POST /api/hooks/github`, see
+docs/protocol.md §Webhooks) additionally carry `trigger: ci-failure|pr-comment`
+provenance; human-authored tickets omit it.
+
+### Reviewing a spec or incident artifact
+
+`spec-review` and `incident-review` are explicit artifact-consumer task
+classes. They reuse the normal mission plan, Flight Rules resolver, findings,
+waivers, checker results, replay, and evidence bundle. A review ticket names
+one tracked UTF-8 source; the source is read-only and the mission must commit
+a substantive review output:
+
+```markdown
+---
+title: Review the API compatibility proposal
+task-class: spec-review
+review-artifact: docs/proposals/api-v2.md
+review-output: reviews/api-v2.md
+---
+
+## Goal
+Review the proposal against the applicable engineering standards.
+```
+
+`review-output` is optional and defaults to `reviews/<ticket-slug>.md`.
+Drafting refuses a missing, blank, oversized, untracked, symlink, or non-text
+source. Approval requires the plan touch set to include the output and exclude
+the input. The final gate refuses a missing/blank/unchanged output and also
+refuses any deliverable commit that touched the source—even if a later commit
+restored its bytes. Rules scoped by `task-classes` and `when-paths` resolve
+against the immutable input as read-only context; exceptions and attestations
+remain bound to the resulting review diff.
+
+## Importing an OpenSpec change
+
+If you author work with [OpenSpec](https://github.com/Fission-AI/OpenSpec),
+`kranz ticket import-openspec` turns a change folder into a ticket:
+
+```bash
+kranz ticket import-openspec openspec/changes/dark-mode
+```
+
+It reads `proposal.md` (required) into `## Goal`, and `design.md` plus every
+`specs/**/*.md` into `## Context` as authored intent. The slug defaults to the
+change directory's name; `--slug` overrides it. Re-importing refuses rather
+than overwriting a ticket you have since edited.
+
+Two things it deliberately does not do, both of which matter more than what it
+does.
+
+It never imports `tasks.md`. That checklist is the authoring assistant's own
+decomposition, self-reported and ungraded. Importing it would slip an
+unvalidated plan past the orchestrator, which is the step that should be doing
+that thinking.
+
+It never turns spec scenarios into acceptance hints. "The app SHALL default to
+the system preference" is prose, and prose cannot fail, so copying it into
+`## Acceptance hints` would ship a vacuous criterion with every imported
+mission. The generated section says so and asks for commands that can fail,
+guarded by a passed count. Fill it in before drafting.
+
+The import runs one way. OpenSpec explains why the work exists; once you
+approve a plan, that plan is what the validator judges. Nothing writes back to
+`openspec/changes/`, so the two cannot drift into disagreeing about what was
+actually built.
+
+The lighter-weight alternative needs no import at all: point a review ticket
+at the proposal with `task-class: spec-review` and `review-artifact`, and
+kranz will critique the spec before anyone builds against it.
+
+## Listing the backlog
+
+```sh
+kranz ticket list          # slug, priority, state, title
+kranz ticket show <slug>   # one ticket in full, incl. needs-context questions
+                           # or a wrong-plan escalation reason
+kranz queue                # the execution queue (approved, awaiting a run)
+kranz queue --remove <id>  # retire one runnable entry; keep its mission audit
+kranz work --once --expect <id> # run only if this mission is still the front
+```
+
+Slack: `/kranz work` reports the queue read-only; the App Home tab shows
+the overview. The backlog is also browsable, draftable, and approvable
+from the dashboard's Pipeline Backlog lens (`#/backlog`, linked from the mission
+picker) — it lists the same slug/priority/state/title/blocked-by columns,
+drills into a ticket for its goal/context/needs-context, and drives
+draft/approve with the same blocked-by-aware gate described below.
+
+Slack also has direct backlog verbs:
+
+- **`/kranz ticket list`** — one line per ticket (slug, priority, state,
+  title). Read-only: no allowlist gate, and the reply is ephemeral (visible
+  only to the invoker).
+- **`/kranz ticket show <slug>`** — one ticket's full detail (goal, state,
+  blocked-by, any parked NEEDS-CONTEXT questions). Also read-only and
+  ephemeral, no allowlist gate; an unknown or invalid slug replies with a
+  graceful ephemeral error rather than failing silently.
+- **`/kranz draft <slug>`** — runs a non-interactive draft turn for a
+  backlog ticket through the hosted engine (create the mission, seed it,
+  demand the plan). A SPEND action: gated on the `slack.allowUsers`
+  allowlist exactly like `/kranz new`, same "not authorized" refusal for
+  unlisted users. On authorization it acks immediately with an
+  `:hourglass_flowing_sand:` ephemeral (the draft turn takes a minute or
+  two), then posts the terminal outcome back to the invoker: ready-for-review
+  (mission id + branch), approved-and-queued, or — if the ticket was
+  underspecified — **NEEDS-CONTEXT** with the orchestrator's questions
+  appended, the same as the CLI/REST draft path.
+- **`/kranz approve <slug>`** — the slug-resolving twin of `/kranz approve
+  <mission-id>`; approve-by-slug. Gated on the same allowlist as `/kranz
+  new`/`draft`. It resolves the ticket's drafted mission and runs the exact
+  same `kranz_engine::deps::approve_ticket` gate the CLI and REST approve
+  paths run, so a blocked-by refusal (or a cycle, or a not-REVIEW ticket) is
+  surfaced to the Slack user **verbatim** — never paraphrased. On success it
+  replies with the mission id now queued for `kranz work`.
+
+## The pipeline: draft → review → approve → drain
+
+```sh
+kranz ticket new my-fix --title "..." --goal "..."   # scaffold (refuses overwrite)
+kranz draft my-fix        # orchestrator drafts a plan, parks plan.md for review
+kranz ticket approve my-fix   # commit approval, enqueue, mark QUEUED
+kranz work                # drain the queue: one mission at a time, crash-safe
+```
+
+Headless producers that start from an external ticket-shaped brief can use
+`kranz exec -f mission.md --enqueue`: it creates, plans, and approves the
+mission, then writes its mission id to this same queue without running a
+worker. Producers that must reconcile a terminal result back to their own
+system pair it with `--enqueue-source <producer> --enqueue-external-ref <id>`;
+kranz writes that structured ownership receipt before exposing the queue
+entry. Execution still belongs to `kranz work` or the serve drain.
+
+What each step really does:
+
+- **`kranz draft <slug>`** is non-interactive: the orchestrator is seeded
+  with the whole ticket, produces a plan, and parks a committed `plan.md`
+  for review — no execution, no repo changes. An underspecified ticket
+  comes back **NEEDS-CONTEXT** with the orchestrator's actual questions
+  appended to the ticket file; answer under `## Scoping answers` and
+  re-draft. Spend is bounded by the orchestrator budget cap.
+- **`kranz draft <slug> --yes`** collapses draft → approve → queue into
+  one command. Only for tickets you trust completely: you are skipping the
+  one human gate between a ticket and paid execution, and estimates for
+  unusual mission shapes can miss badly (m-d341a7: $163.64 actual vs
+  $18.35 expected — a doc-heavy shape the calibration corpus didn't model).
+- **`kranz ticket approve <slug>`** requires the REVIEW state (a parked
+  drafted plan) and moves it to QUEUED with a queue entry.
+- **`kranz work`** drains the per-repo queue serially — missions own the
+  working tree, so one at a time. `--once` processes exactly one front
+  entry and exits (exit 0 if the repo is busy). Crash recovery is
+  automatic: claims are atomic file renames, and dead dispatchers' claims
+  are recovered on the next run.
+
+## Dependencies (`blocked-by`)
+
+A ticket can name other tickets it depends on:
+
+```markdown
+---
+title: Wire the new client into the dashboard
+priority: 2
+blocked-by: [add-client-lib, add-client-tests]
+---
+```
+
+A blocker is **satisfied only when its mission reaches `Complete`** —
+approved, queued, running, or failed all still count as blocked. There is
+no partial credit: satisfaction is authoritative on mission status alone,
+never on ticket/queue pipeline state.
+
+- **`kranz ticket approve <slug>`** refuses an approval with an unsatisfied
+  blocker, naming it honestly:
+
+  ```
+  cannot approve <slug>: blocked by <blocker>, <blocker> (its mission is not Complete)
+  ```
+
+- **`kranz ticket approve <slug> --force`** overrides unsatisfied blockers
+  (approve anyway, at your own risk) — but never a cycle (below); a cycle
+  is refused unconditionally.
+- **Cycle detection** runs at approve time regardless of `--force`: the
+  `blocked-by` graph is walked from `slug`, and a reachable cycle refuses
+  the approval with the path spelled out:
+
+  ```
+  blocked-by cycle: a -> b -> a
+  ```
+
+- **`kranz work` re-checks blockers at work time**, not just at approve
+  time: batch-approving a night's worth of tickets can queue a dependent
+  right alongside a blocker that later fails mid-drain. When the
+  dispatcher is about to run a queued entry and finds a `blocked-by` ticket
+  that reached `Failed`, it skips the entry — retiring its claim, marking
+  the ticket `Failed` with a note naming the blocker, and printing:
+
+  ```
+  warning: skipping ticket '<slug>' — blocked-by '<blocker>' failed
+  ```
+
+  This is a one-shot skip, not a retry loop — re-driving a mission whose
+  dependency failed can never succeed on its own.
+
+The CLI and the REST `POST /api/tickets/:slug/approve` route share this
+exact gate (`kranz_engine::deps::approve_ticket`), so the two surfaces can
+never drift on what "approvable" means.
+
+## The backlog over REST
+
+`kranz serve` exposes the same backlog as a REST surface, as an
+alternative to the CLI pipeline above:
+
+```
+GET  /api/tickets              # list: slug, priority, state, title, blockedBy
+GET  /api/tickets/:slug        # full ticket + needsContext + wrongPlan
+POST /api/tickets/:slug/draft  # kick off a draft (202, long-running)
+POST /api/tickets/:slug/approve  # {"force": bool} -> approve into the queue
+```
+
+`draft` is asynchronous: it returns `202 {"missionId":"m-…"}` immediately
+and the draft turns run as a background task. Watch progress over that
+mission's `GET /api/missions/:id/ws` feed, and poll `GET /api/tickets/:slug`
+for the terminal outcome (Review vs NEEDS-CONTEXT). Both `POST` routes
+require the mutation token like every other `POST` (docs/protocol.md
+§Authority); `approve` returns the same `409` shapes described above for
+an unsatisfied blocker or a cycle. See docs/protocol.md §Tickets for the
+full request/response reference.
+
+## Batch pattern
+
+```sh
+kranz draft fix-a
+kranz draft fix-b
+# read both parked plans — check the estimates before committing spend
+kranz ticket approve fix-a
+kranz ticket approve fix-b
+kranz work        # leave it in a spare terminal; exits when the queue is dry
+```
+
+Queue order is `(priority, insertion order)` from the frontmatter
+`priority` field. Batch-approving a night's worth and letting `kranz work`
+grind is the intended workflow; reviewing each drafted plan's estimate
+first is the one gate worth keeping human.
+
+## Operational notes
+
+- With `kranz serve` running, a drafted mission stays attached to serve
+  (holding the mission lock) until approval releases it — the approve
+  paths hand off automatically. Expect `kranz status` to show the lock
+  moving between serve and the `kranz work` dispatcher.
+- Ticket-approve is spend-adjacent everywhere: in Slack it is gated on the
+  user allowlist like `/kranz new`.
+- Mission outcomes flow back: exit 0 completes the ticket, a blocked
+  mission (exit 2) surfaces for guidance, an underspecified plan (exit 3)
+  bounces the ticket back with questions.

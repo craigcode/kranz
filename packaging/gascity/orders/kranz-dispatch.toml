@@ -1,0 +1,19 @@
+# Create approved kranz queue entries for ready kranz-labeled beads.
+#
+# City-side setup (see packaging/gascity/README.md):
+#   - run kranz-city-worker as a supervised session (agents/kranz-worker/)
+#   - multi-rig cities: routing derives the rig from the bead id prefix via
+#     `gc rig list --json`; single-rig setups may pin KRANZ_RIG_DIR
+#   - kranz, jq, and the pack's bin/ must be on PATH (or absolute paths)
+#   - rigs with skipScrutiny=true are refused unless KRANZ_ALLOW_UNVALIDATED=1
+#
+# This order fires INSTANTLY on bead.created (the demo path). Two gaps are
+# covered by the sibling order kranz-dispatch-backstop.toml (slow cooldown):
+# a quiet city with a dead claim (no bead.created fires to run the reclaim
+# sweep), and a bead re-readied after a reopen/refine (fires bead.updated,
+# not bead.created — there is no bead.ready event in the gc vocabulary).
+[order]
+description = "Queue ready kranz-labeled beads for the kranz-city-worker"
+trigger = "event"
+on = "bead.created"
+exec = "kranz-dispatch"

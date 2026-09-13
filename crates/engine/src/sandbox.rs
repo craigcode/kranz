@@ -1,0 +1,5905 @@
+//! OS sandbox profile/argv generation — Tier 2 filesystem/network containment.
+//! See docs/scoping/worker-sandboxing.md tier 2.
+//!
+//! macOS uses Seatbelt (`sandbox-exec`) for filesystem isolation. Seatbelt
+//! cannot express hostname egress allowlists (it accepts only `*`/`localhost`
+//! network hosts), so `fs+net` on macOS restricts outbound TCP to loopback
+//! and the run routes through the userspace filtering egress proxy
+//! (`crate::egress_proxy`), which enforces the per-host allowlist at CONNECT
+//! time. Linux uses bubblewrap for filesystem isolation; `fs+net` fails closed
+//! with `--unshare-net` because bwrap alone cannot express a hostname egress
+//! allowlist (and its netns cannot reach a host proxy — out of scope for v1).
+//!
+//! Write scope (P1, ticket sandbox-writable-scope): a session may write only
+//! its working directory, its per-session private scratch root
+//! (`SandboxInputs::tmpdir` — NOT the shared system temp root, which would
+//! expose every sibling mission's worktrees and merge scratch), and
+//! operator-declared `extraWrite` paths. The mission dir is never
+//! worker-writable; its engine-owned metadata (audit log, state snapshot,
+//! control inbox, transcripts) is additionally denied/masked so it stays
+//! read-only even in checkout mode, where the writable `session_cwd` is an
+//! ancestor of the mission dir.
+//!
+//! Mandatory validator containment (ticket `validator-mandatory-containment`):
+//! VALIDATOR sessions are the one class wrapped regardless of
+//! `sandbox.enforce` — the validator is the adversarial reader the whole
+//! gate rests on, so its isolation cannot be operator-opt-in.
+//! [`resolve_validator_containment`] resolves the posture: the role's own
+//! enforced sandbox plus the real-checkout read-deny set when enforcement
+//! is configured, the mandatory `fs`-tier wrap when it is not, and — where
+//! the platform or the selected backend cannot contain — a FAIL-CLOSED
+//! refusal by default (ticket `validator-containment-degrade-fail-closed`,
+//! 14th-pass review: the loud degrade reopens the modify→use→restore path,
+//! so it is now the explicit opt-in `validatorAllowUncontainedDegrade`, never
+//! the default).
+//! The read-deny set ([`validator_read_deny_entries`]) closes the broad
+//! read allow over the real checkout's source tree — the snapshot
+//! worktree is the sole writable root and the only tree the validator can
+//! read — keeping the narrow `.git`/`.kranz` carve-outs the inspection
+//! legitimately needs.
+
+use std::path::{Path, PathBuf};
+
+/// Default egress needed by Claude/Anthropic sessions under `fs+net`.
+pub const DEFAULT_EGRESS: &[&str] = &["api.anthropic.com:443", "*.anthropic.com:443"];
+
+/// Inputs used to build a session sandbox.
+#[derive(Debug, Clone)]
+pub struct SandboxInputs {
+    pub enforce: crate::types::SandboxEnforce,
+    pub session_cwd: PathBuf,
+    pub mission_dir: PathBuf,
+    /// The session-PRIVATE scratch root — the only TMPDIR-side path the
+    /// session may write (the cleared child env points `HOME`/`TMPDIR`
+    /// under it; see `crate::agent_env`). NOT the shared system temp root:
+    /// allowing all of `TMPDIR` made every sibling mission's worktree and
+    /// merge scratch worker-writable (P1, ticket sandbox-writable-scope).
+    /// `build_inputs` defaults it to the mission's gitignored probe scratch;
+    /// the runner overrides it per session with
+    /// `crate::backend_claude::scratch_home_root(session_id)`.
+    pub tmpdir: PathBuf,
+    pub extra_write: Vec<PathBuf>,
+    pub egress: Vec<String>,
+    /// Mandatory validator containment (ticket
+    /// `validator-mandatory-containment`): the REAL checkout roots a
+    /// VALIDATOR session must not read — the checkout the snapshot was taken
+    /// from, plus the primary checkout when worktree mode separates them.
+    /// Empty for every non-validator session (workers, orchestrator turns)
+    /// and for engine-run gates: those legitimately work in the real tree,
+    /// and an empty set keeps the generated profile/argv byte-identical to
+    /// the pre-containment shape. The validator's own snapshot worktree is
+    /// never in this set — it lives under the mission dir, which the
+    /// read-deny carve-outs (`<root>/.git`, `<root>/.kranz`) deliberately
+    /// keep reachable; see [`validator_read_deny_entries`].
+    pub validator_read_deny_roots: Vec<PathBuf>,
+}
+
+/// Concrete OS sandbox backend selected for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    Seatbelt,
+    Bubblewrap,
+    /// Stable Win32 AppContainer profile + path-specific SID ACLs. The
+    /// hostile child is created suspended and Job-owned before resume.
+    AppContainer,
+    /// Tier-3: run the session inside a container (see
+    /// [`crate::sandbox_container`]); `ResolvedSandbox::container` is `Some`.
+    Container,
+}
+
+/// How a role's `enforce` setting maps onto the current platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxDecision {
+    /// Enforcement is off; no sandbox is attached.
+    Off,
+    /// Enforcement is requested and the platform supports it.
+    Enforce(SandboxBackend),
+    /// Enforcement is requested but the platform can't honor it; run-level
+    /// callers must refuse rather than proceed unsandboxed.
+    UnsupportedWarn,
+}
+
+fn enforce_label(enforce: crate::types::SandboxEnforce) -> &'static str {
+    match enforce {
+        crate::types::SandboxEnforce::Off => "off",
+        crate::types::SandboxEnforce::Fs => "fs",
+        crate::types::SandboxEnforce::FsNet => "fs+net",
+    }
+}
+
+/// Pure decision fn: given a role's `enforce` setting and the target OS
+/// (`std::env::consts::OS`-shaped string), decide whether the session gets an
+/// enforced sandbox. Parameterized on `target_os` so it is testable
+/// cross-platform.
+pub fn platform_support(enforce: crate::types::SandboxEnforce, target_os: &str) -> SandboxDecision {
+    match enforce {
+        crate::types::SandboxEnforce::Off => SandboxDecision::Off,
+        crate::types::SandboxEnforce::Fs if target_os == "macos" => {
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        }
+        crate::types::SandboxEnforce::FsNet if target_os == "macos" => {
+            // Seatbelt's loopback-only egress profile plus the egress proxy's
+            // per-host allowlist (crate::egress_proxy): the hostname rules the
+            // SBPL cannot express live in the proxy, not the profile.
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+            if target_os == "linux" =>
+        {
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
+        }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet
+            if target_os == "windows" =>
+        {
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        }
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::FsNet => {
+            SandboxDecision::UnsupportedWarn
+        }
+    }
+}
+
+/// A resolved, enforced sandbox for one session.
+#[derive(Debug, Clone)]
+pub struct ResolvedSandbox {
+    pub backend: SandboxBackend,
+    pub inputs: SandboxInputs,
+    /// Container runtime + image; `Some` iff `backend == Container`.
+    pub container: Option<crate::sandbox_container::ContainerSpec>,
+}
+
+/// Expand a leading `~/` (or `~\` on Windows) in `raw` using the platform home
+/// variable; otherwise return `raw` unchanged as a `PathBuf`. `pub(crate)` so
+/// the engine-run gate wrap (`crate::command_exec::resolve_gate_sandbox`)
+/// builds `extra_write` inputs with the SAME expansion sessions get — never a
+/// second hand-rolled rule.
+///
+/// Windows reads `USERPROFILE`, matching [`crate::paths::global_config`]. A
+/// natively launched `kranz.exe` has no `HOME` (only shells like Git Bash
+/// inject one), so keying solely off `HOME` silently left `~/...` literal and
+/// the sandbox grant then pointed at a directory named `~`.
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    let rest = raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix("~\\")
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = rest {
+        if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Resolve a role's sandbox config into an (optional) enforced sandbox for
+/// one session, plus an optional one-time warning string.
+///
+/// Returns `(Some(ResolvedSandbox), None)` when enforcement is requested and
+/// supported, `(None, None)` when enforcement is off, and
+/// `(None, Some(warning))` when enforcement is requested but unsupported on
+/// this platform.
+pub fn resolve_for_session(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    let runtime = crate::sandbox_container::detect();
+    let resolved = resolve_for_session_target(
+        role_sandbox,
+        session_cwd,
+        mission_dir,
+        std::env::consts::OS,
+        command_available("bwrap"),
+        runtime,
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
+    );
+    prewarm_xcrun_for_resolved_seatbelt(resolved.0.as_ref());
+    resolved
+}
+
+/// Apple command-line-tool shims refresh a per-user `xcrun_db*` file even for
+/// read-only Git commands. The profile correctly refuses that shared write,
+/// so refresh the cache outside the sandbox once per resolved Seatbelt
+/// session. Gate wrappers use the same bounded helper; command wrapping never
+/// performs the prewarm itself.
+#[cfg(target_os = "macos")]
+fn prewarm_xcrun_for_resolved_seatbelt(sandbox: Option<&ResolvedSandbox>) {
+    if sandbox.is_some_and(|sandbox| sandbox.backend == SandboxBackend::Seatbelt) {
+        crate::command_exec::prewarm_xcrun_cache_outside_sandbox();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prewarm_xcrun_for_resolved_seatbelt(_sandbox: Option<&ResolvedSandbox>) {}
+
+/// Take a bind-mount proof only where resolution needs one.
+///
+/// Linux is CI-proven and Windows is refused outright, so neither pays for a
+/// probe. Everything else pays once per host, cached, and only when a
+/// container was actually requested.
+pub(crate) fn session_mount_proof(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    runtime: Option<crate::sandbox_container::ContainerRuntime>,
+) -> Option<crate::sandbox_container::MountProof> {
+    if role_sandbox.provider != crate::types::SandboxProvider::Container
+        || role_sandbox.enforce == crate::types::SandboxEnforce::Off
+        || cfg!(target_os = "linux")
+        || cfg!(target_os = "windows")
+    {
+        return None;
+    }
+    let runtime = runtime?;
+    let extra_write: Vec<PathBuf> = role_sandbox
+        .extra_write
+        .iter()
+        .map(|raw| expand_tilde(raw))
+        .collect();
+    Some(crate::sandbox_container::prove_mount_roots(
+        runtime,
+        &crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write),
+        crate::sandbox_container::DEFAULT_IMAGE,
+    ))
+}
+
+fn resolve_for_session_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    target_os: &str,
+    bwrap_available: bool,
+    container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    container_mount_proof: Option<crate::sandbox_container::MountProof>,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    if role_sandbox.provider == crate::types::SandboxProvider::Container {
+        return resolve_container_target(
+            role_sandbox,
+            session_cwd,
+            mission_dir,
+            target_os,
+            container_runtime,
+            container_mount_proof,
+        );
+    }
+    match platform_support(role_sandbox.enforce, target_os) {
+        SandboxDecision::Off => (None, None),
+        SandboxDecision::UnsupportedWarn => (
+            None,
+            Some(format!(
+                "sandbox enforce:{} requested but unsupported on target_os={target_os}; refusing to run unsandboxed",
+                enforce_label(role_sandbox.enforce)
+            )),
+        ),
+        SandboxDecision::Enforce(SandboxBackend::Bubblewrap) if !bwrap_available => (
+            None,
+            Some(format!(
+                "sandbox enforce:{} requested on linux but `bwrap` was not found; refusing to run unsandboxed",
+                enforce_label(role_sandbox.enforce)
+            )),
+        ),
+        SandboxDecision::Enforce(backend) => (
+            Some(ResolvedSandbox {
+                backend,
+                inputs: build_inputs(role_sandbox, session_cwd, mission_dir),
+                container: None,
+            }),
+            None,
+        ),
+    }
+}
+
+/// Resolve the tier-3 container provider: `enforce: off` stays unsandboxed;
+/// `fs+net` with an empty egress list keeps the `--network none` hard egress
+/// boundary. A non-empty list is supported only by Docker: the runner creates
+/// a unique internal network and authenticated filtering relay before spawn.
+/// Other runtimes refuse rather than silently falling back to their bridge.
+/// A requested container with no runtime on PATH is refused.
+fn resolve_container_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    target_os: &str,
+    runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    mount_proof: Option<crate::sandbox_container::MountProof>,
+) -> (Option<ResolvedSandbox>, Option<String>) {
+    if role_sandbox.enforce == crate::types::SandboxEnforce::Off {
+        return (None, None);
+    }
+    // Linux carries a continuously enforced CI receipt for the shipped
+    // bind-mount, authority-mask, and egress contracts, so it needs no
+    // per-host evidence. macOS cannot renew that receipt in CI, because
+    // hosted runners are already guests and cannot provision the VM the
+    // runtime needs. Rather than claim macOS on a receipt that expires or
+    // deny a host that demonstrably works, require the evidence AT RUN TIME:
+    // a macOS host is supported exactly when this runtime proves it really
+    // shares the mounted path. Windows stays refused whatever a probe says,
+    // because its gap is the POSIX guest-path and `/dev/null` authority-mask
+    // contract, which no mount proof addresses.
+    if target_os == "windows" {
+        return (
+            None,
+            Some(format!(
+                "sandbox provider:container with enforce:{} is not supported on target_os=windows: the shipped contract uses POSIX guest paths, Linux images, and /dev/null authority masks that Windows containers do not honor; refusing to run under an unverified container mount contract",
+                enforce_label(role_sandbox.enforce)
+            )),
+        );
+    }
+    if target_os != "linux" {
+        match mount_proof {
+            Some(crate::sandbox_container::MountProof::Proven) => {}
+            Some(crate::sandbox_container::MountProof::Failed(reason)) => {
+                return (
+                    None,
+                    Some(format!(
+                        "sandbox provider:container with enforce:{} refused on target_os={target_os}: {reason}",
+                        enforce_label(role_sandbox.enforce)
+                    )),
+                );
+            }
+            None => {
+                return (
+                    None,
+                    Some(format!(
+                        "sandbox provider:container with enforce:{} on target_os={target_os} requires a bind-mount proof on this host and none was taken; refusing to run under an unverified container mount contract; use sandbox.provider=\"process\" for native host containment",
+                        enforce_label(role_sandbox.enforce)
+                    )),
+                );
+            }
+        }
+    }
+    let Some(runtime) = runtime else {
+        return (
+            None,
+            Some(
+                "sandbox provider:container requested but no container runtime (docker/podman/nerdctl/container) found on PATH; refusing to run unsandboxed"
+                    .to_string(),
+            ),
+        );
+    };
+    if role_sandbox.enforce == crate::types::SandboxEnforce::FsNet
+        && !role_sandbox.egress.is_empty()
+        && runtime != crate::sandbox_container::ContainerRuntime::Docker
+    {
+        return (
+            None,
+            Some(format!(
+                "sandbox provider:container with enforce:fs+net and a non-empty egress list requires Docker's internal-network boundary; runtime {} is not live-proven for that posture — refusing to run",
+                runtime.binary()
+            )),
+        );
+    }
+    (
+        Some(ResolvedSandbox {
+            backend: SandboxBackend::Container,
+            inputs: build_inputs(role_sandbox, session_cwd, mission_dir),
+            container: Some(crate::sandbox_container::ContainerSpec {
+                runtime,
+                image: role_sandbox
+                    .image
+                    .clone()
+                    .unwrap_or_else(|| crate::sandbox_container::DEFAULT_IMAGE.to_string()),
+                network: None,
+                name: None,
+            }),
+        }),
+        None,
+    )
+}
+
+fn build_inputs(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+) -> SandboxInputs {
+    let extra_write = role_sandbox
+        .extra_write
+        .iter()
+        .map(|s| expand_tilde(s))
+        .collect();
+    SandboxInputs {
+        enforce: role_sandbox.enforce,
+        session_cwd: session_cwd.to_path_buf(),
+        mission_dir: mission_dir.to_path_buf(),
+        // Default session-private scratch: the mission's gitignored
+        // contract/sandbox scratch home — the shape the engine's own probes
+        // (preflight contract commands, whose cleared env points HOME/TMPDIR
+        // at `runs/contract-home`) execute under. The runner overrides this
+        // per session with the session's private scratch root (see the
+        // `SandboxInputs::tmpdir` doc); warn-only resolves never execute
+        // under the profile, so the default is never their concern.
+        tmpdir: mission_dir.join("runs").join("contract-home"),
+        extra_write,
+        egress: role_sandbox.egress.clone(),
+        // Session sandboxes never read-deny the tree they work in — the
+        // validator containment resolution sets this explicitly.
+        validator_read_deny_roots: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory validator containment (ticket validator-mandatory-containment)
+// ---------------------------------------------------------------------------
+
+/// The outcome of resolving one validator session's MANDATORY containment
+/// (ticket `validator-mandatory-containment`). The validator is the
+/// adversarial reader the whole gate rests on; its isolation must not depend
+/// on the operator opting into enforcement, so `sandbox.enforce: off` (the
+/// default) no longer means an unwrapped validator — where the platform has
+/// a process-sandbox tier and the selected backend can apply it, the session
+/// is wrapped regardless.
+#[derive(Debug)]
+pub struct ValidatorContainment {
+    /// The sandbox to attach to the validator's [`crate::backend::SessionSpec`]
+    /// — `Some` whenever a wrap applies (the role's own enforced sandbox
+    /// plus the read-deny roots, or the mandatory `fs`-tier wrap under
+    /// `enforce: off`), `None` only when containment degraded (see `note`).
+    pub sandbox: Option<ResolvedSandbox>,
+    /// The LOUD operator-facing posture note when containment could not be
+    /// applied AND the operator opted into the degrade
+    /// (`validatorAllowUncontainedDegrade`) — an unsupported platform, a
+    /// linux without `bwrap`, or a backend that does not honor the resolved
+    /// sandbox. The orchestrator surfaces it as a decision per validator
+    /// spawn (so every validation round carries it); `None` when the session
+    /// is contained. Without the opt-in the resolution FAILS CLOSED instead
+    /// (ticket `validator-containment-degrade-fail-closed`, 14th-pass
+    /// review): the degrade reopens the modify→use→restore path the
+    /// mandatory-containment work was built to close, so snapshot
+    /// separation plus the after-fingerprint tripwire alone are no longer
+    /// the default posture.
+    pub note: Option<String>,
+}
+
+/// Resolve the containment posture for one validator session (both roles —
+/// scrutiny and functional run the same shape).
+///
+/// `session_cwd` is the throwaway snapshot worktree — the profile's sole
+/// writable root alongside the session-private scratch. `read_deny_roots`
+/// are the REAL checkout roots the snapshot was taken from (the active tree,
+/// plus the primary checkout when worktree mode separates them); their
+/// source trees become read-denied in the generated profile/argv
+/// ([`validator_read_deny_entries`]). `backend` decides whether the wrap can
+/// be honored at all: only the claude backend applies a resolved sandbox
+/// ([`crate::types::BackendKind::supports_sandbox_enforcement`]).
+///
+/// `enforce != off` keeps today's fail-closed posture byte-for-byte: the
+/// role's own resolution governs (an unsupported platform or missing `bwrap`
+/// is an Err, mirroring the runner's `resolve_sandbox_or_refuse`), with the
+/// read-deny roots ATTACHED on the process tier. The container provider
+/// resolves untouched — its read-only rootfs and named mounts are already
+/// the stronger containment, and the real tree is simply not mounted.
+///
+/// `enforce == off` is the case this ticket exists for: the mandatory
+/// `fs`-tier wrap (write containment with the validator's API egress intact;
+/// no operator `extraWrite` widening — the snapshot is the sole writable
+/// root) wherever the platform supports it and the backend can apply it.
+/// Everywhere else the resolution FAILS CLOSED (ticket
+/// `validator-containment-degrade-fail-closed`, 14th-pass review — this
+/// reverses the 224fa73 loud-degrade default) unless
+/// `allow_uncontained_degrade` (the `validatorAllowUncontainedDegrade`
+/// config flag) opts this repo back into the loud degradation note.
+pub fn resolve_validator_containment(
+    role_sandbox: &crate::types::SandboxConfig,
+    backend: crate::types::BackendKind,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    read_deny_roots: &[PathBuf],
+    allow_uncontained_degrade: bool,
+) -> crate::error::Result<ValidatorContainment> {
+    let runtime = crate::sandbox_container::detect();
+    let resolved = resolve_validator_containment_target(
+        role_sandbox,
+        backend,
+        session_cwd,
+        mission_dir,
+        read_deny_roots,
+        allow_uncontained_degrade,
+        std::env::consts::OS,
+        command_available("bwrap"),
+        runtime,
+        session_mount_proof(role_sandbox, session_cwd, mission_dir, runtime),
+    );
+    if let Ok(containment) = &resolved {
+        prewarm_xcrun_for_resolved_seatbelt(containment.sandbox.as_ref());
+    }
+    resolved
+}
+
+/// [`resolve_validator_containment`] parameterized on the target OS, `bwrap`
+/// availability, and container runtime so the decision matrix is testable
+/// cross-platform (mirrors [`resolve_for_session_target`] /
+/// `crate::command_exec::resolve_gate_sandbox_target`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_validator_containment_target(
+    role_sandbox: &crate::types::SandboxConfig,
+    backend: crate::types::BackendKind,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    read_deny_roots: &[PathBuf],
+    allow_uncontained_degrade: bool,
+    target_os: &str,
+    bwrap_available: bool,
+    container_runtime: Option<crate::sandbox_container::ContainerRuntime>,
+    container_mount_proof: Option<crate::sandbox_container::MountProof>,
+) -> crate::error::Result<ValidatorContainment> {
+    if role_sandbox.enforce != crate::types::SandboxEnforce::Off {
+        // The role's own resolution governs; an enforced pair with a
+        // backend that cannot honor it is already refused by
+        // `config::validate` (fail closed) before a mission reaches here.
+        let (sandbox, warn) = resolve_for_session_target(
+            role_sandbox,
+            session_cwd,
+            mission_dir,
+            target_os,
+            bwrap_available,
+            container_runtime,
+            container_mount_proof,
+        );
+        return match sandbox {
+            Some(mut resolved) => {
+                // Process-tier wraps (Seatbelt/bwrap) get the read-deny
+                // roots; the container tier's mounts are the containment
+                // and simply do not include the real tree.
+                if resolved.backend != SandboxBackend::Container {
+                    resolved.inputs.validator_read_deny_roots = read_deny_roots.to_vec();
+                }
+                Ok(ValidatorContainment {
+                    sandbox: Some(resolved),
+                    note: None,
+                })
+            }
+            // Fail closed, mirroring resolve_sandbox_or_refuse: enforcement
+            // was requested and cannot be honored on this platform.
+            None => Err(crate::error::EngineError::Backend(warn.unwrap_or_else(|| {
+                format!(
+                    "sandbox enforce:{} requested but no sandbox could be resolved; refusing to run unsandboxed",
+                    role_sandbox.enforce.as_str()
+                )
+            }))),
+        };
+    }
+
+    // enforce: off — MANDATORY containment. The provider is ignored here:
+    // `provider: container` with `enforce: off` documents "no sandboxing,
+    // same as today", and the mandatory wrap is the process tier.
+    //
+    // Where the wrap cannot apply, the default is FAIL CLOSED (ticket
+    // validator-containment-degrade-fail-closed, 14th-pass review — this
+    // REVERSES the 224fa73 loud-degrade-by-default decision: a degraded
+    // validator runs with snapshot separation and the tripwire only, which
+    // reopens the modify→use→restore path the wrap exists to close).
+    // `validatorAllowUncontainedDegrade` opts this repo back into the loud
+    // per-round degradation note.
+    let uncontained = |why: String, note: String| -> crate::error::Result<ValidatorContainment> {
+        if !allow_uncontained_degrade {
+            return Err(crate::error::EngineError::Config(format!(
+                "mandatory validator containment cannot apply ({why}); refusing to run an \
+                 uncontained validator — the degraded posture reopens the modify→use→restore \
+                 path the wrap exists to close (ticket \
+                 validator-containment-degrade-fail-closed). To run validators here anyway, \
+                 set \"validatorAllowUncontainedDegrade\": true in .kranz/config.json (the \
+                 loud per-round degrade returns); otherwise use a containable platform \
+                 (macOS, or linux with `bwrap` on PATH) and the claude validator backend"
+            )));
+        }
+        Ok(ValidatorContainment {
+            sandbox: None,
+            note: Some(note),
+        })
+    };
+    if !backend.supports_sandbox_enforcement() {
+        return uncontained(
+            format!(
+                "the {} backend does not apply the resolved sandbox profile",
+                backend.as_str()
+            ),
+            format!(
+                "validator sessions on the {} backend cannot be OS-sandbox-contained (only the \
+                 claude backend applies the resolved sandbox profile); \
+                 validatorAllowUncontainedDegrade is set, so this validator runs with \
+                 snapshot isolation and the after-fingerprint tripwire only — the real checkout \
+                 is reachable from the session. Select a claude validator backend for mandatory \
+                 containment (ticket validator-mandatory-containment; the degrade is opt-in per \
+                 validator-containment-degrade-fail-closed)",
+                backend.as_str()
+            ),
+        );
+    }
+    let degraded = |why: String| {
+        uncontained(
+            why.clone(),
+            format!(
+                "validator sessions are NOT OS-sandbox-contained ({why}); \
+                 validatorAllowUncontainedDegrade is set, so the validator still runs in its \
+                 throwaway snapshot with the after-fingerprint tripwire on the real checkout, \
+                 but hostile validator code could walk to the real checkout and restore bytes \
+                 before the fingerprint — containment here is the snapshot's physical \
+                 separation only (ticket validator-mandatory-containment; the degrade is \
+                 opt-in per validator-containment-degrade-fail-closed)"
+            ),
+        )
+    };
+    match platform_support(crate::types::SandboxEnforce::Fs, target_os) {
+        // Unreachable (Fs is not Off) — platform_support is the shared
+        // vocabulary, so the match stays exhaustive anyway.
+        SandboxDecision::Off => unreachable!("fs never decides Off"),
+        SandboxDecision::UnsupportedWarn => {
+            degraded(format!("target_os={target_os} has no process-sandbox tier"))
+        }
+        SandboxDecision::Enforce(SandboxBackend::Bubblewrap) if !bwrap_available => {
+            degraded("linux without `bwrap` on PATH".to_string())
+        }
+        // platform_support never selects Container (that resolution is
+        // resolve_container_target's, and the enforce!=off arm above owns
+        // the provider) — the match stays exhaustive anyway.
+        SandboxDecision::Enforce(SandboxBackend::Container) => {
+            unreachable!("process tier only")
+        }
+        SandboxDecision::Enforce(backend_kind) => Ok(ValidatorContainment {
+            sandbox: Some(ResolvedSandbox {
+                backend: backend_kind,
+                inputs: SandboxInputs {
+                    // The fs tier: write containment with network intact
+                    // (denying egress would brick the validator's API
+                    // session — the same reason the session profile
+                    // allows network under fs).
+                    enforce: crate::types::SandboxEnforce::Fs,
+                    session_cwd: session_cwd.to_path_buf(),
+                    mission_dir: mission_dir.to_path_buf(),
+                    // Pinned per session by the runner to the session's
+                    // private scratch root (the same pin
+                    // resolve_sandbox_or_refuse applies); the default
+                    // here is the probe-shaped contract home.
+                    tmpdir: mission_dir.join("runs").join("contract-home"),
+                    // NO operator extraWrite widening under the mandatory
+                    // wrap: the snapshot worktree is the sole writable
+                    // root (plus the session-private scratch).
+                    extra_write: Vec::new(),
+                    egress: Vec::new(),
+                    validator_read_deny_roots: read_deny_roots.to_vec(),
+                },
+                container: None,
+            }),
+            note: None,
+        }),
+    }
+}
+
+pub(crate) fn command_available(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    // Windows PATH entries carry no extension; the executable suffixes live in
+    // PATHEXT. Probing the bare name alone reports every Windows executable as
+    // missing (`grep` vs `grep.exe`).
+    let mut candidates = vec![name.to_string()];
+    if cfg!(windows) {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        candidates.extend(
+            pathext
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .map(|ext| format!("{name}{ext}")),
+        );
+    }
+    std::env::split_paths(&path).any(|dir| candidates.iter().any(|name| dir.join(name).is_file()))
+}
+
+/// Absolutize a path without requiring it to exist: canonicalize if possible,
+/// otherwise join it onto the current directory when relative.
+pub(crate) fn absolutize(path: &Path) -> PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    // Future authority paths still need their existing ancestors resolved
+    // (notably /var -> /private/var), even before their leaf is created.
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(canon) = ancestor.canonicalize() {
+            if let Ok(suffix) = path.strip_prefix(ancestor) {
+                return canon.join(suffix);
+            }
+        }
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+// Mount destinations name the inspected leaf without following its links.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+pub(crate) fn global_authority_dir() -> Option<PathBuf> {
+    crate::paths::global_config().and_then(|path| path.parent().map(absolutize))
+}
+
+/// Escape a path for embedding in an SBPL string literal.
+pub(crate) fn escape_sbpl_literal(path: &Path) -> String {
+    escape_sbpl_string(&path.to_string_lossy())
+}
+
+fn escape_sbpl_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escape a path for embedding in an SBPL `#"..."` regex literal: every
+/// regex metacharacter is backslash-escaped so the path matches literally
+/// (temp-dir names carry no metacharacters in practice, but a repo root
+/// might — `.` in a directory name must not become an any-char match).
+pub(crate) fn escape_sbpl_regex(path: &Path) -> String {
+    let mut out = String::new();
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if "^.+$*?()[]{}|".contains(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The session's writable roots: its working directory (worktree or, in
+/// checkout mode, the repo root), its private scratch root, and each
+/// operator-declared `extraWrite` entry. The mission dir and the shared
+/// system temp root are deliberately NOT here (ticket
+/// sandbox-writable-scope): the engine writes mission metadata from OUTSIDE
+/// the sandbox, and whole-`TMPDIR` access made sibling missions' worktrees
+/// writable. Mission metadata that would still be reachable through an
+/// allowed ancestor (checkout mode: `session_cwd` is the repo root) is
+/// carved back out by [`mission_write_denies`].
+pub(crate) fn write_allowlist(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut write_paths: Vec<PathBuf> =
+        vec![absolutize(&inputs.session_cwd), absolutize(&inputs.tmpdir)];
+    write_paths.extend(inputs.extra_write.iter().map(|p| absolutize(p)));
+    write_paths.sort();
+    write_paths.dedup();
+    write_paths
+}
+
+/// The mission-metadata write-deny set: engine-owned files a sandboxed
+/// session must never write even when an allowed ancestor (checkout mode's
+/// `session_cwd` = repo root) would otherwise cover them. A worker that
+/// could rewrite `events.jsonl` defeats the append-only audit log; one that
+/// could drop files into `control/` injects control commands; one that
+/// could rewrite `runs/*.jsonl` forges transcripts. Like
+/// [`authority_read_deny_paths`], both the raw and canonical mission-dir
+/// forms are expanded (Seatbelt matches canonical paths; the child may
+/// address either form).
+pub(crate) struct MissionWriteDenies {
+    /// Engine-written files at the mission-dir root: literal write denies
+    /// (Seatbelt) / read-only directory views (bwrap).
+    pub files: Vec<PathBuf>,
+    /// Current and sibling `control/` inboxes: subpath write deny / tmpfs shadow.
+    pub control_dirs: Vec<PathBuf>,
+    /// The `runs/` transcript dirs: `runs/*.jsonl` regex write deny
+    /// (Seatbelt) / read-only directory binds (bwrap). Session scratch and
+    /// the current worktree keep their explicit writable roots.
+    pub runs_dirs: Vec<PathBuf>,
+}
+
+/// Engine-written files at the mission-dir root a sandboxed session must
+/// never write (see [`MissionWriteDenies`]).
+pub(crate) const MISSION_METADATA_FILES: &[&str] = &[
+    "events.jsonl",
+    "events.jsonl.lock",
+    "state.json",
+    "state.json.tmp",
+    "estimate.json",
+];
+
+pub(crate) fn mission_write_denies(inputs: &SandboxInputs) -> MissionWriteDenies {
+    let mut denies = MissionWriteDenies {
+        files: Vec::new(),
+        control_dirs: Vec::new(),
+        runs_dirs: Vec::new(),
+    };
+    let mut mission_dirs = vec![inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)];
+    // Checkout mode makes the whole repository writable. Protect sibling
+    // missions as well as the current one; their inboxes have equal authority.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions"))
+    {
+        if let Ok(entries) = std::fs::read_dir(missions) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    mission_dirs.extend([entry.path(), absolutize(&entry.path())]);
+                }
+            }
+        }
+    }
+    for mission_dir in mission_dirs {
+        for name in MISSION_METADATA_FILES {
+            denies.files.push(mission_dir.join(name));
+        }
+        denies.control_dirs.push(mission_dir.join("control"));
+        denies.runs_dirs.push(mission_dir.join("runs"));
+    }
+    denies
+}
+
+/// The operator's real Cargo home: ambient `CARGO_HOME` when set, else
+/// `~/.cargo` when HOME is set — the same resolution
+/// `crate::agent_env::toolchain_var_value("CARGO_HOME", ".cargo")` applies
+/// when it builds the isolated contract home. The two MUST stay in
+/// lockstep: whatever the isolated home can LINK is what the profile must
+/// be able to DENY writes to (see [`cargo_cache_write_deny_paths`]).
+fn operator_cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+}
+
+/// The operator's REAL shared Cargo cache directories —
+/// `<cargo home>/registry` and `<cargo home>/git` — in both raw and
+/// canonicalized forms (the `/var` ↔ `/private/var` idiom the write
+/// allowlist already uses; Seatbelt matches canonical paths and a child
+/// may address either form). Above the copy ceiling the isolated contract
+/// home LINKS these in (`crate::agent_env::cache_only_cargo_home`'s
+/// documented residual trade), so every sandbox profile must deny WRITES
+/// to them explicitly (13th-pass review, P1): deny-default covers the
+/// common case, but only an explicit deny survives EVERY allow — an
+/// operator `extraWrite` of `$HOME`, or any future broadened writable
+/// root, would otherwise silently re-widen the linked cache to writes
+/// from worker-authored contract code, poisoning later builds. PRECISE
+/// scope: the two cache dirs only, never the whole cargo home —
+/// `~/.cargo/bin`'s rustup shims keep their ordinary posture. Reads stay
+/// allowed: the linked cache is the session/gate's registry.
+pub(crate) fn cargo_cache_write_deny_paths() -> Vec<PathBuf> {
+    let Some(cargo_home) = operator_cargo_home() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::with_capacity(4);
+    for base in [cargo_home.clone(), absolutize(&cargo_home)] {
+        paths.push(base.join("registry"));
+        paths.push(base.join("git"));
+    }
+    paths
+}
+
+/// Authority files a sandboxed session must never read, even under the broad
+/// read allow: a read of `serve.token` IS mutation authority over `kranz
+/// serve` (loopback is reachable from every sandbox tier), `serve.read.token`
+/// is its GET-side sibling, `config.json` carries Slack tokens and
+/// remote-workspace credentials, and `domain-terms.local` is the plaintext
+/// clean-room lint vocabulary that must never be readable outside the
+/// engine-side lint (14th-pass review: the mandatory validator wrap's
+/// `.kranz` carve-out — kept for the snapshot — otherwise leaks it).
+/// Derived from the mission dir's canonical `<repo>/.kranz/missions/<id>`
+/// layout. Both the raw and the canonical mission-dir forms are expanded (the
+/// dir exists at spawn time even when the token files do not yet), because
+/// Seatbelt matches against canonical paths — the same `/var` ↔
+/// `/private/var` split the write allowlist handles.
+///
+/// Also denied: `$CARGO_HOME/credentials.toml` AND the legacy extensionless
+/// `$CARGO_HOME/credentials` (or `~/.cargo/...` when CARGO_HOME is unset) —
+/// CARGO_HOME crosses into child envs for registry-cache locality
+/// ([`crate::agent_env`]), but cargo reads BOTH filenames for registry auth
+/// tokens (the legacy one is still supported and takes precedence where
+/// present), so both are the same credential class as the serve token.
+pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+        if let Some(kranz_dir) = mission_dir
+            .parent()
+            .filter(|path| path.ends_with("missions"))
+            .and_then(Path::parent)
+        {
+            for name in KRANZ_AUTHORITY_FILES {
+                paths.push(kranz_dir.join(name));
+            }
+        }
+    }
+    for name in [
+        "serve.token",
+        "serve.read.token",
+        "config.json",
+        "domain-terms.local",
+    ] {
+        paths.push(absolutize(&inputs.session_cwd).join(".kranz").join(name));
+    }
+    if let Some(global) = crate::paths::global_config() {
+        paths.extend([global.clone(), absolutize(&global)]);
+    }
+    if let Some(cargo_home) = operator_cargo_home() {
+        for base in [cargo_home.clone(), absolutize(&cargo_home)] {
+            paths.push(base.join("credentials.toml"));
+            paths.push(base.join("credentials"));
+        }
+    }
+    // Config layers can be symlinked. Deny the resolved file as well as its
+    // configured name so a canonical read cannot bypass the authority rule.
+    paths.extend(paths.clone().iter().map(|path| absolutize(path)));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Authority DIRECTORIES a sandboxed session must never read (14th-pass
+/// review — the directory half of [`authority_read_deny_paths`], denied as
+/// Seatbelt subpaths / bwrap tmpfs shadows):
+///
+/// - `<repo>/.kranz/hook-status/` — the hook-signal projection
+///   (registrations + per-run capability-token hashes). The in-sandbox
+///   `kranz hook-status` relay reads only its session-private spec and POSTs
+///   loopback; the server reads the projection from OUTSIDE the sandbox.
+/// - `<mission_dir>/control/` — the operator→engine control inbox (approve /
+///   pause / config-change commands). The orchestrator polls it from outside
+///   the sandbox; no session ever legitimately reads it. The bwrap write
+///   shadow already hid its contents — this aligns the Seatbelt read posture.
+/// - `<global kranz dir>/keys/` — the operator-side authority keys the
+///   consent substrate is authenticated with (2026-09-01 adversarial audit,
+///   C1/H6: control files and the event log are MACed with a key that must
+///   live OUTSIDE every sandboxed session's readable set, or the MAC proves
+///   nothing against the agent it is meant to exclude). Denied for writes
+///   too ([`authority_write_denies`]): a session that can replace the key
+///   can re-sign whatever it likes.
+pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+        dirs.push(mission_dir.join("control"));
+        if let Some(kranz_dir) = mission_dir
+            .parent()
+            .filter(|path| path.ends_with("missions"))
+            .and_then(Path::parent)
+        {
+            dirs.push(kranz_dir.join("hook-status"));
+        }
+    }
+    if let Some(global) = crate::paths::global_kranz_dir() {
+        dirs.extend([global.clone(), absolutize(&global)]);
+    }
+    for keys_dir in global_key_dirs() {
+        dirs.push(keys_dir);
+    }
+    dirs
+}
+
+/// Mount-backed sandboxes need a private directory namespace, not just
+/// per-file masks: an absent token/config can be created while a worker is
+/// running. Rebind only existing non-authority entries read-only beneath an
+/// empty tmpfs. No placeholder files are created in the host checkout.
+pub(crate) struct AuthorityDirectoryMask {
+    pub path: PathBuf,
+    pub visible_entries: Vec<PathBuf>,
+}
+
+pub(crate) fn authority_directory_masks(inputs: &SandboxInputs) -> Vec<AuthorityDirectoryMask> {
+    let files: std::collections::BTreeSet<_> = authority_read_deny_paths(inputs)
+        .into_iter()
+        .filter_map(|path| Some(absolutize(path.parent()?).join(path.file_name()?)))
+        .collect();
+    let dirs: std::collections::BTreeSet<_> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|path| absolutize(path))
+        .collect();
+    let mut roots: std::collections::BTreeSet<_> = files
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    // Hide denied subdirectories through their parent's private namespace.
+    // This also works when control/ or hook-status/ does not yet exist under
+    // a read-only mission bind; setup need not mkdir in the host directory.
+    for dir in &dirs {
+        if !roots.contains(dir) {
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+        }
+    }
+    let writable = write_allowlist(inputs);
+    // A denied path may pass through a symlink beneath an allowed write root.
+    // Mask the link's parent too: masking only its target would let the worker
+    // replace the alias and redirect the engine's next config read. Ancestors
+    // outside writable roots need no extra view (e.g. the system /var alias).
+    for path in authority_read_deny_paths(inputs)
+        .into_iter()
+        .chain(authority_read_deny_dirs(inputs))
+    {
+        for ancestor in path.ancestors() {
+            if std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                if let Some(parent) = ancestor.parent().map(absolutize) {
+                    if writable.iter().any(|root| parent.starts_with(root)) {
+                        roots.insert(parent);
+                    }
+                }
+            }
+        }
+    }
+    let roots: std::collections::BTreeSet<_> = roots
+        .into_iter()
+        .map(|path| {
+            if !path.exists() && !writable.iter().any(|root| path.starts_with(root)) {
+                // bwrap cannot create a mountpoint inside its read-only / bind.
+                // Mask the nearest existing ancestor instead; denied descendants
+                // are never rebound, and private write roots are restored below.
+                path.ancestors()
+                    .skip(1)
+                    .find(|parent| parent.is_dir())
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            } else {
+                path
+            }
+        })
+        .collect();
+    roots
+        .into_iter()
+        .map(|path| {
+            let mut visible_entries = Vec::new();
+            if !dirs.iter().any(|dir| path.starts_with(dir)) {
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        // Never follow a worker-authored link while constructing
+                        // a privileged bind. Unknown/unreadable entries stay hidden.
+                        if entry
+                            .file_type()
+                            .is_ok_and(|kind| kind.is_dir() || kind.is_file())
+                            && !files.contains(&entry_path)
+                            && !dirs.iter().any(|dir| entry_path.starts_with(dir))
+                        {
+                            visible_entries.push(entry_path);
+                        }
+                    }
+                }
+            }
+            visible_entries.sort();
+            AuthorityDirectoryMask {
+                path,
+                visible_entries,
+            }
+        })
+        .collect()
+}
+
+/// The GLOBAL kranz authority stores (`<global kranz dir>/keys`, where the
+/// per-repository authority key lives, and `<global kranz dir>/seals`, where
+/// each mission's seal floor lives), each in raw and canonical form. The
+/// global dir comes from [`crate::paths::global_kranz_dir`], the same
+/// resolver the key writer and the seal recorder use, so the deny and the
+/// writers cannot drift apart. Empty when no global dir resolves (no home,
+/// no key dir, nothing to deny).
+fn global_key_dirs() -> Vec<PathBuf> {
+    let Some(global) = crate::paths::global_kranz_dir() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in ["keys", "seals"] {
+        let dir = global.join(name);
+        let canonical = absolutize(&dir);
+        if canonical != dir {
+            out.push(canonical);
+        }
+        out.push(dir);
+    }
+    out
+}
+
+/// Repo-level `<repo>/.kranz` stores the ENGINE owns end to end. Named
+/// explicitly (not only enumerated from the live directory) so the deny
+/// exists before the store does: a session that could CREATE
+/// `.kranz/queue/` would own the autoWork drain outright.
+const KRANZ_ENGINE_OWNED_DIRS: &[&str] = &["queue", "tickets", "lessons", "hook-status"];
+
+/// Authority FILES that live directly under a `<repo>/.kranz` dir — the
+/// same four [`authority_read_deny_paths`] names, factored out so the
+/// container tier can apply them to the `.kranz` under its own session
+/// mount without re-typing the list (2026-09-01 adversarial audit, MED-3:
+/// the hand-copied three-name list had already drifted).
+const KRANZ_AUTHORITY_FILES: &[&str] = &[
+    "serve.token",
+    "serve.read.token",
+    "config.json",
+    "domain-terms.local",
+];
+
+/// The authority set under ONE `<repo>/.kranz` dir: the engine-owned files
+/// and the engine-owned stores. Shared by the process, container, and
+/// Windows tiers so none of them can drift from the others.
+pub(crate) fn kranz_authority_entries(kranz_dir: &Path) -> WriteDenySet {
+    WriteDenySet {
+        files: KRANZ_AUTHORITY_FILES
+            .iter()
+            .map(|name| kranz_dir.join(name))
+            .collect(),
+        dirs: KRANZ_ENGINE_OWNED_DIRS
+            .iter()
+            .map(|name| kranz_dir.join(name))
+            .collect(),
+    }
+}
+
+/// The `(<repo>/.kranz, <repo>/.kranz/missions, <mission dir>)` triples this
+/// session's mission dir sits in — raw and canonical form — and ONLY when
+/// the mission dir actually has the canonical `<repo>/.kranz/missions/<id>`
+/// shape.
+///
+/// The shape check is load-bearing, not defensive tidiness: the deny
+/// derivation below SWEEPS these directories, and a mission dir that is not
+/// in the canonical layout (a bare temp dir in a fixture, a future layout
+/// change) would otherwise make the sweep walk the system temp root, or
+/// `/`, and deny writes across the whole host. A non-canonical layout
+/// yields nothing here, which is the fail-quiet direction for a deny that is
+/// additive to an already-narrow write allowlist.
+fn repo_kranz_dirs(inputs: &SandboxInputs) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for mission_dir in [inputs.mission_dir.clone(), absolutize(&inputs.mission_dir)] {
+        let Some(missions_dir) = mission_dir.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        let Some(kranz_dir) = missions_dir.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        if missions_dir.file_name() != Some(std::ffi::OsStr::new("missions"))
+            || kranz_dir.file_name() != Some(std::ffi::OsStr::new(".kranz"))
+        {
+            continue;
+        }
+        out.push((kranz_dir, missions_dir, mission_dir));
+    }
+    out
+}
+
+/// A write-deny set split by what each tier can express: `files` deny as
+/// Seatbelt literals / bwrap self ro-binds / Windows non-inheriting ACL
+/// denies, `dirs` as Seatbelt subpaths / bwrap self ro-binds / inheriting
+/// ACL denies.
+pub(crate) struct WriteDenySet {
+    pub files: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
+}
+
+fn sorted_dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Authority material a sandboxed session must never WRITE (2026-09-01
+/// adversarial audit H2 + H11).
+///
+/// The pre-audit posture denied READS of `<repo>/.kranz/config.json`,
+/// `serve.token`, `serve.read.token`, `domain-terms.local`, `hook-status/`
+/// and the mission `control/` inbox while leaving them WRITABLE: under
+/// `workerIsolation: "checkout"` the session cwd IS the repo root, so a
+/// contained worker could overwrite the trust root it could not read. The
+/// running mission is immune (its config is pinned into `MissionCreated`);
+/// the next mission picks up `claudeBinary`, `dangerouslyAllowAll`, or
+/// `enforce: off` from the file the worker wrote. Every path the read deny
+/// names is therefore denied for writes as well.
+///
+/// H11 is the same asymmetry one level up: every mission-metadata deny was
+/// derived from THIS session's `mission_dir`, so a mission-A worker could
+/// forge approvals into mission B's `control/` inbox, or drop entries into
+/// `.kranz/queue/`, `.kranz/tickets/`, `.kranz/lessons/`. The deny is now
+/// derived from `<repo>/.kranz` as a whole:
+///
+/// - every ENGINE-owned repo-level store ([`KRANZ_ENGINE_OWNED_DIRS`]),
+///   named unconditionally so a store that does not exist yet cannot be
+///   created by a session either,
+/// - every top-level entry of `<repo>/.kranz` present at profile-build time
+///   EXCEPT `missions/`, which is carved out because the session's own
+///   mission dir lives under it,
+/// - every SIBLING mission dir under `<repo>/.kranz/missions/` — the
+///   session's own mission dir is carved back in, and inside it the
+///   narrower [`mission_write_denies`] keeps the audit log, state snapshot,
+///   control inbox and transcripts read-only while leaving the session's
+///   own worktree/scratch under `runs/` writable,
+/// - the global key dir, via [`authority_read_deny_dirs`].
+///
+/// Enumeration is spawn-time, so an entry created under `<repo>/.kranz`
+/// AFTER the profile is built is not individually named. Seatbelt closes
+/// that residue with [`sealed_kranz_dir_roots`]; bwrap and Windows cannot
+/// express it (their masks likewise require the target to exist at spawn),
+/// which is the documented remainder on those tiers.
+pub(crate) fn authority_write_denies(inputs: &SandboxInputs) -> WriteDenySet {
+    let mut files = authority_read_deny_paths(inputs);
+    let mut dirs = authority_read_deny_dirs(inputs);
+    for (kranz_dir, missions_dir, mission_dir) in repo_kranz_dirs(inputs) {
+        let entries = kranz_authority_entries(&kranz_dir);
+        files.extend(entries.files);
+        dirs.extend(entries.dirs);
+        if let Ok(entries) = std::fs::read_dir(&kranz_dir) {
+            for entry in entries.flatten() {
+                // `missions/` is the one carve-out: the session's own
+                // mission dir is under it (see the sibling sweep below).
+                if entry.file_name().as_os_str() == std::ffi::OsStr::new("missions") {
+                    continue;
+                }
+                let path = entry.path();
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => dirs.push(path),
+                    // A symlink is denied as a file: denying the LINK is
+                    // what stops a session replacing it, and following it
+                    // would deny some unrelated target instead.
+                    Ok(_) => files.push(path),
+                    Err(_) => {}
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&missions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == mission_dir {
+                    continue;
+                }
+                dirs.push(path);
+            }
+        }
+    }
+    WriteDenySet {
+        files: sorted_dedup(files),
+        dirs: sorted_dedup(dirs),
+    }
+}
+
+/// Seatbelt-only companion to [`authority_write_denies`]: directory roots
+/// whose DIRECT children may not be created or replaced, emitted as a
+/// `^<root>/[^/]*$` write-deny regex. Sealing `<repo>/.kranz` stops a
+/// session creating `.kranz/queue/` (or any future engine store) after the
+/// profile was built; sealing `<repo>/.kranz/missions` stops it fabricating
+/// a sibling mission dir to forge approvals into. Neither seal reaches
+/// GRANDchildren, so the session's own `<mission>/runs/<scratch>` stays
+/// writable.
+pub(crate) fn sealed_kranz_dir_roots(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (kranz_dir, missions_dir, _) in repo_kranz_dirs(inputs) {
+        roots.push(kranz_dir);
+        roots.push(missions_dir);
+    }
+    sorted_dedup(roots)
+}
+
+/// The operator's OWN controlling terminal, in raw and canonical form
+/// (2026-09-01 adversarial audit, H7).
+///
+/// The gate profile grants read/write/`file-ioctl` on the pty device class
+/// `^/dev/tty[p-t][0-9a-f]+$` so the validator harness's `openpty` chain
+/// works. On macOS that pool IS the terminal pool: a Terminal.app session is
+/// `/dev/ttys003`, matched by the same regex. A contained gate command could
+/// therefore open the operator's own terminal, write raw escape sequences to
+/// it, or issue `TIOCSTI` to push characters into the operator's shell —
+/// arbitrary execution as the operator, outside the sandbox. Naming the
+/// parent's terminal explicitly lets both profiles DENY exactly that one
+/// device while keeping the pty pair the harness allocates for itself; SBPL
+/// denies beat allows regardless of clause order, which this file already
+/// relies on throughout.
+///
+/// Resolved from the ENGINE's own fds 0/1/2 at profile-build time. Every
+/// child the engine spawns gets piped or null stdio, so no sandboxed process
+/// legitimately holds this device. An empty result (no tty at all: a daemon,
+/// CI, `kranz serve`) emits nothing extra.
+#[cfg(unix)]
+pub(crate) fn operator_tty_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for fd in [0, 1, 2] {
+        // SAFETY: `isatty` and `ttyname_r` take a plain fd and, for the
+        // latter, a caller-owned buffer with its length; no ownership
+        // crosses. `ttyname_r` is the thread-safe form (`ttyname` returns a
+        // shared static buffer).
+        let name = unsafe {
+            if libc::isatty(fd) != 1 {
+                continue;
+            }
+            let mut buffer = [0 as libc::c_char; 1024];
+            if libc::ttyname_r(fd, buffer.as_mut_ptr(), buffer.len()) != 0 {
+                continue;
+            }
+            std::ffi::CStr::from_ptr(buffer.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(name);
+        paths.push(absolutize(&path));
+        paths.push(path);
+    }
+    sorted_dedup(paths)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn operator_tty_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Render the operator-terminal deny block for `paths` (2026-09-01
+/// adversarial audit, H7). Empty in, empty out: a host with no controlling
+/// terminal has nothing to protect, and an empty `(deny …)` block would be
+/// noise in every CI profile. Shared by [`generate_profile`] and the gate
+/// extras (`crate::command_exec::gate_profile_extras`) so the two cannot
+/// render the same guard differently. Parameterized on the paths rather
+/// than calling [`operator_tty_paths`] itself, so the rendering is testable
+/// on a host whose test runner has no tty.
+pub(crate) fn tty_deny_block(paths: &[PathBuf]) -> String {
+    let literals: std::collections::BTreeSet<String> =
+        paths.iter().map(|path| escape_sbpl_literal(path)).collect();
+    if literals.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("(deny file-read* file-write* file-ioctl\n");
+    for literal in &literals {
+        block.push_str(&format!("  (literal \"{literal}\")\n"));
+    }
+    block.push_str(")\n");
+    block
+}
+
+/// Refuse Git configurations whose complete input set this sandbox cannot
+/// protect. The enforcement protects against contained children; a separate
+/// unsandboxed host process can still change the repository concurrently.
+pub(crate) fn validate_git_config_protection(
+    inputs: &SandboxInputs,
+    mount_based: bool,
+) -> crate::error::Result<()> {
+    let writable = write_allowlist(inputs);
+    let neutral_config = absolutize(crate::git_ops::empty_global_config_path()?);
+    if writable.iter().any(|root| neutral_config.starts_with(root)) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot grant sandbox writes over the engine's neutral Git configuration; narrow the overlapping session, scratch, or extraWrite root".into(),
+        ));
+    }
+    let Some(marker) = git_marker(&inputs.session_cwd) else {
+        return Ok(());
+    };
+    let root = marker.parent().expect("git marker has a parent");
+    let repo = crate::git_ops::GitRepo::open(root)?;
+    let (git_dir, common, worktree_enabled) = repo.config_protection_paths()?;
+    let described = git_metadata_dirs(&inputs.session_cwd);
+    if [&git_dir, &common].iter().any(|dir| {
+        !described
+            .iter()
+            .any(|path| absolutize(path) == absolutize(dir))
+    }) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot protect Git metadata redirected outside the session's Git layout; remove repository environment overrides before running an enforced session".into(),
+        ));
+    }
+    let masks = authority_directory_masks(inputs);
+    let mut graph_dirs = vec![git_dir.clone(), common.clone()];
+    graph_dirs.extend(git_metadata_mount_nodes(inputs));
+    if graph_dirs.iter().any(|dir| {
+        let dir = absolutize(dir);
+        // A shared Git directory outside writable roots remains read-only;
+        // its existing read-only authority view needs no writable node bind.
+        if !writable.iter().any(|root| dir.starts_with(root)) {
+            return false;
+        }
+        masks.iter().any(|mask| {
+            dir.starts_with(&mask.path)
+                && ![&inputs.session_cwd, &inputs.tmpdir].iter().any(|private| {
+                    let private = absolutize(private);
+                    private != mask.path
+                        && private.starts_with(&mask.path)
+                        && dir.starts_with(private)
+                })
+        })
+    }) {
+        return Err(crate::error::EngineError::Backend(
+            "cannot protect Git metadata through an authority directory; keep the Git directory outside .kranz and credential stores".into(),
+        ));
+    }
+    let mut sources = vec![common.join("config")];
+    if marker.is_file() {
+        sources.push(marker.clone());
+        sources.push(git_dir.join("commondir"));
+    }
+    if worktree_enabled {
+        sources.push(git_dir.join("config.worktree"));
+    }
+    for source in sources {
+        let writable_source = writable
+            .iter()
+            .any(|root| absolutize(&source).starts_with(root));
+        // A symlink input (or replaceable symlink ancestor) defeats a path-only
+        // deny. System aliases outside writable roots, such as /var, are fine.
+        for ancestor in source.ancestors() {
+            if std::fs::symlink_metadata(ancestor).is_ok_and(|meta| meta.file_type().is_symlink())
+                && (ancestor == source
+                    || writable.iter().any(|root| {
+                        ancestor
+                            .parent()
+                            .map(absolutize)
+                            .map(|parent| parent.join(ancestor.file_name().unwrap_or_default()))
+                            .is_some_and(|path| path.starts_with(root))
+                    }))
+            {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect Git configuration through symlink {}; use regular Git metadata paths", ancestor.display()
+                )));
+            }
+        }
+        match std::fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() != 1 {
+                        return Err(crate::error::EngineError::Backend(format!(
+                            "cannot protect multiply linked Git configuration {}; replace it with a private regular file", source.display()
+                        )));
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && (!mount_based || !writable_source) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect absent active Git configuration {} with a mount sandbox; create the intended regular config file before running, or disable extensions.worktreeConfig", source.display()
+                )));
+            }
+            _ => {
+                return Err(crate::error::EngineError::Backend(format!(
+                    "cannot protect Git configuration {}; expected a regular file",
+                    source.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_marker(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|path| path.join(".git"))
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+/// Follow only the two bounded Git indirection files to describe denies. The
+/// execution boundary validates the layout using Git itself before spawning.
+fn git_metadata_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let Some(marker) = git_marker(cwd) else {
+        return vec![cwd.join(".git")];
+    };
+    let read = |path: &Path| {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| crate::paths::read_regular_file_bounded(file, 16384).ok())
+    };
+    if marker.is_dir() {
+        return vec![marker];
+    }
+    let Some(link) = read(&marker) else {
+        return Vec::new();
+    };
+    let Some(path) = link.trim().strip_prefix("gitdir: ") else {
+        return Vec::new();
+    };
+    let dir = absolutize(&marker.parent().unwrap().join(path));
+    let mut dirs = vec![dir.clone()];
+    if let Some(common) = read(&dir.join("commondir")) {
+        dirs.push(absolutize(&dir.join(common.trim())));
+    }
+    dirs
+}
+
+/// Pin writable metadata directory nodes as mountpoints, so renaming a parent
+/// cannot replace a protected config path. The directories stay writable for
+/// Git's index/ref lock files; named configuration inputs are mounted read-only.
+pub(crate) fn git_metadata_mount_nodes(inputs: &SandboxInputs) -> Vec<PathBuf> {
+    let writable = write_allowlist(inputs);
+    let mut nodes = std::collections::BTreeSet::new();
+    let mut dirs = git_metadata_dirs(&inputs.session_cwd);
+    if let Some(marker) = git_marker(&inputs.session_cwd).filter(|path| path.is_file()) {
+        dirs.push(
+            marker
+                .parent()
+                .expect("git marker has a parent")
+                .to_path_buf(),
+        );
+    }
+    for dir in dirs {
+        for path in absolutize(&dir).ancestors() {
+            if writable
+                .iter()
+                .any(|root| path.starts_with(root) && path != root)
+                && path.is_dir()
+            {
+                nodes.insert(path.to_path_buf());
+            }
+        }
+    }
+    nodes.into_iter().collect()
+}
+
+/// The `.git` metadata a sandboxed session must never write (2026-09-01
+/// adversarial audit H3 support).
+///
+/// The engine runs git IN the tree the worker controls: `commit_dirty_paths`
+/// checkpoints after every feature on a hardened handle
+/// (`orchestrator.rs`), and `push_mission_branch` pushes from the CLI. A
+/// worker that plants `.git/hooks/pre-commit`, sets `core.fsmonitor` /
+/// `core.sshCommand` in `.git/config`, or rewrites the WORKTREE GITLINK to
+/// point at a `.git` dir of its own making gets host execution with the
+/// engine's full environment, outside every sandbox.
+///
+/// The deny is NARROW on purpose: the worker's own role is to commit (see
+/// `prompts/worker.md` step 6), so `.git/index`, `.git/objects`,
+/// `.git/refs`, and `.git/logs` must stay writable. What is denied is the
+/// config-and-hook surface that turns a later engine-side git invocation
+/// into code execution, plus the gitlink FILE form:
+///
+/// - `<cwd>/.git/hooks/` and `<cwd>/.git/info/` (subtrees),
+/// - `<cwd>/.git/modules/` (subtree) — a submodule keeps its own `config`
+///   and `hooks/` under `.git/modules/<name>/`, the SAME host-execution
+///   surface one level down, and in checkout mode it sits inside the rw
+///   session bind (follow-up review, M-9). Denied as a whole subtree so a
+///   submodule added after the profile was built is covered too; git never
+///   needs to write it from inside the sandbox.
+/// - `<cwd>/.git/config` and `<cwd>/.git/config.worktree` (files),
+/// - `<cwd>/.git` itself as a LITERAL — in worktree mode that path is the
+///   gitlink file, and denying the literal stops a rewrite of it; in
+///   checkout mode it is the directory node, where the literal deny stops a
+///   replace of the directory without touching anything beneath it.
+///
+/// Reads stay allowed throughout: git cannot operate without reading its
+/// own config, and secrecy was never this tier's promise.
+pub(crate) fn git_metadata_write_denies(inputs: &SandboxInputs) -> WriteDenySet {
+    let mut files = git_metadata_mount_nodes(inputs);
+    let mut dirs = Vec::new();
+    for cwd in [inputs.session_cwd.clone(), absolutize(&inputs.session_cwd)] {
+        files.push(cwd.join(".git"));
+        if let Some(marker) = git_marker(&cwd) {
+            files.push(marker);
+        }
+        for git in git_metadata_dirs(&cwd) {
+            files.push(git.join("config"));
+            files.push(git.join("config.worktree"));
+            files.push(git.join("commondir"));
+            dirs.push(git.join("hooks"));
+            dirs.push(git.join("info"));
+            dirs.push(git.join("modules"));
+        }
+    }
+    WriteDenySet {
+        files: sorted_dedup(files),
+        dirs: sorted_dedup(dirs),
+    }
+}
+
+/// One entry of the validator read-deny set: a top-level path of a real
+/// checkout root the validator must not read, classified so the Seatbelt
+/// profile can pick `subpath` vs `literal` and the bwrap argv can pick a
+/// tmpfs shadow vs a `/dev/null` mask.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ValidatorReadDenyEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+/// Top-level names a validator read-deny root ALWAYS keeps readable, because
+/// the validator's own machinery cannot work without them:
+///
+/// - `.git` — the shared git directory. The snapshot is a WORKTREE: its
+///   `.git` file points into `<root>/.git/worktrees/<n>`, and every
+///   `git log`/`diff`/`show` the scrutiny/inspection flow runs resolves
+///   objects and refs through the common dir. This is the narrow
+///   `.git` surface the ticket keeps: READABLE (the fold needs it), never
+///   writable (deny-default; a ref move is the tripwire's `for-each-ref`
+///   half). `.git/config` stays readable for the same reason git itself
+///   reads it — the same posture today's broad-read sandbox has.
+/// - `.kranz` — the mission dir lives here, and the validator's snapshot
+///   worktree sits under it (`<root>/.kranz/missions/<id>/runs/`). The
+///   engine-owned metadata inside stays write-denied
+///   ([`mission_write_denies`]) and the authority files read-denied
+///   ([`authority_read_deny_paths`]) exactly as for any session; the rest
+///   (tracked `workspace.json`, tickets) is content the snapshot already
+///   carries.
+const VALIDATOR_READ_DENY_CARVEOUTS: &[&str] = &[".git", ".kranz"];
+
+/// The validator read-deny set (ticket `validator-mandatory-containment`):
+/// every TOP-LEVEL entry of each [`SandboxInputs::validator_read_deny_roots`]
+/// root EXCEPT the [`VALIDATOR_READ_DENY_CARVEOUTS`]. Denying whole top-level
+/// entries covers the source tree without naming the root itself as a
+/// subpath (which would swallow the carved-out `.git`/`.kranz` beneath it —
+/// SBPL denies take precedence over every allow, so no allow could carve
+/// them back out).
+///
+/// Entries are classified by `std::fs::metadata` — which FOLLOWS symlinks —
+/// so a symlinked top-level dir is denied as a dir (and the canonical form
+/// emitted alongside covers the link TARGET, the same raw+canonical idiom
+/// [`authority_read_deny_paths`] uses; Seatbelt matches canonical paths).
+/// Entries whose metadata fails (a broken symlink, a racer's unlink) are
+/// skipped: a dangling link leaks nothing, and a vanished entry is gone.
+///
+/// The root ITSELF is not in this set: a literal deny on the root dir would
+/// block stat/readdir of it, and coreutils `mkdir -p` stats every ancestor
+/// of an absolute path — denying the root broke `mkdir -p` under the
+/// snapshot (probed 2026-08-04). The root's directory LISTING therefore
+/// stays readable on both tiers (names, never contents — the bwrap side
+/// cannot express a listing deny without masking the carve-outs anyway).
+///
+/// One documented residual gap, outside the threat model (validator code can
+/// create NOTHING at a deny root — writes there are deny-default): an entry
+/// created at a root AFTER profile generation is not in the set — the same
+/// spawn-time shape the bwrap authority masks already accept.
+pub(crate) fn validator_read_deny_entries(inputs: &SandboxInputs) -> Vec<ValidatorReadDenyEntry> {
+    let mut entries = std::collections::BTreeSet::new();
+    for root in &inputs.validator_read_deny_roots {
+        let Ok(read_dir) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            if VALIDATOR_READ_DENY_CARVEOUTS.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let is_dir = metadata.is_dir();
+            entries.insert(ValidatorReadDenyEntry {
+                path: path.clone(),
+                is_dir,
+            });
+            let canonical = absolutize(&path);
+            if canonical != path {
+                entries.insert(ValidatorReadDenyEntry {
+                    path: canonical,
+                    is_dir,
+                });
+            }
+        }
+    }
+    entries.into_iter().collect()
+}
+
+/// Default Anthropic egress plus mission-configured additions, trimmed and
+/// de-duplicated in stable order.
+pub fn effective_egress(configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_EGRESS.iter().map(|s| (*s).to_string()).collect();
+    for item in configured {
+        let item = item.trim();
+        if !item.is_empty() && !out.iter().any(|existing| existing == item) {
+            out.push(item.to_string());
+        }
+    }
+    out
+}
+
+/// Generate an SBPL profile: deny-by-default, broad read (Seatbelt cannot
+/// usefully scope toolchain/dyld reads without breaking `/bin/sh`) with the
+/// [`authority_read_deny_paths`]/[`authority_read_deny_dirs`] carve-out,
+/// write limited to subpaths of
+/// `session_cwd`, the session-private scratch `tmpdir`, and each
+/// `extra_write` entry — with the mission metadata of
+/// [`mission_write_denies`] carved back OUT by explicit write denies, so the
+/// audit log / state snapshot / control inbox / transcripts stay read-only
+/// to the session even in checkout mode (where `session_cwd` is the repo
+/// root and the mission dir sits under it). `fs` allows network — the profile wraps the agent
+/// binary itself, so denying egress bricks Anthropic/API sessions; write
+/// containment is the fs-tier promise. `fs+net` restricts outbound TCP to
+/// loopback: Seatbelt rejects hostname egress rules (`host must be * or
+/// localhost`), so the per-host allowlist is enforced by the run's egress
+/// proxy (`crate::egress_proxy`) — the only reachable way out. The
+/// operator's real Cargo registry/git caches carry an explicit write deny
+/// of their own (13th-pass review, P1 — [`cargo_cache_write_deny_paths`]):
+/// the isolated contract home may LINK them in above the copy ceiling, and
+/// the linked target must stay read-only under every allow.
+///
+/// Mandatory validator containment (ticket `validator-mandatory-containment`):
+/// when [`SandboxInputs::validator_read_deny_roots`] is non-empty (validator
+/// sessions only), a second read-deny block closes the broad read allow over
+/// the REAL checkout's source tree — every top-level entry of each root
+/// except the `.git`/`.kranz` carve-outs ([`validator_read_deny_entries`]) —
+/// plus the `/dev/null` write allow every shell/git needs under deny-default
+/// (the gate wrap's documented finding). The root's own listing stays
+/// readable (names, never contents — a literal deny on the root breaks
+/// `mkdir -p` under the snapshot, which stats every ancestor; the bwrap
+/// side cannot express the listing deny at all). The snapshot worktree
+/// (under `<root>/.kranz/...`) and the shared git dir stay readable; the
+/// validator provably reads only its snapshot's contents. Denies take
+/// precedence over the broad allow regardless of clause order (the same
+/// guarantee the authority deny above relies on). Every Seatbelt session
+/// also keeps `/dev/null` writable: shells, Git, and agent tool runners use
+/// it for ordinary redirects even outside validator sessions.
+pub fn generate_profile(inputs: &SandboxInputs) -> String {
+    let write_paths = write_allowlist(inputs);
+
+    let mut profile = String::new();
+    profile.push_str("(version 1)\n");
+    profile.push_str("(deny default)\n");
+    profile.push('\n');
+    profile.push_str("(allow process*)\n");
+    profile.push_str("(allow signal (target self))\n");
+    profile.push_str("(allow sysctl-read)\n");
+    profile.push_str("(allow mach-lookup)\n");
+    profile.push_str("(allow mach-register)\n");
+    profile.push_str("(allow iokit-open)\n");
+    profile.push('\n');
+    // Reads stay broad: Seatbelt cannot usefully express "toolchain + dyld +
+    // locale" without a long allowlist that still breaks `/bin/sh` redirects.
+    // Secrecy is not the fs-tier promise — write containment is — with ONE
+    // carve-out: the authority material below.
+    profile.push_str("(allow file-read*)\n");
+    profile.push('\n');
+    // Serve tokens, the repo config, the plaintext lint vocabulary, the
+    // hook-status projection, and the control inbox must stay unreadable even
+    // under the broad read allow (see authority_read_deny_paths /
+    // authority_read_deny_dirs). SBPL denies take precedence over allows
+    // regardless of clause order (verified with sandbox-exec), so placing
+    // the deny after the allow is documentary.
+    let mut deny_literals = std::collections::BTreeSet::new();
+    for path in authority_read_deny_paths(inputs) {
+        deny_literals.insert(escape_sbpl_literal(&path));
+    }
+    let mut deny_subpaths = std::collections::BTreeSet::new();
+    for dir in authority_read_deny_dirs(inputs) {
+        deny_subpaths.insert(escape_sbpl_literal(&dir));
+    }
+    if !deny_literals.is_empty() || !deny_subpaths.is_empty() {
+        profile.push_str("(deny file-read*\n");
+        for lit in &deny_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &deny_literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+    // Mandatory validator containment (see the fn doc): read-deny the real
+    // checkout's source tree. Directories deny as subpaths (the whole
+    // subtree), files as literals. Deny wins over the broad read allow
+    // regardless of clause order — placement after it is documentary. The
+    // root ITSELF is deliberately NOT denied: a literal deny on the root
+    // dir blocks stat/readdir of it, and coreutils `mkdir -p` stats every
+    // ancestor of an absolute path — denying the root broke `mkdir -p`
+    // under the snapshot (probed 2026-08-04). The root's directory LISTING
+    // stays visible (names, never contents) — the same posture the bwrap
+    // side is limited to anyway.
+    let validator_denies = validator_read_deny_entries(inputs);
+    if !validator_denies.is_empty() {
+        let mut subpaths = std::collections::BTreeSet::new();
+        let mut literals = std::collections::BTreeSet::new();
+        for entry in &validator_denies {
+            if entry.is_dir {
+                subpaths.insert(escape_sbpl_literal(&entry.path));
+            } else {
+                literals.insert(escape_sbpl_literal(&entry.path));
+            }
+        }
+        profile.push_str("(deny file-read*\n");
+        for lit in &subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+    // `/dev/null` must stay writable even under deny-default (the gate
+    // wrap's documented finding, `gate_profile_extras` — probed
+    // 2026-08-03): Git, shells, and agent tool runners open it O_RDWR in
+    // ordinary operation. This applies to every session, not only the
+    // validator shape above.
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+    profile.push('\n');
+    match inputs.enforce {
+        crate::types::SandboxEnforce::FsNet => {
+            // Loopback-only egress: the session's proxy hops (CONNECT to
+            // 127.0.0.1) are legal, and every non-localhost destination is
+            // denied here at the kernel boundary — the egress proxy is the
+            // only way out and applies the hostname allowlist.
+            profile.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
+        }
+        // `fs` (and Off) must allow network: this profile wraps the agent
+        // binary, so `deny network*` bricks API egress. Egress restriction
+        // is an `fs+net` concern.
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::Off => {
+            profile.push_str("(allow network*)\n");
+        }
+    }
+    profile.push('\n');
+    // Write allowlist: include both the canonical path and the path as given
+    // (macOS `/var` ↔ `/private/var`) so shell redirects using either form match.
+    profile.push_str("(allow file-write*\n");
+    let mut write_literals = std::collections::BTreeSet::new();
+    for p in &write_paths {
+        write_literals.insert(escape_sbpl_literal(p));
+    }
+    for raw in [&inputs.session_cwd, &inputs.tmpdir]
+        .into_iter()
+        .chain(inputs.extra_write.iter())
+    {
+        write_literals.insert(escape_sbpl_literal(raw));
+        write_literals.insert(escape_sbpl_literal(&absolutize(raw)));
+    }
+    for lit in &write_literals {
+        profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+    }
+    profile.push_str(")\n");
+    profile.push('\n');
+    // Mission metadata write deny: the allowlist no longer names the mission
+    // dir, but in checkout mode `session_cwd` IS the repo root and the
+    // mission dir sits under it — without these denies the audit log, state
+    // snapshot, control inbox, and transcripts would be writable through the
+    // session-cwd subpath allow. SBPL denies take precedence over allows
+    // regardless of clause order (the same guarantee the read deny above
+    // relies on), so placement after the allow is documentary.
+    let write_denies = mission_write_denies(inputs);
+    profile.push_str("(deny file-write*\n");
+    let mut deny_literals = std::collections::BTreeSet::new();
+    for p in &write_denies.files {
+        deny_literals.insert(escape_sbpl_literal(p));
+    }
+    for lit in &deny_literals {
+        profile.push_str(&format!("  (literal \"{lit}\")\n"));
+    }
+    let mut deny_subpaths = std::collections::BTreeSet::new();
+    for p in &write_denies.control_dirs {
+        deny_subpaths.insert(escape_sbpl_literal(p));
+    }
+    for lit in &deny_subpaths {
+        profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+    }
+    // Transcripts are `runs/*.jsonl` files directly under the runs dir; the
+    // `[^/]*` keeps `runs/` SUBDIRECTORIES (session scratch, preflight
+    // worktree) writable.
+    let mut deny_regexes = std::collections::BTreeSet::new();
+    for p in &write_denies.runs_dirs {
+        deny_regexes.insert(escape_sbpl_regex(p));
+    }
+    for lit in &deny_regexes {
+        profile.push_str(&format!("  (regex #\"^{lit}/[^/]*\\.jsonl$\")\n"));
+    }
+    profile.push_str(")\n");
+    profile.push('\n');
+
+    // Authority write deny (2026-09-01 adversarial audit, H2 + H11 — see
+    // authority_write_denies for the full why): every path the read deny
+    // above names, plus the repo-level `.kranz` stores and every SIBLING
+    // mission dir. Under checkout mode `session_cwd` is the repo root, so
+    // without this block a contained worker could overwrite the trust root
+    // it cannot read, or forge approvals into another mission's inbox.
+    // Denies take precedence over allows regardless of clause order, so
+    // placement after the write allow is documentary.
+    let authority_writes = authority_write_denies(inputs);
+    let mut authority_write_literals = std::collections::BTreeSet::new();
+    for path in &authority_writes.files {
+        authority_write_literals.insert(escape_sbpl_literal(path));
+    }
+    let mut authority_write_subpaths = std::collections::BTreeSet::new();
+    for path in &authority_writes.dirs {
+        authority_write_subpaths.insert(escape_sbpl_literal(path));
+    }
+    // The spawn-time residue the enumeration cannot cover: sealing the
+    // DIRECT children of `<repo>/.kranz` and `<repo>/.kranz/missions` stops
+    // a session creating a store or a sibling mission dir after the profile
+    // was built. `[^/]*` never crosses a separator, so the session's own
+    // `<mission>/runs/<scratch>` stays writable.
+    let mut sealed_regexes = std::collections::BTreeSet::new();
+    for root in sealed_kranz_dir_roots(inputs) {
+        sealed_regexes.insert(escape_sbpl_regex(&root));
+    }
+    if !authority_write_literals.is_empty()
+        || !authority_write_subpaths.is_empty()
+        || !sealed_regexes.is_empty()
+    {
+        profile.push_str("(deny file-write*\n");
+        for lit in &authority_write_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &authority_write_literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        for root in &sealed_regexes {
+            profile.push_str(&format!("  (regex #\"^{root}/[^/]*$\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+
+    // `.git` metadata write deny (2026-09-01 adversarial audit, H3 support —
+    // see git_metadata_write_denies): the engine checkpoints with a
+    // hardened git handle in the tree the worker controls, so the hook and
+    // config surface that turns the next engine-side `git commit` into host
+    // execution is denied. Narrow by design — the worker's own role is to
+    // commit, so the index, objects, refs and logs stay writable.
+    let git_writes = git_metadata_write_denies(inputs);
+    let mut git_write_literals = std::collections::BTreeSet::new();
+    for path in &git_writes.files {
+        git_write_literals.insert(escape_sbpl_literal(path));
+    }
+    let mut git_write_subpaths = std::collections::BTreeSet::new();
+    for path in &git_writes.dirs {
+        git_write_subpaths.insert(escape_sbpl_literal(path));
+    }
+    if !git_write_literals.is_empty() || !git_write_subpaths.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for lit in &git_write_subpaths {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        for lit in &git_write_literals {
+            profile.push_str(&format!("  (literal \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
+
+    // Operator terminal deny (2026-09-01 adversarial audit, H7 — see
+    // operator_tty_paths): the engine's own controlling terminal is denied
+    // read, write, AND ioctl. Every child the engine spawns has piped or
+    // null stdio, so nothing inside the sandbox needs this device, and the
+    // deny is what stops escape-sequence writes and TIOCSTI-class input
+    // injection into the operator's shell. Nothing is emitted when the
+    // engine has no terminal (a daemon, CI, `kranz serve`).
+    let tty_block = tty_deny_block(&operator_tty_paths());
+    if !tty_block.is_empty() {
+        profile.push_str(&tty_block);
+        profile.push('\n');
+    }
+
+    profile.push_str("(deny file-write*\n");
+    // Match future sibling missions too: enumeration alone would leave an
+    // inbox created after this session starts writable under checkout mode.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions"))
+    {
+        for root in [missions.to_path_buf(), absolutize(missions)] {
+            let root = escape_sbpl_regex(&root);
+            profile.push_str(&format!(
+                "  (regex #\"^{root}/[^/]+/(events\\.jsonl(\\.lock)?|state\\.json(\\.tmp)?|estimate\\.json)$\")\n"
+            ));
+            profile.push_str(&format!("  (regex #\"^{root}/[^/]+/control(/|$)\")\n"));
+            profile.push_str(&format!(
+                "  (regex #\"^{root}/[^/]+/runs/[^/]*\\.jsonl$\")\n"
+            ));
+        }
+    }
+    profile.push_str(")\n");
+
+    // Denying a file alone does not stop renaming its parent directory,
+    // which would move authority outside path-based read/write rules.
+    // Pin ancestor names without denying ordinary writes to their children.
+    let mut pinned_dirs = std::collections::BTreeSet::new();
+    for path in authority_read_deny_paths(inputs)
+        .into_iter()
+        .chain(authority_read_deny_dirs(inputs))
+        .chain(mission_write_denies(inputs).control_dirs)
+    {
+        for parent in path.ancestors().skip(1) {
+            pinned_dirs.insert(escape_sbpl_literal(parent));
+        }
+    }
+    profile.push_str("(deny file-write-unlink\n");
+    for path in pinned_dirs {
+        profile.push_str(&format!("  (literal \"{path}\")\n"));
+    }
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|p| p.ends_with("missions"))
+    {
+        for path in [missions.to_path_buf(), absolutize(missions)] {
+            profile.push_str(&format!(
+                "  (regex #\"^{}/[^/]+(/(control|runs))?$\")\n",
+                escape_sbpl_regex(&path)
+            ));
+        }
+    }
+    profile.push_str(")\n");
+
+    // Shared-Cargo-cache write deny (13th-pass review, P1 — see
+    // cargo_cache_write_deny_paths for the full why): when the shared
+    // registry/git cache exceeds the copy ceiling, the isolated contract
+    // home LINKS it in, and only an EXPLICIT deny keeps the link target
+    // read-only under every allow (an operator extraWrite of $HOME would
+    // otherwise re-widen it to worker-authored contract code). Precise
+    // scope: registry/ and git/ only. Denies take precedence over allows
+    // regardless of clause order (the same guarantee the blocks above
+    // rely on), so placement after the allow is documentary.
+    let mut cache_denies = std::collections::BTreeSet::new();
+    for path in cargo_cache_write_deny_paths() {
+        cache_denies.insert(escape_sbpl_literal(&path));
+    }
+    if !cache_denies.is_empty() {
+        profile.push_str("(deny file-write*\n");
+        for lit in &cache_denies {
+            profile.push_str(&format!("  (subpath \"{lit}\")\n"));
+        }
+        profile.push_str(")\n");
+    }
+
+    profile
+}
+
+/// Build the bubblewrap argv tail for running `binary args` under the resolved
+/// sandbox. The caller uses program `bwrap` and passes this vector as args.
+///
+/// Write scope mirrors the Seatbelt profile: the whole filesystem is bound
+/// read-only, then `session_cwd`, the session-private scratch `tmpdir`, and
+/// each `extra_write` entry are bound writable — the mission dir and the
+/// shared system temp root are NOT writable (ticket sandbox-writable-scope).
+/// Mission metadata that an rw ancestor bind would otherwise cover (checkout
+/// mode) is masked back out, the bwrap analogue of the profile's write deny;
+/// the operator's real Cargo registry/git caches get explicit stacked
+/// ro-binds for the same reason (13th-pass review — they stay readable, a
+/// linked cache is the session's registry, but never writable).
+///
+/// Mandatory validator containment (ticket `validator-mandatory-containment`
+/// — the bwrap analogue of the profile's validator read-deny block): when
+/// [`SandboxInputs::validator_read_deny_roots`] is non-empty, each top-level
+/// source-tree entry of those roots ([`validator_read_deny_entries`]) is
+/// masked — directories shadowed by an empty tmpfs, files by a `/dev/null`
+/// ro-bind — so the whole-fs ro-bind no longer exposes the real checkout's
+/// contents. The `.git`/`.kranz` carve-outs stay (git needs the shared
+/// object store; the snapshot lives under `.kranz`). The root's own
+/// directory LISTING stays visible on both tiers (names, never contents):
+/// bwrap cannot close it without masking the carve-outs, and the Seatbelt
+/// side declines to (a literal deny on the root breaks `mkdir -p` under
+/// the snapshot). `/dev/null` needs no allow here — the bwrap argv mounts
+/// a real `/dev` (`--dev /dev`).
+pub fn bubblewrap_args(
+    inputs: &SandboxInputs,
+    binary: &Path,
+    args: &[String],
+) -> crate::error::Result<Vec<String>> {
+    let mut out = vec![
+        "--die-with-parent".to_string(),
+        "--ro-bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        // Namespace set (2026-09-01 adversarial audit, H8). Before it the
+        // argv unshared ONLY the network namespace, and only under `fs+net`:
+        //
+        // - `--unshare-pid` is what makes `--proc /proc` mean what the mount
+        //   above assumes. Without it the contained agent sees HOST procfs
+        //   and can read `/proc/<engine pid>/environ` — precisely the set
+        //   `agent_env`'s env_clear exists to keep away from a
+        //   prompt-injectable child — on any host with
+        //   `kernel.yama.ptrace_scope = 0`. It also stops the agent
+        //   signalling the engine or any same-uid host process.
+        // - `--unshare-ipc` closes the System V / POSIX IPC channel to host
+        //   processes.
+        // - `--unshare-uts` and `--unshare-cgroup-try` keep hostname and
+        //   cgroup views from being host-identifying or host-mutable. The
+        //   `-try` suffix is load-bearing (follow-up review, M-8): cgroup
+        //   namespaces need Linux >= 4.6 and are unavailable in some nested
+        //   container and hardened-kernel environments, where the plain
+        //   `--unshare-cgroup` makes bwrap EXIT non-zero — and every resolver
+        //   in this file fails closed, so the whole session would die rather
+        //   than degrade by one namespace. `--unshare-pid`/`ipc`/`uts` are
+        //   long-supported and stay unconditional.
+        // - `--new-session` drops the controlling terminal, which is the
+        //   Linux half of the TIOCSTI escape H7 names on macOS (still live
+        //   on kernels built with CONFIG_LEGACY_TIOCSTI). Safe here: every
+        //   child the engine spawns gets piped or null stdio, and the pty
+        //   harness passes its OWN slave fd rather than relying on an
+        //   inherited ctty.
+        //
+        // Unconditional, unlike `--unshare-net` below: none of these is an
+        // egress decision, and `fs` is a containment tier too.
+        "--unshare-pid".to_string(),
+        "--unshare-ipc".to_string(),
+        "--unshare-uts".to_string(),
+        "--unshare-cgroup-try".to_string(),
+        "--new-session".to_string(),
+    ];
+    if inputs.enforce == crate::types::SandboxEnforce::FsNet {
+        out.push("--unshare-net".to_string());
+    }
+    for path in write_allowlist(inputs) {
+        let path = path.display().to_string();
+        out.push("--bind".to_string());
+        out.push(path.clone());
+        out.push(path);
+    }
+    // Keep the mission namespace read-only, including siblings created
+    // after spawn. A validator snapshot or private scratch nested here
+    // gets its own writable bind back before the metadata masks below.
+    if let Some(missions) = inputs
+        .mission_dir
+        .parent()
+        .filter(|path| path.ends_with("missions") && path.is_dir())
+    {
+        let missions = absolutize(missions);
+        let display = missions.display().to_string();
+        out.extend(["--ro-bind".to_string(), display.clone(), display]);
+        for private in [&inputs.session_cwd, &inputs.tmpdir] {
+            let private = absolutize(private);
+            if private.starts_with(&missions) && private != missions {
+                let display = private.display().to_string();
+                out.extend(["--bind".to_string(), display.clone(), display]);
+            }
+        }
+    }
+    // The bwrap analogue of the profile's shared-Cargo-cache write deny
+    // (13th-pass review, P1 — cargo_cache_write_deny_paths): the `/`
+    // ro-bind already mounts the real caches read-only, but an rw bind
+    // covering an ancestor (an extraWrite of $HOME) would silently
+    // re-widen them — stack an explicit ro-bind OVER each cache dir
+    // present at spawn (later binds win; the destination must exist,
+    // hence the is_dir filter). The dir stays READABLE — a linked cache
+    // is the session/gate's registry — only writes close. This
+    // behavior is also enforced by the private Cargo-home namespace below,
+    // which keeps later credential/cache creation out of the session.
+    let cache_ro_binds: std::collections::BTreeSet<String> = cargo_cache_write_deny_paths()
+        .iter()
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .collect();
+    for bind in &cache_ro_binds {
+        out.push("--ro-bind".to_string());
+        out.push(bind.clone());
+        out.push(bind.clone());
+    }
+    // The bwrap analogue of the profile's authority and `.git` write denies
+    // (2026-09-01 adversarial audit, H2 + H11 + H3 support): bwrap has no
+    // per-path write deny to stack over an rw bind, so each denied path is
+    // ro-bound OVER ITSELF — the contents stay READABLE (git cannot run
+    // without its own config, and the Seatbelt side denies writes only) while
+    // every write closes. Later binds win: install these after the initial
+    // writable roots, and restore them after any private-root rebind below.
+    //
+    // Private authority directory views below close both reads and writes,
+    // including authority files created after launch. These extra ro-binds
+    // cover readable policy and Git metadata outside those views. For that
+    // Git configuration surface, active absent inputs are refused before
+    // spawn. Inactive config.worktree cannot become active while the main
+    // config is immutable. Writable self-binds pin metadata directory nodes
+    // against rename without closing the index/object/ref lockfile paths.
+    // Do not directly bind READ-denied paths: their private directory view
+    // owns the destination. A host bind stacked over a mask would restore
+    // the credential the mask is meant to hide.
+    // The write-deny set is a superset of the read-deny set by
+    // construction, so subtract the masked paths and everything beneath a
+    // masked directory before binding.
+    let masked_files: Vec<PathBuf> = authority_read_deny_paths(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let masked_dirs: Vec<PathBuf> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|p| lexical_absolute(p))
+        .collect();
+    let is_masked = |path: &Path| -> bool {
+        let abs = lexical_absolute(path);
+        masked_files.contains(&abs) || masked_dirs.iter().any(|d| abs.starts_with(d))
+    };
+    let git_mount_nodes = git_metadata_mount_nodes(inputs);
+    for node in &git_mount_nodes {
+        let node = node.display().to_string();
+        out.extend(["--bind".to_string(), node.clone(), node]);
+    }
+    let authority_writes = authority_write_denies(inputs);
+    let git_writes = git_metadata_write_denies(inputs);
+    let write_ro_binds: std::collections::BTreeSet<String> = authority_writes
+        .files
+        .iter()
+        .chain(authority_writes.dirs.iter())
+        .filter(|path| path.exists())
+        .chain(
+            git_writes
+                .files
+                .iter()
+                .filter(|path| path.is_file() && !path.is_symlink()),
+        )
+        .chain(git_writes.dirs.iter().filter(|path| path.is_dir()))
+        .filter(|path| !is_masked(path))
+        .map(|path| lexical_absolute(path).display().to_string())
+        .collect();
+    for bind in &write_ro_binds {
+        out.push("--ro-bind".to_string());
+        out.push(bind.clone());
+        out.push(bind.clone());
+    }
+    // Reject hostile metadata leaves before constructing read-only views.
+    // Missing state/transcript files stay absent in the private namespace;
+    // no host-side state.json.tmp placeholder is needed.
+    let write_denies = mission_write_denies(inputs);
+    for path in &write_denies.files {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(crate::error::EngineError::InvalidState(format!(
+                    "bwrap mask prep: {} exists and is not a regular file",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let authority_dirs: Vec<_> = authority_read_deny_dirs(inputs)
+        .iter()
+        .map(|path| absolutize(path))
+        .collect();
+    let authority_masks = authority_directory_masks(inputs);
+    for mask in &authority_masks {
+        let display = mask.path.display().to_string();
+        out.extend(["--tmpfs".to_string(), display.clone()]);
+        for path in &mask.visible_entries {
+            let path = path.display().to_string();
+            // Ordinary entries can disappear after enumeration (for example,
+            // another gate's temporary cache). Leaving a missing entry hidden
+            // is safe; the enclosing mask and read-only remount remain required.
+            out.extend(["--ro-bind-try".to_string(), path.clone(), path]);
+        }
+        // A deeper mask may replace an entry hidden by this one (e.g.
+        // HOME/.kranz below a HOME mask for a missing Cargo home). Reserve
+        // its empty mountpoint in the private tmpfs before sealing it.
+        for nested in &authority_masks {
+            if nested.path != mask.path
+                && nested.path.starts_with(&mask.path)
+                && !mask
+                    .visible_entries
+                    .iter()
+                    .any(|entry| nested.path.starts_with(entry))
+            {
+                out.extend(["--dir".to_string(), nested.path.display().to_string()]);
+            }
+        }
+        out.extend(["--remount-ro".to_string(), display]);
+        // A snapshot or session-private scratch under .kranz remains writable.
+        // Later (deeper) masks still hide its own authority directories.
+        for private in [&inputs.session_cwd, &inputs.tmpdir] {
+            let private = absolutize(private);
+            if private != mask.path
+                && private.starts_with(&mask.path)
+                && !authority_dirs
+                    .iter()
+                    .any(|denied| private.starts_with(denied))
+            {
+                let path = private.display().to_string();
+                out.extend(["--bind".to_string(), path.clone(), path.clone()]);
+                for node in git_mount_nodes
+                    .iter()
+                    .filter(|node| node.starts_with(&private))
+                {
+                    let node = node.display().to_string();
+                    out.extend(["--bind".to_string(), node.clone(), node]);
+                }
+                // Host-source binds replace every nested mount. Restore the
+                // write denies this private root just covered, before deeper
+                // authority masks hide their secrets. Rebinding denied host
+                // directories after those masks would expose them again.
+                let restored_denies: std::collections::BTreeSet<_> = cache_ro_binds
+                    .iter()
+                    .chain(&write_ro_binds)
+                    .filter_map(|denied| {
+                        let denied_path = Path::new(denied);
+                        if denied_path.starts_with(&private) {
+                            Some(denied)
+                        } else if private.starts_with(denied_path) {
+                            Some(&path)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for denied in restored_denies {
+                    out.extend(["--ro-bind".to_string(), denied.clone(), denied.clone()]);
+                }
+            }
+        }
+    }
+    // The bwrap analogue of the profile's validator read-deny block (ticket
+    // validator-mandatory-containment — see the fn doc): shadow each real
+    // source-tree entry so the whole-fs ro-bind stops exposing it. Dirs get
+    // an empty tmpfs (the existing control/-shadow idiom), files a
+    // /dev/null ro-bind (the authority-mask idiom). Entries were enumerated
+    // from the live fs and exist at spawn; later binds win, and this block
+    // lands after every bind and authority view, so neither can re-expose a
+    // denied entry — the carve-outs (`.git`, `.kranz`) were never in the
+    // set, so the snapshot and the shared git dir stay as their binds left
+    // them.
+    for entry in validator_read_deny_entries(inputs) {
+        let display = entry.path.display().to_string();
+        if entry.is_dir {
+            out.push("--tmpfs".to_string());
+            out.push(display);
+        } else {
+            out.push("--ro-bind".to_string());
+            out.push("/dev/null".to_string());
+            out.push(display);
+        }
+    }
+    out.push("--chdir".to_string());
+    out.push(absolutize(&inputs.session_cwd).display().to_string());
+    out.push("--".to_string());
+    out.push(binary.display().to_string());
+    out.extend(args.iter().cloned());
+    Ok(out)
+}
+
+/// Write the profile to a uniquely-named file under `dir`, returning its path.
+pub fn write_profile_file(dir: &Path, profile: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("kranz-sandbox-{}.sb", uuid::Uuid::new_v4()));
+    std::fs::write(&path, profile)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    use std::sync::Mutex;
+
+    /// `extra_write: ["~/cache"]` must resolve against the platform home.
+    /// Regression: this read `HOME` only, which a natively launched
+    /// `kranz.exe` does not have (Git Bash injects one; cmd/PowerShell/
+    /// Explorer do not), so the entry stayed the literal `~/cache` and the
+    /// sandbox grant silently targeted a directory named `~`.
+    #[test]
+    fn expand_tilde_uses_the_platform_home_variable() {
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
+        assert_eq!(expand_tilde("~notatilde"), PathBuf::from("~notatilde"));
+
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("the platform home variable is always set on a real host");
+        let expanded = expand_tilde("~/cache");
+        assert_eq!(expanded, PathBuf::from(&home).join("cache"));
+        assert!(
+            expanded.is_absolute(),
+            "an expanded home path must be absolute: {expanded:?}"
+        );
+
+        #[cfg(windows)]
+        assert_eq!(expand_tilde(r"~\cache"), PathBuf::from(&home).join("cache"));
+    }
+
+    #[cfg(target_os = "macos")]
+    static SANDBOX_EXEC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "macos")]
+    fn sandbox_exec_can_apply() -> bool {
+        let found = std::process::Command::new("which")
+            .arg("sandbox-exec")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            crate::test_capability::skip(
+                crate::test_capability::capability::SANDBOX_EXEC,
+                "sandbox-exec not found on this host",
+            );
+            return false;
+        }
+
+        let smoke = std::process::Command::new("sandbox-exec")
+            .arg("-p")
+            .arg("(version 1)\n(allow default)\n")
+            .arg("/usr/bin/true")
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "sandbox-exec cannot apply a smoke profile on this host; skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("sandbox-exec smoke probe failed; skipping: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bwrap_can_apply() -> bool {
+        if !command_available("bwrap") {
+            crate::test_capability::skip(
+                crate::test_capability::capability::BWRAP,
+                "bwrap not found on this host",
+            );
+            return false;
+        }
+
+        let smoke = std::process::Command::new("bwrap")
+            .args([
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "/bin/true",
+            ])
+            .output();
+        match smoke {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "bwrap cannot apply a smoke sandbox on this host; skipping: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("bwrap smoke probe failed; skipping: {e}");
+                false
+            }
+        }
+    }
+
+    fn inputs(
+        session_cwd: &Path,
+        mission_dir: &Path,
+        tmpdir: &Path,
+        extra: Vec<PathBuf>,
+    ) -> SandboxInputs {
+        SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: session_cwd.to_path_buf(),
+            mission_dir: mission_dir.to_path_buf(),
+            tmpdir: tmpdir.to_path_buf(),
+            extra_write: extra,
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sandbox_profile_contains_required_clauses() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        ));
+
+        assert!(profile.contains("(version 1)"));
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
+        // `fs` must allow network so the sandboxed agent can reach its API.
+        assert!(profile.contains("(allow network*)"));
+        assert!(!profile.contains("(deny network*)"));
+
+        let session_abs = absolutize(session.path());
+        let tmp_abs = absolutize(tmp.path());
+        let extra_abs = absolutize(extra.path());
+
+        // The writable set: session cwd, the session-private scratch, and
+        // each extraWrite entry.
+        for p in [&session_abs, &tmp_abs, &extra_abs] {
+            let expected = format!("(subpath \"{}\")", escape_sbpl_literal(p));
+            assert!(
+                profile.contains(&expected),
+                "profile missing subpath rule for {:?}:\n{}",
+                p,
+                profile
+            );
+        }
+
+        // The mission dir is NOT writable (its engine-owned metadata carries
+        // explicit write denies instead — see
+        // sandbox_profile_denies_mission_metadata_writes).
+        let mission_abs = absolutize(mission.path());
+        let mission_rule = format!("(subpath \"{}\")", escape_sbpl_literal(&mission_abs));
+        assert!(
+            !profile.contains(&mission_rule),
+            "profile must not allow writes to the whole mission dir:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_denies_authority_material_reads() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+
+        // Broad reads stay, with the authority material carved out by explicit
+        // denies (SBPL denies take precedence over the allow).
+        assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains("(deny file-read*"));
+        let kranz_dir = repo.path().join(".kranz");
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            // The plaintext clean-room lint vocabulary (14th-pass review).
+            "domain-terms.local",
+        ] {
+            for base in [kranz_dir.clone(), absolutize(&kranz_dir)] {
+                let expected = format!("(literal \"{}\")", escape_sbpl_literal(&base.join(name)));
+                assert!(
+                    profile.contains(&expected),
+                    "profile missing read deny for {}:\n{profile}",
+                    base.join(name).display()
+                );
+            }
+        }
+        // The cargo registry token file is denied too (CARGO_HOME crosses
+        // into child envs for cache locality; its credentials must not
+        // ride along).
+        assert!(
+            profile.contains("credentials.toml"),
+            "profile missing read deny for cargo credentials:\n{profile}"
+        );
+        if let Some(global) = crate::paths::global_config() {
+            let global_dir = global.parent().unwrap();
+            for operation in ["(deny file-read*", "(deny file-write*"] {
+                for protected in [&global, global_dir] {
+                    assert!(
+                        profile.split(operation).skip(1).any(|block| {
+                            block
+                                .split("\n)\n")
+                                .next()
+                                .unwrap()
+                                .contains(&escape_sbpl_literal(protected))
+                        }),
+                        "missing {operation} rule for {}",
+                        protected.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_checkout_denies_authority_writes_and_future_sibling_inboxes() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let mission = root.join(".kranz/missions/m-current");
+        std::fs::create_dir_all(&mission).unwrap();
+        let config = root.join(".kranz/config.json");
+        let config_target = root.join("operator-config.json");
+        std::fs::write(&config_target, "original").unwrap();
+        std::os::unix::fs::symlink(&config_target, &config).unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = generate_profile(&inputs(&root, &mission, &scratch, vec![]));
+        // Create a sibling after generating the profile to cover future
+        // missions rather than relying on a spawn-time directory listing.
+        let sibling = root.join(".kranz/missions/m-later/control");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let run = |script: &str, path: &Path| {
+            Command::new("sandbox-exec")
+                .args(["-p", &profile, "/bin/sh", "-c", script, "audit"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let probe = run("exit 0", &root);
+        if !probe.status.success()
+            && String::from_utf8_lossy(&probe.stderr).contains("sandbox_apply")
+        {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        assert!(probe.status.success(), "{probe:?}");
+        for protected in [
+            config.clone(),
+            config_target.clone(),
+            sibling.join("forged.json"),
+            sibling.parent().unwrap().join("events.jsonl"),
+        ] {
+            assert!(
+                !run("printf forged > \"$1\"", &protected).status.success(),
+                "wrote {}",
+                protected.display()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(config).unwrap(), "original");
+        assert!(
+            !run("cat \"$1\"", &config_target).status.success(),
+            "the symlink's target must carry the same authority read denial"
+        );
+        assert!(!sibling.join("forged.json").exists());
+        assert!(
+            !run(
+                "ln \"$1/.kranz/config.json\" \"$1/authority-hardlink\"",
+                &root
+            )
+            .status
+            .success(),
+            "a hard link must not move authority outside the read deny"
+        );
+        assert!(
+            !run("mv \"$1/.kranz\" \"$1/moved-authority\"", &root)
+                .status
+                .success(),
+            "renaming the authority parent must not move it outside its deny rules"
+        );
+        assert!(run("printf feature > \"$1\"", &root.join("feature.txt"))
+            .status
+            .success());
+        assert!(run("printf scratch > \"$1\"", &scratch.join("work.txt"))
+            .status
+            .success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_global_authority_is_denied_when_created_after_profile() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_global_authority_is_denied_when_created_after_profile",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("operator");
+        let alias = root.join("operator-alias");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let session = root.join("session");
+        let mission = session.join(".kranz/missions/m-test");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&mission).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = {
+            let _env = crate::agent_env::EnvTestGuard::engage(&[("HOME", alias.to_str().unwrap())]);
+            generate_profile(&inputs(&session, &mission, &scratch, vec![home.clone()]))
+        };
+        let authority = home.join(".kranz/serve/later.token");
+        std::fs::create_dir_all(authority.parent().unwrap()).unwrap();
+        std::fs::write(&authority, "fake-authority").unwrap();
+        let output = std::process::Command::new("sandbox-exec")
+            .args(["-p", &profile, "/bin/sh", "-c",
+                "printf witness > \"$1/witness\" || exit 2; if cat \"$2\"; then exit 3; fi; if printf forged > \"$2\"; then exit 4; fi",
+                "test"])
+            .arg(&session).arg(&authority).output().unwrap();
+        if String::from_utf8_lossy(&output.stderr).contains("sandbox_apply") {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        assert!(output.status.success(), "{output:?}");
+        assert!(session.join("witness").exists());
+        assert_eq!(
+            std::fs::read_to_string(authority).unwrap(),
+            "fake-authority"
+        );
+    }
+
+    /// Composition audit (ticket `config-fail-open-audit`): the effective
+    /// egress list EXTENDS the compiled-in Anthropic floor — a mission's
+    /// configured `egress[]` (and, downstream, its operator-approved egress
+    /// grants) can only add destinations, never drop or narrow the defaults.
+    /// A replace-shaped regression here strands the sandboxed session's own
+    /// API access, or worse, goes unnoticed while the operator believes the
+    /// floor is still composed in.
+    #[test]
+    fn composition_audit_effective_egress_extends_never_replaces_the_default_floor() {
+        let configured = vec![
+            " crates.io:443 ".to_string(),       // trimmed on the way in
+            "api.anthropic.com:443".to_string(), // a duplicate of the floor
+            "registry.npmjs.org:443".to_string(),
+        ];
+        let out = effective_egress(&configured);
+        assert_eq!(
+            out,
+            vec![
+                "api.anthropic.com:443".to_string(),
+                "*.anthropic.com:443".to_string(),
+                "crates.io:443".to_string(),
+                "registry.npmjs.org:443".to_string(),
+            ]
+        );
+        // An empty configured list still yields the full default floor.
+        assert_eq!(effective_egress(&[]).len(), DEFAULT_EGRESS.len());
+    }
+
+    /// Composition audit: `extraWrite` EXTENDS the writable floor (session
+    /// cwd + session-private scratch) — the floor itself is not configurable
+    /// away, so no config shape can un-write the session's own worktree or
+    /// its private scratch.
+    #[test]
+    fn composition_audit_extra_write_extends_never_replaces_the_writable_floor() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let inputs = inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        );
+        let writable = write_allowlist(&inputs);
+        for floor in [absolutize(session.path()), absolutize(tmp.path())] {
+            assert!(
+                writable.contains(&floor),
+                "the writable floor {floor:?} must survive any extraWrite list"
+            );
+        }
+        assert!(writable.contains(&absolutize(extra.path())));
+    }
+
+    /// Composition audit: the explicit deny sets (mission metadata writes,
+    /// authority reads) survive an `extraWrite` broad enough to COVER them.
+    /// SBPL denies take precedence over every allow regardless of clause
+    /// order, so the deny clauses must still be emitted when the allow side
+    /// is at its widest — this is the deny-wins pin for the sandbox surface.
+    #[test]
+    fn composition_audit_explicit_denies_survive_a_covering_extra_write_allow() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // extraWrite = the repo root: every mission file now sits under an
+        // allowed subpath — the widest realistic allow shape.
+        let profile = generate_profile(&inputs(
+            repo.path(),
+            &mission,
+            tmp.path(),
+            vec![repo.path().to_path_buf()],
+        ));
+        // The covering allow IS emitted...
+        assert!(
+            profile.contains(&format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(repo.path()))
+            )),
+            "the covering extraWrite allow must be present:\n{profile}"
+        );
+        // ...and the metadata write denies still are too: the audit log,
+        // state snapshot, and control inbox stay unwritable through the
+        // allow because SBPL denies win over it.
+        assert!(profile.contains("(deny file-write*"));
+        for name in ["events.jsonl", "state.json"] {
+            assert!(
+                profile.contains(&escape_sbpl_literal(&mission.join(name))),
+                "the write deny for {name} must survive the covering allow:\n{profile}"
+            );
+        }
+        // Authority reads (serve.token) stay denied under the broad read
+        // allow for the same reason.
+        assert!(
+            profile.contains(&escape_sbpl_literal(
+                &repo.path().join(".kranz").join("serve.token")
+            )),
+            "the read deny for serve.token must survive the covering allow:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_args_mask_authority_material_with_dev_null() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let serve_token = repo.path().join(".kranz").join("serve.token");
+        std::fs::write(&serve_token, "secret").unwrap();
+
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, tmp.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let expected = format!(
+            "--tmpfs {}",
+            absolutize(serve_token.parent().unwrap()).display()
+        );
+        assert!(
+            joined.contains(&expected),
+            "missing private authority directory: {args:?}"
+        );
+        // Neither existing nor future credentials get a bind back into it.
+        assert!(!joined.contains("serve.token"));
+        assert!(
+            !joined.contains("serve.read.token"),
+            "future authority files must not get a host bind: {args:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_denies_mission_metadata_writes() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        // Checkout-mode shape: the session cwd is the repo root, an ANCESTOR
+        // of the mission dir — without explicit write denies the audit log,
+        // state snapshot, control inbox, and transcripts would be writable
+        // through the session-cwd subpath allow.
+        let profile = generate_profile(&inputs(repo.path(), &mission, scratch.path(), vec![]));
+
+        assert!(
+            profile.contains("(deny file-write*"),
+            "missing write deny block:\n{profile}"
+        );
+        for name in MISSION_METADATA_FILES {
+            for base in [mission.clone(), absolutize(&mission)] {
+                let expected = format!("(literal \"{}\")", escape_sbpl_literal(&base.join(name)));
+                assert!(
+                    profile.contains(&expected),
+                    "profile missing write deny for {}:\n{profile}",
+                    base.join(name).display()
+                );
+            }
+        }
+        for base in [mission.clone(), absolutize(&mission)] {
+            let control = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&base.join("control"))
+            );
+            assert!(
+                profile.contains(&control),
+                "profile missing control/ write deny:\n{profile}"
+            );
+            let runs = format!(
+                "(regex #\"^{}/[^/]*\\.jsonl$\")",
+                escape_sbpl_regex(&base.join("runs"))
+            );
+            assert!(
+                profile.contains(&runs),
+                "profile missing transcript write deny:\n{profile}"
+            );
+        }
+        // The mission dir root itself is not in the allow set.
+        let mission_rule = format!(
+            "(subpath \"{}\")",
+            escape_sbpl_literal(&absolutize(&mission))
+        );
+        assert!(
+            !profile.contains(&mission_rule),
+            "the whole mission dir must not be writable:\n{profile}"
+        );
+    }
+
+    /// 13th-pass review (P1): above the copy ceiling the isolated contract
+    /// Cargo home LINKS the operator's registry/git caches in — the profile
+    /// must deny writes to those REAL cache dirs (raw AND canonical forms)
+    /// so the linked target stays read-only under every allow. The deny is
+    /// PRECISE: the two cache dirs, never the whole cargo home (rustup/cargo
+    /// binaries keep their ordinary posture).
+    #[test]
+    fn cache_write_deny_profile_denies_real_cache_dirs_precisely() {
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("registry")).unwrap();
+        std::fs::create_dir_all(cargo.path().join("git")).unwrap();
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(
+            session.path(),
+            mission.path(),
+            scratch.path(),
+            vec![],
+        ));
+        for base in [cargo.path().to_path_buf(), absolutize(cargo.path())] {
+            for name in ["registry", "git"] {
+                let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&base.join(name)));
+                assert!(
+                    profile.contains(&expected),
+                    "profile missing cache write deny for {}:\n{profile}",
+                    base.join(name).display()
+                );
+            }
+        }
+        // Precision: the cargo home ITSELF is not in the deny set — the
+        // closing `"` after the home path makes this an exact-line check
+        // (the registry/git lines carry a longer path and cannot match).
+        for base in [cargo.path().to_path_buf(), absolutize(cargo.path())] {
+            let whole_home = format!("(subpath \"{}\")", escape_sbpl_literal(&base));
+            assert!(
+                !profile.contains(&whole_home),
+                "the deny must be precise to the cache dirs, not the whole cargo home:\n{profile}"
+            );
+        }
+    }
+
+    /// The bwrap analogue: the real cache dirs present at spawn get explicit
+    /// ro-binds stacked AFTER the rw binds (later binds win — an rw
+    /// extraWrite covering an ancestor must not re-widen them), and absent
+    /// dirs are skipped (bwrap requires the destination to exist).
+    #[test]
+    fn cache_write_deny_bwrap_stacks_ro_binds_over_real_cache() {
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("registry")).unwrap();
+        // git/ deliberately absent → not bound (the is_dir filter).
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
+            "CARGO_HOME",
+            cargo.path().to_str().expect("utf-8 temp path"),
+        )]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let args = bubblewrap_args(
+            &inputs(session.path(), mission.path(), scratch.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let registry = absolutize(&cargo.path().join("registry"));
+        let expected = format!("--ro-bind {0} {0}", registry.display());
+        assert!(
+            joined.contains(&expected),
+            "missing stacked ro-bind for the real registry cache: {args:?}"
+        );
+        let git_cache = cargo.path().join("git");
+        assert!(
+            !joined.contains(&git_cache.display().to_string()),
+            "an absent cache dir must not be bound: {args:?}"
+        );
+        // Ordering is load-bearing: the cache ro-bind must land AFTER every
+        // rw `--bind`, or a wide writable root would re-cover it.
+        let last_rw = args
+            .iter()
+            .rposition(|arg| arg == "--bind")
+            .expect("the writable roots are rw-bound");
+        let registry_arg = registry.display().to_string();
+        let cache_pos = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == registry_arg && w[2] == registry_arg)
+            .expect("the cache ro-bind pair exists");
+        assert!(
+            cache_pos > last_rw,
+            "the cache ro-bind must stack after the rw binds: {args:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_keeps_sibling_temp_neighbors_unwritable() {
+        // The worktree-mode layout the finding named: integration/feature
+        // worktrees for ALL missions sit side by side under the shared temp
+        // root. The session's own worktree + private scratch must be
+        // writable; the sibling mission's worktree, the sibling's scratch,
+        // and the shared temp root itself must not.
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("kranz-wt-aaa-m1-f-1-1");
+        let scratch = root.path().join("kranz-worker-home-sess-1");
+        let sibling = root.path().join("kranz-wt-bbb-m2-_integration");
+        let sibling_scratch = root.path().join("kranz-worker-home-sess-2");
+        for d in [&session, &scratch, &sibling, &sibling_scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mission = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(&session, mission.path(), &scratch, vec![]));
+
+        for allowed in [&session, &scratch] {
+            let expected = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(allowed))
+            );
+            assert!(
+                profile.contains(&expected),
+                "profile missing allow for {}:\n{profile}",
+                allowed.display()
+            );
+        }
+        for denied in [&sibling, &sibling_scratch, &root.path().to_path_buf()] {
+            let rule = format!("(subpath \"{}\")", escape_sbpl_literal(&absolutize(denied)));
+            assert!(
+                !profile.contains(&rule),
+                "{} must not be writable:\n{profile}",
+                denied.display()
+            );
+        }
+    }
+
+    #[test]
+    fn bubblewrap_args_mask_mission_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        let runs = mission.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        // Engine-owned metadata present at spawn.
+        let events = mission.join("events.jsonl");
+        let state = mission.join("state.json");
+        let transcript = runs.join("run-1.jsonl");
+        let denials = runs.join("egress-denials.jsonl");
+        for f in [&events, &state, &transcript, &denials] {
+            std::fs::write(f, "engine").unwrap();
+        }
+        let control = mission.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        // A runs/ SUBDIRECTORY of session scratch: its jsonl files are not
+        // transcripts and must NOT be masked.
+        let contract_home = runs.join("contract-home");
+        std::fs::create_dir_all(&contract_home).unwrap();
+        let scratch_jsonl = contract_home.join("notes.jsonl");
+        std::fs::write(&scratch_jsonl, "session").unwrap();
+
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        for path in [&events, &state, &mission.join("runs")] {
+            let path = absolutize(path).display().to_string();
+            assert!(
+                joined.contains(&format!("--ro-bind-try {path} {path}")),
+                "metadata must remain read-only: {args:?}"
+            );
+        }
+        let mission_abs = absolutize(&mission).display().to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == mission_abs));
+        assert!(
+            !args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == absolutize(&control).display().to_string()
+                    && part[1] == part[2]
+            }),
+            "the control inbox must not be rebound into the private mission directory"
+        );
+        assert!(
+            !mission.join("state.json.tmp").exists(),
+            "argv construction must not create metadata"
+        );
+        // Absent metadata files are not masked (bwrap needs the destination
+        // to exist).
+        assert!(
+            !joined.contains("estimate.json"),
+            "absent metadata files must not be masked: {args:?}"
+        );
+        // No rw bind of the mission dir, and runs/-subdir scratch files stay
+        // unmasked.
+        let mission_abs = absolutize(&mission);
+        assert!(
+            !joined.contains(&format!("--bind {0} {0}", mission_abs.display())),
+            "mission dir must not be rw-bound: {args:?}"
+        );
+        assert!(
+            !joined.contains(&scratch_jsonl.display().to_string()),
+            "runs/ subdir scratch files must not be masked: {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bubblewrap_mask_prep_rejects_preexisting_state_tmp_symlink() {
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("runs")).unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("outside");
+        std::fs::write(&target, "unchanged").unwrap();
+        symlink(&target, mission.join("state.json.tmp")).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let error = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .expect_err("a symlink cannot become a bwrap mask mount point");
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+        assert!(
+            std::fs::symlink_metadata(mission.join("state.json.tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "mask preparation must not replace or follow the hostile leaf"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_excludes_paths_outside_allowlist() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let outsider = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(session.path(), mission.path(), tmp.path(), vec![]));
+
+        let outsider_abs = absolutize(outsider.path());
+        let forbidden = format!("(subpath \"{}\")", escape_sbpl_literal(&outsider_abs));
+        assert!(
+            !profile.contains(&forbidden),
+            "profile unexpectedly allows write to path outside the allowlist"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_fs_net_restricts_egress_to_loopback() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+        inputs.egress = vec!["crates.io:443".into(), "api.anthropic.com:443".into()];
+
+        let profile = generate_profile(&inputs);
+
+        // Seatbelt rejects hostname egress rules, so the profile cuts outbound
+        // TCP to loopback only; the per-host allowlist (including the
+        // configured entries above) is the egress proxy's job, not the SBPL's.
+        assert!(!profile.contains("(allow network*)"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
+        assert!(
+            !profile.contains("crates.io") && !profile.contains("anthropic.com"),
+            "no per-host egress rules in the profile:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_args_bind_write_roots_and_unshare_network_for_fs_net() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(
+            session.path(),
+            mission.path(),
+            tmp.path(),
+            vec![extra.path().to_path_buf()],
+        );
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+
+        let args =
+            bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &["--print".into()]).unwrap();
+        let joined = args.join(" ");
+
+        assert!(args.contains(&"--unshare-net".to_string()));
+        for path in [
+            absolutize(session.path()),
+            absolutize(tmp.path()),
+            absolutize(extra.path()),
+        ] {
+            assert!(
+                joined.contains(&format!("--bind {0} {0}", path.display())),
+                "bubblewrap args missing bind for {}: {args:?}",
+                path.display()
+            );
+        }
+        // The mission dir is bound read-only via the whole-fs ro-bind only —
+        // never re-bound writable.
+        let mission_abs = absolutize(mission.path());
+        assert!(
+            !joined.contains(&format!("--bind {0} {0}", mission_abs.display())),
+            "bubblewrap args must not rw-bind the mission dir: {args:?}"
+        );
+        assert!(joined.contains("--ro-bind / /"));
+        assert!(joined.ends_with("/usr/bin/claude --print"));
+    }
+
+    /// H8 (2026-09-01 adversarial audit): the argv unshared ONLY the network
+    /// namespace, and only under `fs+net`. Host `/proc` was therefore the
+    /// engine's own `/proc`, so a contained agent could read
+    /// `/proc/<engine>/environ` (the very set `agent_env` exists to withhold)
+    /// on a `ptrace_scope = 0` host, keep the controlling terminal, and
+    /// signal the engine. Every namespace flag is unconditional; only
+    /// `--unshare-net` stays tier-gated, because it is an egress decision.
+    #[test]
+    fn bubblewrap_args_unshare_every_namespace_on_both_tiers() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+            inputs.enforce = enforce;
+            let args = bubblewrap_args(&inputs, Path::new("/usr/bin/claude"), &[]).unwrap();
+
+            for flag in [
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--new-session",
+                "--die-with-parent",
+            ] {
+                assert!(
+                    args.contains(&flag.to_string()),
+                    "{enforce:?} argv missing {flag}: {args:?}"
+                );
+            }
+            // M-8 (follow-up review): the non-try form makes bwrap EXIT
+            // non-zero where cgroup namespaces are unavailable (kernels
+            // before 4.6, nested containers, hardened kernels), and every
+            // resolver here fails closed — so the whole session dies rather
+            // than degrading by one namespace.
+            assert!(
+                !args.contains(&"--unshare-cgroup".to_string()),
+                "the non-try cgroup unshare must never be emitted: {args:?}"
+            );
+            assert_eq!(
+                args.contains(&"--unshare-net".to_string()),
+                enforce == crate::types::SandboxEnforce::FsNet,
+                "--unshare-net is the one tier-gated namespace: {args:?}"
+            );
+        }
+    }
+
+    /// The canonical `<repo>/.kranz/missions/<id>` fixture the authority
+    /// write denies need: a repo root with the mission's own dir, a SIBLING
+    /// mission, the repo-level engine stores, and a `.git`.
+    fn authority_write_fixture() -> (tempfile::TempDir, PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+        let mission = kranz.join("missions").join("m-x");
+        std::fs::create_dir_all(mission.join("runs").join("scratch")).unwrap();
+        std::fs::create_dir_all(kranz.join("missions").join("m-other")).unwrap();
+        for name in ["queue", "tickets", "lessons", "hook-status"] {
+            std::fs::create_dir_all(kranz.join(name)).unwrap();
+        }
+        for name in ["config.json", "serve.token", "serve.read.token"] {
+            std::fs::write(kranz.join(name), "secret").unwrap();
+        }
+        std::fs::create_dir_all(repo.path().join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".git").join("info")).unwrap();
+        std::fs::write(repo.path().join(".git").join("config"), "[core]\n").unwrap();
+        (repo, mission)
+    }
+
+    /// H2 + H11 (2026-09-01 adversarial audit): `.kranz/config.json` was
+    /// read-denied but WRITE-allowed, and every metadata deny was derived
+    /// from the session's OWN mission dir. Under checkout mode `session_cwd`
+    /// is the repo root, so a contained worker could overwrite the trust
+    /// root it could not read, and forge approvals into a sibling mission.
+    #[test]
+    fn sandbox_profile_denies_authority_material_writes() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+
+        // Checkout mode: session_cwd IS the repo root, the hostile shape.
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+
+        for name in ["config.json", "serve.token", "serve.read.token"] {
+            let expected = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&absolutize(&kranz.join(name)))
+            );
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .kranz/{name}:\n{profile}"
+            );
+        }
+        for name in ["queue", "tickets", "lessons", "hook-status"] {
+            let expected = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&absolutize(&kranz.join(name)))
+            );
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .kranz/{name}/:\n{profile}"
+            );
+        }
+        // The SIBLING mission is denied; the session's OWN mission dir is
+        // not denied wholesale (mission_write_denies keeps the narrow set,
+        // and runs/<scratch> must stay writable).
+        let other = absolutize(&kranz.join("missions").join("m-other"));
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", escape_sbpl_literal(&other))),
+            "profile missing write deny for the sibling mission dir:\n{profile}"
+        );
+        let own = absolutize(&mission);
+        assert!(
+            !profile.contains(&format!("(subpath \"{}\")\n", escape_sbpl_literal(&own))),
+            "the session's own mission dir must not be denied wholesale:\n{profile}"
+        );
+        // The sealing regexes: no NEW store under `.kranz`, no NEW sibling
+        // mission dir, after the profile was built.
+        for root in [absolutize(&kranz), absolutize(&kranz.join("missions"))] {
+            let expected = format!("(regex #\"^{}/[^/]*$\")", escape_sbpl_regex(&root));
+            assert!(
+                profile.contains(&expected),
+                "profile missing the sealing regex for {}:\n{profile}",
+                root.display()
+            );
+        }
+    }
+
+    /// The global kranz key dir (`~/.kranz/keys`) is denied for BOTH reads
+    /// and writes on every tier (2026-09-01 adversarial audit, C1/H6): the
+    /// consent substrate's MAC key has to live outside a sandboxed session's
+    /// readable set, or the MAC proves nothing against the agent it excludes;
+    /// and a session that could replace the key could re-sign anything.
+    #[test]
+    fn global_key_dir_is_read_and_write_denied() {
+        // The global dir is resolved once per process (`paths::global_kranz_dir`),
+        // so the test reads the resolved value instead of rebinding HOME: the
+        // property under test is that the deny follows the SAME resolver the
+        // key writer and the seal recorder use.
+        let global = crate::paths::global_kranz_dir().expect("a global kranz dir resolves");
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+
+        for store in ["keys", "seals"] {
+            let dir = global.join(store);
+            assert!(
+                authority_read_deny_dirs(&inputs).contains(&dir),
+                "the global {store} dir must be read-denied"
+            );
+            assert!(
+                authority_write_denies(&inputs).dirs.contains(&dir),
+                "the global {store} dir must be write-denied"
+            );
+            let profile = generate_profile(&inputs);
+            let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&dir));
+            assert!(
+                profile.matches(&expected).count() >= 2,
+                "the {store} dir belongs in BOTH the read-deny and the write-deny block:\n{profile}"
+            );
+        }
+    }
+
+    /// A mission dir that is NOT in the canonical
+    /// `<repo>/.kranz/missions/<id>` layout must yield no sweep at all — the
+    /// derivation walks parents, and a bare temp-dir mission would otherwise
+    /// seal the system temp root (or `/`) against every write.
+    #[test]
+    fn authority_write_denies_refuse_a_noncanonical_mission_layout() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+
+        assert!(
+            sealed_kranz_dir_roots(&inputs).is_empty(),
+            "a non-canonical mission dir must seal nothing"
+        );
+        let denies = authority_write_denies(&inputs);
+        let temp_root = absolutize(&std::env::temp_dir());
+        assert!(
+            !denies.dirs.iter().any(|d| d == &temp_root),
+            "the sweep must never reach the system temp root: {:?}",
+            denies.dirs
+        );
+    }
+
+    /// H3 support (2026-09-01 adversarial audit): the engine checkpoints with
+    /// an UNHARDENED git handle in the tree the worker controls, so a planted
+    /// `.git/hooks/pre-commit` or a `core.sshCommand` in `.git/config`
+    /// executes on the host with the engine's full environment. The deny is
+    /// narrow because the worker's own role is to commit.
+    #[test]
+    fn sandbox_profile_denies_git_config_and_hook_writes_but_not_the_index() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+
+        let git = absolutize(&repo.path().join(".git"));
+        for dir in ["hooks", "info"] {
+            let expected = format!("(subpath \"{}\")", escape_sbpl_literal(&git.join(dir)));
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .git/{dir}/:\n{profile}"
+            );
+        }
+        for file in ["config", "config.worktree"] {
+            let expected = format!("(literal \"{}\")", escape_sbpl_literal(&git.join(file)));
+            assert!(
+                profile.contains(&expected),
+                "profile missing write deny for .git/{file}:\n{profile}"
+            );
+        }
+        // The gitlink FILE form (worktree mode) is denied as a literal, which
+        // in checkout mode denies a replace of the `.git` directory node.
+        assert!(
+            profile.contains(&format!("(literal \"{}\")", escape_sbpl_literal(&git))),
+            "profile missing write deny for the .git node itself:\n{profile}"
+        );
+        // The commit path stays open: nothing denies the index or objects.
+        for open in ["index", "objects", "refs"] {
+            let denied = format!("(subpath \"{}\")", escape_sbpl_literal(&git.join(open)));
+            assert!(
+                !profile.contains(&denied),
+                ".git/{open} must stay writable — the worker commits:\n{profile}"
+            );
+        }
+    }
+
+    /// M-9 (follow-up review): a submodule keeps its own `config` and
+    /// `hooks/` under `.git/modules/<name>/`, which is the SAME host-execution
+    /// surface `.git/config` and `.git/hooks/` are — and in checkout mode it
+    /// sits inside the rw session bind. The subtree deny covers every
+    /// submodule, present and future; git never needs to write it from
+    /// inside the sandbox.
+    #[test]
+    fn git_metadata_write_denies_cover_the_submodule_config_and_hook_surface() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+
+        let modules = absolutize(&repo.path().join(".git").join("modules"));
+        assert!(
+            git_metadata_write_denies(&inputs).dirs.contains(&modules),
+            "the .git/modules subtree must be write-denied: {:?}",
+            git_metadata_write_denies(&inputs).dirs
+        );
+        let profile = generate_profile(&inputs);
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", escape_sbpl_literal(&modules))),
+            "profile missing write deny for .git/modules/:\n{profile}"
+        );
+    }
+
+    /// The bwrap analogue of the two blocks above: each denied path is
+    /// ro-bound over itself (readable, unwritable), and the `.git` DIRECTORY
+    /// node is deliberately excluded — binding it whole would close the index
+    /// the worker's own `git commit` writes.
+    /// Later binds win in bwrap. A read-denied file is closed by its
+    /// /dev/null mask; a self ro-bind of the same path emitted afterwards
+    /// would put the real content back. Every masked path must therefore be
+    /// absent from the self-bind set (Linux CI receipt, 2026-09-03).
+    #[test]
+    fn bubblewrap_args_never_self_bind_a_masked_authority_path() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![]);
+        let args = bubblewrap_args(&inputs, Path::new("/bin/true"), &[]).unwrap();
+        let masked: Vec<String> = authority_read_deny_paths(&inputs)
+            .iter()
+            .map(|path| absolutize(path).display().to_string())
+            .collect();
+        let kranz = absolutize(&repo.path().join(".kranz"))
+            .display()
+            .to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--tmpfs" && pair[1] == kranz));
+        let mut i = 0;
+        while i + 2 < args.len() {
+            if matches!(args[i].as_str(), "--ro-bind" | "--ro-bind-try")
+                && args[i + 1] == args[i + 2]
+            {
+                assert!(
+                    !masked.contains(&args[i + 2]),
+                    "{} is masked and must not be re-bound over itself",
+                    args[i + 2]
+                );
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn bubblewrap_args_ro_bind_authority_and_git_write_denies() {
+        let (repo, mission) = authority_write_fixture();
+        let tmp = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, tmp.path(), vec![]),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        for path in [
+            kranz.join("queue"),
+            kranz.join("tickets"),
+            kranz.join("lessons"),
+            kranz.join("missions").join("m-other"),
+            repo.path().join(".git").join("hooks"),
+            repo.path().join(".git").join("info"),
+            repo.path().join(".git").join("config"),
+        ] {
+            let expected = format!("--ro-bind {0} {0}", lexical_absolute(&path).display());
+            assert!(
+                joined.contains(&expected),
+                "bwrap argv missing the write-closing ro-bind for {}: {args:?}",
+                path.display()
+            );
+        }
+        let git = lexical_absolute(&repo.path().join(".git"));
+        assert!(
+            !joined.contains(&format!("--ro-bind {0} {0}", git.display())),
+            "the .git DIRECTORY must never be ro-bound whole — the worker commits: {args:?}"
+        );
+    }
+
+    /// H7 (2026-09-01 adversarial audit): the operator's own terminal must
+    /// be denied read, write AND ioctl — the last is what closes TIOCSTI —
+    /// even though the gate extras still ALLOW the pty device class the
+    /// harness's `openpty` needs, and even though `/dev/ttys003` is matched
+    /// by that class. Rendered from an explicit path list so the assertion
+    /// holds on a test runner with no controlling terminal of its own.
+    #[test]
+    fn tty_deny_block_denies_ioctl_on_the_named_terminal_and_nothing_when_absent() {
+        let block = tty_deny_block(&[
+            PathBuf::from("/dev/ttys003"),
+            PathBuf::from("/dev/ttys003"),
+            PathBuf::from("/dev/ttys001"),
+        ]);
+        assert!(block.starts_with("(deny file-read* file-write* file-ioctl\n"));
+        assert!(block.contains("(literal \"/dev/ttys003\")"), "{block}");
+        assert!(block.contains("(literal \"/dev/ttys001\")"), "{block}");
+        assert_eq!(
+            block.matches("/dev/ttys003").count(),
+            1,
+            "duplicate fds must collapse to one literal:\n{block}"
+        );
+        assert!(
+            tty_deny_block(&[]).is_empty(),
+            "no controlling terminal means no deny block"
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_write_profile_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = "(version 1)\n(deny default)\n";
+        let path = write_profile_file(dir.path(), profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), profile);
+        assert!(path.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn sandbox_platform_support_matrix() {
+        use crate::types::SandboxEnforce;
+
+        assert_eq!(
+            platform_support(SandboxEnforce::Off, "macos"),
+            SandboxDecision::Off
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Fs, "macos"),
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Fs, "linux"),
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "macos"),
+            SandboxDecision::Enforce(SandboxBackend::Seatbelt)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "linux"),
+            SandboxDecision::Enforce(SandboxBackend::Bubblewrap)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Fs, "windows"),
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::FsNet, "windows"),
+            SandboxDecision::Enforce(SandboxBackend::AppContainer)
+        );
+        assert_eq!(
+            platform_support(SandboxEnforce::Off, "linux"),
+            SandboxDecision::Off
+        );
+    }
+
+    #[test]
+    fn sandbox_resolve_off_yields_none() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Off,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        assert!(resolved.is_none());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn sandbox_resolve_linux_requires_bwrap() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            None,
+            None,
+        );
+        assert!(resolved.is_none());
+        assert!(
+            warn.unwrap().contains("bwrap"),
+            "missing-bwrap warning should name bwrap"
+        );
+
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            true,
+            None,
+            None,
+        );
+        assert!(warn.is_none());
+        assert_eq!(
+            resolved.expect("bwrap present").backend,
+            SandboxBackend::Bubblewrap
+        );
+    }
+
+    fn container_cfg(
+        enforce: crate::types::SandboxEnforce,
+        egress: Vec<String>,
+    ) -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig {
+            enforce,
+            provider: crate::types::SandboxProvider::Container,
+            image: None,
+            extra_write: vec![],
+            egress,
+        }
+    }
+
+    #[test]
+    fn container_provider_off_stays_unsandboxed() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Off, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            None,
+            None,
+        );
+        assert!(resolved.is_none());
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn container_provider_on_macos_resolves_only_against_a_mount_proof() {
+        use crate::sandbox_container::{ContainerRuntime, MountProof};
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let resolve = |proof: Option<MountProof>| {
+            resolve_for_session_target(
+                &cfg,
+                session.path(),
+                mission.path(),
+                "macos",
+                false,
+                Some(ContainerRuntime::Docker),
+                proof,
+            )
+        };
+
+        // A host that proved the round trip is supported, receipt or no receipt.
+        let (resolved, warn) = resolve(Some(MountProof::Proven));
+        assert!(resolved.is_some(), "a proven mount must resolve: {warn:?}");
+
+        // A host whose mount shares nothing is refused, and the operator is
+        // told which path failed rather than that the platform is unsupported.
+        let (resolved, warn) = resolve(Some(MountProof::Failed(
+            "docker accepted a bind mount of /var/folders/x and shared nothing".to_string(),
+        )));
+        assert!(resolved.is_none());
+        let warn = warn.expect("a failed proof must refuse loudly");
+        assert!(warn.contains("/var/folders/x"), "{warn}");
+        assert!(warn.contains("shared nothing"), "{warn}");
+
+        // No proof is not the same as a passing proof.
+        let (resolved, warn) = resolve(None);
+        assert!(resolved.is_none());
+        let warn = warn.expect("an unproven host must refuse");
+        assert!(warn.contains("requires a bind-mount proof"), "{warn}");
+    }
+
+    #[test]
+    fn container_provider_on_windows_refuses_even_a_proven_mount() {
+        use crate::sandbox_container::{ContainerRuntime, MountProof};
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Windows fails the POSIX guest-path and /dev/null authority-mask
+        // contract, which a mount proof says nothing about.
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "windows",
+            false,
+            Some(ContainerRuntime::Docker),
+            Some(MountProof::Proven),
+        );
+        assert!(resolved.is_none());
+        let warn = warn.expect("windows must refuse");
+        assert!(
+            warn.contains("not supported on target_os=windows"),
+            "{warn}"
+        );
+        assert!(warn.contains("POSIX guest paths"), "{warn}");
+    }
+
+    #[test]
+    fn container_provider_without_runtime_fails_closed() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            None,
+            None,
+        );
+        assert!(resolved.is_none());
+        let warn = warn.expect("missing runtime must produce a warning");
+        assert!(warn.contains("provider:container"), "{warn}");
+        assert!(warn.contains("docker/podman/nerdctl/container"), "{warn}");
+        assert!(warn.contains("refusing to run unsandboxed"), "{warn}");
+    }
+
+    #[test]
+    fn macos_enforced_container_provider_fails_closed_to_native_process_guidance() {
+        let cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warning) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "macos",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
+        );
+        assert!(resolved.is_none());
+        let warning = warning.expect("an unproved macOS container must refuse");
+        // The refusal is now about THIS host's evidence, not about the
+        // platform: an unproved macOS host is refused, and a proved one
+        // resolves (container_provider_on_macos_resolves_only_against_a_mount_proof).
+        assert!(warning.contains("requires a bind-mount proof"), "{warning}");
+        assert!(
+            warning.contains("sandbox.provider=\"process\""),
+            "{warning}"
+        );
+        assert!(warning.contains("native host containment"), "{warning}");
+    }
+
+    /// M7 Windows parity, phase 4: the process provider resolves the stable
+    /// AppContainer backend. Merely finding `docker.exe` still does not prove
+    /// the Windows container mount contract, so that provider stays refused;
+    /// `off` remains the operator's explicit unsandboxed posture.
+    #[test]
+    fn windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let process = crate::types::SandboxConfig {
+                enforce,
+                provider: crate::types::SandboxProvider::Process,
+                image: None,
+                extra_write: vec![],
+                egress: vec![],
+            };
+            let (resolved, warning) = resolve_for_session_target(
+                &process,
+                session.path(),
+                mission.path(),
+                "windows",
+                false,
+                Some(crate::sandbox_container::ContainerRuntime::Docker),
+                None,
+            );
+            assert!(warning.is_none(), "{warning:?}");
+            let resolved = resolved.expect("Windows process enforcement resolves");
+            assert_eq!(resolved.backend, SandboxBackend::AppContainer);
+            assert_eq!(resolved.inputs.enforce, enforce);
+            assert_eq!(resolved.inputs.session_cwd, session.path());
+            assert_eq!(resolved.inputs.mission_dir, mission.path());
+
+            let container = container_cfg(enforce, vec![]);
+            let (resolved, warning) = resolve_for_session_target(
+                &container,
+                session.path(),
+                mission.path(),
+                "windows",
+                false,
+                Some(crate::sandbox_container::ContainerRuntime::Docker),
+                None,
+            );
+            assert!(resolved.is_none());
+            let warning = warning.expect("an unproved Windows container must refuse");
+            // Windows is refused on its own contract gap, not for want of a
+            // mount proof: guest paths and /dev/null masks are what fail
+            // there, so no probe result could change this answer.
+            assert!(
+                warning.contains("not supported on target_os=windows"),
+                "{warning}"
+            );
+            assert!(
+                warning.contains("unverified container mount contract"),
+                "{warning}"
+            );
+        }
+
+        let off = container_cfg(crate::types::SandboxEnforce::Off, vec![]);
+        let (resolved, warning) = resolve_for_session_target(
+            &off,
+            session.path(),
+            mission.path(),
+            "windows",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
+        );
+        assert!(resolved.is_none());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn container_provider_fs_net_with_egress_list_resolves_for_the_proxy() {
+        let cfg = container_cfg(
+            crate::types::SandboxEnforce::FsNet,
+            vec!["crates.io:443".to_string()],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Docker resolves the posture; the runner provisions the unique
+        // internal network + authenticated relay before session spawn.
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
+        );
+        assert!(warn.is_none(), "{warn:?}");
+        let resolved = resolved.expect("container fs+net with egress must resolve");
+        assert_eq!(resolved.backend, SandboxBackend::Container);
+        assert_eq!(resolved.inputs.egress, vec!["crates.io:443".to_string()]);
+    }
+
+    #[test]
+    fn container_provider_fs_net_with_egress_refuses_non_docker_runtime() {
+        let cfg = container_cfg(
+            crate::types::SandboxEnforce::FsNet,
+            vec!["crates.io:443".to_string()],
+        );
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let (resolved, warning) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Podman),
+            None,
+        );
+        assert!(resolved.is_none());
+        let warning = warning.expect("unproved runtime must fail closed");
+        assert!(warning.contains("requires Docker"), "{warning}");
+        assert!(warning.contains("podman"), "{warning}");
+    }
+
+    #[test]
+    fn container_provider_resolves_runtime_and_image() {
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        // Default image when config names none.
+        let cfg = container_cfg(crate::types::SandboxEnforce::FsNet, vec![]);
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Podman),
+            None,
+        );
+        assert!(warn.is_none());
+        let resolved = resolved.expect("runtime present and policy supportable");
+        assert_eq!(resolved.backend, SandboxBackend::Container);
+        let container = resolved.container.expect("container spec must be set");
+        assert_eq!(
+            container.runtime,
+            crate::sandbox_container::ContainerRuntime::Podman
+        );
+        assert_eq!(container.image, crate::sandbox_container::DEFAULT_IMAGE);
+
+        // Configured image overrides the default.
+        let mut cfg = container_cfg(crate::types::SandboxEnforce::Fs, vec![]);
+        cfg.image = Some("ghcr.io/example/kranz-worker:1".to_string());
+        let (resolved, warn) = resolve_for_session_target(
+            &cfg,
+            session.path(),
+            mission.path(),
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
+        );
+        assert!(warn.is_none());
+        assert_eq!(
+            resolved
+                .expect("runtime present")
+                .container
+                .expect("container spec")
+                .image,
+            "ghcr.io/example/kranz-worker:1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_fs_on_macos_yields_resolved_sandbox() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        assert!(warn.is_none());
+        let resolved = resolved.expect("expected an enforced sandbox on macos");
+        assert_eq!(resolved.backend, SandboxBackend::Seatbelt);
+        assert_eq!(resolved.inputs.session_cwd, session.path());
+        assert_eq!(resolved.inputs.mission_dir, mission.path());
+        assert!(!resolved.inputs.tmpdir.as_os_str().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_prewarms_apple_git_cache_before_profile_use() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("initialize disposable repository");
+        assert!(init.success());
+        let mission = tempfile::tempdir().unwrap();
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+
+        // Resolution performs the bounded host-side prewarm before the
+        // generated profile can deny the shared xcrun cache refresh.
+        let (resolved, warn) = resolve_for_session(&cfg, repo.path(), mission.path());
+        assert!(warn.is_none());
+        let resolved = resolved.expect("Seatbelt resolves on macOS");
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path =
+            write_profile_file(profile_dir.path(), &generate_profile(&resolved.inputs)).unwrap();
+        let output = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(profile_path)
+            .arg("/usr/bin/git")
+            .args(["status", "--short"])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run Apple Git under the resolved profile");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "Apple Git must run: {stderr}");
+        assert!(
+            !stderr.contains("xcrun_db"),
+            "the host-side prewarm must prevent an in-sandbox cache refresh: {stderr}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_expands_tilde_extra_write_via_home() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec!["~/.cargo".to_string()],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+
+        let (resolved, _warn) = resolve_for_session(&cfg, session.path(), mission.path());
+        let resolved = resolved.expect("expected an enforced sandbox on macos");
+        assert_eq!(
+            resolved.inputs.extra_write,
+            vec![PathBuf::from(home).join(".cargo")]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_resolve_fs_net_on_macos_yields_seatbelt_with_loopback_profile() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            provider: crate::types::SandboxProvider::Process,
+            image: None,
+            extra_write: vec![],
+            egress: vec![],
+        };
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+
+        let (resolved, warn) = resolve_for_session(&cfg, session.path(), mission.path());
+
+        assert!(warn.is_none(), "fs+net on macOS resolves: {warn:?}");
+        let resolved = resolved.expect("fs+net on macOS resolves to Seatbelt");
+        assert_eq!(resolved.backend, SandboxBackend::Seatbelt);
+        let profile = generate_profile(&resolved.inputs);
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"),
+            "fs+net profile must restrict egress to loopback so only the egress proxy is reachable:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_allows_inside_denies_outside() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(session.path(), mission.path(), tmp.path(), vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let inside_file = session.path().join("inside.txt");
+        let inside_status = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo hi > {}", inside_file.display()))
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            inside_status.success(),
+            "expected write inside session_cwd to succeed"
+        );
+        assert!(inside_file.exists(), "expected inside file to be created");
+
+        let dev_null_status = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("echo hi > /dev/null 2>&1")
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            dev_null_status.success(),
+            "ordinary shell redirects to /dev/null must succeed"
+        );
+
+        let outside_file = outside.path().join(format!(
+            "kranz_sandbox_should_fail_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside_status = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(format!("echo hi > {}", outside_file.display()))
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            !outside_status.success(),
+            "expected write outside allowlist to be denied"
+        );
+        assert!(
+            !outside_file.exists(),
+            "denied write must not have created the file"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_denies_authority_material_reads() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kranz_dir = repo.path().join(".kranz");
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            "domain-terms.local",
+        ] {
+            std::fs::write(kranz_dir.join(name), "secret").unwrap();
+        }
+        let public = repo.path().join("public.txt");
+        std::fs::write(&public, "public").unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, tmp.path(), vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        for name in [
+            "serve.token",
+            "serve.read.token",
+            "config.json",
+            "domain-terms.local",
+        ] {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/cat")
+                .arg(kranz_dir.join(name))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                !status.success(),
+                "sandboxed read of .kranz/{name} must be denied"
+            );
+        }
+
+        // Ordinary repo reads keep working under the same profile.
+        let output = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/cat")
+            .arg(&public)
+            .output()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            output.status.success(),
+            "ordinary repo reads must keep working: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "public");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_denies_mission_metadata_writes() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        // Checkout-mode shape: session_cwd is the repo root, an ANCESTOR of
+        // the mission dir — the hostile case the write denies exist for.
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        let runs = mission.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let control = mission.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        let contract_home = runs.join("contract-home");
+        std::fs::create_dir_all(&contract_home).unwrap();
+        let events = mission.join("events.jsonl");
+        let state = mission.join("state.json");
+        let old_transcript = runs.join("run-old.jsonl");
+        std::fs::write(&events, "{\"seq\":1}\n").unwrap();
+        std::fs::write(&state, "{}").unwrap();
+        std::fs::write(&old_transcript, "original\n").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, scratch.path(), vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        // Engine-owned paths refuse writes — including a NEW runs/*.jsonl
+        // (the transcript regex denies creation, not just modification).
+        let denied_writes = [
+            format!("echo tampered >> {}", events.display()),
+            format!("echo tampered > {}", state.display()),
+            format!("echo x > {}", control.join("approve.json").display()),
+            format!("echo forged >> {}", old_transcript.display()),
+            format!("echo forged > {}", runs.join("run-new.jsonl").display()),
+        ];
+        for write in denied_writes {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(&write)
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(!status.success(), "write must be denied: {write}");
+        }
+        assert_eq!(std::fs::read_to_string(&events).unwrap(), "{\"seq\":1}\n");
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(&old_transcript).unwrap(),
+            "original\n"
+        );
+        assert!(!runs.join("run-new.jsonl").exists());
+        assert!(std::fs::read_dir(&control).unwrap().next().is_none());
+
+        // The session's own work continues under the same profile: the repo
+        // tree, the private scratch, and runs/ SUBDIRECTORIES stay writable.
+        let allowed_writes = [
+            repo.path().join("src.txt"),
+            scratch.path().join("notes.txt"),
+            contract_home.join("out.txt"),
+        ];
+        for target in allowed_writes {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ok > {}", target.display()))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                status.success(),
+                "write must be allowed: {}",
+                target.display()
+            );
+            assert!(target.exists());
+        }
+    }
+
+    /// The live half of `sandbox_profile_denies_authority_material_writes`
+    /// and `..._git_config_and_hook_writes...`: a real `sandbox-exec` run
+    /// under a checkout-mode profile refuses the writes and keeps the
+    /// session's own work going (H2, H11, H3 support).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_denies_authority_and_git_metadata_writes() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let (repo, mission) = authority_write_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let kranz = repo.path().join(".kranz");
+        let git = repo.path().join(".git");
+        std::fs::write(git.join("index"), "idx").unwrap();
+
+        let profile = generate_profile(&inputs(repo.path(), &mission, scratch.path(), vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let denied = [
+            // The trust root: overwritten without ever being read.
+            format!("echo '{{}}' > {}", kranz.join("config.json").display()),
+            // A sibling mission's control inbox (forged operator consent).
+            format!(
+                "echo x > {}",
+                kranz
+                    .join("missions")
+                    .join("m-other")
+                    .join("approve.json")
+                    .display()
+            ),
+            // A NEW sibling mission dir, and a NEW repo-level store.
+            format!(
+                "mkdir {}",
+                kranz.join("missions").join("m-forged").display()
+            ),
+            format!("mkdir {}", kranz.join("newstore").display()),
+            // Repo-level engine stores.
+            format!("echo x > {}", kranz.join("queue").join("q.json").display()),
+            format!("echo x > {}", kranz.join("lessons").join("l.md").display()),
+            // The git hook and config surface the engine's next checkpoint
+            // commit would execute.
+            format!(
+                "echo x > {}",
+                git.join("hooks").join("pre-commit").display()
+            ),
+            format!("echo x > {}", git.join("config").display()),
+        ];
+        for command in &denied {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(!status.success(), "write must be denied: {command}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(kranz.join("config.json")).unwrap(),
+            "secret"
+        );
+        assert!(!kranz.join("missions").join("m-forged").exists());
+        assert!(!kranz.join("newstore").exists());
+        assert!(!git.join("hooks").join("pre-commit").exists());
+
+        // The session's own work is untouched: the repo tree, the private
+        // scratch, its own mission scratch under runs/, and the git index
+        // the worker's own `git commit` writes.
+        let allowed = [
+            repo.path().join("src.txt"),
+            scratch.path().join("notes.txt"),
+            mission.join("runs").join("scratch").join("out.txt"),
+            git.join("index"),
+        ];
+        for target in allowed {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ok > {}", target.display()))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                status.success(),
+                "write must be allowed: {}",
+                target.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_denies_sibling_temp_neighbors() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        // The finding's layout: every mission's integration/feature
+        // worktrees and scratch homes sit side by side under the shared
+        // temp root. A session must write its own worktree + scratch and
+        // nothing beside them.
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("kranz-wt-aaa-m1-f-1-1");
+        let scratch = root.path().join("kranz-worker-home-sess-1");
+        let scratch_home = scratch.join("home");
+        let sibling = root.path().join("kranz-wt-bbb-m2-_integration");
+        let sibling_scratch = root.path().join("kranz-worker-home-sess-2");
+        for d in [&session, &scratch_home, &sibling, &sibling_scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mission = tempfile::tempdir().unwrap();
+
+        let profile = generate_profile(&inputs(&session, mission.path(), &scratch, vec![]));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        for allowed in [session.join("code.rs"), scratch_home.join("notes.txt")] {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ok > {}", allowed.display()))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                status.success(),
+                "write inside the session's own roots must be allowed: {}",
+                allowed.display()
+            );
+            assert!(allowed.exists());
+        }
+
+        for denied in [
+            sibling.join("evil.txt"),
+            sibling_scratch.join("evil.txt"),
+            root.path().join("evil.txt"),
+        ] {
+            let status = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo evil > {}", denied.display()))
+                .status()
+                .expect("failed to run sandbox-exec");
+            assert!(
+                !status.success(),
+                "write to a temp neighbor must be denied: {}",
+                denied.display()
+            );
+            assert!(!denied.exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_enforcement_macos_fs_net_loopback_profile_applies() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+        inputs.enforce = crate::types::SandboxEnforce::FsNet;
+
+        // The fs+net profile (loopback-only egress) must be ACCEPTED by
+        // sandbox-exec — unlike the hostname-rule shape Seatbelt rejects with
+        // "host must be * or localhost" — or fs+net sessions could not run.
+        let profile = generate_profile(&inputs);
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let applied = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/usr/bin/true")
+            .output()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            applied.status.success(),
+            "loopback-only fs+net profile must apply cleanly on macOS: {}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_enforcement_linux_bwrap_allows_inside_denies_outside() {
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+
+        let inside_file = session.path().join("inside.txt");
+        let inside_args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/sh"),
+            &["-c".into(), format!("echo hi > {}", inside_file.display())],
+        )
+        .unwrap();
+        let inside_status = Command::new("bwrap")
+            .args(inside_args)
+            .status()
+            .expect("failed to run bwrap");
+        assert!(
+            inside_status.success(),
+            "expected write inside session_cwd to succeed"
+        );
+        assert!(inside_file.exists(), "expected inside file to be created");
+
+        let outside_file = outside
+            .path()
+            .join(format!("kranz_bwrap_should_fail_{}", uuid::Uuid::new_v4()));
+        let outside_args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/sh"),
+            &["-c".into(), format!("echo hi > {}", outside_file.display())],
+        )
+        .unwrap();
+        let outside_status = Command::new("bwrap")
+            .args(outside_args)
+            .status()
+            .expect("failed to run bwrap");
+        assert!(
+            !outside_status.success(),
+            "expected write outside allowlist to be denied"
+        );
+        assert!(
+            !outside_file.exists(),
+            "denied write must not have created the file"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries",
+        ) {
+            return;
+        }
+        if !bwrap_can_apply() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", home.path().to_str().unwrap())]);
+        let kranz = home.path().join(".kranz");
+        let mission = repo.path().join(".kranz/missions/m-mask-race");
+        std::fs::create_dir_all(&mission).unwrap();
+        let transient_dir = home.path().join("temporary-cache");
+        let transient_file = home.path().join("temporary-note");
+        let public = home.path().join("public.txt");
+        let authority_path = repo.path().join(".kranz/serve.token");
+        let late_authority_path = kranz.join("serve.read.token");
+        let writable = repo.path().join("result.txt");
+        std::fs::create_dir(&transient_dir).unwrap();
+        std::fs::write(&transient_file, "temporary").unwrap();
+        std::fs::write(&public, "public").unwrap();
+        std::fs::write(&authority_path, "secret").unwrap();
+        let args = bubblewrap_args(
+            &inputs(repo.path(), &mission, scratch.path(), vec![]),
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "test ! -e \"$1\" && test ! -e \"$2\" \
+                 && test \"$(cat \"$3\")\" = public && ! touch \"$3\" \
+                 && test ! -e \"$4\" && test ! -e \"$5\" \
+                 && printf ok > \"$6\""
+                    .into(),
+                "mask-race".into(),
+                transient_dir.display().to_string(),
+                transient_file.display().to_string(),
+                public.display().to_string(),
+                authority_path.display().to_string(),
+                late_authority_path.display().to_string(),
+                writable.display().to_string(),
+            ],
+        )
+        .unwrap();
+        for path in [&transient_dir, &transient_file] {
+            let path = absolutize(path).display().to_string();
+            assert!(args.windows(3).any(|part| {
+                matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                    && part[1] == path
+                    && part[2] == path
+            }));
+        }
+        // Deterministically reproduce deletion between enumeration and mount
+        // setup, while also creating authority that the private view must hide.
+        std::fs::remove_dir(&transient_dir).unwrap();
+        std::fs::remove_file(&transient_file).unwrap();
+        std::fs::create_dir(&kranz).unwrap();
+        std::fs::write(&late_authority_path, "late-secret").unwrap();
+        let output = std::process::Command::new("bwrap")
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "missing ordinary entries must stay hidden without breaking the sandbox: {output:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&writable).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(&public).unwrap(), "public");
+        assert_eq!(std::fs::read_to_string(&authority_path).unwrap(), "secret");
+        assert_eq!(
+            std::fs::read_to_string(&late_authority_path).unwrap(),
+            "late-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_bwrap_rebinding_keeps_git_and_authority_protected() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_bwrap_rebinding_keeps_git_and_authority_protected",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let cargo = home.join(".cargo");
+        std::fs::create_dir(home.join(".kranz")).unwrap();
+        let _env = crate::agent_env::EnvTestGuard::engage(&[
+            ("HOME", home.to_str().unwrap()),
+            ("CARGO_HOME", cargo.to_str().unwrap()),
+        ]);
+        // The absent Cargo home promotes its authority mask to HOME, above
+        // the checkout. A validator snapshot also gets rebound below runs/.
+        assert!(!cargo.exists());
+        for snapshot in [false, true] {
+            let repo = home.join(if snapshot {
+                "validator-repo"
+            } else {
+                "checkout"
+            });
+            let mission = repo.join(".kranz/missions/m-rebind");
+            let scratch = mission.join("runs/scratch");
+            let cwd = if snapshot {
+                mission.join("runs/snapshot")
+            } else {
+                repo.clone()
+            };
+            for path in [&cwd, &scratch] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let protected = if snapshot {
+                vec![cwd.join(".git")]
+            } else {
+                std::fs::create_dir_all(cwd.join(".git/hooks")).unwrap();
+                vec![cwd.join(".git/config"), cwd.join(".git/hooks/probe")]
+            };
+            for path in &protected {
+                std::fs::write(path, "protected").unwrap();
+            }
+            let authority_path = repo.join(".kranz/serve.token");
+            std::fs::write(&authority_path, "secret").unwrap();
+            let ordinary = if snapshot {
+                cwd.join("witness")
+            } else {
+                cwd.join(".git/index")
+            };
+            let mut command = vec![
+                "-c".into(),
+                "printf work > \"$1\" || exit 1; printf work > \"$2\" || exit 2; \
+                 if cat \"$3\"; then exit 3; fi; shift 3; \
+                 for path in \"$@\"; do \
+                 test \"$(cat \"$path\")\" = protected || exit 4; \
+                 if printf forged > \"$path\"; then exit 5; fi; done"
+                    .into(),
+                "rebind-test".into(),
+                ordinary.display().to_string(),
+                scratch.join("witness").display().to_string(),
+                authority_path.display().to_string(),
+            ];
+            command.extend(protected.iter().map(|path| path.display().to_string()));
+            let args = bubblewrap_args(
+                &inputs(&cwd, &mission, &scratch, vec![]),
+                Path::new("/bin/sh"),
+                &command,
+            )
+            .unwrap();
+            for path in &protected {
+                let last_bind = args.windows(3).rev().find(|part| {
+                    matches!(part[0].as_str(), "--bind" | "--ro-bind" | "--ro-bind-try")
+                        && path.starts_with(&part[2])
+                });
+                assert_eq!(
+                    last_bind.map(|part| part[0].as_str()),
+                    Some("--ro-bind"),
+                    "a later writable ancestor reopened {}: {args:?}",
+                    path.display()
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if bwrap_can_apply() {
+                let output = std::process::Command::new("bwrap")
+                    .args(&args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "snapshot={snapshot}: {output:?}");
+                assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), "work");
+                assert_eq!(std::fs::read_to_string(&authority_path).unwrap(), "secret");
+                for path in protected {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), "protected");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_enforcement_linux_bwrap_masks_authority_material() {
+        if crate::agent_env::isolated_global_home_test(
+            "sandbox::tests::sandbox_enforcement_linux_bwrap_masks_authority_material",
+        ) {
+            return;
+        }
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let serve_token = repo.path().join(".kranz").join("serve.token");
+        std::fs::write(&serve_token, "secret").unwrap();
+        let public = repo.path().join("public.txt");
+        std::fs::write(&public, "public").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let authority_target = tempfile::tempdir().unwrap();
+        let alias = home.path().join(".kranz");
+        std::os::unix::fs::symlink(authority_target.path(), &alias).unwrap();
+        let config_target = authority_target.path().join("settings.json");
+        std::fs::write(&config_target, "config-secret").unwrap();
+        std::os::unix::fs::symlink(&config_target, repo.path().join(".kranz/config.json")).unwrap();
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", home.path().to_str().unwrap())]);
+        let inputs = inputs(repo.path(), &mission, tmp.path(), vec![home.path().into()]);
+
+        // The private directory has no authority entry at all.
+        let masked = Command::new("bwrap")
+            .args(
+                bubblewrap_args(
+                    &inputs,
+                    Path::new("/bin/cat"),
+                    &[serve_token.display().to_string()],
+                )
+                .unwrap(),
+            )
+            .output()
+            .expect("failed to run bwrap");
+        assert!(
+            !masked.status.success(),
+            "reading the hidden authority path must fail: {}",
+            String::from_utf8_lossy(&masked.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&masked.stdout).contains("secret"),
+            "serve.token content must be masked inside the sandbox"
+        );
+
+        let late = repo.path().join(".kranz/serve.read.token");
+        let args = bubblewrap_args(
+            &inputs,
+            Path::new("/bin/cat"),
+            &[late.display().to_string()],
+        )
+        .unwrap();
+        // Create the token after the mount policy has been resolved. The old
+        // existence-filtered file mask would have exposed this value.
+        std::fs::write(&late, "late-secret").unwrap();
+        let output = Command::new("bwrap").args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("late-secret"));
+
+        let host_view = format!("/proc/{}/root{}", std::process::id(), serve_token.display());
+        let output = Command::new("bwrap")
+            .args(bubblewrap_args(&inputs, Path::new("/bin/cat"), &[host_view]).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "host /proc roots must not bypass the namespace"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+
+        for (binary, path) in [("/bin/cat", &config_target), ("/bin/rm", &alias)] {
+            let output = Command::new("bwrap")
+                .args(
+                    bubblewrap_args(&inputs, Path::new(binary), &[path.display().to_string()])
+                        .unwrap(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "authority alias/target was exposed: {output:?}"
+            );
+        }
+        assert!(
+            alias.is_symlink(),
+            "the operator's authority alias was replaced"
+        );
+
+        let control = Command::new("bwrap")
+            .args(
+                bubblewrap_args(
+                    &inputs,
+                    Path::new("/bin/cat"),
+                    &[public.display().to_string()],
+                )
+                .unwrap(),
+            )
+            .output()
+            .expect("failed to run bwrap");
+        assert_eq!(String::from_utf8_lossy(&control.stdout), "public");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mandatory validator containment (ticket validator-mandatory-containment)
+    // -----------------------------------------------------------------------
+
+    /// A fake real-checkout root in the exact production layout: a source
+    /// tree (dir + files, including a dotfile secret), the shared `.git`
+    /// dir, and the `.kranz` mission layout with the validator's snapshot
+    /// worktree underneath. Returns (tempdir guard, root, snapshot, mission).
+    fn validator_containment_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("secret.rs"), "fn secret() {}\n").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        // The .env is authority material by NAME (path-based deny); its
+        // content is irrelevant to the test and deliberately not
+        // secret-shaped (the range scanner fires on TOKEN= shapes — the
+        // path is bound separately so no .env + value adjacency exists).
+        let dotenv_path = root.join(".env");
+        std::fs::write(&dotenv_path, "placeholder-content\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let mission = root.join(".kranz").join("missions").join("m-x");
+        let snapshot = mission.join("runs").join("validator-snapshot-scrutiny");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("README.md"), "snapshot copy\n").unwrap();
+        std::fs::write(root.join(".kranz").join("serve.token"), "secret-token").unwrap();
+        // The sensitive .kranz runtime the 14th-pass over-read finding names
+        // (ticket validator-containment-kranz-overread): the plaintext lint
+        // vocabulary, the hook-status projection, and the mission control
+        // inbox — all reachable through the .kranz carve-out unless the
+        // authority read-deny set covers them.
+        std::fs::write(
+            root.join(".kranz").join("domain-terms.local"),
+            "acme widget\n",
+        )
+        .unwrap();
+        let hook_status = root.join(".kranz").join("hook-status").join("m-x");
+        std::fs::create_dir_all(&hook_status).unwrap();
+        std::fs::write(hook_status.join("run-1.json"), "{\"tokenHash\":\"abc\"}\n").unwrap();
+        let control = mission.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::write(control.join("approve.json"), "{}\n").unwrap();
+        (dir, root, snapshot, mission)
+    }
+
+    /// A REAL git repo in the same layout (one committed file + a committed
+    /// `src/` dir, `.kranz/` ignored, the snapshot as a detached worktree
+    /// under the mission's `runs/`) for the applied probes that exercise
+    /// the git surface. None when git is not on PATH (mirrors the
+    /// orchestrator tests' `lessons_test_repo` skip).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn validator_containment_git_fixture() -> Option<(tempfile::TempDir, PathBuf, PathBuf, PathBuf)>
+    {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            crate::test_capability::skip(
+                crate::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        if !std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            run(&["init"]);
+            run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("secret.rs"), "fn secret() {}\n").unwrap();
+        std::fs::write(root.join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), ".kranz/\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
+        let mission = root.join(".kranz").join("missions").join("m-x");
+        let snapshot = mission.join("runs").join("validator-snapshot-scrutiny");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        run(&[
+            "worktree",
+            "add",
+            "--detach",
+            snapshot.to_str().expect("utf-8 temp path"),
+        ]);
+        // Engine-owned metadata + the authority material the denies cover.
+        std::fs::write(mission.join("events.jsonl"), "{\"seq\":1}\n").unwrap();
+        std::fs::write(root.join(".kranz").join("serve.token"), "secret-token").unwrap();
+        Some((dir, root, snapshot, mission))
+    }
+
+    /// The mandatory-wrap inputs shape: the snapshot as the sole writable
+    /// session root, the real checkout as the read-deny root.
+    fn validator_containment_inputs(
+        root: &Path,
+        snapshot: &Path,
+        mission: &Path,
+        tmpdir: &Path,
+    ) -> SandboxInputs {
+        SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: snapshot.to_path_buf(),
+            mission_dir: mission.to_path_buf(),
+            tmpdir: tmpdir.to_path_buf(),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: vec![root.to_path_buf()],
+        }
+    }
+
+    /// The read-deny set covers the whole source tree — dirs classified as
+    /// dirs, files as files, raw AND canonical forms — and NEVER names the
+    /// `.git`/`.kranz` carve-outs.
+    #[test]
+    fn validator_containment_entries_cover_source_tree_and_carve_out_git_and_kranz() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        let entries = validator_read_deny_entries(&inputs);
+
+        for base in [root.clone(), absolutize(&root)] {
+            let src = base.join("src");
+            assert!(
+                entries.contains(&ValidatorReadDenyEntry {
+                    path: src.clone(),
+                    is_dir: true
+                }),
+                "src/ must be a denied dir: {entries:?}"
+            );
+            for file in ["Cargo.toml", ".env"] {
+                assert!(
+                    entries.contains(&ValidatorReadDenyEntry {
+                        path: base.join(file),
+                        is_dir: false
+                    }),
+                    "{file} must be a denied file: {entries:?}"
+                );
+            }
+        }
+        assert!(
+            entries.iter().all(|e| e
+                .path
+                .file_name()
+                .is_some_and(|n| n != ".git" && n != ".kranz")),
+            "the carve-outs must never be denied: {entries:?}"
+        );
+    }
+
+    /// The generated profile: a second read-deny block closes the broad read
+    /// allow over the real checkout (dirs as subpaths, files and the root
+    /// itself as literals) while the snapshot stays writable and the shared
+    /// git dir + mission dir stay reachable.
+    #[test]
+    fn validator_containment_profile_read_denies_source_tree_and_keeps_carveouts() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let read_rules: String = profile
+            .split("(deny file-read*")
+            .skip(1)
+            .map(|block| block.split("\n)\n").next().unwrap_or_default())
+            .collect();
+
+        for base in [root.clone(), absolutize(&root)] {
+            let src = format!("(subpath \"{}\")", escape_sbpl_literal(&base.join("src")));
+            assert!(
+                profile.contains(&src),
+                "profile missing read deny for src/:\n{profile}"
+            );
+            for file in ["Cargo.toml", ".env"] {
+                let lit = format!("(literal \"{}\")", escape_sbpl_literal(&base.join(file)));
+                assert!(
+                    profile.contains(&lit),
+                    "profile missing read deny for {file}:\n{profile}"
+                );
+            }
+            let root_lit = format!("(literal \"{}\")", escape_sbpl_literal(&base));
+            assert!(
+                !read_rules.contains(&root_lit),
+                "the root itself is deliberately NOT denied (a literal deny breaks \
+                 coreutils `mkdir -p`, which stats every ancestor):\n{profile}"
+            );
+            // The carve-outs are never denied: no rule names the .git or
+            // .kranz DIRS themselves (the closing quote makes this exact).
+            let git_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".git")));
+            assert!(
+                !read_rules.contains(&git_rule),
+                ".git must stay readable (the inspection's git surface):\n{profile}"
+            );
+            let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base.join(".kranz")));
+            assert!(
+                !read_rules.contains(&kranz_rule),
+                ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
+            );
+        }
+        // …and the .kranz carve-out does not reopen the authority material.
+        for base in [root.join(".kranz"), absolutize(&root.join(".kranz"))] {
+            let token = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&base.join("serve.token"))
+            );
+            assert!(
+                profile.contains(&token),
+                "the authority read deny must survive the carve-out:\n{profile}"
+            );
+        }
+        // The snapshot stays the writable root.
+        let snap_rule = format!(
+            "(subpath \"{}\")",
+            escape_sbpl_literal(&absolutize(&snapshot))
+        );
+        assert!(
+            profile.contains(&snap_rule),
+            "the snapshot must stay writable:\n{profile}"
+        );
+        // …and /dev/null stays writable (the gate wrap's documented finding:
+        // git and the shell open it O_RDWR in ordinary operation).
+        assert!(
+            profile.contains("(allow file-write* (literal \"/dev/null\"))"),
+            "validator profiles must keep /dev/null writable:\n{profile}"
+        );
+    }
+
+    /// 14th-pass review (ticket `validator-containment-kranz-overread`): the
+    /// `.kranz` carve-out the snapshot lives under must not reopen the
+    /// sensitive runtime beneath it — the plaintext lint vocabulary
+    /// (`domain-terms.local`), the hook-status projection, and the mission
+    /// control inbox are read-denied (literal for the file, subpaths for the
+    /// dirs) in BOTH raw and canonical forms, exactly like the serve-token
+    /// authority material.
+    #[test]
+    fn validator_containment_profile_denies_sensitive_kranz_runtime_reads() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let read_rules: String = profile
+            .split("(deny file-read*")
+            .skip(1)
+            .map(|block| block.split("\n)\n").next().unwrap_or_default())
+            .collect();
+
+        let kranz = root.join(".kranz");
+        for base in [kranz.clone(), absolutize(&kranz)] {
+            let terms = format!(
+                "(literal \"{}\")",
+                escape_sbpl_literal(&base.join("domain-terms.local"))
+            );
+            assert!(
+                profile.contains(&terms),
+                "profile missing read deny for domain-terms.local:\n{profile}"
+            );
+            let hook = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&base.join("hook-status"))
+            );
+            assert!(
+                profile.contains(&hook),
+                "profile missing read deny for hook-status/:\n{profile}"
+            );
+        }
+        for base in [mission.clone(), absolutize(&mission)] {
+            let control = format!(
+                "(subpath \"{}\")",
+                escape_sbpl_literal(&base.join("control"))
+            );
+            assert!(
+                profile.contains(&control),
+                "profile missing read deny for the control inbox:\n{profile}"
+            );
+        }
+        // …while the carve-out itself stays: no deny names the .kranz DIR
+        // (the closing quote makes this exact).
+        for base in [kranz.clone(), absolutize(&kranz)] {
+            let kranz_rule = format!("\"{}\"", escape_sbpl_literal(&base));
+            assert!(
+                !read_rules.contains(&kranz_rule),
+                ".kranz must stay reachable (the snapshot lives under it):\n{profile}"
+            );
+        }
+    }
+
+    /// Non-validator sessions (empty roots) get byte-stable profiles: exactly
+    /// the pre-containment shape, i.e. only the authority read-deny block.
+    #[test]
+    fn validator_containment_empty_roots_emit_no_deny_block() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        inputs.validator_read_deny_roots = Vec::new();
+        let profile = generate_profile(&inputs);
+        assert_eq!(
+            profile.matches("(deny file-read*").count(),
+            1,
+            "empty roots must leave the pre-containment profile shape alone:\n{profile}"
+        );
+
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        assert_eq!(
+            profile.matches("(deny file-read*").count(),
+            2,
+            "the validator read-deny block must land when roots are set:\n{profile}"
+        );
+    }
+
+    /// The bwrap analogue: source dirs shadowed by tmpfs, source files
+    /// masked with /dev/null, carve-outs untouched, the snapshot rw-bound.
+    #[test]
+    fn validator_containment_bwrap_masks_source_tree_and_keeps_carveouts() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let args = bubblewrap_args(
+            &validator_containment_inputs(&root, &snapshot, &mission, scratch.path()),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let src = absolutize(&root.join("src")).display().to_string();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == src),
+            "missing tmpfs shadow for src/: {args:?}"
+        );
+        let env_file = absolutize(&root.join(".env")).display().to_string();
+        assert!(
+            joined.contains(&format!("--ro-bind /dev/null {env_file}")),
+            "missing /dev/null mask for .env: {args:?}"
+        );
+        // The carve-outs are never masked, and the root itself is not
+        // shadowed (bwrap cannot close the listing without hiding them).
+        let git = absolutize(&root.join(".git")).display().to_string();
+        assert!(
+            !joined.contains(&git),
+            ".git must not be masked (the inspection's git surface): {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == root.display().to_string()),
+            "the root itself must not be shadowed: {args:?}"
+        );
+        // The snapshot stays rw-bound.
+        let snap = absolutize(&snapshot).display().to_string();
+        assert!(
+            joined.contains(&format!("--bind {snap} {snap}")),
+            "the snapshot must stay rw-bound: {args:?}"
+        );
+    }
+
+    /// The bwrap analogue of the 14th-pass over-read fix (ticket
+    /// `validator-containment-kranz-overread`): the plaintext lint
+    /// vocabulary gets a `/dev/null` mask, and the hook-status projection +
+    /// the control inbox get tmpfs shadows (the control/ shadow was already
+    /// the write-deny idiom; the same mechanism now hides hook-status/).
+    #[test]
+    fn validator_containment_bwrap_masks_sensitive_kranz_runtime() {
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let args = bubblewrap_args(
+            &validator_containment_inputs(&root, &snapshot, &mission, scratch.path()),
+            Path::new("/usr/bin/claude"),
+            &[],
+        )
+        .unwrap();
+        let joined = args.join(" ");
+
+        let kranz = absolutize(&root.join(".kranz")).display().to_string();
+        assert!(
+            joined.contains(&format!("--tmpfs {kranz}")) && !joined.contains("domain-terms.local"),
+            "the private authority directory must exclude domain-terms.local: {args:?}"
+        );
+        for dir in [
+            root.join(".kranz").join("hook-status"),
+            mission.join("control"),
+        ] {
+            let shadow = absolutize(dir.parent().unwrap()).display().to_string();
+            assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == shadow));
+            let denied = absolutize(&dir).display().to_string();
+            assert!(
+                !args.windows(3).any(|part| {
+                    matches!(part[0].as_str(), "--ro-bind" | "--ro-bind-try")
+                        && part[1] == denied
+                        && part[2] == denied
+                }),
+                "denied directory must not be rebound: {args:?}"
+            );
+        }
+    }
+
+    // --- the resolution matrix -----------------------------------------------
+
+    fn off_cfg() -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig::default()
+    }
+
+    fn fs_cfg() -> crate::types::SandboxConfig {
+        crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            ..crate::types::SandboxConfig::default()
+        }
+    }
+
+    /// The case the ticket exists for: `enforce: off` (the default) STILL
+    /// wraps the validator on macOS — the mandatory fs-tier wrap with the
+    /// real checkout read-denied and NO operator extraWrite widening.
+    #[test]
+    fn validator_containment_off_macos_wraps_mandatory_seatbelt() {
+        let mut cfg = off_cfg();
+        cfg.extra_write = vec!["~/elsewhere".to_string()];
+        let roots = vec![PathBuf::from("/repo")];
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/repo/.kranz/missions/m-x/runs/snap"),
+            Path::new("/repo/.kranz/missions/m-x"),
+            &roots,
+            false,
+            "macos",
+            false,
+            None,
+            None,
+        )
+        .expect("off+macos resolves the mandatory wrap");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        let sandbox = containment.sandbox.expect("a wrap applies");
+        assert_eq!(sandbox.backend, SandboxBackend::Seatbelt);
+        assert_eq!(
+            sandbox.inputs.enforce,
+            crate::types::SandboxEnforce::Fs,
+            "the mandatory wrap is the fs tier (egress stays open for the API)"
+        );
+        assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+        assert!(
+            sandbox.inputs.extra_write.is_empty(),
+            "no operator extraWrite widening under the mandatory wrap"
+        );
+        assert_eq!(
+            sandbox.inputs.session_cwd,
+            PathBuf::from("/repo/.kranz/missions/m-x/runs/snap"),
+            "the snapshot is the writable root"
+        );
+    }
+
+    /// Linux: the mandatory wrap needs `bwrap`; without it the resolution
+    /// FAILS CLOSED by default (naming the platform limit and the flag), and
+    /// only the explicit `validatorAllowUncontainedDegrade` opt-in restores
+    /// the loud degrade note (ticket
+    /// validator-containment-degrade-fail-closed).
+    #[test]
+    fn validator_containment_off_linux_without_bwrap_fails_closed_unless_opted_in() {
+        let roots = vec![PathBuf::from("/repo")];
+        let err = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            false,
+            "linux",
+            false,
+            None,
+            None,
+        )
+        .expect_err("no bwrap and no opt-in: fail closed");
+        let err = err.to_string();
+        assert!(err.contains("bwrap"), "{err}");
+        assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
+        assert!(
+            err.contains("refusing to run an uncontained validator"),
+            "{err}"
+        );
+
+        let containment = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            true,
+            "linux",
+            false,
+            None,
+            None,
+        )
+        .expect("the opt-in restores the loud degrade");
+        assert!(containment.sandbox.is_none());
+        let note = containment.note.expect("the loud note");
+        assert!(note.contains("bwrap"), "{note}");
+        assert!(note.contains("validator-mandatory-containment"), "{note}");
+
+        let containment = resolve_validator_containment_target(
+            &off_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &roots,
+            false,
+            "linux",
+            true,
+            None,
+            None,
+        )
+        .expect("off+linux+bwrap resolves");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        assert_eq!(
+            containment.sandbox.expect("a wrap applies").backend,
+            SandboxBackend::Bubblewrap
+        );
+    }
+
+    /// M7 Windows parity, phase 4: validators resolve the same mandatory
+    /// AppContainer fs-tier wrap as other containable platforms, regardless
+    /// of the legacy uncontained-degrade opt-in.
+    #[test]
+    fn validator_containment_off_windows_resolves_appcontainer() {
+        let roots = vec![PathBuf::from("C:\\repo")];
+        for allow_uncontained_degrade in [false, true] {
+            let containment = resolve_validator_containment_target(
+                &off_cfg(),
+                crate::types::BackendKind::Claude,
+                Path::new("C:\\snap"),
+                Path::new("C:\\mission"),
+                &roots,
+                allow_uncontained_degrade,
+                "windows",
+                false,
+                None,
+                None,
+            )
+            .expect("Windows resolves the mandatory AppContainer wrap");
+            assert!(containment.note.is_none(), "{:?}", containment.note);
+            let sandbox = containment.sandbox.expect("a wrap applies");
+            assert_eq!(sandbox.backend, SandboxBackend::AppContainer);
+            assert_eq!(sandbox.inputs.enforce, crate::types::SandboxEnforce::Fs);
+            assert_eq!(sandbox.inputs.session_cwd, PathBuf::from("C:\\snap"));
+            assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+            assert!(sandbox.inputs.extra_write.is_empty());
+        }
+    }
+
+    /// A backend that cannot honor the resolved sandbox must never silently
+    /// run bare: by default the resolution FAILS CLOSED naming the backend
+    /// and the flag; with the opt-in the wrap is skipped and the note names
+    /// the backend.
+    #[test]
+    fn validator_containment_off_non_claude_backend_fails_closed_unless_opted_in() {
+        for backend in [
+            crate::types::BackendKind::Codex,
+            crate::types::BackendKind::Droid,
+            crate::types::BackendKind::Kimi,
+            crate::types::BackendKind::Local,
+            crate::types::BackendKind::Acp,
+            crate::types::BackendKind::Cursor,
+        ] {
+            let err = resolve_validator_containment_target(
+                &off_cfg(),
+                backend,
+                Path::new("/snap"),
+                Path::new("/mission"),
+                &[PathBuf::from("/repo")],
+                false,
+                "macos",
+                false,
+                None,
+                None,
+            )
+            .expect_err("an uncontainable backend fails closed by default");
+            let err = err.to_string();
+            assert!(err.contains(backend.as_str()), "{err}");
+            assert!(err.contains("validatorAllowUncontainedDegrade"), "{err}");
+
+            let containment = resolve_validator_containment_target(
+                &off_cfg(),
+                backend,
+                Path::new("/snap"),
+                Path::new("/mission"),
+                &[PathBuf::from("/repo")],
+                true,
+                "macos",
+                false,
+                None,
+                None,
+            )
+            .expect("the opt-in restores the loud degrade");
+            assert!(
+                containment.sandbox.is_none(),
+                "{backend:?} must not get a wrap it cannot honor"
+            );
+            let note = containment.note.expect("the loud note");
+            assert!(note.contains(backend.as_str()), "{note}");
+            assert!(note.contains("validator-mandatory-containment"), "{note}");
+        }
+    }
+
+    /// `enforce != off` keeps the role's own resolution AND gains the
+    /// read-deny roots on the process tier; the operator's extraWrite stays
+    /// (the mandatory no-widening rule is the off-case wrap's).
+    #[test]
+    fn validator_containment_enforced_role_resolves_and_attaches_roots() {
+        let mut cfg = fs_cfg();
+        cfg.extra_write = vec!["~/keep".to_string()];
+        let roots = vec![PathBuf::from("/repo")];
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/repo/.kranz/missions/m-x/runs/snap"),
+            Path::new("/repo/.kranz/missions/m-x"),
+            &roots,
+            false,
+            "macos",
+            false,
+            None,
+            None,
+        )
+        .expect("fs on macos resolves");
+        assert!(containment.note.is_none(), "{:?}", containment.note);
+        let sandbox = containment.sandbox.expect("the role's wrap");
+        assert_eq!(sandbox.backend, SandboxBackend::Seatbelt);
+        assert_eq!(sandbox.inputs.validator_read_deny_roots, roots);
+        assert!(
+            !sandbox.inputs.extra_write.is_empty(),
+            "an enforced role keeps its declared extraWrite"
+        );
+    }
+
+    /// `enforce != off` stays fail-closed on an unknown platform (the
+    /// runner's resolve_sandbox_or_refuse posture, unchanged).
+    #[test]
+    fn validator_containment_enforced_role_still_fails_closed_where_unsupported() {
+        let err = resolve_validator_containment_target(
+            &fs_cfg(),
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
+            false,
+            "solaris",
+            false,
+            None,
+            None,
+        )
+        .expect_err("enforcement requested but unhonorable must fail closed");
+        assert!(err.to_string().contains("unsupported"), "{err}");
+    }
+
+    /// The container provider keeps its own (stronger) containment: resolved
+    /// untouched, no read-deny roots attached (the real tree is simply not
+    /// mounted). Under `enforce: off` the provider is ignored — the
+    /// mandatory wrap is the process tier.
+    #[test]
+    fn validator_containment_container_provider_posture() {
+        let cfg = crate::types::SandboxConfig {
+            enforce: crate::types::SandboxEnforce::Fs,
+            provider: crate::types::SandboxProvider::Container,
+            ..crate::types::SandboxConfig::default()
+        };
+        let containment = resolve_validator_containment_target(
+            &cfg,
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
+            false,
+            "linux",
+            false,
+            Some(crate::sandbox_container::ContainerRuntime::Docker),
+            None,
+        )
+        .expect("container resolves with a runtime");
+        let sandbox = containment.sandbox.expect("the container wrap");
+        assert_eq!(sandbox.backend, SandboxBackend::Container);
+        assert!(
+            sandbox.inputs.validator_read_deny_roots.is_empty(),
+            "the container's mounts are the containment — no process-tier deny set"
+        );
+
+        let mut off_container = off_cfg();
+        off_container.provider = crate::types::SandboxProvider::Container;
+        let containment = resolve_validator_containment_target(
+            &off_container,
+            crate::types::BackendKind::Claude,
+            Path::new("/snap"),
+            Path::new("/mission"),
+            &[PathBuf::from("/repo")],
+            false,
+            "macos",
+            false,
+            None,
+            None,
+        )
+        .expect("off+container still gets the mandatory process-tier wrap");
+        assert_eq!(
+            containment.sandbox.expect("a wrap applies").backend,
+            SandboxBackend::Seatbelt,
+            "provider:container with enforce:off documents 'no sandboxing'; the mandatory wrap is process-tier"
+        );
+    }
+
+    /// Applied proof on macOS (the ticket's test gate): a validator-session
+    /// fixture under `enforce: off`-shape inputs provably CANNOT read the
+    /// real checkout's source tree or the authority material, while the
+    /// shared git dir and the snapshot stay readable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validator_containment_macos_denies_real_checkout_reads() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+        let (_dir, root, snapshot, mission) = validator_containment_fixture();
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+
+        let read = |path: &Path| {
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/cat")
+                .arg(path)
+                .status()
+                .expect("failed to run sandbox-exec")
+        };
+        // The real checkout's source tree is unreadable…
+        for denied in [
+            root.join("src").join("secret.rs"),
+            root.join("Cargo.toml"),
+            root.join(".env"),
+        ] {
+            assert!(
+                !read(&denied).success(),
+                "read of the real tree must be denied: {}",
+                denied.display()
+            );
+        }
+        // …and so is the sensitive .kranz runtime the carve-out would
+        // otherwise reopen (14th-pass review,
+        // validator-containment-kranz-overread): the plaintext lint
+        // vocabulary, the hook-status projection, and the control inbox.
+        for denied in [
+            root.join(".kranz").join("domain-terms.local"),
+            root.join(".kranz")
+                .join("hook-status")
+                .join("m-x")
+                .join("run-1.json"),
+            mission.join("control").join("approve.json"),
+        ] {
+            assert!(
+                !read(&denied).success(),
+                "read of the sensitive .kranz runtime must be denied: {}",
+                denied.display()
+            );
+        }
+        // …the root LISTING stays visible (names, never contents — a
+        // literal deny on the root breaks coreutils `mkdir -p`, which stats
+        // every ancestor; documented on the entries helper)…
+        let listing = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/bin/ls")
+            .arg(&root)
+            .status()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            listing.success(),
+            "the root listing stays open (names, never contents)"
+        );
+        // …and the authority material stays denied through the carve-out.
+        assert!(
+            !read(&root.join(".kranz").join("serve.token")).success(),
+            "the authority read deny must survive the .kranz carve-out"
+        );
+        // The narrow legitimate surfaces stay readable: the shared git dir
+        // and the validator's own snapshot worktree.
+        for allowed in [root.join(".git").join("HEAD"), snapshot.join("README.md")] {
+            assert!(
+                read(&allowed).success(),
+                "read must keep working: {}",
+                allowed.display()
+            );
+        }
+    }
+
+    /// The second applied half: writes outside the snapshot are denied
+    /// (source tree, mission metadata, and the shared git refs — the
+    /// tripwire's domain, now hard-denied), while the snapshot stays
+    /// writable and read-only git (`log`/`status`/`diff` — the inspection's
+    /// surface) keeps working: the validation round still completes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validator_containment_macos_keeps_snapshot_writes_and_readonly_git() {
+        use std::process::Command;
+
+        let _guard = SANDBOX_EXEC_TEST_LOCK.lock().unwrap();
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+        let Some((_dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = generate_profile(&validator_containment_inputs(
+            &root,
+            &snapshot,
+            &mission,
+            scratch.path(),
+        ));
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile_path = write_profile_file(profile_dir.path(), &profile).unwrap();
+        let sh = |command: &str| {
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+                .expect("failed to run sandbox-exec")
+        };
+
+        // Write denies: the real tree, the root, the engine's metadata, and
+        // the shared git plumbing (index + refs).
+        for command in [
+            format!("echo x >> {}", root.join("tracked.rs").display()),
+            format!("echo x > {}", root.join("new.txt").display()),
+            format!("echo x >> {}", mission.join("events.jsonl").display()),
+            format!("git -C {} add -A", snapshot.display()),
+            format!("git -C {} branch -f side HEAD", snapshot.display()),
+        ] {
+            assert!(!sh(&command).success(), "must be denied: {command}");
+        }
+        // The snapshot stays fully writable (the warmed-target shape)…
+        assert!(sh(&format!(
+            "mkdir -p {0}/target && echo built > {0}/target/out && echo note > {0}/notes.txt",
+            snapshot.display()
+        ))
+        .success());
+        // …and the read-only git inspection surface works — the functional
+        // and scrutiny validators' whole job in the snapshot.
+        let git_log = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("git")
+            .arg("-C")
+            .arg(&snapshot)
+            .arg("log")
+            .arg("--oneline")
+            .output()
+            .expect("failed to run sandbox-exec");
+        assert!(
+            git_log.status.success(),
+            "read-only git must work in the snapshot: {}",
+            String::from_utf8_lossy(&git_log.stderr)
+        );
+        assert!(String::from_utf8_lossy(&git_log.stdout).contains("init"));
+        assert!(sh(&format!("git -C {} status --porcelain", snapshot.display())).success());
+        assert!(sh(&format!("git -C {} diff HEAD", snapshot.display())).success());
+        // The snapshot's own copy of the source tree reads fine.
+        assert!(sh(&format!("cat {}", snapshot.join("tracked.rs").display())).success());
+    }
+
+    /// The linux applied analogue: bwrap masks the real tree (dirs ENOENT
+    /// under the tmpfs shadow, files empty under /dev/null), keeps the
+    /// carve-outs and the snapshot, and read-only git still works.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validator_containment_linux_bwrap_denies_real_checkout_and_keeps_snapshot() {
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+        let Some((dir, root, snapshot, mission)) = validator_containment_git_fixture() else {
+            return;
+        };
+        // An absent global authority directory makes its HOME the enclosing
+        // private view. Restoring the repo under that view must not reopen
+        // the validator's real-checkout read denies.
+        let _env =
+            crate::agent_env::EnvTestGuard::engage(&[("HOME", dir.path().to_str().unwrap())]);
+        let scratch = tempfile::tempdir().unwrap();
+        let inputs = validator_containment_inputs(&root, &snapshot, &mission, scratch.path());
+        let run = |command: &str| {
+            Command::new("bwrap")
+                .args(
+                    bubblewrap_args(
+                        &inputs,
+                        Path::new("/bin/sh"),
+                        &["-c".to_string(), command.to_string()],
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .expect("failed to run bwrap")
+        };
+
+        // A source DIR is shadowed: reads underneath fail outright.
+        let shadowed = run(&format!(
+            "cat {}",
+            root.join("src").join("secret.rs").display()
+        ));
+        assert!(
+            !shadowed.status.success(),
+            "the tmpfs-shadowed source dir must not resolve: {}",
+            String::from_utf8_lossy(&shadowed.stderr)
+        );
+        // A source FILE is /dev/null-masked: the open succeeds, the content
+        // does not cross (the authority-mask idiom).
+        let masked = run(&format!("cat {}", root.join("tracked.rs").display()));
+        assert!(
+            !String::from_utf8_lossy(&masked.stdout).contains("tracked"),
+            "the masked source file must not yield its content"
+        );
+        // The authority material is masked too.
+        let authority_read = run(&format!(
+            "cat {}",
+            root.join(".kranz").join("serve.token").display()
+        ));
+        assert!(
+            !String::from_utf8_lossy(&authority_read.stdout).contains("secret-token"),
+            "the authority material must stay masked"
+        );
+        // The carve-outs and the snapshot read fine.
+        let git_head = run(&format!("cat {}", root.join(".git").join("HEAD").display()));
+        assert!(git_head.status.success());
+        let snap_read = run(&format!("cat {}", snapshot.join("tracked.rs").display()));
+        assert!(
+            String::from_utf8_lossy(&snap_read.stdout).contains("tracked"),
+            "the snapshot's own copy reads fine"
+        );
+        // Writes outside the snapshot fail (the whole fs is ro-bound); the
+        // snapshot and the git plumbing behave like the Seatbelt side.
+        for command in [
+            format!("echo x >> {}", root.join("tracked.rs").display()),
+            format!("echo x >> {}", mission.join("events.jsonl").display()),
+            format!("git -C {} branch -f side HEAD", snapshot.display()),
+        ] {
+            assert!(!run(&command).status.success(), "must be denied: {command}");
+        }
+        assert!(
+            run(&format!("echo built > {}/target-out", snapshot.display()))
+                .status
+                .success()
+        );
+        let git_log = run(&format!("git -C {} log --oneline", snapshot.display()));
+        assert!(
+            git_log.status.success(),
+            "read-only git must work in the snapshot: {}",
+            String::from_utf8_lossy(&git_log.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "git_config_protection_tests.rs"]
+mod git_config_protection_tests;

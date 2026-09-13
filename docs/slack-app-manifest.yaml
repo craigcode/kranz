@@ -1,0 +1,60 @@
+# Kranz Slack app manifest — paste into api.slack.com/apps →
+# "Create New App" → "From an app manifest" → pick your workspace → paste.
+# This encodes every scope, event, slash command, and Socket Mode setting the
+# bridge needs, so there are no checkboxes to hunt for afterwards.
+#
+# NAMING — running more than one Kranz instance? Clone this app ONCE PER
+# INSTANCE (Socket Mode load-balances inbound envelopes across a single app's
+# connections, so two instances sharing one app randomly misroute commands).
+# For each clone: give it a per-machine display name (e.g. "Kranz (studio)")
+# AND a distinct slash-command name below (e.g. /kranz-studio) — slash-command
+# names are workspace-global and duplicates are last-install-wins. Then set
+# slack.instanceName in that machine's ~/.kranz/config.json so its messages
+# are labeled. See docs/slack-management.md "Running multiple instances".
+display_information:
+  name: Kranz
+  description: Mission notifications and control for Kranz.
+features:
+  bot_user:
+    display_name: kranz
+    always_online: true
+  # App Home tab: a dashboard of active missions + queue + open tickets,
+  # published via views.publish when a user opens the Home tab (see the
+  # app_home_opened bot event below). Enabling this requires re-applying this
+  # manifest / reinstalling the app — see docs/slack-management.md.
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
+  slash_commands:
+    # Multi-instance: rename per clone (/kranz-studio, /kranz-laptop, …) —
+    # same-name commands across apps collide, most-recently-installed wins.
+    - command: /kranz
+      description: Kranz mission commands — try /kranz help
+      usage_hint: help | new <goal> | status [id] | config <role> <model> [effort] | ticket <title>
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      # post mission updates + button/thread replies. Also authorizes
+      # views.publish for the App Home tab — publishing a Home view needs NO
+      # scope beyond chat:write; the only prerequisite is app_home.home_tab_enabled
+      # above (already set). No new scope means re-installing does not re-prompt
+      # for broader permissions.
+      - chat:write
+      # the /kranz slash command
+      - commands
+      # read threaded human replies (→ orchestrator guidance)
+      - channels:history
+settings:
+  event_subscriptions:
+    bot_events:
+      # deliver messages in public channels the bot is in (thread replies)
+      - message.channels
+      # a user opened the App Home tab → publish their dashboard view
+      - app_home_opened
+  interactivity:
+    is_enabled: true # the approve button (block_actions over the socket)
+  socket_mode_enabled: true # outbound websocket — no public URL needed
+  org_deploy_enabled: false
+  token_rotation_enabled: false

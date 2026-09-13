@@ -1,0 +1,20 @@
+{
+  "type": "slash_commands",
+  "envelope_id": "d3a7c9e4-1b5f-6c32-ae4d-9a8b2f3c4d5e",
+  "accepts_response_payload": true,
+  "payload": {
+    "token": "verification-token-redacted",
+    "team_id": "T024BE7LD",
+    "team_domain": "acme",
+    "channel_id": "C0G9QF9GW",
+    "channel_name": "kranz",
+    "user_id": "U0263M3QW",
+    "user_name": "craig",
+    "command": "/kranz",
+    "text": "ticket Rate-limit the notes API",
+    "api_app_id": "A0123456789",
+    "is_enterprise_install": "false",
+    "response_url": "https://hooks.slack.com/commands/T024BE7LD/1234/abcd",
+    "trigger_id": "241582872337.3.def"
+  }
+}

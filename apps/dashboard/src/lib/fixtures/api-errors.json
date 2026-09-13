@@ -1,0 +1,39 @@
+[
+  {
+    "name": "mission_not_hosted",
+    "status": 409,
+    "body": {
+      "error": "mission 'm-fixture' is not hosted by this server — resume planning with `kranz plan --mission m-fixture`, or start execution via POST /api/missions/m-fixture/start",
+      "code": "mission_not_hosted"
+    }
+  },
+  {
+    "name": "turn_in_flight",
+    "status": 409,
+    "body": {
+      "error": "a turn is in flight for this mission — wait for it to finish",
+      "code": "turn_in_flight"
+    }
+  },
+  {
+    "name": "repository_busy",
+    "status": 409,
+    "body": {
+      "error": "host.maxConcurrentRepos is saturated; retry when another repository finishes",
+      "code": "repository_busy"
+    }
+  },
+  {
+    "name": "stale_plan",
+    "status": 409,
+    "body": {
+      "error": "mission 'm-fixture' has no reviewed plan pending — refresh the plan preview before approving",
+      "code": "stale_plan"
+    }
+  },
+  {
+    "name": "legacy",
+    "status": 409,
+    "body": { "error": "mission is not hosted" }
+  }
+]

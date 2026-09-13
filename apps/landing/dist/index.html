@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fafbff" />
+    <meta
+      name="description"
+      content="Kranz is local mission control for coding agents. Turn a goal into an approved plan, independently validated work, and a durable record of every decision."
+    />
+    <meta property="og:title" content="Kranz — Agent work. Human authority." />
+    <meta
+      property="og:description"
+      content="Git-native mission control for coding agents. Plan, approve, validate, and know why a change passed."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://kranz.craigmartin.com/" />
+    <link rel="canonical" href="https://kranz.craigmartin.com/" />
+    <title>Kranz — Agent work. Human authority.</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%234a50df'/%3E%3Cpath d='M12 10v20m16-20L17 20l11 10' fill='none' stroke='white' stroke-width='4' stroke-linecap='square'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./script.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href="#" aria-label="Kranz home"
+        ><span class="brand-mark" aria-hidden="true">k</span>kranz<span
+          class="brand-period"
+          >.</span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="#workflow">How it works</a>
+        <a href="#features">Features</a>
+        <a class="nav-source" href="https://github.com/craigcode/kranz"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero wrap" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">
+            <span class="eyebrow-line" aria-hidden="true"></span>MISSION CONTROL
+            FOR CODING AGENTS
+          </p>
+          <h1 id="hero-title">
+            Agent work.<br /><span>Human authority.</span>
+          </h1>
+          <p class="hero-description">
+            Give your coding agents a mission.<br />Keep the decisions that
+            matter.
+          </p>
+          <p class="hero-detail">
+            Kranz turns a goal into an approved plan, independently validated
+            work, and a record you can trust. All in your Git repository.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#workflow"
+              >See how it works <span aria-hidden="true">↓</span></a
+            >
+            <a
+              class="text-link"
+              href="https://github.com/craigcode/kranz#readme"
+              >Read the docs <span aria-hidden="true">↗</span></a
+            >
+          </div>
+          <p class="hero-footnote">
+            Local-first <span>·</span> Built in Rust <span>·</span> Git-native
+          </p>
+        </div>
+        <div class="mission-scene">
+          <div class="scene-label">
+            <span>THE ANATOMY OF A MISSION</span><span>4 CHECKPOINTS</span>
+          </div>
+          <article
+            class="mission-card"
+            aria-label="Illustrative mission, ready for human review"
+          >
+            <div class="mission-card-top">
+              <span class="mission-id">MISSION / 024</span
+              ><span class="sample-label">Illustrative run</span>
+            </div>
+            <h2>Add an authenticated API endpoint</h2>
+            <div class="branch-name">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <circle cx="7" cy="5" r="2.5" />
+                <circle cx="7" cy="19" r="2.5" />
+                <circle cx="17" cy="7" r="2.5" />
+                <path d="M7 7.5v9M17 9.5c0 5-10 2-10 7" /></svg
+              >kranz/mission-024
+            </div>
+            <ol class="mission-steps">
+              <li>
+                <span class="step-icon" aria-hidden="true">✓</span>
+                <div>
+                  <strong>Plan approved</strong
+                  ><span>Scope, criteria, and base commit pinned</span>
+                </div>
+                <span class="step-owner">YOU</span>
+              </li>
+              <li>
+                <span class="step-icon" aria-hidden="true">✓</span>
+                <div>
+                  <strong>Work delivered</strong
+                  ><span>Changes committed in an isolated worktree</span>
+                </div>
+                <span class="step-owner">WORKER</span>
+              </li>
+              <li>
+                <span class="step-icon" aria-hidden="true">✓</span>
+                <div>
+                  <strong>Independently validated</strong
+                  ><span>Contract checks + fresh-context scrutiny</span>
+                </div>
+                <span class="step-owner">REVIEWERS</span>
+              </li>
+              <li class="step-pending">
+                <span class="step-icon" aria-hidden="true">4</span>
+                <div>
+                  <strong>Your call to merge</strong
+                  ><span>Review the evidence. Approve the change.</span>
+                </div>
+                <span class="step-owner">YOU</span>
+              </li>
+            </ol>
+            <div class="mission-card-footer">
+              <span class="evidence-icon" aria-hidden="true">≡</span> Every step
+              recorded. Every decision traceable.
+            </div>
+          </article>
+          <div class="scene-bottom">
+            <span class="scene-bracket" aria-hidden="true">└</span> The agent
+            writes the code. Kranz owns the gates.
+          </div>
+        </div>
+      </section>
+
+      <section class="backends wrap" aria-label="Supported agent backends">
+        <p>YOUR AGENTS. <br />ONE GOVERNANCE LAYER.</p>
+        <ul>
+          <li>Claude Code</li>
+          <li>Codex CLI</li>
+          <li>Factory Droid</li>
+          <li>Kimi Code</li>
+          <li>Cursor</li>
+          <li>ACP <span>/</span> Local models</li>
+        </ul>
+        <p class="backend-note">
+          Claude Code is the default. Role and sandbox support varies by
+          backend.
+        </p>
+      </section>
+
+      <section
+        class="control-surfaces wrap"
+        aria-label="Mission control surfaces"
+      >
+        <p class="eyebrow">ONE MISSION. <br />THREE WAYS IN.</p>
+        <ul>
+          <li>
+            <strong>Web & desktop</strong
+            ><span>The full Mission Control dashboard.</span>
+          </li>
+          <li>
+            <strong>Slack</strong
+            ><span>Plan, approve, and steer in a thread.</span>
+          </li>
+          <li>
+            <strong>Even Realities G2</strong
+            ><span>A glanceable glasses client.</span
+            ><em>Hardware validation pending.</em>
+          </li>
+        </ul>
+      </section>
+
+      <section
+        class="workflow section wrap"
+        id="workflow"
+        aria-labelledby="workflow-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">THE WORKFLOW</p>
+            <h2 id="workflow-title">From intent to evidence.</h2>
+          </div>
+          <p>One durable mission. <br />Four deliberate steps.</p>
+        </div>
+        <ol class="workflow-grid">
+          <li>
+            <span class="workflow-number"
+              >01 <span aria-hidden="true">/</span></span
+            >
+            <h3>Define the outcome</h3>
+            <p>
+              Describe your goal. An orchestrator shapes it into milestones and
+              testable acceptance criteria.
+            </p>
+            <span class="workflow-tag">CONTRACT FIRST</span>
+          </li>
+          <li>
+            <span class="workflow-number"
+              >02 <span aria-hidden="true">/</span></span
+            >
+            <h3>Approve the plan</h3>
+            <p>
+              Review the scope, cost estimate, and permissions. Approval pins
+              the plan and the Git base.
+            </p>
+            <span class="workflow-tag">HUMAN CONSENT</span>
+          </li>
+          <li>
+            <span class="workflow-number"
+              >03 <span aria-hidden="true">/</span></span
+            >
+            <h3>Dispatch & validate</h3>
+            <p>
+              Workers implement. Separate reviewers inspect the diff and judge
+              engine-run contract checks.
+            </p>
+            <span class="workflow-tag">SEPARATED ROLES</span>
+          </li>
+          <li>
+            <span class="workflow-number"
+              >04 <span aria-hidden="true">/</span></span
+            >
+            <h3>Review & merge</h3>
+            <p>
+              Inspect the report. Your merge action runs base-owned gates
+              against the exact integration commit.
+            </p>
+            <span class="workflow-tag">EVIDENCE INCLUDED</span>
+          </li>
+        </ol>
+      </section>
+
+      <section class="product-views wrap" aria-labelledby="product-views-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">INSIDE MISSION CONTROL</p>
+            <h2 id="product-views-title">The work. And the evidence.</h2>
+          </div>
+          <p>
+            See what ran, who reviewed it,<br />
+            and why it passed.
+          </p>
+        </div>
+        <figure class="product-capture">
+          <a
+            class="capture-link"
+            href="./images/web-mission-review.jpg"
+            target="_blank"
+            rel="noopener"
+            aria-label="Open the full-size Kranz web dashboard screenshot in a new tab"
+          >
+            <div class="capture-heading">
+              <span>WEB DASHBOARD</span>
+              <span>View full size <span aria-hidden="true">↗</span></span>
+            </div>
+            <img
+              src="./images/web-mission-review.jpg"
+              alt="Kranz Mission Control showing a completed mission, separate worker and validator sessions marked PASS, scrutiny review evidence, model assignments, usage, and milestone progress."
+              width="1280"
+              height="720"
+              loading="lazy"
+              decoding="async"
+            />
+          </a>
+          <figcaption>
+            <div>
+              <strong>Independent review, in context.</strong>
+              <p>
+                Inspect agent sessions, reviewer findings, usage, and progress
+                without losing the mission around them.
+              </p>
+            </div>
+            <span class="capture-provenance">RECORDED MISSION · JUL 2026</span>
+          </figcaption>
+        </figure>
+      </section>
+
+      <section class="difference wrap" aria-labelledby="difference-title">
+        <div class="difference-intro">
+          <p class="eyebrow">WHAT MAKES KRANZ DIFFERENT</p>
+          <h2 id="difference-title">“It passed” <br />needs a paper trail.</h2>
+          <p>
+            Know what was approved, what was checked, and why a change was
+            allowed through.
+          </p>
+        </div>
+        <div class="difference-points">
+          <article>
+            <span aria-hidden="true">01</span>
+            <div>
+              <h3>Success is defined before the work.</h3>
+              <p>
+                Behavioral contracts make the outcome testable. An empty
+                deliverable fails honestly.
+              </p>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">02</span>
+            <div>
+              <h3>The worker never grades its own work.</h3>
+              <p>
+                Fresh reviewers judge the diff and captured checks, without the
+                worker’s reasoning.
+              </p>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">03</span>
+            <div>
+              <h3>The change cannot weaken its merge gates.</h3>
+              <p>
+                Checks come from the base branch. Only the exact integration
+                commit that passed can advance it.
+              </p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section
+        class="features section wrap"
+        id="features"
+        aria-labelledby="features-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">THE CAPABILITIES</p>
+            <h2 id="features-title">Control at every step.</h2>
+          </div>
+          <button
+            class="expand-all"
+            type="button"
+            aria-controls="feature-list"
+            aria-expanded="false"
+            hidden
+          >
+            Expand all <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <div class="feature-list" id="feature-list">
+          <details>
+            <summary>
+              <span class="feature-number">01</span>
+              <h3>Planning & approval</h3>
+              <span class="feature-teaser">An outcome becomes a contract.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Interactive planning.</strong> Shape plain-language
+                  goals into milestones, features, behavioral assertions, and
+                  validation commands.
+                </li>
+                <li>
+                  <strong>Informed approval.</strong> Review estimates,
+                  permissions, and scope; pin the plan, applicable rules, and
+                  Git base at consent.
+                </li>
+                <li>
+                  <strong>A Git-native backlog.</strong> Markdown tickets,
+                  dependencies, discussion notes, lifecycle states, and
+                  asynchronous plan drafting.
+                </li>
+                <li>
+                  <strong>Durable queues.</strong> Approve now and drain later,
+                  with recoverable claims and one active mission per repository.
+                </li>
+                <li>
+                  <strong>Readiness checks.</strong> Check runtime discovery,
+                  authentication, models, environment prerequisites, and merge
+                  gates before spending.
+                </li>
+                <li>
+                  <strong>Mid-mission revisions.</strong> Change the remaining
+                  scope with a fresh approval while preserving completed
+                  milestones.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/tickets.md"
+                >Explore planning & tickets
+                <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">02</span>
+              <h3>Isolation & permissions</h3>
+              <span class="feature-teaser"
+                >Clear boundaries around agent actions.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Dedicated worktrees.</strong> Isolate mission changes
+                  from your primary checkout, with supervised child processes
+                  and cleanup.
+                </li>
+                <li>
+                  <strong>Roles with distinct authority.</strong> Separate
+                  planning, implementation, and review permissions; record
+                  denials and human command grants.
+                </li>
+                <li>
+                  <strong>Explicit credentials.</strong> Clear child
+                  environments and admit only sanctioned backend credentials and
+                  declared secret channels.
+                </li>
+                <li>
+                  <strong>Filesystem & network boundaries.</strong> Enforce
+                  supported sandbox profiles and filtered network access. Worker
+                  sandbox enforcement currently requires Claude Code.
+                </li>
+                <li>
+                  <strong>Contained validators.</strong> Review in disposable
+                  snapshots with the real source tree denied; unsupported
+                  containment fails closed by default.
+                </li>
+                <li>
+                  <strong>Secret protection.</strong> Scan and redact at log
+                  ingestion, scan before merge, and audit fingerprint-based
+                  waivers. Separate read and mutation tokens protect the API.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/scoping/worker-sandboxing.md"
+                >Explore isolation & sandboxing
+                <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">03</span>
+              <h3>Validation & delivery</h3>
+              <span class="feature-teaser">Evidence before a green light.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Contract checks.</strong> Engine-run commands capture
+                  test, build, and lint results; judgment assertions are checked
+                  against the mission diff.
+                </li>
+                <li>
+                  <strong>Two independent review roles.</strong> Functional
+                  validation judges captured results. Scrutiny checks intent,
+                  weak tests, and integration seams.
+                </li>
+                <li>
+                  <strong>Reviewer independence.</strong> Optionally require a
+                  different model family for review, pinned at approval and
+                  enforced across fallback choices.
+                </li>
+                <li>
+                  <strong>Functional UI review.</strong> Configure browser or
+                  computer-use QA for repositories with a runnable, scriptable
+                  application.
+                </li>
+                <li>
+                  <strong>Bounded recovery.</strong> Cap repair cycles and
+                  worker respawns. Unresolved work becomes blocked; a mission
+                  with no feature deliverable fails.
+                </li>
+                <li>
+                  <strong>Gated local merging.</strong> Run base-owned gates in
+                  a scratch worktree against the pinned integration commit. The
+                  human triggers the merge; local Kranz never pushes.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/merge-gates.md"
+                >Explore validation & merge gates
+                <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">04</span>
+              <h3>Evidence & cost</h3>
+              <span class="feature-teaser">An audit trail you can replay.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Durable event history.</strong> An append-only,
+                  hash-chained log records mission events and rebuilds state
+                  after interruption or a stale snapshot.
+                </li>
+                <li>
+                  <strong>Provenance replay.</strong> Reconstruct gates, backend
+                  and model identities, prompt hashes, escalations, and human
+                  decisions from the log.
+                </li>
+                <li>
+                  <strong>Completion reports.</strong> Keep committed plans and
+                  reports with delivered features, validation history, waived
+                  findings, elapsed time, and costs.
+                </li>
+                <li>
+                  <strong>Spend visibility.</strong> Track reported tokens and
+                  costs, configured run budgets, calibrated estimates,
+                  task-class outcomes, and cost per merged change.
+                </li>
+                <li>
+                  <strong>Trust metrics.</strong> Measure autonomy,
+                  interventions, approval latency, and defects later traced to
+                  missions that had passed.
+                </li>
+                <li>
+                  <strong>Portable evidence.</strong> Export OpenTelemetry
+                  traces, escalation ledgers, execution traces, and training
+                  corpora from recorded mission evidence.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/metrics.md"
+                >Explore evidence & metrics
+                <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">05</span>
+              <h3>Engineering standards</h3>
+              <span class="feature-teaser"
+                >House rules with accountable exceptions.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Private knowledge packs.</strong> Keep domain
+                  knowledge and organization-specific policy outside the
+                  domain-free core.
+                </li>
+                <li>
+                  <strong>Flight Rules.</strong> Manage versioned SHOULD/MUST
+                  standards with deterministic applicability and revisions
+                  pinned at approval.
+                </li>
+                <li>
+                  <strong>Checks that fit the rule.</strong> Bind deterministic,
+                  contextual, and human review mechanisms to the right stage of
+                  the mission.
+                </li>
+                <li>
+                  <strong>Exact human waivers.</strong> Record authorized
+                  exceptions, their rationale, and the specific findings and
+                  rule revisions they cover.
+                </li>
+                <li>
+                  <strong>Review beyond code.</strong> Apply the evidence
+                  workflow to tracked specification and incident artifacts, with
+                  a required review output.
+                </li>
+                <li>
+                  <strong>Learn from outcomes.</strong> Retain mission lessons
+                  and repository knowledge, and report rule effectiveness across
+                  missions.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/scoping/flight-rules-engineering-standards.md"
+                >Explore Flight Rules <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">06</span>
+              <h3>Mission operations</h3>
+              <span class="feature-teaser"
+                >Steer the work from where you are.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>CLI, web & desktop.</strong> Plan, approve, run, and
+                  inspect missions in the terminal, Mission Control dashboard,
+                  or Tauri desktop shell.
+                </li>
+                <li>
+                  <strong>Slack control.</strong> Plan in threads, approve,
+                  steer, configure, and receive mission notifications with
+                  authorized-user spend controls.
+                </li>
+                <li>
+                  <strong>Even Realities G2 glasses.</strong> A lightweight
+                  client uses the mission API for glanceable status and
+                  controls. Hardware validation is still pending.
+                </li>
+                <li>
+                  <strong>Live steering.</strong> Message, interrupt, pause,
+                  resume, unblock, or abandon; queue role and model changes for
+                  subsequent sessions.
+                </li>
+                <li>
+                  <strong>Multiple repositories.</strong> Serve a host catalog
+                  with repository-specific missions, queues, configuration, and
+                  Slack routing.
+                </li>
+                <li>
+                  <strong>Optional parallel workers.</strong> Dispatch
+                  independent features in separate worktrees and integrate in
+                  declared order. Sequential execution remains the default.
+                </li>
+                <li>
+                  <strong>Crash recovery & hygiene.</strong> Resume from logged
+                  progress, recover provably dead locks, and clean or archive
+                  old missions. Core CLI support spans macOS, Linux, and
+                  Windows.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/backlog-and-slack.md"
+                >Explore mission operations
+                <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+          <details>
+            <summary>
+              <span class="feature-number">07</span>
+              <h3>Backends & integrations</h3>
+              <span class="feature-teaser"
+                >Bring your agents and existing workflows.</span
+              ><span class="disclosure" aria-hidden="true"></span>
+            </summary>
+            <div class="feature-body">
+              <ul>
+                <li>
+                  <strong>Backend choice by role.</strong> Claude Code, Codex
+                  CLI, Factory Droid, Kimi Code, Cursor, ACP-compatible agents,
+                  and OpenAI-compatible local inference.
+                </li>
+                <li>
+                  <strong>Tracked routing policy.</strong> Base-owned rules
+                  select backends and models within declared role, readiness,
+                  and containment constraints.
+                </li>
+                <li>
+                  <strong>Divergent candidates for review.</strong>
+                  Heterogeneous dispatch compares agent outputs as evidence,
+                  with explicit cost consent and no automatically merged winner.
+                </li>
+                <li>
+                  <strong>Headless automation.</strong> Feed a plan to
+                  <code>kranz exec</code>; receive distinct complete, failed,
+                  blocked, or underspecified exit codes.
+                </li>
+                <li>
+                  <strong>API & event streams.</strong> Build clients against
+                  the REST API and live WebSocket/SSE mission feeds.
+                </li>
+                <li>
+                  <strong>External work intake.</strong> Integrate Gas City /
+                  Beads work, import OpenSpec changes, and configure workspace
+                  bootstrap and data hooks.
+                </li>
+              </ul>
+              <a
+                class="feature-doc"
+                href="https://github.com/craigcode/kranz/blob/main/docs/agent-backends.md"
+                >Explore backends & setup <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </details>
+        </div>
+        <p class="availability-note">
+          <span>AVAILABILITY</span> Core workflows run locally. Cloud missions
+          are a preview; the Even Realities G2 glasses client awaits hardware
+          validation. Backend, model, and sandbox capabilities vary.
+        </p>
+      </section>
+
+      <section class="get-started wrap" aria-labelledby="get-started-title">
+        <div>
+          <p class="eyebrow">PUT YOUR NEXT CHANGE ON A MISSION</p>
+          <h2 id="get-started-title">
+            Your repo. Your agents. <br />Your call.
+          </h2>
+          <a
+            class="button button-primary"
+            href="https://github.com/craigcode/kranz#quick-start"
+            >Explore the source <span aria-hidden="true">↗</span></a
+          >
+        </div>
+        <div class="start-example">
+          <div class="terminal-label">
+            <span>IN YOUR REPOSITORY</span
+            ><span aria-hidden="true">~/your-project</span>
+          </div>
+          <pre
+            aria-label="Example workflow after installing Kranz"
+          ><code><span class="code-comment"># Initialize and check your setup</span>
+kranz init
+kranz ready
+
+<span class="code-comment"># Plan, approve, then run</span>
+kranz plan <span class="code-string">"Add an API endpoint with tests"</span>
+kranz run</code></pre>
+          <p>
+            Start with the source install. Bring Git, Rust 1.88+, and an
+            installed, authenticated agent runtime.
+          </p>
+        </div>
+      </section>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="brand" href="#">kranz<span class="brand-period">.</span></a>
+      <p>Named for Gene Kranz. Built to run the room.</p>
+      <a href="https://github.com/craigcode/kranz"
+        >Source & documentation <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>

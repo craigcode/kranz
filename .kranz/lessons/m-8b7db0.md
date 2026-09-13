@@ -1,0 +1,3 @@
+When a validation-contract `command` asserts that a specific named test passes, never use a bare `cargo test -p <crate> <namefilter>` — a f…
+
+When a validation-contract `command` asserts that a specific named test passes, never use a bare `cargo test -p <crate> <namefilter>` — a filter that matches zero tests still exits 0, so a missing, renamed, or never-written test passes the assertion vacuously. Pipe through a passed-count guard, e.g. `cargo test -p kranz <name> 2>&1 | grep -qE 'result: ok\. [1-9][0-9]* passed'`, so the assertion actually fails when the test is absent.

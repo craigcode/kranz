@@ -1,0 +1,52 @@
+[package]
+# Published as `kranz` so `cargo install kranz` works (the binary below is
+# also `kranz`). The LIBRARY target keeps the historical `kranz_cli` name so
+# `use kranz_cli::…` in main.rs and the integration tests is undisturbed —
+# same package/bin/lib naming split as ripgrep (package `ripgrep`, bin `rg`).
+name = "kranz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "kranz_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kranz"
+path = "src/main.rs"
+
+[dependencies]
+kranz-engine.workspace = true
+kranz-server.workspace = true
+kranz-slack.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+cap-std.workspace = true
+cap-fs-ext.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true

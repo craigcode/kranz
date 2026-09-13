@@ -1,0 +1,24 @@
+{
+  "type": "events_api",
+  "envelope_id": "e4b8dae5-2c6a-7d43-bf5e-0b9c3a4d5e6f",
+  "accepts_response_payload": false,
+  "payload": {
+    "token": "verification-token-redacted",
+    "team_id": "T024BE7LD",
+    "api_app_id": "A0123456789",
+    "type": "event_callback",
+    "event_id": "Ev0PV52K30",
+    "event_time": 1700000300,
+    "event": {
+      "type": "message",
+      "subtype": "bot_message",
+      "channel": "C0G9QF9GW",
+      "bot_id": "B0G9QF9C6",
+      "app_id": "A0123456789",
+      "text": "Milestone blocked — m-7",
+      "ts": "1700000300.000300",
+      "thread_ts": "1700000000.000100",
+      "channel_type": "channel"
+    }
+  }
+}

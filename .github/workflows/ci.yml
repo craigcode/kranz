@@ -1,0 +1,685 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No job needs Git credentials after checkout. Checkout v7 persists them as
+# repository includeIf directives, which hardened local Git correctly refuses.
+# Keep checkout authentication transient so source-repository probes can run.
+jobs:
+  # Dogfood the tracked knowledge vault as an honesty gate. Full history is
+  # load-bearing: the detector asks whether cited paths changed after each
+  # note's last_verified date, which a shallow checkout cannot answer.
+  knowledge-refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Fail on stale or unverifiable knowledge
+        run: cargo run --locked --package kranz -- knowledge-refresh
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Audit tracked public content
+        run: scripts/audit-public-tree.sh
+      - name: Prove required operator-marker audits fail closed
+        run: python3 scripts/test-audit-operator-markers.py
+      - name: Install pinned Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.29.1
+          GITLEAKS_LINUX_X64_SHA256: e4eb209d04e20339d77122a3bdf9cd41351255cfb27ebcb75e85325e04f88924
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          bin_dir="$RUNNER_TEMP/gitleaks-bin"
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GITLEAKS_LINUX_X64_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir" gitleaks
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Audit reachable history metadata
+        run: scripts/audit-public-history.sh
+      - name: Verify package license notices
+        run: scripts/check-package-licenses.sh
+      - name: Build strict public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
+        with:
+          command: check
+      - name: Verify package licenses and dependency notices
+        run: |
+          cargo install cargo-about --locked --version 0.9.2 --features cli
+          bash scripts/check-rust-notices.sh
+          bash scripts/check-package-licenses.sh
+          python3 scripts/test-package-release.py
+
+  # Stage 4 autonomous slice (docs/gascity-citizenship.md, ticket
+  # gascity-pack-publish): pin gc, lint the pack, run stub-safe pack tests.
+  # Does not publish, does not gc init/start, does not run the live-bd
+  # round-trip (that stays a local merge-gate).
+  gascity-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Gas City CLI
+        env:
+          GASCITY_VERSION: 1.3.2
+          GASCITY_LINUX_AMD64_SHA256: 09f2a357b6260dbb56817cc8a173f5e94bd51fcee1c1ea3f106301026a4439f3
+        run: |
+          archive="$RUNNER_TEMP/gascity.tar.gz"
+          bin_dir="$RUNNER_TEMP/gascity-bin"
+          curl --fail --silent --show-error --location \
+            "https://github.com/gastownhall/gascity/releases/download/v${GASCITY_VERSION}/gascity_${GASCITY_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GASCITY_LINUX_AMD64_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir" gc
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Lint pack and run stub-safe tests
+        run: bash scripts/ci-gascity-pack.sh
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install Linux sandbox tooling
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap mold
+          # ubuntu-latest currently restricts unprivileged user namespaces
+          # through AppArmor. This is an ephemeral hosted runner dedicated to
+          # the proof; enable the kernel primitive bubblewrap needs, then make
+          # capability failure loud here instead of letting the receipt skip.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true
+      # mold as the linker: the a3 plan-contract regression runs a nested
+      # `cargo test -p kranz-engine` inside the suite, which feature-plan
+      # thrashes against the outer --workspace build and RELINKS the big
+      # test binaries — GNU ld then died SIGBUS under the runner's memory
+      # envelope (run 31064030885, `collect2: ld terminated with signal 7
+      # [Bus error]`). mold links at a fraction of GNU ld's memory, which
+      # closes the class for the whole job, not just that test.
+      - name: Link with mold
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      # The same thrash also needs disk: the nested plan's rebuild
+      # duplicates the engine rlib + test binaries under different
+      # fingerprints (~5 GB), which filled the runner right after the
+      # linker stopped dying (run 31065552031, ENOSPC). The stock
+      # toolchains are ~10 GB the suite never touches.
+      - name: Free runner disk (nested plan-contract rebuild headroom)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          df -h /
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      # These snapshot and Git-layout/ACL regressions need no machine-wide host preparation.
+      # Run them first so cleanup failures report native descriptor evidence
+      # without waiting for the slower host and production-gate proofs.
+      - name: Check Windows snapshots, ACL leases, and process cleanup
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          for name in \
+            validator_snapshot::tests::snapshot_replays_uncommitted_state_and_cleans_up \
+            orchestrator::reviewer_independence_tests::reviewer_independence_final_gate_refuses_an_already_dirty_review_baseline \
+            appcontainer_windows::tests::self_test_worktree_supports_git_configuration_validation \
+            appcontainer_windows::tests::gitlink_aliases_never_receive_generic_metadata_denies \
+            appcontainer_windows::tests::boundary_parent_rejects_package_delete_child_grants \
+            appcontainer_windows::tests::boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules \
+            appcontainer_windows::tests::boundary_marker_without_shared_baseline_fails_closed \
+            appcontainer_windows::tests::sealed_acl_boundaries_survive_either_lease_order_and_restore_inheritance \
+            appcontainer_windows::tests::boundary_inheritance_cleanup_follows_retained_object_after_rename \
+            appcontainer_windows::tests::suspended_child_is_reaped_when_setup_exits_before_job_assignment \
+            appcontainer_windows::tests::recursive_grants_reserve_only_the_isolated_worktree_authority_namespace \
+            agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch \
+            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens; do
+            log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
+            set +e
+            cargo test -p kranz-engine --lib "$name" -- --exact --nocapture >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            test "$status" -eq 0
+            grep -qE 'test result: ok\. [1-9]' "$log"
+          done
+      # AppContainer tools probe each local drive root and open NUL during
+      # startup. The disposable runner is elevated once here to install
+      # Microsoft's exact drive-root metadata ACEs and null-device descriptor;
+      # the ordinary Kranz launcher verifies both prerequisites read-only.
+      - name: Prepare Windows AppContainer host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        # A cold Windows runner spends ~5 minutes compiling sandbox-prepare;
+        # applying the drive-root capability ACL then exceeded the remaining
+        # 10 minutes on run 32506686902. Budget the host mutation itself, not
+        # just the warm-cache case.
+        timeout-minutes: 30
+        run: |
+          $targets = @(
+            [System.IO.Path]::GetPathRoot($env:SystemRoot)
+            [System.IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+            [System.IO.Path]::GetPathRoot($env:RUNNER_TEMP)
+            [System.IO.Path]::GetPathRoot((Get-Command node).Source)
+            [System.IO.Path]::GetPathRoot((Get-Command cargo).Source)
+          ) | Sort-Object -Unique
+          ./scripts/prepare-windows-appcontainer.ps1 -Target $targets
+      # M7 Windows containment phases 4-5: exercise the exact production
+      # helper/ACL lease through the built kranz binary, prove ordinary Node
+      # and Rust gates plus retained overhead samples through one production
+      # validation/final-gate posture, then hold both the positive
+      # process-provider resolution and negative container-provider refusal
+      # contracts before the full workspace suite.
+      - name: Prove production Windows LPAC containment and gates
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        # Thirty minutes covered the hostile receipt but not the phase-5
+        # timing receipt, which retires thirty-two wrapped and unwrapped
+        # samples, each rebuilding a cache-only Cargo home.
+        timeout-minutes: 60
+        run: |
+          # tee rather than redirect-then-cat: the AppContainer gate receipt
+          # streams per-sample progress, and a buffered log is lost entirely
+          # when the step timeout kills a run that has not returned yet.
+          run_exact_test() {
+            local log="$1"
+            shift
+            set +e
+            "$@" 2>&1 | tee "$log"
+            local status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -ne 0 ]; then
+              return "$status"
+            fi
+            grep -qE 'test result: ok\. [1-9]' "$log"
+          }
+
+          probe_log="$RUNNER_TEMP/kranz-windows-sandbox-probe.log"
+          run_exact_test "$probe_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_experimental_process_sandbox_probe_reports_capability -- --exact --nocapture
+
+          appcontainer_log="$RUNNER_TEMP/kranz-windows-appcontainer-fixture.log"
+          run_exact_test "$appcontainer_log" cargo test -p kranz-engine --lib sandbox_windows::tests::windows_appcontainer_hostile_fixture_denies_out_of_root_write_and_network -- --exact --nocapture
+
+          production_log="$RUNNER_TEMP/kranz-windows-appcontainer-production.log"
+          run_exact_test "$production_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_helper_enforces_and_restores_boundary -- --exact --nocapture
+
+          gate_log="$RUNNER_TEMP/kranz-windows-appcontainer-gates.log"
+          run_exact_test "$gate_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target -- --exact --nocapture
+
+          session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
+          run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
+
+          gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
+          run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
+      # M7 Linux live receipt: this is a real bwrap spawn, not argv inspection.
+      # It proves a sibling write and host-network connection are denied,
+      # retains seven interleaved warm Node timings, and verifies the tracked
+      # primary checkout stays byte-clean and on the same commit.
+      - name: Prove Linux bubblewrap hostile boundary and overhead
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          before_head="$(git rev-parse HEAD)"
+          before_status="$(git status --porcelain --untracked-files=no)"
+          test -z "$before_status"
+
+          regression_log="$RUNNER_TEMP/kranz-linux-disappearing-entry.log"
+          set +e
+          cargo test -p kranz-engine --lib sandbox::tests::sandbox_enforcement_linux_bwrap_tolerates_disappearing_visible_entries -- --exact --nocapture >"$regression_log" 2>&1
+          status=$?
+          set -e
+          cat "$regression_log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$regression_log"
+
+          receipt_log="$RUNNER_TEMP/kranz-linux-bubblewrap-live-receipt.log"
+          set +e
+          cargo test -p kranz-engine --lib command_exec::tests::linux_bubblewrap_hostile_live_receipt -- --exact --ignored --nocapture >"$receipt_log" 2>&1
+          status=$?
+          set -e
+          cat "$receipt_log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$receipt_log"
+          grep -q 'KRANZ_LINUX_LIVE_RECEIPT=' "$receipt_log"
+
+          after_head="$(git rev-parse HEAD)"
+          after_status="$(git status --porcelain --untracked-files=no)"
+          test "$after_head" = "$before_head"
+          test "$after_status" = "$before_status"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # --no-fail-fast: report every failing test target, not just the first,
+      # so a cross-platform break surfaces in one run instead of one per push.
+      #
+      # KRANZ_REQUIRED_CAPABILITIES names what this platform must actually
+      # exercise. A runtime-gated test that returns early still prints `ok`, so
+      # without this a capability can quietly stop being tested while CI stays
+      # green — which is exactly how the Windows container tests hid two real
+      # bugs for the life of this lane. `test_capability::skip` panics instead
+      # of skipping when the missing capability is listed here.
+      #
+      # Windows deliberately omits `container`: the provider is supported only
+      # on Linux and session and gate resolution fail closed elsewhere. It also
+      # omits `bwrap` (Linux-only) and `sandbox-exec` (macOS-only).
+      - run: cargo test --workspace --no-fail-fast
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: >-
+            ${{ matrix.os == 'ubuntu-latest'
+                && 'git,bwrap,container,grep'
+                || 'git' }}
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      # What the run did NOT exercise. libtest captures a passing test's
+      # output, and a skipping test passes, so without this ledger the skips
+      # are invisible in exactly the case that matters.
+      - name: Report capabilities this platform skipped
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/kranz-test-skips.log"
+          if [ -s "$log" ]; then
+            echo "Capability gates skipped on ${{ matrix.os }}:"
+            sort -u "$log"
+          else
+            echo "No capability gate skipped on ${{ matrix.os }}."
+          fi
+      # Regression guard for two Windows failure classes the step above
+      # STRUCTURALLY CANNOT see, both found only by building on a real
+      # workstation:
+      #
+      #   1. `run:` defaults to pwsh on Windows, which never sets the
+      #      `=ExitCode` pseudo variable. cmd.exe sets it after its first
+      #      command, and it used to make every enforced AppContainer session
+      #      fail closed while constructing the child environment block.
+      #   2. Hosted runners carry Git's `usr/bin` on PATH, supplying the POSIX
+      #      `true`/`false`/`test` that fixtures must not depend on. A stock
+      #      Windows box has only `Git\cmd`, so those fixtures failed there
+      #      while CI stayed green.
+      #
+      # Re-run only the exposed targets (compilation is already warm, so this
+      # is test execution, ~7 min) the way a stock developer box looks:
+      # launched from cmd.exe, with those coreutils removed.
+      - name: Windows stock-box regression guard (cmd.exe, no POSIX coreutils)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set "PATH=%PATH:C:\Program Files\Git\usr\bin;=%"
+          set "PATH=%PATH:;C:\Program Files\Git\usr\bin=%"
+          rem Fail loudly rather than guard nothing if the image moves Git.
+          where true >nul 2>&1 && (echo GUARD VACUOUS: POSIX coreutils still on PATH & exit /b 1) || echo coreutils absent as intended
+          where git >nul 2>&1 || (echo git must stay on PATH & exit /b 1)
+          cargo test -p kranz-engine --lib --no-fail-fast || exit /b 1
+          cargo test -p kranz-engine --test mission_test --test worktree_isolation --no-fail-fast
+
+  # Dedicated macOS job (not folded into the matrix above) so the Seatbelt
+  # sandbox and unix process-group/kill paths run in CI. macOS runs tests
+  # only; fmt/clippy stay ubuntu-only to save runner minutes.
+  rust-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      # The supported macOS boundary is native Seatbelt. GitHub-hosted macOS
+      # runners do not expose the virtualization needed by VM-backed container
+      # runtimes, so container support is live-proven and required on Linux
+      # only; macOS container configuration fails closed in the engine.
+      - run: cargo test --workspace --no-fail-fast
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Report capabilities macOS skipped
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/kranz-test-skips.log"
+          if [ -s "$log" ]; then
+            echo "Capability gates skipped on macos-latest:"
+            sort -u "$log"
+          else
+            echo "No capability gate skipped on macos-latest."
+          fi
+
+  # M7 tier-3 live proof: exercise the real Docker daemon, not an argv-only
+  # mock. The worker gets an internal-only network; the fixture proves an
+  # allowed CONNECT through the authenticated relay, a structured denied
+  # CONNECT, a failed direct-socket bypass with proxy env absent, and cleanup
+  # after normal shutdown, error-path Drop, and stale-owner crash recovery.
+  rust-linux-container-egress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Prove non-bypassable per-host container egress
+        run: |
+          log="$RUNNER_TEMP/kranz-container-egress-live-proof.log"
+          set +e
+          cargo test -p kranz-engine --lib container_egress::tests::container_per_host_egress_live_proof -- --exact --ignored --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 1 passed' "$log"
+
+  # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
+  # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A
+  # WRAPPED CONTRACT COMMAND through the gate sandbox wrap, proving a kranz
+  # mission with process enforcement can satisfy this repo's own gate. The
+  # fixture itself drives the wrapped suite and asserts a green exit; the
+  # suite's no-sandbox-can-host tests (setuid /bin/ps exec, nested
+  # sandbox_apply) skip inside the wrap with the detectable
+  # `SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood)` marker — the job
+  # surfaces that count so a silently widening skip set is visible in the
+  # log. macOS-only: the supervision policy being proven is the Seatbelt
+  # clause. The filter substring `dogfood_supervision` matches exactly the
+  # two fixtures of that name (grep-verified collision-free).
+  rust-macos-wrapped-suite:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Configure git identity (git_ops tests)
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+      # Prebuild the outer harness AND the full workspace dep set. The
+      # wrapped suite still compiles the workspace UNDER the wrap — the
+      # gate's cache-only CARGO_HOME moves the registry source paths, so
+      # target/ fingerprints miss and a full rebuild happens inside the
+      # sandbox. That is the same cost a production wrapped gate pays
+      # (documented in command_exec.rs), and this job is where it is
+      # exercised — the 75-minute budget is for it. The workspace-wide
+      # prebuild is load-bearing, not a shortcut: the wrapped profile
+      # write-denies the operator's real cargo cache (13th-pass), so a
+      # wrapped cargo that needs to DOWNLOAD anything fails EPERM writing
+      # the .crate (run 30977994630 — the engine-only prebuild left cli/
+      # server/slack deps unfetched). With every crate already cached the
+      # wrapped run writes nothing there.
+      - run: cargo test --workspace --no-run
+      - name: Run the wrapped workspace suite (dogfood fixture)
+        # The override appends `-- --nocapture` to the ticket's gate: the
+        # exit code the fixture asserts is unchanged, but libtest then
+        # streams the suite's SKIP-UNDER-WRAP markers into the job log
+        # (captured test output would hide them), keeping the skip set
+        # auditable run over run.
+        env:
+          KRANZ_DOGFOOD_SUITE_CMD: cargo test --workspace -- --nocapture
+        run: cargo test -p kranz-engine dogfood_supervision -- --ignored --nocapture
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Validate macOS CI structure
+        run: bash scripts/check-macos-ci.sh
+      - name: Verify acceptance harness without a model
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo build --locked --package kranz-engine --example acceptance_gate
+          python3 scripts/test-acceptance-smoke.py
+      - run: cargo check --workspace --locked
+
+  # The Tauri desktop shell (apps/dashboard/src-tauri) is a STANDALONE cargo
+  # workspace with its own committed Cargo.lock, deliberately outside the
+  # root workspace gates above, so it gets its own compile gate here. macOS:
+  # Tauri's webview stack builds there with no extra system packages (Linux
+  # would need webkit2gtk). `cargo check --locked` only — no app bundle.
+  tauri:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      # `tauri::generate_context!` resolves `frontendDist: ../dist` at
+      # compile time, so the dashboard bundle must exist before cargo runs.
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
+      # Advisory gate on the committed lockfiles (3rd-pass review): Dependabot
+      # alerts surface advisories after the fact; `cargo audit` blocks the
+      # merge. Covers the desktop tree AND the root workspace — no audit job
+      # exists anywhere else in this workflow. (cargo-audit reads the
+      # committed Cargo.lock directly; there is no --locked flag.)
+      # 7th-pass review: plain `cargo audit` lets "unsound" advisories through
+      # as allowed warnings (RUSTSEC-2024-0429/glib stayed green while its
+      # Dependabot alert was open) — gate them with --deny unsound, and pin
+      # the installer version instead of floating on latest.
+      - run: cargo install cargo-audit --locked --version 0.22.1
+      - run: cargo audit --deny unsound
+        working-directory: apps/dashboard/src-tauri
+      - run: cargo audit --deny unsound
+
+  # The Windows desktop binary is also a production mission host: its main
+  # must route the private LPAC launcher re-entry before Tauri initializes.
+  # The root Windows workspace job cannot compile this standalone crate, so
+  # keep a native Windows check beside the macOS desktop gate.
+  tauri-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm audit --audit-level=high
+        working-directory: apps/dashboard
+      # `tsc -b` (build mode): tsconfig.json is solution-style (files: [] +
+      # project references), so plain `tsc --noEmit` would check ZERO files.
+      - run: npx tsc -b
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: npm run check-embedded
+        working-directory: apps/dashboard
+      - run: npm run test
+        working-directory: apps/dashboard
+      - run: npm run lint
+        working-directory: apps/dashboard
+
+  even-g2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/even-g2/package-lock.json
+      - run: npm ci
+        working-directory: apps/even-g2
+      - run: npm audit --audit-level=high
+        working-directory: apps/even-g2
+      - run: npm run test
+        working-directory: apps/even-g2
+      - run: npm run pack
+        working-directory: apps/even-g2
+      - run: npm run lint
+        working-directory: apps/even-g2
+
+  # `docker build .` so the Dockerfile can't silently rot. Gated to changes
+  # that can affect the image (workflow-level `paths:` can't gate a single
+  # job, so the filter is a step output instead); workflow_dispatch always
+  # builds.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check whether image-relevant paths changed
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"; HEAD="${{ github.event.pull_request.head.sha }}"
+          elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            BASE="${{ github.event.before }}"; HEAD="${{ github.sha }}"
+          fi
+          # `git diff --quiet` avoids the SIGPIPE false negative produced by a
+          # `git diff | grep -q` pipeline under Actions' `pipefail` shell.
+          if ! git diff --quiet "$BASE" "$HEAD" -- Dockerfile .dockerignore Cargo.toml Cargo.lock .cargo crates; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build image
+        if: steps.changes.outputs.changed == 'true'
+        run: docker build .
+
+  # One real-model smoke mission, manual trigger only (costs tokens).
+  smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Prepare Linux validator containment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Match the Rust job's ephemeral runner setup: validators require
+          # containment even when the worker profile does not enforce it.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true
+      - name: Install Claude Code
+        # Pinned to an exact version: this job carries ANTHROPIC_API_KEY, so an
+        # unpinned install would auto-pull any newly published (possibly
+        # hijacked) release straight into a secret-bearing environment. Bump
+        # deliberately.
+        run: npm install --global @anthropic-ai/claude-code@2.1.261
+      - name: Build kranz
+        run: |
+          cargo build --release --locked --package kranz --bin kranz
+          cargo build --release --locked --package kranz-engine --example acceptance_gate
+      - name: Run flagship live acceptance mission
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KRANZ_BIN: ${{ github.workspace }}/target/release/kranz
+          KRANZ_ACCEPTANCE_GATE_BIN: ${{ github.workspace }}/target/release/examples/acceptance_gate
+          ARTIFACT_DIR: ${{ runner.temp }}/kranz-acceptance-artifacts
+        run: bash scripts/acceptance-smoke.sh
+      - name: Upload mission record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flagship-acceptance-mission
+          path: ${{ runner.temp }}/kranz-acceptance-artifacts
+          if-no-files-found: warn

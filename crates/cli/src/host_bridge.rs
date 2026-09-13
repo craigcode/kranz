@@ -1,0 +1,202 @@
+//! `kranz serve --slack` glue: the Slack bridge's [`PlanningHost`] implemented
+//! over the SAME [`kranz_server::MissionHost`] the web UI serves from — one
+//! hosted-engine registry, two clients (docs/slack-management.md). This is the
+//! only place the two crates meet; `kranz_slack` stays server-free and
+//! `kranz_server` stays Slack-free.
+
+use kranz_engine::draft::DraftOutcome;
+use kranz_engine::types::{Plan, TokenUsage};
+use kranz_server::{ApiError, MissionHost, PendingApproval};
+use kranz_slack::host::{ApprovePendingOutcome, AskOutcome, BoxFuture, PlanOutcome, PlanningHost};
+use serde_json::Value;
+use std::sync::Arc;
+
+/// Adapter handed to [`kranz_slack::serve_slack`] by the serve command.
+pub struct HostedPlanning(pub Arc<MissionHost>);
+
+impl PlanningHost for HostedPlanning {
+    fn create<'a>(&'a self, goal: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move { self.0.create(goal, None).await.map_err(plain) })
+    }
+
+    fn planning_turn<'a>(
+        &'a self,
+        id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move { self.0.planning_turn(id, text).await.map_err(plain) })
+    }
+
+    fn request_plan<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<PlanOutcome>> {
+        Box::pin(async move {
+            let value = self.0.request_plan(id).await.map_err(plain)?;
+            if value.get("ready").and_then(Value::as_bool) == Some(true) {
+                let plan: Plan =
+                    serde_json::from_value(value.get("plan").cloned().unwrap_or(Value::Null))
+                        .map_err(|e| anyhow::anyhow!("host returned an unparseable plan: {e}"))?;
+                Ok(PlanOutcome::Ready {
+                    plan,
+                    estimate: estimate_line(&value),
+                })
+            } else {
+                let reply = value
+                    .get("reply")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(PlanOutcome::NotReady(reply))
+            }
+        })
+    }
+
+    fn approve_pending<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async move { self.0.try_approve_pending(id).await.map_err(plain) })
+    }
+
+    /// The shared identity-checked approval holds the engine and pending-plan
+    /// locks through commit, so a concurrent re-plan cannot replace the plan
+    /// or be overwritten by a failed approval. Overrides the trait's default.
+    fn approve_pending_if<'a>(
+        &'a self,
+        id: &'a str,
+        expected_identity: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<ApprovePendingOutcome>> {
+        Box::pin(async move {
+            let outcome = self
+                .0
+                .try_approve_pending_matching(id, expected_identity)
+                .await
+                .map_err(plain)?;
+            Ok(match outcome {
+                PendingApproval::Approved(branch) => ApprovePendingOutcome::Approved(branch),
+                PendingApproval::NothingParked => ApprovePendingOutcome::NothingParked,
+                PendingApproval::Mismatch { parked } => ApprovePendingOutcome::StalePlan { parked },
+            })
+        })
+    }
+
+    /// Reads the parked plan without consuming it, so the bridge can refuse
+    /// an approve from a card that shows an older plan (Slack M2).
+    fn pending_plan_identity<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+        Box::pin(async move {
+            Ok(self
+                .0
+                .pending_plan(id)
+                .as_ref()
+                .map(kranz_engine::planning::plan_identity))
+        })
+    }
+
+    fn start<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move { self.0.start(id).await.map_err(plain) })
+    }
+
+    fn release<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move { self.0.release(id).map_err(plain) })
+    }
+
+    fn draft<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<DraftOutcome>> {
+        // `then_enqueue: false` — the Slack draft verb parks for review, same
+        // as `kranz ticket draft <slug>` without `--yes`; queueing is a
+        // separate approve step.
+        Box::pin(async move { self.0.draft(slug, false).await.map_err(plain) })
+    }
+
+    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+        // `force: false` — `/kranz approve <slug>` runs the plain gate, same
+        // as REST's default body; a blocked-by refusal is a refusal, not a
+        // reason to silently override it from Slack.
+        Box::pin(async move {
+            self.0
+                .approve_ticket(slug, false)
+                .map(|a| a.mission_id)
+                .map_err(plain)
+        })
+    }
+
+    fn drain<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<()>> {
+        // Same seam as `POST /api/queue/drain`: the host spawns the drain
+        // task and returns; this adapter never drives a mission turn itself.
+        Box::pin(async move { self.0.drain().await.map(|_| ()).map_err(plain) })
+    }
+
+    fn merge<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Value>> {
+        // Same seam as `POST /api/missions/:id/merge`: `MissionHost::merge`
+        // already carries a user-presentable refusal (dirty tree / failing
+        // gate with its verbatim output / conflict) in `ApiError::message`.
+        Box::pin(async move { self.0.merge(id).await.map_err(plain) })
+    }
+
+    fn ask<'a>(&'a self, question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>> {
+        Box::pin(async move {
+            let value = self.0.ask(question).await.map_err(plain)?;
+            let answer = value
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let cost_usd = value.get("costUsd").and_then(Value::as_f64).unwrap_or(0.0);
+            let tokens: TokenUsage =
+                serde_json::from_value(value.get("tokens").cloned().unwrap_or(Value::Null))
+                    .unwrap_or_default();
+            Ok(AskOutcome {
+                answer,
+                cost_usd,
+                tokens,
+            })
+        })
+    }
+}
+
+/// The host's errors already carry user-presentable messages (409 "a turn is
+/// in flight…", 404 "unknown mission…"); the status code adds nothing in a
+/// Slack ephemeral, so forward the message alone.
+fn plain(e: ApiError) -> anyhow::Error {
+    anyhow::anyhow!("{}", e.message)
+}
+
+/// One estimate line for the plan-review context row, from the host's
+/// `{"estimate":{"lowUsd":…,"expectedUsd":…,"highUsd":…}}` payload — the same
+/// numbers the planning TUI prints.
+fn estimate_line(value: &Value) -> Option<String> {
+    let est = value.get("estimate")?;
+    let low = est.get("lowUsd").and_then(Value::as_f64)?;
+    let expected = est.get("expectedUsd").and_then(Value::as_f64)?;
+    let high = est.get("highUsd").and_then(Value::as_f64)?;
+    let low_confidence = est.get("confidence").and_then(Value::as_str) == Some("low");
+    if low_confidence {
+        Some(format!(
+            "estimated ${low:.2}–${high:.2} (expected ~${expected:.2}; doc-heavy / \
+             judgement-heavy shape — LOW CONFIDENCE, corpus lacks a comparable mission, \
+             ${high:.2} is a soft ceiling)"
+        ))
+    } else {
+        Some(format!(
+            "estimated ${low:.2}–${high:.2} (expected ~${expected:.2})"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_line_renders_all_three_numbers() {
+        let value = json!({ "estimate": { "lowUsd": 6.1, "expectedUsd": 12.2, "highUsd": 30.5 } });
+        assert_eq!(
+            estimate_line(&value).unwrap(),
+            "estimated $6.10–$30.50 (expected ~$12.20)"
+        );
+    }
+
+    #[test]
+    fn estimate_line_absent_when_estimate_missing_or_partial() {
+        assert!(estimate_line(&json!({})).is_none());
+        assert!(estimate_line(&json!({ "estimate": { "lowUsd": 1.0 } })).is_none());
+    }
+}

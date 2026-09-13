@@ -1,0 +1,124 @@
+# Mission plan — m-a78225
+
+**Goal:** Free the single-writer lock held by serve's adopted in-planning engines when they go idle (time-based auto-release plus an on-demand kranz release verb), so a terminal kranz plan is never stranded behind a serve that adopted the mission.
+
+Branch `kranz/mission-m-a78225` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** kranz-server tests pass, including: an idle planning cell past the window is released with its lock provably free via EventLog::acquire; a cell with a turn in flight survives the sweep; POST /api/missions/:id/release returns 200 (frees the lock), 409 mid-turn, and 404 for an unknown mission. 
+  `cargo test -p kranz-server`
+- **[a2]** kranz CLI tests pass, including parsing of `kranz release` and its --mission/--url/--token options. 
+  `cargo test -p kranz`
+- **[a3]** The engine crate's tests still pass after the new MissionConfig field is added (config load/validate/defaults unaffected). 
+  `cargo test -p kranz-engine`
+- **[a4]** The workspace is clippy-clean at deny-warnings. 
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a5]** docs/protocol.md documents the release endpoint and docs/slack-management.md's slice-5 trade-off note records that it is closed by idle-release. 
+  `grep -q '/release' docs/protocol.md && grep -q 'closed by idle-release' docs/slack-management.md`
+
+## Milestone 1 — Server-side idle auto-release and release endpoint
+
+### 1.1 Add planningIdleReleaseMinutes to MissionConfig
+
+Add a new configuration field controlling the idle-release window for hosted planning engines.
+
+FILES: crates/engine/src/types.rs (the MissionConfig struct and its Default impl) and crates/engine/src/config.rs (validation).
+
+WHAT TO DO:
+1. In crates/engine/src/types.rs, add a field `planning_idle_release_minutes: u64` to `pub struct MissionConfig` (around line 326). MissionConfig derives `#[serde(rename_all = "camelCase", default)]`, so this serializes as `planningIdleReleaseMinutes` and older config files/logs without the key still deserialize. Add a `///` doc comment: an in-planning mission whose hosted engine sits idle this many minutes is released (its events.jsonl lock freed); 0 disables auto-release. Add the field to the `Default for MissionConfig` impl (near the existing defaults around line 375) with value `30`.
+2. NOTE: types.rs opens with a 'CONTRACT FILE — do not modify' banner. Adding a config field is the established, backward-compatible exception here: `maxParallelWorkers` and `eventStreamThrottleMs` were added the same way (additive, serde default). Add ONLY this one field; do not touch Mission/Plan/Assertion or any other type.
+3. In crates/engine/src/config.rs `validate()`, no lower/upper bound is required (0 = never; any positive value = minutes). Do NOT add a rejecting rule unless an existing pattern demands it — just confirm the merged config still deserializes. If you add any bound, follow the existing `if !(range).contains(...)` style and error message shape.
+
+CONSTRAINTS: camelCase serde; layered-file config semantics (a partial file overriding just this one key must work via the existing deep_merge path); do not change unrelated fields or their defaults.
+
+Done when:
+- MissionConfig::default().planning_idle_release_minutes == 30 (unit test in config.rs or types.rs).
+- A config layer file containing {"planningIdleReleaseMinutes": 5} loads via config::load_layers and yields planning_idle_release_minutes == 5, while an absent key yields the default 30 (test uses explicit layer paths, following the existing config-load test pattern).
+- serde_json::to_value(MissionConfig::default()) contains the key "planningIdleReleaseMinutes" (camelCase), asserted in a test.
+
+### 1.2 Last-use tracking, sweep_idle, and lazy background sweeper in MissionHost
+
+Give the hosted-engine registry a per-planning-cell last-use timestamp, a testable sweep method, and a lazy background task that periodically releases idle planning engines. Do NOT add the HTTP endpoint here (separate feature).
+
+FILE: crates/server/src/host.rs (and its #[cfg(test)] module / crates/server/tests/host_test.rs for tests).
+
+BACKGROUND: `HostedMission::Planning(EngineCell)` (host.rs:53) holds a mission's engine and its single-writer lock. `MissionHost::release(id)` (host.rs:307) already drops an idle planning engine via `Arc::try_unwrap` + drop (freeing the lock) and REFUSES a mid-turn cell (the in-flight turn holds an Arc clone so try_unwrap fails, returning `turn_in_flight()`). REUSE `release`; never force.
+
+WHAT TO DO:
+1. Track last-use per planning cell. Extend the `Planning` variant to also carry a last-use `std::time::Instant` with interior mutability suitable for the `Arc<Mutex<HashMap<..>>>` registry — e.g. change it to `Planning { cell: EngineCell, last_use: Arc<std::sync::Mutex<std::time::Instant>> }` (or an equivalent struct). Update ALL match arms/constructors that build or read `HostedMission::Planning` in this file (create, start, release, abandon, planning_cell, planning_cell_or_attach) accordingly.
+2. Update last-use to `Instant::now()` whenever a planning turn touches the cell: do it inside `planning_cell` and `planning_cell_or_attach` (the shared handout points used by planning_turn/request_plan/approve) while the registry lock is held. Setting last-use at turn START is sufficient — a long in-flight turn cannot be swept because release() refuses live borrows.
+3. Add `pub fn sweep_idle(&self, threshold: std::time::Duration) -> Vec<String>`: lock the registry, collect the ids of `Planning` entries whose `last_use.elapsed() >= threshold`, then for each call `self.release(id)`; ignore the `turn_in_flight` error (a mid-turn cell must be left hosted); never touch `Running` entries. Return the ids actually released. The 'threshold' is the raw window as a Duration — the 0-means-never semantics live in the caller (step 4), NOT here, so tests can pass Duration::ZERO to force a sweep.
+4. Add a lazily-spawned background sweeper OWNED by the host. Spawn it (via tokio::spawn, storing the JoinHandle on the host, guarded so it is started at most once) the first time a mission is inserted into the registry (e.g. in create() and in planning_cell_or_attach's insert). The task loops: sleep a small fixed interval (e.g. 60s), then read the window from `kranz_engine::config::load(&self.repo_root)` — if `planning_idle_release_minutes == 0`, skip (never release); otherwise call `sweep_idle(Duration::from_secs(minutes * 60))`. Keep the loop cheap and correct when the registry is momentarily empty (just sweep nothing). The host is always constructed inside a tokio runtime (serve; #[tokio::test]).
+5. TESTS (mirror crates/server/tests/host_test.rs `release_frees_the_mission_lock_for_external_runners`, using init_repo/seed_mission_log/MockBackend and EventLog::acquire): (a) attach a mission via a planning turn, assert an external EventLog::acquire is LockHeld while attached, call `host.sweep_idle(Duration::ZERO)`, then assert EventLog::acquire now SUCCEEDS (lock provably free) and the returned Vec contains the mission id; (b) attach a mission, hold its cell's tokio Mutex lock exactly like an in-flight turn (as the existing `contended_planning_mutex_is_409_for_turns_and_start` test does with `cell.try_lock()`), call `host.sweep_idle(Duration::ZERO)`, and assert the mission is STILL hosted (planning_cell(&id).is_ok()) and was NOT in the released Vec.
+
+CONSTRAINTS: never release a `Running` mission; never force a lock; the sweep must be idempotent and safe on an empty registry; do not change external behavior of create/start/abandon/release beyond adding the timestamp.
+
+Done when:
+- After attaching a mission (planning turn) and calling sweep_idle(Duration::ZERO), EventLog::acquire on that mission succeeds where it was LockHeld before — proving the single-writer lock is freed.
+- A mission whose cell mutex is held (simulating an in-flight turn) survives sweep_idle(Duration::ZERO): it remains hosted (planning_cell is Ok) and is absent from sweep_idle's returned ids.
+- sweep_idle never releases a Running entry and is a safe no-op on an empty registry (covered by the tests not panicking / returning empty).
+
+### 1.3 POST /api/missions/:id/release endpoint
+
+Expose the existing MissionHost::release over HTTP, mutation-token-gated, mirroring the abandon/delete handlers.
+
+FILES: crates/server/src/host.rs (handler), crates/server/src/lib.rs (route), crates/server/tests/host_test.rs (tests).
+
+BACKGROUND: `MissionHost::release(id)` (host.rs:307) returns `Ok(true)` when the mission is now free of this host (released, or was never hosted), `Ok(false)` when it is actively Running, and `Err(turn_in_flight())` (a 409 ApiError) mid-turn. It returns `Ok(true)` for a totally unknown id, so the HANDLER must add the on-disk existence check for the 404.
+
+WHAT TO DO:
+1. Add `pub(crate) async fn release_mission_route(State(server), UrlPath(id), body: Bytes) -> Result<Json<Value>, ApiError>` in host.rs, mirroring `abandon_mission_route` (host.rs:638): call `valid_id(&server, &id)?`; then, mirroring `not_hosted`/`clean`, return `ApiError::not_found(...)` when `MissionPaths::new(server.host.repo_root(), &id).events_file()` is NOT a file (unknown mission → 404). Otherwise call `server.host.release(&id)?` (a mid-turn cell surfaces as the 409 from `turn_in_flight`; a Running mission returns Ok(false)) and respond `200 Json(json!({ "released": <bool> }))`. Add a doc comment matching the surrounding style. No request body fields are needed (accept and ignore an empty/`{}` body like the others).
+2. In crates/server/src/lib.rs, register the route next to abandon/delete (around line 142): `.route("/api/missions/{id}/release", post(host::release_mission_route))`. POST so the existing mutation-token gate applies by construction.
+3. TESTS in crates/server/tests/host_test.rs, following `abandon_then_delete_lifecycle_over_rest` and `release_frees_the_mission_lock_for_external_runners` (use router_with_host + post_json with Some(TOKEN), init_repo/MockBackend where a real engine is needed): (a) 200 + lock freed — attach a mission (a planning turn via the host, then build the app over that same host, OR drive attach through the API), POST /api/missions/<id>/release, assert status 200 and body["released"] == true, and assert an external EventLog::acquire on the mission now succeeds; (b) 409 mid-turn — hold the mission's cell mutex like an in-flight turn, POST release, assert status 409; (c) 404 unknown — POST /api/missions/m-does-not-exist/release, assert status 404.
+
+CONSTRAINTS: POST only (token gate); never force-steal a lock; a not-hosted-but-on-disk mission is an idempotent 200 (already free), only a mission absent from disk is 404.
+
+Done when:
+- POST /api/missions/:id/release on an attached mission returns 200 with {"released":true} and the mission's EventLog::acquire subsequently succeeds (lock freed).
+- POST /api/missions/:id/release while a turn is in flight (cell mutex held) returns 409.
+- POST /api/missions/:id/release for a mission that does not exist on disk returns 404.
+- The route is registered under the mutation-token-gated POST middleware (a tokenless POST is rejected, consistent with the other POST routes).
+
+
+## Milestone 2 — CLI release verb and documentation
+
+### 2.1 kranz release CLI verb calling the serve API
+
+Add a `kranz release` subcommand that POSTs to a running serve's release endpoint, since the CLI runs in a different process and cannot reach the registry directly.
+
+FILES: crates/cli/src/cli.rs (Command enum), crates/cli/src/commands.rs (dispatch), crates/cli/Cargo.toml (add reqwest), crates/cli/tests/cli_test.rs (parse test).
+
+BACKGROUND: The CLI has no HTTP client today. `reqwest` is already a WORKSPACE dependency (used by kranz-slack and kranz-server dev-deps); add `reqwest.workspace = true` to crates/cli/Cargo.toml `[dependencies]`. The CLI resolves a mission id via `select_mission(&repo, explicit)` (commands.rs:192), exactly as `Abandon` does with `id.or(cli.mission)` (commands.rs:108). `kranz serve` prints `mutation token: <t>` and requires it in the `x-kranz-token` header on every POST; POST bodies MUST be `application/json` (the server's require_json_api_posts middleware rejects other content types with 415). The default serve URL is http://127.0.0.1:4560 (cli.rs Serve `port` default 4560).
+
+WHAT TO DO:
+1. In crates/cli/src/cli.rs, add a `Release` variant to `enum Command` with a `///` doc comment (a mission id comes from the global `--mission`, matching the goal `kranz release [--mission <id>]`). Add release-specific flags on the variant: `#[arg(long, default_value = "http://127.0.0.1:4560")] url: String` and `#[arg(long, value_name = "TOKEN")] token: [REDACTED] Do NOT add a new mission arg — reuse the existing global `--mission`.
+2. In crates/cli/src/commands.rs, handle `Command::Release { url, token }`: resolve the id with `select_mission(&repo, cli.mission.as_deref())?` (same auto-selection as abandon — the newest mission when none is given); resolve the token from `token` else `std::env::var("KRANZ_TOKEN").ok()`, and if still absent return a clear error (`anyhow!`) telling the user to pass `--token` or set `KRANZ_TOKEN` (printed by `kranz serve`). Build the request URL as `{url}/api/missions/{id}/release` (trim a trailing slash on url). POST it with reqwest, setting the `x-kranz-token` header and a JSON body (use `.json(&serde_json::json!({}))` so Content-Type is application/json). This handler is async like the others. Map outcomes to friendly output/exit codes: 200 → print that the mission was released (freeing the lock); 409 → report a turn is in flight, try again shortly; 404 → unknown mission; 401 → the token was missing/invalid; a reqwest connection error (server not reachable) → an honest message like `no kranz serve reachable at {url} — is it running?`. Return a non-zero exit code (mirroring how other CLI commands signal failure) for the error cases.
+3. Add a parse test in crates/cli/tests/cli_test.rs following the existing `parses_abandon`/`parses_serve` patterns: `kranz release` parses to `Command::Release { .. }` with url defaulting to http://127.0.0.1:4560 and token None; `kranz --mission m-7 release` leaves the global mission Some("m-7"); `kranz release --url http://127.0.0.1:5001 --token sesame` captures url and Some("sesame").
+
+CONSTRAINTS: keep URL/token discovery simple (flags + KRANZ_TOKEN fallback; do NOT add token persistence to serve — out of scope); never touch the event log directly from this verb (it always goes through the server); the JSON content-type header is mandatory or the server returns 415.
+
+Done when:
+- `kranz release` parses to Command::Release with url defaulting to http://127.0.0.1:4560 and token None (cli_test.rs).
+- `kranz --mission m-7 release` parses with the global mission set to Some("m-7") and `kranz release --url <u> --token <t>` captures both flag values (cli_test.rs).
+- The dispatch resolves the mission via select_mission and errors clearly when no token is available from --token or $KRANZ_TOKEN (unit-testable helper or asserted via the error message).
+- reqwest is declared as a dependency of the kranz CLI crate and the crate builds.
+
+### 2.2 Document the release endpoint and update the slice-5 trade-off note
+
+Document the new release affordance in the two docs the acceptance checks.
+
+FILES: docs/protocol.md and docs/slack-management.md.
+
+WHAT TO DO:
+1. In docs/protocol.md, add a row to the mission-lifecycle endpoint table (the table around lines 37-40 that lists approve/start/abandon/delete) documenting `POST /api/missions/:id/release`: it un-hosts an idle in-planning mission, dropping the engine and freeing its single-writer lock so an external runner (a terminal `kranz plan`, `kranz work`) can take over → `200 {"released":true}`; `409` while a planning turn is in flight (the web never force-steals); `404` for an unknown mission. Note it is POST so the mutation-token gate applies, and that it is idempotent for a mission that is not currently hosted. Match the existing row style. The string `/release` must appear in the file.
+2. In docs/slack-management.md, update the slice-5 trade-off note (around lines 103-105, which currently says once attached serve holds the mission's single-writer lock so a concurrent `kranz plan --mission` sees LockHeld until serve releases it): append that this trade-off is now CLOSED BY IDLE-RELEASE — an idle attached planning engine is auto-released after `planningIdleReleaseMinutes` (default 30; 0 disables), and `kranz release [--mission <id>]` (POST /api/missions/:id/release) frees it on demand. The exact phrase `closed by idle-release` must appear in the note.
+
+CONSTRAINTS: docs only; keep the surrounding formatting/table structure intact; ensure the two grep targets (`/release` in protocol.md, `closed by idle-release` in slack-management.md) are present.
+
+Done when:
+- docs/protocol.md contains a documented POST /api/missions/:id/release endpoint (the substring "/release" is present) describing its 200/409/404 behavior.
+- docs/slack-management.md's slice-5 trade-off note contains the phrase "closed by idle-release" and references the config window and the kranz release verb.
+

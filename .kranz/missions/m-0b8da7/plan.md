@@ -1,0 +1,110 @@
+# Mission plan — m-0b8da7
+
+**Goal:** Make pre-mission cost estimates shape-aware: detect doc-heavy/judgement-heavy plan shapes the calibration corpus doesn't cover, widen their range and label them low-confidence, so post-hoc estimating m-d341a7 brackets its $163.64 actual while code-mission estimates stay unchanged.
+
+Branch `kranz/mission-m-0b8da7` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Cost estimate
+
+Estimated **$4.80 – $24.02** (expected ~$9.61). Rough estimate — live usage is authoritative; based on 19 completed mission(s).
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** Post-hoc estimating m-d341a7's recorded plan against a code-only corpus (no doc-heavy mission) produces a range that brackets its actual $163.64 and is flagged low-confidence — proven by a backtest unit test. 
+  `bash -c 'set -o pipefail; cargo test --workspace backtest_m_d341a7 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'`
+- **[a2]** When the estimate is low-confidence for an uncovered shape, the rendered one-line estimate names the shape and says the corpus lacks it (instead of printing a tight range) — proven by a rendering unit test. 
+  `bash -c 'set -o pipefail; cargo test --workspace cost_estimate 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'`
+- **[a3]** Code-mission and neutral-contract estimates are unchanged within tolerance: the base formula still yields low=0.5x/high=2.5x expected, and a cargo-gated plan classifies as a code shape with no widening — proven by regression unit tests. 
+  `bash -c 'set -o pipefail; cargo test --workspace estimate_ 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'`
+- **[a4]** The full workspace test suite passes. 
+  `bash -c 'set -o pipefail; cargo test --workspace 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'`
+
+## Milestone 1 — Shape-aware, confidence-labeled cost estimates
+
+### 1.1 MissionShape classifier from observable plan features
+
+CONTEXT. Repo is kranz, a Rust mission harness. Pre-mission cost estimation lives in crates/engine/src/cost.rs. Today cost::estimate() is a pure formula on milestone/feature counts + MissionConfig only — it is blind to the validation-contract shape, which is why a doc-heavy mission (m-d341a7) cost $163.64 against an $18.35 estimate. This feature adds ONLY a pure classifier + its unit tests; it must NOT change estimate()/calibrate() behavior yet (later features wire it in). Everything must compile and all existing tests must still pass.
+
+READ FIRST: crates/engine/src/cost.rs (whole file — especially estimate(), calibrate(), EstimateParams, CostEstimate, Calibration); crates/engine/src/types.rs lines ~36-243 (Plan, PlanMilestone, PlanFeature, Assertion, AssertionCheck { Command, AgentJudgement }). Note Assertion has fields: id, statement, check: AssertionCheck, command: Option<String>.
+
+IMPLEMENT in crates/engine/src/cost.rs:
+1. `pub enum MissionShape { CodeChange, DocHeavy, Unknown }` (derive Debug, Clone, Copy, PartialEq, Eq).
+2. `pub fn classify_shape(plan: &Plan) -> MissionShape` operating ONLY on plan.validation_contract (observable at plan time). Rules, in this order:
+   - Let `judgements` = count of assertions with check == AssertionCheck::AgentJudgement.
+   - Let `build_test_cmd` = any assertion with check == Command whose `command` (lowercased) contains any of these tool tokens: "cargo test", "cargo build", "cargo check", "cargo clippy", "npm test", "npm run", "pytest", "go test", "make ". (These mark a mission that gates on compilation/tests — a code mission.)
+   - If `build_test_cmd` is true -> CodeChange.
+   - Else if `judgements >= 1` -> DocHeavy (a contract that leans on full-mission-diff agent judgement with no build/test gate: the expensive, doc-heavy shape).
+   - Else -> Unknown (trivial/empty or grep-only-without-judgement contract; treated as neutral, never widened).
+   Add a concise doc-comment explaining WHY these signals predict cost: agent-judgement assertions are re-evaluated by validators+orchestrator against the growing full mission diff every validation pass (m-d341a7: 2 judgement assertions over a 1074-line doc drove 21.5M cache-reads / 17 judgment turns), whereas code missions gate on cargo/test commands.
+
+UNIT TESTS — add to crates/engine/tests/config_cost_prompts_test.rs (a #[test] per case; build inline Plan values; construct Assertion literals directly):
+   - classify_shape on a plan whose contract has >=1 agent-judgement assertion AND only grep/git-diff command assertions (no cargo) == DocHeavy. (Mirror m-d341a7's shape: e.g. 2 agent-judgement + 3 `bash -c grep ...` command assertions.)
+   - classify_shape on an EMPTY contract (validation_contract: vec![]) == Unknown.
+   - classify_shape on a plan with a `cargo test ...` command assertion (even if it also has an agent-judgement assertion) == CodeChange.
+   - classify_shape on a contract of only grep command assertions with ZERO agent-judgement == Unknown.
+
+Do not modify estimate(), calibrate(), CostEstimate, or any call site in this feature.
+
+SELF-CHECK before reporting (run verbatim, make pass):
+bash -c 'set -o pipefail; cargo test --workspace classify_shape 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+bash -c 'set -o pipefail; cargo build --workspace 2>&1 | tail -1'
+
+Done when:
+- cost::classify_shape exists and is pure over plan.validation_contract only; MissionShape enum has CodeChange/DocHeavy/Unknown.
+- A contract with >=1 agent-judgement assertion and no cargo/build/test command classifies DocHeavy; an empty contract classifies Unknown; a contract containing a `cargo test` command classifies CodeChange; a grep-only contract with no agent-judgement classifies Unknown.
+- All new classify_shape tests pass and the whole workspace still builds and passes; estimate()/calibrate()/call sites are unchanged in this feature.
+
+### 1.2 Confidence-gated shape widening in calibrate + estimate
+
+CONTEXT. Repo is kranz. crates/engine/src/cost.rs has: estimate(plan,&cfg,&params)->CostEstimate (hardwired low=0.5x, high=2.5x expected); calibrate(repo_root)->Calibration { params, missions_used } (folds every COMPLETED mission's event log into one pooled EstimateParams mean); and (from the previous feature) MissionShape + classify_shape(plan). READ cost.rs whole, plus how classify_shape works, plus crates/engine/tests/config_cost_prompts_test.rs (esp. the calibrate_* tests, and helpers write_events/mission_a_events/mission_b_events/created/spawned/completed/plan_with — reuse them). Also read types.rs Plan/Assertion/Milestone/Feature. Do NOT reproduce the expensive shape: no changes here need agent-judgement.
+
+GOAL: make estimates shape-aware WITHOUT changing the base estimate() output for existing callers/tests. Do it via a post-processing step, so the existing estimate() unit tests keep passing untouched.
+
+IMPLEMENT in cost.rs:
+1. Add two fields to `CostEstimate`: `pub shape: MissionShape` and `pub confidence: Confidence`, where `pub enum Confidence { High, Low }` (derive Debug,Clone,Copy,PartialEq,Eq). In estimate(), set shape = MissionShape::Unknown and confidence = Confidence::High (i.e. estimate() itself stays shape-neutral — its numeric low/expected/high are IDENTICAL to today). Update every struct-literal construction of CostEstimate in the codebase/tests to include the new fields (search for `CostEstimate {`).
+2. Extend `Calibration` with `pub doc_heavy_missions_used: usize` — during calibrate(), for each COMPLETED mission also reconstruct its Plan (from state.mission: goal + validation_contract + milestones mapped to PlanMilestone/PlanFeature) and run classify_shape; count how many classify as DocHeavy. (missions_used and params unchanged.)
+3. Add `pub fn apply_shape(base: CostEstimate, plan: &Plan, cal: &Calibration) -> CostEstimate`:
+   - shape = classify_shape(plan); set base.shape = shape.
+   - If shape == DocHeavy AND cal.doc_heavy_missions_used == 0: this shape is uncovered -> set confidence = Low and WIDEN: high = expected * LOW_CONFIDENCE_HIGH_MULT, where LOW_CONFIDENCE_HIGH_MULT is a documented const chosen so the widened high comfortably exceeds m-d341a7's recorded actual from its own $18.35 base (use 15.0; 15*18.35=$275.25 > $163.64 with margin). Leave expected and low unchanged. Add a doc-comment: expected stays the corpus best-guess; the wide high signals 'a comparable mission has run ~9x over — we cannot bound this tightly yet'.
+   - Otherwise (CodeChange, Unknown, or a DocHeavy shape the corpus now covers): return base unchanged with confidence = High. This is a strict no-op for the regression population.
+4. Wire apply_shape into the non-test estimate call sites: crates/cli/src/commands.rs (~605), crates/cli/src/planning_tui.rs (~1201), crates/engine/src/orchestrator.rs (~675), crates/server/src/host.rs (~426). Each already does `calibrate()` then `estimate()`; add `let estimate = cost::apply_shape(estimate, &plan, &calibration);` immediately after. Do NOT change render call signatures here (next feature handles rendering).
+
+TESTS — in crates/engine/tests/config_cost_prompts_test.rs:
+   A) BACKTEST `backtest_m_d341a7_doc_heavy_lands_in_range`: copy the real recorded plan `.kranz/missions/m-d341a7/plan.json` into `crates/engine/tests/fixtures/m-d341a7-plan.json`; in the test, include_str! it and serde_json::from_str::<Plan>() (Plan is camelCase serde — it deserializes as-is). Build a CODE-ONLY corpus in a tempdir using the existing mission_a_events()/mission_b_events() helpers (NO doc-heavy mission), calibrate() it (assert doc_heavy_missions_used == 0), estimate() the m-d341a7 plan with the calibrated params, then apply_shape(). Assert: est.shape == DocHeavy; est.confidence == Low; and the RECORDED ACTUAL is bracketed: `est.low_usd <= 163.64 && 163.64 <= est.high_usd`. Define the recorded actual as a `const M_D341A7_ACTUAL_USD: f64 = 163.64;` with a comment citing its provenance (m-d341a7 report/event log; the mission that motivated this work).
+   B) REGRESSION `estimate_code_shape_unchanged_by_apply_shape`: take a cargo-gated plan (contract with a `cargo test ...` command assertion) over the same 2-milestone/5-feature counts as estimate_matches_hand_computed_formula; estimate() then apply_shape() against a code-only corpus; assert low/expected/high are IDENTICAL to the base estimate() (0.5x/2.5x) and confidence == High and shape == CodeChange.
+   C) REGRESSION `apply_shape_noop_for_unknown_contract`: an empty-contract plan -> apply_shape leaves numbers unchanged, shape Unknown, confidence High.
+   Keep the existing estimate_matches_hand_computed_formula / estimate_respects_skip_scrutiny tests passing unchanged.
+
+SELF-CHECK before reporting (verbatim):
+bash -c 'set -o pipefail; cargo test --workspace backtest_m_d341a7 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+bash -c 'set -o pipefail; cargo test --workspace estimate_ 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+bash -c 'set -o pipefail; cargo test --workspace apply_shape 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+
+Done when:
+- The backtest test estimates m-d341a7's real plan.json (checked in as a fixture) against a code-only corpus and asserts est.low_usd <= 163.64 <= est.high_usd, est.shape == DocHeavy, est.confidence == Low, and doc_heavy_missions_used == 0.
+- apply_shape widens high (via a documented const, 15x, that exceeds the recorded actual) and marks Low confidence ONLY for a DocHeavy shape with zero doc-heavy missions in the corpus; it is a strict no-op (identical low/expected/high, confidence High) for CodeChange and Unknown shapes.
+- estimate() base output (low=0.5x, high=2.5x) is unchanged: estimate_matches_hand_computed_formula and estimate_respects_skip_scrutiny still pass verbatim; the code-shape and unknown-shape regression tests pass.
+- All four estimate call sites (commands.rs, planning_tui.rs, orchestrator.rs, host.rs) apply apply_shape after estimate; the whole workspace builds and passes.
+
+### 1.3 Render the shape + low-confidence indicator across estimate surfaces
+
+CONTEXT. Repo is kranz. The one-line pre-mission cost estimate is rendered by `render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> String` in crates/cli/src/output.rs and consumed by /plan line mode, the planning TUI, the orchestrator's plan.md/Reviewable, Slack (crates/slack/src/format.rs), and the web plan-review path. After the previous feature, CostEstimate carries `shape: MissionShape` and `confidence: Confidence`. READ: crates/cli/src/output.rs (render_cost_estimate + surrounding); crates/cli/tests/cli_test.rs (the cost_estimate_renders_range_and_calibration_provenance test — note it constructs CostEstimate as a struct literal); crates/slack/src/format.rs around line 174 (how the estimate string is carried); and grep for render_cost_estimate call sites. This feature is rendering/copy only; no changes to estimate math.
+
+IMPLEMENT:
+1. In render_cost_estimate: when `estimate.confidence == Confidence::Low` (uncovered doc-heavy shape), emit a line that (a) still shows the range and expected, but (b) explicitly NAMES the shape (e.g. 'doc-heavy / judgement-heavy') and (c) says the corpus lacks a comparable mission so the estimate is LOW CONFIDENCE and the upper bound is a soft ceiling — instead of implying a tight range. Keep it a single collapsed line. When confidence == High, keep the current wording EXACTLY (so the existing provenance assertions still hold). Keep the existing `missions_used == 0` vs `based on N completed mission(s)` provenance branch intact and composable with the confidence note.
+2. Update the existing render test's CostEstimate struct literal to include the new shape/confidence fields (confidence High + a code/unknown shape) so it compiles and its current assertions (`estimated $9.18-$45.88`, `expected ~$18.35`, provenance) still pass verbatim.
+3. ADD a rendering test `cost_estimate_low_confidence_names_shape` (in cli_test.rs): construct a CostEstimate with confidence Low, shape DocHeavy, and a widened high; assert the rendered line contains a shape word (case-insensitive 'doc' or 'judgement') AND a low-confidence phrase (e.g. 'low confidence' / 'corpus lacks' / 'rough') AND is a single line (no embedded newline). Assert a High-confidence estimate does NOT contain the low-confidence phrase.
+4. VERIFY the Slack and web/plan.md surfaces surface the same information: confirm they render via render_cost_estimate (or the CostEstimate's confidence) so the low-confidence note reaches Slack's estimate string and the persisted plan.md line. If any surface formats low/high independently rather than routing through render_cost_estimate, route it through render_cost_estimate (or have it read estimate.confidence) so the indicator is not dropped. Do not change unrelated formatting.
+
+SELF-CHECK before reporting (verbatim):
+bash -c 'set -o pipefail; cargo test --workspace cost_estimate 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+bash -c 'set -o pipefail; cargo test --workspace 2>&1 | grep -qE "result: ok\. [1-9][0-9]* passed"'
+
+Done when:
+- render_cost_estimate emits a single-line, shape-named, low-confidence estimate line when confidence == Low (naming the doc-heavy/judgement-heavy shape and saying the corpus lacks it), and preserves the exact existing wording + provenance branches when confidence == High.
+- The existing cost_estimate_renders_range_and_calibration_provenance test passes unchanged after adding the new struct fields; a new test asserts the low-confidence line names the shape and carries a low-confidence phrase on one line, and that a High-confidence line omits it.
+- Slack (format.rs) and the web/plan.md estimate paths carry the low-confidence indicator (they route through render_cost_estimate or read estimate.confidence); no independent low/high formatting silently drops it.
+- cargo test --workspace passes end to end.
+

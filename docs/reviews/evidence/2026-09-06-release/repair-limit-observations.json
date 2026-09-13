@@ -1,0 +1,52 @@
+{
+  "source_commit": "d1eafe037df0dc08dd67e94889937fa66f56f7ac",
+  "mission_id": "m-53a35b",
+  "initial_cap": 2,
+  "config_change": {
+    "seq": 38,
+    "ts": "2026-09-06T05:09:28.791281628Z",
+    "cap": 3
+  },
+  "final_cap": 3,
+  "cycles_used": {
+    "ms-1": 2,
+    "ms-2": 2
+  },
+  "injected_turn_count": 24,
+  "injected_turns_containing_current_cap_key": 0,
+  "planning_state_read_records": [
+    41,
+    42
+  ],
+  "planning_summary_record": 114,
+  "research_summary_record": 125,
+  "stale_budget_decision_events": [
+    333,
+    376,
+    430,
+    773,
+    810
+  ],
+  "stale_budget_waiver_events": [
+    477,
+    866
+  ],
+  "evidence_sha256": {
+    "events.jsonl": "7fecf76455195429024c41e781da40eed5c1f387f7ed7833395b4a42acfc2c70",
+    "state.json": "8f573acd247fd74b74400964523e8afa19f62a1430bb182e269d8f66cf9768d9",
+    "research.md": "ab081121a8273d709851c38d66b19c1c1f0d66f94ccbe5e8345cc033842e0c77",
+    "runs/orch-1.jsonl": "1008b15d4a19011118706a293637fb1cc294710a27108ae3bb750b5240bb419a"
+  },
+  "deterministic_probe": {
+    "source": "repair-budget-probe.rs",
+    "exit_code": 0,
+    "accepted_caps": [
+      2,
+      3,
+      1
+    ],
+    "digest_identical_across_caps": true,
+    "reseed_identical_after_increase": true,
+    "meaning": "Reproduces the defect on the pinned source; these assertions are not the desired fixed behavior."
+  }
+}

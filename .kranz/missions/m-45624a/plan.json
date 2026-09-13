@@ -1,0 +1,90 @@
+{
+  "goal": "Enable a 'live QA mode' for the functional validator: when a mission config lists browser/computer-use tooling for validatorFunctional, that validator both receives (--tools) and is permitted (--allowedTools) those tools, is prompted to drive the built app against acceptance criteria, and the pattern is documented in a docs/validating-uis.md cookbook.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "The functional validator's SessionSpec both carries its configured tools in `tools` and auto-approves the extra (non-inspect) tools in `allowed_tools`, without broadening Bash and without dropping the Write/Edit deny — proven by a named mock-seam integration test.",
+      "check": "command",
+      "command": "cargo test -p kranz-engine functional_validator_tools_are_carried_and_allowed 2>&1 | grep -qE 'result: ok\\. [1-9][0-9]* passed'"
+    },
+    {
+      "id": "a2",
+      "statement": "The full kranz-engine test suite passes (no regressions introduced by the prompt/engine/test changes).",
+      "check": "command",
+      "command": "cargo test -p kranz-engine"
+    },
+    {
+      "id": "a3",
+      "statement": "kranz-engine is clippy-clean with warnings denied.",
+      "check": "command",
+      "command": "cargo clippy -p kranz-engine --all-targets -- -D warnings"
+    },
+    {
+      "id": "a4",
+      "statement": "docs/validating-uis.md exists and contains a concrete .kranz/config.json block that sets validatorFunctional.tools.",
+      "check": "command",
+      "command": "test -f docs/validating-uis.md && grep -q 'validatorFunctional' docs/validating-uis.md && grep -q '\"tools\"' docs/validating-uis.md"
+    },
+    {
+      "id": "a5",
+      "statement": "The functional validator prompt contains an always-present Live QA section.",
+      "check": "command",
+      "command": "grep -qi 'live qa' crates/engine/prompts/validator-functional.md"
+    },
+    {
+      "id": "a6",
+      "statement": "The Live QA section of validator-functional.md is always present, self-activates on the session having browser/computer-use tools (not a template flag), instructs starting the app per the repo's run docs, exercising each acceptance criterion live, capturing evidence (URLs visited, observed text/state), staying read-only, does not hardcode any specific tool name, and preserves the existing findings-JSON contract.",
+      "check": "agent-judgement"
+    },
+    {
+      "id": "a7",
+      "statement": "docs/validating-uis.md is a coherent cookbook: it warns that `tools` is the exclusive --tools set so Bash/Read/Glob/Grep must be listed alongside the browser tool, uses a placeholder (not a real hardcoded) browser tool name, explains that the functional validator's configured extra tools are auto-approved while Write/Edit stay denied, and includes a worked apps/dashboard example with an accurate start command and at least one live-driven acceptance criterion plus the evidence to capture.",
+      "check": "agent-judgement"
+    },
+    {
+      "id": "a8",
+      "statement": "No files are changed outside the functional-validator prompt, the cookbook doc, the engine permissions/runner source, the engine tests, and the design doc — measured against the pinned base commit.",
+      "check": "command",
+      "command": "test -z \"$(git diff --name-only $KRANZ_BASE_SHA | grep -vE '^(crates/engine/prompts/validator-functional\\.md|docs/validating-uis\\.md|crates/engine/src/permissions\\.rs|crates/engine/src/runner\\.rs|crates/engine/tests/[A-Za-z0-9_]+\\.rs|docs/design\\.md)$')\""
+    }
+  ],
+  "milestones": [
+    {
+      "title": "Functional validator drives the app in live QA mode",
+      "features": [
+        {
+          "title": "Grant functional validator its configured tools (allow-list) + mock-seam integration test",
+          "spec": "Background: Kranz spawns headless `claude -p` sessions. A SessionSpec has three tool fields: `tools` (emitted as `--tools`, the EXCLUSIVE built-in tool set — which tools EXIST), `allowed_tools` (`--allowedTools`, auto-approved calls), `disallowed_tools` (`--disallowedTools`, denied; deny wins over allow). In `-p` mode there are NO interactive prompts: a tool call that exists but is not auto-approved FAILS (see docs/design.md lines 32-33).\n\nThe prerequisite scrutiny-floor mission already wired per-role config `tools` -> SessionSpec.tools -> `--tools`. Confirm by reading, and follow the existing style exactly: crates/engine/src/runner.rs `run_validator` sets `tools: cfg.role(kind).tools.clone()` (~line 767); crates/engine/src/permissions.rs `apply()` deliberately does NOT touch spec.tools (see its doc comment ~line 169); crates/engine/src/backend_claude.rs emits `--tools` when spec.tools is non-empty (~line 324). So a functional validator already RECEIVES its configured tools in `--tools`.\n\nGap to close: those configured tools are only in the exclusive set, not auto-approved, so a browser/computer-use tool would FAIL headless. Fix: for the FUNCTIONAL validator ONLY (never scrutiny), fold its configured EXTRA tools into `allowed_tools` so they are auto-approved, while keeping the read-only deny list intact.\n\nImplementation in crates/engine/src/permissions.rs `for_role`: the `Role::ValidatorScrutiny | Role::ValidatorFunctional` arm builds `allowed` from Read/Glob/Grep + git-inspect + contract-command patterns. AFTER that, ONLY when `role == Role::ValidatorFunctional`, append each configured tool name from `cfg.validator_functional.tools` to `allowed`, EXCLUDING the standard inspect tools in the `INSPECT_TOOLS` constant (Bash, Read, Glob, Grep). This exclusion is critical: those inspect tools are already governed by precise existing allow patterns, and adding a bare `Bash` entry would broaden Bash to ALL commands and break the read-only guarantee. Then call `dedup_preserving_order`. Do NOT change the scrutiny code path. Keep `disallowed_tools = READ_ONLY_DENY` and `permission_mode = \"default\"` unchanged. Do not alter `profile.tools`. `for_role` already takes `&MissionConfig`, so `cfg.validator_functional.tools` is available.\n\nAlso update the docs/design.md section-4.7 permission table (or a footnote beneath it): note that the functional validator ADDITIONALLY auto-approves any EXTRA tools listed in `validatorFunctional.tools` (e.g. a browser tool) to enable live-QA mode, while Write/Edit/WebFetch/WebSearch/git-push remain denied. Keep this edit minimal.\n\nIntegration test: add to crates/engine/tests/backend_mock_test.rs, mirroring the existing `worker_session_carries_configured_tools_onto_the_spec` test and reusing its mock-backend spec-capture harness (read it first; do NOT invent a new harness). Name the new test EXACTLY `functional_validator_tools_are_carried_and_allowed`. Build a MissionConfig where `validator_functional.tools = vec![\"Bash\".into(), \"Read\".into(), \"Glob\".into(), \"Grep\".into(), \"FakeBrowserTool\".into()]` — use the clearly-fake placeholder `FakeBrowserTool`; do NOT assume any real installed tool name. Drive the functional-validator spawn through the same seam the worker test uses (run_validator with the mock backend) and capture the SessionSpec. Assert ALL of: (1) spec.tools equals the configured list verbatim; (2) spec.allowed_tools contains \"FakeBrowserTool\"; (3) spec.allowed_tools does NOT contain a bare \"Bash\" entry; (4) spec.disallowed_tools still contains \"Write\" and \"Edit\". Additionally assert (in this test or a sibling) that a SCRUTINY validator built with the same configured tools does NOT get \"FakeBrowserTool\" folded into its allowed_tools (live-QA is functional-only).\n\nEnsure `cargo test -p kranz-engine` is green and `cargo clippy -p kranz-engine --all-targets -- -D warnings` is clean. Touch ONLY: crates/engine/src/permissions.rs, crates/engine/tests/backend_mock_test.rs, docs/design.md (and crates/engine/src/runner.rs ONLY if the spawn seam genuinely requires it — prefer permissions.rs alone).",
+          "validationCriteria": [
+            "A functional validator whose config `tools` includes a non-inspect tool ('FakeBrowserTool') produces a SessionSpec whose `allowed_tools` contains that tool name.",
+            "The same SessionSpec's `tools` field equals the configured list verbatim, and `disallowed_tools` still contains 'Write' and 'Edit'.",
+            "Folding configured tools into `allowed_tools` never adds a bare 'Bash' entry (Bash stays restricted to the existing precise patterns).",
+            "A scrutiny validator built with the same configured tools does NOT get the extra non-inspect tool folded into its `allowed_tools`.",
+            "A test named exactly `functional_validator_tools_are_carried_and_allowed` exists in crates/engine/tests/backend_mock_test.rs and passes, `cargo test -p kranz-engine` is green, and `cargo clippy -p kranz-engine --all-targets -- -D warnings` is clean."
+          ]
+        },
+        {
+          "title": "Add always-on Live QA section to the functional validator prompt",
+          "spec": "File: crates/engine/prompts/validator-functional.md. Read it fully first. It is the append-system-prompt for the functional validator, rendered UNCONDITIONALLY by the runner (no per-mission templating of this section is required). The role currently verifies a milestone by running contract commands and reading output, and ends with a strict findings-JSON message.\n\nAdd a new section whose heading includes the words \"Live QA\". The section must be ALWAYS present in the file but SELF-ACTIVATE only when the session actually has browser/computer-use tools available (activated by tool presence, NOT by a template flag or engine variable). When such tools are available (i.e. beyond the standard Bash/Read/Glob/Grep), it must instruct the validator to:\n- Recognize it is in 'live QA mode' and DRIVE THE BUILT APPLICATION rather than judge behaviour from command output alone.\n- Start the app per the repository's own run/dev docs (e.g. README or docs) — do not assume a fixed command.\n- Exercise EACH acceptance criterion / contract assertion behaviourally against the running app.\n- Capture concrete evidence in the report: URLs visited, exact observed on-screen text/state, and screenshots if the tooling supports them.\n- Fall back to command/read evidence for any criterion that cannot be exercised live, and say so explicitly.\n- Stay READ-ONLY: drive the app, never edit its source or commit.\n\nConstraints: Do NOT hardcode any specific tool name — the installed claude's browser/computer tooling varies and the config carries the list; refer to 'browser/computer-use tools' generically. Keep the change ADDITIVE: do not weaken existing instructions, and do NOT change the final findings-JSON contract or the read-only boundaries already stated. Live-QA evidence must flow into the SAME findings/summary JSON the role already emits.\n\nTouch ONLY crates/engine/prompts/validator-functional.md. If (and only if) `cargo test -p kranz-engine` has a test that pins this prompt's content or hash and it fails because of your edit, update that test's expected value; do not otherwise touch tests.",
+          "validationCriteria": [
+            "crates/engine/prompts/validator-functional.md contains an always-present section (heading including 'Live QA') that instructs the validator to drive the built application when browser/computer-use tools are available.",
+            "The section activates on tool presence (no template flag/variable), tells the validator to start the app per repo docs, exercise each acceptance criterion live, and capture evidence (URLs visited, observed text/state).",
+            "The section does not hardcode any specific tool name and refers to browser/computer-use tools generically.",
+            "The change is additive: the existing findings-JSON contract and read-only boundaries remain intact, and `cargo test -p kranz-engine` stays green."
+          ]
+        },
+        {
+          "title": "Write docs/validating-uis.md cookbook with config block and dashboard worked example",
+          "spec": "Create a new file docs/validating-uis.md — a cookbook for putting the functional validator into 'live QA mode' so it drives a running UI instead of judging from code. Touch ONLY docs/validating-uis.md (no code, no other docs).\n\nCover, concretely:\n1. The convention: adding browser/computer-use tooling to the functional validator's config turns it into live-QA mode; the prompt (crates/engine/prompts/validator-functional.md) already teaches the behaviour and self-activates on tool presence.\n2. A concrete `.kranz/config.json` block. Config is layered (compiled defaults < ~/.kranz/config.json < <repo>/.kranz/config.json; later wins), keys are camelCase, and files may be partial. Show setting `validatorFunctional.tools`. CALL OUT PROMINENTLY: `tools` is the EXCLUSIVE `--tools` set — it REPLACES the default tool set for that role — so you MUST list the inspection tools the validator still needs (`Bash`, `Read`, `Glob`, `Grep`) ALONGSIDE the browser tool, or the validator loses the ability to run its contract commands. Use a clearly-marked PLACEHOLDER for the browser tool name (e.g. `\"<your-installed-browser-tool>\"`) and explain the exact name is whatever the installed `claude` exposes — do NOT hardcode a real name. Example shape: {\"validatorFunctional\": {\"tools\": [\"Bash\",\"Read\",\"Glob\",\"Grep\",\"<your-installed-browser-tool>\"]}}\n3. A brief permission-model note: the engine auto-approves the functional validator's configured EXTRA tools (so the browser tool actually runs in headless `-p` mode) while Write/Edit/WebFetch/WebSearch/git-push stay denied — the validator drives the app but cannot modify it. (Implemented in crates/engine/src/permissions.rs.)\n4. A WORKED EXAMPLE against this repo's own dashboard (apps/dashboard). READ apps/dashboard/README.md and apps/dashboard/package.json scripts to get the REAL start/dev command. Show: how the validator starts the dashboard, one or two concrete acceptance-style criteria driven live (e.g. navigate to the local dev URL, observe a specific UI element/text that proves a milestone behaviour), and exactly what evidence to record (URL visited, observed text). Keep every command accurate to what apps/dashboard actually provides.\n5. A short 'evidence in the report' note: live observations flow into the functional validator's normal findings/summary JSON.\n\nKeep it a focused cookbook (about one to two screens).",
+          "validationCriteria": [
+            "docs/validating-uis.md exists and contains a `.kranz/config.json` example that sets `validatorFunctional.tools`.",
+            "The config example lists Bash, Read, Glob, and Grep alongside a placeholder browser tool, and the doc explicitly warns that `tools` is the exclusive set so the inspection tools must be included.",
+            "The doc does not hardcode a real browser/computer-use tool name (uses a placeholder) and states the name depends on the installed claude.",
+            "The doc includes a worked apps/dashboard example with a start command accurate to apps/dashboard and at least one live-driven acceptance criterion plus the evidence to capture.",
+            "The doc explains that the functional validator's configured extra tools are auto-approved while Write/Edit remain denied."
+          ]
+        }
+      ]
+    }
+  ]
+}

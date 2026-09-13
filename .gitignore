@@ -1,0 +1,34 @@
+/target
+node_modules/
+dist/
+!crates/cli/assets/
+!crates/cli/assets/dashboard/
+!crates/cli/assets/dashboard/dist/
+!crates/cli/assets/dashboard/dist/**
+.DS_Store
+
+# per-repo mission data (plan.json is committed on the mission branch, not here)
+# (mirrors the runtime-ignore block `kranz init` writes — keep in sync with
+# crates/cli/src/init.rs RUNTIME_IGNORE_PATTERNS)
+.kranz/config.json
+.kranz/missions/*/events.jsonl
+.kranz/missions/*/events.jsonl.lock
+.kranz/missions/*/state.json
+.kranz/missions/*/state.json.tmp
+.kranz/missions/*/estimate.json
+.kranz/missions/*/enqueue-source*.json
+.kranz/missions/*/runs/
+.kranz/missions/*/control/
+.kranz/missions/*/workspace/
+.kranz/slack-threads.json
+.kranz/slack/
+.kranz/queue/
+.kranz/hook-status/
+.kranz/tickets/*.status
+.kranz/serve.token
+.kranz/serve.read.token
+# operator-local plaintext domain vocabulary (the input to
+# `kranz domain-lint --seed-config`; never committed — the committed
+# denylist is salted hashes only, see docs/domain-lint.md)
+.kranz/domain-terms.local
+/notes.txt

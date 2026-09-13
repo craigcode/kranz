@@ -1,0 +1,11 @@
+# kranz-city-worker as a City-supervised named session (non-LLM).
+#
+# INTENDED WIRING — validated against gc 1.3.2 docs, not yet against a live
+# supervisor (the spike city runs unregistered; see docs/gascity.md). The
+# worker is a plain long-running process: the supervisor's health patrol
+# restarts it if it dies, which is exactly the supervision the spike's nohup
+# lacked. It spends nothing while the native queues are empty.
+[agent]
+name = "kranz-worker"
+command = "kranz-city-worker"
+lifecycle = "long_running"

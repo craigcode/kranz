@@ -1,0 +1,58 @@
+[package]
+name = "kranz-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governed mission engine for auditable AI coding-agent work."
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+regex.workspace = true
+globset.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+cap-std.workspace = true
+cap-primitives.workspace = true
+cap-fs-ext.workspace = true
+reqwest.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows process-tree kill via Job Objects (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+# Unverified on this repo's dev host (macOS); validated only by windows-latest CI.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest = "1"

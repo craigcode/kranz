@@ -1,0 +1,32 @@
+# Normalize to LF in the index and, crucially, in the WORKING TREE too.
+#
+# Without this, Git for Windows' default core.autocrlf=true checks the tree out
+# with CRLF. That silently breaks the `npm run check-embedded` merge gate: the
+# committed dashboard bundle under crates/cli/assets/dashboard/dist/ becomes
+# CRLF, while a fresh vite build emits mixed endings (CRLF passed through from
+# the tracked source template, LF for vite's own injected tags), and the check
+# is a byte comparison. A Windows contributor could not make that gate pass.
+#
+# `eol=lf` (not just `text=auto`) is what pins the working tree, so it holds
+# regardless of a contributor's core.autocrlf setting.
+* text=auto eol=lf
+
+# Shell scripts and anything with a shebang must stay LF to remain executable
+# under bash/WSL and inside the Docker build context.
+*.sh text eol=lf
+
+# PowerShell is the one place CRLF is the native convention. Windows PowerShell
+# 5.1 in particular can mis-parse an LF-only script containing a here-string.
+*.ps1 text eol=crlf
+
+# Binary assets: never transform, never diff as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.gz binary

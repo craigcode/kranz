@@ -1,0 +1,183 @@
+{
+  "cli_version": "2026.07.08-0c04a8a",
+  "cli_version_prior": "2026.04.13-a9d7fb5",
+  "flags": [
+    "--api-key",
+    "--header",
+    "--print",
+    "--output-format",
+    "--stream-partial-output",
+    "--mode",
+    "--plan",
+    "--resume",
+    "--continue",
+    "--model",
+    "--list-models",
+    "--force",
+    "--yolo",
+    "--auto-review",
+    "--sandbox",
+    "--approve-mcps",
+    "--trust",
+    "--workspace",
+    "--add-dir",
+    "--plugin-dir",
+    "--worktree",
+    "--worktree-base",
+    "--skip-worktree-setup"
+  ],
+  "flags_diff_vs_prior": {
+    "removed": ["--cloud"],
+    "added": ["--auto-review", "--add-dir", "--plugin-dir"],
+    "new_subcommand": "worker"
+  },
+  "auth_usable": true,
+  "auth_usable_prior": false,
+  "status_output": "✓ Logged in as <redacted>\n(exit code 0)",
+  "status_output_prior": "Starting login process...\nChecking authentication status...\n✓ Login successful!\nLogged in (unable to fetch user details)\n(exit code 0)",
+  "about_output": "About Cursor CLI\n\nCLI Version         2026.07.08-0c04a8a\nModel               Auto\nSubscription Tier   Ultra\nOS                  darwin (arm64)\nTerminal            unknown\nShell               zsh\nUser Email          <redacted>\n(exit code 0)",
+  "models_output": "Available models (~190 entries, populated catalog; see preflight.md 2026-07-09 section for full verbatim list)\n(exit code 0)",
+  "models_output_prior": "Loading models…\nNo models available for this account.\n(exit code 0)",
+  "grok_id_vs_display_name_off_by_one": "grok-4.5-medium displays as 'Cursor Grok 4.5 Low'; grok-4.5-high displays as 'Cursor Grok 4.5 Medium' -- the id's tier word is one step higher than the catalog's own display name for that same line. Always read the display name from the catalog; do not infer it from the id.",
+  "model_matrix": {
+    "default": "2026-04-13 probe, prior binary, account had zero provisioned models (superseded, kept for history): `agent --list-models --model gpt-5` -> \"Loading models…\" then \"No models available for this account.\" exit 0. No arg-parse error; --model value accepted syntactically.",
+    "grok": "2026-04-13 probe, prior binary (superseded, kept for history): `agent --list-models --model grok-4.5` -> identical output to default case: \"No models available for this account.\" exit 0. No distinct error for this model id vs. the default; cannot confirm/deny grok-4.5 is a valid CLI model id at this layer. Superseded by the 2026-07-09 catalog, which shows no bare `grok-4.5` id at all -- only tiered ids (`grok-4.5-medium`, `grok-4.5-high`, `grok-4.5-xhigh`, and `-fast-` variants); see grok_id_vs_display_name_off_by_one.",
+    "invalid": "2026-04-13 probe, prior binary (superseded, kept for history): `agent --list-models --model definitely-not-a-real-model` -> identical output: \"No models available for this account.\" exit 0. No client-side validation of the --model value was observed at that time.",
+    "auto_live_2026_07_09": {
+      "command": "agent --print --output-format json --force --trust --workspace <throwaway tmpdir> --model auto \"Reply with the single word OK\"",
+      "observed": true,
+      "raw_result": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"duration_ms\":4125,\"duration_api_ms\":4125,\"result\":\"OK\",\"session_id\":\"<redacted>\",\"request_id\":\"<redacted>\",\"usage\":{\"inputTokens\":22039,\"outputTokens\":33,\"cacheReadTokens\":8192,\"cacheWriteTokens\":0}}",
+      "exit_code": 0,
+      "notes": "Resolves to a real underlying model (billed turn ran, non-zero inputTokens/outputTokens/cacheReadTokens); the CLI accepts 'auto' as a first-class --model value and does not require the caller to resolve it to a concrete id."
+    },
+    "grok_4_5_xhigh_live_2026_07_09": {
+      "command": "agent --print --output-format json --force --trust --workspace <throwaway tmpdir> --model grok-4.5-xhigh \"Reply with the single word OK\"",
+      "observed": true,
+      "raw_result": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"duration_ms\":3470,\"duration_api_ms\":3470,\"result\":\"OK\",\"session_id\":\"<redacted>\",\"request_id\":\"<redacted>\",\"usage\":{\"inputTokens\":24069,\"outputTokens\":25,\"cacheReadTokens\":8320,\"cacheWriteTokens\":0}}",
+      "exit_code": 0,
+      "notes": "Held to exactly one smallest-prompt run per spec to limit spend. Valid model id from the 2026-07-09 catalog; behaved identically in shape to the 'auto' case -- clean single-line json result object, no distinct availability-failure signal."
+    },
+    "gpt_5_6_luna_low_live_2026_07_09": {
+      "command": "agent --print --output-format json --force --trust --workspace <throwaway tmpdir> --model gpt-5.6-luna-low \"Reply with the single word OK\"",
+      "observed": true,
+      "raw_result": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"duration_ms\":2045,\"duration_api_ms\":2045,\"result\":\"OK\",\"session_id\":\"<redacted>\",\"request_id\":\"<redacted>\",\"usage\":{\"inputTokens\":32013,\"outputTokens\":5,\"cacheReadTokens\":0,\"cacheWriteTokens\":0}}",
+      "exit_code": 0,
+      "notes": "gpt-5.6 family case (Luna variant, low reasoning effort). Same clean-result shape as auto/grok. This is also the model used for the f-1-3 committed stream-json fixture and the mode/sandbox permission-posture runs below."
+    },
+    "invalid_live_2026_07_09": {
+      "command": "agent --print --output-format json --force --trust --workspace <throwaway tmpdir> --model definitely-not-a-real-model \"Reply with the single word OK\"",
+      "observed": true,
+      "raw_result": "Cannot use this model: definitely-not-a-real-model. Available models: auto, gpt-5.3-codex-low, ... [full ~190-entry catalog printed to stderr/stdout as a comma-separated list; truncated here, see preflight.md for the verbatim capture]",
+      "exit_code": 1,
+      "fails_before_or_after_billed_turn": "before -- this is a plain-text error line (not a json result object), no session_id/request_id/usage block is present, so no billed turn was started. The CLI validates --model against the account's live catalog client-side (or via a cheap pre-flight call) before invoking the model.",
+      "notes": "Distinct and diagnostic: unlike the 2026-04-13 zero-catalog account (which returned an identical 'No models available' message for every model id including invalid ones), the 2026-07-09 populated-catalog account now rejects an invalid id immediately with a specific 'Cannot use this model' message naming the offending id and enumerating every valid id. This directly resolves the model_availability_failures_deterministic_readable acceptance-bar item as diagnostic in the current (auth_usable=true) environment."
+    }
+  },
+  "permission_posture": {
+    "scope_note": "All runs below used --workspace <throwaway tmpdir under $TMPDIR> (never this repo, never --worktree), model gpt-5.6-luna-low, --output-format json. 'observed' entries are from a live --print run in this feature; 'inferred' entries are read from --help text only, to avoid spending on a run whose outcome is already unambiguous from the flag description.",
+    "mode_ask": {
+      "label": "observed",
+      "command": "agent --print --output-format json --mode ask --trust --workspace <tmpdir> --model gpt-5.6-luna-low \"Create a file named ask-mode.txt containing hi\"",
+      "raw_result": "\"Ask mode is active, so I can’t create or modify files. Switch to Agent mode and I can create `ask-mode.txt` containing `hi`.\"",
+      "exit_code": 0,
+      "filesystem_effect": "confirmed no file was written (workspace dir listing unchanged before/after)",
+      "role_fit": "validator: yes -- refuses writes at the model-turn level, billed but safe; the refusal happens inside the (paid) turn, not as a free CLI-level rejection, so it costs a turn but never mutates state. worker: no -- cannot make any edits."
+    },
+    "mode_plan": {
+      "label": "observed",
+      "command": "agent --print --output-format json --mode plan --trust --workspace <tmpdir> --model gpt-5.6-luna-low \"Create a file named plan-mode.txt containing hi\"",
+      "raw_result": "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",...}",
+      "exit_code": 0,
+      "filesystem_effect": "confirmed no file was written (workspace dir listing unchanged before/after)",
+      "notes": "the top-level json 'result' text field was empty in this run despite exit 0/success; plan content (if any) was not surfaced in the json result field for this prompt -- stream-json was not re-probed here to avoid extra spend, so the exact shape of plan output is unconfirmed beyond 'no write occurred'.",
+      "role_fit": "validator: yes, same reasoning as mode_ask -- read-only, no filesystem mutation observed. worker: no."
+    },
+    "default_mode": {
+      "label": "observed",
+      "command": "agent --print --output-format json --trust --workspace <tmpdir> --model gpt-5.6-luna-low \"Create a file named default-mode.txt containing hi\" (no --mode, no --force/--yolo)",
+      "raw_result": "\"Created `default-mode.txt` containing `hi`.\"",
+      "exit_code": 0,
+      "filesystem_effect": "confirmed default-mode.txt was written to the workspace",
+      "notes": "with --trust set and no --mode flag, the default (agent) mode wrote a file in headless --print mode with no interactive approval prompt observed -- i.e. --trust alone was sufficient to permit a write in this run, --force/--yolo was not required for this simple single-tool-call case. Whether a riskier/denylisted command would still prompt (and how a --print/headless run would even surface an interactive prompt) is unconfirmed -- not tested, to avoid spend on an ambiguous/hanging case.",
+      "role_fit": "worker: yes, this is the standard read-write mode. validator: no -- permits writes, must not be used for a validator role."
+    },
+    "force_yolo": {
+      "label": "observed for --force; inferred for --yolo",
+      "force_command": "agent --print --output-format json --force --trust --workspace <tmpdir> --model <various> \"...\" (used across every model_matrix and sandbox run above)",
+      "force_observed": "every --force run in this feature (model_matrix auto/grok/gpt-5.6-luna-low, both sandbox runs) completed writes/shell commands with no interactive prompt and no denial, consistent with --help's 'Force allow commands unless explicitly denied'.",
+      "yolo_inferred": "--help documents --yolo as 'Alias for --force (Run Everything)'; not separately live-tested in this feature to avoid duplicate spend on a flag documented as a literal alias.",
+      "role_fit": "worker: yes -- appropriate for a worker role that needs unattended writes. validator: no -- must never be passed for a validator role, since it removes the CLI's own command-level denial checks on top of whatever --sandbox does."
+    },
+    "sandbox_enabled_vs_disabled": {
+      "label": "observed",
+      "network_test": {
+        "command": "agent --print --output-format json --force --trust --sandbox enabled --workspace <tmpdir> --model gpt-5.6-luna-low \"Run the shell command: curl -s -o /dev/null -w '%{http_code}' https://example.com --max-time 5 . Report the exit code and output.\"",
+        "raw_result": "\"Exit code: `0`  \\nOutput: `200`\"",
+        "notes": "outbound network access succeeded under --sandbox enabled -- no observed network restriction."
+      },
+      "filesystem_outside_workspace_test": {
+        "enabled_command": "agent --print --output-format json --force --trust --sandbox enabled --workspace <tmpdir> --model gpt-5.6-luna-low \"Run the shell command: echo outside > /tmp/kranz-sandbox-test-outside.txt . Report the exit code and any error output verbatim.\"",
+        "enabled_raw_result": "\"Exit code: `0`\\n\\nError output: none.\"",
+        "enabled_filesystem_effect": "confirmed: /tmp/kranz-sandbox-test-outside.txt was actually created outside the --workspace directory, then deleted by this probe as cleanup",
+        "disabled_command": "identical prompt/flags with --sandbox disabled instead of enabled, writing to a second /tmp path",
+        "disabled_raw_result": "\"Exit code: `0`\\n\\nError output: none.\"",
+        "disabled_filesystem_effect": "confirmed: file was likewise created outside the workspace and then deleted by this probe as cleanup",
+        "notes": "no observable difference between --sandbox enabled and --sandbox disabled for either outbound network access or writes to paths outside --workspace in this environment/account/OS combination (macOS/darwin). --sandbox enabled did NOT restrict either action in this test. This is a live, observed result, not an inference -- but it is a negative result (absence of a detected restriction), so it should be treated as 'no sandbox enforcement was observed for these two specific probes' rather than 'sandbox enforcement does not exist'; other restriction categories (e.g. specific denylisted binaries/commands) were not probed."
+      },
+      "role_fit": "IMPORTANT for the kranz no-push/no-publish/no-main-write invariants: --sandbox enabled must NOT be relied upon as the isolation mechanism for either a validator or a worker role, since this probe observed it failing to block both network egress and writes outside the declared --workspace. Isolation for kranz roles should continue to come from process/container-level controls (throwaway workspace directories, restricted credentials/tokens, no git remote access) rather than the CLI's own --sandbox flag."
+    }
+  },
+  "fixture": "docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl",
+  "fixture_capture": {
+    "date": "2026-07-09",
+    "auth_usable_at_capture": true,
+    "command": "agent --print --output-format stream-json --force --trust --workspace <tmpdir> --model gpt-5.6-luna-low \"Create hello.txt containing hi, then run cat hello.txt\"",
+    "workspace": "throwaway git repo under $TMPDIR (mktemp -d + git init), never this repo, never --worktree",
+    "event_types_observed": ["system/init", "user", "tool_call/started", "tool_call/completed", "assistant", "result/success"],
+    "criteria_met": {
+      "assistant_text": "present in the final 'assistant' event (message.content[0].text) and echoed into the terminal 'result' event's result field",
+      "tool_use_event": "three tool_call/started events present: a shellToolCall ('ls'), an editToolCall (write hello.txt), and a readToolCall (read hello.txt back) -- the model satisfied 'run a shell command' via its own verification 'ls' call rather than literally running 'cat', and read the file back via its Read tool instead of a shell 'cat'",
+      "tool_result_event": "three matching tool_call/completed events present, each carrying a 'result' object (shellToolCall.result.success, editToolCall.result.success, readToolCall.result.success)",
+      "terminal_usage_or_cost_event": "final 'result' event, subtype 'success', carries usage: {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens} -- token usage present; no separate dollar-cost field was observed on the wire in this CLI version"
+    },
+    "redaction_applied": "session_id, call_id, toolCallId, request_id, model_call_id, conversationId string values replaced with <redacted>; $HOME path prefix and any email-shaped strings redacted; JSON structure, key names, and event 'type'/'subtype' values left untouched"
+  },
+  "prompt_shape_matrix": {
+    "file_edit_and_shell_command": {
+      "prompt": "Create hello.txt containing hi, then run cat hello.txt",
+      "stream_shape": "system/init -> user -> tool_call(shellToolCall 'ls', started+completed) -> tool_call(editToolCall write hello.txt, started+completed) -> tool_call(readToolCall read hello.txt, started+completed) -> assistant (text summarizing the file contents) -> result/success (usage tokens, no cost field)",
+      "temp_repo_git_diff_after": "git status: hello.txt untracked (new file, not staged/committed by the agent); git diff (tracked files): empty -- the agent wrote the file via its edit tool but did not stage or commit it; README.md (pre-existing tracked file) unchanged",
+      "note": "this is the committed fixture (docs/scoping/cursor-probe-evidence/fixture-stream-json.jsonl)"
+    },
+    "deliberately_failing_command": {
+      "prompt": "Run the shell command 'exit 1' and report what happened. Do not create or edit any files.",
+      "stream_shape": "system/init -> user -> ~78 thinking/delta events (reasoning stream, model gpt-5.6-luna-low is a reasoning model) -> thinking/completed -> tool_call(shellToolCall 'exit 1', started+completed) -> assistant (text: reports exit code 1, no output, no files changed) -> result/success (is_error:false at the top level -- the CLI run itself succeeded even though the shell command it ran failed)",
+      "tool_result_detail": "the shellToolCall's completed event nests the failure under result.failure (not result.success): {command:'exit 1', exitCode:1, signal:'', stdout:'', stderr:'', aborted:false} -- a distinct 'failure' variant of the tool-result payload, sibling to the 'success' variant seen in the write-capable run",
+      "temp_repo_git_diff_after": "no change: git status/diff identical to before this run (only the pre-existing untracked hello.txt from the prior run remains; no new files, no tracked-file changes)",
+      "not_committed": "raw output kept only as local evidence for this record, not committed as a separate fixture per spec (one write-capable fixture is committed; this run's shape is documented here instead)"
+    },
+    "no_op": {
+      "prompt": "Do nothing. Do not use any tools. Just reply with the single word: OK",
+      "stream_shape": "system/init -> user -> assistant (text: 'OK') -> result/success (usage tokens) -- no tool_call events at all",
+      "temp_repo_git_diff_after": "no change: git status/diff identical to before this run",
+      "not_committed": "raw output kept only as local evidence for this record, not committed as a separate fixture per spec"
+    }
+  },
+  "blocker": "2026-07-09 update: the prior blocker (no reachable auth credential, zero models provisioned) is RESOLVED in this worker's environment -- `agent status`/`agent about` now agree on a logged-in, identifiable account (Subscription Tier: Ultra) and `agent models`/`agent --list-models` return a populated ~190-entry catalog. auth_usable is now true (was false). This feature (f-1-1) is scoped to free/read-only re-verification only and intentionally did not run `agent --print`, so the --print output-shape/billed-turn questions below remain unresolved by this pass; they are now unblocked for a later, explicitly-billed feature to pursue since auth is confirmed usable. Original 2026-04-13 blocker text, kept for history: Exact commands attempted and their verbatim (redacted) output: (1) `agent status` -> \"Starting login process...\\nChecking authentication status...\\n✓ Login successful!\\nLogged in (unable to fetch user details)\\n(exit code 0)\"; (2) `agent about` -> \"User Email: Not logged in\" (exit code 0); (3) `agent models` / `agent --list-models` (default, and with `--model grok-4.5`, and with `--model definitely-not-a-real-model`) -> \"Loading models…\\nNo models available for this account.\\n(exit code 0)\" in all three cases. `agent --print` (`--output-format json` and separately `stream-json`, both `--mode ask --trust`) was run twice and both failed free at the auth gate with \"Authentication required\" before any billed turn could start (see preflight.md's `agent --print` auth-gate check).",
+  "recommendation": "direct-parser",
+  "recommendation_note": "2026-07-09 f-1-4 final call: direct-parser (parse --print --output-format json / stream-json), not ACP, not defer. Basis: (1) json/stream-json output is a stable, self-describing, single-shot or event-stream structure (system/init, user, tool_call/started+completed with distinct success/failure result variants, assistant, result/success -- see f-1-3's fixture and prompt_shape_matrix) that a direct parser can consume without needing Cursor's Agent Client Protocol; (2) model selection and invalid-model handling are now clean and diagnostic (see model_matrix.invalid_live_2026_07_09) rather than the ambiguous zero-catalog state seen in the 2026-04-13 probe, removing the main uncertainty that previously justified deferring; (3) --mode ask/--mode plan give a real, observed read-only boundary suitable for a kranz validator role, while default/--force/--yolo give a real, observed read-write boundary suitable for a kranz worker role -- both are visible and controllable purely through CLI flags plus output parsing, with no ACP round-trip required; (4) the one caveat is --sandbox: it was observed live to NOT block outbound network access or writes outside --workspace, so backend_cursor must not treat --sandbox enabled as a security/isolation boundary -- isolation must come from external process/workspace controls (throwaway dirs, scoped credentials, no git remote access), independent of which integration approach (direct-parser vs ACP) is chosen. See implementation-brief.md for the concrete adapter shape.",
+  "acceptance_bar": {
+    "terminal_text_stitching": "RESOLVED (f-1-3, f-1-4): --print --output-format json/stream-json both captured live; json gives a single terminal 'result' event with the full text in .result, stream-json gives the same text split across the final 'assistant' event and the terminal 'result' event. See f-1-3's fixture-json.json / fixture-stream-json.jsonl.",
+    "tool_use_and_results_observable": "RESOLVED (f-1-3): write-capable stream-json fixture captured showing tool_call/started + tool_call/completed pairs with distinct success/failure result variants (shellToolCall, editToolCall, readToolCall). See fixture_capture and prompt_shape_matrix above.",
+    "usage_cost_on_wire_or_priceable": "RESOLVED (f-1-3, f-1-4): every --print json/stream-json run's terminal 'result' event carries a usage object {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}; no separate dollar-cost field is on the wire in this CLI version -- a backend_cursor cost estimate must be computed client-side from usage tokens plus a locally-maintained per-model price table, not read directly off the wire.",
+    "cwd_workspace_worktree_isolation": "PARTIALLY RESOLVED: --workspace was exercised live in every run in f-1-3 and f-1-4 (throwaway tmpdir git repos) and worked as documented. --worktree was intentionally never exercised (spec for both features requires --workspace, never --worktree, to avoid mutating ~/.cursor/worktrees state) -- --worktree behavior remains unobserved by design.",
+    "model_availability_failures_deterministic_readable": "RESOLVED (f-1-4): as of 2026-07-09 with a populated ~190-model catalog, an invalid --model id now fails deterministically and diagnostically -- exit 1, plain-text 'Cannot use this model: <id>. Available models: ...' naming the bad id and enumerating every valid id, before any billed turn starts (no session_id/usage present). See model_matrix.invalid_live_2026_07_09.",
+    "permission_mapping_preserves_invariants": "RESOLVED (f-1-4): see probe-result.json.permission_posture above. Summary -- mode ask/plan: read-only, safe for a validator role (observed, no filesystem mutation). default mode / --force / --yolo: read-write, worker role only (observed for default+--force; --yolo inferred as a documented alias of --force). --sandbox enabled|disabled: observed to make NO difference to outbound network access or writes outside --workspace in this environment -- must NOT be relied on as a kranz isolation boundary; isolation must come from external process/workspace controls instead.",
+    "fixture_offline_parser_test": "RESOLVED (f-1-3): probe-result.json.fixture points at the committed fixture-stream-json.jsonl (and fixture-json.json/fixture-text.txt exist alongside it), captured from a real write-capable run, redacted, suitable for an offline fixture-driven parser test."
+  },
+  "route_decision": {
+    "decision": "direct-parser",
+    "decided_by": "f-1-4 (2026-07-09)",
+    "implementation_brief": "docs/scoping/cursor-probe-evidence/implementation-brief.md"
+  }
+}

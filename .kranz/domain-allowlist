@@ -1,0 +1,23 @@
+# Reviewed waivers for the clean-room domain lint (KRZ-314,
+# docs/domain-lint.md). One finding fingerprint per line — the lint prints
+# each finding's fingerprint next to its file:line. Fingerprints are
+# path-scoped salted hashes: a waiver covers every occurrence of ONE banned
+# term in ONE file, present and future, so re-review on any edit that leans
+# on one. NOTE: describe waived hits WITHOUT quoting them — a quoted term
+# here is itself the leak the lint exists to catch.
+#
+# Reviewed definitional mentions (2026-08-04, initial seed): the positioning
+# ADR and the governance-evidence-layer scoping doc DEFINE the boundary by
+# naming its protected vocabulary classes. Those mentions are the
+# definition, not a leak — every future mention outside these two paragraphs
+# needs its own review.
+#   742056a2 / a47032d3 — ADR IP-boundary paragraph, line 86 (two classes)
+#   562f8ada          — ADR IP-boundary paragraph, line 87
+#   7c909cc7 / ef8b81b6 — scoping doc standing-rule paragraph, line 138 (two)
+#   6f82c8e6          — scoping doc standing-rule paragraph, line 139
+742056a29517dbafb13be664
+a47032d344757dd8701f65b1
+562f8ada61d2cb249d7aa78b
+7c909cc7ef96607dbf73ef07
+ef8b81b6614458748e3eeb0b
+6f82c8e624b2d71a2fceb63e

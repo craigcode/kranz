@@ -1,0 +1,216 @@
+# Cutting a release
+
+Kranz v0.2.0 distributes a CLI through GitHub release binaries and crates.io.
+A Homebrew tap is a follow-on after those two paths are proven on clean hosts,
+not a condition of the first public release. The Tauri shell is build-checked
+but is not currently a supported release artifact. Do not advertise or attach
+desktop bundles until a separate signed, platform-specific bundle/notarization
+pipeline exists.
+
+The historical v0.1.0 GitHub release is a private preview. It is 1,000+ commits
+behind the current source and predates substantial security hardening. Never
+reuse that tag or publish current source as 0.1.0. The first version-aligned
+public release is 0.2.0 unless the owner deliberately chooses a later version.
+
+## 0. Public-distribution prerequisites
+
+Complete `docs/public-readiness.md`. In particular:
+
+- both public audit scripts pass from a fresh clone containing every branch,
+  tag, and GitHub pull-request ref;
+- the old v0.1.0 release remains only in the private archive, or is withdrawn
+  or visibly marked unsupported on an approved in-place route;
+- the repository is public and an anonymous clone has been verified;
+- all four reserved crates.io names are controlled by the expected owners;
+- the `release` GitHub environment requires owner approval;
+- the repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`;
+  and
+- no release tag already exists for the chosen version.
+
+Supply the owner's private vocabulary as one case-sensitive UTF-8 literal per line
+in a file outside the checkout (`KRANZ_PUBLIC_AUDIT_MARKERS_FILE`), or through
+`KRANZ_PUBLIC_AUDIT_MARKERS`. Blank lines and `#` comments are ignored. Set
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` for both candidate audits; missing, empty or
+unreadable input fails. These checks print counts rather than vocabulary or
+matched content. The history check examines every reachable object, including
+deleted blobs, commit messages and identity headers, and refuses shallow history.
+Configure the repository Actions secret `KRANZ_PUBLIC_AUDIT_MARKERS` with the
+same reviewed vocabulary; the release workflow requires it for both audits.
+The fixed built-in marker checks and Gitleaks remain separate checks.
+
+These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
+branches, tags, crates, formulas, or releases.
+
+## 1. Prepare the version pull request
+
+Versions are workspace-inherited. Update:
+
+- `[workspace.package] version` in the root `Cargo.toml`;
+- `kranz-engine`, `kranz-server`, and `kranz-slack` version requirements under
+  root `[workspace.dependencies]`;
+- `apps/dashboard/src-tauri/tauri.conf.json`;
+- `apps/dashboard/src-tauri/Cargo.toml`; and
+- `CHANGELOG.md`, moving the relevant Unreleased entries into a dated version
+  section.
+
+Do not render the Homebrew template yet: GitHub's tagged tarball and its digest
+do not exist until the tag exists.
+
+Run `cargo check --workspace --locked` so the root lockfile records the new
+workspace versions. Refresh the standalone Tauri lockfile with its locked
+check as needed. Then run the exact release check locally without querying
+remote main:
+
+```sh
+KRANZ_RELEASE_SKIP_MAIN_CHECK=1 scripts/check-release-version.sh vX.Y.Z
+```
+
+## 2. Run the release-candidate gates
+
+Run commands directly and preserve their exit codes:
+
+```sh
+cargo fmt --all
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo build --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-tree.sh
+KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-history.sh
+```
+
+For the two audit commands, point `KRANZ_PUBLIC_AUDIT_MARKERS_FILE` at the
+reviewed newline-delimited marker file outside the checkout and set
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1`. Routine public CI runs Gitleaks over full
+history without those private strings; the tag workflow requires the matching
+masked repository secret and fails closed if it is absent.
+
+Run the full dashboard gate from `apps/dashboard` and the locked Tauri check
+from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull
+request must pass every required GitHub check on the exact commit that will be
+tagged.
+
+The manually dispatched live-smoke job additionally needs the repository's
+`ANTHROPIC_API_KEY` secret. Its Linux setup installs and probes bubblewrap and
+enables user namespaces on the disposable hosted runner before spending model
+tokens. Validator containment remains required; local OAuth rehearsal evidence
+does not establish that the remote job's credentials or host setup work.
+
+The final acceptance audit also executes generated code. Build the test-only
+adapter with `cargo build --locked -p kranz-engine --example acceptance_gate`
+and set `KRANZ_ACCEPTANCE_GATE_BIN` to that executable when invoking
+`scripts/acceptance-smoke.sh`. It uses the existing production gate runner with
+`fs` enforcement, a sanitized environment, and mission authority read-denies;
+there is no unsandboxed fallback. The filesystem tier permits networking,
+including the localhost listener required by the HTTP contract. The offline
+harness tests use the debug example by default and require Seatbelt on macOS or working bubblewrap on Linux.
+
+## 3. Rehearse crate packaging honestly
+
+Cargo removes workspace `path` dependencies when publishing and resolves their
+version from the target registry. Therefore a dependent crate cannot complete
+a crates.io dry-run until its sibling version is actually visible there. A
+claim that all four crates can dry-run before *any* publication is false.
+
+Before publication:
+
+```sh
+cargo package --list -p kranz-engine
+cargo package --list -p kranz-server
+cargo package --list -p kranz-slack
+cargo package --list -p kranz
+cargo publish --dry-run -p kranz-engine
+```
+
+Inspect every package list for secrets, runtime state, oversized fixtures, and
+unintended generated files. If the release requires proof of all dependent
+packages before the first irreversible publish, use a disposable local Cargo
+registry; do not mislabel a crates.io-resolution failure as a source defect.
+
+## 4. Merge, tag, and approve GitHub publication
+
+After the version pull request merges and `main` is green, create an annotated
+tag on that exact commit and push it as a separate human action:
+
+```sh
+git switch main
+git pull --ff-only origin main
+scripts/check-release-version.sh vX.Y.Z
+git tag -a vX.Y.Z -m "Kranz vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The tag starts `.github/workflows/release.yml`. It rechecks version/main
+alignment, all reachable history, Rust/dashboard gates, documentation, and
+dependency policy before building. It also verifies upstream license text
+and the committed dependency notices using pinned cargo-about 0.9.2. Each
+platform archive contains the executable, MIT license, Rust/dashboard
+dependency notices, and the build toolchain's Rust library copyright inventory.
+Archives receive GitHub build-provenance attestations. The final
+protected-environment job assembles the archives, SPDX JSON SBOM and
+`SHA256SUMS`; an owner must approve that job before
+GitHub creates the release.
+
+After approval, verify all assets, checksums, attestations, generated notes,
+and `kranz --version` on clean Linux, macOS, and Windows hosts. Also inspect
+the extracted notices, run `kranz licenses` outside a source checkout, and
+check `/THIRD_PARTY_NOTICES.txt` from the served embedded dashboard. A failed matrix
+or missing evidence means no release—delete the draft/tag only through the
+documented operator recovery process.
+
+## 5. Publish crates bottom-up
+
+Publishing is irreversible. Run each dry-run immediately before its publish,
+then wait until crates.io resolves that exact version before continuing:
+
+```sh
+cargo publish --dry-run -p kranz-engine
+cargo publish -p kranz-engine
+
+cargo publish --dry-run -p kranz-server
+cargo publish -p kranz-server
+
+cargo publish --dry-run -p kranz-slack
+cargo publish -p kranz-slack
+
+cargo publish --dry-run -p kranz
+cargo publish -p kranz
+```
+
+`kranz-server` and `kranz-slack` are independent once `kranz-engine` is live;
+the CLI must be last because it depends on all three. Confirm ownership,
+package contents, repository URL, license, README rendering, and installability
+on crates.io after every step.
+
+## 6. Optional follow-on: render and publish the Homebrew formula
+
+Do this only after the v0.2.0 Cargo and GitHub installations are proven. A
+Homebrew failure does not invalidate those published artifacts and does not
+block closing the first public release.
+
+Download GitHub's tagged source tarball, compute its SHA-256 digest, and render
+`packaging/homebrew/kranz.rb.in` into the `craigcode/homebrew-kranz` tap by
+replacing `VERSION` and `SHA256`. Review the resulting diff; the committed file
+in this repository remains a template, not an installable all-zero formula.
+
+Test the rendered formula before pushing the tap:
+
+```sh
+brew install --build-from-source ./Formula/kranz.rb
+brew test kranz
+kranz --version
+```
+
+Finally verify a clean `brew tap craigcode/kranz && brew install kranz` and a
+clean `cargo install kranz --locked` without a Kranz source checkout.
+
+## 7. Close the release
+
+- Update the changelog comparison links if adopted.
+- Record clean-install evidence and artifact digests in the release notes.
+- Verify GitHub still reports every required security and branch rule.
+- Mark the M4 operator-release ticket done after GitHub, crates.io, and
+  clean-host smoke tests all agree on the same version. Track Homebrew as a
+  separate post-v0.2.0 distribution follow-on.

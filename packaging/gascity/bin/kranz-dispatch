@@ -1,0 +1,533 @@
+#!/bin/sh
+# kranz-dispatch — Gas City → kranz bridge, dispatch side.
+#
+# Drains READY beads carrying the kranz label by atomically CLAIMING each
+# (first-wins). With KRANZ_NATIVE_QUEUE=1 it asks `kranz exec --enqueue` to
+# create, plan, approve, and enqueue a mission in the selected rig; the
+# supervised kranz-city-worker later runs it through `kranz work --once`.
+# No feature execution happens in this order. Without the flag, the
+# spike-era KRANZ_SPOOL path remains available as an immediate rollback.
+#
+# Scrutiny floor (docs/gascity.md lesson 3): a rig whose .kranz/config.json
+# disables the scrutiny validator is REFUSED for autonomous dispatch — the
+# bead stays open with an explanatory comment — unless
+# KRANZ_ALLOW_UNVALIDATED=1 explicitly accepts letter-over-spirit risk.
+#
+# Rig routing: KRANZ_RIG_DIR wins when set (single-rig city); otherwise the
+# bead id's prefix is resolved via `gc rig list --json`. A resolved rig must
+# be a git checkout.
+#
+# Atomic claim (shipped): after the rig-routing and scrutiny-floor refusals
+# below — so a refused bead is never claimed — dispatch issues
+# `gc bd update "$ID" --claim` BEFORE either spool file is written. Per
+# docs/scoping/beads-bridge-dialect.md §3 (verified against installed bd
+# 1.0.5), `--claim` atomically sets assignee and status to in_progress in
+# one call, first-wins, and is idempotent if this dispatcher already holds
+# the claim. If the claim fails — lost the race to another dispatcher, or
+# any other bd error — the bead is skipped SILENTLY: no comment, no spool
+# files, no orphan .md/.json entry.
+#
+# Claim rollback on abandonment (shipped): once the claim above succeeds,
+# every path in the loop body that gives up on the bead BEFORE both spool
+# files are written removes any spool file already written for that
+# stamp/id (`rm -f` on both the .md and .json, whichever exist) and releases
+# that claim — `gc bd update "$ID" --status open --assignee ""` (dialect doc
+# §2's verified `-a/--assignee`; an empty string clears it, confirmed by an
+# executed probe against upstream `bd` directly — the `gc bd` pass-through
+# used here is unverified, per dialect doc §2) — then continues, so the bead
+# is returned to open and unassigned with no partial spool entry left behind.
+# This covers a `gc bd show` failure and a failure writing either the .md or
+# .json spool file. The lost-race path (the `--claim` call itself failing) is
+# unaffected and stays silent: no comment, no spool files, no rollback needed
+# because no claim was ever taken.
+#
+# Lease (shipped client-side, f-3-1): bd 1.0.5 itself exposes no TTL,
+# heartbeat, or expiry mechanism — no --lease/--lease-ttl/--heartbeat flag,
+# and no lease_expires_at/heartbeat_at field in `bd show --json`, confirmed
+# by an executed sandbox probe (docs/scoping/beads-bridge-dialect.md §3) —
+# an upstream lease mechanism (1.1.0+) is NOT YET IMPLEMENTED there. The
+# bridge therefore keeps its own lease: kranz-run-bead renews
+# ${KRANZ_LEASE_DIR:-$GC_CITY/.gc/kranz-leases}/<id>.lease — `<pid> <unix-ts>
+# <start-token>`, the token being the claimant's process start time
+# (`ps -o lstart=`, equality-compared) — while a mission runs, removed on
+# terminal exit. The reclaim sweep (see reclaim_sweep() below) releases
+# claimed beads liveness-first with the kranz queue's three-way verdict:
+# a claim whose pid is ALIVE and — when the lease carries a token —
+# provably the claimant's (a recycled pid fails the start-time compare; an
+# unverifiable one stands conservatively; a tokenless legacy lease's live
+# pid stands at any age) is never stolen. A pid proven DEAD (the signal
+# probe failed AND ps shows no such process — never EPERM, which is the
+# Unknown class) releases claim, lease, and any stale spool pair together.
+# Everything the probe cannot settle — another uid's process, a recycled
+# or unverifiable token, a missing lease — falls to the KRANZ_CLAIM_TTL
+# backstop (default 120s — expiry strictly as backstop, the operator's
+# accepted design D-BW-2). Native queue work is the exception: its active,
+# structured enqueue-source receipt plus a queue claim or post-approval
+# mission state is durable ownership independent of process age. Every
+# release removes the bead's spool pair or orphaned native binding with the
+# claim, so a released bead's re-dispatch creates exactly one replacement —
+# never duplicating in-flight work for one bead
+# (bridge-reclaim-sweep-defects).
+#
+# Reclaim sweep placement (ms-3-fix-5-1): reclaim_sweep runs at the START
+# of every invocation, before the ready-bead drain, so a bare
+# `kranz-dispatch` — the shape packaging/gascity/orders/kranz-dispatch.toml
+# actually runs — performs liveness-first dead-claim recovery with no
+# `--reclaim` argument required. The sweep is scoped HARD to beads carrying
+# $LABEL: its candidate query filters server-side via `gc bd list --label
+# "$LABEL"` (dialect doc §2, VERIFIED) and re-checks each candidate's
+# `.labels` array client-side before ever releasing it, so a foreign bead
+# (no $LABEL) is left untouched even if the server-side filter is dropped
+# by the `gc bd` pass-through. The sweep is non-fatal: every bd/jq call
+# inside it is guarded with `|| ...` fallbacks, so a sweep failure falls
+# through to the dispatch drain below rather than aborting it. `--reclaim`
+# remains a sweep-only mode: it runs reclaim_sweep and exits without
+# draining.
+#
+# Residual exposure (as shipped): the rollback above only covers failures
+# THIS process can detect and act on, and the reclaim sweep only runs when
+# invoked — a dispatch process that dies after claiming but before handing
+# work off leaves a lease-less claim the TTL backstop (not any heartbeat)
+# must age out. On the rollback spool path, the interval through the
+# worker's first heartbeat remains TTL-only. On the native path, kranz
+# writes the structured source receipt before exposing the queue entry; a
+# receipt with an approved mission but no queue claim is recognized as an
+# interrupted enqueue and reclaimed after TTL measured from that receipt's
+# own creation time (not the possibly much older City claim). The worst case
+# is therefore one reclaim cycle's delay, never a duplicate or permanently
+# stranded bead.
+#
+# Outbound provenance (shipped, D-BW-2 brief 2): after a successful claim
+# the dispatch records `external_ref = kranz-<slug>` on the bead — the
+# slug derived from the bead TITLE (lowercase, non-alnum runs collapsed to
+# dashes, 60-char cap; a title with no alnum falls back to the bead id),
+# which for a bead created from a kranz ticket recovers the ticket's own
+# slug. A bead already carrying an external_ref (an imported ticket's slug
+# or a foreign system's ref) is NEVER clobbered, and a failed write is
+# logged but never fails the dispatch — provenance is a map, not a gate.
+# The return path (kranz-run-bead comments the mission id and terminal
+# outcome back, deduped) completes the two-way navigation.
+#
+# Env:
+#   KRANZ_RIG_DIR            explicit rig checkout (optional)
+#   KRANZ_LABEL              bead label to drain (default "kranz")
+#   KRANZ_MAX_CYCLES         fix-cycle bound per mission (default 1)
+#   KRANZ_NATIVE_QUEUE       =1 creates approved native queue entries
+#   KRANZ_SPOOL              rollback spool (default $GC_CITY/.gc/kranz-spool)
+#   KRANZ_LEASE_DIR          lease dir (default $GC_CITY/.gc/kranz-leases)
+#   KRANZ_CLAIM_TTL          lease-less claim TTL in seconds (default 120)
+#   KRANZ_ALLOW_UNVALIDATED  =1 permits validators-off rigs (NOT recommended)
+#
+# Bidirectional bead status <-> kranz-side state map (all four bead
+# statuses, both directions):
+#   open         <-> Queued           (ready for dispatch / re-readied)
+#   in_progress  <-> Running          (set below by the atomic claim, before enqueue)
+#   blocked      <-> Blocked-report   (set by kranz-run-bead, exit 2)
+#   closed       <-> Done             (set by kranz-run-bead, exit 0)
+#
+# Exit-code contract (kranz-run-bead owns the exit-code translation; this
+# script only ever moves a bead from open to in_progress, via the atomic
+# claim, before enqueueing):
+#   0            -> closed  (mission COMPLETE)
+#   2            -> blocked (mission BLOCKED, escalate to a human)
+#   exit 3       -> open    (refused as UNDERSPECIFIED; refine and re-ready)
+#   exit 1/other -> open    (mission FAILED; reopen for re-readying)
+#
+# open is many-to-one on the kranz side: both exit 3 (refused,
+# underspecified brief) and exit 1/other (mission failed outright) return
+# the bead to open, because neither outcome leaves partial progress worth
+# preserving as "blocked" — the bead just needs to be re-readied, either
+# after a human refines it (exit 3) or as-is for a retry (exit 1/other).
+# Only exit 2 (blocked) preserves an in-flight state for escalation.
+set -u
+
+LABEL=${KRANZ_LABEL:-kranz}
+MAX_CYCLES=${KRANZ_MAX_CYCLES:-1}
+CITY=${GC_CITY:?GC_CITY is required (run via a gc order)}
+NATIVE_QUEUE=${KRANZ_NATIVE_QUEUE:-0}
+SPOOL=${KRANZ_SPOOL:-$CITY/.gc/kranz-spool}
+if [ "$NATIVE_QUEUE" != "1" ]; then
+    mkdir -p "$SPOOL"
+fi
+
+resolve_rig() {
+    # $1 = bead id. Echoes the rig checkout path, or nothing when unroutable.
+    if [ -n "${KRANZ_RIG_DIR:-}" ]; then
+        echo "$KRANZ_RIG_DIR"
+        return
+    fi
+    PREFIX=${1%%-*}
+    gc rig list --json 2>/dev/null |
+        jq -r --arg p "$PREFIX" '.rigs[] | select(.prefix == $p) | .path' | head -1
+}
+
+# --- Reclaim sweep (f-3-1, wired into the fast path by ms-3-fix-5-1): -----
+# sweep beads carrying $LABEL, release dead claims. Liveness-first with the
+# kranz queue's three-way verdict (Alive/Dead/Unknown — anything uncertain
+# is never read as Dead): Alive-by-token stands at any age; Dead releases
+# claim, lease, and stale spool pair together; Unknown (EPERM, recycled or
+# unverifiable token, missing lease) hits only the TTL backstop on the
+# bead's updated_at (KRANZ_CLAIM_TTL, default 120s). Non-fatal throughout:
+# every bd/jq call is guarded with `|| ...` so a failure here never aborts
+# the dispatch drain that runs after it.
+
+# The claimant-identity token for a live pid: its process start time,
+# normalized for plain string equality (tr collapses ps's field padding,
+# the seds drop ps's leading/trailing whitespace — `read` trims both from
+# the recorded field, so the probe must match). Mirrors the kranz queue's
+# process_identity_token compare: same pid + same start time is the same
+# process; same pid + a different start time is a recycled pid wearing the
+# claimant's number.
+lease_pid_token() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+valid_mission_id() {
+    printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
+}
+
+# Resolve the durable, structured producer binding that `kranz exec
+# --enqueue-source gascity` writes BEFORE exposing the queue entry. Prompt
+# text is never identity: a bead title/description may contain any marker.
+native_binding_mission() {
+    # $1 = bead id. Echoes the bound mission id, or returns 1 when absent.
+    BINDING_RIG=$(resolve_rig "$1")
+    [ -n "$BINDING_RIG" ] || return 1
+    for SOURCE in "$BINDING_RIG"/.kranz/missions/*/enqueue-source.json; do
+        [ -e "$SOURCE" ] || continue
+        SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
+        PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
+        BOUND_ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || BOUND_ID=""
+        BOUND_MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || BOUND_MID=""
+        DIR_MID=$(basename "$(dirname "$SOURCE")")
+        [ "$SCHEMA" = "1" ] || continue
+        [ "$PRODUCER" = "gascity" ] || continue
+        valid_mission_id "$BOUND_MID" || continue
+        [ -n "$BOUND_MID" ] && [ "$BOUND_MID" = "$DIR_MID" ] || continue
+        if [ "$BOUND_ID" = "$1" ]; then
+            printf '%s\n' "$BOUND_MID"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True when a live queue file (unclaimed or claimed by any legitimate kranz
+# drainer) still names this mission. The queue entry content is authoritative;
+# file names are only an ordering/index format and are not parsed for identity.
+native_queue_contains_mission() {
+    # $1 = rig directory, $2 = mission id.
+    for ENTRY in "$1"/.kranz/queue/*.json "$1"/.kranz/queue/*.json.claimed.*; do
+        [ -e "$ENTRY" ] || continue
+        ENTRY_MID=$(jq -r '.missionId // empty' < "$ENTRY" 2>/dev/null) || ENTRY_MID=""
+        [ "$ENTRY_MID" = "$2" ] && return 0
+    done
+    return 1
+}
+
+# The producer receipt is written before queue visibility. Normally it is
+# paired with an unclaimed/claimed queue file, followed by a non-approved or
+# terminal state. An approved mission with no queue file is the one crash
+# window between those two writes. A fresh receipt may still belong to the
+# enqueue process in that tiny interval, so it stands until its own age reaches
+# TTL; only then does it fall through to normal claim recovery.
+native_binding_is_durable() {
+    # $1 = bead id.
+    DURABLE_MID=$(native_binding_mission "$1") || return 1
+    DURABLE_RIG=$(resolve_rig "$1")
+    [ -n "$DURABLE_RIG" ] || return 1
+    DURABLE_STATUS=$(jq -r '.mission.status // empty' < "$DURABLE_RIG/.kranz/missions/$DURABLE_MID/state.json" 2>/dev/null) || DURABLE_STATUS=""
+    if [ "$DURABLE_STATUS" = "approved" ]; then
+        native_queue_contains_mission "$DURABLE_RIG" "$DURABLE_MID" && return 0
+        SOURCE_CREATED=$(jq -r '.createdUnixSecs // empty' < "$DURABLE_RIG/.kranz/missions/$DURABLE_MID/enqueue-source.json" 2>/dev/null) || SOURCE_CREATED=""
+        case $SOURCE_CREATED in
+            "" | *[!0-9]*) return 0 ;; # legacy/unreadable: preserve conservatively
+        esac
+        SOURCE_NOW=$(date +%s)
+        if [ "$SOURCE_CREATED" -gt "$SOURCE_NOW" ] ||
+            [ $((SOURCE_NOW - SOURCE_CREATED)) -lt "${KRANZ_CLAIM_TTL:-120}" ]; then
+            return 0
+        fi
+        return 1
+    fi
+    # Running/paused/validating and terminal missions can legitimately have
+    # no queue file. An unreadable state is preserved conservatively rather
+    # than risking a duplicate mission; the City return path or an operator
+    # can resolve the damaged record.
+    return 0
+}
+
+# Drop a bead's spool entry (.md/.json/.inflight, any stamp) alongside a
+# claim release. A released bead returns to open and WILL be re-dispatched
+# by a later drain; with the stale entry still present that re-dispatch
+# spools a SECOND brief for one bead and the city-worker runs two missions
+# (the verified claimed-and-spooled defect). rm -f on a non-matching
+# glob's literal is a no-op, so an absent file costs nothing.
+remove_spool_pair() {
+    if [ "$NATIVE_QUEUE" = "1" ]; then
+        MID=$(native_binding_mission "$1") || return 0
+        RIG_DIR=$(resolve_rig "$1")
+        ( cd "$RIG_DIR" && kranz abandon "$MID" --reason "Gas City reclaimed bead $1 before execution" >/dev/null 2>&1 ) || true
+        QUEUE_REMOVED=0
+        ( cd "$RIG_DIR" && kranz queue --remove "$MID" >/dev/null 2>&1 ) && QUEUE_REMOVED=1
+        if [ "$QUEUE_REMOVED" -eq 1 ] || ! native_queue_contains_mission "$RIG_DIR" "$MID"; then
+            SOURCE="$RIG_DIR/.kranz/missions/$MID/enqueue-source.json"
+            [ -e "$SOURCE" ] && mv -f "$SOURCE" "$RIG_DIR/.kranz/missions/$MID/enqueue-source.cancelled.json"
+        else
+            echo "kranz-dispatch: warning: could not remove reclaimed mission $MID from $RIG_DIR queue" >&2
+        fi
+        return 0
+    fi
+    rm -f "$SPOOL"/*-"$1".md "$SPOOL"/*-"$1".json "$SPOOL"/*-"$1".inflight
+}
+
+reclaim_sweep() {
+    LEASE_DIR=${KRANZ_LEASE_DIR:-$CITY/.gc/kranz-leases}
+    TTL=${KRANZ_CLAIM_TTL:-120}
+    NOW=$(date +%s)
+    # Candidate query (dialect doc §2, VERIFIED on `bd list`): explicit
+    # in_progress status filter and an unlimited row limit so the sweep
+    # cannot silently truncate at bd list's default 50-row page, plus the
+    # server-side label filter. The jq `select(.status == ...)` and the
+    # `.labels` membership check are kept as belt-and-braces: the `gc bd`
+    # pass-through's fidelity to these upstream flags is unverified (dialect
+    # doc §2 scope caveat), so the HARD INVARIANT that a foreign (non-
+    # $LABEL) bead is never released is enforced client-side here too, not
+    # only trusted to the server-side --label filter.
+    CLAIMED=$(gc bd list --status in_progress --limit 0 --label "$LABEL" --json 2>/dev/null |
+        jq -r --arg label "$LABEL" \
+            '.[] | select(.status == "in_progress") | select((.labels // []) | index($label) != null) | .id') || CLAIMED=""
+    for CID in $CLAIMED; do
+        # A native queue/source binding is durable ownership, not an idle
+        # process lease. It may wait behind unrelated repo work for longer
+        # than KRANZ_CLAIM_TTL, and any valid kranz dispatcher may consume its
+        # queue entry before this adapter returns the terminal state. Preserve
+        # that ownership, but not an approved source record stranded before
+        # its queue write; native_binding_is_durable distinguishes the two.
+        if [ "$NATIVE_QUEUE" = "1" ] && native_binding_is_durable "$CID"; then
+            continue
+        fi
+        LEASE_FILE="$LEASE_DIR/$CID.lease"
+        PID=""
+        TS=""
+        TOKEN=""
+        if [ -f "$LEASE_FILE" ]; then
+            read -r PID TS TOKEN < "$LEASE_FILE" || true
+            if [ -z "$PID" ]; then
+                # Lease file present but empty/unparseable: retry a small
+                # bounded number of times with a short pause. A genuine
+                # mid-rename window is sub-millisecond, so a real live
+                # holder's lease parses on retry and takes the live-pid
+                # branch below. If it still doesn't parse, this is a wedged
+                # empty file (not a live holder) — fall through to the
+                # lease-less TTL backstop rather than skipping forever, so
+                # a genuinely dead/stuck claim can still be recovered; a
+                # truly live holder stays safe because its bd updated_at
+                # keeps getting refreshed.
+                ATTEMPT=0
+                while [ -z "$PID" ] && [ "$ATTEMPT" -lt 2 ]; do
+                    sleep 1
+                    read -r PID TS TOKEN < "$LEASE_FILE" || true
+                    ATTEMPT=$((ATTEMPT + 1))
+                done
+            fi
+        fi
+        if [ -n "$PID" ]; then
+            if kill -0 "$PID" 2>/dev/null; then
+                if [ -z "$TOKEN" ]; then
+                    continue # legacy tokenless lease: a live pid stands at any age
+                fi
+                CURRENT_START=$(lease_pid_token "$PID")
+                if [ -z "$CURRENT_START" ]; then
+                    # Alive but identity unverifiable right now: stand
+                    # conservatively — a false stand delays recovery, a
+                    # false release runs a mission twice (the queue's rule).
+                    continue
+                fi
+                if [ "$CURRENT_START" = "$TOKEN" ]; then
+                    continue # alive and provably the claimant: stands at any age
+                fi
+                # Token mismatch: the pid was RECYCLED after the claimant
+                # died — alive, but not ours. Not proof the claim is
+                # abandonware on its own (a wrong-pid heartbeat reads the
+                # same), so the TTL backstop below decides, as the queue's
+                # pid-reuse rule does.
+            else
+                # kill -0 failed: distinguish ESRCH (truly gone) from EPERM
+                # (a process exists under another uid — never OUR same-user
+                # claimant, but not proof of death either). `ps -o pid=`
+                # prints a row iff the process EXISTS, across owners.
+                if [ -z "$(ps -o pid= -p "$PID" 2>/dev/null)" ]; then
+                    # DEAD with positive proof: release claim, lease, and
+                    # stale spool entry together (see remove_spool_pair) —
+                    # but ONLY on a confirmed release. A transient City
+                    # failure must not destroy the only copy of the queued
+                    # brief while the bead stays claimed (12th-pass review).
+                    if gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1; then
+                        rm -f "$LEASE_FILE"
+                        remove_spool_pair "$CID"
+                        echo "kranz-dispatch: reclaim sweep released dead claim $CID (pid $PID gone)"
+                    else
+                        echo "kranz-dispatch: reclaim sweep could not release $CID (bd update failed); claim, lease, and spool entry LEFT INTACT" >&2
+                    fi
+                    continue
+                fi
+                # EPERM-class Unknown: a process exists but is not ours to
+                # signal. Never read as dead — the TTL backstop decides.
+            fi
+        fi
+        # TTL backstop — the lease-less claim, the wedged/unparseable lease,
+        # the EPERM-unknown, and the recycled-token claim all land here.
+        # bd renders updated_at UTC ISO-8601 with a trailing Z — strip the
+        # Z, then the fractional seconds (SHORTEST suffix match: %% would
+        # eat everything from the FIRST dot onward).
+        UPDATED=$(gc bd show "$CID" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | .updated_at // .updatedAt // 0' | head -1)
+        UPDATED=${UPDATED%Z}
+        UPDATED=${UPDATED%.*}
+        # bd's updated_at is UTC; parse it AS UTC on both platforms (date -j
+        # reads local time otherwise, and so does GNU date -d — either one
+        # skews the comparison by the host's UTC offset if left unwrapped).
+        UPDATED=$(TZ=UTC0 date -j -f '%Y-%m-%dT%H:%M:%S' "$UPDATED" +%s 2>/dev/null || TZ=UTC0 date -d "$UPDATED" +%s 2>/dev/null || echo 0)
+        if [ "$UPDATED" -gt 0 ] && [ $((NOW - UPDATED)) -ge "$TTL" ]; then
+            # Release the claim AND the stale spool entry (and any wedged
+            # lease file) as one unit — only when the release is CONFIRMED;
+            # a failed bd update leaves everything intact (the bead re-enters
+            # open exactly once reclaimable, never double-spooled, and never
+            # brief-less).
+            if gc bd update "$CID" --status open --assignee "" >/dev/null 2>&1; then
+                rm -f "$LEASE_FILE"
+                remove_spool_pair "$CID"
+                echo "kranz-dispatch: reclaim sweep released stale claim $CID (idle $((NOW - UPDATED))s > ${TTL}s)"
+            else
+                echo "kranz-dispatch: reclaim sweep could not release $CID (bd update failed); claim, lease, and spool entry LEFT INTACT" >&2
+            fi
+        fi
+    done
+}
+
+reclaim_sweep
+
+if [ "${1:-}" = "--reclaim" ]; then
+    exit 0
+fi
+
+READY=$(gc bd ready --label "$LABEL" --json 2>/dev/null | jq -r '.[].id') || READY=""
+
+[ -n "$READY" ] || { echo "kranz-dispatch: no ready beads labeled '$LABEL'"; exit 0; }
+
+for ID in $READY; do
+    RIG_DIR=$(resolve_rig "$ID")
+    if [ -z "$RIG_DIR" ] || [ ! -d "$RIG_DIR/.git" ]; then
+        gc bd comment "$ID" "kranz-dispatch: no routable rig for prefix '${ID%%-*}' (set KRANZ_RIG_DIR or register the rig); bead left open" >/dev/null 2>&1
+        continue
+    fi
+    if [ "${KRANZ_ALLOW_UNVALIDATED:-0}" != "1" ] &&
+        jq -e '.skipScrutiny == true' "$RIG_DIR/.kranz/config.json" >/dev/null 2>&1; then
+        gc bd comment "$ID" "kranz-dispatch: REFUSED — rig disables the scrutiny validator and autonomous missions with no adversarial reader satisfy the letter over the spirit (docs/gascity.md lesson 3). Re-enable scrutiny or set KRANZ_ALLOW_UNVALIDATED=1 deliberately." >/dev/null 2>&1
+        continue
+    fi
+
+    # Atomic, first-wins claim BEFORE any spool write. A failed claim means
+    # another dispatcher won the race (or some other bd error): skip
+    # silently, no comment, no spool files.
+    gc bd update "$ID" --claim >/dev/null 2>&1 || continue
+
+    # Release the claim on any abandonment from here on, so the bead is
+    # returned to open/unassigned rather than left claimed with no spool
+    # entry (see the "Claim rollback on abandonment" header note above).
+    release_claim() {
+        gc bd update "$ID" --status open --assignee "" >/dev/null 2>&1
+    }
+
+    BEAD=$(gc bd show "$ID" --json) || { release_claim; continue; }
+    TITLE=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .title // empty')
+    DESC=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
+    ACCEPT=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | (.acceptance_criteria // "") | if type == "array" then map(if type == "string" then . else tostring end) | join("\n") else . end')
+
+    # Outbound provenance (D-BW-2 brief 2): name the kranz-side work item
+    # on the bead, once. Never clobbers an existing external_ref — an
+    # imported ticket's own slug or a foreign system's ref wins — and a
+    # failed write never fails the dispatch (a map, not a gate).
+    EXISTING_REF=$(printf '%s' "$BEAD" | jq -r '(if type == "array" then .[0] else . end) | .external_ref // empty')
+    if [ -z "$EXISTING_REF" ]; then
+        SLUG=$(printf '%s' "$TITLE" | tr 'A-Z' 'a-z' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-60 | sed -e 's/-$//')
+        [ -n "$SLUG" ] || SLUG="bead-$ID"
+        gc bd update "$ID" --external-ref "kranz-$SLUG" >/dev/null 2>&1 ||
+            echo "kranz-dispatch: external_ref write failed for $ID (provenance only; dispatch continues)" >&2
+    fi
+
+    STAMP=$(date +%s)
+    BRIEF_DIR=""
+    if [ "$NATIVE_QUEUE" = "1" ]; then
+        BRIEF_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kranz-gascity-brief.XXXXXX") || {
+            release_claim
+            continue
+        }
+        MFILE="$BRIEF_DIR/mission.md"
+    else
+        MFILE="$SPOOL/$STAMP-$ID.md"
+    fi
+    # Rollback form matters: `cmd >file || rollback` — dash/macOS /bin/sh
+    # evaluates `if ! { compound; } >file` such that a REDIRECT failure
+    # (read-only target, full disk) never runs the then-branch, leaving the
+    # rollback as dead code exactly when it is needed (round-trip case
+    # envfail-claim-released).
+    {
+        printf '## Goal\n%s\n\n' "$TITLE"
+        printf '## Context\nGas City bead: %s\nDispatched from Gas City bead %s (label %s). Work fully autonomously.\n\n%s\n\n' "$ID" "$ID" "$LABEL" "$DESC"
+        printf '## Scoping answers\nNo human is available during this run. Prefer the smallest faithful interpretation; if materially ambiguous, block rather than guess. Validators stay enabled.\n\n'
+        printf '## Acceptance hints\n%s\n' "${ACCEPT:-The goal above is demonstrably met.}"
+    } > "$MFILE" || {
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"
+        [ -n "$BRIEF_DIR" ] && rmdir "$BRIEF_DIR" 2>/dev/null
+        release_claim
+        continue
+    }
+
+    if [ "$NATIVE_QUEUE" = "1" ]; then
+        LINE=$( cd "$RIG_DIR" && kranz exec -f "$MFILE" --enqueue \
+            --enqueue-source gascity --enqueue-external-ref "$ID" \
+            --max-cycles "$MAX_CYCLES" )
+        CODE=$?
+        rm -f "$MFILE"
+        rmdir "$BRIEF_DIR" 2>/dev/null || true
+        MISSION_ID=$(printf '%s' "$LINE" | grep -oE 'm-[0-9a-f]{6}' | head -1 || true)
+        if [ "$CODE" -eq 0 ] && [ -z "$MISSION_ID" ]; then
+            MISSION_ID=$(native_binding_mission "$ID" 2>/dev/null || true)
+        fi
+        case $CODE in
+            0)
+                if [ -z "$MISSION_ID" ]; then
+                    release_claim
+                    gc bd comment "$ID" "kranz-dispatch: native enqueue returned no mission id; bead reopened. $LINE" >/dev/null 2>&1
+                    continue
+                fi
+                gc bd comment "$ID" "kranz mission $MISSION_ID approved and queued in $RIG_DIR" >/dev/null 2>&1 || true
+                echo "kranz-dispatch: bead $ID -> native queue mission $MISSION_ID in $RIG_DIR"
+                ;;
+            3)
+                release_claim
+                gc bd comment "$ID" "kranz refused native enqueue: UNDERSPECIFIED — refine the brief, then re-ready. $LINE" >/dev/null 2>&1
+                ;;
+            *)
+                release_claim
+                gc bd comment "$ID" "kranz native enqueue FAILED (exit $CODE) — $LINE" >/dev/null 2>&1
+                ;;
+        esac
+        continue
+    fi
+
+    # The spool record is DATA, not shell: JSON written by jq (values are
+    # escaped by construction — a metacharacter-bearing rig path or bead id
+    # can never become code), parsed by the worker with jq, never sourced
+    # (12th-pass review: sourcing the spool was arbitrary code execution in
+    # the unsanitized city worker).
+    jq -n --arg id "$ID" --arg city "$CITY" --arg rig "$RIG_DIR" --arg cycles "$MAX_CYCLES" \
+        '{id:$id, city:$city, rigDir:$rig, maxCycles:$cycles}' > "$SPOOL/$STAMP-$ID.json" || {
+        rm -f "$SPOOL/$STAMP-$ID.md" "$SPOOL/$STAMP-$ID.json"
+        release_claim
+        continue
+    }
+
+    echo "kranz-dispatch: bead $ID spooled for $RIG_DIR"
+done

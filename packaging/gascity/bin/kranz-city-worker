@@ -1,0 +1,395 @@
+#!/bin/sh
+# kranz-city-worker — Gas City → kranz bridge, execution side.
+#
+# Long-lived, SUPERVISED drain loop. With KRANZ_NATIVE_QUEUE=1 it scans the
+# registered rigs, drains one approved mission through `kranz work --once`,
+# and passes the terminal state through kranz-run-bead's City translator.
+# Durable enqueue-source receipts beside missions let this adapter return a
+# terminal result even when another legitimate `kranz work` dispatcher drains
+# the shared queue. Return-only receipts retry transient City writes without
+# replaying work. The private spool remains the flag-off rollback.
+# Strictly serial: one worker per city keeps the spend faucet single-valved.
+#
+# Intended to run under the City supervisor as a named non-LLM session (see
+# packaging/gascity/agents/kranz-worker/) or any process manager. --once
+# drains at most one entry and exits (tests, cron).
+#
+# Spool records are DATA, not shell (12th-pass review): kranz-dispatch writes
+# each record as jq-escaped JSON and this worker parses it with jq — the
+# spike-era `. "$ENV_FILE"` sourcing made a metacharacter-bearing rig path
+# arbitrary code execution in this unsanitized process.
+#
+# Idempotency (12th-pass review): an .inflight marker is written BEFORE the
+# mission starts, and the startup sweep below reconciles any marker left by
+# a crash — a worker that dies after kranz-run-bead closed/blocked the bead
+# but before the entry sweep must not replay the whole mission on restart.
+# drain_one additionally verifies the bead is still in_progress immediately
+# before executing: a released (reclaimed) or already-driven bead is not
+# ours to run, and its stale entry is dropped instead.
+#
+# Terminal confirmation (13th-pass review): the mission record is deleted
+# ONLY after the bead's terminal state is confirmed live. run-bead's own bd
+# writes are best-effort (`>/dev/null`), so a transient City failure can
+# leave the bead in_progress after a completed mission. Deleting the entry
+# there destroys the recovery trail; re-draining it replays the mission.
+# An unconfirmed entry is therefore DEFERRED aside (out of the drain glob)
+# for the startup sweep and the operator — never re-run, never silently
+# dropped.
+#
+# Worker lock (13th-pass review): the single-instance lock is a directory
+# holding `<pid> <start-token>` (the lease idiom, kranz-dispatch's
+# lease_pid_token). A plain mkdir survives SIGKILL/host crash and would
+# disable dispatch forever; a contended lock is reclaimed only when the
+# recorded process is provably gone (dead pid, or a recycled one) — an
+# alive-by-token holder is never stolen from, and an unverifiable one is
+# left alone (a false stand delays work; a false steal double-runs it).
+#
+# Env: KRANZ_NATIVE_QUEUE=1 drains each registered rig's native queue.
+#      KRANZ_SPOOL (default $GC_CITY/.gc/kranz-spool) is the rollback path.
+set -u
+
+CITY=${GC_CITY:?GC_CITY is required}
+NATIVE_QUEUE=${KRANZ_NATIVE_QUEUE:-0}
+SPOOL=${KRANZ_SPOOL:-$CITY/.gc/kranz-spool}
+BIN_DIR=$(dirname "$0")
+ONCE=${1:-}
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    WORK_ROOT="$CITY/.gc"
+else
+    WORK_ROOT="$SPOOL"
+fi
+mkdir -p "$WORK_ROOT"
+
+bd() { gc --city "$CITY" bd "$@"; }
+
+bead_status() {
+    # $1 = bead id; echoes its status (empty on any bd/jq failure — callers
+    # treat empty as UNKNOWN, never as a concrete state).
+    bd show "$1" --json 2>/dev/null |
+        jq -r '(if type == "array" then .[0] else . end) | .status // empty' 2>/dev/null | head -1
+}
+
+# The process start-time token for a live pid, normalized for plain string
+# equality (duplicated from kranz-dispatch's lease_pid_token — these
+# scripts share no library by design).
+pid_start_token() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# Single-instance guard with crash-safe reclaim: the lock dir carries the
+# holder's pid + start token. On contention, a provably-dead holder
+# (kill -0 fails AND ps shows no such pid) or a provably-recycled one
+# (token mismatch) loses the lock; anything uncertain (unreadable,
+# unverifiable) stands the holder and we exit quietly.
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    LOCK="$WORK_ROOT/.kranz-worker-lock"
+else
+    LOCK="$SPOOL/.worker-lock"
+fi
+if ! mkdir "$LOCK" 2>/dev/null; then
+    read -r LOCK_PID LOCK_TOKEN < "$LOCK/holder" 2>/dev/null || LOCK_PID=""
+    if [ -z "$LOCK_PID" ]; then
+        # Fresh mkdir whose holder file is not yet written: bounded retry
+        # (sub-millisecond window), then treat as an abandoned shell.
+        ATTEMPT=0
+        while [ -z "$LOCK_PID" ] && [ "$ATTEMPT" -lt 2 ]; do
+            sleep 1
+            read -r LOCK_PID LOCK_TOKEN < "$LOCK/holder" 2>/dev/null || LOCK_PID=""
+            ATTEMPT=$((ATTEMPT + 1))
+        done
+    fi
+    RECLAIM=0
+    if [ -n "$LOCK_PID" ]; then
+        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            # kill -0 failed: ESRCH (truly gone) vs EPERM (another uid).
+            if [ -z "$(ps -o pid= -p "$LOCK_PID" 2>/dev/null)" ]; then
+                RECLAIM=1 # provably dead
+            fi
+        elif [ -n "$LOCK_TOKEN" ]; then
+            CURRENT=$(pid_start_token "$LOCK_PID")
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$LOCK_TOKEN" ]; then
+                RECLAIM=1 # alive but a recycled pid wearing the holder's number
+            fi
+        fi
+    else
+        RECLAIM=1 # no holder file after retries: an abandoned lock shell
+    fi
+    # Re-acquire only after contention: either the reclaim cleared a stale
+    # lock, or the holder stands (a live-by-token holder is never stolen).
+    if [ "$RECLAIM" -eq 1 ]; then
+        echo "kranz-city-worker: reclaiming a stale worker lock (holder ${LOCK_PID:-unknown} is gone)"
+        rm -f "$LOCK/holder" 2>/dev/null
+        rmdir "$LOCK" 2>/dev/null
+    fi
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        echo "kranz-city-worker: another worker holds $LOCK; exiting"
+        exit 0
+    fi
+fi
+printf '%s %s\n' "$$" "$(pid_start_token "$$")" > "$LOCK/holder.tmp.$$" 2>/dev/null &&
+    mv -f "$LOCK/holder.tmp.$$" "$LOCK/holder" 2>/dev/null || true
+trap 'rm -f "$LOCK/holder" 2>/dev/null; rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+write_native_rigs() {
+    # $1 = destination file. One raw path per line; consumers always use
+    # `IFS= read -r`, never word splitting, so spaces remain data.
+    if [ -n "${KRANZ_RIG_DIR:-}" ]; then
+        printf '%s\n' "$KRANZ_RIG_DIR" > "$1"
+    else
+        gc rig list --json 2>/dev/null | jq -r '.rigs[]?.path // empty' > "$1"
+    fi
+}
+
+valid_mission_id() {
+    printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
+}
+
+native_terminal_return() {
+    RIG_LIST=$(mktemp "$WORK_ROOT/.kranz-rigs.XXXXXX") || return 1
+    write_native_rigs "$RIG_LIST" || { rm -f "$RIG_LIST"; return 1; }
+    while IFS= read -r RIG_DIR; do
+        [ -d "$RIG_DIR/.git" ] || continue
+        for SOURCE in "$RIG_DIR"/.kranz/missions/*/enqueue-source.json; do
+            [ -e "$SOURCE" ] || continue
+            SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
+            PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
+            MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || MID=""
+            ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || ID=""
+            DIR_MID=$(basename "$(dirname "$SOURCE")")
+            [ "$SCHEMA" = "1" ] || continue
+            [ "$PRODUCER" = "gascity" ] || continue
+            valid_mission_id "$MID" || continue
+            [ -n "$MID" ] && [ "$MID" = "$DIR_MID" ] && [ -n "$ID" ] || continue
+            STATUS=$(jq -r '.mission.status // empty' < "$RIG_DIR/.kranz/missions/$MID/state.json" 2>/dev/null) || STATUS=""
+            case $STATUS in
+                complete | blocked | failed | abandoned) : ;;
+                *) continue ;;
+            esac
+            jq -n --arg rig "$RIG_DIR" --arg missionId "$MID" --arg beadId "$ID" \
+                '{rigDir:$rig, missionId:$missionId, beadId:$beadId}'
+            rm -f "$RIG_LIST"
+            return 0
+        done
+    done < "$RIG_LIST"
+    rm -f "$RIG_LIST"
+    return 1
+}
+
+native_queue_front() {
+    RIG_LIST=$(mktemp "$WORK_ROOT/.kranz-rigs.XXXXXX") || return 1
+    write_native_rigs "$RIG_LIST" || { rm -f "$RIG_LIST"; return 1; }
+    while IFS= read -r RIG_DIR; do
+        [ -d "$RIG_DIR/.git" ] || continue
+        for ENTRY in "$RIG_DIR"/.kranz/queue/*.json; do
+            [ -e "$ENTRY" ] || continue
+            MID=$(jq -r '.missionId // empty' < "$ENTRY" 2>/dev/null) || MID=""
+            [ -n "$MID" ] || continue
+            valid_mission_id "$MID" || break
+            SOURCE="$RIG_DIR/.kranz/missions/$MID/enqueue-source.json"
+            SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
+            PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
+            SOURCE_MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || SOURCE_MID=""
+            ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || ID=""
+            # Only a Gas City mission at the ACTUAL front authorizes this
+            # worker to drain the rig. Never skip past unrelated queued work:
+            # `kranz work --once` would otherwise execute that foreign front.
+            [ "$SCHEMA" = "1" ] && [ "$PRODUCER" = "gascity" ] &&
+                [ "$SOURCE_MID" = "$MID" ] && [ -n "$ID" ] || break
+            jq -n --arg rig "$RIG_DIR" --arg missionId "$MID" --arg beadId "$ID" \
+                '{rigDir:$rig, missionId:$missionId, beadId:$beadId}'
+            rm -f "$RIG_LIST"
+            return 0
+        done
+    done < "$RIG_LIST"
+    rm -f "$RIG_LIST"
+    return 1
+}
+
+drain_native_one() {
+    if FRONT=$(native_terminal_return); then
+        MODE=--return-only
+    elif FRONT=$(native_queue_front); then
+        MODE=--queued
+    else
+        return 1
+    fi
+    RIG_DIR=$(printf '%s' "$FRONT" | jq -r '.rigDir // empty')
+    MID=$(printf '%s' "$FRONT" | jq -r '.missionId // empty')
+    ID=$(printf '%s' "$FRONT" | jq -r '.beadId // empty')
+    [ -n "$RIG_DIR" ] && [ -n "$MID" ] && [ -n "$ID" ] || return 1
+
+    if [ "$MODE" = "--queued" ]; then
+        STATUS=$(bead_status "$ID")
+        case $STATUS in
+            in_progress) : ;;
+            "")
+                echo "kranz-city-worker: bead $ID state unreadable; native mission $MID left queued" >&2
+                return 0
+                ;;
+            *)
+                echo "kranz-city-worker: bead $ID is '$STATUS'; abandoning stale native mission $MID"
+                ( cd "$RIG_DIR" && kranz abandon "$MID" --reason "Gas City bead $ID left in_progress before execution" >/dev/null 2>&1 ) || true
+                ( cd "$RIG_DIR" && kranz queue --remove "$MID" >/dev/null 2>&1 ) || true
+                return 0
+                ;;
+        esac
+    fi
+
+    echo "kranz-city-worker: bead $ID -> $MODE mission $MID (rig $RIG_DIR)"
+    "$BIN_DIR/kranz-run-bead" "$MODE" "$CITY" "$ID" "$RIG_DIR" "$MID"
+    CODE=$?
+    if [ "$CODE" -eq 75 ]; then
+        echo "kranz-city-worker: mission $MID execution/return not yet settled; left for retry" >&2
+        return 75
+    fi
+    return 0
+}
+
+if [ "$NATIVE_QUEUE" = "1" ]; then
+    if [ "$ONCE" = "--once" ]; then
+        drain_native_one
+        CODE=$?
+        if [ "$CODE" -eq 1 ]; then
+            echo "kranz-city-worker: native queues empty"
+        fi
+        if [ "$CODE" -eq 75 ]; then
+            exit 75
+        fi
+        exit 0
+    fi
+    echo "kranz-city-worker: watching kranz-native queues"
+    while :; do
+        drain_native_one
+        CODE=$?
+        if [ "$CODE" -ne 0 ]; then
+            sleep 15
+        fi
+    done
+fi
+
+# Crash/deferral recovery: reconcile any .inflight or .deferred entry left
+# by a previous worker. Terminal bead (closed/blocked) => the mission
+# completed — sweep the entry only. Still in_progress => the mission died
+# too — drop the stale entry and let the reclaim sweep recover the claim
+# (it re-dispatches a FRESH brief; the spool-atomic release prevents a
+# duplicate). Unknown => leave everything (the conservative posture).
+# A .deferred entry (terminal-unconfirmed at run end, 13th-pass) is swept
+# only when the bead is NOW confirmed terminal; otherwise it stays for the
+# operator — deferred entries are never re-run.
+for MARKER in "$SPOOL"/*.inflight "$SPOOL"/*.deferred; do
+    [ -e "$MARKER" ] || continue
+    # The per-file renames (x.json.deferred etc.) also end in .deferred;
+    # only the bare BASE.deferred marker is a recovery record.
+    case $MARKER in
+        *.json.deferred | *.md.deferred | *.inflight.deferred | *.events.log.deferred)
+            continue
+            ;;
+    esac
+    BASE="${MARKER%.inflight}"
+    BASE="${BASE%.deferred}"
+    ID=$(jq -r '.id // empty' < "$BASE.json" 2>/dev/null) || ID=""
+    if [ -z "$ID" ]; then
+        echo "kranz-city-worker: recovery entry $BASE is unreadable; left in place" >&2
+        continue
+    fi
+    STATUS=$(bead_status "$ID")
+    case $STATUS in
+        closed | blocked)
+            echo "kranz-city-worker: bead $ID reached '$STATUS'; sweeping $BASE"
+            rm -f "$BASE".*
+            ;;
+        in_progress)
+            case $MARKER in
+                *.deferred)
+                    echo "kranz-city-worker: bead $ID still in_progress; deferred entry $BASE kept for the operator (never re-run)" >&2
+                    ;;
+                *)
+                    echo "kranz-city-worker: bead $ID died mid-mission; dropping stale entry (the reclaim sweep re-dispatches fresh)"
+                    rm -f "$BASE".*
+                    ;;
+            esac
+            ;;
+        *)
+            echo "kranz-city-worker: bead $ID state unknown; recovery entry $BASE left in place" >&2
+            ;;
+    esac
+done
+
+# Move a spool entry aside as .deferred — out of the drain glob, never
+# re-run, kept for the startup sweep and the operator. The suffix goes at
+# the END (x.json.deferred): a `*.json` glob must never re-pick it.
+defer_entry() {
+    # $1 = the entry's .json path
+    BASE="${1%.json}"
+    for EXT in md json inflight events.log; do
+        [ -e "$BASE.$EXT" ] && mv "$BASE.$EXT" "$BASE.$EXT.deferred"
+    done
+    : > "$BASE.deferred"
+}
+
+drain_one() {
+    ENV_FILE=$(ls "$SPOOL"/*.json 2>/dev/null | sort | head -1)
+    [ -n "$ENV_FILE" ] || return 1
+    MFILE="${ENV_FILE%.json}.md"
+    # Parse the record as DATA (see the header): jq, never source.
+    ID=$(jq -r '.id // empty' < "$ENV_FILE") || ID=""
+    RIG_DIR=$(jq -r '.rigDir // empty' < "$ENV_FILE") || RIG_DIR=""
+    MAX_CYCLES=$(jq -r '.maxCycles // "1"' < "$ENV_FILE") || MAX_CYCLES="1"
+    if [ -z "$ID" ] || [ -z "$RIG_DIR" ]; then
+        # An unreadable record is an operator problem, not a reason to
+        # destroy a brief: log, skip past it this pass, leave it in place.
+        echo "kranz-city-worker: $ENV_FILE is not a parseable spool record; left in place" >&2
+        sleep 15
+        return 0
+    fi
+    # Ownership guard: only an in_progress bead is ours to run. A CONCRETE
+    # other state (released and reclaimed elsewhere, or driven terminal)
+    # makes the entry stale — drop it. An UNREADABLE state is unknown —
+    # leave the entry for a later pass (a transient City failure must not
+    # destroy queued work, the same rule the sweep's release path keeps).
+    STATUS=$(bead_status "$ID")
+    case $STATUS in
+        in_progress) : ;;
+        "")
+            echo "kranz-city-worker: bead $ID state unreadable; entry left for a later pass" >&2
+            sleep 15
+            return 0
+            ;;
+        *)
+            echo "kranz-city-worker: bead $ID is '$STATUS' (not in_progress); dropping stale spool entry"
+            rm -f "${ENV_FILE%.json}".*
+            return 0
+            ;;
+    esac
+    # Mark in-flight BEFORE the mission starts (see the header).
+    : > "${ENV_FILE%.json}.inflight"
+    echo "kranz-city-worker: bead $ID -> kranz exec (rig $RIG_DIR)"
+    "$BIN_DIR/kranz-run-bead" "$CITY" "$ID" "$MFILE" "$RIG_DIR" "$MAX_CYCLES"
+    # Terminal confirmation (13th-pass): sweep ONLY on a confirmed terminal
+    # state — closed/blocked (run-bead recorded the outcome) or open (it
+    # released the claim for re-readying). Still in_progress means the
+    # terminal bd write FAILED transiently: defer the entry aside — never
+    # re-run, never silently destroyed. Unreadable is unknown: same.
+    STATUS=$(bead_status "$ID")
+    case $STATUS in
+        closed | blocked | open)
+            # Sweep the whole entry (brief, record, marker, events sidecar).
+            rm -f "${ENV_FILE%.json}".*
+            ;;
+        *)
+            echo "kranz-city-worker: bead $ID terminal state UNCONFIRMED after the run ('${STATUS:-unknown}') — entry deferred aside, NOT re-run and NOT destroyed" >&2
+            defer_entry "$ENV_FILE"
+            ;;
+    esac
+    return 0
+}
+
+if [ "$ONCE" = "--once" ]; then
+    drain_one || echo "kranz-city-worker: spool empty"
+    exit 0
+fi
+
+echo "kranz-city-worker: watching $SPOOL"
+while :; do
+    drain_one || sleep 15
+done

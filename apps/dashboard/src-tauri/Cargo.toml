@@ -1,0 +1,34 @@
+[package]
+name = "kranz-dashboard"
+version = "0.2.0"
+description = "Kranz Mission Control — Tauri desktop shell embedding the kranz server"
+authors = ["Kranz"]
+license = "MIT"
+edition = "2021"
+# Matches the root workspace (../Cargo.toml): the path dependencies on
+# kranz-server/kranz-engine require it, so a lower declared MSRV would be
+# false advertising (this standalone workspace cannot inherit the value).
+rust-version = "1.88"
+
+# Standalone workspace: keeps the heavy Tauri dependency tree out of the root
+# cargo workspace's builds (the root workspace does not list this package as a
+# member; without this table cargo would refuse to build it at all).
+[workspace]
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dependencies]
+kranz-server = { path = "../../../crates/server" }
+kranz-engine = { path = "../../../crates/engine" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3" }
+tauri-plugin-log = "2"

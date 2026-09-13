@@ -1,0 +1,11 @@
+# Gas City pack: kranz as a validated-mission rig type.
+#
+# Import this pack into a city to dispatch beads as headless kranz missions:
+# City routes and holds escalations; kranz plans, executes with its internal
+# orchestrator/worker/validator cast, and returns a contract-validated branch
+# plus report. The city sees ONE opaque agent type — no resident LLM sessions
+# on the City side (deliberately no [[named_session]]: the mayor pattern is
+# what this pack replaces for kranz-shaped work).
+[pack]
+name = "kranz"
+schema = 2

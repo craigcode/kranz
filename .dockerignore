@@ -1,0 +1,33 @@
+# Keep the build context small and reproducible. Mirrors .gitignore's intent
+# and, crucially, its re-inclusion of the committed dashboard dist that
+# crates/cli/build.rs embeds into the `kranz` binary.
+
+# Rust build output — rebuilt inside the builder stage.
+target/
+**/target/
+
+# Node artifacts (the release build needs none; the dashboard dist is committed).
+node_modules/
+**/node_modules/
+
+# Built dashboards in general are noise in the context…
+dist/
+**/dist/
+# …EXCEPT the one the CLI embeds. Without these the built image loses its UI.
+!crates/cli/assets/
+!crates/cli/assets/dashboard/
+!crates/cli/assets/dashboard/dist/
+!crates/cli/assets/dashboard/dist/**
+
+# Per-repo mission data — never belongs in an image (transcripts are secrets).
+.kranz/
+**/.kranz/
+
+# VCS + local cruft. The build does not need git history; drop it from context.
+.git/
+.gitignore
+.DS_Store
+
+# Docs and packaging are not needed to compile the binary.
+docs/
+packaging/
