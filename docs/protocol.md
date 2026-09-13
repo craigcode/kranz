@@ -189,6 +189,9 @@ token (`--read-token` / `$KRANZ_READ_TOKEN` to pin it; generated otherwise)
 and stores it next to the mutation token with the same `0600` discipline:
 `<repo>/.kranz/serve.read.token` single-repo, or
 `~/.kranz/serve/<bound-endpoint>.read.token` for an operator-catalog serve.
+Pinned tokens must be non-empty visible ASCII without whitespace, and the read
+token must differ from the mutation token. The CLI rejects invalid values before
+binding, starting workers, printing credentials, or writing either token file.
 Wherever the read gate is armed (`--read-auth`, or any non-loopback bind),
 GET/HEAD `/api/...` and the WS upgrade accept EITHER token via
 `x-kranz-token`, but `?token=` accepts ONLY the read token. Mutation tokens
@@ -217,8 +220,9 @@ to a mutation-token URL; closing or replacing a connection cancels its pending
 exchange. Anonymous loopback sockets still connect without a token.
 
 Embedders that omit a read token get a generated one through the same exchange.
-An empty read token or one equal to mutation authority is replaced with a
-distinct generated token. Existing custom WebSocket clients must use read
+For compatibility, the infallible router constructor also replaces an empty read
+token or one equal to mutation authority with a distinct generated token; the CLI
+validates pinned values before calling it. Existing custom WebSocket clients must use read
 authority in their query or send a valid `x-kranz-token` header.
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`

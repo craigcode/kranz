@@ -267,7 +267,7 @@ pub fn router_with_multi_repo_host_and_addr(
 /// (docs/protocol.md "Authority: mutation token"). `read_authority`
 /// authenticates GET/HEAD (and the WS upgrade) wherever the read gate is
 /// armed, but is never accepted on a mutating route — it is the token safe
-/// to hand to dashboards and agents. If absent or equal to mutation authority,
+/// to hand to dashboards and agents. If absent, empty, or equal to mutation authority,
 /// a distinct read token is generated. Clients obtain it from `/api/read-token`
 /// using either valid token in the header; mutation tokens remain header-only.
 pub fn router_with_read_authority_and_addr(
@@ -489,7 +489,13 @@ fn repo_context_router(
 }
 
 fn repo_api_routes(gate: TokenGate) -> Router<Arc<ServerState>> {
-    Router::new()
+    protected_repo_api_routes()
+        .route_layer(middleware::from_fn_with_state(gate, require_mutation_token))
+        .merge(independently_authenticated_hook_routes())
+}
+
+fn protected_repo_api_routes() -> Router<Arc<ServerState>> {
+    let routes = Router::new()
         .route(
             "/missions",
             get(rest::list_missions).post(host::create_mission),
@@ -569,11 +575,26 @@ fn repo_api_routes(gate: TokenGate) -> Router<Arc<ServerState>> {
         .route("/tickets/{slug}/draft", post(tickets::draft_ticket))
         .route("/tickets/{slug}/approve", post(tickets::approve_ticket))
         .route("/queue", get(host::queue_state_route))
-        .route("/queue/drain", post(host::drain_queue_route))
-        .route_layer(middleware::from_fn_with_state(gate, require_mutation_token))
-        // Only these POST routes authenticate independently: GitHub HMAC
-        // and per-run hook capability. Keep exceptions local to registration;
-        // a future route with a similar suffix must still require authority.
+        .route("/queue/drain", post(host::drain_queue_route));
+    // Exercise future suffix collisions through the real router composition,
+    // without exposing synthetic endpoints in production or a public test API.
+    #[cfg(test)]
+    let routes = routes
+        .route(
+            "/future/hook-status",
+            post(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
+            "/future/hooks/github",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+    routes
+}
+
+/// Only these POSTs bypass serve-token authentication. Each handler checks
+/// its own authority: GitHub HMAC or a per-run hook capability.
+fn independently_authenticated_hook_routes() -> Router<Arc<ServerState>> {
+    Router::new()
         .route("/hooks/github", post(hooks::github_hook))
         .route(
             "/hook-status",
@@ -898,6 +919,8 @@ struct HostGate {
 /// Browser WebSockets obtain that read authority through [`read_token`];
 /// rejecting mutation tokens in URLs also protects non-WebSocket reads.
 /// Hook routes apply their own authentication at registration instead.
+/// Layer this middleware only on protected API routes, never the SPA/static
+/// fallback. Nested routers may already have stripped their `/api` prefix.
 async fn require_mutation_token(
     State(gate): State<TokenGate>,
     request: Request,
@@ -1164,6 +1187,40 @@ mod tests {
 
     fn authority() -> super::MutationAuthority {
         super::MutationAuthority::new("tok").unwrap()
+    }
+
+    #[tokio::test]
+    async fn registered_hook_suffix_posts_require_mutation_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = super::repo_api_routes(super::TokenGate {
+            authority: authority(),
+            read_authority: "dummy-read".into(),
+            require_read_token: true,
+        })
+        .with_state(Arc::new(super::ServerState {
+            repo_root: temp.path().into(),
+            host: Arc::new(super::MissionHost::new(temp.path().into())),
+            bind_addr: None,
+            bind_is_loopback: true,
+        }));
+        for path in ["/future/hook-status", "/future/hooks/github"] {
+            for (presented, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some("dummy-read"), StatusCode::UNAUTHORIZED),
+                (Some("tok"), StatusCode::NO_CONTENT),
+            ] {
+                let mut request = Request::post(path);
+                if let Some(value) = presented {
+                    request = request.header(super::TOKEN_HEADER, value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "registered route: {path}");
+            }
+        }
     }
 
     fn seed_planning_mission(root: &Path, goal: &str) {

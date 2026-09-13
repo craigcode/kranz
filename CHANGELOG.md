@@ -14,6 +14,8 @@ Notable user-visible changes are documented here. This project follows
   The dashboard exchanges its header credential at GET /api/read-token and
   sends only read authority in WebSocket URLs, including after reconnect.
   Custom browser clients must use a read token or adopt that exchange.
+- Fixed: `serve` rejects empty, malformed, or duplicated read credentials
+  before startup, so printed and stored read tokens match the active server.
 - Added a security-review index linking historical findings, remediation,
   regression evidence, and recorded limitations.
 

@@ -30,8 +30,8 @@ separate design work. They are not included in this maintenance release.
 
 Validated on macOS with Rust 1.97.1 and Node 22.23.1:
 
-- Full `cargo test --workspace`: 2,937 passed, zero failed, 10 existing ignored,
-  across 65 test summaries (including documentation tests).
+- Full `cargo test --workspace`: 2,940 passed, zero failed, 10 existing ignored,
+  across 66 test summaries (including documentation tests).
 - Workspace Clippy with warnings denied, formatting, locked build, and strict
   public Rust documentation: passed.
 - Dashboard clean install, TypeScript, 238 tests, build, embedded sync/check,
@@ -74,3 +74,47 @@ as authentication as a security check controlled by browser input. The helper
 is now named for its actual operation, exchange-and-connect; server middleware
 remains the authority. The real WebSocket tests prove tokenless gated reads
 and mutation-query credentials are rejected independently of any client branch.
+
+## Follow-up review
+
+The supplied follow-up found that the CLI printed and stored pinned read
+credentials before the router normalized empty or duplicated values. `serve`
+now rejects invalid token transport and equal mutation/read credentials before
+binding, starting workers, printing credentials, or writing token files. Errors
+identify the flag/environment setting without displaying its value. Flag
+precedence over environment variables remains unchanged.
+
+`serve_rejects_invalid_read_credentials_before_binding_or_publishing` failed
+before the fix and passes afterward for flag and environment input. The live
+CLI test `serve_published_read_credential_matches_live_server` verifies that the
+stored read token matches the exchange response and cannot authorize a POST.
+
+The two independently authenticated hook handlers now live in a named router,
+merged separately from the protected route list. The private unit-test build
+registers synthetic suffix-collision POSTs in that protected list;
+`registered_hook_suffix_posts_require_mutation_authority` exercises the actual
+composition, including a successful authorized call to each handler. The token
+middleware documents its API-only placement and nested-path assumption.
+
+The distinct status for a development dashboard connected to a v0.2.0 server
+remains deferred. Such a mixed-version deployment retries the failed exchange;
+the embedded production dashboard is version-aligned with its server and no
+mutation-credential URL fallback is introduced.
+
+During follow-up validation, one parallel workspace run failed the unchanged
+`git_config_protection_resolves_linked_worktree_config_and_rename_ancestors`
+test with an authority-directory error. It passed in isolation and in the next
+full parallel workspace run. An existing Kimi discovery test temporarily
+changes process-global `HOME`, which is a possible concurrency cause, not a
+confirmed diagnosis. No sandbox implementation or assertion was changed.
+
+The completed Rust CodeQL scan resurfaced existing alerts #21, #24, #43 and
+#52 in unchanged `hook_status.rs`. Inspection of SARIF analysis 1769314126
+shows that every trace begins by treating Axum `State<Arc<ServerState>>` as
+HTTP input, then follows `server.repo_root` to filesystem calls. That root is
+constructed from the operator's repository context in `repo_context_router`,
+not supplied by the request. Mission and run IDs from the JSON body separately
+pass `MissionPaths::is_safe_id` before any path join. The existing endpoint and
+engine traversal/capability regressions pass. These four traces are false
+positives; the same alerts exist on baseline `05778ae`. Their individual GitHub
+triage records preserve this reasoning; no scanner rule or workflow is weakened.
