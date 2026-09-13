@@ -8,6 +8,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to rehearse without publishing (for example v0.2.2)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +42,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # Match the Linux CI host: the workspace suite exercises real enforced
+      # gates and nested builds. An unprepared release runner must not turn
+      # these checks into skips or run those gates without containment.
+      - name: Install Linux sandbox tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap mold
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true
+
+      - name: Link with mold
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      - name: Free runner disk for nested contract builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          df -h /
+
+      - name: Configure git identity for fixture commits
+        run: |
+          git config --global user.name kranz-ci
+          git config --global user.email ci@kranz.local
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -47,7 +79,8 @@ jobs:
       - name: Verify tag, versions, changelog, and current main
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/check-release-version.sh
+          KRANZ_RELEASE_CANDIDATE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: scripts/check-release-version.sh "$KRANZ_RELEASE_CANDIDATE_TAG"
 
       - name: Verify public release switch
         env:
@@ -94,6 +127,19 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
       - run: cargo test --workspace --no-fail-fast
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: git,bwrap,container,grep
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+
+      - name: Report recorded capability skips
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/kranz-test-skips.log"
+          if [ -s "$log" ]; then
+            sort -u "$log"
+          else
+            echo "No capability skips recorded."
+          fi
 
       - run: cargo build --workspace --locked
 
@@ -272,6 +318,9 @@ jobs:
 
   publish:
     name: publish GitHub release
+    # A manual run rehearses the complete source/build pipeline before the
+    # public tag exists. Only a tag push can request publication.
+    if: github.event_name == 'push'
     needs: [build, sbom]
     runs-on: ubuntu-latest
     environment: release

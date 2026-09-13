@@ -150,3 +150,34 @@ only around the Kimi writer would not protect unrelated readers. All discovery
 and Git-protection assertions remain; no sandbox runtime behavior was changed.
 The failing CI log does not identify the exact concurrent writer, so the earlier
 Kimi attribution remains a hypothesis rather than a confirmed diagnosis.
+
+## Release verification and v0.2.2
+
+PR #52 and merged commit `0542e80` passed every CI and CodeQL check. The
+annotated v0.2.1 tag points to that commit. Release run 34788843394 then failed
+`sandbox_preflight_emits_no_macos_profile_issue_on_linux`: the release runner
+did not have `bwrap`, and plan approval correctly refused to run enforced
+engine gates without containment. Regular CI installs and probes bubblewrap;
+the release workflow had omitted that host preparation. No binary archive,
+GitHub release, or v0.2.1 crate was published.
+
+The corrected release is v0.2.2, preserving the public v0.2.1 tag. Its release
+runner uses the same bubblewrap/user-namespace setup, mold linker, and nested
+build disk preparation as Linux CI, along with its fixture Git identity and
+required-capability policy. Recorded skips remain visible in the job log.
+The failing test and runtime refusal stay
+intact. Product behavior is the reviewed server patch above; this follow-up
+changes release infrastructure and aligned version metadata only. The owner's
+decision to use the existing secret and domain checks also applies to v0.2.2.
+The workflow now also accepts a manual rehearsal: it verifies the candidate
+version against current `main` and builds all artifacts, while publication
+remains limited to tag-push runs. This lets the actual release pipeline be
+checked before another public tag is created.
+
+Local v0.2.2 validation passed: 2,940 workspace tests (10 existing ignored),
+Clippy with warnings denied, formatting, locked build, strict Rustdoc, Cargo
+audit/deny, knowledge freshness, domain lint (865 files), package license checks,
+and the live CLI smoke test. The clean dashboard gates passed with 238 tests
+and the same embedded bundle; the standalone Tauri locked check also passed.
+Actionlint validates the workflow. The actual Linux release rehearsal is run
+after this change merges, before the v0.2.2 tag or publication.
