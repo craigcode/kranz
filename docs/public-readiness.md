@@ -4,9 +4,9 @@ Status (2026-09-13 UTC): **the source repository is public; distribution is
 tracked separately**.
 
 The owner authorized the public source snapshot and crates.io publication.
-GitHub `main` contains one `Initial commit`; older branch and pull-request
-references are separate from that history. The [README](../README.md#install)
-leads with a source install and pins the registry command to v0.2.0 so readers
+The first public `main` snapshot was one `Initial commit`; older branch and
+pull-request references are separate from that history. The [README](../README.md#install)
+leads with a source install and pins the registry command to an explicit version so readers
 cannot silently install the earlier `0.0.1` placeholder. Check
 [crates.io](https://crates.io/crates/kranz/versions) and
 [GitHub Releases](https://github.com/craigcode/kranz/releases) for the artifacts
@@ -41,10 +41,11 @@ production distribution.
 - `scripts/audit-public-tree.sh` passes on the exact proposed public commit.
 - `scripts/audit-public-history.sh` passes with every branch, tag, and GitHub
   pull-request ref fetched.
-- Both audits pass with `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the owner's
-  reviewed private vocabulary supplied outside the checkout. The matching
-  `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret is configured. Ordinary CI's
-  built-in-marker scan does not substitute for this owner-supplied vocabulary.
+- The existing secret scan and committed domain-policy check pass. An
+  additional confidentiality word list is optional; the owner selected no
+  additional list for v0.2.1. If one is configured, both audits must pass with
+  `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the matching reviewed
+  `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret.
 - Mission records, tickets, fixtures, and review documents have received a
   human confidentiality/licensing review; automated secret scans do not detect
   external-party identifiers, private prompts, or proprietary prose reliably.
@@ -120,9 +121,10 @@ release. They must never silently become the supported distribution.
 - The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` remains
   `false` until every item in this document is complete; set it to `true` only
   after the protected release environment is verified.
-- The masked repository secret `KRANZ_PUBLIC_AUDIT_MARKERS` contains the same
-  newline-delimited operator markers used for the local release audit. The tag
-  workflow fails closed when it is missing or empty.
+- If additional confidentiality terms are configured, the masked repository
+  secret `KRANZ_PUBLIC_AUDIT_MARKERS` contains the same newline-delimited terms
+  used locally. A configured but empty/invalid list fails closed. Without that
+  optional secret, releases still require the existing secret and domain checks.
 - Private vulnerability reporting, Dependabot alerts/security updates, secret
   scanning, push protection, and code scanning are enabled where the current
   visibility/plan permits them.

@@ -105,6 +105,7 @@ def main():
     try:
         markers = load_markers()
         if not markers:
+            print("operator-marker audit: no additional vocabulary configured; optional scan skipped")
             return 0
         hits = scan_tree(markers) if args.scope == "tree" else scan_history(markers)
     except AuditError as error:

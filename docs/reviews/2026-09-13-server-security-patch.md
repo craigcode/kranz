@@ -40,15 +40,15 @@ Validated on macOS with Rust 1.97.1 and Node 22.23.1:
   existing allowed audit warnings remain. Dependency versions were unchanged.
 - Experimental Even G2 client: 22 tests, build/package, lint and npm audit passed.
 - Root Cargo audit/deny, regenerated Rust notices, four package license checks,
-  two packaging tests, 11 operator-marker tests, and knowledge freshness passed.
+  two packaging tests, 12 operator-marker tests, and knowledge freshness passed.
 - Package inventories inspected; the engine crate's packaging/build dry-run
   passed. Dependent crate registry dry-runs must follow engine publication.
 - The CLI served a disposable repository with read authentication: header
   exchange, read-token access, mutation-query rejection, dashboard response,
   license output, and graceful token-file cleanup passed.
-- Staged tree audit and reachable-history secret scan passed. The release-only
-  private-vocabulary check still requires the owner's vocabulary; these ordinary
-  checks do not substitute for it.
+- Staged tree audit and reachable-history secret scan passed. The initial
+  release workflow also required an owner-supplied private vocabulary; the
+  owner's subsequent decision below makes that additional check optional.
 
 The first full run exposed a stopped Docker daemon and less than 4 GiB free
 space, which correctly parked queue fixtures at the disk preflight. Starting
@@ -118,3 +118,24 @@ pass `MissionPaths::is_safe_id` before any path join. The existing endpoint and
 engine traversal/capability regressions pass. These four traces are false
 positives; the same alerts exist on baseline `05778ae`. Their individual GitHub
 triage records preserve this reasoning; no scanner rule or workflow is weakened.
+
+## Release workflow and Windows follow-up
+
+The owner explicitly selected the existing secret and domain-policy checks,
+with no additional confidentiality word list. Release verification now skips
+only the unconfigured extra vocabulary scan and says so in its output. A
+configured vocabulary still must be valid and pass both tree/history checks.
+Gitleaks remains mandatory, and release verification now also runs the committed
+domain-policy check directly after building the CLI. The private domain seed
+was not copied into GitHub or repurposed as a blanket confidentiality ban: its
+matches in the two governance documents have existing, path-specific waivers.
+The updated audit fixtures prove that optional mode still rejects configured
+matches and that required mode still rejects missing or empty input.
+
+Windows CI on `0a60100` passed the new credential tests and production
+containment receipts, then failed the unchanged
+`pause_resume_and_user_message_flow`: after a fixed 900 ms sleep the snapshot
+was still `Approved`, rather than `Paused`. The test now waits, within the
+existing timeout, for the observed paused state and then for the pending user
+message before enqueuing Resume. Completion, event order, paused-time reporting,
+and inbox cleanup assertions remain. No engine runtime behavior changed.

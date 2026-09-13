@@ -58,9 +58,9 @@ jobs:
             exit 1
           fi
 
-      - name: Audit current public tree
+      - name: Audit any configured confidentiality vocabulary in the public tree
         env:
-          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_REQUIRE_OPERATOR_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS != '' && '1' || '0' }}
           KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-tree.sh
 
@@ -85,7 +85,7 @@ jobs:
 
       - name: Scan all reachable history for secrets and operator metadata
         env:
-          KRANZ_REQUIRE_OPERATOR_MARKERS: "1"
+          KRANZ_REQUIRE_OPERATOR_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS != '' && '1' || '0' }}
           KRANZ_PUBLIC_AUDIT_MARKERS: ${{ secrets.KRANZ_PUBLIC_AUDIT_MARKERS }}
         run: scripts/audit-public-history.sh
 
@@ -96,6 +96,9 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
 
       - run: cargo build --workspace --locked
+
+      - name: Check the committed domain policy
+        run: target/debug/kranz domain-lint
 
       - name: Verify package licenses and dependency notices
         run: |
