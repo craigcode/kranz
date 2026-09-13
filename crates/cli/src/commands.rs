@@ -2333,6 +2333,25 @@ async fn cmd_serve(
         .parse()
         .map_err(|e| anyhow!("--host '{host}' is not an IP address: {e}"))?;
     refuse_non_loopback_without_insecure_lan(bind, insecure_lan)?;
+    let token = token
+        .or_else(|| std::env::var("KRANZ_TOKEN").ok())
+        .unwrap_or_else(kranz_server::generate_token);
+    let read_token = read_token
+        .or_else(|| std::env::var("KRANZ_READ_TOKEN").ok())
+        .unwrap_or_else(kranz_server::generate_token);
+    // Validate before binding, starting workers, printing credentials, or
+    // writing token files. The router's compatibility normalization must
+    // never make the CLI publish a credential different from the active one.
+    kranz_server::MutationAuthority::new(token.clone())
+        .context("--token / KRANZ_TOKEN is invalid")?;
+    anyhow::ensure!(
+        !read_token.is_empty() && read_token.bytes().all(|byte| byte.is_ascii_graphic()),
+        "--read-token / KRANZ_READ_TOKEN must be non-empty visible ASCII without whitespace"
+    );
+    anyhow::ensure!(
+        read_token != token,
+        "--read-token / KRANZ_READ_TOKEN must differ from the mutation token"
+    );
     if !bind.is_loopback() {
         eprintln!(
             "WARNING: binding {bind} with --insecure-lan — the API is reachable \
@@ -2412,13 +2431,6 @@ async fn cmd_serve(
         std::net::IpAddr::V4(v4) => v4.to_string(),
     };
     let url = format!("http://{display_host}:{}/", local_addr.port());
-    let token = token
-        .or_else(|| std::env::var("KRANZ_TOKEN").ok())
-        .unwrap_or_else(kranz_server::generate_token);
-    let read_token = read_token
-        .or_else(|| std::env::var("KRANZ_READ_TOKEN").ok())
-        .unwrap_or_else(kranz_server::generate_token);
-
     println!("kranz server on {url}");
     println!("mutation token: {token}");
     println!("read token: {read_token} (GETs/WS only — safe for dashboards and agents)");

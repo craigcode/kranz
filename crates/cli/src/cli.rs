@@ -544,7 +544,8 @@ pub enum Command {
         /// only — never mutations — so it is the token safe to hand to
         /// dashboards and agents. Stored next to serve.token at
         /// .kranz/serve.read.token (operator catalog:
-        /// `~/.kranz/serve/<endpoint>.read.token`).
+        /// `~/.kranz/serve/<endpoint>.read.token`). Must be non-empty visible
+        /// ASCII without whitespace and differ from the mutation token.
         #[arg(long, value_name = "TOKEN")]
         read_token: Option<String>,
 

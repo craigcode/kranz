@@ -950,9 +950,9 @@ async fn non_loopback_bind_requires_token_on_gets() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Query-param token also works (browser WebSocket / simple clients).
+    // Mutation authority is header-only, including on reads.
     let (status, _) = get_json(&app, &format!("/api/missions/m-01/state?token={TOKEN}")).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// Real LAN clients present `Host: <lan-ip>:<port>` — the Host gate must
@@ -1053,9 +1053,9 @@ async fn query_token_is_rejected_on_posts() {
     .await;
     assert_ne!(status, StatusCode::UNAUTHORIZED);
 
-    // GETs keep the query form — the browser WebSocket depends on it.
+    // Mutation authority is header-only on reads as well as writes.
     let (status, _) = get_json(&app, &format!("/api/missions/m-01/state?token={TOKEN}")).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// The read-only token (`.kranz/serve.read.token`) authenticates gated GETs

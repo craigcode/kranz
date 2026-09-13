@@ -165,11 +165,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Serializes every test (in this module and in `orchestrator.rs`) that
-/// mutates the process-global env vars consulted by [`discover_kimi_binary`]
-/// (`KRANZ_KIMI_BIN`, `PATH`, `HOME`), since `cargo test` runs tests in
-/// parallel threads within one process and a second, independent mutex would
-/// not mutually exclude against this one (mirrors `DROID_ENV_LOCK`, but must
+/// Serializes tests (in this module and in `orchestrator.rs`) that mutate
+/// `KRANZ_KIMI_BIN` in the shared test process. The HOME/PATH fixture runs in
+/// its own child process to protect unrelated readers. A second, independent
+/// mutex would not mutually exclude against this one (mirrors `DROID_ENV_LOCK`, but must
 /// be `pub(crate)` — unlike droid, kimi's env-mutating tests are split across
 /// two source files and both must lock the SAME mutex).
 #[cfg(test)]
@@ -977,9 +976,27 @@ mod tests {
     fn kimi_discovery_falls_through_configured_to_path_then_well_known() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = super::KIMI_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // KIMI_ENV_LOCK cannot protect unrelated HOME/PATH readers. Run this
+        // environment fixture alone, as the scratch-root tests already do.
+        if std::env::var_os("KRANZ_KIMI_DISCOVERY_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "backend_kimi::tests::kimi_discovery_falls_through_configured_to_path_then_well_known",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("KRANZ_KIMI_DISCOVERY_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"));
+            return;
+        }
         let saved_env_override = std::env::var_os("KRANZ_KIMI_BIN");
         std::env::remove_var("KRANZ_KIMI_BIN");
         let saved_path = std::env::var_os("PATH");
@@ -993,9 +1010,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bogus_configured = dir.path().join("does-not-exist-kimi");
 
-        // Prepend (never replace) PATH so unrelated tests spawning real
-        // system binaries (`true`, `sh`, ...) concurrently on other threads
-        // keep resolving them.
+        // Put the fixture before any Kimi installation on the host PATH.
         let prepend_path = |extra: &Path| {
             let mut dirs = vec![extra.to_path_buf()];
             if let Some(existing) = std::env::var_os("PATH") {
@@ -1016,11 +1031,9 @@ mod tests {
 
         let path_result = discover_kimi_binary(Some(bogus_configured.to_str().unwrap()));
 
-        // Stage 2: PATH is pinned to a minimal, known-safe set of standard
-        // dirs (still enough for unrelated concurrent tests to spawn `true`
-        // / `sh`, but guaranteed to carry no `kimi`, unlike the developer's
-        // real PATH which may well have one installed). HOME points at a
-        // dir with a working `~/.kimi-code/bin/kimi`. Discovery must fall
+        // Stage 2: PATH is pinned to standard system directories, excluding
+        // the fixture and the developer's usual Kimi installation. HOME points
+        // at a dir with a working `~/.kimi-code/bin/kimi`. Discovery must fall
         // through PATH -> well-known and pick it up.
         std::env::set_var("PATH", "/usr/bin:/bin");
         let home_dir = dir.path().join("home");

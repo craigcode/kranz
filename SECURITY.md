@@ -29,3 +29,8 @@ Kranz reduces risk; it is not a general-purpose containment boundary. Keep
 agent credentials least-privileged, review mission plans and grants, use the
 enforced sandbox profiles where supported, and run untrusted repositories in a
 separate operating-system or container account.
+
+## Review evidence
+
+The [security-review log](docs/security-review-log.md) indexes scoped audit
+reports, remediation records, regression evidence, and remaining limitations.

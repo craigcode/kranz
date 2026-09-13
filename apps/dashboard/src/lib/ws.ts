@@ -11,8 +11,8 @@
 // checks whether the mission still exists; a 404 stops the socket for good
 // and reports 'gone' through onStatus.
 //
-// Off-loopback serves also require ?token= (browsers cannot set the
-// x-kranz-token header on WebSocket upgrades).
+// Authenticated sockets first exchange the header credential for read-only
+// authority. Only that read token enters the WebSocket URL.
 
 import { ApiError, getJson, scopedApiPath } from './api';
 import { repoIdFromHash } from './routes';
@@ -41,6 +41,7 @@ export interface MissionSocketOptions {
 export class MissionSocket {
   private ws: WebSocket | null = null;
   private closed = false;
+  private authRequest: AbortController | null = null;
   private backoffMs = BACKOFF_MIN_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Consecutive closes without a successful open (resets on 'live'). */
@@ -58,8 +59,8 @@ export class MissionSocket {
     this.unsubscribeToken = subscribeTokenGate(() => {
       if (this.closed || resolveToken() === null) return;
       this.backoffMs = BACKOFF_MIN_MS;
-      if (this.reconnectTimer !== null) {
-        clearTimeout(this.reconnectTimer);
+      if (this.reconnectTimer !== null || this.authRequest !== null) {
+        if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
         this.connect();
       }
@@ -69,10 +70,57 @@ export class MissionSocket {
   connect(): void {
     if (this.closed) return;
     this.opts.onStatus('connecting');
+    this.authRequest?.abort();
+    this.authRequest = null;
+    // Server middleware decides whether anonymous reads are allowed. This
+    // branch only chooses whether the connection needs a credential exchange.
+    const token = resolveToken();
+    if (token === null) {
+      this.openSocket(null);
+    } else {
+      void this.exchangeAndConnect(token);
+    }
+  }
 
+  private async exchangeAndConnect(token: string): Promise<void> {
+    const request = new AbortController();
+    this.authRequest = request;
+    const timeout = setTimeout(() => request.abort(), 10_000);
+    try {
+      const response = await fetch(`${this.opts.origin}/api/read-token`, {
+        headers: { 'x-kranz-token': token },
+        cache: 'no-store',
+        redirect: 'error',
+        credentials: 'omit',
+        signal: request.signal,
+      });
+      if (!response.ok) throw new Error('read-token exchange failed');
+      const body: unknown = await response.json();
+      if (typeof body !== 'object' || body === null || !('token' in body) ||
+          typeof body.token !== 'string' || body.token === '') {
+        throw new Error('invalid read-token response');
+      }
+      if (this.closed || this.authRequest !== request) return;
+      if (resolveToken() !== token) {
+        this.connect();
+        return;
+      }
+      this.openSocket(body.token);
+    } catch {
+      if (!this.closed && this.authRequest === request) {
+        this.opts.onStatus('lost');
+        this.scheduleReconnect();
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (this.authRequest === request) this.authRequest = null;
+    }
+  }
+
+  private openSocket(readToken: string | null): void {
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.url());
+      ws = new WebSocket(this.url(readToken));
     } catch {
       this.scheduleReconnect();
       return;
@@ -117,6 +165,8 @@ export class MissionSocket {
 
   close(): void {
     this.closed = true;
+    this.authRequest?.abort();
+    this.authRequest = null;
     this.unsubscribeToken();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
@@ -129,13 +179,12 @@ export class MissionSocket {
     }
   }
 
-  private url(): string {
+  private url(readToken: string | null): string {
     const wsOrigin = this.opts.origin.replace(/^http/i, 'ws');
     const params = new URLSearchParams();
     const since = this.opts.getSince();
     if (since !== null) params.set('since', String(since));
-    const token = resolveToken();
-    if (token !== null) params.set('token', token);
+    if (readToken !== null) params.set('token', readToken);
     const query = params.toString();
     const q = query === '' ? '' : `?${query}`;
     const repoId = this.opts.repoId === undefined ? repoIdFromHash() : this.opts.repoId;

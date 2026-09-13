@@ -75,13 +75,15 @@ ACL grants and profiles. Cleanup failure is a non-success result, with Drop as
 a retry fallback. Overlapping leases retain shared boundary baselines until
 their grants are removed and inheritance is restored.
 
-Public-release audits additionally require an owner-supplied marker vocabulary.
-`KRANZ_REQUIRE_OPERATOR_MARKERS=1` fails on missing/empty input; tree checks
+Public releases require Gitleaks and the committed domain-policy check. An
+additional owner-supplied confidentiality vocabulary is optional; when configured,
+`KRANZ_REQUIRE_OPERATOR_MARKERS=1` fails on missing/empty input. Tree checks
 scan tracked paths and content, while history checks inspect all reachable
 objects and refuse shallow clones. Output contains counts, not private terms
 or matching content. Ordinary CI exercises this behavior with synthetic
 positive/negative fixtures; the release workflow consumes the reviewed Actions
-secret. An unconfigured optional CI scan is not an owner-vocabulary receipt.
+secret when present. An unconfigured optional scan explicitly reports its skip
+and is not an owner-vocabulary receipt.
 
 The `knowledge-refresh` job checks out full history, then runs
 `cargo run --locked --package kranz -- knowledge-refresh`. Full history is

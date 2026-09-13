@@ -6846,10 +6846,10 @@ SOFTWARE.
 ================================================================================
 MIT License (MIT)
 Used by:
-- kranz 0.2.0 <https://github.com/craigcode/kranz>
-- kranz-engine 0.2.0 <https://github.com/craigcode/kranz>
-- kranz-server 0.2.0 <https://github.com/craigcode/kranz>
-- kranz-slack 0.2.0 <https://github.com/craigcode/kranz>
+- kranz 0.2.1 <https://github.com/craigcode/kranz>
+- kranz-engine 0.2.1 <https://github.com/craigcode/kranz>
+- kranz-server 0.2.1 <https://github.com/craigcode/kranz>
+- kranz-slack 0.2.1 <https://github.com/craigcode/kranz>
 
 MIT License
 

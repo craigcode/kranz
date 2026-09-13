@@ -189,9 +189,14 @@ token (`--read-token` / `$KRANZ_READ_TOKEN` to pin it; generated otherwise)
 and stores it next to the mutation token with the same `0600` discipline:
 `<repo>/.kranz/serve.read.token` single-repo, or
 `~/.kranz/serve/<bound-endpoint>.read.token` for an operator-catalog serve.
+Pinned tokens must be non-empty visible ASCII without whitespace, and the read
+token must differ from the mutation token. The CLI rejects invalid values before
+binding, starting workers, printing credentials, or writing either token file.
 Wherever the read gate is armed (`--read-auth`, or any non-loopback bind),
 GET/HEAD `/api/...` and the WS upgrade accept EITHER token via
-`x-kranz-token` or `?token=`; mutating routes accept ONLY the mutation token
+`x-kranz-token`, but `?token=` accepts ONLY the read token. Mutation tokens
+in query strings no longer authenticate as of v0.2.1. Mutating routes accept
+ONLY the mutation token
 (presenting the read token there is the same `401` as any wrong token). The
 read token is therefore the one safe to hand to dashboards and agents — and
 the one a deployment should prefer for anything that only observes. Sandboxed
@@ -199,6 +204,26 @@ workers can reach neither file: the tier-2 Seatbelt/bwrap profiles explicitly
 deny reads of `.kranz/serve.token`, `.kranz/serve.read.token`, and
 `.kranz/config.json`, and the tier-3 container masks any such file under the
 session root with a `/dev/null` bind.
+
+### Browser read-token exchange
+
+`GET /api/read-token` returns `{"token":"<read-token-placeholder>"}` after validating
+an `x-kranz-token` header containing either the mutation token or the read token.
+This process-wide route is not repository-scoped. It always requires a valid
+header, even when loopback reads are otherwise anonymous; a query credential
+alone receives HTTP 401. Responses carry `Cache-Control: no-store`.
+
+The dashboard retains its existing credential for HTTP headers and exchanges
+it before each authenticated WebSocket connection. Only the returned read
+credential enters the socket URL. Failed exchanges retry without falling back
+to a mutation-token URL; closing or replacing a connection cancels its pending
+exchange. Anonymous loopback sockets still connect without a token.
+
+Embedders that omit a read token get a generated one through the same exchange.
+For compatibility, the infallible router constructor also replaces an empty read
+token or one equal to mutation authority with a distinct generated token; the CLI
+validates pinned values before calling it. Existing custom WebSocket clients must use read
+authority in their query or send a valid `x-kranz-token` header.
 
 ## WebSocket `GET /api/missions/:id/ws?since=<seq>`
 

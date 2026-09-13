@@ -4949,15 +4949,21 @@ async fn pause_resume_and_user_message_flow() {
         (engine, result)
     });
 
-    // Give the loop time to drain the Pause and settle; the snapshot (kept in
-    // lockstep by emit) must show Paused.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let snapshot = reducer::read_snapshot(&paths.state_file()).expect("state.json snapshot");
-    assert_eq!(
-        snapshot.mission.status,
-        MissionStatus::Paused,
-        "engine paused while waiting"
-    );
+    // Observe the applied Pause, rather than assuming startup and the first
+    // drain fit in 900 ms on a loaded Windows runner. The snapshot is kept in
+    // lockstep by emit; a loop that never pauses must still fail the bound.
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Ok(snapshot) = reducer::read_snapshot(&paths.state_file()) {
+                if snapshot.mission.status == MissionStatus::Paused {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("engine must apply Pause before proceeding");
 
     // Queue the user message WHILE PAUSED: a paused engine only drains its
     // inbox, so the message provably sits in pending_user_messages until the
@@ -4973,7 +4979,23 @@ async fn pause_resume_and_user_message_flow() {
         },
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(700)).await; // a drain tick passes
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Ok(snapshot) = reducer::read_snapshot(&paths.state_file()) {
+                if snapshot.mission.status == MissionStatus::Paused
+                    && snapshot
+                        .pending_user_messages
+                        .iter()
+                        .any(|text| text == "swap feature")
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("user message must be applied while paused, before Resume");
     control::enqueue(&paths, &ControlCommand::Resume).unwrap();
 
     let (engine, result) = timeout(TEST_TIMEOUT, handle)
@@ -4985,7 +5007,7 @@ async fn pause_resume_and_user_message_flow() {
     drop(engine);
 
     // The completion report folds the paused span out of the elapsed time
-    // and says so (mission.paused → mission.resumed is > 1s in this test).
+    // and says so for the observed mission.paused → mission.resumed interval.
     let report = std::fs::read_to_string(
         root.join(".kranz")
             .join("missions")

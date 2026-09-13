@@ -86,6 +86,11 @@ fn git_config_protection_refuses_active_absence_only_when_writable_and_mount_bas
 
 #[test]
 fn git_config_protection_resolves_linked_worktree_config_and_rename_ancestors() {
+    // Authority masks read HOME repeatedly. Keep the shared metadata check
+    // out of other fixtures' temporary HOME values and directory teardown.
+    let _env_lock = crate::agent_env::ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (_dir, mut inputs) = fixture();
     let main = inputs.session_cwd.clone();
     let worktree = main.join("linked");

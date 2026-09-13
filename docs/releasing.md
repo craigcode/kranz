@@ -27,7 +27,12 @@ Complete `docs/public-readiness.md`. In particular:
   and
 - no release tag already exists for the chosen version.
 
-Supply the owner's private vocabulary as one case-sensitive UTF-8 literal per line
+The normal release checks require the existing secret scanner and committed
+domain policy. An additional confidentiality word list is optional; the owner
+selected no additional list for v0.2.1. No new secret is needed for that choice.
+
+If additional confidential names or phrases must be blocked, supply one
+case-sensitive UTF-8 literal per line
 in a file outside the checkout (`KRANZ_PUBLIC_AUDIT_MARKERS_FILE`), or through
 `KRANZ_PUBLIC_AUDIT_MARKERS`. Blank lines and `#` comments are ignored. Set
 `KRANZ_REQUIRE_OPERATOR_MARKERS=1` for both candidate audits; missing, empty or
@@ -35,8 +40,11 @@ unreadable input fails. These checks print counts rather than vocabulary or
 matched content. The history check examines every reachable object, including
 deleted blobs, commit messages and identity headers, and refuses shallow history.
 Configure the repository Actions secret `KRANZ_PUBLIC_AUDIT_MARKERS` with the
-same reviewed vocabulary; the release workflow requires it for both audits.
-The fixed built-in marker checks and Gitleaks remain separate checks.
+same reviewed vocabulary. When configured, the release workflow requires it to
+be nonempty and pass both audits. When absent, it explicitly skips only this
+additional scan. Gitleaks and the committed domain policy remain mandatory.
+The domain policy has reviewed, path-specific exceptions; its private seed file
+is not interchangeable with a blanket confidentiality word list.
 
 These are human/operator gates. Neither Kranz nor a coding-agent mission pushes
 branches, tags, crates, formulas, or releases.
@@ -77,15 +85,16 @@ cargo fmt --all --check
 cargo build --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
-KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-tree.sh
-KRANZ_REQUIRE_OPERATOR_MARKERS=1 scripts/audit-public-history.sh
+target/debug/kranz domain-lint
+scripts/audit-public-tree.sh
+scripts/audit-public-history.sh
 ```
 
-For the two audit commands, point `KRANZ_PUBLIC_AUDIT_MARKERS_FILE` at the
-reviewed newline-delimited marker file outside the checkout and set
-`KRANZ_REQUIRE_OPERATOR_MARKERS=1`. Routine public CI runs Gitleaks over full
-history without those private strings; the tag workflow requires the matching
-masked repository secret and fails closed if it is absent.
+If the owner adds a confidentiality word list, point
+`KRANZ_PUBLIC_AUDIT_MARKERS_FILE` at that reviewed file outside the checkout
+and set `KRANZ_REQUIRE_OPERATOR_MARKERS=1` for both audit commands. Routine
+public CI and the release workflow scan full history with Gitleaks regardless
+of whether an additional word list is configured.
 
 Run the full dashboard gate from `apps/dashboard` and the locked Tauri check
 from `apps/dashboard/src-tauri`, as described in `AGENTS.md`. The release pull

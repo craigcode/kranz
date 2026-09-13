@@ -116,8 +116,17 @@ class OperatorMarkerAuditTests(unittest.TestCase):
         self.assertEqual(self.audit("history", TERM).returncode, 2)
 
     def test_unconfigured_optional_scan_preserves_existing_workflow(self):
-        self.assertEqual(self.audit("tree", required="0").returncode, 0)
-        self.assertEqual(self.audit("history", required="0").returncode, 0)
+        for scope in ("tree", "history"):
+            with self.subTest(scope=scope):
+                result = self.audit(scope, required="0")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("optional scan skipped", result.stdout)
+
+    def test_optional_mode_still_rejects_a_configured_match(self):
+        self.track("private.txt", TERM.encode())
+        for scope in ("tree", "history"):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.audit(scope, TERM, required="0").returncode, 1)
 
 
 if __name__ == "__main__":
