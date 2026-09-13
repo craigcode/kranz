@@ -134,7 +134,7 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # These ACL/handle regressions need no machine-wide host preparation.
+      # These Git-layout/ACL regressions need no machine-wide host preparation.
       # Run them first so cleanup failures report native descriptor evidence
       # without waiting for the slower host and production-gate proofs.
       - name: Check Windows ACL lease and process cleanup
@@ -143,6 +143,7 @@ jobs:
         timeout-minutes: 15
         run: |
           for name in \
+            appcontainer_windows::tests::self_test_worktree_supports_git_configuration_validation \
             appcontainer_windows::tests::gitlink_aliases_never_receive_generic_metadata_denies \
             appcontainer_windows::tests::boundary_parent_rejects_package_delete_child_grants \
             appcontainer_windows::tests::boundary_baseline_survives_a_late_joiner_and_preserves_explicit_rules \

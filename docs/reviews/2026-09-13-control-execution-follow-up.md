@@ -121,5 +121,14 @@ Local validation parsed the workflow, checked every checkout's setting and
 knowledge's full-history fetch, passed the macOS CI structure check, and verified
 all ten knowledge notes. A disposable repository also proved that the current
 binary passes without persisted authentication, refuses a checkout-shaped
-conditional include, and passes again when that include is absent. Hosted CI
-must still rerun against the corrected workflow.
+conditional include, and passes again when that include is absent.
+
+The second PR run cleared the checkout and lint failures, then exposed incomplete
+Git metadata in the Windows production normal-gate fixture. Its gitlink and
+`commondir` were sufficient for ACL layout checks, but hardened Git correctly
+refused the missing repository structure. Both production receipts and two
+positive ACL-layout fixtures now share a writer for valid unborn primary and
+linked repositories. An early Windows regression checks both hardened handles,
+their resolved metadata paths, and configuration-protection preflight; removing
+the linked `HEAD` must still fail. This check runs before host preparation and
+makes no ACL changes. Native Windows validation of that repair remains pending.

@@ -3561,6 +3561,40 @@ impl Drop for SelfTestRoot {
     }
 }
 
+fn write_self_test_worktree(repo: &Path, worktree: &Path, name: &str) -> Result<()> {
+    let repo = local_dos_path(repo);
+    let worktree = local_dos_path(worktree);
+    let common = repo.join(".git");
+    let gitdir = common.join("worktrees").join(name);
+    for path in [
+        common.join("objects"),
+        common.join("refs/heads"),
+        gitdir.clone(),
+    ] {
+        std::fs::create_dir_all(path)?;
+    }
+    std::fs::create_dir_all(&worktree)?;
+    // A gitlink and commondir alone pass the ACL layout parser but are not a
+    // Git repository. Keep both unborn HEADs and the shared metadata valid so
+    // production config validation runs, without importing host init templates.
+    std::fs::write(
+        common.join("config"),
+        "[core]\nrepositoryformatversion = 0\nbare = false\n",
+    )?;
+    std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n")?;
+    std::fs::write(gitdir.join("HEAD"), format!("ref: refs/heads/{name}\n"))?;
+    std::fs::write(gitdir.join("commondir"), "../..\n")?;
+    std::fs::write(
+        gitdir.join("gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )?;
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", gitdir.display()),
+    )?;
+    Ok(())
+}
+
 /// Exercise the exact production helper, ACL lease, validator denial, stdio
 /// inheritance, and hard-offline fs+net posture. The CLI integration test and
 /// Windows CI invoke this private entry point; the protected receipt is the
@@ -3622,7 +3656,6 @@ fn production_hostile_self_test() -> Result<String> {
     // grant is the only authority a regular AppContainer would have to write.
     let broad_app_packages = toolchain.join("broad-app-packages");
     let trusted_git = repo.join(".git");
-    let worktree_git = trusted_git.join("worktrees").join("self-test");
     for path in [
         &mission,
         &worktree,
@@ -3631,13 +3664,13 @@ fn production_hostile_self_test() -> Result<String> {
         &real_checkout,
         &toolchain,
         &broad_app_packages,
-        &worktree_git,
         &kranz_dir,
     ] {
         std::fs::create_dir_all(path).map_err(|error| {
             EngineError::Backend(format!("failed to create {}: {error}", path.display()))
         })?;
     }
+    write_self_test_worktree(&repo, &worktree, "self-test")?;
     // Make the sibling root deliberately accessible to the broad principal
     // carried by regular AppContainers. The hostile write can stay denied
     // only if the production child is actually LPAC and opts out of that
@@ -3678,11 +3711,6 @@ fn production_hostile_self_test() -> Result<String> {
     std::fs::write(&real_source, "must-not-read")?;
     let shared_git_marker = trusted_git.join("inspection-marker");
     std::fs::write(&shared_git_marker, "git-readable")?;
-    std::fs::write(
-        worktree.join(".git"),
-        format!("gitdir: {}\n", worktree_git.display()),
-    )?;
-    std::fs::write(worktree_git.join("commondir"), "../..\n")?;
     let gitlink_before = snapshot_dacl(&worktree.join(".git"))?;
 
     let source_executable = std::env::current_exe().map_err(|error| {
@@ -4081,24 +4109,18 @@ pub fn run_production_gate_self_test() -> std::result::Result<String, String> {
 fn production_gate_self_test() -> Result<String> {
     let root = SelfTestRoot::create()?;
     let repo = root.0.join("repo");
-    let trusted_git = repo.join(".git");
-    let worktree_git = trusted_git.join("worktrees").join("phase-5-gate");
     let mission = repo
         .join(".kranz")
         .join("missions")
         .join("m-production-gate-self-test");
     let worktree = root.0.join("worktree");
     let rust_src = worktree.join("rust-gate").join("src");
-    for path in [&worktree_git, &mission, &worktree, &rust_src] {
+    for path in [&mission, &worktree, &rust_src] {
         std::fs::create_dir_all(path).map_err(|error| {
             EngineError::Backend(format!("failed to create {}: {error}", path.display()))
         })?;
     }
-    std::fs::write(
-        worktree.join(".git"),
-        format!("gitdir: {}\n", worktree_git.display()),
-    )?;
-    std::fs::write(worktree_git.join("commondir"), "../..\n")?;
+    write_self_test_worktree(&repo, &worktree, "phase-5-gate")?;
     std::fs::write(repo.join(".kranz").join("serve.token"), "must-not-cross")?;
 
     // GitHub's hosted Node image lives under a host-owned protected toolcache.
@@ -4424,6 +4446,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn self_test_worktree_supports_git_configuration_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture_root = root.path().canonicalize().unwrap();
+        let repo = fixture_root.join("repo");
+        let worktree = fixture_root.join("worktree with spaces");
+        write_self_test_worktree(&repo, &worktree, "fixture").unwrap();
+        let common = repo.join(".git");
+        for (checkout, expected_git) in [
+            (&repo, common.clone()),
+            (&worktree, common.join("worktrees/fixture")),
+        ] {
+            let git = crate::git_ops::GitRepo::open(checkout).unwrap();
+            let (git_dir, common_dir, worktree_config) = git.config_protection_paths().unwrap();
+            assert_eq!(
+                comparable_path(&crate::sandbox::absolutize(&git_dir)),
+                comparable_path(&crate::sandbox::absolutize(&expected_git))
+            );
+            assert_eq!(
+                comparable_path(&crate::sandbox::absolutize(&common_dir)),
+                comparable_path(&crate::sandbox::absolutize(&common))
+            );
+            assert!(!worktree_config);
+        }
+        let inputs = crate::sandbox::SandboxInputs {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            session_cwd: worktree,
+            mission_dir: repo.join(".kranz/missions/m-fixture"),
+            tmpdir: fixture_root.join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        crate::sandbox::validate_git_config_protection(&inputs, false).unwrap();
+        // Malformed repository state remains a refusal, never a reason for a
+        // self-test-specific bypass in the production protection check.
+        std::fs::remove_file(common.join("worktrees/fixture/HEAD")).unwrap();
+        assert!(crate::sandbox::validate_git_config_protection(&inputs, false).is_err());
+    }
+
+    #[test]
     fn recursive_grants_reserve_only_the_isolated_worktree_authority_namespace() {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("worktree");
@@ -4448,10 +4510,7 @@ mod tests {
                 .is_err(),
             "a recursive write grant must not cover redirected Git metadata"
         );
-        let gitdir = shared_git.join("worktrees/test");
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        write_self_test_worktree(&root.path().join("repo"), &cwd, "test").unwrap();
         validate_recursive_roots(&inputs, &[cwd.clone(), scratch], &[], &shared_git).unwrap();
         assert!(validate_recursive_roots(&inputs, &[cwd.join(".git")], &[], &shared_git).is_err());
         for forbidden in [
@@ -4509,15 +4568,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("worktree");
         let mission = root.path().join("repo/.kranz/missions/m-test");
-        let gitdir = root.path().join("repo/.git/worktrees/test");
         let scratch = root.path().join("scratch");
         let toolchain = root.path().join("toolchain");
         let alias = root.path().join("alias");
-        for path in [&cwd, &mission, &gitdir, &scratch, &toolchain, &alias] {
+        for path in [&cwd, &mission, &scratch, &toolchain, &alias] {
             std::fs::create_dir_all(path).unwrap();
         }
-        std::fs::write(cwd.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        write_self_test_worktree(&root.path().join("repo"), &cwd, "test").unwrap();
         let executable = toolchain.join("probe.exe");
         std::fs::write(&executable, "fixture").unwrap();
         let inputs = crate::sandbox::SandboxInputs {
