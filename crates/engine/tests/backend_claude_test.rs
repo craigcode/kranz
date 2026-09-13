@@ -657,28 +657,13 @@ fn discover_accepts_configured_script_that_reports_a_version() {
 }
 
 #[test]
-fn discover_with_nonexistent_configured_path_falls_through_or_lists_attempts() {
-    let bogus = if cfg!(windows) {
-        r"C:\definitely\not\here\claude-nope.exe"
-    } else {
-        "/definitely/not/here/claude-nope"
-    };
-    match discover_claude_binary(Some(bogus)) {
-        // A real claude elsewhere on this machine: the bogus configured path
-        // fell through instead of hard-failing.
-        Ok(found) => assert_ne!(found, PathBuf::from(bogus)),
-        // Nothing else found: the error must list what was tried.
+fn discover_rejects_relative_configured_path_before_any_probe() {
+    match discover_claude_binary(Some("./claude-not-authorized")) {
         Err(EngineError::Config(msg)) => {
-            assert!(
-                msg.contains(bogus),
-                "error must list the configured attempt: {msg}"
-            );
-            assert!(
-                msg.contains("claude"),
-                "error should mention other candidates: {msg}"
-            );
+            assert!(msg.contains("./claude-not-authorized"), "{msg}");
+            assert!(msg.contains("must be an absolute path"), "{msg}");
         }
-        Err(other) => panic!("expected Config error, got {other:?}"),
+        other => panic!("expected configured-path refusal, got {other:?}"),
     }
 }
 

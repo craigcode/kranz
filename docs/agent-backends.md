@@ -33,6 +33,10 @@ boundary.
 Binary overrides such as `KRANZ_CLAUDE_BIN`, `KRANZ_CODEX_BIN`,
 `KRANZ_DROID_BIN`, `KRANZ_KIMI_BIN`, and `KRANZ_CURSOR_BIN` are exclusive: a
 bad override fails loudly rather than falling back to another executable.
+For Claude, a nonempty `claudeBinary` configuration takes precedence over
+`KRANZ_CLAUDE_BIN`; either selection is exclusive. A failed or timed-out version
+probe reports that path and its failure. PATH and known installation locations
+are searched only when neither override is supplied.
 Role-specific backend and model selection lives in `.kranz/config.json`; use
 `kranz config show` to inspect the effective merged configuration.
 

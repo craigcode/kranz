@@ -169,10 +169,10 @@ pub(crate) mod win_job {
 
 /// Locate a working `claude` binary.
 ///
-/// Order: `configured` → `KRANZ_CLAUDE_BIN` env var → `claude` on PATH →
-/// well-known install locations. Each candidate is validated by running it
-/// with `--version`; the first one that succeeds wins. Errors list every
-/// attempt so the user can see what was tried.
+/// A nonempty `configured` path is exclusive; otherwise a nonempty
+/// `KRANZ_CLAUDE_BIN` is exclusive. A failed `--version` probe returns the
+/// selected path and cause without trying another executable. Only absent
+/// overrides permit discovery through PATH and then well-known locations.
 ///
 /// A RELATIVE `configured` path is refused outright rather than tried
 /// (audit 2026-09-01 H1): candidate one is executed, and a relative path
@@ -184,22 +184,6 @@ pub(crate) mod win_job {
 /// refusal at the execution site, for the callers that pass a raw string.
 pub fn discover_claude_binary(configured: Option<&str>) -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(configured) = configured {
-        let trimmed = configured.trim();
-        if !trimmed.is_empty() && !Path::new(trimmed).is_absolute() {
-            return Err(EngineError::Config(format!(
-                "configured claude binary {trimmed:?} must be an absolute path: a relative \
-                 path resolves against the process working directory, so which program runs \
-                 depends on where kranz was invoked"
-            )));
-        }
-        candidates.push(PathBuf::from(configured));
-    }
-    if let Some(env_bin) = std::env::var_os("KRANZ_CLAUDE_BIN") {
-        if !env_bin.is_empty() {
-            candidates.push(PathBuf::from(env_bin));
-        }
-    }
     // Bare names resolve through PATH (std::process handles .cmd/.exe lookup
     // rules per-platform).
     candidates.push(PathBuf::from("claude"));
@@ -209,6 +193,43 @@ pub fn discover_claude_binary(configured: Option<&str>) -> Result<PathBuf> {
         candidates.push(PathBuf::from("claude.exe"));
     }
     candidates.extend(fallback_candidates());
+    discover_claude_binary_from(
+        configured,
+        std::env::var_os("KRANZ_CLAUDE_BIN").as_deref(),
+        candidates,
+        probe_version,
+    )
+}
+
+/// Explicit inputs keep selection tests independent of installed backends.
+fn discover_claude_binary_from(
+    configured: Option<&str>,
+    env_bin: Option<&std::ffi::OsStr>,
+    candidates: Vec<PathBuf>,
+    mut probe: impl FnMut(&Path) -> std::result::Result<String, String>,
+) -> Result<PathBuf> {
+    let explicit = if let Some(configured) = configured.filter(|s| !s.trim().is_empty()) {
+        if !Path::new(configured).is_absolute() {
+            return Err(EngineError::Config(format!(
+                "configured claude binary {configured:?} must be an absolute path: a relative \
+                 path resolves against the process working directory, so which program runs \
+                 depends on where kranz was invoked"
+            )));
+        }
+        Some((PathBuf::from(configured), "claudeBinary"))
+    } else {
+        env_bin
+            .filter(|path| !path.is_empty())
+            .map(|path| (PathBuf::from(path), "KRANZ_CLAUDE_BIN"))
+    };
+    if let Some((candidate, source)) = explicit {
+        return probe(&candidate).map(|_| candidate.clone()).map_err(|why| {
+            EngineError::Config(format!(
+                "{source} override {} failed: {why}; refusing to fall back to another executable",
+                candidate.display()
+            ))
+        });
+    }
 
     // Dedupe, preserving priority order.
     let mut deduped: Vec<PathBuf> = Vec::new();
@@ -220,7 +241,7 @@ pub fn discover_claude_binary(configured: Option<&str>) -> Result<PathBuf> {
 
     let mut attempts: Vec<String> = Vec::new();
     for candidate in deduped {
-        match probe_version(&candidate) {
+        match probe(&candidate) {
             Ok(_version) => return Ok(candidate),
             Err(why) => attempts.push(format!("{} ({why})", candidate.display())),
         }
@@ -1380,6 +1401,166 @@ impl AgentSession for ClaudeSession {
 
     fn exit_status(&self) -> Option<SessionExit> {
         self.exit.clone()
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn claude_discovery_explicit_selection_never_probes_another_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("configured claude ");
+        let environment = root.path().join("environment-claude");
+        let fallback = root.path().join("fallback-claude");
+        for use_config in [true, false] {
+            let selected = if use_config {
+                &configured
+            } else {
+                &environment
+            };
+            for failure in [
+                None,
+                Some("--version exited with status 17"),
+                Some("--version did not exit within 3s (killed)"),
+            ] {
+                let mut attempts = Vec::new();
+                let result = discover_claude_binary_from(
+                    use_config.then(|| configured.to_str().unwrap()),
+                    Some(environment.as_os_str()),
+                    vec![fallback.clone()],
+                    |path| {
+                        attempts.push(path.to_path_buf());
+                        if path == selected {
+                            failure
+                                .map_or_else(|| Ok("fixture version".into()), |why| Err(why.into()))
+                        } else {
+                            Ok("successful fallback sentinel".into())
+                        }
+                    },
+                );
+                assert_eq!(attempts, vec![selected.clone()]);
+                if let Some(why) = failure {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains(&selected.display().to_string()), "{error}");
+                    assert!(error.contains(why), "{error}");
+                    assert!(
+                        error.contains(if use_config {
+                            "claudeBinary"
+                        } else {
+                            "KRANZ_CLAUDE_BIN"
+                        }),
+                        "{error}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), *selected);
+                }
+            }
+        }
+        assert!(discover_claude_binary_from(
+            Some(" /not-an-absolute-path"),
+            None,
+            vec![fallback],
+            |_| panic!("relative configured paths must be refused before probing"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn claude_discovery_automatic_selection_preserves_order_and_deduplication() {
+        let first = PathBuf::from("path-claude");
+        let second = PathBuf::from("known-location-claude");
+        let mut attempts = Vec::new();
+        let found = discover_claude_binary_from(
+            None,
+            None,
+            vec![first.clone(), first.clone(), second.clone()],
+            |path| {
+                attempts.push(path.to_path_buf());
+                if path == first {
+                    Err("not executable".into())
+                } else {
+                    Ok("fixture version".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(found, second);
+        assert_eq!(attempts, vec![first.clone(), second.clone()]);
+        let error = discover_claude_binary_from(
+            Some("  "),
+            Some(std::ffi::OsStr::new("")),
+            vec![first, second],
+            |_| Err("fixture unavailable".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("path-claude (fixture unavailable)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("known-location-claude (fixture unavailable)"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_discovery_failed_and_hung_overrides_never_execute_working_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let staged = root.path().join(format!(".{name}.tmp"));
+            let path = root.path().join(name);
+            std::fs::write(&staged, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(staged, &path).unwrap();
+            path
+        };
+        let fallback = script(
+            "fallback",
+            "printf probed > \"$0.marker\"; printf 'fixture version' ",
+        );
+        let marker = fallback.with_extension("marker");
+        assert_eq!(probe_version(&fallback).unwrap(), "fixture version");
+        assert!(marker.exists(), "the fallback sentinel works");
+        std::fs::remove_file(&marker).unwrap();
+        for (name, body, cause) in [
+            (
+                "failed",
+                "printf intentional-probe-failure >&2; exit 17",
+                "intentional-probe-failure",
+            ),
+            ("hung", "exec /bin/sleep 30", "did not exit within 3s"),
+        ] {
+            let explicit = script(name, body);
+            for use_config in [true, false] {
+                let mut attempts = Vec::new();
+                let start = std::time::Instant::now();
+                let error = discover_claude_binary_from(
+                    use_config.then(|| explicit.to_str().unwrap()),
+                    Some(if use_config {
+                        fallback.as_os_str()
+                    } else {
+                        explicit.as_os_str()
+                    }),
+                    vec![fallback.clone()],
+                    |path| {
+                        attempts.push(path.to_path_buf());
+                        probe_version(path)
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+                assert_eq!(attempts, vec![explicit.clone()]);
+                assert!(error.contains(cause), "{error}");
+                assert!(error.contains(&explicit.display().to_string()), "{error}");
+                assert!(!marker.exists(), "explicit failure executed the fallback");
+                assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            }
+        }
     }
 }
 

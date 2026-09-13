@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-12
+last_verified: 2026-09-13
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
@@ -47,6 +47,11 @@ them. New `worker.spawned` records carry resolved backend provenance alongside
 the model, including sequential, buffered parallel and pool runs. Missing
 provenance never satisfies a strict review requirement. See
 [config composition](../../config-composition.md#reviewer-independence-reviewerindependence).
+
+An explicit Claude executable selection is authoritative: `claudeBinary` takes
+precedence over `KRANZ_CLAUDE_BIN`, and a failed probe returns its cause without
+selecting a different installed executable. PATH and well-known locations are
+searched only when neither override is present.
 
 Accounting groups token use and estimates missing cost from the recorded run
 backend; reported cost, including zero, remains authoritative. Legacy runs

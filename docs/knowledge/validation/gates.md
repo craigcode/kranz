@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-12
+last_verified: 2026-09-13
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -154,7 +154,11 @@ Selected command assertions can carry explicit valid/defective controls.
 Approval and final validation run the same approved command in read-only,
 contained disposable checkouts and record fresh advisory evidence. A positive
 behavioral-check receipt is required: setup errors, zero tests and timeouts
-remain inconclusive. Controls never replace ordinary validation or the
+remain inconclusive. Their execution directory is the read-only checkout;
+writable sandbox roots remain private scratch. The control-specific runner
+retains the leader PID until same-group descendants are killed on completion,
+error, cancellation, or timeout. Ordinary gate execution is unchanged.
+Controls never replace ordinary validation or the
 empty-deliverable gate. See [critical assertion controls](../../contract-controls.md).
 
 `final_gate()` in [finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)

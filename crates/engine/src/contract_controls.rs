@@ -23,8 +23,8 @@ const MAX_CONTROLS: usize = 8;
 const TOTAL_BUDGET: Duration = Duration::from_secs(300);
 static CONTROL_EXECUTIONS: Mutex<()> = Mutex::new(());
 
-/// Dropping the awaiting mission operation stops subsequent control launches.
-/// A running bounded case retains ownership until it exits and is cleaned up.
+/// Dropping the awaiting mission operation cancels the active control and
+/// stops subsequent launches. Its runner retains ownership through cleanup.
 #[derive(Default)]
 pub(crate) struct CancellationGuard(Arc<AtomicBool>);
 
@@ -404,6 +404,7 @@ fn run_case(
         "KRANZ_CONTROL_RESULT".into(),
         scratch.join("result.json").display().to_string(),
     );
+    let env = crate::command_exec::gate_env_for_sandbox(&env, &sandbox);
     let mut environment_names: Vec<_> = env.keys().cloned().collect();
     environment_names.sort();
     let timeout = deadline
@@ -414,12 +415,13 @@ fn run_case(
     }
     check_budget(deadline, cancelled)?;
     let start = Instant::now();
-    let (exit_code, output) = crate::command_exec::run_shell_command_sandboxed_blocking(
+    let (exit_code, output) = crate::command_exec::run_control_command_sandboxed_blocking(
         &snapshot,
         assertion.command.as_deref().expect("validated command"),
         timeout,
         &env,
         &sandbox,
+        cancelled,
     );
     let dir = Dir::open_ambient_dir(&scratch, cap_std::ambient_authority())?;
     let receipt = crate::paths::read_regular_file_under(

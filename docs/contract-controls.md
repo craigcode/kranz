@@ -33,9 +33,14 @@ starts. In-flight Git setup and cleanup retain their own bounded deadlines, so
 the budget is not a strict wall-clock deadline including cleanup.
 Only one control evaluation executes per process at a time. Concurrent requests
 receive inconclusive busy evidence without queueing more commands. Cancelling
-an awaiting final-validation task prevents subsequent control launches; an
-already running case keeps its command deadline and cleans up its worktree
-before releasing capacity.
+an awaiting final-validation task stops the active case and subsequent launches.
+The control runner kills remaining members of its process group on completion,
+error, cancellation, or timeout, before worktree cleanup and capacity release.
+The leader remains unreaped until that signal, so its process identity cannot
+be reused for an unrelated process. Error paths also terminate the still-owned
+direct child if it has left the group. Descendants that deliberately leave the
+process group are outside this supervision guarantee; the sandbox remains the
+containment boundary.
 
 ## Checker result protocol
 
@@ -45,6 +50,8 @@ an adapter should write the receipt only when the variable is present, while
 preserving its ordinary exit status. `KRANZ_CONTROL_SCRATCH` names private writable
 scratch. HOME, temporary files, Cargo target output, and result receipts stay in
 scratch; the checkout and approved checking inputs are read-only.
+Commands execute from the checkout on both macOS and Linux. The Linux wrapper
+changes directory after entering containment without granting checkout writes.
 
 Successful behavioral checks:
 

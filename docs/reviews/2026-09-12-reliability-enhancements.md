@@ -1,5 +1,8 @@
 # Reliability enhancements review — 2026-09-12
 
+The [follow-up execution review](2026-09-13-control-execution-follow-up.md)
+records subsequently discovered execution defects and their corrections.
+
 The user approved these six improvements following the audit remediation.
 They strengthen consent, recovery, evidence, and resource boundaries within
 the positioning freeze; they do not add agent dispatch or prompting features.

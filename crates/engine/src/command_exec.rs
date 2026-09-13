@@ -437,6 +437,41 @@ pub(crate) struct WrappedCommand {
 }
 
 impl GateSandbox {
+    /// Controls execute from a read-only checkout while the ordinary gate
+    /// posture's cwd denotes writable scratch. Keep the mount inputs intact;
+    /// the inner shell changes directory only after entering containment.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    fn wrap_control_shell(
+        &self,
+        cwd: &std::path::Path,
+        command: &str,
+        env: &HashMap<String, String>,
+    ) -> crate::error::Result<WrappedCommand> {
+        match self {
+            Self::Seatbelt { .. } => self.wrap_shell(command, env),
+            Self::Bubblewrap { inputs } => Ok(WrappedCommand {
+                program: "bwrap".into(),
+                args: crate::sandbox::bubblewrap_args(
+                    inputs,
+                    std::path::Path::new("/bin/sh"),
+                    &[
+                        "-c".into(),
+                        "cd -- \"$1\" && exec /bin/sh -c \"$2\"".into(),
+                        "kranz-control".into(),
+                        cwd.display().to_string(),
+                        command.into(),
+                    ],
+                )?,
+                timeout_teardown: None,
+                #[cfg(windows)]
+                _appcontainer_context: None,
+            }),
+            _ => Err(crate::error::EngineError::Config(
+                "negative controls require native macOS/Linux containment".into(),
+            )),
+        }
+    }
+
     /// The enforcement level the wrap applies (`Off` when disabled) — the
     /// runner keys the fs+net offline-by-cache env adjustment on it.
     pub(crate) fn enforce(&self) -> crate::types::SandboxEnforce {
@@ -1007,7 +1042,7 @@ fn resolve_gate_sandbox_target(
 /// proxy (session infrastructure — see the module doc), so an `fs+net` gate
 /// is offline-by-cache: the explicit offline flag turns a missing crate into
 /// a clear cargo error instead of a kernel-denied socket.
-fn gate_env_for_sandbox(
+pub(crate) fn gate_env_for_sandbox(
     env: &HashMap<String, String>,
     sandbox: &GateSandbox,
 ) -> HashMap<String, String> {
@@ -1170,6 +1205,182 @@ pub(crate) fn run_shell_command_sandboxed_blocking(
             )
         })
     })
+}
+
+/// Controls own their descendant group through every exit, including a shell
+/// that exits after starting a child with redirected output. Ordinary gates
+/// retain their existing execution semantics.
+pub(crate) fn run_control_command_sandboxed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> (Option<i32>, String) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let env = gate_env_for_sandbox(env, sandbox);
+                    let wrapped = match sandbox.wrap_control_shell(cwd, command, &env) {
+                        Ok(wrapped) => wrapped,
+                        Err(error) => return (None, format!("control wrap failed: {error}")),
+                    };
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => return (None, format!("control runtime failed: {error}")),
+                    };
+                    let mut cmd = tokio::process::Command::new(&wrapped.program);
+                    cmd.args(&wrapped.args).env_clear();
+                    runtime.block_on(run_control_command_bounded(
+                        configure_bounded_child(cmd, cwd, &env),
+                        timeout,
+                        cancelled,
+                    ))
+                })
+                .join()
+                .unwrap_or_else(|_| (None, "control runner panicked".into()))
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (cwd, command, timeout, env, sandbox, cancelled);
+        (
+            None,
+            "negative controls require native macOS/Linux containment".into(),
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ControlChild(tokio::process::Child);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for ControlChild {
+    fn drop(&mut self) {
+        // Child::id becomes None after wait/reap. Never signal a cached PID.
+        crate::backend_claude::kill_unreaped_group(&self.0);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn control_leader_exited(pid: u32) -> std::io::Result<()> {
+    loop {
+        let exited = {
+            // SAFETY: zeroed siginfo_t is a valid output buffer. WNOWAIT
+            // observes our owned child and retains its zombie/PID for group
+            // kill. Keep siginfo_t's platform pointers out of async state.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                false
+            } else {
+                unsafe { info.si_pid() != 0 }
+            }
+        };
+        if exited {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn run_control_command_bounded(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> (Option<i32>, String) {
+    use std::sync::atomic::Ordering;
+    if cancelled.load(Ordering::Acquire) {
+        return (None, "control evaluation cancelled".into());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => ControlChild(child),
+        Err(error) => return (None, format!("failed to spawn control: {error}")),
+    };
+    let stdout = child.0.stdout.take().expect("stdout is piped");
+    let stderr = child.0.stderr.take().expect("stderr is piped");
+    let capture = async { tokio::try_join!(read_stream_tail(stdout), read_stream_tail(stderr)) };
+    tokio::pin!(capture);
+    let leader = control_leader_exited(child.0.id().expect("unreaped child has an id"));
+    tokio::pin!(leader);
+    let cancellation = async {
+        while !cancelled.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::pin!(cancellation);
+    let mut output = None;
+    let execution = async {
+        loop {
+            tokio::select! {
+                result = &mut leader => return result.map_err(|error| format!("control wait failed: {error}")),
+                () = &mut cancellation => return Err("control evaluation cancelled".into()),
+                result = &mut capture, if output.is_none() => {
+                    output = Some(result.map_err(|error| format!("control output failed: {error}"))?);
+                }
+            }
+        }
+    };
+    let result = match tokio::time::timeout(timeout, execution).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+    };
+    // No Child::wait/try_wait has run: even on normal exit its zombie pins the
+    // process group identity until every same-group descendant is killed.
+    crate::backend_claude::kill_unreaped_group(&child.0);
+    if result.is_err() {
+        // A live leader can leave its original group. Its still-owned PID
+        // remains safe to target directly; do not wait indefinitely for it.
+        let _ = child.0.start_kill();
+    }
+    let status = child.0.wait().await;
+    if let Err(error) = result {
+        return (None, error);
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => return (None, format!("control reap failed: {error}")),
+    };
+    let (stdout, stderr) = match output {
+        Some(output) => output,
+        None => match tokio::time::timeout(Duration::from_secs(1), &mut capture).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return (None, format!("control output failed: {error}")),
+            Err(_) => {
+                return (
+                    None,
+                    "control output remained open after group cleanup".into(),
+                )
+            }
+        },
+    };
+    let mut combined = stdout;
+    if !stderr.trim().is_empty() {
+        combined.push_str("\n--- stderr ---\n");
+        combined.push_str(stderr.trim_end());
+    }
+    (
+        status.code(),
+        tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
+    )
 }
 
 /// Child setup shared by every bounded run: piped stdout/stderr (drained
@@ -1638,6 +1849,325 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::runner;
+
+    #[test]
+    fn control_wrapper_keeps_scratch_mounts_and_positional_snapshot_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("scratch");
+        let snapshot = root.path().join("readonly snapshot's checkout");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        let inputs = gate_sandbox_inputs(
+            &fs_sandbox_config(crate::types::SandboxEnforce::Fs),
+            &scratch,
+            &root.path().join(".kranz/missions/control"),
+            &scratch,
+        );
+        let sandbox = GateSandbox::Bubblewrap {
+            inputs: Box::new(inputs),
+        };
+        let command = "sh check.sh && printf '%s' \"$HOME\"";
+        let wrapped = sandbox
+            .wrap_control_shell(&snapshot, command, &HashMap::new())
+            .unwrap();
+        let chdir = wrapped
+            .args
+            .iter()
+            .position(|arg| arg == "--chdir")
+            .unwrap();
+        assert_eq!(
+            wrapped.args[chdir + 1],
+            std::fs::canonicalize(&scratch)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            &wrapped.args[chdir + 2..],
+            &[
+                "--",
+                "/bin/sh",
+                "-c",
+                "cd -- \"$1\" && exec /bin/sh -c \"$2\"",
+                "kranz-control",
+                &snapshot.display().to_string(),
+                command,
+            ]
+        );
+        let writes: Vec<_> = wrapped
+            .args
+            .windows(3)
+            .filter(|args| args[0] == "--bind")
+            .map(|args| args[2].clone())
+            .collect();
+        assert!(writes.contains(
+            &std::fs::canonicalize(&scratch)
+                .unwrap()
+                .display()
+                .to_string()
+        ));
+        assert!(!writes.contains(&snapshot.display().to_string()));
+        assert!(GateSandbox::Disabled
+            .wrap_control_shell(&snapshot, command, &HashMap::new())
+            .is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn control_wait_retains_the_leader_until_group_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]).env_clear();
+        let mut child = ControlChild(
+            configure_bounded_child(command, root.path(), &HashMap::new())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id().unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(3), control_leader_exited(pid))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        crate::backend_claude::kill_unreaped_group(&child.0);
+        assert_eq!(child.0.wait().await.unwrap().code(), Some(7));
+        assert!(
+            child.0.id().is_none(),
+            "the drop guard cannot signal a reaped PID"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn control_timeout_kills_a_leader_outside_its_original_group() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("escaped-leader");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "command_exec::tests::control_escaped_leader_fixture",
+                "--nocapture",
+            ])
+            .env_clear();
+        let command = configure_bounded_child(
+            command,
+            root.path(),
+            &HashMap::from([(
+                "KRANZ_CONTROL_ESCAPED_LEADER".into(),
+                ready.display().to_string(),
+            )]),
+        );
+        let (code, output) = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_control_command_bounded(
+                command,
+                Duration::from_secs(1),
+                &std::sync::atomic::AtomicBool::new(false),
+            ),
+        )
+        .await
+        .expect("cleanup must terminate the escaped direct child before waiting");
+        let evidence =
+            std::fs::read_to_string(ready).expect("fixture moved out of its original group");
+        let (pid, group) = evidence.split_once(' ').unwrap();
+        assert_ne!(pid, group, "fixture must leave its original group");
+        assert_eq!(code, None, "{output}");
+        assert!(output.contains("timed out"), "{output}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    #[ignore = "disposable subprocess fixture for direct-child timeout cleanup"]
+    fn control_escaped_leader_fixture() {
+        let Some(ready) = std::env::var_os("KRANZ_CONTROL_ESCAPED_LEADER") else {
+            return;
+        };
+        // Only this disposable child changes group. The supervisor must target
+        // its original group and owned PID, never signal the parent's group.
+        let group = unsafe { libc::getpgid(libc::getppid()) };
+        assert!(group > 0);
+        assert_eq!(unsafe { libc::setpgid(0, group) }, 0);
+        std::fs::write(ready, format!("{} {group}", std::process::id())).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn control_abort_cleans_unreaped_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let marker = root.path().join("survived");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(sleep 1; printf survived > \"$MARKER\") >/dev/null 2>&1 & printf ready > \"$READY\"; wait",
+            ])
+            .env_clear();
+        let command = configure_bounded_child(
+            command,
+            root.path(),
+            &HashMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("READY".into(), ready.display().to_string()),
+                ("MARKER".into(), marker.display().to_string()),
+            ]),
+        );
+        let task = tokio::spawn(async move {
+            run_control_command_bounded(
+                command,
+                Duration::from_secs(5),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checker started before cancellation");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "aborted runner left a live descendant");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn control_wrapper_reads_snapshot_and_cleans_every_exit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _lock = GATE_SANDBOX_WRAP_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !gate_wrap_enforcement_available() {
+            return;
+        }
+        let _env = crate::agent_env::EnvTestGuard::engage(&[(
+            "KRANZ_CONTROL_AMBIENT_SENTINEL",
+            "not-authorized",
+        )]);
+        let (repo, mission) = gate_wrap_layout();
+        let snapshot = repo.path().join("readonly snapshot's checkout");
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join("checker-input"), "approved").unwrap();
+        let checker = r#"set -eu
+[ "$(cat checker-input)" = approved ]
+[ -z "${KRANZ_CONTROL_AMBIENT_SENTINEL+x}" ]
+[ "$CARGO_NET_OFFLINE" = true ]
+if (printf changed > checker-input) 2>/dev/null; then exit 90; fi
+if [ "$MODE" = inherited ]; then
+  (sleep 2; printf survived > "$CONTROL_MARKER") &
+else
+  (sleep 2; printf survived > "$CONTROL_MARKER") >/dev/null 2>&1 &
+fi
+printf ready > "$CONTROL_READY"
+printf control-stdout
+printf control-stderr >&2
+case "$MODE" in
+  nonzero) exit 7;;
+  timeout|cancel) wait;;
+esac
+"#;
+        std::fs::write(snapshot.join("check.sh"), checker).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let sandbox = resolve_gate_sandbox(
+            &fs_sandbox_config(crate::types::SandboxEnforce::FsNet),
+            scratch.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+        )
+        .unwrap()
+        .sandbox;
+        let mut markers = Vec::new();
+        for mode in ["success", "nonzero", "inherited", "timeout", "cancel"] {
+            let marker = scratch.path().join(format!("{mode}.survived"));
+            let ready = scratch.path().join(format!("{mode}.ready"));
+            let env = HashMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("MODE".into(), mode.into()),
+                ("CONTROL_MARKER".into(), marker.display().to_string()),
+                ("CONTROL_READY".into(), ready.display().to_string()),
+            ]);
+            let cancelled = AtomicBool::new(false);
+            let (code, output) = std::thread::scope(|scope| {
+                let ready = &ready;
+                let cancelled = &cancelled;
+                if mode == "cancel" {
+                    scope.spawn(move || {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while !ready.exists() {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "checker did not start"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        cancelled.store(true, Ordering::Release);
+                    });
+                }
+                run_control_command_sandboxed_blocking(
+                    &snapshot,
+                    "sh check.sh",
+                    Duration::from_secs(if mode == "timeout" { 1 } else { 5 }),
+                    &env,
+                    &sandbox,
+                    cancelled,
+                )
+            });
+            assert!(ready.exists(), "{mode}: checker did not run: {output}");
+            match mode {
+                "timeout" => {
+                    assert_eq!(code, None);
+                    assert!(output.contains("timed out"));
+                }
+                "cancel" => {
+                    assert_eq!(code, None);
+                    assert!(output.contains("cancelled"));
+                }
+                _ => {
+                    assert_eq!(
+                        code,
+                        Some(if mode == "nonzero" { 7 } else { 0 }),
+                        "{output}"
+                    );
+                    assert!(output.contains("control-stdout"), "{output}");
+                    assert!(output.contains("control-stderr"), "{output}");
+                }
+            }
+            markers.push(marker);
+        }
+        // Prove the delayed marker works without supervision; all supervised
+        // same-group children must be gone even when they closed both pipes.
+        let control = scratch.path().join("unsupervised.survived");
+        let mut positive = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 2; printf survived > \"$1\"",
+                "positive",
+                &control.display().to_string(),
+            ])
+            .spawn()
+            .unwrap();
+        assert!(positive.wait().unwrap().success());
+        assert!(control.exists());
+        for marker in markers {
+            assert!(
+                !marker.exists(),
+                "descendant survived cleanup: {}",
+                marker.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("checker-input")).unwrap(),
+            "approved"
+        );
+    }
 
     #[test]
     fn tail_chars_keeps_the_end() {

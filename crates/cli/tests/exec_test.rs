@@ -1,9 +1,9 @@
 //! Integration tests for `kranz exec` — fully headless missions for CI.
 //!
-//! No real `claude` binary is ever spawned: `cmd_exec` needs a backend, so it
-//! is exercised only through its pure helpers. Parsing is checked with clap
-//! `try_parse_from`; the plan-file parse path is checked by feeding
-//! ticket-shaped markdown to `parse_mission_markdown` and asserting the folded
+//! No installed `claude` binary is ever spawned: the SIGINT test uses an
+//! explicit shell fixture, and other coverage exercises pure helpers.
+//! Parsing is checked with clap `try_parse_from`; the plan-file parse path feeds
+//! ticket-shaped markdown to `parse_mission_markdown` and asserts the folded
 //! mission goal carries the goal / acceptance criteria; the outcome→exit-code
 //! mapping is checked directly on `exit_code_for`.
 
@@ -289,8 +289,10 @@ fn non_terminal_statuses_map_to_failure() {
 #[cfg(unix)]
 #[test]
 fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command as Process, Stdio};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     let dir = tempfile::tempdir().unwrap();
@@ -329,19 +331,34 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         "---\ntitle: Interrupt fixture\n---\n\n## Goal\nImplement a fixture.\n",
     )
     .unwrap();
-    let pids = dir.path().join("pids.json");
+    let pids = dir.path().join("pids 'quoted'.json");
     let fake = dir.path().join("claude");
-    std::fs::write(&fake, format!(
-        "#!/usr/bin/env python3\nimport json,os,pathlib,subprocess,sys,time\nif '--version' in sys.argv:\n print('2.1.0 (Claude Code)'); sys.exit(0)\nchild=subprocess.Popen(['sleep','300'])\npathlib.Path({:?}).write_text(json.dumps([os.getpid(),child.pid]))\ntime.sleep(300)\n",
-        pids.to_str().unwrap()
-    )).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let staged_fake = dir.path().join(".claude.tmp");
+    let quoted_pids = format!("'{}'", pids.to_str().unwrap().replace('\'', "'\\''"));
+    std::fs::write(
+        &staged_fake,
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             if [ \"${{1-}}\" = --version ]; then\n\
+               printf '%s\\n' '2.1.0 (Claude Code)'\n\
+               exit 0\n\
+             fi\n\
+             /bin/sleep 300 &\n\
+             tool=$!\n\
+             printf '[%s,%s]\\n' \"$$\" \"$tool\" > {quoted_pids}\n\
+             wait \"$tool\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged_fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(staged_fake, &fake).unwrap();
     std::fs::write(
         authority.join("config.json"),
         serde_json::json!({"claudeBinary":fake}).to_string(),
     )
     .unwrap();
-    let child = Process::new(env!("CARGO_BIN_EXE_kranz"))
+    let mut child = Process::new(env!("CARGO_BIN_EXE_kranz"))
         .args([
             "--repo",
             repo.to_str().unwrap(),
@@ -355,9 +372,33 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain continuously: a full stderr pipe must not prevent startup, and
+    // failure diagnostics must not wait for a still-running child to exit.
+    let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&stderr_tail);
+    let mut stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        const LIMIT: usize = 16 * 1024;
+        let mut chunk = [0; 4096];
+        while let Ok(read) = stderr.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            let mut tail = captured.lock().unwrap();
+            tail.extend_from_slice(&chunk[..read]);
+            let excess = tail.len().saturating_sub(LIMIT);
+            tail.drain(..excess);
+        }
+    });
     struct Cleanup {
         child: std::process::Child,
         pids: std::path::PathBuf,
+        stderr_tail: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Cleanup {
+        fn stderr(&self) -> String {
+            String::from_utf8_lossy(&self.stderr_tail.lock().unwrap()).into_owned()
+        }
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -365,10 +406,10 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
             let _ = self.child.wait();
             if let Ok(bytes) = std::fs::read(&self.pids) {
                 if let Ok(ids) = serde_json::from_slice::<Vec<u32>>(&bytes) {
-                    let _ = Process::new("sh")
+                    let _ = Process::new("/bin/sh")
                         .args([
                             "-c",
-                            "kill -s KILL -- \"$1\"",
+                            "kill -KILL \"$1\"",
                             "kranz-test",
                             &format!("-{}", ids[0]),
                         ])
@@ -382,6 +423,7 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
     let mut running = Cleanup {
         child,
         pids: pids.clone(),
+        stderr_tail,
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     let ids: Vec<u32> = loop {
@@ -392,13 +434,39 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         }
         assert!(
             running.child.try_wait().unwrap().is_none(),
-            "CLI exited before starting the fixture"
+            "CLI exited before starting the fixture; stderr:\n{}",
+            running.stderr()
         );
-        assert!(Instant::now() < deadline, "fixture backend did not start");
+        assert!(
+            Instant::now() < deadline,
+            "fixture backend did not start; stderr:\n{}",
+            running.stderr()
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
+    assert_eq!(ids.len(), 2, "fixture must record backend and tool PIDs");
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(ids[0], running.child.id());
+    // The backend must own a group distinct from the CLI, otherwise killing
+    // only the CLI could accidentally satisfy the descendant-cleanup check.
+    // The -SIGNAL form handles negative group IDs in both dash and macOS sh.
+    assert!(
+        Process::new("/bin/sh")
+            .args([
+                "-c",
+                "kill -0 \"$1\"",
+                "kranz-test",
+                &format!("-{}", ids[0]),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "fixture backend does not own its process group"
+    );
     // POSIX shells provide kill even on minimal hosts without /bin/kill.
-    assert!(Process::new("sh")
+    assert!(Process::new("/bin/sh")
         .args([
             "-c",
             "kill -s INT \"$1\"",
@@ -413,12 +481,16 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         if let Some(status) = running.child.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "CLI did not exit after SIGINT");
+        assert!(
+            Instant::now() < deadline,
+            "CLI did not exit after SIGINT; stderr:\n{}",
+            running.stderr()
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(status.code(), Some(130));
+    assert_eq!(status.code(), Some(130), "stderr:\n{}", running.stderr());
     for pid in ids {
-        while Process::new("sh")
+        while Process::new("/bin/sh")
             .args(["-c", "kill -0 \"$1\"", "kranz-test", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
