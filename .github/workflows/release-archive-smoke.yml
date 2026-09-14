@@ -1,0 +1,70 @@
+name: release archive smoke
+
+# Execute already-built archives on matching native hosts. Each archive must
+# attest to the requested source and the release workflow before execution.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Release workflow run containing the archives"
+        required: true
+        type: string
+      source_ref:
+        description: "Attested source ref (refs/heads/main or refs/tags/vX.Y.Z)"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact release source commit"
+        required: true
+        type: string
+      version:
+        description: "Expected CLI version without the v prefix"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  attestations: read
+
+env:
+  KRANZ_SMOKE_SOURCE_REF: ${{ inputs.source_ref }}
+  KRANZ_SMOKE_SOURCE_SHA: ${{ inputs.source_sha }}
+  KRANZ_SMOKE_VERSION: ${{ inputs.version }}
+
+jobs:
+  archive:
+    name: smoke ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: kranz-linux-x86_64
+          - os: macos-latest
+            asset: kranz-macos-aarch64
+          - os: macos-15-intel
+            asset: kranz-macos-x86_64
+          - os: windows-latest
+            asset: kranz-windows-x86_64
+          - os: windows-11-arm
+            asset: kranz-windows-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          name: ${{ matrix.asset }}
+          path: archive
+
+      - name: Verify provenance and execute native archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KRANZ_SMOKE_ASSET: ${{ matrix.asset }}
+        run: python scripts/verify-release-archive-probe.py
