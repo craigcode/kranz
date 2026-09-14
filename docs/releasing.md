@@ -120,10 +120,13 @@ harness tests use the debug example by default and require Seatbelt on macOS or 
 
 ## 3. Rehearse crate packaging honestly
 
-Cargo removes workspace `path` dependencies when publishing and resolves their
-version from the target registry. Therefore a dependent crate cannot complete
-a crates.io dry-run until its sibling version is actually visible there. A
-claim that all four crates can dry-run before *any* publication is false.
+Cargo removes workspace `path` dependencies when packaging. For a single
+dependent crate, its sibling version must already be visible in the target
+registry. Current Cargo also supports a workspace-wide dry run, staging the
+selected packages together so unpublished siblings can be verified before
+upload. This path was exercised with Cargo 1.97.1 for v0.2.3; the application's
+Rust 1.88 build floor does not imply every older Cargo has the same publishing
+options. See the [Cargo publish reference](https://doc.rust-lang.org/cargo/commands/cargo-publish.html).
 
 Before publication:
 
@@ -132,13 +135,16 @@ cargo package --list -p kranz-engine
 cargo package --list -p kranz-server
 cargo package --list -p kranz-slack
 cargo package --list -p kranz
-cargo publish --dry-run -p kranz-engine
+cargo publish --workspace --dry-run --locked
 ```
 
 Inspect every package list for secrets, runtime state, oversized fixtures, and
-unintended generated files. If the release requires proof of all dependent
-packages before the first irreversible publish, use a disposable local Cargo
-registry; do not mislabel a crates.io-resolution failure as a source defect.
+unintended generated files. Keep `--dry-run` explicit: a workspace publication
+without it uploads all selected packages. Actual release uploads below remain
+one package at a time, with an immediate dry run and registry verification at
+each step. With an older Cargo that cannot stage a workspace, use a disposable
+local registry for the pre-publication proof; do not mislabel a missing sibling
+version in crates.io as a source defect.
 
 ## 4. Merge, tag, and approve GitHub publication
 
