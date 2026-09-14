@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-14
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
@@ -17,6 +17,11 @@ verified_against:
 
 A strategic decision about what kranz is, made 2026-07-29. Work that
 contradicts it should be flagged against this ADR, not reconciled quietly.
+
+Rechecked 2026-09-14 against the
+[ACP/gate integration scope](../../scoping/acp-worker-gate-contract.md).
+Its consent, external-check and evidence work uses the shipped dispatch seams;
+it adds no code-generation pool, prompt optimizer or cross-feature context reuse.
 
 **Kranz is a governance and evidence layer for agent work. It is not an
 execution harness. One line: kranz dispatches, gates, records and proves.

@@ -16,6 +16,12 @@ Format:
 
 ## Now
 
+- **ACP consent and external gate integration** - finish the live governance workflow on the shipped ACP, gate, pack and evidence foundations.
+  Why: The missing work is exact one-call consent, typed external checks, stage authority and proven containment; rebuilding the foundations would duplicate shipped code.
+  Trigger: Resolve the proposed D-A…D-H decisions while delivering the contract and released-adapter compatibility slices; live calls get a bounded operator-authorized proof.
+  Source: docs/scoping/acp-worker-gate-contract.md; docs/roadmap.md
+  Ticket: gate-evaluation-contract-v1; acp-adapter-compatibility-proof (entry slices; seven-ticket dependency chain in the scope)
+
 - **Roadmap surface v1** - keep `/kranz roadmap` backed by this tracked file so strategic options remain visible from Slack.
   Why: The backlog shows captured work, and `/kranz todo` shows immediate human actions; this file keeps conditional futures from collapsing into either.
   Trigger: Maintain whenever roadmap/scoping docs add or retire a strategic option.
