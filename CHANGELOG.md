@@ -3,7 +3,21 @@
 Notable user-visible changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.2 - 2026-09-13
+
+- Includes the server security fixes prepared for the unpublished v0.2.1
+  candidate below.
+- Fixed release verification on Linux: install and probe bubblewrap, enable
+  the required user namespaces on the ephemeral runner, and use the same
+  linker and disk preparation as regular CI. Enforced gates remain mandatory.
+- Added a manual release rehearsal that verifies source and builds every
+  platform archive before tagging; manual runs cannot publish a release.
+
 ## 0.2.1 - 2026-09-13
+
+Tagged candidate only; no GitHub binaries or crates.io packages were published.
+Release verification stopped because its runner lacked bubblewrap. The public
+tag is retained, and v0.2.2 carries the corrected release workflow.
 
 - Security: non-JSON POST bodies with no Content-Length, including chunked
   requests, now receive HTTP 415. Known-empty requests remain supported.

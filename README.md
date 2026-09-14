@@ -98,7 +98,7 @@ from its root.
 silently install the older `0.0.1` placeholder:
 
 ```sh
-cargo install kranz --version 0.2.1 --locked
+cargo install kranz --version 0.2.2 --locked
 ```
 
 If crates.io reports that `0.2.1` is unavailable, use the source install above.

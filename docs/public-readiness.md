@@ -43,7 +43,7 @@ production distribution.
   pull-request ref fetched.
 - The existing secret scan and committed domain-policy check pass. An
   additional confidentiality word list is optional; the owner selected no
-  additional list for v0.2.1. If one is configured, both audits must pass with
+  additional list for v0.2.1 and v0.2.2. If one is configured, both audits must pass with
   `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the matching reviewed
   `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret.
 - Mission records, tickets, fixtures, and review documents have received a

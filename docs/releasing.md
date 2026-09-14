@@ -29,7 +29,7 @@ Complete `docs/public-readiness.md`. In particular:
 
 The normal release checks require the existing secret scanner and committed
 domain policy. An additional confidentiality word list is optional; the owner
-selected no additional list for v0.2.1. No new secret is needed for that choice.
+selected no additional list for v0.2.1 and v0.2.2. No new secret is needed for that choice.
 
 If additional confidential names or phrases must be blocked, supply one
 case-sensitive UTF-8 literal per line
@@ -140,8 +140,18 @@ registry; do not mislabel a crates.io-resolution failure as a source defect.
 
 ## 4. Merge, tag, and approve GitHub publication
 
-After the version pull request merges and `main` is green, create an annotated
-tag on that exact commit and push it as a separate human action:
+After the version pull request merges, rehearse the release workflow on `main`
+before creating the public tag:
+
+```sh
+gh workflow run release.yml --ref main -f tag=vX.Y.Z
+```
+
+The manual run performs source verification and all platform builds, and
+produces temporary workflow artifacts. Its publication job is disabled.
+Inspect those artifacts and wait for both this rehearsal and `main` CI to pass.
+Then create an annotated tag on that exact commit and push it as a separate
+human action:
 
 ```sh
 git switch main
