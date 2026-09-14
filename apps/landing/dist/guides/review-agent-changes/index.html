@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fafbff" />
+    <meta
+      name="description"
+      content="Review an AI coding agent's scope, diff, validation results, and merge checks in Kranz, with clear limits on backend and reviewer independence."
+    />
+    <meta property="og:title" content="Review agent changes with Kranz" />
+    <meta
+      property="og:description"
+      content="Review an AI coding agent's scope, diff, validation results, and merge checks in Kranz, with clear limits on backend and reviewer independence."
+    />
+    <meta property="og:type" content="article" />
+    <meta
+      property="og:url"
+      content="https://kranz.craigmartin.com/guides/review-agent-changes/"
+    />
+    <link
+      rel="canonical"
+      href="https://kranz.craigmartin.com/guides/review-agent-changes/"
+    />
+    <title>Review agent changes with Kranz</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%234a50df'/%3E%3Cpath d='M12 10v20m16-20L17 20l11 10' fill='none' stroke='white' stroke-width='4' stroke-linecap='square'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css?v=8cec34c0ffbe" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href="/" aria-label="Kranz home"
+        ><span class="brand-mark" aria-hidden="true">k</span>kranz<span
+          class="brand-period"
+          >.</span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="/#guides">All guides</a>
+        <a class="nav-source" href="https://github.com/craigcode/kranz"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main class="guide-page wrap" id="main">
+      <article>
+        <header class="guide-heading">
+          <p class="eyebrow">02 / REVIEW THE WORK</p>
+          <h1>Review agent changes with Kranz</h1>
+          <p class="guide-intro">
+            A useful review connects four things: what you approved, what the
+            agent changed, what was checked, and what still needs your judgment.
+            Kranz keeps those records together in a mission.
+          </p>
+        </header>
+        <div class="guide-content">
+          <nav class="guide-sequence" aria-label="Guide reading order">
+            <a href="/guides/first-mission/">First mission</a> →
+            <strong aria-current="page">Review</strong> →
+            <a href="/guides/validation-evidence/">Evidence</a>
+          </nav>
+          <h2>Start with the approved scope</h2>
+          <p>
+            Open the mission’s plan and acceptance criteria before reading the
+            diff. Identify the behavior the change should deliver and any
+            boundaries you set: files, dependencies, interfaces, or commands.
+            This gives you a basis for spotting both missing work and additions
+            you did not ask for.
+          </p>
+          <p>
+            For a health endpoint, for example, the review should cover the
+            response status, JSON shape, and integration test. An unrelated
+            authentication rewrite is a separate scope decision, even if the
+            worker describes it as cleanup.
+          </p>
+
+          <h2>Compare the diff with the result you wanted</h2>
+          <p>
+            Inspect the mission branch’s actual changes. Follow the code path
+            from input to output, check error handling, and read the tests
+            alongside the implementation. Pay particular attention to changed
+            dependency files, configuration, and permission boundaries.
+          </p>
+          <p>
+            Then compare the completion report with the diff. Every claim that
+            matters to acceptance should have supporting code or evidence. If
+            the report says a behavior was tested, find the corresponding check
+            and its result.
+          </p>
+
+          <h2>Read the checks and reviewer findings</h2>
+          <p>
+            Kranz runs contract commands and uses fresh validator sessions to
+            judge milestone work. Scrutiny examines the implementation against
+            the contract; functional review judges captured command results and
+            the relevant criteria. Failed rounds and repairs are part of the
+            record.
+          </p>
+          <p>
+            Look for the command that actually ran, its outcome, and any missing
+            or skipped checks. A successful process exit is weak evidence if the
+            test filter selected zero relevant tests. For user-facing changes,
+            also check whether the intended interaction was exercised.
+          </p>
+          <p>
+            Use the
+            <a href="/guides/validation-evidence/">validation evidence guide</a>
+            to distinguish command results, reviewer judgments, and missing
+            artifacts.
+          </p>
+
+          <h2>Check which agents did the work and review</h2>
+          <p>
+            Claude Code is Kranz’s default backend. Codex CLI and other runtimes
+            can be selected by role, subject to model and containment
+            requirements. Run <code>kranz config show</code> to inspect the
+            effective configuration and <code>kranz ready</code> before starting
+            a mission.
+          </p>
+          <p>
+            A fresh reviewer session does not by itself guarantee a different
+            model family. If you require that separation, configure
+            <code>reviewerIndependence</code> before creating the mission.
+            Approval pins that policy; the runtime checks it against recorded
+            worker attempts.
+          </p>
+          <p>
+            Containment is a separate constraint. Kranz’s enforced worker
+            sandbox modes currently support the Claude backend. Validators have
+            additional containment requirements, and an unsupported pairing
+            blocks by default. Read the
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/agent-backends.md"
+              >backend guide</a
+            >
+            and
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/config-composition.md#reviewer-independence-reviewerindependence"
+              >reviewer independence policy</a
+            >
+            when choosing roles.
+          </p>
+
+          <h2>Make the merge decision</h2>
+          <p>
+            When the mission is complete and the evidence supports acceptance,
+            use the dashboard’s Merge action. Kranz reads merge policy from the
+            pinned live base, creates a scratch integration of the mission
+            branch, and runs the applicable checks against that result.
+          </p>
+          <p>
+            A failure, conflict, or moving branch stops the merge. The worker
+            cannot weaken the checks judging its own change by editing its copy
+            of the merge policy. The base advances only to the tested
+            integration commit.
+          </p>
+          <p>
+            The merge decision remains yours. Check the
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/merge-gates.md"
+              >merge gate reference</a
+            >
+            when setting repository policy, and keep your normal review and push
+            process around the result.
+          </p>
+        </div>
+      </article>
+      <aside class="guide-related" aria-labelledby="related-title">
+        <p class="eyebrow" id="related-title">KEEP GOING</p>
+        <a href="/guides/first-mission/"
+          >Run your first AI coding mission with Kranz
+          <span aria-hidden="true">→</span></a
+        >
+        <a href="/guides/validation-evidence/"
+          >Understand AI coding validation evidence in Kranz
+          <span aria-hidden="true">→</span></a
+        >
+      </aside>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="brand" href="/">kranz<span class="brand-period">.</span></a>
+      <p>Named for Gene Kranz. Built to run the room.</p>
+      <a href="https://github.com/craigcode/kranz"
+        >Source &amp; documentation <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>

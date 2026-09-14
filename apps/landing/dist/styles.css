@@ -1351,6 +1351,165 @@ details[open] > summary h3 {
 .product-views {
   padding-block: 0 75px;
 }
+.guides {
+  border-top: 1px solid var(--line);
+}
+.guide-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+.guide-card {
+  display: flex;
+  flex-direction: column;
+  padding: 28px;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.guide-card:hover {
+  border-color: var(--blue);
+}
+.guide-card h3 {
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.4;
+  letter-spacing: -0.3px;
+}
+.guide-card p {
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1.65;
+  margin: 16px 0 28px;
+}
+.guide-link {
+  margin-top: auto;
+  color: var(--blue);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.guide-optional {
+  margin-top: 20px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.guide-optional .eyebrow {
+  margin-bottom: 12px;
+}
+.guide-optional p {
+  margin-bottom: 0;
+}
+.guide-optional .guide-link {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+.guide-page {
+  max-width: 800px;
+  padding-block: 70px;
+}
+.guide-heading {
+  padding-bottom: 35px;
+  border-bottom: 1px solid var(--line);
+}
+.guide-heading h1 {
+  margin: 0 0 24px;
+  font-size: clamp(2rem, 4.5vw, 3.5rem);
+  line-height: 1.12;
+  letter-spacing: -1.5px;
+}
+.guide-intro {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.25rem;
+  line-height: 1.7;
+}
+.guide-content {
+  font-size: 1.0625rem;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.guide-content h2 {
+  margin: 42px 0 16px;
+  font-size: 1.5rem;
+  line-height: 1.35;
+  letter-spacing: -0.4px;
+}
+.guide-content p {
+  margin: 0 0 20px;
+}
+.guide-content .guide-sequence {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 400;
+  margin-bottom: 20px;
+}
+.guide-content li + li {
+  margin-top: 12px;
+}
+.guide-content a {
+  color: var(--blue);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.guide-content a:hover {
+  color: var(--blue-dark);
+}
+.guide-content code {
+  font-family: var(--mono);
+  font-size: 0.875em;
+}
+.guide-content pre {
+  margin: 24px 0;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f1f3fa;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.guide-related {
+  margin-top: 52px;
+  padding-top: 28px;
+  border-top: 1px solid var(--line);
+}
+.guide-related a {
+  display: block;
+  width: fit-content;
+  margin: 18px 0;
+  color: var(--blue);
+  font-size: 1rem;
+  line-height: 1.6;
+}
+.guide-related a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+@media (max-width: 800px) {
+  .guide-grid {
+    grid-template-columns: 1fr;
+  }
+  .guide-optional {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+  }
+  .guide-page {
+    padding-block: 45px;
+  }
+}
+@media (max-width: 480px) {
+  .nav-features {
+    display: none;
+  }
+  .guide-intro {
+    font-size: 1.125rem;
+  }
+  .guide-content pre {
+    padding: 16px;
+  }
+}
 .product-capture {
   margin: 0;
 }

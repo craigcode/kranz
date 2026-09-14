@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fafbff" />
+    <meta
+      name="description"
+      content="Optionally connect Kranz to Slack: configure the app, tokens, and authorized users, then plan, approve, follow, and steer coding missions in threads."
+    />
+    <meta property="og:title" content="Set up Slack for Kranz missions" />
+    <meta
+      property="og:description"
+      content="Optional Slack setup and everyday commands for planning, approving, and following Kranz coding missions."
+    />
+    <meta property="og:type" content="article" />
+    <meta
+      property="og:url"
+      content="https://kranz.craigmartin.com/guides/slack/"
+    />
+    <link rel="canonical" href="https://kranz.craigmartin.com/guides/slack/" />
+    <title>Set up Slack for Kranz missions</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%234a50df'/%3E%3Cpath d='M12 10v20m16-20L17 20l11 10' fill='none' stroke='white' stroke-width='4' stroke-linecap='square'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css?v=8cec34c0ffbe" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href="/" aria-label="Kranz home"
+        ><span class="brand-mark" aria-hidden="true">k</span>kranz<span
+          class="brand-period"
+          >.</span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="/#guides">All guides</a>
+        <a class="nav-source" href="https://github.com/craigcode/kranz"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main class="guide-page wrap" id="main">
+      <article>
+        <header class="guide-heading">
+          <p class="eyebrow">OPTIONAL / SLACK</p>
+          <h1>Set up Slack for Kranz missions</h1>
+          <p class="guide-intro">
+            Plan in a thread, approve the work, and follow the result from
+            Slack. Your Kranz host still runs the mission; Slack is another way
+            to operate it.
+          </p>
+        </header>
+        <div class="guide-content">
+          <h2>Before you connect</h2>
+          <p>
+            Slack is optional. Complete the repository and agent setup in
+            <a href="/guides/first-mission/">your first mission</a> first. You
+            need permission to install a Slack app, a channel for mission
+            updates, and a machine that can keep Kranz running.
+          </p>
+          <p>
+            This walkthrough uses one Kranz host, one repository, and the
+            supplied manifest’s public-channel setup. If you already use
+            <code>host.repos</code>, configure the catalog’s per-repository
+            Slack routes; changing the terminal’s working directory does not
+            override that catalog. See the
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/scoping/m8-multi-root-host.md"
+              >multi-repository host reference</a
+            >.
+          </p>
+          <p>
+            The bridge uses
+            <a href="https://docs.slack.dev/apis/events-api/using-socket-mode/"
+              >Slack Socket Mode</a
+            >, so it connects outward to Slack. You do not need to expose your
+            dashboard or open a public webhook endpoint.
+          </p>
+
+          <h2>1. Create and install the Slack app</h2>
+          <ol>
+            <li>
+              Open
+              <a href="https://api.slack.com/apps">Slack’s app settings</a>,
+              choose to create an app from a manifest, and use
+              <a
+                href="https://github.com/craigcode/kranz/blob/main/docs/slack-app-manifest.yaml"
+                >Kranz’s app manifest</a
+              >. Review the requested permissions before installing it in your
+              workspace.
+            </li>
+            <li>
+              Under <strong>OAuth &amp; Permissions</strong>, copy the installed
+              app’s bot token, which starts with <code>xoxb-</code>.
+            </li>
+            <li>
+              Under <strong>Basic Information → App-Level Tokens</strong>,
+              generate an app token with
+              <a
+                href="https://docs.slack.dev/reference/scopes/connections.write/"
+                ><code>connections:write</code></a
+              >. This token starts with <code>xapp-</code>. Confirm Socket Mode
+              is enabled.
+            </li>
+            <li>
+              Add the Kranz app to the public channel you will use. Note the
+              channel’s Slack ID and your own Slack member ID for the
+              configuration below.
+            </li>
+          </ol>
+          <p>
+            The manifest defines <code>/kranz</code>, interactive buttons, the
+            App Home tab, and public-channel thread events. Private-channel and
+            direct-message conversations require additional Slack configuration;
+            they are outside this walkthrough.
+          </p>
+
+          <h2>2. Configure the host and authorized users</h2>
+          <p>
+            On the machine running Kranz, add or merge this
+            <code>slack</code> object into your user-level
+            <code>~/.kranz/config.json</code>. Preserve any existing settings.
+            Replace every example value; the IDs are Slack IDs, not display
+            names.
+          </p>
+          <pre><code>{
+  "slack": {
+    "botToken": "REPLACE_WITH_BOT_TOKEN",
+    "appToken": "REPLACE_WITH_APP_TOKEN",
+    "channel": "C0123456789",
+    "allowUsers": ["U0123456789"],
+    "allowAllUsers": false
+  }
+}</code></pre>
+          <p>
+            Keep tokens out of the repository and Slack messages. The bridge
+            reads these credentials from the user-level configuration, not the
+            repository’s <code>.kranz/config.json</code>. A host secret store
+            can instead supply <code>KRANZ_SLACK_BOT_TOKEN</code>,
+            <code>KRANZ_SLACK_APP_TOKEN</code>, and
+            <code>KRANZ_SLACK_CHANNEL</code>; those environment values take
+            precedence over the corresponding file fields.
+          </p>
+          <p>
+            <code>allowUsers</code> controls spending and mutation: creating or
+            planning missions, approvals, steering, and configuration changes.
+            An empty list with <code>allowAllUsers: false</code> authorizes
+            nobody for those actions. Read-only commands such as status remain
+            available to other app users, so this list is not a confidentiality
+            boundary for mission information.
+          </p>
+
+          <h2>3. Start the bridge and check the connection</h2>
+          <p>From the prepared repository, start one server process:</p>
+          <pre><code>kranz serve --slack</code></pre>
+          <p>
+            If <code>autoWork</code> is enabled, the server can also start
+            already queued missions. Review that queue before starting it.
+          </p>
+          <p>
+            If a Kranz server is already running, arrange a restart with
+            <code>--slack</code> when it is safe to do so. Keep the host running
+            and awake for Slack control. Missing token or channel configuration
+            leaves the bridge disabled; inspect the terminal’s connection
+            messages if it does not respond.
+          </p>
+          <p>
+            In the Slack channel’s main composer, send these commands
+            individually:
+          </p>
+          <pre><code>/kranz help
+/kranz status</code></pre>
+          <p>
+            These commands do not start an agent session. Use slash commands in
+            the channel; use ordinary replies inside a mission’s thread.
+          </p>
+
+          <h2>4. Plan, approve, and follow a mission</h2>
+          <p>
+            Use <code>/kranz new</code> to open a form for a goal, or send a
+            one-line goal:
+          </p>
+          <pre><code>/kranz new Add a GET /health endpoint with an integration test</code></pre>
+          <p>
+            Creating a mission starts a planning turn through your configured
+            agent runtime. Usage and costs follow that runtime. Answer the
+            orchestrator in the resulting thread. When the scope is ready,
+            request the plan from the channel, replacing the example ID with
+            your mission’s ID:
+          </p>
+          <pre><code>/kranz plan m-123abc</code></pre>
+          <p>
+            Review the plan, estimate, and acceptance criteria. Use the card’s
+            <strong>Approve &amp; start</strong> button to approve and begin, or
+            <strong>Approve &amp; queue</strong> to approve and enqueue it.
+            These buttons bind to the plan shown on the card; a stale card is
+            refused.
+          </p>
+          <p>
+            Queueing can lead to execution automatically if the host’s auto-work
+            setting is enabled. Otherwise, an authorized operator can trigger
+            the queue with <code>/kranz work run</code>. That command drains
+            queued work; <code>/kranz work</code> only reports the queue.
+          </p>
+          <p>
+            Follow updates in the mission thread. For targeted status and
+            control, use these commands individually:
+          </p>
+          <pre><code>/kranz status m-123abc
+/kranz pause m-123abc
+/kranz resume m-123abc</code></pre>
+          <p>
+            Pause is applied between worker runs; it is not an immediate process
+            kill. Ordinary thread replies continue planning or provide guidance
+            to a running mission. Read the recorded reason when work blocks or
+            fails.
+          </p>
+
+          <h2>5. Review the result and merge</h2>
+          <p>
+            Slack carries completion summaries and controls. Use the dashboard
+            for full transcripts, diffs, and detailed validation evidence. A
+            completed mission’s <strong>Merge</strong> action runs the same
+            repository merge gates as the dashboard. The ordinary merge stays
+            local; push reviewed work through your normal Git workflow.
+          </p>
+          <p>
+            Optionally set <code>slack.dashboardUrl</code> to your dashboard’s
+            base URL to add dashboard links to mission messages. That URL must
+            be reachable from the device opening it:
+            <code>http://127.0.0.1:4560/</code> works only on the Kranz host
+            itself. Slack connectivity does not make a local dashboard reachable
+            from your phone.
+          </p>
+          <p>
+            If commands are missing, check the app installation and manifest. If
+            replies in threads are missing, check app channel membership and the
+            manifest’s message subscription. If an action says “not authorized,”
+            check the invoking member’s ID in <code>allowUsers</code>.
+          </p>
+          <p>
+            Continue with
+            <a href="/guides/review-agent-changes/">reviewing agent changes</a>,
+            or consult the
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/knowledge/surfaces/slack-commands.md"
+              >current Slack command reference</a
+            >
+            for backlog and configuration commands.
+          </p>
+        </div>
+      </article>
+      <aside class="guide-related" aria-labelledby="related-title">
+        <p class="eyebrow" id="related-title">KEEP GOING</p>
+        <a href="/guides/first-mission/"
+          >Run your first AI coding mission with Kranz
+          <span aria-hidden="true">→</span></a
+        >
+        <a href="/guides/validation-evidence/"
+          >Understand AI coding validation evidence in Kranz
+          <span aria-hidden="true">→</span></a
+        >
+      </aside>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="brand" href="/">kranz<span class="brand-period">.</span></a>
+      <p>Named for Gene Kranz. Built to run the room.</p>
+      <a href="https://github.com/craigcode/kranz"
+        >Source &amp; documentation <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>
