@@ -15,6 +15,12 @@ python3 -m http.server 4173 --bind 127.0.0.1 --directory apps/landing/dist
 Open http://127.0.0.1:4173. Reload after editing the HTML, CSS, or JavaScript.
 The feature sections work without JavaScript; JavaScript adds expand/collapse all.
 
+All pages reference the stylesheet with a `?v=` value containing the first 12
+characters of its SHA-256 hash. When CSS changes, update that value on every
+page: Cloudflare caches unversioned CSS for four hours, so a new deployment
+alone can otherwise leave the previous styles active. Verify the exact asset
+URL referenced by the deployed HTML.
+
 ## Railway deployment
 
 The live URL is `https://kranz.craigmartin.com/`. The Dockerfile serves only
