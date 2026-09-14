@@ -195,6 +195,43 @@ merge requires reapproval/revalidation; and old/no-pack missions remain
 unchanged. The executable evidence matrix and closure record are in
 [`docs/reviews/flight-rules-m55-proof.md`](reviews/flight-rules-m55-proof.md).
 
+## Scoped follow-up — ACP worker and external gate contract (2026-09-14)
+
+The ACP backend, internal gate interface, pack contract and evidence spine
+already shipped (KRZ-301/311/312/313/325/326). The remaining work is to connect
+them into governed live dispatch: exact one-call permissions, external checks
+over pinned evidence, stage-specific authority and proven adapter containment.
+Design and proposed D-A…D-H decisions:
+[`docs/scoping/acp-worker-gate-contract.md`](scoping/acp-worker-gate-contract.md).
+
+- [ ] `gate-evaluation-contract-v1` — typed subjects, wire schemas, authority
+  matrix and additive lifecycle contract changes.
+- [ ] `acp-adapter-compatibility-proof` — released adapter/runtime fixtures,
+  authentication, actual model/report/cost behavior and cancellation proof.
+- [ ] `gate-subprocess-evaluator` — contained, bounded JSON-RPC checker process
+  registered through the existing pack contract.
+- [ ] `acp-live-permission-consent` — durable one-call decisions through the
+  CLI, server, Slack and dashboard without widening mission-wide grants.
+- [ ] `gate-lifecycle-evidence-integration` — approval, permission, milestone,
+  final and merge joins, restricted validator inputs and replay/export.
+- [ ] `acp-worker-containment-proof` — real adapter/descendant wrappers and
+  explicit platform support; callbacks alone are not a sandbox.
+- [ ] `acp-governed-mission-acceptance` — seeded defect, human consent,
+  independent checks, local merge and portable evidence in one synthetic mission.
+
+Sequence: contract and compatibility first; evaluator/lifecycle and live consent
+next; containment before the integrated acceptance claim. Proposed core scope
+is 25–41 engineering days for one contributor, including tests/review, subject
+to the design decisions and adapter/platform findings. Client fs/terminal
+mediation and same-feature ACP resume are separately estimated later slices.
+
+Done when: the acceptance mission delivers a nonempty change, binds every
+decision to exact policy/evidence, rejects stale consent and failed checks,
+survives interruption without replaying authorization, keeps primary checkout
+bytes untouched, and explains authorization, changes, checks and remaining human
+work from its exported evidence. Existing advisory/floor/waiver behavior stays
+intact. No push or automatic ACP-default promotion is part of this scope.
+
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; Railway live deploy operator-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP

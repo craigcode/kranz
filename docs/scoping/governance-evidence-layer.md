@@ -22,6 +22,12 @@ frozen/retained boundary: the ADR.
 
 ## Series map
 
+The substrate-status column below records the original planning baseline.
+For the 2026-09-14 review of the now-shipped ACP/gate/pack/evidence foundations
+and their remaining integration work, see
+[ACP worker and gate contract](acp-worker-gate-contract.md). Its seven follow-up
+tickets preserve the completed KRZ-301/311/312/313/325/326 records.
+
 | KRZ | Ticket slug | Pri | Blocked by | Substrate status |
 |-----|-------------|----:|------------|------------------|
 | 301 | `acp-worker-backend` | 1 | — | new; cursor ACP route decision is prior art |

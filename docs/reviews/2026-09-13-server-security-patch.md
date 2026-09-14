@@ -190,3 +190,36 @@ and the live CLI smoke test. The clean dashboard gates passed with 238 tests
 and the same embedded bundle; the standalone Tauri locked check also passed.
 Actionlint validates the workflow. The actual Linux release rehearsal is run
 after this change merges, before the v0.2.2 tag or publication.
+
+## Published archive verification and housekeeping disposition
+
+Reviewed 2026-09-14: [v0.2.2 is published](https://github.com/craigcode/kranz/releases/tag/v0.2.2).
+The successful [tag release run](https://github.com/craigcode/kranz/actions/runs/34795182574)
+built source `e233e12602a0fb854f88e0c2e90738e7d1bbfaf3`. The separate
+[native archive smoke run](https://github.com/craigcode/kranz/actions/runs/34796239523)
+passed on Linux x86_64, macOS arm64/x86_64 and Windows arm64/x86_64. Each host
+verified the archive attestation against the release workflow, exact tag and
+source commit before executing the expected binary. It checked the binary's
+native format/architecture, then `--version`, `--help` and `licenses` outside
+a checkout with a temporary home and no workflow credentials in the child.
+These are startup/provenance checks, not a live coding mission or containment
+certification.
+
+The probe read the tag workflow's build artifacts. Its recorded SHA-256 values
+match the published release assets inspected during this review:
+
+| Archive | SHA-256 |
+|---|---|
+| `kranz-linux-x86_64.tar.gz` | `5bc1be6262935a64cfbb59577d873c931ef174315d7e6c6a8f66f948b0460308` |
+| `kranz-macos-aarch64.tar.gz` | `0e0c468973e8283197bcea84182c724beaa117a709677f1252ed13f224dc1359` |
+| `kranz-macos-x86_64.tar.gz` | `a7193f1a732b56a975d78a53431b9b4b2ea98a6c53e0510c1110debbe22da76c` |
+| `kranz-windows-aarch64.zip` | `e9caf591e86b4f10b107b605b71bcc6e11185ccafc1220ea0bceef9dd83884f8` |
+| `kranz-windows-x86_64.zip` | `f12ed07557996188e810b540d57505d397f43c6b8bffa99a0113b6129246b585` |
+
+Disposition: retain `codex/release-artifact-smoke-v0.2.2` at
+`1918579ab28029c618b6077c3489e22c78fbb219` as verification history; do not merge
+its one-off workflow into main. Its trigger names that branch and its inputs
+pin one expiring Actions artifact run, so it would not provide ongoing release
+coverage on main. A reusable published-archive check can be scoped with the
+next release. The existing release pipeline remains authoritative. This
+documentation closeout changes no runtime code, dependency, version or tag.
