@@ -61,11 +61,23 @@
           </p>
         </header>
         <div class="guide-content">
+          <nav class="guide-sequence" aria-label="Guide reading order">
+            <strong aria-current="page">First mission</strong> →
+            <a href="/guides/review-agent-changes/">Review</a> →
+            <a href="/guides/validation-evidence/">Evidence</a>
+          </nav>
           <h2>1. Install Kranz and your agent runtime</h2>
           <p>
             You need Git, a Git repository to work in, and an installed,
-            authenticated agent runtime. Claude Code is the default. For a
-            source install, you also need Rust 1.88 or newer:
+            authenticated agent runtime. Claude Code is the default.
+          </p>
+          <p>
+            This walkthrough builds the current source, including fixes made
+            after the latest packaged release, and requires Rust 1.88 or newer.
+            Prebuilt binaries are also available; see the
+            <a href="https://github.com/craigcode/kranz#install"
+              >installation options and supported platforms</a
+            >.
           </p>
           <pre><code>git clone https://github.com/craigcode/kranz.git
 cargo install --path kranz/crates/cli --locked</code></pre>
@@ -146,6 +158,11 @@ kranz init</code></pre>
             <code>kranz status</code>.
           </p>
           <p>
+            Prefer to operate from a Slack thread? Follow the
+            <a href="/guides/slack/">optional Slack setup and usage guide</a>
+            to connect the same host for planning, approvals, and updates.
+          </p>
+          <p>
             Use the mission view to follow progress, review findings, and steer
             the work. A blocked or failed mission needs attention; read the
             recorded reason before resuming.
@@ -177,8 +194,7 @@ kranz init</code></pre>
       <aside class="guide-related" aria-labelledby="related-title">
         <p class="eyebrow" id="related-title">KEEP GOING</p>
         <a href="/guides/review-agent-changes/"
-          >Review Claude Code and Codex changes with Kranz
-          <span aria-hidden="true">→</span></a
+          >Review agent changes with Kranz <span aria-hidden="true">→</span></a
         >
         <a href="/guides/validation-evidence/"
           >Understand AI coding validation evidence in Kranz

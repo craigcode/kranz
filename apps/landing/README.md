@@ -84,24 +84,36 @@ Preview features and backend/containment limits must remain qualified.
 
 ## Guides and search metadata
 
-The homepage links three static guides under `dist/guides/`: first mission,
-reviewing agent changes, and validation evidence. Each directory has its own
-`index.html`, title, description, and production canonical URL. Caddy serves
+The homepage links four static guides under `dist/guides/`: first mission,
+reviewing agent changes, validation evidence, and optional Slack setup and
+usage. Each directory has its own `index.html`, title, description, and
+production canonical URL. Caddy serves
 these directories directly; no client-side router or JavaScript is required.
 The homepage keeps the visible product tagline and uses a descriptive search
-title. `robots.txt` advertises `sitemap.xml`, which lists all four content URLs.
+title. `robots.txt` advertises `sitemap.xml`, which lists all five content URLs.
 Update the sitemap when adding pages; change `lastmod` only for substantive
 content edits. These files enable discovery, not a promise of indexing.
 
 The September 14, 2026 content review checked the guides against CLI parsing,
 `init.rs`, `planning_tui.rs`, worker-isolation defaults, backend validation,
 reviewer-independence policy, merge behavior, and `evidence_bundle.rs`.
-The examples use current source installation and illustrative goals/mission
+The installation section identifies the current-source path and links published
+install options. A linked reading order connects the three core guides, and the
+review title applies across agent backends. The examples use illustrative goals/mission
 IDs. They do not claim a mission was run. Local inference need not incur
 vendor charges; immediate execution after plan approval is optional; fresh
 reviewer context does not itself guarantee a different model family; missing
 bundle artifacts remain unresolved. No release version change is needed for
 this static site update.
+
+The optional Slack guide was also checked against the shipped app manifest,
+Slack's official Socket Mode/app-token documentation, the global-only token
+loader, authorization rules, command help/router, host catalog selection,
+plan-bound approval buttons, and queue/auto-work behavior. Its token and ID
+values are placeholders. The guide distinguishes public-channel setup from
+private channels/DMs, spend authorization from read access, and Slack access
+from dashboard network access. No Slack app or user configuration was changed,
+and no messages or paid agent sessions were sent to validate this documentation.
 
 ## Product captures
 
@@ -134,6 +146,12 @@ membership. Local HTTP checks compared all nine page/asset responses with their
 source bytes. Browser review covered all guide content, desktop and 375px mobile
 layouts, navigation, and the existing expand/collapse controls. The CLI examples
 were checked against current help and source without starting a paid mission.
+
+The Slack follow-up extends those metadata, link, sitemap, and HTTP checks to
+five pages and ten page/asset responses. Desktop and 375px mobile review covers
+the optional homepage card and the Slack setup guide, including its configuration
+example. Current source and the public release inventory were checked when
+clarifying installation options.
 
 The Railway Caddy configuration was validated with Caddy 2.11.4 and exercised
 locally on port 4180: all four assets returned exact file bytes, gzip worked,

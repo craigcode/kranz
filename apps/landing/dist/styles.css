@@ -1388,6 +1388,23 @@ details[open] > summary h3 {
   font-size: 0.875rem;
   font-weight: 600;
 }
+.guide-optional {
+  margin-top: 20px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.guide-optional .eyebrow {
+  margin-bottom: 12px;
+}
+.guide-optional p {
+  margin-bottom: 0;
+}
+.guide-optional .guide-link {
+  margin-top: 0;
+  flex-shrink: 0;
+}
 .guide-page {
   max-width: 800px;
   padding-block: 70px;
@@ -1421,6 +1438,15 @@ details[open] > summary h3 {
 }
 .guide-content p {
   margin: 0 0 20px;
+}
+.guide-content .guide-sequence {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 400;
+  margin-bottom: 20px;
+}
+.guide-content li + li {
+  margin-top: 12px;
 }
 .guide-content a {
   color: var(--blue);
@@ -1463,6 +1489,11 @@ details[open] > summary h3 {
 @media (max-width: 800px) {
   .guide-grid {
     grid-template-columns: 1fr;
+  }
+  .guide-optional {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
   }
   .guide-page {
     padding-block: 45px;
