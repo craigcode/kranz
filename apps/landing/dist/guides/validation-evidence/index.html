@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fafbff" />
+    <meta
+      name="description"
+      content="Read Kranz contract checks, validator findings, merge results, and evidence bundles to understand what an AI coding mission actually proved."
+    />
+    <meta
+      property="og:title"
+      content="Understand AI coding validation evidence in Kranz"
+    />
+    <meta
+      property="og:description"
+      content="Read Kranz contract checks, validator findings, merge results, and evidence bundles to understand what an AI coding mission actually proved."
+    />
+    <meta property="og:type" content="article" />
+    <meta
+      property="og:url"
+      content="https://kranz.craigmartin.com/guides/validation-evidence/"
+    />
+    <link
+      rel="canonical"
+      href="https://kranz.craigmartin.com/guides/validation-evidence/"
+    />
+    <title>Understand AI coding validation evidence in Kranz</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%234a50df'/%3E%3Cpath d='M12 10v20m16-20L17 20l11 10' fill='none' stroke='white' stroke-width='4' stroke-linecap='square'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href="/" aria-label="Kranz home"
+        ><span class="brand-mark" aria-hidden="true">k</span>kranz<span
+          class="brand-period"
+          >.</span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="/#guides">All guides</a>
+        <a class="nav-source" href="https://github.com/craigcode/kranz"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main class="guide-page wrap" id="main">
+      <article>
+        <header class="guide-heading">
+          <p class="eyebrow">03 / FOLLOW THE EVIDENCE</p>
+          <h1>Understand AI coding validation evidence in Kranz</h1>
+          <p class="guide-intro">
+            Validation evidence should let you trace an acceptance claim to a
+            check or a recorded judgment. Start with one requirement, then
+            follow its implementation, result, and review.
+          </p>
+        </header>
+        <div class="guide-content">
+          <h2>Separate a command result from a judgment</h2>
+          <p>
+            A contract command records what ran and how it finished. A validator
+            interprets whether the implementation and results satisfy the agreed
+            criteria. Both matter: a test can pass while checking the wrong
+            thing, and a reviewer’s positive summary needs supporting evidence.
+          </p>
+          <p>
+            For an endpoint change, follow the acceptance criterion to the route
+            implementation, then to the test that makes the request and asserts
+            the response. Read the actual test result. Check that the test ran
+            and that failures would cause a nonzero exit.
+          </p>
+          <p>
+            Preserve uncertainty. A missing artifact, unavailable browser check,
+            or inconclusive result needs to remain visible in your decision.
+          </p>
+
+          <h2>Follow repairs through to the final result</h2>
+          <p>
+            Milestones can go through validation and repair rounds. Read why the
+            first attempt failed, what changed in response, and whether the
+            later check covers the original finding. Earlier passing output
+            cannot establish that a subsequently edited implementation still
+            passes.
+          </p>
+          <p>
+            Kranz’s mission record includes worker and validator sessions, gate
+            results, and decisions. Use the report as an entry point and follow
+            the underlying evidence for the criteria that matter most.
+          </p>
+          <p>
+            For interface changes, see
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/validating-uis.md"
+              >live UI validation</a
+            >. Its evidence should identify the interaction exercised and what
+            the validator observed.
+          </p>
+
+          <h2>Understand what the merge gate adds</h2>
+          <p>
+            Milestone validation judges the work as it progresses. The
+            human-triggered merge gate checks the proposed integration with the
+            current base branch. Kranz runs the repository’s applicable merge
+            commands in a scratch worktree and advances the base only to that
+            tested integration.
+          </p>
+          <p>
+            This matters when another change has landed since the mission began.
+            The
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/merge-gates.md"
+              >repository merge suite</a
+            >
+            should reflect the tests, build, and lint checks you require for the
+            combined result.
+          </p>
+
+          <h2>Export a portable review record</h2>
+          <p>
+            From the mission’s repository, export its evidence bundle to a new
+            or empty directory. Replace the example mission ID with the one you
+            are reviewing:
+          </p>
+          <pre><code>kranz evidence-bundle m-123abc --out ../mission-review</code></pre>
+          <p>
+            The bundle can be opened without repository access. Start with
+            <code>summary.md</code>, then use <code>manifest.json</code> to find
+            source references and SHA-256 hashes.
+            <code>chain.json</code> carries the provenance record,
+            <code>events.jsonl</code> the scrubbed event log, and
+            <code>artefacts/</code> the resolvable supporting text.
+          </p>
+          <p>
+            Unavailable artifacts appear as unresolved manifest entries. Their
+            absence is part of the evidence. Exported text is scrubbed for
+            supported secret patterns, but it can still contain source code and
+            private project information; review the bundle before sharing it.
+          </p>
+
+          <h2>Use the evidence to make a decision</h2>
+          <p>
+            You should be able to explain which requirement passed, what
+            supports that conclusion, who or what checked it, and which
+            questions remain open. An evidence bundle preserves that
+            explanation; a passing verdict still needs to be assessed against
+            the change you intend to accept.
+          </p>
+          <p>
+            Continue with
+            <a href="/guides/review-agent-changes/">the review workflow</a> or
+            <a href="/guides/first-mission/">run your first mission</a>.
+          </p>
+        </div>
+      </article>
+      <aside class="guide-related" aria-labelledby="related-title">
+        <p class="eyebrow" id="related-title">KEEP GOING</p>
+        <a href="/guides/first-mission/"
+          >Run your first AI coding mission with Kranz
+          <span aria-hidden="true">→</span></a
+        >
+        <a href="/guides/review-agent-changes/"
+          >Review Claude Code and Codex changes with Kranz
+          <span aria-hidden="true">→</span></a
+        >
+      </aside>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="brand" href="/">kranz<span class="brand-period">.</span></a>
+      <p>Named for Gene Kranz. Built to run the room.</p>
+      <a href="https://github.com/craigcode/kranz"
+        >Source &amp; documentation <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>

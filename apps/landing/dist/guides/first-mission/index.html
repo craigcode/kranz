@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fafbff" />
+    <meta
+      name="description"
+      content="Set up Kranz in a Git repository, approve a small coding plan, run your agent, and review the validated change before merging."
+    />
+    <meta
+      property="og:title"
+      content="Run your first AI coding mission with Kranz"
+    />
+    <meta
+      property="og:description"
+      content="Set up Kranz in a Git repository, approve a small coding plan, run your agent, and review the validated change before merging."
+    />
+    <meta property="og:type" content="article" />
+    <meta
+      property="og:url"
+      content="https://kranz.craigmartin.com/guides/first-mission/"
+    />
+    <link
+      rel="canonical"
+      href="https://kranz.craigmartin.com/guides/first-mission/"
+    />
+    <title>Run your first AI coding mission with Kranz</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%234a50df'/%3E%3Cpath d='M12 10v20m16-20L17 20l11 10' fill='none' stroke='white' stroke-width='4' stroke-linecap='square'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="brand" href="/" aria-label="Kranz home"
+        ><span class="brand-mark" aria-hidden="true">k</span>kranz<span
+          class="brand-period"
+          >.</span
+        ></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="/#guides">All guides</a>
+        <a class="nav-source" href="https://github.com/craigcode/kranz"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main class="guide-page wrap" id="main">
+      <article>
+        <header class="guide-heading">
+          <p class="eyebrow">01 / GET STARTED</p>
+          <h1>Run your first AI coding mission with Kranz</h1>
+          <p class="guide-intro">
+            Start with one small change you can check yourself. Kranz turns that
+            goal into an approved plan, work on a mission branch, and evidence
+            for your decision to merge.
+          </p>
+        </header>
+        <div class="guide-content">
+          <h2>1. Install Kranz and your agent runtime</h2>
+          <p>
+            You need Git, a Git repository to work in, and an installed,
+            authenticated agent runtime. Claude Code is the default. For a
+            source install, you also need Rust 1.88 or newer:
+          </p>
+          <pre><code>git clone https://github.com/craigcode/kranz.git
+cargo install --path kranz/crates/cli --locked</code></pre>
+          <p>
+            Kranz uses your existing agent runtime; it does not install it or
+            sign you into a vendor account. See the
+            <a
+              href="https://github.com/craigcode/kranz/blob/main/docs/agent-backends.md"
+              >backend setup guide</a
+            >
+            for supported runtimes and their authentication requirements.
+          </p>
+
+          <h2>2. Prepare the repository</h2>
+          <p>
+            In the repository you want the agent to change, initialize Kranz:
+          </p>
+          <pre><code>cd /path/to/your/repo
+kranz init</code></pre>
+          <p>
+            <code>kranz init</code> detects common Rust, Node, and Python checks
+            and creates the repository setup. Review the generated
+            <code>.kranz/merge-gates.json</code>: its commands should match the
+            checks you actually require before accepting work. For another
+            toolchain, supply a check explicitly, such as
+            <code>kranz init --gate "make verify"</code>.
+          </p>
+          <p>
+            Review and commit the setup files reported by <code>init</code>,
+            including the runtime ignore rules and merge policy. Then check
+            readiness:
+          </p>
+          <pre><code>kranz ready</code></pre>
+          <p>
+            Resolve readiness findings before starting. Backend, model,
+            authentication, and sandbox support affect which roles can run.
+          </p>
+
+          <h2>3. Plan one checkable change</h2>
+          <p>
+            Choose a goal with a clear expected result. For example, in a
+            service that already has an HTTP test suite:
+          </p>
+          <pre><code>kranz plan "Add a GET /health endpoint that returns 200 and a JSON status, with an integration test"</code></pre>
+          <p>
+            This starts an agent planning session using your configured runtime.
+            Hosted providers may incur charges. Discuss the scope, then use
+            <code>/plan</code> in the interactive session to render the proposal
+            and cost estimate. Before approving, check the acceptance criteria,
+            files in scope, test commands, and budget. Approval commits the plan
+            to a new mission branch.
+          </p>
+          <p>
+            A useful criterion names an observable behavior. “The endpoint
+            returns the agreed JSON and its integration test passes” gives the
+            reviewer something concrete to verify.
+          </p>
+
+          <h2>4. Run and follow the mission</h2>
+          <p>
+            After approval, the planner offers to start execution immediately.
+            If you chose to defer it, start the mission from the same
+            repository:
+          </p>
+          <pre><code>kranz run</code></pre>
+          <p>
+            Workers implement the planned features, and validators review
+            milestone results. In the default worktree mode, implementation
+            happens in a separate Git worktree. Usage and costs depend on your
+            configured runtime.
+          </p>
+          <p>
+            From another terminal in the same repository, open the dashboard:
+          </p>
+          <pre><code>kranz serve --open</code></pre>
+          <p>
+            For a one-time terminal status report instead, use
+            <code>kranz status</code>.
+          </p>
+          <p>
+            Use the mission view to follow progress, review findings, and steer
+            the work. A blocked or failed mission needs attention; read the
+            recorded reason before resuming.
+          </p>
+
+          <h2>5. Review before merging</h2>
+          <p>
+            A complete mission is ready for your review. Compare the actual diff
+            with the approved plan, read the validation results, and check any
+            remaining caveats. The dashboard’s Merge action runs the
+            repository’s merge gates against the proposed integration before
+            advancing the local base branch.
+          </p>
+          <p>
+            Ordinary mission execution and merging stay local. Push reviewed
+            work through your normal Git workflow when you are ready.
+          </p>
+          <p>
+            Continue with
+            <a href="/guides/review-agent-changes/">reviewing agent changes</a>,
+            or read the
+            <a href="https://github.com/craigcode/kranz#quick-start"
+              >CLI quick start</a
+            >
+            for more ways to steer a mission.
+          </p>
+        </div>
+      </article>
+      <aside class="guide-related" aria-labelledby="related-title">
+        <p class="eyebrow" id="related-title">KEEP GOING</p>
+        <a href="/guides/review-agent-changes/"
+          >Review Claude Code and Codex changes with Kranz
+          <span aria-hidden="true">→</span></a
+        >
+        <a href="/guides/validation-evidence/"
+          >Understand AI coding validation evidence in Kranz
+          <span aria-hidden="true">→</span></a
+        >
+      </aside>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="brand" href="/">kranz<span class="brand-period">.</span></a>
+      <p>Named for Gene Kranz. Built to run the room.</p>
+      <a href="https://github.com/craigcode/kranz"
+        >Source &amp; documentation <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>

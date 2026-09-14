@@ -65,8 +65,8 @@ valid HTTPS, verified ownership, and these Cloudflare DNS records (CNAME proxied
 | CNAME | `kranz` | `6zwzlo7u.up.railway.app` |
 | TXT | `_railway-verify.kranz` | `railway-verify=55c6e9ca37e8aecbcdd36f2e97c0fccfe1c001c425d1fcaa0223150097a4bfbb` |
 
-`craigcode/kranz` is currently private; its links are intentionally
-retained because the owner plans to make the repository public before launch.
+`craigcode/kranz` is public; source and documentation links are accessible
+without signing in.
 The optional `.openai/hosting.json` describes
 the static directory for Sites, but this deployment uses Railway.
 
@@ -81,6 +81,27 @@ Feature copy follows `README.md`, `docs/agent-backends.md`, `docs/roadmap.md`,
 When they differ, prefer current implementation and the positioning ADR over
 older quickstart prose. The mission card is explicitly illustrative.
 Preview features and backend/containment limits must remain qualified.
+
+## Guides and search metadata
+
+The homepage links three static guides under `dist/guides/`: first mission,
+reviewing agent changes, and validation evidence. Each directory has its own
+`index.html`, title, description, and production canonical URL. Caddy serves
+these directories directly; no client-side router or JavaScript is required.
+The homepage keeps the visible product tagline and uses a descriptive search
+title. `robots.txt` advertises `sitemap.xml`, which lists all four content URLs.
+Update the sitemap when adding pages; change `lastmod` only for substantive
+content edits. These files enable discovery, not a promise of indexing.
+
+The September 14, 2026 content review checked the guides against CLI parsing,
+`init.rs`, `planning_tui.rs`, worker-isolation defaults, backend validation,
+reviewer-independence policy, merge behavior, and `evidence_bundle.rs`.
+The examples use current source installation and illustrative goals/mission
+IDs. They do not claim a mission was run. Local inference need not incur
+vendor charges; immediate execution after plan approval is optional; fresh
+reviewer context does not itself guarantee a different model family; missing
+bundle artifacts remain unresolved. No release version change is needed for
+this static site update.
 
 ## Product captures
 
@@ -106,6 +127,13 @@ node --check apps/landing/dist/script.js
 Check desktop and mobile layouts, keyboard navigation, individual disclosures,
 and expand/collapse all in the browser. Follow the repository's `AGENTS.md`
 workspace gates before declaring changes complete.
+
+The September 14 SEO pass verified all four pages' unique titles/descriptions,
+single primary headings, canonical URLs, local links and fragments, and sitemap
+membership. Local HTTP checks compared all nine page/asset responses with their
+source bytes. Browser review covered all guide content, desktop and 375px mobile
+layouts, navigation, and the existing expand/collapse controls. The CLI examples
+were checked against current help and source without starting a paid mission.
 
 The Railway Caddy configuration was validated with Caddy 2.11.4 and exercised
 locally on port 4180: all four assets returned exact file bytes, gzip worked,

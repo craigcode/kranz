@@ -8,7 +8,10 @@
       name="description"
       content="Kranz is local mission control for coding agents. Turn a goal into an approved plan, independently validated work, and a durable record of every decision."
     />
-    <meta property="og:title" content="Kranz — Agent work. Human authority." />
+    <meta
+      property="og:title"
+      content="Kranz — Mission control for AI coding agents"
+    />
     <meta
       property="og:description"
       content="Git-native mission control for coding agents. Plan, approve, validate, and know why a change passed."
@@ -16,7 +19,7 @@
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://kranz.craigmartin.com/" />
     <link rel="canonical" href="https://kranz.craigmartin.com/" />
-    <title>Kranz — Agent work. Human authority.</title>
+    <title>Kranz — Mission control for AI coding agents</title>
     <link
       rel="icon"
       type="image/svg+xml"
@@ -36,7 +39,8 @@
       >
       <nav aria-label="Main navigation">
         <a href="#workflow">How it works</a>
-        <a href="#features">Features</a>
+        <a class="nav-features" href="#features">Features</a>
+        <a href="#guides">Guides</a>
         <a class="nav-source" href="https://github.com/craigcode/kranz"
           >GitHub <span aria-hidden="true">↗</span></a
         >
@@ -699,16 +703,66 @@
         </p>
       </section>
 
+      <section
+        class="guides section wrap"
+        id="guides"
+        aria-labelledby="guides-title"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">FROM FIRST MISSION TO MERGE</p>
+            <h2 id="guides-title">Put the workflow to work.</h2>
+          </div>
+          <p>
+            Practical guides to starting a mission, reviewing agent changes, and
+            reading the evidence.
+          </p>
+        </div>
+        <div class="guide-grid">
+          <a class="guide-card" href="/guides/first-mission/">
+            <span class="eyebrow">01 / GET STARTED</span>
+            <h3>Run your first mission</h3>
+            <p>
+              Set up a repository, approve a small plan, and follow the work
+              through validation.
+            </p>
+            <span class="guide-link"
+              >Start a mission <span aria-hidden="true">→</span></span
+            >
+          </a>
+          <a class="guide-card" href="/guides/review-agent-changes/">
+            <span class="eyebrow">02 / REVIEW THE WORK</span>
+            <h3>Review Claude Code and Codex changes</h3>
+            <p>
+              Connect the approved scope, the actual diff, and the checks behind
+              your decision to merge.
+            </p>
+            <span class="guide-link"
+              >Walk through review <span aria-hidden="true">→</span></span
+            >
+          </a>
+          <a class="guide-card" href="/guides/validation-evidence/">
+            <span class="eyebrow">03 / FOLLOW THE EVIDENCE</span>
+            <h3>Understand validation evidence</h3>
+            <p>
+              Read contract results, reviewer findings, and a portable record of
+              why a change passed.
+            </p>
+            <span class="guide-link"
+              >Read the evidence <span aria-hidden="true">→</span></span
+            >
+          </a>
+        </div>
+      </section>
+
       <section class="get-started wrap" aria-labelledby="get-started-title">
         <div>
           <p class="eyebrow">PUT YOUR NEXT CHANGE ON A MISSION</p>
           <h2 id="get-started-title">
             Your repo. Your agents. <br />Your call.
           </h2>
-          <a
-            class="button button-primary"
-            href="https://github.com/craigcode/kranz#quick-start"
-            >Explore the source <span aria-hidden="true">↗</span></a
+          <a class="button button-primary" href="/guides/first-mission/"
+            >Run your first mission <span aria-hidden="true">→</span></a
           >
         </div>
         <div class="start-example">
