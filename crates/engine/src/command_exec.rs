@@ -1281,7 +1281,7 @@ impl Drop for ControlChild {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn control_leader_exited(pid: u32) -> std::io::Result<()> {
+pub(crate) async fn control_leader_exited(pid: u32) -> std::io::Result<()> {
     loop {
         let exited = {
             // SAFETY: zeroed siginfo_t is a valid output buffer. WNOWAIT

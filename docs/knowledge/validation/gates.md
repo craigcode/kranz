@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-15
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -60,7 +60,9 @@ dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
 tests, and lint. The Even G2 lane runs install, high-severity audit, tests,
 package construction (including type/build checks and license notices), and lint.
-Physical glasses acceptance remains a separate operator receipt.
+Physical glasses acceptance remains a separate operator receipt. Ubuntu and
+macOS also build and exercise the bounded ACP compatibility probe with a local
+synthetic peer; this check requires no provider credentials or model calls.
 
 The supply-chain job also checks the four package MIT notices, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
