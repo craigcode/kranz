@@ -1,0 +1,20 @@
+{
+  "jsonrpc": "2.0",
+  "id": "eval-0-attempt-1",
+  "result": {
+    "schemaVersion": 1,
+    "evaluationId": "eval-0",
+    "attemptId": "eval-0-attempt-1",
+    "binding": {
+      "subjectDigest": "sha256:459a972b00a172fa6243c1dadfe6eacd9f101577c01b8add67b2be825f47ea5c",
+      "planDigest": "sha256:a31db2cdc410cefb3bf98cea758926fefd700cffa031a819e22cee176426ebc2",
+      "policyDigest": "sha256:c82fc52c78bf8154d4dd7d8766c422ab151052d72098d72ded237aafcd78e4e0",
+      "registrationDigest": "sha256:072cd9d78fd1c10792937c50c01bfa661dd0fc86262d5e7d3eef7cd26c336022",
+      "workspaceId": "workspace-fixture"
+    },
+    "evidenceDigest": "sha256:70a0f2d8ec027a20abef58103fc6f8085a71e56d1ed8424f12ebfe4edfd32678",
+    "status": "escalate",
+    "rationale": "Synthetic contract fixture.",
+    "artifacts": []
+  }
+}

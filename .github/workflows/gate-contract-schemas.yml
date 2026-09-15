@@ -1,0 +1,26 @@
+name: gate-contract-schemas
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate-contract-schemas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned schema validation tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kranz-gate-schema-venv"
+          "$RUNNER_TEMP/kranz-gate-schema-venv/bin/python" -m pip install \
+            --only-binary=:all: --require-hashes -r scripts/requirements-gate-schemas.txt
+      - name: Validate gate contract schemas and synthetic fixtures
+        run: '"$RUNNER_TEMP/kranz-gate-schema-venv/bin/python" scripts/check-gate-contract.py'

@@ -268,9 +268,14 @@ once external execution. Human escalation parks in the durable inbox, not a
 long-lived plugin process. Existing CLI, server, Slack and dashboard remain
 clients of the same authority checks.
 
-## D-X — operator decisions before implementation
+## D-X — selected implementation decisions
 
-| Decision | Recommendation | Consequence |
+The operator approved proceeding with the recommended release and S1–S3 work.
+[Gate evaluation contract v1](../gate-evaluation-contract.md) records the
+selected D-A…D-H defaults, typed wire contract and follow-on migration rules.
+This does not authorize a live model budget, credentials or production access.
+
+| Decision | Selected recommendation | Consequence |
 |---|---|---|
 | D-A: What is v1? | Contained ACP worker + human one-call permissions + subprocess checks + stage/evidence joins | Finish the governance integration without rewriting the engine |
 | D-B: Who may approve? | Preserve stage-specific authority; models/scripts evaluate, humans retain required consent | Replaceable evaluators do not make approvers interchangeable |
@@ -281,9 +286,8 @@ clients of the same authority checks.
 | D-G: Recovery | Fresh feature attempts first; same-feature ACP resume later | Mission replay works without restoring a provider transcript |
 | D-H: Platforms and pilot | First prove on the operator's macOS host, then Linux; Windows either proven or explicitly unavailable for the new capability | Whole-tree kill stays cross-platform; no unsupported enforcement claim |
 
-These are recommendations for plan approval, not blockers to this scoping work.
 Live adapter runs still need a bounded fixture, versions, model budget and
-operator-authorized credentials. Scoping does not dispatch them.
+operator-authorized credentials. The contract design does not dispatch them.
 
 ## Delivery slices and effort
 
@@ -302,7 +306,7 @@ in the new tickets; none supersedes a completed foundation ticket.
 | S6 `acp-worker-containment-proof` | S2 | Real wrapper and hostile-process tests for supported adapter/platform pairs | 4–7 |
 | S7 `acp-governed-mission-acceptance` | S4, S5, S6 | Seeded end-to-end mission, crash/race proof, private-pack seam demonstrated synthetically | 3–5 |
 
-Core v1: **25–41 engineering days (roughly 5–8 weeks)**, contingent on D-A…D-H.
+Core v1: **25–41 engineering days (roughly 5–8 weeks)** under D-A…D-H.
 Start S1 and S2; S3/S5 and S4 can then progress independently, with S6 required
 before claiming containment. First useful delivery is a synthetic script gate
 judging pinned evidence, followed by the live permission workflow. Do not make
