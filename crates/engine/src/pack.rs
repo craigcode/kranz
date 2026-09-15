@@ -54,6 +54,10 @@
 
 mod toml;
 
+/// Content-pinned external checkers. Their asynchronous driver is separate
+/// from legacy command gates; mission-stage consumption follows in S5.
+pub mod evaluator;
+
 /// The Flight Rules standards corpus (KRZ-341): the additive schema-4
 /// `[standards]` root, its strict RFC/rule loader, the normalized manifest +
 /// content digest, and the lifecycle transition lint.
@@ -96,6 +100,9 @@ pub const SCHEMA_CONTRACT: u32 = 3;
 /// where its lifecycle can be reasoned about.
 pub const SCHEMA_STANDARDS: u32 = 4;
 
+/// External evaluator declarations, additive to the schema-4 contract.
+pub const SCHEMA_EVALUATORS: u32 = 5;
+
 /// Engine gate names a pack gate may never claim. The first four are the
 /// contract-defect floor gates ([`crate::contract_gates`]); `merge-gate-suite`
 /// is the repo-owned merge gate ([`crate::merge_gate::MergeSuiteGate`]).
@@ -120,6 +127,7 @@ pub struct Pack {
     /// reported by lint and the run-start decision).
     pub dir: PathBuf,
     pub gates: Vec<PackGateDecl>,
+    pub evaluators: Vec<evaluator::Declaration>,
     pub prompts: Vec<PackPrompt>,
     pub checklists: Vec<PackChecklist>,
     pub artefact_stores: Vec<PackArtefactStore>,
@@ -232,29 +240,7 @@ impl Pack {
         doc: &toml::Document,
         trust: standards::StandardsTrust,
     ) -> Result<Pack, String> {
-        // Unknown SECTIONS fail closed too — a mistyped `[[gates]]` must not
-        // silently register nothing.
-        for section in &doc.sections {
-            let name = match section {
-                toml::Section::Single(t) => t.name.as_str(),
-                toml::Section::Array { name, .. } => name.as_str(),
-            };
-            if ![
-                "pack",
-                "gate",
-                "prompt",
-                "checklist",
-                "artefact_store",
-                "standards",
-            ]
-            .contains(&name)
-            {
-                return Err(format!(
-                    "{PACK_MANIFEST}: unknown section `{name}` (declared sections: [pack], \
-                     [[gate]], [[prompt]], [[checklist]], [[artefact_store]], [standards])"
-                ));
-            }
-        }
+        validate_sections(doc)?;
 
         let (name, schema) = manifest_header(doc)?;
 
@@ -263,6 +249,15 @@ impl Pack {
             gates.push(load_gate(item, idx)?);
         }
         reject_duplicate_names("gate", gates.iter().map(|g| g.name.as_str()))?;
+
+        let evaluators = evaluator::declarations(doc, schema)?;
+        reject_duplicate_names(
+            "gate/evaluator",
+            gates
+                .iter()
+                .map(|g| g.name.as_str())
+                .chain(evaluators.iter().map(|e| e.name.as_str())),
+        )?;
 
         let mut prompts = Vec::new();
         for (idx, item) in doc.array("prompt").iter().enumerate() {
@@ -298,6 +293,7 @@ impl Pack {
             schema,
             dir: dir.to_path_buf(),
             gates,
+            evaluators,
             prompts,
             checklists,
             artefact_stores,
@@ -412,6 +408,9 @@ pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<P
             dir.display()
         ));
     };
+    if !pack.evaluators.is_empty() {
+        return Err("external evaluators require the S5 mission-stage integration; this binary supports explicit evaluation only and will not skip configured checks".into());
+    }
     Ok(Some(pack))
 }
 
@@ -438,6 +437,9 @@ pub fn render_lint(pack: &Pack) -> String {
             "  - {}: `{}` ({scoping})\n",
             gate.name, gate.command
         ));
+    }
+    for evaluator in &pack.evaluators {
+        out.push_str(&format!("external evaluator {}: {:?}, {:?}; explicit evaluation only, mission integration unavailable\n", evaluator.name.as_str(), evaluator.kind, evaluator.stages));
     }
     out.push_str("prompts (appended to the target role's prompt):\n");
     if pack.prompts.is_empty() {
@@ -543,6 +545,35 @@ impl Gate for PackGate {
 // Per-section validation
 // ---------------------------------------------------------------------------
 
+// Shared by directory loading and the approved-ref evaluator loader.
+fn validate_sections(doc: &toml::Document) -> Result<(), String> {
+    // Unknown SECTIONS fail closed too — a mistyped `[[gates]]` must not
+    // silently register nothing.
+    for section in &doc.sections {
+        let name = match section {
+            toml::Section::Single(t) => t.name.as_str(),
+            toml::Section::Array { name, .. } => name.as_str(),
+        };
+        if ![
+            "pack",
+            "gate",
+            "prompt",
+            "checklist",
+            "artefact_store",
+            "standards",
+            "evaluator",
+        ]
+        .contains(&name)
+        {
+            return Err(format!(
+                    "{PACK_MANIFEST}: unknown section `{name}` (declared sections: [pack], \
+                     [[gate]], [[prompt]], [[checklist]], [[artefact_store]], [standards], [[evaluator]])"
+                ));
+        }
+    }
+    Ok(())
+}
+
 /// The `[pack]` header: name + schema version, with the strict field/type
 /// checks every load path shares. Factored out of `from_document` so the
 /// Flight Rules base-ref loader ([`standards::load_at_ref`]) validates a
@@ -559,13 +590,14 @@ fn manifest_header(doc: &toml::Document) -> Result<(String, u32), String> {
             if n == i64::from(SCHEMA_BASE)
                 || n == i64::from(SCHEMA_CONTRACT)
                 || n == i64::from(SCHEMA_STANDARDS)
+                || n == i64::from(SCHEMA_EVALUATORS)
             {
                 n as u32
             } else {
                 return Err(format!(
                     "[pack] field `schema` is {n}: supported versions are {SCHEMA_BASE} \
                      (base manifest), {SCHEMA_CONTRACT} (contract), and {SCHEMA_STANDARDS} \
-                     (standards)"
+                     (standards), {SCHEMA_EVALUATORS} (external evaluators)"
                 ));
             }
         }
@@ -581,7 +613,7 @@ fn manifest_header(doc: &toml::Document) -> Result<(String, u32), String> {
 }
 
 /// The normalized `[standards] root` path, when declared (KRZ-341). The
-/// section is valid ONLY at schema 4 — at schema 2/3 it is a load error
+/// section is valid at schema 4/5 — at schema 2/3 it is a load error
 /// naming the field — and unknown keys inside it fail closed. The root is a
 /// pack-relative path without parent components, normalized like every
 /// other pack path.
@@ -589,11 +621,11 @@ fn standards_root_of(doc: &toml::Document, schema: u32) -> Result<Option<String>
     let Some(table) = doc.single("standards") else {
         return Ok(None);
     };
-    if schema != SCHEMA_STANDARDS {
+    if schema != SCHEMA_STANDARDS && schema != SCHEMA_EVALUATORS {
         return Err(format!(
             "[standards] requires [pack] field `schema` = {SCHEMA_STANDARDS} (this pack \
              declares schema {schema}) — the standards root is additive at schema \
-             {SCHEMA_STANDARDS} only"
+             {SCHEMA_STANDARDS} and {SCHEMA_EVALUATORS}"
         ));
     }
     check_unknown(table, "[standards]", &["root"])?;
@@ -1115,9 +1147,9 @@ kind = "local-dir"
 
     #[test]
     fn pack_contract_unsupported_schema_fails_closed() {
-        let (_tmp, dir) = pack_dir_with("[pack]\nname = \"x\"\nschema = 5\n", &[]);
+        let (_tmp, dir) = pack_dir_with("[pack]\nname = \"x\"\nschema = 6\n", &[]);
         let err = Pack::load(&dir).expect_err("must fail");
-        assert!(err.contains("field `schema` is 5"), "{err}");
+        assert!(err.contains("field `schema` is 6"), "{err}");
     }
 
     #[test]

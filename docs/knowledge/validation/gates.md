@@ -29,6 +29,18 @@ verified_against:
   - docs/tickets.md
 ---
 
+## Explicit external evaluator checks
+
+The schema-5 evaluator implementation is separate from mission-stage consumption.
+`load_for_config` refuses configured external evaluators until S5 is wired; legacy
+command gates and standards remain unchanged. `rust-linux-external-evaluator`
+runs `gate_subprocess_v1` with the Docker opt-in and a pinned synthetic Python
+image. Missing Docker/image support fails that job; ordinary workspace tests
+print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
+exercise protocol, byte pinning, artifact imports and containment without model
+calls. See [external evaluators](../../external-evaluators.md) for API boundaries,
+retention and recovery limits.
+
 ## The full-workspace gate suite
 
 Before declaring any Rust change done, run all four — bare, reading raw exit

@@ -135,6 +135,9 @@
 //! through the real wrap and asserts a green exit, reporting the
 //! skip-under-wrap marker count.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod evaluator_io;
+
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
