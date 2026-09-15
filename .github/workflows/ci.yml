@@ -435,7 +435,23 @@ jobs:
       - name: Prove external evaluator containment and protocol failures
         env:
           KRANZ_GATE_CONTAINER_TESTS: '1'
-        run: cargo test --workspace gate_subprocess_v1 -- --nocapture
+        run: |
+          log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
+          set +e
+          cargo test --workspace gate_subprocess_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 7 passed' "$log"
+          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs; do
+            grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
+            exit 1
+          fi
 
   # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
   # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A
