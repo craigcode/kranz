@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kranz:gate:request:1",
+  "type": "object",
+  "properties": {
+    "jsonrpc": {
+      "const": "2.0"
+    },
+    "id": {
+      "$ref": "urn:kranz:gate:common:1#/$defs/id"
+    },
+    "method": {
+      "const": "gate/evaluate"
+    },
+    "params": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "evaluationId": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/id"
+        },
+        "attemptId": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/id"
+        },
+        "gateId": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/id"
+        },
+        "missionId": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/id"
+        },
+        "binding": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/binding"
+        },
+        "stage": {
+          "enum": [
+            "plan-approval",
+            "command-permission",
+            "milestone-validation",
+            "final-gate",
+            "merge"
+          ]
+        },
+        "subject": {},
+        "evidence": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/inputArtifactRef"
+        },
+        "deadline": {
+          "$ref": "urn:kranz:gate:common:1#/$defs/deadline"
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "wallTimeMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600000
+            },
+            "writeTimeMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "maxFrameBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "maxStdoutBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "maxStderrBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "maxArtifactBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 67108864
+            },
+            "maxArtifacts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 128
+            }
+          },
+          "required": [
+            "wallTimeMs",
+            "writeTimeMs",
+            "maxFrameBytes",
+            "maxStdoutBytes",
+            "maxStderrBytes",
+            "maxArtifactBytes",
+            "maxArtifacts"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "evaluationId",
+        "attemptId",
+        "gateId",
+        "missionId",
+        "binding",
+        "stage",
+        "subject",
+        "evidence",
+        "deadline",
+        "limits"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "stage": {
+              "const": "plan-approval"
+            },
+            "subject": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "plan"
+                },
+                "revision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "planDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                },
+                "baseCommit": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                }
+              },
+              "required": [
+                "kind",
+                "revision",
+                "planDigest",
+                "baseCommit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "stage": {
+              "const": "command-permission"
+            },
+            "subject": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "invocation"
+                },
+                "runId": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/id"
+                },
+                "peerSessionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "toolCallId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "peerRequestId": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  ]
+                },
+                "actionDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                },
+                "optionsDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                },
+                "cwdId": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/id"
+                }
+              },
+              "required": [
+                "kind",
+                "runId",
+                "peerSessionId",
+                "toolCallId",
+                "peerRequestId",
+                "actionDigest",
+                "optionsDigest",
+                "cwdId"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "stage": {
+              "const": "milestone-validation"
+            },
+            "subject": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "milestone"
+                },
+                "milestoneId": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/id"
+                },
+                "startCommit": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                },
+                "snapshotDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                },
+                "criteriaDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                }
+              },
+              "required": [
+                "kind",
+                "milestoneId",
+                "startCommit",
+                "snapshotDigest",
+                "criteriaDigest"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "stage": {
+              "const": "final-gate"
+            },
+            "subject": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "deliverable"
+                },
+                "baseCommit": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                },
+                "snapshotDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                },
+                "featureReceiptDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                }
+              },
+              "required": [
+                "kind",
+                "baseCommit",
+                "snapshotDigest",
+                "featureReceiptDigest"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "stage": {
+              "const": "merge"
+            },
+            "subject": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "integration"
+                },
+                "liveBaseCommit": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                },
+                "candidateCommit": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                },
+                "integrationTree": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/gitObject"
+                },
+                "snapshotDigest": {
+                  "$ref": "urn:kranz:gate:common:1#/$defs/digest"
+                }
+              },
+              "required": [
+                "kind",
+                "liveBaseCommit",
+                "candidateCommit",
+                "integrationTree",
+                "snapshotDigest"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "method",
+    "params"
+  ],
+  "additionalProperties": false
+}

@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: S1 design, schemas and fixture checks complete; runtime integration remains S3/S4/S5.
+state: done
 title: Gate evaluation contract v1 — typed evidence and separate decision authority
 priority: 1
 schedule: once
@@ -14,8 +15,9 @@ not a replacement mission engine.
 ## Context
 
 S1 of docs/scoping/acp-worker-gate-contract.md (2026-09-14; D-A through D-H
-are proposed). KRZ-311/312/313 already shipped. Keep Gate/GatePipeline,
-existing gate.result events and pack schema 2/3/4 compatible.
+are selected in docs/gate-evaluation-contract.md). KRZ-311/312/313 already
+shipped. Keep Gate/GatePipeline, existing gate.result events and pack schema
+2/3/4 compatible.
 
 ## Scope
 
@@ -43,3 +45,18 @@ existing gate.result events and pack schema 2/3/4 compatible.
 ## Out of scope
 
 Runtime wiring, live model spend, new worker abstractions or remote transport.
+
+## Implementation and proof
+
+The design record is docs/gate-evaluation-contract.md. Four versioned JSON
+schemas and five synthetic stage fixture families live in crates/engine/schemas,
+with offline validation after installing the hash-pinned development tools in
+scripts/requirements-gate-schemas.txt. scripts/check-gate-contract.py contains
+fifteen uniquely prefixed `test_gate_contract_v1_` checks, including fifteen
+positive request/result pairs. These prove schema and fixture bindings, not
+runtime execution, containment, live adapters or human consent.
+
+Backend/event/state changes remain explicit contractChangeRequest proposals for
+S3/S4/S5; the existing Rust contracts and old-log/config behavior are unchanged.
+The five-axis self-review and local gate results are recorded in
+docs/reviews/2026-09-14-gate-evaluation-contract-v1.md.

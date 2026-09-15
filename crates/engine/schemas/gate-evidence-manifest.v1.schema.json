@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kranz:gate:evidence:1",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "missionId": {
+      "$ref": "urn:kranz:gate:common:1#/$defs/id"
+    },
+    "binding": {
+      "$ref": "urn:kranz:gate:common:1#/$defs/binding"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "urn:kranz:gate:common:1#/$defs/id"
+          },
+          "role": {
+            "enum": [
+              "scope",
+              "criteria",
+              "subject",
+              "policy",
+              "registration",
+              "plan",
+              "action",
+              "permission-options",
+              "feature-receipts",
+              "diff",
+              "snapshot-inventory",
+              "source",
+              "check-receipt",
+              "prior-finding",
+              "context"
+            ]
+          },
+          "content": {
+            "$ref": "urn:kranz:gate:common:1#/$defs/inputArtifactRef"
+          },
+          "producer": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "engine",
+                  "independent-checker",
+                  "worker"
+                ]
+              },
+              "runId": {
+                "$ref": "urn:kranz:gate:common:1#/$defs/id"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "content",
+          "producer"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "maxItems": 100000
+    },
+    "sourceLogRange": {
+      "type": "object",
+      "properties": {
+        "first": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "last": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "first",
+        "last"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "missionId",
+    "binding",
+    "artifacts"
+  ],
+  "additionalProperties": false
+}

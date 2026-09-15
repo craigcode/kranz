@@ -1,0 +1,51 @@
+{
+  "jsonrpc": "2.0",
+  "id": "eval-4-attempt-1",
+  "method": "gate/evaluate",
+  "params": {
+    "schemaVersion": 1,
+    "evaluationId": "eval-4",
+    "attemptId": "eval-4-attempt-1",
+    "gateId": "synthetic-check",
+    "missionId": "m-fixture",
+    "binding": {
+      "subjectDigest": "sha256:6cc0c937eb83d11e4a69e152b2976122bd1b907ff4f5d66d348d7ca0e2aafcd8",
+      "planDigest": "sha256:a31db2cdc410cefb3bf98cea758926fefd700cffa031a819e22cee176426ebc2",
+      "policyDigest": "sha256:c82fc52c78bf8154d4dd7d8766c422ab151052d72098d72ded237aafcd78e4e0",
+      "registrationDigest": "sha256:072cd9d78fd1c10792937c50c01bfa661dd0fc86262d5e7d3eef7cd26c336022",
+      "workspaceId": "workspace-fixture"
+    },
+    "stage": "merge",
+    "subject": {
+      "kind": "integration",
+      "liveBaseCommit": {
+        "algorithm": "sha1",
+        "value": "1111111111111111111111111111111111111111"
+      },
+      "candidateCommit": {
+        "algorithm": "sha1",
+        "value": "2222222222222222222222222222222222222222"
+      },
+      "integrationTree": {
+        "algorithm": "sha1",
+        "value": "3333333333333333333333333333333333333333"
+      },
+      "snapshotDigest": "sha256:827eeab94f7421c651f6170d7d0e62cd4fad4594fb07faff4466acb01128ccd9"
+    },
+    "evidence": {
+      "path": "inputs/manifest.json",
+      "digest": "sha256:d097edddfc4e859b02b261a625328ef067761975467b796331fbb859bb3fa52f",
+      "bytes": 704
+    },
+    "deadline": "2030-01-01T00:00:00Z",
+    "limits": {
+      "wallTimeMs": 10000,
+      "writeTimeMs": 1000,
+      "maxFrameBytes": 65536,
+      "maxStdoutBytes": 65536,
+      "maxStderrBytes": 65536,
+      "maxArtifactBytes": 1048576,
+      "maxArtifacts": 8
+    }
+  }
+}

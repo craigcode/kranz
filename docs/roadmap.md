@@ -201,11 +201,13 @@ The ACP backend, internal gate interface, pack contract and evidence spine
 already shipped (KRZ-301/311/312/313/325/326). The remaining work is to connect
 them into governed live dispatch: exact one-call permissions, external checks
 over pinned evidence, stage-specific authority and proven adapter containment.
-Design and proposed D-A…D-H decisions:
+Design and selected D-A…D-H decisions:
 [`docs/scoping/acp-worker-gate-contract.md`](scoping/acp-worker-gate-contract.md).
+The [v1 contract](gate-evaluation-contract.md) defines the wire schemas and
+authority/migration rules; runtime integration remains in the later slices.
 
-- [ ] `gate-evaluation-contract-v1` — typed subjects, wire schemas, authority
-  matrix and additive lifecycle contract changes.
+- [x] `gate-evaluation-contract-v1` — typed subjects, wire schemas, authority
+  matrix and additive lifecycle contract-change proposals.
 - [ ] `acp-adapter-compatibility-proof` — released adapter/runtime fixtures,
   authentication, actual model/report/cost behavior and cancellation proof.
 - [ ] `gate-subprocess-evaluator` — contained, bounded JSON-RPC checker process

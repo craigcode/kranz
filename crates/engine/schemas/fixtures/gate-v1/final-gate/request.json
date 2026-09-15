@@ -1,0 +1,44 @@
+{
+  "jsonrpc": "2.0",
+  "id": "eval-3-attempt-1",
+  "method": "gate/evaluate",
+  "params": {
+    "schemaVersion": 1,
+    "evaluationId": "eval-3",
+    "attemptId": "eval-3-attempt-1",
+    "gateId": "synthetic-check",
+    "missionId": "m-fixture",
+    "binding": {
+      "subjectDigest": "sha256:c44a96c02f651842a94e44abf361fdc1cceae456184e9b95e94e09a501f65117",
+      "planDigest": "sha256:a31db2cdc410cefb3bf98cea758926fefd700cffa031a819e22cee176426ebc2",
+      "policyDigest": "sha256:c82fc52c78bf8154d4dd7d8766c422ab151052d72098d72ded237aafcd78e4e0",
+      "registrationDigest": "sha256:072cd9d78fd1c10792937c50c01bfa661dd0fc86262d5e7d3eef7cd26c336022",
+      "workspaceId": "workspace-fixture"
+    },
+    "stage": "final-gate",
+    "subject": {
+      "kind": "deliverable",
+      "baseCommit": {
+        "algorithm": "sha1",
+        "value": "1111111111111111111111111111111111111111"
+      },
+      "snapshotDigest": "sha256:827eeab94f7421c651f6170d7d0e62cd4fad4594fb07faff4466acb01128ccd9",
+      "featureReceiptDigest": "sha256:c65f7bfecff3f02dc59aa5414a05e3f89a5b2d78bce45622b8d3851d9d548fe3"
+    },
+    "evidence": {
+      "path": "inputs/manifest.json",
+      "digest": "sha256:c7efa96742437b73a41945a922b949737325629be4bfdf56be4e0287da8852dd",
+      "bytes": 704
+    },
+    "deadline": "2030-01-01T00:00:00Z",
+    "limits": {
+      "wallTimeMs": 10000,
+      "writeTimeMs": 1000,
+      "maxFrameBytes": 65536,
+      "maxStdoutBytes": 65536,
+      "maxStderrBytes": 65536,
+      "maxArtifactBytes": 1048576,
+      "maxArtifacts": 8
+    }
+  }
+}

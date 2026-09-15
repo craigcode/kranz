@@ -1,0 +1,49 @@
+{
+  "positive": [
+    {
+      "name": "plan-approval",
+      "request": "plan-approval/request.json",
+      "responses": [
+        "plan-approval/pass.json",
+        "plan-approval/fail.json",
+        "plan-approval/escalate.json"
+      ]
+    },
+    {
+      "name": "command-permission",
+      "request": "command-permission/request.json",
+      "responses": [
+        "command-permission/pass.json",
+        "command-permission/fail.json",
+        "command-permission/escalate.json"
+      ]
+    },
+    {
+      "name": "milestone-validation",
+      "request": "milestone-validation/request.json",
+      "responses": [
+        "milestone-validation/pass.json",
+        "milestone-validation/fail.json",
+        "milestone-validation/escalate.json"
+      ]
+    },
+    {
+      "name": "final-gate",
+      "request": "final-gate/request.json",
+      "responses": [
+        "final-gate/pass.json",
+        "final-gate/fail.json",
+        "final-gate/escalate.json"
+      ]
+    },
+    {
+      "name": "merge",
+      "request": "merge/request.json",
+      "responses": [
+        "merge/pass.json",
+        "merge/fail.json",
+        "merge/escalate.json"
+      ]
+    }
+  ]
+}

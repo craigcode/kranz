@@ -1,0 +1,45 @@
+{
+  "jsonrpc": "2.0",
+  "id": "eval-2-attempt-1",
+  "method": "gate/evaluate",
+  "params": {
+    "schemaVersion": 1,
+    "evaluationId": "eval-2",
+    "attemptId": "eval-2-attempt-1",
+    "gateId": "synthetic-check",
+    "missionId": "m-fixture",
+    "binding": {
+      "subjectDigest": "sha256:48116d8760dd1630da26b0a897c6428d9fcbe66be259bc2887196a171fc557c5",
+      "planDigest": "sha256:a31db2cdc410cefb3bf98cea758926fefd700cffa031a819e22cee176426ebc2",
+      "policyDigest": "sha256:c82fc52c78bf8154d4dd7d8766c422ab151052d72098d72ded237aafcd78e4e0",
+      "registrationDigest": "sha256:072cd9d78fd1c10792937c50c01bfa661dd0fc86262d5e7d3eef7cd26c336022",
+      "workspaceId": "workspace-fixture"
+    },
+    "stage": "milestone-validation",
+    "subject": {
+      "kind": "milestone",
+      "milestoneId": "milestone-fixture",
+      "startCommit": {
+        "algorithm": "sha1",
+        "value": "1111111111111111111111111111111111111111"
+      },
+      "snapshotDigest": "sha256:827eeab94f7421c651f6170d7d0e62cd4fad4594fb07faff4466acb01128ccd9",
+      "criteriaDigest": "sha256:ad48063616647f4db22e80a23efbca07f7512824abbadb6de3028e0725730436"
+    },
+    "evidence": {
+      "path": "inputs/manifest.json",
+      "digest": "sha256:7a386fe341461668d11f77e3150ebba769aa4cb8173b73070d4b88d9d0855a09",
+      "bytes": 704
+    },
+    "deadline": "2030-01-01T00:00:00Z",
+    "limits": {
+      "wallTimeMs": 10000,
+      "writeTimeMs": 1000,
+      "maxFrameBytes": 65536,
+      "maxStdoutBytes": 65536,
+      "maxStderrBytes": 65536,
+      "maxArtifactBytes": 1048576,
+      "maxArtifacts": 8
+    }
+  }
+}
