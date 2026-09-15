@@ -3,6 +3,19 @@
 Notable user-visible changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.2.3 - 2026-09-14
+
+- Security: updated rustls from 0.23.44 to 0.23.45 for
+  [RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc),
+  which corrects acceptance of TLS 1.3 handshake messages across encryption
+  level boundaries. Both dependency lockfiles and bundled notices include the
+  fixed version. Existing v0.2.2 installations need this rebuilt release.
+- Added a reusable manual check that verifies release-archive provenance and
+  executes the matching binary on all five supported native platforms.
+- Added reviewed website guides for first missions, review, validation
+  evidence, and optional Slack setup. Scoped the remaining ACP and external
+  gate work; those roadmap items are not new runtime capabilities in 0.2.3.
+
 ## 0.2.2 - 2026-09-13
 
 - Includes the server security fixes prepared for the unpublished v0.2.1

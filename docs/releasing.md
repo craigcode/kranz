@@ -1,6 +1,6 @@
 # Cutting a release
 
-Kranz v0.2.0 distributes a CLI through GitHub release binaries and crates.io.
+Kranz distributes a CLI through GitHub release binaries and crates.io.
 A Homebrew tap is a follow-on after those two paths are proven on clean hosts,
 not a condition of the first public release. The Tauri shell is build-checked
 but is not currently a supported release artifact. Do not advertise or attach
@@ -9,8 +9,9 @@ pipeline exists.
 
 The historical v0.1.0 GitHub release is a private preview. It is 1,000+ commits
 behind the current source and predates substantial security hardening. Never
-reuse that tag or publish current source as 0.1.0. The first version-aligned
-public release is 0.2.0 unless the owner deliberately chooses a later version.
+reuse that tag or publish current source as 0.1.0. v0.2.2 provides matching
+GitHub binaries and registry packages. Choose a new version for every
+subsequent release; never replace an existing tag or archive.
 
 ## 0. Public-distribution prerequisites
 
@@ -29,7 +30,8 @@ Complete `docs/public-readiness.md`. In particular:
 
 The normal release checks require the existing secret scanner and committed
 domain policy. An additional confidentiality word list is optional; the owner
-selected no additional list for v0.2.1 and v0.2.2. No new secret is needed for that choice.
+selected no additional list for v0.2.1 and v0.2.2, and the v0.2.3 patch retains
+that policy. No new secret is needed for that choice.
 
 If additional confidential names or phrases must be blocked, supply one
 case-sensitive UTF-8 literal per line
@@ -64,10 +66,10 @@ Versions are workspace-inherited. Update:
 Do not render the Homebrew template yet: GitHub's tagged tarball and its digest
 do not exist until the tag exists.
 
-Run `cargo check --workspace --locked` so the root lockfile records the new
-workspace versions. Refresh the standalone Tauri lockfile with its locked
-check as needed. Then run the exact release check locally without querying
-remote main:
+Run `cargo check --workspace` to record the new workspace package versions in
+the lockfile, and refresh the standalone Tauri lockfile with `cargo check` from
+its directory. Review both lockfile diffs, then repeat the checks with
+`--locked`. Run the exact release check locally without querying remote main:
 
 ```sh
 KRANZ_RELEASE_SKIP_MAIN_CHECK=1 scripts/check-release-version.sh vX.Y.Z
@@ -118,10 +120,13 @@ harness tests use the debug example by default and require Seatbelt on macOS or 
 
 ## 3. Rehearse crate packaging honestly
 
-Cargo removes workspace `path` dependencies when publishing and resolves their
-version from the target registry. Therefore a dependent crate cannot complete
-a crates.io dry-run until its sibling version is actually visible there. A
-claim that all four crates can dry-run before *any* publication is false.
+Cargo removes workspace `path` dependencies when packaging. For a single
+dependent crate, its sibling version must already be visible in the target
+registry. Current Cargo also supports a workspace-wide dry run, staging the
+selected packages together so unpublished siblings can be verified before
+upload. This path was exercised with Cargo 1.97.1 for v0.2.3; the application's
+Rust 1.88 build floor does not imply every older Cargo has the same publishing
+options. See the [Cargo publish reference](https://doc.rust-lang.org/cargo/commands/cargo-publish.html).
 
 Before publication:
 
@@ -130,13 +135,16 @@ cargo package --list -p kranz-engine
 cargo package --list -p kranz-server
 cargo package --list -p kranz-slack
 cargo package --list -p kranz
-cargo publish --dry-run -p kranz-engine
+cargo publish --workspace --dry-run --locked
 ```
 
 Inspect every package list for secrets, runtime state, oversized fixtures, and
-unintended generated files. If the release requires proof of all dependent
-packages before the first irreversible publish, use a disposable local Cargo
-registry; do not mislabel a crates.io-resolution failure as a source defect.
+unintended generated files. Keep `--dry-run` explicit: a workspace publication
+without it uploads all selected packages. Actual release uploads below remain
+one package at a time, with an immediate dry run and registry verification at
+each step. With an older Cargo that cannot stage a workspace, use a disposable
+local registry for the pre-publication proof; do not mislabel a missing sibling
+version in crates.io as a source defect.
 
 ## 4. Merge, tag, and approve GitHub publication
 
@@ -150,8 +158,20 @@ gh workflow run release.yml --ref main -f tag=vX.Y.Z
 The manual run performs source verification and all platform builds, and
 produces temporary workflow artifacts. Its publication job is disabled.
 Inspect those artifacts and wait for both this rehearsal and `main` CI to pass.
-Then create an annotated tag on that exact commit and push it as a separate
-human action:
+Run the archive smoke workflow against the rehearsal run and its exact source:
+
+```sh
+gh workflow run release-archive-smoke.yml --ref main \
+  -f run_id=RELEASE_RUN_ID -f source_ref=refs/heads/main \
+  -f source_sha=RELEASE_COMMIT_SHA -f version=X.Y.Z
+```
+
+Replace the placeholders with the recorded run ID, full commit SHA, and
+version. All five jobs must verify provenance, native binary architecture,
+version, help, and embedded licenses outside a source checkout. This workflow
+downloads the built archives; it does not rebuild them or publish anything.
+After it passes, create an annotated tag on that exact commit and push it as a
+separate operator action:
 
 ```sh
 git switch main
@@ -178,6 +198,11 @@ the extracted notices, run `kranz licenses` outside a source checkout, and
 check `/THIRD_PARTY_NOTICES.txt` from the served embedded dashboard. A failed matrix
 or missing evidence means no release—delete the draft/tag only through the
 documented operator recovery process.
+
+Repeat `release-archive-smoke.yml` for the tag-triggered release run, using
+`source_ref=refs/tags/vX.Y.Z` and the same source SHA. A rehearsal receipt does
+not attest a later rebuild. Compare published archive bytes with those tested
+workflow artifacts, and verify the checksum manifest and SBOM attestations.
 
 ## 5. Publish crates bottom-up
 

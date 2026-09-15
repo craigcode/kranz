@@ -1,21 +1,23 @@
 # Public-readiness gate
 
-Status (2026-09-13 UTC): **the source repository is public; distribution is
-tracked separately**.
+Status (2026-09-14 UTC): **the source repository is public, and v0.2.2 GitHub
+binaries and all four crates.io packages are published**. The v0.2.3 security
+patch is being prepared through the same reviewed release process.
 
 The owner authorized the public source snapshot and crates.io publication.
 The first public `main` snapshot was one `Initial commit`; older branch and
 pull-request references are separate from that history. The [README](../README.md#install)
-leads with a source install and pins the registry command to an explicit version so readers
-cannot silently install the earlier `0.0.1` placeholder. Check
+documents Cargo, binary, and source installs and pins the registry command to
+an explicit version. Check
 [crates.io](https://crates.io/crates/kranz/versions) and
 [GitHub Releases](https://github.com/craigcode/kranz/releases) for the artifacts
 that have actually been published. Source availability is not evidence that
 registry packages or prebuilt binaries exist.
 
 Main branch protection is active. The `release` environment has an owner
-reviewer, and `KRANZ_PUBLIC_RELEASE_ENABLED` remains `false`; the GitHub binary
-release workflow remains locked until that separate publication is ready.
+reviewer, and `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`. Both settings were
+rechecked for the v0.2.3 preparation. Every new release still requires the
+source, packaging, platform, provenance, and protected-environment checks.
 The historical [owner review packet](reviews/2026-09-06-owner-publication-review.md)
 and [acceptance receipt](reviews/2026-09-06-unattended-acceptance.md) retain their
 original scope and dates. They do not certify artifacts from a later commit.
@@ -43,7 +45,8 @@ production distribution.
   pull-request ref fetched.
 - The existing secret scan and committed domain-policy check pass. An
   additional confidentiality word list is optional; the owner selected no
-  additional list for v0.2.1 and v0.2.2. If one is configured, both audits must pass with
+  additional list for v0.2.1 and v0.2.2; v0.2.3 retains that policy. If one is
+  configured, both audits must pass with
   `KRANZ_REQUIRE_OPERATOR_MARKERS=1` and the matching reviewed
   `KRANZ_PUBLIC_AUDIT_MARKERS` Actions secret.
 - Mission records, tickets, fixtures, and review documents have received a
@@ -101,8 +104,10 @@ new releases still need review of their advertised refs and distribution artifac
 ## Existing releases
 
 The v0.1.0 private-preview binaries predate substantial security hardening and
-remain only in the private archive. The active origin has no imported tag or
-release. They must never silently become the supported distribution.
+remain only in the private archive. The active origin's v0.2.1 tag records an
+unpublished candidate; v0.2.2 has matching published binaries and registry packages.
+The private-preview artifacts must never silently become the supported
+distribution.
 
 ## GitHub controls
 
@@ -116,11 +121,11 @@ release. They must never silently become the supported distribution.
   publish job.
   The 2026-09-06 preparation attempt to add that rule was rejected by GitHub
   because the current plan does not support required reviewers for this
-  private repository. Keep the release switch off; after separately approved
-  public visibility, configure and verify the rule before enabling releases.
-- The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` remains
-  `false` until every item in this document is complete; set it to `true` only
-  after the protected release environment is verified.
+  private repository. After public visibility was approved, the owner-review
+  rule was configured and verified before release publication was enabled.
+- The repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`
+  following that setup. Verify the protected release environment before every
+  new release; do not remove its owner-review requirement.
 - If additional confidentiality terms are configured, the masked repository
   secret `KRANZ_PUBLIC_AUDIT_MARKERS` contains the same newline-delimited terms
   used locally. A configured but empty/invalid list fails closed. Without that
