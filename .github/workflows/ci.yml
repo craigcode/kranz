@@ -305,6 +305,12 @@ jobs:
                 && 'git,bwrap,container,grep'
                 || 'git' }}
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Check bounded ACP probe with a synthetic peer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --example acp_compat_probe
+          python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
       # What the run did NOT exercise. libtest captures a passing test's
       # output, and a skipping test passes, so without this ledger the skips
       # are invisible in exactly the case that matters.
@@ -370,6 +376,12 @@ jobs:
         env:
           KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Check bounded ACP probe with a synthetic peer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --example acp_compat_probe
+          python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
       - name: Report capabilities macOS skipped
         if: always()
         run: |
