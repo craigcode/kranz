@@ -44,3 +44,12 @@ seams; deterministic command gates and Flight Rules remain supported.
 ## Out of scope
 
 Plugin daemons, remote protocols, a marketplace and domain-specific checkers.
+
+## Implementation candidate (2026-09-15 UTC)
+
+The explicit engine API and schema-5 registration are implemented on
+`codex/gate-subprocess-evaluator`. See `docs/external-evaluators.md` and the
+five-axis author review in `docs/reviews/2026-09-14-gate-subprocess-evaluator.md`.
+Local macOS/Colima hostile-checker proof is green. This ticket stays open pending
+its dedicated Linux containment proof and the final remote regression checks.
+Mission-stage consumption and automated replay/recovery remain S5, as scoped.
