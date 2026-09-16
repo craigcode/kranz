@@ -50,10 +50,10 @@ Format:
 
 ## Later / gated
 
-- **Review efficiency and evidence** - scheduled follow-ups for human review packets, comparable baseline/candidate receipts, outcome reasons and a bounded review-effort pilot.
-  Why: Let operators assess current evidence and remaining decisions without reconstructing a mission; measure evidence gaps and active review separately from waiting time.
-  Trigger: After `acp-governed-mission-acceptance`; the pilot follows all three evidence/reporting tickets. One-shot backlog dependencies, not automatic execution or a new ACP release gate.
-  Source: docs/roadmap.md; https://vercel.com/blog/building-a-software-factory-for-ai-sdk
+- **Review efficiency and evidence** - review packets, baseline/candidate receipts, outcome reasons and a bounded pilot.
+  Why: Make current evidence and human decisions easier to assess; measure review effort separately from waiting.
+  Trigger: After ACP acceptance; the pilot follows the three implementations. Backlog dependencies, not automatic execution.
+  Source: docs/roadmap.md
   Ticket: gate-review-packet; baseline-candidate-evidence; mission-outcome-reasons; review-effort-pilot
 
 - **Gas City pack publish remainder** - human `gc pack registry` / `gc pack release` after Stage 1 receipt and a second consumer.

@@ -239,25 +239,35 @@ intact. No push or automatic ACP-default promotion is part of this scope.
 The operator authorized these follow-ups after reviewing
 [Vercel's software factory article](https://vercel.com/blog/building-a-software-factory-for-ai-sdk).
 They extend Kranz's review and evidence surfaces within the existing positioning
-boundary. The current ACP integration, containment and S7 acceptance remain
-ahead of this work; no new release prerequisite is added to that scope.
+boundary. The current ACP integration, containment and S7 (governed mission
+acceptance) remain ahead of this work; no new release prerequisite is added to
+that scope. S5 and S7 are defined in the
+[ACP/gate implementation sequence](scoping/acp-worker-gate-contract.md#delivery-slices-and-effort).
 
-| Wave | Ticket | Priority | Admission dependency |
-|---|---|---|---|
-| 1 | [Gate review packet](../.kranz/tickets/gate-review-packet.md) | 2 | S7 `acp-governed-mission-acceptance` |
-| 1 | [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md) | 2 | S7 `acp-governed-mission-acceptance` |
-| 1 | [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) | 2 | S7 `acp-governed-mission-acceptance` |
-| 2 | [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) | 3 | All three wave-1 tickets |
+- [ ] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,
+  current evidence and the human decision.
+- [ ] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
+  — comparable observations across actual revisions, extending existing controls.
+- [ ] [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) —
+  explain recorded causes without changing mission states or authority.
+- [ ] [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) — a bounded
+  assessment of evidence gaps and human work after the implementations land.
 
-These are one-shot backlog tickets with `schedule: once` and `blocked-by` edges,
-not dated or recurring executions. Pick up the review packet first after S7;
-the baseline and outcome extensions can be planned independently. The pilot
-waits for all three. Normal plan review and approval still precede execution.
-The dependency gate checks recorded Complete missions, not a ticket's `done`
-label alone; an implementation merged outside a mission needs explicit operator
-reconciliation before admitting a dependent, without fabricating a mission pass.
+Ticket frontmatter owns priority, one-shot scheduling and admission dependencies.
+It ranks the review packet first after S7; the baseline and outcome extensions
+can be planned independently, and the pilot waits for all three. These are
+backlog entries, not dated or recurring executions. Normal plan review and
+approval still precede execution.
 
-S5 continues to own authoritative stage inputs, receipts and freshness checks.
+The [dependency gate](tickets.md#dependencies-blocked-by) requires recorded
+Complete missions, not a ticket's `done` label alone. For an implementation
+merged outside a mission, the operator must verify the prerequisite and
+explicitly choose the documented `kranz ticket approve <slug> --force` override
+to admit a dependent. That override does not fabricate a completed mission or
+bypass cycle detection.
+
+S5 (stage/evidence integration) continues to own authoritative stage inputs,
+receipts and freshness checks.
 The follow-ups make that evidence easier to assess and compare. Human review
 packets may expose a wider audit chain than fresh validators receive. Outcome
 categories explain existing states without creating new authority or automated
