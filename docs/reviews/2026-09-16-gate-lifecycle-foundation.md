@@ -59,8 +59,8 @@ non-ASCII labels remain unsupported by this v1 path contract.
 
 ## Remaining S5 work
 
-- Assemble minimal frozen inputs from the approved plan, selected scope,
-  criteria, source snapshots, current check receipts and independent findings.
+- Connect the frozen input builder to engine-observed check receipts and the
+  approved required-check set at each real stage.
 - Connect real approval, milestone, final and scratch-integration merge drivers,
   with pinned registration/policy and live-base drift checks at consumption.
 - Join legacy gate receipts without inventing a pass for errors/escalation.
@@ -79,3 +79,31 @@ Clippy with warnings denied, formatting and build passed. All 16 protocol schema
 checks passed. The six source snapshot tests passed again after retaining the
 exact source-selection bytes. Knowledge refresh passed. These local results do
 not complete S5's stage-driver acceptance or the stack's missing provider proof.
+
+## Evidence builder follow-up
+
+The builder now covers all five typed stage subjects. It retains the exact
+approved plan serialization, derives scope and selected criteria from that plan,
+and includes the pinned registration, policy, selected source snapshot, check
+receipts and prior independent findings. It has no file-path input for loading
+worker transcripts or an auditor bundle. Invocation inputs must match the live
+permission's workspace, plan, policy, action, options and deadline.
+
+Required checks are supplied separately from observed receipts. Missing receipts,
+changed commands, source or environment drift, unknown/zero assertion counts
+where counts are required, and a later failed run leave the prerequisite false.
+A judgment evaluator cannot start from that input. Older receipts remain labelled
+as historical; they are never promoted to cover current bytes. Prior findings
+retain their original evidence bindings and omit the old evaluator rationale.
+
+The stage driver remains responsible for observing executions, selecting the
+approved requirements, proving the real scratch integration tree and checking
+live state before consuming a decision. The builder does not infer these facts
+from a worker report. Its 1,000-artifact limit includes metadata and receipts;
+a snapshot that fits the source collector can still exceed this smaller bound
+and be refused. No new dependency or execution/authorization surface is added.
+
+Follow-up validation: all six builder tests passed, followed by 2,998 passing
+workspace tests with zero failures and ten existing ignored tests, including
+the opt-in real container evaluator proofs. Workspace Clippy with warnings
+denied, formatting, build and knowledge refresh passed.

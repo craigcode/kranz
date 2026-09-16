@@ -165,6 +165,13 @@ impl FrozenEvidence {
     pub fn request(&self) -> &Request {
         &self.request
     }
+    /// Retention reads the same frozen bytes that execution receives.
+    pub fn inputs(&self) -> impl Iterator<Item = (&InputArtifact, &[u8])> {
+        self.manifest
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact, self.inputs[&artifact.id].as_slice()))
+    }
     fn role(&self, role: ArtifactRole) -> Result<&InputArtifact, String> {
         let mut matches = self.manifest.artifacts.iter().filter(|a| a.role == role);
         let artifact = matches.next().ok_or("required evidence role is missing")?;

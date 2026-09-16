@@ -314,7 +314,9 @@ References: [integration scope](scoping/acp-worker-gate-contract.md),
 ## S5 foundation checkpoint (2026-09-16)
 
 The lifecycle branch implements the four proposed audit events, pure folding,
-source snapshot identity and retained-artifact export checks. It does not yet
+source snapshot identity, typed stage input assembly and retained-artifact export
+checks. The input builder derives prerequisite status from required checks and
+engine-observed receipts bound to content and environment. It does not yet
 connect the mission stage drivers; `load_for_config` still refuses external
 evaluators. See the [review and remaining integration work](reviews/2026-09-16-gate-lifecycle-foundation.md).
 
