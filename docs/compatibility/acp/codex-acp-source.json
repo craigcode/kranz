@@ -52,5 +52,7 @@
     "package": "@openai/codex",
     "version": "0.153.4"
   },
-  "liveProof": false
+  "liveProof": true,
+  "liveReceipt": "codex-acp-native-login.jsonl",
+  "liveProofScope": "macOS arm64 existing auth.json login; one no-tools text/report turn. Not containment or ordinary mission credential provisioning."
 }
