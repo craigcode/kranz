@@ -22,27 +22,143 @@ struct Config {
     program: PathBuf,
     args: Vec<String>,
     credential_env: Option<String>,
+    /// Explicit opt-in to minimal native login seeding; never the child HOME.
+    native_login_home: Option<PathBuf>,
     receipt: PathBuf,
 }
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        let native = self.native_login_home.is_some();
         let valid = match self.provider.as_str() {
-            "claude" => self.credential_env.as_deref() == Some("ANTHROPIC_API_KEY"),
-            "codex" => matches!(
-                self.credential_env.as_deref(),
-                Some("CODEX_API_KEY" | "OPENAI_API_KEY")
-            ),
-            "fixture" => self.credential_env.is_none(),
+            "claude" => self.credential_env.as_deref() == Some("ANTHROPIC_API_KEY") || native,
+            "codex" => {
+                matches!(
+                    self.credential_env.as_deref(),
+                    Some("CODEX_API_KEY" | "OPENAI_API_KEY")
+                ) || native
+            }
+            "fixture" => self.credential_env.is_none() && !native,
             _ => false,
         };
-        if !valid {
+        if !valid || (native && self.credential_env.is_some()) {
             bail!("provider/credential channel is unsupported by this probe");
+        }
+        if self
+            .native_login_home
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute() || !p.is_dir())
+        {
+            bail!("nativeLoginHome must name an existing absolute operator home");
         }
         if !self.program.is_absolute() || !self.program.is_file() || !self.receipt.is_absolute() {
             bail!("program and new receipt path must be absolute; program must exist");
         }
         Ok(())
+    }
+}
+
+fn seed_native_login(
+    config: &Config,
+    private: &std::path::Path,
+    env: &mut HashMap<String, String>,
+) -> Result<()> {
+    let Some(source_home) = &config.native_login_home else {
+        return Ok(());
+    };
+    if config.provider == "claude" {
+        // File-based credentials only. Never link or query the macOS Keychain.
+        if !source_home.join(".claude/.credentials.json").is_file() {
+            bail!(
+                "Claude file-based login is absent; Keychain access is not supported by this probe"
+            );
+        }
+        let (_, config_dir) = kranz_engine::backend_claude::seed_worker_scratch_home(
+            private,
+            None,
+            Some(&source_home.join(".claude")),
+        )?;
+        env.insert("CLAUDE_CONFIG_DIR".into(), config_dir.display().to_string());
+    } else {
+        let source = source_home.join(".codex/auth.json");
+        let metadata =
+            std::fs::symlink_metadata(&source).context("native Codex auth.json is absent")?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            bail!("native Codex auth.json must be a bounded regular file");
+        }
+        let dest = private.join("home/.codex");
+        std::fs::create_dir_all(&dest)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(dest.join("auth.json"))?;
+        file.write_all(&std::fs::read(source)?)?;
+        env.insert("CODEX_HOME".into(), dest.display().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_login_tests {
+    use super::*;
+
+    fn config(root: &std::path::Path, provider: &str) -> Config {
+        Config {
+            provider: provider.into(),
+            program: std::env::current_exe().unwrap(),
+            args: vec![],
+            credential_env: None,
+            native_login_home: Some(root.to_owned()),
+            receipt: root.join("new-receipt.jsonl"),
+        }
+    }
+
+    #[test]
+    fn native_login_requires_explicit_exclusive_auth_source() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "codex");
+        cfg.validate().unwrap();
+        cfg.credential_env = Some("OPENAI_API_KEY".into());
+        assert!(cfg.validate().is_err());
+        cfg.credential_env = None;
+        cfg.provider = "fixture".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn native_login_seeds_credentials_without_settings_or_history() {
+        let source = tempfile::tempdir().unwrap();
+        for provider in ["codex", "claude"] {
+            let dir = source.path().join(format!(".{provider}"));
+            std::fs::create_dir(&dir).unwrap();
+            let name = if provider == "codex" {
+                "auth.json"
+            } else {
+                ".credentials.json"
+            };
+            std::fs::write(dir.join(name), b"opaque-fixture-credential").unwrap();
+            for unwanted in ["settings.json", "config.toml", "history.jsonl"] {
+                std::fs::write(dir.join(unwanted), b"must-not-cross").unwrap();
+            }
+            let private = tempfile::tempdir().unwrap();
+            let mut env = HashMap::new();
+            seed_native_login(&config(source.path(), provider), private.path(), &mut env).unwrap();
+            let dest = private.path().join(format!("home/.{provider}"));
+            assert_eq!(
+                std::fs::read(dest.join(name)).unwrap(),
+                b"opaque-fixture-credential"
+            );
+            for unwanted in ["settings.json", "config.toml", "history.jsonl"] {
+                assert!(!dest.join(unwanted).exists());
+            }
+            assert!(!env
+                .values()
+                .any(|value| value == &source.path().display().to_string()));
+        }
     }
 }
 
@@ -83,7 +199,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":credential_present,"receiptAvailable":!config.receipt.exists(),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
+            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file()),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -102,14 +218,17 @@ async fn main() -> Result<()> {
     std::fs::create_dir(&workspace)?;
     std::fs::create_dir(&home)?;
     let mut env = HashMap::from([("HOME".into(), home.display().to_string())]);
+    seed_native_login(&config, private.path(), &mut env)?;
     if let (Some(key), Some(value)) = (&config.credential_env, &credential) {
         env.insert(key.clone(), value.clone());
     }
     if config.provider == "codex" {
-        env.insert(
-            "DEFAULT_AUTH_REQUEST".into(),
-            r#"{"methodId":"api-key"}"#.into(),
-        );
+        if config.credential_env.is_some() {
+            env.insert(
+                "DEFAULT_AUTH_REQUEST".into(),
+                r#"{"methodId":"api-key"}"#.into(),
+            );
+        }
         env.insert("NO_BROWSER".into(), "1".into());
         env.insert("INITIAL_AGENT_MODE".into(), "read-only".into());
     }
@@ -130,7 +249,7 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else { "api-key-or-fixture" },"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
         credential.as_deref(),
         &root,
     )?;
@@ -182,9 +301,10 @@ async fn main() -> Result<()> {
                     AgentEvent::Init { raw, .. } => ("init", raw, false, None),
                     AgentEvent::Text { raw, .. } => ("text", raw, false, None),
                     AgentEvent::Other { raw } => ("other", raw, false, None),
-                    AgentEvent::ToolUse { raw, .. } | AgentEvent::ToolResult { raw, .. } => {
-                        ("tool", raw, true, None)
-                    }
+                    AgentEvent::ToolUse { raw, .. }
+                    | AgentEvent::ToolResult { raw, .. }
+                    | AgentEvent::PermissionRequested { raw, .. }
+                    | AgentEvent::PermissionResponded { raw, .. } => ("tool", raw, true, None),
                     AgentEvent::Result {
                         text,
                         is_error,

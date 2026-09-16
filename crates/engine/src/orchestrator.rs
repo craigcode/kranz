@@ -87,6 +87,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 mod finalization;
+mod live_permissions;
 
 /// Max chars of an `orchestrator.decision` summary (matches digest cap).
 const DECISION_SUMMARY_MAX: usize = 200;
@@ -288,6 +289,8 @@ impl Drop for ApprovalLintWorktree {
 /// runner, control inbox, and the long-lived orchestrator session into the
 /// §4.5 loop.
 pub struct MissionEngine {
+    permission_handles: HashMap<String, crate::live_permission::PermissionResponder>,
+    permission_cancel: Option<Arc<tokio::sync::Notify>>,
     backend: Arc<dyn AgentBackend>,
     pub(crate) paths: MissionPaths,
     pub(crate) log: EventLog,
@@ -499,6 +502,8 @@ impl MissionEngine {
         reducer::write_snapshot(&state, &paths.state_file())?;
 
         let mut engine = MissionEngine {
+            permission_handles: HashMap::new(),
+            permission_cancel: None,
             backend,
             paths,
             log,
@@ -638,7 +643,9 @@ impl MissionEngine {
         }
         reducer::write_snapshot(&state, &paths.state_file())?;
 
-        Ok(MissionEngine {
+        let mut engine = MissionEngine {
+            permission_handles: HashMap::new(),
+            permission_cancel: None,
             backend,
             paths,
             log,
@@ -665,7 +672,12 @@ impl MissionEngine {
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
             workspace_provider: None,
-        })
+        };
+        engine.close_permissions(
+            None,
+            "engine restarted; the former peer cannot receive a response",
+        )?;
+        Ok(engine)
     }
 
     // -----------------------------------------------------------------------
@@ -2881,7 +2893,28 @@ impl MissionEngine {
     /// command outright.
     async fn drain_control(&mut self) -> Result<()> {
         for (path, cmd) in control::drain(&self.paths)? {
+            if let Some(cancel) = &self.permission_cancel {
+                if !matches!(
+                    cmd,
+                    ControlCommand::ResolvePermission { .. }
+                        | ControlCommand::Msg {
+                            interrupt: false,
+                            ..
+                        }
+                ) {
+                    // Finish owned workers before a control can revise policy or
+                    // start another model turn. Leave this and later inbox files
+                    // unacknowledged so the high-water mark cannot skip them.
+                    cancel.notify_waiters();
+                    break;
+                }
+            }
             match cmd {
+                ControlCommand::ResolvePermission { resolution } => {
+                    if let Err(error) = self.resolve_live_permission(resolution) {
+                        tracing::warn!(%error, "one-call permission answer rejected");
+                    }
+                }
                 ControlCommand::Pause => {
                     if self.state.mission.status != MissionStatus::Paused {
                         self.emit(EventKind::MissionPaused {})?;
@@ -3405,7 +3438,44 @@ impl MissionEngine {
             // Flight Rules (KRZ-345): the approved standards pin projects
             // the implementation-stage rules into the worker prompt.
             let standards_pin = self.state.mission.standards_manifest.clone();
-            let outcome = if self.state.config.isolation() == WorkerIsolation::Worktree {
+            let outcome = if selected_kind == BackendKind::Acp {
+                let session_cwd = self.active_root().to_path_buf();
+                let paths = self.paths.clone();
+                let (relay, mut receiver) = self.permission_channel()?;
+                self.permission_cancel = Some(cancel.clone());
+                let future = runner::run_worker_in_buffered_controlled(
+                    backend.as_ref(),
+                    &paths,
+                    &cfg,
+                    &feature,
+                    &goal,
+                    &milestone_title,
+                    guidance.as_deref(),
+                    &session_cwd,
+                    base_sha.as_deref(),
+                    &grants,
+                    &egress_grants,
+                    &deny_exceptions,
+                    auth_verdict,
+                    &touch_set,
+                    executor_route.clone(),
+                    standards_pin.as_ref(),
+                    Some(relay),
+                    Some(cancel),
+                );
+                let result = self.drive_permission_worker(future, &mut receiver).await;
+                self.permission_cancel = None;
+                self.close_permissions(None, "worker stopped; no response will be replayed")?;
+                match result {
+                    Ok((events, outcome)) => {
+                        for event in events {
+                            self.emit(event)?;
+                        }
+                        Ok(outcome)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else if self.state.config.isolation() == WorkerIsolation::Worktree {
                 let session_cwd = self.active_root().to_path_buf();
                 runner::run_worker_in(
                     backend.as_ref(),
@@ -3950,6 +4020,18 @@ impl MissionEngine {
         let standards_pin = self.state.mission.standards_manifest.clone();
         let tracker = ConcurrencyTracker::new();
 
+        let permissions_enabled = selected
+            .iter()
+            .flatten()
+            .any(|selection| selection.kind == BackendKind::Acp);
+        let (permission_relay, mut permission_receiver) = if permissions_enabled {
+            let (relay, receiver) = self.permission_channel()?;
+            (Some(relay), receiver)
+        } else {
+            (None, tokio::sync::mpsc::channel(1).1)
+        };
+        let permission_cancel = Arc::new(tokio::sync::Notify::new());
+        self.permission_cancel = permissions_enabled.then(|| permission_cancel.clone());
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
         for (idx, ws) in workspaces.iter().enumerate() {
             let Some(selection) = selected[idx].take() else {
@@ -3975,9 +4057,25 @@ impl MissionEngine {
             let touch_set = touch_set.clone();
             let standards_pin = standards_pin.clone();
             let executor_route = self.state.mission.executor_route.clone();
+            let relay = if selection.kind == BackendKind::Acp {
+                let mut relay = permission_relay
+                    .as_ref()
+                    .expect("ACP relay enabled")
+                    .clone();
+                relay.candidate = Some(CandidateLink {
+                    unit: feature.id.clone(),
+                    index: idx as u32,
+                    count: n as u32,
+                    backend: ws.spec.backend.clone(),
+                });
+                Some(relay)
+            } else {
+                None
+            };
+            let cancel = permissions_enabled.then(|| permission_cancel.clone());
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
-                let result = runner::run_worker_in_buffered(
+                let result = runner::run_worker_in_buffered_controlled(
                     backend.as_ref(),
                     &paths,
                     &cfg,
@@ -3994,6 +4092,8 @@ impl MissionEngine {
                     &touch_set,
                     executor_route,
                     standards_pin.as_ref(),
+                    relay,
+                    cancel,
                 )
                 .await;
                 (idx, result)
@@ -4007,7 +4107,23 @@ impl MissionEngine {
         let mut buffered: Vec<Option<(Vec<EventKind>, runner::RunOutcome)>> =
             (0..n).map(|_| None).collect();
         let mut panic_note: Option<String> = None;
-        while let Some(joined) = set.join_next().await {
+        let mut permission_tick = tokio::time::interval(Duration::from_millis(100));
+        let mut broker_failure = None;
+        while !set.is_empty() {
+            if broker_failure.is_some() {
+                permission_cancel.notify_waiters();
+            }
+            let joined = tokio::select! {
+                Some(joined) = set.join_next() => joined,
+                Some(packet) = permission_receiver.recv() => {
+                    if broker_failure.is_none() { broker_failure = self.handle_permission_packet(packet).err(); }
+                    continue;
+                }
+                _ = permission_tick.tick(), if permissions_enabled => {
+                    if broker_failure.is_none() { broker_failure = self.permission_tick().await.err(); }
+                    continue;
+                }
+            };
             match joined {
                 Ok((idx, Ok(result))) => buffered[idx] = Some(result),
                 Ok((idx, Err(e))) => stream_errors[idx] = Some(e.to_string()),
@@ -4016,6 +4132,14 @@ impl MissionEngine {
                 }
             }
         }
+        self.permission_cancel = None;
+        if let Some(error) = broker_failure {
+            return Err(error);
+        }
+        self.close_permissions(
+            None,
+            "parallel workers stopped; no response will be replayed",
+        )?;
         // A panicked task carries no index; any stream that produced neither
         // a result nor an error was spawned but never returned (selection
         // errors already populated `stream_errors`), so the panic becomes
@@ -4696,6 +4820,15 @@ impl MissionEngine {
             AuthVerdict::Inconclusive
         };
 
+        let permissions_enabled = selected_kind == BackendKind::Acp;
+        let (permission_relay, mut permission_receiver) = if permissions_enabled {
+            let (relay, receiver) = self.permission_channel()?;
+            (Some(relay), receiver)
+        } else {
+            (None, tokio::sync::mpsc::channel(1).1)
+        };
+        let permission_cancel = Arc::new(tokio::sync::Notify::new());
+        self.permission_cancel = permissions_enabled.then(|| permission_cancel.clone());
         let mut set: tokio::task::JoinSet<(usize, BufferedRunResult)> = tokio::task::JoinSet::new();
         for (idx, ws) in workspaces.iter().enumerate() {
             let (mwi, fwi) = self.locate_feature(&ws.feature_id)?;
@@ -4714,9 +4847,20 @@ impl MissionEngine {
             let touch_set = touch_set.clone();
             let standards_pin = standards_pin.clone();
             let executor_route = self.state.mission.executor_route.clone();
+            let relay = if selected_kind == BackendKind::Acp {
+                let mut relay = permission_relay
+                    .as_ref()
+                    .expect("ACP relay enabled")
+                    .clone();
+                relay.candidate = None;
+                Some(relay)
+            } else {
+                None
+            };
+            let cancel = permissions_enabled.then(|| permission_cancel.clone());
             set.spawn(async move {
                 let _live = guard.enter(); // count this session as live
-                let result = runner::run_worker_in_buffered(
+                let result = runner::run_worker_in_buffered_controlled(
                     backend.as_ref(),
                     &paths,
                     &cfg,
@@ -4733,6 +4877,8 @@ impl MissionEngine {
                     &touch_set,
                     executor_route,
                     standards_pin.as_ref(),
+                    relay,
+                    cancel,
                 )
                 .await;
                 (idx, result)
@@ -4744,7 +4890,23 @@ impl MissionEngine {
         let mut buffered: Vec<Option<(Vec<EventKind>, runner::RunOutcome)>> =
             (0..workspaces.len()).map(|_| None).collect();
         let mut join_err: Option<EngineError> = None;
-        while let Some(joined) = set.join_next().await {
+        let mut permission_tick = tokio::time::interval(Duration::from_millis(100));
+        let mut broker_failure = None;
+        while !set.is_empty() {
+            if broker_failure.is_some() {
+                permission_cancel.notify_waiters();
+            }
+            let joined = tokio::select! {
+                Some(joined) = set.join_next() => joined,
+                Some(packet) = permission_receiver.recv() => {
+                    if broker_failure.is_none() { broker_failure = self.handle_permission_packet(packet).err(); }
+                    continue;
+                }
+                _ = permission_tick.tick(), if permissions_enabled => {
+                    if broker_failure.is_none() { broker_failure = self.permission_tick().await.err(); }
+                    continue;
+                }
+            };
             match joined {
                 Ok((idx, Ok(result))) => buffered[idx] = Some(result),
                 Ok((_, Err(e))) => join_err = join_err.or(Some(e)),
@@ -4755,6 +4917,14 @@ impl MissionEngine {
                 }
             }
         }
+        self.permission_cancel = None;
+        if let Some(error) = broker_failure {
+            return Err(error);
+        }
+        self.close_permissions(
+            None,
+            "parallel workers stopped; no response will be replayed",
+        )?;
         // A session error/panic aborts the batch AFTER every task has been
         // joined (the JoinSet is drained above, so no worker is left running).
         // The caller's cleanup guard still sweeps every worktree/branch, and a
@@ -7120,7 +7290,9 @@ impl MissionEngine {
             | AgentEvent::ToolUse { raw, .. }
             | AgentEvent::ToolResult { raw, .. }
             | AgentEvent::Result { raw, .. }
-            | AgentEvent::Other { raw } => raw,
+            | AgentEvent::Other { raw }
+            | AgentEvent::PermissionRequested { raw, .. }
+            | AgentEvent::PermissionResponded { raw, .. } => raw,
         };
         if let Some(transcript) = self.orch_transcript.as_mut() {
             writeln!(transcript, "{}", scrub::scrub(&serde_json::to_string(raw)?))?;
@@ -9601,6 +9773,7 @@ pub(crate) mod tests {
         runs.insert("run-1".to_string(), run);
         runs.insert("run-2".to_string(), second_run);
         let state = MissionState {
+            permissions: Default::default(),
             feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".to_string(),

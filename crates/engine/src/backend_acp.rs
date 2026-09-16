@@ -32,7 +32,11 @@
 //! Deny patterns run before the read-only posture. Unclassified operations
 //! and mode changes are refused. A display title cannot stand in for shell
 //! arguments. Only an offered, unambiguous one-time option may be selected;
-//! durable or malformed options cancel. Every refusal has a denied receipt.
+//! durable or malformed options cancel. The engine records each request and
+//! resolution before its separately callable responder can send an answer.
+//! Understood calls require one-time operator consent; prohibitions are denied
+//! by policy. Output continues while a request waits, with a five-minute limit.
+//! Delivery receipts are separate from the eventual tool outcome.
 //! This is a cooperative permission policy, not shell parsing or containment:
 //! an adapter can perform actions without asking. `allowed_tools` is not an
 //! enforced allowlist here, and read-only roles may still execute commands.
@@ -132,8 +136,14 @@ const MUTATING_KINDS: &[&str] = &["edit", "delete", "move"];
 /// request, a peer request we must answer, or a notification.
 #[derive(Debug)]
 enum Frame {
+    /// In-process broker messages; never constructible from peer JSON.
+    PermissionAnswer(crate::live_permission::Answer),
+    PermissionExpired,
     /// `result`/`error` for a client-issued request id.
-    Response { id: u64, outcome: RpcOutcome },
+    Response {
+        id: u64,
+        outcome: RpcOutcome,
+    },
     /// Peer→client request (`session/request_permission`, or an unsupported
     /// client method). The `id` is echoed back verbatim — it may be a string
     /// or a number per JSON-RPC, so it is kept as a raw [`Value`].
@@ -428,9 +438,11 @@ fn permission_response(decision: &PermissionDecision, options: &[Value]) -> Valu
     };
     let selected = valid
         .then(|| {
-            options
+            let mut matching = options
                 .iter()
-                .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
+                .filter(|option| option.get("kind").and_then(Value::as_str) == Some(kind));
+            let first = matching.next()?;
+            matching.next().is_none().then_some(first)
         })
         .flatten();
     match selected {
@@ -629,6 +641,8 @@ impl AgentBackend for AcpBackend {
             })
         };
 
+        let (permission_responder, permission_answers) =
+            crate::live_permission::PermissionResponder::channel();
         let mut session = AcpSession {
             session_id: spec.session_id.clone(),
             acp_session_id: None,
@@ -648,6 +662,10 @@ impl AgentBackend for AcpBackend {
             next_request_id: 1,
             prompt_request_id: None,
             tool_calls: HashMap::new(),
+            permission_responder,
+            permission_answers,
+            pending_permissions: HashMap::new(),
+            seen_permission_ids: std::collections::HashSet::new(),
             message_text: String::new(),
             message_id: None,
             last_usage: None,
@@ -677,6 +695,11 @@ impl AgentBackend for AcpBackend {
 ///
 /// Reading is inline in `next_event`. Every write is bounded: a peer that
 /// stops reading stdin cannot block cancellation indefinitely.
+struct PendingPermission {
+    proposal: crate::live_permission::Proposal,
+    expires_at: tokio::time::Instant,
+}
+
 pub struct AcpSession {
     session_id: String,
     /// The peer-issued session id (`session/new` response).
@@ -704,6 +727,10 @@ pub struct AcpSession {
     /// `tool_call_update` or permission request resolves to what is known
     /// about the call.
     tool_calls: HashMap<String, ToolCallInfo>,
+    permission_responder: crate::live_permission::PermissionResponder,
+    permission_answers: tokio::sync::mpsc::Receiver<crate::live_permission::Answer>,
+    pending_permissions: HashMap<String, PendingPermission>,
+    seen_permission_ids: std::collections::HashSet<String>,
     /// Accumulated text of the CURRENT assistant message (chunks with the
     /// same `messageId` concatenate; a changed/missing-`messageId` boundary
     /// starts a new message, and the last message wins the terminal Result,
@@ -955,6 +982,23 @@ impl AcpSession {
     /// keepalive must not fabricate events).
     async fn read_frame(&mut self) -> Result<Option<Frame>> {
         loop {
+            let permission_wait = self
+                .pending_permissions
+                .values()
+                .map(|p| {
+                    p.expires_at
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(
+                            (p.proposal.deadline - chrono::Utc::now())
+                                .to_std()
+                                .unwrap_or_default(),
+                        )
+                })
+                .min()
+                .unwrap_or(std::time::Duration::from_secs(86400));
+            if permission_wait.is_zero() {
+                return Ok(Some(Frame::PermissionExpired));
+            }
             let read = {
                 let line = self.lines.next_line();
                 tokio::pin!(line);
@@ -968,7 +1012,16 @@ impl AcpSession {
                         })?
                 } else {
                     tokio::select! {
+                        biased;
+                        // Drain already-buffered action changes before applying
+                        // a queued answer to the older invocation description.
                         read = &mut line => read,
+                        answer = self.permission_answers.recv() => {
+                            return Ok(answer.map(Frame::PermissionAnswer));
+                        }
+                        _ = tokio::time::sleep(permission_wait), if !self.pending_permissions.is_empty() => {
+                            return Ok(Some(Frame::PermissionExpired));
+                        }
                         exited = wait_for_peer_exit(&mut self.child) => {
                             exited.map_err(|e| EngineError::Backend(format!("acp process observation failed: {e}")))?;
                             kill_owned_peer(&mut self.child, #[cfg(windows)] self.job.as_ref());
@@ -1012,6 +1065,14 @@ impl AcpSession {
     /// answers, tool tracking, usage capture, terminal-Result synthesis).
     async fn handle_frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
+            Frame::PermissionAnswer(answer) => self.answer_permission(answer).await?,
+            Frame::PermissionExpired => {
+                // Do not manufacture or replay a denial resolution. Terminating
+                // the peer closes its requests without authorizing an effect.
+                return Err(EngineError::Backend(
+                    "live permission deadline expired".into(),
+                ));
+            }
             Frame::Notification {
                 method,
                 params,
@@ -1115,6 +1176,33 @@ impl AcpSession {
             ));
         }
         let update = params.get("update").cloned().unwrap_or(Value::Null);
+        if let Some(call_id) = update.get("toolCallId").and_then(Value::as_str) {
+            if let Some(pending) = self
+                .pending_permissions
+                .values()
+                .map(|p| &p.proposal)
+                .find(|p| p.tool_call_id == call_id)
+            {
+                // Compare complete effect-bearing fields, including content.
+                // A same-title/same-path edit can still contain different bytes.
+                let changed = ["kind", "rawInput", "locations", "content"]
+                    .iter()
+                    .any(|key| {
+                        update
+                            .get(*key)
+                            .is_some_and(|value| pending.action.get(*key) != Some(value))
+                    });
+                let terminal = update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s == "completed" || s == "failed" || s == "in_progress");
+                if changed || terminal {
+                    return Err(EngineError::Backend(
+                        "ACP invocation changed or started while consent was pending".into(),
+                    ));
+                }
+            }
+        }
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("agent_message_chunk") => {
                 let text = update
@@ -1285,56 +1373,126 @@ impl AcpSession {
             self.track_tool_call(call_id.clone(), info.clone())?;
         }
 
-        let mut decision = if missing_id {
+        let decision = if missing_id {
             PermissionDecision::Deny("tool call has no valid action identity (toolCallId)".into())
         } else {
-            decide_permission(&self.spec, &info)
+            match decide_permission(&self.spec, &info) {
+                PermissionDecision::Allow
+                    if !call_update.get("rawInput").is_some_and(Value::is_object)
+                        || info.subject.trim().is_empty() =>
+                {
+                    PermissionDecision::Deny(
+                        "the complete action is unavailable for one-call consent".into(),
+                    )
+                }
+                decision => decision,
+            }
         };
+        let peer_id = serde_json::to_string(&id)?;
+        if self.pending_permissions.len() >= crate::live_permission::MAX_PENDING
+            || self.seen_permission_ids.len() >= 1024
+            || !self.seen_permission_ids.insert(peer_id)
+            || self
+                .pending_permissions
+                .values()
+                .any(|p| p.proposal.tool_call_id == call_id)
+        {
+            return Err(EngineError::Backend(
+                "duplicate or excessive ACP permission requests".into(),
+            ));
+        }
         let options = params
             .get("options")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let result = permission_response(&decision, &options);
-        if matches!(decision, PermissionDecision::Allow)
-            && result["outcome"]["outcome"] != "selected"
-        {
-            decision = PermissionDecision::Deny(
-                "peer offered no unambiguous one-time permission option".into(),
-            );
+        let mut action = call_update;
+        if let Some(fields) = action.as_object_mut() {
+            fields.insert("kind".into(), Value::String(info.kind));
         }
-        self.write_message(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }))
-        .await?;
-
-        if let PermissionDecision::Deny(reason) = &decision {
-            tracing::info!(
-                session_id = %self.session_id,
-                tool_call_id = %call_id,
-                kind = %info.kind,
-                decision = "deny",
-                reason = %reason,
-                "acp permission request refused at the kranz seam"
-            );
-            self.queue.push_back(AgentEvent::ToolResult {
-                tool: Some(info.kind.clone()),
-                denied: true,
-                summary: truncate_chars(
-                    &format!("refused by kranz permission seam: {reason}"),
-                    SUMMARY_MAX_CHARS,
-                ),
-                raw,
-            });
-        } else {
-            // The approval itself is not an event — the peer's own
-            // tool_call_update reports the outcome. The request line stays
-            // in the transcript.
-            self.queue.push_back(AgentEvent::Other { raw });
+        let now = chrono::Utc::now();
+        let mut proposal = crate::live_permission::Proposal {
+            id: format!("permission-{}", uuid::Uuid::new_v4()),
+            engine_session_id: self.session_id.clone(),
+            peer_session_id: self.acp_session_id.clone().expect("validated above"),
+            peer_request_id: id,
+            tool_call_id: call_id,
+            action_digest: crate::live_permission::digest(&action)?,
+            options_digest: crate::live_permission::digest(&options)?,
+            action,
+            options,
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(crate::live_permission::REQUEST_TTL_SECS),
+            prohibition: match decision {
+                PermissionDecision::Deny(reason) => Some(reason),
+                PermissionDecision::Allow => None,
+            },
+        };
+        if proposal.option(true).is_none() && proposal.prohibition.is_none() {
+            proposal.prohibition = Some("no unique certified allow_once option was offered".into());
         }
+        proposal.validate()?;
+        self.pending_permissions.insert(
+            proposal.id.clone(),
+            PendingPermission {
+                proposal: proposal.clone(),
+                expires_at: tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(
+                        crate::live_permission::REQUEST_TTL_SECS as u64,
+                    ),
+            },
+        );
+        self.queue.push_back(AgentEvent::PermissionRequested {
+            proposal: Box::new(proposal),
+            raw,
+        });
         Ok(())
+    }
+
+    async fn answer_permission(&mut self, answer: crate::live_permission::Answer) -> Result<()> {
+        let Some(pending) = self.pending_permissions.get(&answer.proposal.id) else {
+            return Err(EngineError::Backend(
+                "permission response names no live request".into(),
+            ));
+        };
+        if pending.proposal != answer.proposal
+            || chrono::Utc::now() >= pending.proposal.deadline
+            || tokio::time::Instant::now() >= pending.expires_at
+            || (answer.allow
+                && (pending.proposal.prohibition.is_some()
+                    || pending.proposal.option(true).is_none()))
+        {
+            return Err(EngineError::Backend(
+                "stale or prohibited permission response".into(),
+            ));
+        }
+        let proposal = self
+            .pending_permissions
+            .remove(&answer.proposal.id)
+            .expect("checked above")
+            .proposal;
+        let decision = if answer.allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny("one-call consent refused".into())
+        };
+        let result = permission_response(&decision, &proposal.options);
+        let sent = self
+            .write_message(json!({
+                "jsonrpc": "2.0", "id": proposal.peer_request_id, "result": result,
+            }))
+            .await;
+        let delivery = if sent.is_ok() {
+            crate::live_permission::Delivery::Sent
+        } else {
+            crate::live_permission::Delivery::Uncertain
+        };
+        self.queue.push_back(AgentEvent::PermissionResponded {
+            request_id: proposal.id.clone(),
+            delivery: delivery.clone(),
+            raw: json!({"permissionResponse":proposal.id,"delivery":delivery}),
+        });
+        sent
     }
 
     /// Synthesize the terminal `Result` from a `session/prompt` response
@@ -1508,6 +1666,10 @@ impl AcpSession {
 
 #[async_trait::async_trait]
 impl AgentSession for AcpSession {
+    fn permission_responder(&self) -> Option<crate::live_permission::PermissionResponder> {
+        Some(self.permission_responder.clone())
+    }
+
     fn session_id(&self) -> String {
         self.session_id.clone()
     }
@@ -1838,5 +2000,18 @@ mod tests {
             &[options[0].clone()],
         );
         assert_eq!(deny_no_reject["outcome"]["outcome"], json!("cancelled"));
+        for (kind, decision) in [
+            ("allow_once", PermissionDecision::Allow),
+            ("reject_once", PermissionDecision::Deny("refused".into())),
+        ] {
+            let ambiguous = vec![
+                json!({"optionId":"a","kind":kind}),
+                json!({"optionId":"b","kind":kind}),
+            ];
+            assert_eq!(
+                permission_response(&decision, &ambiguous)["outcome"]["outcome"],
+                "cancelled"
+            );
+        }
     }
 }

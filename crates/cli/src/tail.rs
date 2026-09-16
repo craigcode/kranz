@@ -101,6 +101,36 @@ impl EventRenderer {
     /// One event → one human line (role-tagged, truncated to [`LINE_MAX`]).
     pub fn render(&mut self, event: &Event) -> String {
         let (tag, color, body) = match &event.kind {
+            EventKind::PermissionRequested { request } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!(
+                    "{} awaits one-call consent (run {}, expires {})",
+                    request.proposal.id, request.binding.run_id, request.proposal.deadline
+                ),
+            ),
+            EventKind::PermissionResolved { resolution } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {} once; response pending",
+                    resolution.request_id,
+                    if resolution.allow { "allow" } else { "deny" }
+                ),
+            ),
+            EventKind::PermissionResponseRecorded {
+                request_id,
+                delivery,
+            } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!("{request_id}: response {delivery:?}; tool outcome is separate"),
+            ),
+            EventKind::PermissionClosed { request_id, reason } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!("{request_id}: closed ({reason})"),
+            ),
             EventKind::MissionCreated { goal, .. } => (
                 "mission".to_string(),
                 ansi::YELLOW,

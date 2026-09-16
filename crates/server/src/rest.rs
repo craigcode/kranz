@@ -984,6 +984,11 @@ pub(crate) async fn post_control(
     }
     let command: ControlCommand = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid ControlCommand body: {e}")))?;
+    if matches!(command, ControlCommand::ResolvePermission { .. }) {
+        return Err(ApiError::bad_request(
+            "use the permission/answer route; permission actor is assigned by the server",
+        ));
+    }
     if let ControlCommand::ConfigChange { patch } = &command {
         let events = EventLog::read_events(&paths.events_file())?;
         let state = reducer::fold(&events)?;
@@ -1074,6 +1079,43 @@ pub(crate) async fn post_revision_reject(
         &paths,
         &ControlCommand::RejectRevision {
             revision: body.revision,
+        },
+    )?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PermissionAnswerBody {
+    request_id: String,
+    binding_digest: String,
+    allow: bool,
+}
+
+pub(crate) async fn post_permission_answer(
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<PermissionAnswerBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paths = require_revisable_mission(&server, &id)?;
+    let state = fold_log(&paths).map_err(ApiError::internal)?;
+    let record = state
+        .permissions
+        .get(&body.request_id)
+        .ok_or_else(|| ApiError::conflict("unknown live permission"))?;
+    record
+        .validate_answer(&body.binding_digest, body.allow, chrono::Utc::now())
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
+    control::enqueue(
+        &paths,
+        &ControlCommand::ResolvePermission {
+            resolution: kranz_engine::live_permission::Resolution {
+                request_id: body.request_id,
+                binding_digest: body.binding_digest,
+                allow: body.allow,
+                actor: kranz_engine::live_permission::Actor::LocalMutationCapability,
+                reason: "operator answered through the authenticated local API".into(),
+            },
         },
     )?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))

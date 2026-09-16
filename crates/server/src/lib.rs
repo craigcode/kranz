@@ -547,6 +547,10 @@ fn protected_repo_api_routes() -> Router<Arc<ServerState>> {
         )
         .route("/missions/{id}/grant/deny", post(rest::post_grant_deny))
         .route(
+            "/missions/{id}/permission/answer",
+            post(rest::post_permission_answer),
+        )
+        .route(
             "/missions/{id}/question/answer",
             post(rest::post_question_answer),
         )

@@ -50,6 +50,26 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
+    #[serde(rename = "permission.requested")]
+    PermissionRequested {
+        request: crate::live_permission::Request,
+    },
+    #[serde(rename = "permission.resolved")]
+    PermissionResolved {
+        resolution: crate::live_permission::Resolution,
+    },
+    #[serde(rename = "permission.response-recorded")]
+    PermissionResponseRecorded {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        delivery: crate::live_permission::Delivery,
+    },
+    #[serde(rename = "permission.closed")]
+    PermissionClosed {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        reason: String,
+    },
     #[serde(rename = "mission.created")]
     MissionCreated {
         goal: String,
@@ -1152,6 +1172,10 @@ impl EventKind {
     /// The dotted wire name of this event (matches the serde rename).
     pub fn type_name(&self) -> &'static str {
         match self {
+            EventKind::PermissionRequested { .. } => "permission.requested",
+            EventKind::PermissionResolved { .. } => "permission.resolved",
+            EventKind::PermissionResponseRecorded { .. } => "permission.response-recorded",
+            EventKind::PermissionClosed { .. } => "permission.closed",
             EventKind::MissionCreated { .. } => "mission.created",
             EventKind::PlanApproved { .. } => "plan.approved",
             EventKind::PlanRevisionProposed { .. } => "plan.revision.proposed",

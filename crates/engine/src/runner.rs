@@ -32,6 +32,11 @@
 //! [`run_worker_in_buffered`]). Per-run transcripts (`runs/<id>.jsonl`) are
 //! separate files, not the single-writer log, so they are written live in both
 //! modes.
+//!
+//! ACP uses `LogTarget::Controlled`: a permission notice relays the run's
+//! preceding buffer to the engine and awaits only its durability acknowledgement.
+//! The engine remains the sole writer while sessions continue pumping output
+//! during human waits. Runs without permission notices retain deferred replay.
 
 use crate::auth_verify::AuthVerdict;
 use crate::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
@@ -77,6 +82,36 @@ pub enum LogTarget<'a> {
     Live(&'a mut EventLog),
     /// Collect kinds in append order; the engine emits them later, serially.
     Buffer(Vec<EventKind>),
+    Controlled {
+        events: Vec<EventKind>,
+        relay: PermissionRelay,
+        relayed: bool,
+    },
+}
+
+#[derive(Clone)]
+pub struct PermissionRelay {
+    pub sender: tokio::sync::mpsc::Sender<PermissionPacket>,
+    pub plan_digest: String,
+    pub policy_digest: String,
+    pub candidate: Option<crate::types::CandidateLink>,
+}
+
+pub struct PermissionPacket {
+    pub events: Vec<EventKind>,
+    pub binding: crate::live_permission::Binding,
+    pub candidate: Option<crate::types::CandidateLink>,
+    pub notice: PermissionNotice,
+    pub persisted: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+pub enum PermissionNotice {
+    Requested(
+        Box<crate::live_permission::Proposal>,
+        crate::live_permission::PermissionResponder,
+    ),
+    Responded(String, crate::live_permission::Delivery),
+    Finished,
 }
 
 impl LogTarget<'_> {
@@ -88,7 +123,65 @@ impl LogTarget<'_> {
                 log.append(kind)?;
             }
             LogTarget::Buffer(buf) => buf.push(kind),
+            LogTarget::Controlled { events, .. } => {
+                if events.len() >= 4096 {
+                    return Err(EngineError::Backend(
+                        "ACP buffered event limit exceeded".into(),
+                    ));
+                }
+                events.push(kind);
+            }
         }
+        Ok(())
+    }
+
+    async fn permission_notice(
+        &mut self,
+        notice: PermissionNotice,
+        run_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<()> {
+        let LogTarget::Controlled {
+            events,
+            relay,
+            relayed,
+        } = self
+        else {
+            return Err(EngineError::Backend(
+                "live consent requires an engine-owned permission relay".into(),
+            ));
+        };
+        if matches!(notice, PermissionNotice::Finished) && !*relayed {
+            return Ok(());
+        }
+        *relayed = true;
+        let (persisted, acknowledged) = tokio::sync::oneshot::channel();
+        let packet = PermissionPacket {
+            events: std::mem::take(events),
+            binding: crate::live_permission::Binding {
+                mission_id: String::new(), // engine stamps its own mission ID
+                run_id: run_id.to_string(),
+                workspace: cwd.display().to_string(),
+                plan_digest: relay.plan_digest.clone(),
+                policy_digest: relay.policy_digest.clone(),
+            },
+            candidate: relay.candidate.clone(),
+            notice,
+            persisted,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            relay
+                .sender
+                .send(packet)
+                .await
+                .map_err(|_| EngineError::Backend("permission broker ended".into()))?;
+            acknowledged
+                .await
+                .map_err(|_| EngineError::Backend("permission request was not persisted".into()))?
+                .map_err(EngineError::Backend)
+        })
+        .await
+        .map_err(|_| EngineError::Backend("permission persistence timed out".into()))??;
         Ok(())
     }
 }
@@ -119,7 +212,9 @@ impl RunSink<'_, '_> {
             | AgentEvent::ToolUse { raw, .. }
             | AgentEvent::ToolResult { raw, .. }
             | AgentEvent::Result { raw, .. }
-            | AgentEvent::Other { raw } => raw,
+            | AgentEvent::Other { raw }
+            | AgentEvent::PermissionRequested { raw, .. }
+            | AgentEvent::PermissionResponded { raw, .. } => raw,
         };
         let line = scrub::scrub(&serde_json::to_string(raw)?);
         writeln!(self.transcript, "{line}")?;
@@ -325,7 +420,9 @@ pub async fn run_session_to(
     // no-op for sessions that never had hook config projected (validators,
     // orchestrators, every non-claude backend).
     let hook_gate_session_id = spec.session_id.clone();
+    let permission_cwd = spec.cwd.clone();
     let mut session = backend.start(spec).await?;
+    let permission_responder = session.permission_responder();
     let session_id = session.session_id();
 
     let mut usage = TokenUsage::default();
@@ -348,6 +445,7 @@ pub async fn run_session_to(
         loop {
             let step = match &cancel {
                 Some(notify) if !cancelled => tokio::select! {
+                    biased;
                     _ = notify.notified() => Step::Cancelled,
                     event = session.next_event() => Step::Event(event?),
                 },
@@ -360,6 +458,37 @@ pub async fn run_session_to(
                 }
                 Step::Event(None) => break,
                 Step::Event(Some(event)) => {
+                    let notice = match &event {
+                        AgentEvent::PermissionRequested { proposal, .. } => {
+                            Some(PermissionNotice::Requested(
+                                proposal.clone(),
+                                permission_responder.clone().ok_or_else(|| {
+                                    EngineError::Backend(
+                                        "backend advertised a request without a responder".into(),
+                                    )
+                                })?,
+                            ))
+                        }
+                        AgentEvent::PermissionResponded {
+                            request_id,
+                            delivery,
+                            ..
+                        } => Some(PermissionNotice::Responded(
+                            request_id.clone(),
+                            delivery.clone(),
+                        )),
+                        _ => None,
+                    };
+                    if let Some(notice) = notice {
+                        if let Err(error) = sink
+                            .log
+                            .permission_notice(notice, &run_meta.run_id, &permission_cwd)
+                            .await
+                        {
+                            session.abort().await?;
+                            return Err(error);
+                        }
+                    }
                     if let AgentEvent::ToolUse { tool, summary, .. } = &event {
                         last_tool_use = Some((tool.clone(), summary.clone()));
                     }
@@ -878,9 +1007,9 @@ pub async fn run_worker_in(
 /// are per-run files, not the single-writer log, so concurrent writers to
 /// distinct `runs/<id>.jsonl` files never conflict.
 ///
-/// No `cancel`: the buffered concurrent path does not wire interrupts (matching
-/// the parallel subset's live path). Interrupts remain a sequential-path
-/// feature.
+/// This compatibility wrapper does not wire cancellation. The engine's ACP
+/// path uses `run_worker_in_buffered_controlled` to add live consent and cancel
+/// without giving a worker task direct access to the shared log.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker_in_buffered(
     backend: &dyn AgentBackend,
@@ -899,6 +1028,50 @@ pub async fn run_worker_in_buffered(
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
+) -> Result<(Vec<EventKind>, RunOutcome)> {
+    run_worker_in_buffered_controlled(
+        backend,
+        paths,
+        cfg,
+        feature,
+        plan_goal,
+        milestone_title,
+        extra_guidance,
+        session_cwd,
+        base_sha,
+        grants,
+        egress_grants,
+        deny_exceptions,
+        auth_verdict,
+        touch_set,
+        executor_route,
+        standards_pin,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_worker_in_buffered_controlled(
+    backend: &dyn AgentBackend,
+    paths: &MissionPaths,
+    cfg: &MissionConfig,
+    feature: &Feature,
+    plan_goal: &str,
+    milestone_title: &str,
+    extra_guidance: Option<&str>,
+    session_cwd: &std::path::Path,
+    base_sha: Option<&str>,
+    grants: &[String],
+    egress_grants: &[String],
+    deny_exceptions: &[String],
+    auth_verdict: AuthVerdict,
+    touch_set: &[String],
+    executor_route: Option<crate::types::ExecutorRoute>,
+    standards_pin: Option<&crate::types::StandardsPin>,
+    relay: Option<PermissionRelay>,
+    cancel: Option<Arc<Notify>>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
     let (spec, run_meta) = build_worker_spec(
         cfg,
@@ -919,13 +1092,26 @@ pub async fn run_worker_in_buffered(
         executor_route,
         standards_pin,
     )?;
-    let mut target = LogTarget::Buffer(Vec::new());
-    let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, None).await?;
+    let run_id = run_meta.run_id.clone();
+    let mut target = match relay {
+        Some(relay) => LogTarget::Controlled {
+            events: Vec::new(),
+            relay,
+            relayed: false,
+        },
+        None => LogTarget::Buffer(Vec::new()),
+    };
+    let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
+    if matches!(target, LogTarget::Controlled { .. }) {
+        target
+            .permission_notice(PermissionNotice::Finished, &run_id, session_cwd)
+            .await?;
+    }
     let buffered = match target {
-        LogTarget::Buffer(buf) => buf,
+        LogTarget::Buffer(buf) | LogTarget::Controlled { events: buf, .. } => buf,
         LogTarget::Live(_) => unreachable!("buffered target constructed above"),
     };
-    Ok((buffered, outcome))
+    Ok((buffered, outcome?))
 }
 
 /// Extend `spec.env` (already carrying [`contract_env`]) with a scratch

@@ -35,8 +35,26 @@ with warnings denied, formatting and the full workspace build pass. The syntheti
 report parses, and an existing receipt refuses a retry before spawning.
 Actionlint and domain lint pass. The integrating PR carries remaining CI results.
 
-S2 stays open pending separately authorized live Claude and Codex runs with
-available local credentials. Neither provider has been launched. The source
-receipts and mock success must not be labelled live authentication or production
-readiness. Native-state authentication and enforced ACP containment are not
-implemented by this patch.
+## Native-login follow-up (2026-09-16 UTC)
+
+The operator authorized reusing existing CLI login state. Codex passed the bounded
+live probe on macOS arm64 using only a private `auth.json` copy. The reviewed
+receipt removes account display data, preserves the protocol/report evidence and
+hashes the private source. A complete npm lock and runtime installation receipt
+pin the actual providers. No ordinary-mission auth defaults changed.
+
+Claude's first live attempt returned `Authentication required`. A local Keychain
+experiment prompted macOS approval; the operator directed that Keychain access
+stop. The experiment was removed. The current probe neither queries nor links
+Keychain state and refuses absent file-based Claude credentials before launch.
+S2 remains open pending Claude live proof; the Codex result is not a claim about
+Claude authentication, contained execution or production readiness.
+
+The added auth-source validation rejects ambiguous API-key/native inputs. Fake
+credential tests verify that only credential files cross, with no settings,
+hooks or history. These checks require no real login and no model calls.
+
+Validation after the follow-up: all four Rust workspace gates pass (2,953 tests,
+zero failures, ten existing ignored), plus both native-file seed tests and the
+synthetic probe driver. The native change is isolated to the explicit example;
+no runtime auth policy or ordinary mission configuration changed.

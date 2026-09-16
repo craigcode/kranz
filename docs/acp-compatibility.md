@@ -1,9 +1,12 @@
 # ACP adapter compatibility
 
 S2 is in progress. Deterministic transport tests and released-source inspection
-are available; neither provider has a live compatibility pass yet. The current
+are available. Codex has a live native-login text/report pass on macOS arm64;
+Claude remains pending after an authentication failure. The current
 ACP backend remains an opt-in worker backend. Validator use, same-feature resume,
-client filesystem/terminal services and enforced containment remain unavailable.
+client filesystem/terminal services and enforced containment remain unavailable. The
+[one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
+and operator controls.
 
 ## Released baseline
 
@@ -99,9 +102,16 @@ file. This Claude example contains names and paths only, never a key value:
 For Codex, use `provider: "codex"`, its pinned adapter entry point, and exactly one
 of `CODEX_API_KEY` or `OPENAI_API_KEY`. The probe supplies a non-secret
 `DEFAULT_AUTH_REQUEST` selecting `api-key`, `NO_BROWSER=1`, and initial mode
-`read-only`. It does not copy native login state. Native login support must be
-separately scoped and verified; copying a whole provider configuration or restoring
-ambient HOME is not a workaround for missing credentials.
+`read-only`.
+
+For an explicitly authorized existing CLI login, replace `credentialEnv` with
+`"nativeLoginHome": "/absolute/operator/home"`. Codex copies only
+`.codex/auth.json` into the disposable private home; it does not copy settings,
+hooks or history, and does not start an interactive login if that state fails.
+Claude supports only an existing `.claude/.credentials.json` file through this
+probe. An absent file fails before adapter launch. The probe does not query or
+link the macOS Keychain. API-key and native-login inputs are mutually exclusive;
+neither restores ambient HOME or configures authentication for ordinary missions.
 
 ```sh
 target/debug/examples/acp_compat_probe --check /absolute/private-config.json
@@ -109,7 +119,8 @@ target/debug/examples/acp_compat_probe --run /absolute/private-config.json
 ```
 
 `--check` never starts an adapter or reads a credential value. It reports only
-whether the configured variable is present and the receipt path is unused.
+whether the configured variable or native credential file is present and the
+receipt path is unused. File presence is not an authentication verification.
 `--run` requires a fresh receipt path and refuses to overwrite an earlier attempt.
 The driver sends exactly one prompt, uses a new empty workspace/private HOME,
 limits capture to 512 events and 2 MiB, and aborts on observed tool activity.
@@ -137,3 +148,24 @@ normal completion path for the pinned release/platform. Explicit probe injection
 does not configure ordinary missions: `backend_acp` currently has no automatic
 provider credential selection or native-state seeding. S2 remains open until
 both live receipts and that readiness limitation have been reviewed.
+
+## Live results (2026-09-16 UTC)
+
+The [installation receipt](compatibility/acp/live-install.json) and complete
+[resolved dependency lock](compatibility/acp/live-install-lock.json) pin Node,
+adapters and native runtimes for this batch.
+
+- Codex: [retained redacted receipt](compatibility/acp/codex-acp-native-login.jsonl).
+  Existing CLI account login, one prompt, 10.3 seconds, `end_turn`, the expected
+  partial report and successful cleanup. No API key was injected. Account display
+  information is removed from the public receipt; its header hashes the private
+  source. Missing cost remains unavailable.
+- Claude: the initial credential/Keychain-link setup reached the adapter but
+  returned `Authentication required` after 4.8 seconds. A subsequent local
+  experiment accessed the operator's Keychain and prompted macOS approval. The
+  operator prohibited further Keychain access; that path was removed, and no
+  Claude live pass is claimed. File credentials or an explicitly supplied API key
+  remain possible future inputs. No further Claude run is scheduled.
+
+These results do not complete S2 or justify merging its dependent implementation
+as fully accepted. The live Claude receipt is still required.

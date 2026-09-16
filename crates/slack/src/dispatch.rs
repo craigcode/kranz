@@ -873,6 +873,27 @@ pub(crate) async fn dispatch_action(
             )
             .await;
         }
+        Action::ResolvePermission {
+            mission_id,
+            request_id,
+            binding_digest,
+            allow,
+            user_id,
+            response_url,
+        } => {
+            crate::bridge::permission_control(
+                cfg,
+                client,
+                repo_root,
+                mission_id,
+                request_id,
+                binding_digest,
+                *allow,
+                user_id.as_deref(),
+                response_url.as_deref(),
+            )
+            .await;
+        }
         Action::ApproveGrant {
             mission_id,
             command,
