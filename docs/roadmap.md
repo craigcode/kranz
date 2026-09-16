@@ -234,6 +234,40 @@ bytes untouched, and explains authorization, changes, checks and remaining human
 work from its exported evidence. Existing advisory/floor/waiver behavior stays
 intact. No push or automatic ACP-default promotion is part of this scope.
 
+## Scheduled follow-up — review efficiency and evidence (2026-09-16)
+
+The operator authorized these follow-ups after reviewing
+[Vercel's software factory article](https://vercel.com/blog/building-a-software-factory-for-ai-sdk).
+They extend Kranz's review and evidence surfaces within the existing positioning
+boundary. The current ACP integration, containment and S7 acceptance remain
+ahead of this work; no new release prerequisite is added to that scope.
+
+| Wave | Ticket | Priority | Admission dependency |
+|---|---|---|---|
+| 1 | [Gate review packet](../.kranz/tickets/gate-review-packet.md) | 2 | S7 `acp-governed-mission-acceptance` |
+| 1 | [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md) | 2 | S7 `acp-governed-mission-acceptance` |
+| 1 | [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) | 2 | S7 `acp-governed-mission-acceptance` |
+| 2 | [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) | 3 | All three wave-1 tickets |
+
+These are one-shot backlog tickets with `schedule: once` and `blocked-by` edges,
+not dated or recurring executions. Pick up the review packet first after S7;
+the baseline and outcome extensions can be planned independently. The pilot
+waits for all three. Normal plan review and approval still precede execution.
+The dependency gate checks recorded Complete missions, not a ticket's `done`
+label alone; an implementation merged outside a mission needs explicit operator
+reconciliation before admitting a dependent, without fabricating a mission pass.
+
+S5 continues to own authoritative stage inputs, receipts and freshness checks.
+The follow-ups make that evidence easier to assess and compare. Human review
+packets may expose a wider audit chain than fresh validators receive. Outcome
+categories explain existing states without creating new authority or automated
+remediation. The pilot separates active review effort from approval waiting time
+and records missing data honestly before proposing more product machinery.
+
+Specialist prompts and code-generation workflows stay with external harnesses
+or consumer packs. A Sgian desk may present and act through Kranz's decisions;
+terminal/editor/factory UI and cloud orchestration remain outside these tickets.
+
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; Railway live deploy operator-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP
