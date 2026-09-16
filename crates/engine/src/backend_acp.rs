@@ -664,6 +664,7 @@ impl AgentBackend for AcpBackend {
             tool_calls: HashMap::new(),
             permission_responder,
             permission_answers,
+            deferred_permission_answer: None,
             pending_permissions: HashMap::new(),
             seen_permission_ids: std::collections::HashSet::new(),
             message_text: String::new(),
@@ -729,6 +730,7 @@ pub struct AcpSession {
     tool_calls: HashMap<String, ToolCallInfo>,
     permission_responder: crate::live_permission::PermissionResponder,
     permission_answers: tokio::sync::mpsc::Receiver<crate::live_permission::Answer>,
+    deferred_permission_answer: Option<crate::live_permission::Answer>,
     pending_permissions: HashMap<String, PendingPermission>,
     seen_permission_ids: std::collections::HashSet<String>,
     /// Accumulated text of the CURRENT assistant message (chunks with the
@@ -999,6 +1001,7 @@ impl AcpSession {
             if permission_wait.is_zero() {
                 return Ok(Some(Frame::PermissionExpired));
             }
+            let can_answer = !self.lines.has_partial_line();
             let read = {
                 let line = self.lines.next_line();
                 tokio::pin!(line);
@@ -1016,7 +1019,13 @@ impl AcpSession {
                         // Drain already-buffered action changes before applying
                         // a queued answer to the older invocation description.
                         read = &mut line => read,
-                        answer = self.permission_answers.recv() => {
+                        answer = async {
+                            if let Some(answer) = self.deferred_permission_answer.take() {
+                                Some(answer)
+                            } else {
+                                self.permission_answers.recv().await
+                            }
+                        }, if can_answer => {
                             return Ok(answer.map(Frame::PermissionAnswer));
                         }
                         _ = tokio::time::sleep(permission_wait), if !self.pending_permissions.is_empty() => {
@@ -1450,6 +1459,13 @@ impl AcpSession {
     }
 
     async fn answer_permission(&mut self, answer: crate::live_permission::Answer) -> Result<()> {
+        // The biased read may have consumed a fragment before yielding. Do
+        // not authorize against an earlier description until that frame has
+        // been classified. The existing permission deadline bounds this wait.
+        if self.lines.has_partial_line() {
+            self.deferred_permission_answer = Some(answer);
+            return Ok(());
+        }
         let Some(pending) = self.pending_permissions.get(&answer.proposal.id) else {
             return Err(EngineError::Backend(
                 "permission response names no live request".into(),

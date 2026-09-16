@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-16
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -230,3 +230,14 @@ untouched (AGENTS.md rules 1–3).
   a contained worker could once overwrite the trust root it could not read, or
   forge approvals into a sibling mission's inbox (the 2026-09-01 adversarial
   audit, H2/H3/H7/H8/H11/H12).
+
+## One-call consent never widens mission policy
+
+An ACP answer names an exact request and binding digest. The engine must persist
+the resolution before writing the protocol response; a sent receipt is not proof
+of the effect. Prohibited or incomplete actions cannot be approved, and only
+unique certified once-only options qualify. Expiry, action drift, a dead peer
+or a lost response channel closes the request without retrying the effect.
+Local capability authority is recorded as such; only a verified Slack interaction
+supplies a Slack user identity. ACP remains cooperative until separate containment
+proof exists. See [consent operations](../../acp-live-permissions.md).

@@ -83,3 +83,24 @@ build, embedded sync/check and lint (18 existing warnings in untouched component
 zero errors). No live provider, Slack message or Keychain operation was used by
 these checks. The separately retained Codex compatibility receipt is S2 evidence;
 Claude's live proof remains outstanding.
+
+## CI follow-up, 2026-09-16
+
+The first CI run exposed stale knowledge dates, a timing-dependent ACP fixture,
+and a one-second output-drain timeout on the loaded macOS runner. The consent
+fixture now holds a fragmented action change open across a queued answer. That
+exercise also found a real cancellation issue: partial stdout lived in the read
+future and was discarded when another select branch won. The bounded reader now
+retains partial bytes and byte limits across cancellation, and ACP defers answers
+until a started frame is classified. Unit tests exercise exact bytes and limits.
+
+The negative-control runner allows up to five seconds for pipe EOF after group
+cleanup, retaining the unreaped leader and repeating group cleanup until EOF.
+The delayed-effect control still detects surviving descendants, so
+waiting for an escaped process does not turn cleanup into a pass. Knowledge
+notes now describe the new consent behavior and have been checked against it.
+
+After those fixes, the full workspace suite passed 2,980 tests, with zero
+failures and 10 existing ignored tests. Workspace Clippy, formatting, build
+and full-history knowledge refresh passed. This includes the opted-in local
+Docker evaluator checks using the empty Docker credential configuration.
