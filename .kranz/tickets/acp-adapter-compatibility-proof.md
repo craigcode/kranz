@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: S2 basic compatibility implemented and live-proven for pinned Claude/Codex adapters; PR #60 review and downstream containment/mission acceptance remain separate.
+state: done
 title: ACP adapters — prove released protocol, authentication and report compatibility
 priority: 1
 schedule: once
@@ -46,3 +47,14 @@ remain until evidence justifies an explicit change.
 
 Client fs/terminal services, same-feature resume, ACP validator roles and
 automatic backend promotion.
+
+## Completion evidence
+
+The pinned Claude and Codex adapters both passed the bounded native-login
+text/report probe on macOS arm64. The runbook, redacted live receipts, released
+source hashes and full installation lock are retained under
+`docs/acp-compatibility.md` and `docs/compatibility/acp/`. The five-axis self-review
+and regression results are in `docs/reviews/2026-09-14-acp-compatibility.md`.
+PR #60 remains subject to review; this closes S2 implementation and basic
+compatibility proof, not downstream permission, containment or governed-mission
+acceptance.

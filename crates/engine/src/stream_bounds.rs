@@ -155,11 +155,20 @@ where
 pub(crate) struct BoundedLines<R> {
     reader: BufReader<R>,
     cap: usize,
+    strict: bool,
 }
 
 impl<R: AsyncRead + Unpin> BoundedLines<R> {
     pub(crate) fn new(inner: R) -> Self {
         Self::with_cap(inner, STDOUT_LINE_CAP)
+    }
+
+    /// Protocols with authority-bearing JSON reject oversized lines and
+    /// invalid UTF-8 instead of accepting a lossy or truncated rendering.
+    pub(crate) fn new_strict(inner: R) -> Self {
+        let mut lines = Self::new(inner);
+        lines.strict = true;
+        lines
     }
 
     /// Explicit cap, separated so tests can exercise truncation without
@@ -168,6 +177,7 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
         BoundedLines {
             reader: BufReader::new(inner),
             cap,
+            strict: false,
         }
     }
 
@@ -181,6 +191,10 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
+                if self.strict {
+                    std::str::from_utf8(window.tail())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                }
                 // EOF: retained bytes are one last unterminated line; a
                 // pristine window is a clean end of stream.
                 return Ok(if window.is_empty() {
@@ -195,7 +209,17 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
             };
             window.push(&available[..take]);
             self.reader.consume(take);
+            if self.strict && window.truncated {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "protocol line exceeded its byte limit",
+                ));
+            }
             if found_newline {
+                if self.strict {
+                    std::str::from_utf8(window.tail())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                }
                 return Ok(Some(window.render_line()));
             }
         }
