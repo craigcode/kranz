@@ -118,6 +118,10 @@ fn gate_subprocess_v1_pins_script_bytes_at_approved_git_ref() {
     .unwrap();
     let pin = PinnedRegistration::at_ref(&repo, "HEAD", "", "synthetic-checker").unwrap();
     assert_eq!(old, pin.digest());
+    assert_eq!(
+        f.evidence.request().params.binding.registration_digest,
+        pin.digest()
+    );
     git(f.tmp.path(), &["add", "checker.py"]);
     git(
         f.tmp.path(),
@@ -378,6 +382,19 @@ mod container {
                     .env_clear()
                     .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                     .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+                    .envs(
+                        [
+                            "DOCKER_HOST",
+                            "DOCKER_CONTEXT",
+                            "DOCKER_CONFIG",
+                            "DOCKER_TLS",
+                            "DOCKER_TLS_VERIFY",
+                            "DOCKER_CERT_PATH",
+                            "DOCKER_API_VERSION",
+                        ]
+                        .into_iter()
+                        .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+                    )
                     .args([
                         "container",
                         "ls",

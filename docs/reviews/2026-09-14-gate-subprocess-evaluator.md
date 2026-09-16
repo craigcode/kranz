@@ -67,3 +67,18 @@ existing gate order, engine floors, waivers, sandbox behavior and old logs.
 - Linux certification and the full remote regression suite must be green before
   S3 is marked done. S2's live Claude/Codex checks still need separate approved
   call budget and locally supplied API credentials.
+
+## Cross-platform test follow-up (2026-09-16 UTC)
+
+Windows Clippy found that the fixture's frozen evidence was only read by the
+macOS/Linux container tests. The portable pinning test now checks the request's
+registration digest against the approved checker, so Windows exercises that
+binding without suppressing the warning. Review found no production code change.
+
+Running the container proof with an explicit `DOCKER_HOST` also exposed a test
+observer that queried the default daemon after dropping the evaluator. Its
+environment remains cleared and now carries the Docker connection variables,
+matching the daemon selection used by the evaluator. This fixes the observation,
+not the production cleanup path. Full workspace validation uses that explicit
+endpoint and `KRANZ_GATE_CONTAINER_TESTS=1`; remote Windows validation belongs to
+the updated PR head.
