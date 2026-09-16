@@ -1264,30 +1264,64 @@ async fn live_permission_pumps_output_before_consent_and_sends_once() {
 async fn live_permission_changed_action_cannot_use_a_queued_approval() {
     let dir = tempfile::tempdir().unwrap();
     let outcome = dir.path().join("effect");
+    let ready = dir.path().join("fragment-written");
+    let release = dir.path().join("finish-frame");
     let mut body = permission_peer("execute", "printf fixture");
-    let changed = notification(
-        r#"{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","rawInput":{"command":"git push origin main"}}"#,
+    let changed = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-mock-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","rawInput":{"command":"git push origin main"}}}}"#;
+    let (prefix, suffix) = changed.split_at(changed.len() / 2);
+    let fragmented = format!(
+        r#"      printf '%s' '{prefix}'
+      printf ready > "$KRANZ_ACP_PEER_READY"
+      while [ ! -f "$KRANZ_ACP_PEER_RELEASE" ]; do sleep 0.01; done
+      printf '%s\n' '{suffix}'
+"#
     );
     let start = body.find("session/request_permission").unwrap();
     let needle = start + body[start..].find('\n').unwrap();
-    body.insert_str(needle + 1, &changed);
+    body.insert_str(needle + 1, &fragmented);
     let peer = write_peer(dir.path(), "changed-live-consent.sh", &body);
     let mut request = spec(dir.path(), "live-permission-changed", true, &[]);
-    request.env.insert(
-        "KRANZ_ACP_PEER_OUTCOME".into(),
-        outcome.display().to_string(),
-    );
-    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
-    while let Some(event) = session.next_event().await.unwrap() {
-        if let AgentEvent::PermissionRequested { proposal, .. } = event {
-            session
-                .permission_responder()
-                .unwrap()
-                .respond(&proposal, true)
-                .unwrap();
-            break;
-        }
+    for (name, path) in [
+        ("KRANZ_ACP_PEER_OUTCOME", &outcome),
+        ("KRANZ_ACP_PEER_READY", &ready),
+        ("KRANZ_ACP_PEER_RELEASE", &release),
+    ] {
+        request.env.insert(name.into(), path.display().to_string());
     }
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let proposal = loop {
+        if let Some(AgentEvent::PermissionRequested { proposal, .. }) =
+            session.next_event().await.unwrap()
+        {
+            break proposal;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // No complete notification exists yet. Cancellation must preserve the
+    // fragment, and consent cannot overtake it while the peer holds the rest.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    session
+        .permission_responder()
+        .unwrap()
+        .respond(&proposal, true)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    assert!(!outcome.exists());
+    std::fs::write(release, "continue").unwrap();
     drain_bounded(&mut session).await;
     assert!(matches!(
         session.exit_status(),

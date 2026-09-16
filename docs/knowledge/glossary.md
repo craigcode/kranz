@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-16
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
@@ -117,3 +117,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   fix-cycle is counted when a validation round emits repair features; a
   fix-feature is a feature created to resolve a finding. Waiving findings
   does not consume a repair round.
+
+- **One-call permission** — a short-lived ACP request bound to one action, offered
+  options, peer/session/run, workspace and approved plan/policy. Its durable
+  resolution precedes the response; delivery and tool outcome remain separate.
+  It never becomes a mission-wide command grant. See
+  [live consent](../acp-live-permissions.md).

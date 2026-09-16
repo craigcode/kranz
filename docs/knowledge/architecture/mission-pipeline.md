@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-16
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
@@ -285,3 +285,17 @@ backend converts cost to a per-turn delta before `worker.completed` adds it
 to mission totals. Raw provider totals remain in the transcript. Conversation
 resets start a new segment; missing or zeroed crash results do not erase prior
 spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
+
+## Live one-call consent
+
+ACP workers relay `permission.requested` to the engine writer while their output
+continues to drain. The broker binds the request to the approved plan, current
+policy, run, workspace and exact action/options. It persists `permission.resolved`
+before sending a response; `permission.response-recorded` says sent or uncertain,
+not that a tool completed. `permission.closed` preserves why a request can no
+longer be answered. These events fold into `MissionState.permissions`.
+
+Replay recreates records, never response handles. Resume closes orphaned calls;
+pause and policy changes cancel live workers before changing their authority.
+See [one-call consent](../../acp-live-permissions.md) and
+[the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).

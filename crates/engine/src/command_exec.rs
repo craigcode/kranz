@@ -1366,26 +1366,40 @@ async fn run_control_command_bounded(
         // remains safe to target directly; do not wait indefinitely for it.
         let _ = child.0.start_kill();
     }
-    let status = child.0.wait().await;
     if let Err(error) = result {
+        let _ = child.0.wait().await;
         return (None, error);
     }
-    let status = match status {
+    let drained = match output {
+        Some(output) => Ok(output),
+        None => {
+            // Keep the owned zombie until pipe EOF. A descendant already in
+            // fork when SIGKILL was sent can appear after the first group
+            // signal; repeat while draining without ever signalling a reaped
+            // (and therefore reusable) leader PID.
+            let drain = async {
+                loop {
+                    tokio::select! {
+                        result = &mut capture => break result.map_err(|error| format!("control output failed: {error}")),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            crate::backend_claude::kill_unreaped_group(&child.0);
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap_or_else(|_| Err("control output remained open after group cleanup".into()))
+        }
+    };
+    crate::backend_claude::kill_unreaped_group(&child.0);
+    let status = match child.0.wait().await {
         Ok(status) => status,
         Err(error) => return (None, format!("control reap failed: {error}")),
     };
-    let (stdout, stderr) = match output {
-        Some(output) => output,
-        None => match tokio::time::timeout(Duration::from_secs(1), &mut capture).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => return (None, format!("control output failed: {error}")),
-            Err(_) => {
-                return (
-                    None,
-                    "control output remained open after group cleanup".into(),
-                )
-            }
-        },
+    let (stdout, stderr) = match drained {
+        Ok(output) => output,
+        Err(error) => return (None, error),
     };
     let mut combined = stdout;
     if !stderr.trim().is_empty() {
@@ -2156,7 +2170,7 @@ esac
                     assert_eq!(
                         code,
                         Some(if mode == "nonzero" { 7 } else { 0 }),
-                        "{output}"
+                        "{mode}: {output}"
                     );
                     assert!(output.contains("control-stdout"), "{output}");
                     assert!(output.contains("control-stderr"), "{output}");
