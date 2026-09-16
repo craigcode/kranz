@@ -1436,6 +1436,46 @@ impl GitRepo {
             .collect())
     }
 
+    /// Stable labels for an independent gate snapshot: index, untracked source
+    /// and the pinned base's deletions. Preserve UTF-8 exactly; no C quoting or
+    /// lossy path conversion is permitted at this evidence boundary.
+    pub(crate) fn gate_snapshot_paths(&self, base: &str) -> Result<Vec<String>> {
+        let base = self.rev_parse(base)?;
+        let mut paths = std::collections::BTreeSet::new();
+        for args in [
+            vec![
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            vec!["ls-tree", "-r", "-z", "--name-only", &base],
+        ] {
+            let output = self.probe(&args)?;
+            if !output.status.success() {
+                return Err(EngineError::Git(failure_detail(&output)));
+            }
+            if output.stdout.len() > 8 * 1024 * 1024 {
+                return Err(EngineError::Git(
+                    "gate snapshot path inventory exceeds limit".into(),
+                ));
+            }
+            for path in output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let path = std::str::from_utf8(path).map_err(|_| {
+                    EngineError::Git("gate snapshots do not support non-UTF-8 source paths".into())
+                })?;
+                paths.insert(path.to_owned());
+                if paths.len() > 10_000 {
+                    return Err(EngineError::Git(
+                        "gate snapshot exceeds 10,000 paths".into(),
+                    ));
+                }
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     /// Full `git diff HEAD -- <paths>` output (index + working tree vs HEAD),
     /// verbatim — the checkpoint scan's "what this mission actually changed",
     /// never the pre-existing base content of files it merely touches.

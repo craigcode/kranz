@@ -310,3 +310,16 @@ the runtime enforces its requirements.
 References: [integration scope](scoping/acp-worker-gate-contract.md),
 [JSON-RPC 2.0](https://www.jsonrpc.org/specification),
 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12/json-schema-core).
+
+## S5 foundation checkpoint (2026-09-16)
+
+The lifecycle branch implements the four proposed audit events, pure folding,
+source snapshot identity and retained-artifact export checks. It does not yet
+connect the mission stage drivers; `load_for_config` still refuses external
+evaluators. See the [review and remaining integration work](reviews/2026-09-16-gate-lifecycle-foundation.md).
+
+The v1 portable path alphabet now includes ASCII dotfiles and interior spaces.
+Dot/dot-dot components, empty components, trailing spaces/dots, absolute paths,
+backslashes and alternate streams remain invalid. This additive change allows
+ordinary source labels such as `.github/workflows/ci.yml` without encoding them
+as unrelated filenames.

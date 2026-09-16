@@ -331,3 +331,9 @@ access. Fragmented stdout survives cancelled reads, and an answer waits until
 an already-started protocol frame is complete. Future messages from a cooperative
 peer cannot be predicted; this protocol check is not containment.
 See [live consent](../../acp-live-permissions.md).
+
+The S5 foundation adds `gate.evaluation-requested`, `gate.evaluation-finished`,
+`gate.resolution-recorded` and `gate.resolution-consumed` as separate audit
+transitions. The reducer, CLI tail and existing evidence export understand them;
+mission stage drivers are still pending and configured external evaluators remain
+refused. [Checkpoint review](../../reviews/2026-09-16-gate-lifecycle-foundation.md).

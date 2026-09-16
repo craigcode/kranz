@@ -299,3 +299,9 @@ Replay recreates records, never response handles. Resume closes orphaned calls;
 pause and policy changes cancel live workers before changing their authority.
 See [one-call consent](../../acp-live-permissions.md) and
 [the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
+
+The S5 foundation adds `gate.evaluation-requested`, `gate.evaluation-finished`,
+`gate.resolution-recorded` and `gate.resolution-consumed` as separate audit
+transitions. The reducer, CLI tail and existing evidence export understand them;
+mission stage drivers are still pending and configured external evaluators remain
+refused. [Checkpoint review](../../reviews/2026-09-16-gate-lifecycle-foundation.md).

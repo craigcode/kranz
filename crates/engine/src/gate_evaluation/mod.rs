@@ -4,5 +4,7 @@ pub mod protocol;
 
 pub mod artifacts;
 pub mod evidence;
+pub mod lifecycle;
+pub mod snapshot;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod subprocess;

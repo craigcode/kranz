@@ -240,6 +240,8 @@ mod tests {
     fn base_state() -> MissionState {
         MissionState {
             permissions: Default::default(),
+            gate_evaluations: Default::default(),
+            consumed_gate_resolutions: Default::default(),
             feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".into(),

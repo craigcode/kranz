@@ -80,11 +80,13 @@ impl TryFrom<String> for WirePath {
         for component in value.split('/') {
             require(
                 !component.is_empty()
-                    && component.as_bytes()[0] != b'.'
+                    && component != "."
+                    && component != ".."
+                    && !component.starts_with(' ')
                     && component
                         .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-                    && !component.ends_with('.'),
+                        .all(|b| b.is_ascii_alphanumeric() || b" _.-".contains(&b))
+                    && !component.ends_with(['.', ' ']),
                 "invalid wire path component",
             )?;
             let base = component

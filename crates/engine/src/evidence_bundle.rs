@@ -434,6 +434,27 @@ fn render_summary(
         out.push('\n');
     }
 
+    if !chain.gate_evaluations.is_empty() {
+        out.push_str("## External gate decisions\n\n");
+        for record in &chain.gate_evaluations {
+            let request = &record.requested.request.params;
+            let status = match &record.resolution {
+                Some(resolution) => format!("{:?}", resolution.disposition),
+                None if record.finished.is_some() => "awaiting engine resolution".into(),
+                None => "interrupted or pending evaluation".into(),
+            };
+            out.push_str(&format!(
+                "- `{}` / {:?} / `{}`: {}; consumed={} (effect completion is separate).\n",
+                request.gate_id.as_str(),
+                request.stage,
+                request.attempt_id.as_str(),
+                status,
+                record.consumed.is_some()
+            ));
+        }
+        out.push('\n');
+    }
+
     // Flight Rules coverage (KRZ-343, design D-H): the rule coverage matrix
     // rides the chain, so the bundle renders the SAME fold the replay
     // computed — no second derivation to drift. It follows the gate ladder
@@ -593,6 +614,27 @@ pub fn assemble_evidence_bundle(
     for gate in &chain.gates {
         push_reference(gate.artefact_ref.clone());
     }
+    let mut gate_expected = std::collections::BTreeMap::new();
+    for record in &chain.gate_evaluations {
+        for artifact in record.requested.retained_inputs.iter().chain(
+            record
+                .finished
+                .iter()
+                .flat_map(|finished| &finished.artifacts),
+        ) {
+            let reference = file_artefact_ref(artifact.path.as_str());
+            let expected = (artifact.retained_digest.clone(), artifact.retained_bytes);
+            gate_expected
+                .entry(reference.clone())
+                .and_modify(|prior: &mut Option<_>| {
+                    if prior.as_ref() != Some(&expected) {
+                        *prior = None;
+                    }
+                })
+                .or_insert(Some(expected));
+            push_reference(reference);
+        }
+    }
     for session in &chain.sessions {
         push_reference(file_artefact_ref(&session.transcript_ref));
     }
@@ -603,7 +645,21 @@ pub fn assemble_evidence_bundle(
     let mut artefact_entries: Vec<ManifestEntry> = Vec::new();
     let mut artefact_files: Vec<BundleFile> = Vec::new();
     for reference in &references {
-        let (status, bytes) = read_artefact(&mission_dir, reference);
+        let (mut status, mut bytes) = read_artefact(&mission_dir, reference);
+        if let Some(expected) = gate_expected.get(reference) {
+            let matches =
+                expected
+                    .as_ref()
+                    .zip(bytes.as_ref())
+                    .is_some_and(|((digest, length), bytes)| {
+                        *length == bytes.len() as u64
+                            && *digest == crate::gate_evaluation::protocol::Digest::of(bytes)
+                    });
+            if !matches {
+                status = ArtefactStatus::Unresolved;
+                bytes = None;
+            }
+        }
         match artefact_bundle_path(reference).zip(bytes) {
             Some((path, bytes)) => {
                 artefact_entries.push(ManifestEntry {

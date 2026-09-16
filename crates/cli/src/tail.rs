@@ -101,6 +101,44 @@ impl EventRenderer {
     /// One event → one human line (role-tagged, truncated to [`LINE_MAX`]).
     pub fn render(&mut self, event: &Event) -> String {
         let (tag, color, body) = match &event.kind {
+            EventKind::GateEvaluationRequested { evaluation } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{} {:?}: evaluation requested (attempt {})",
+                    evaluation.request.params.gate_id.as_str(),
+                    evaluation.request.params.stage,
+                    evaluation.request.params.attempt_id.as_str()
+                ),
+            ),
+            EventKind::GateEvaluationFinished { evaluation } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: evaluator finished; cleanup confirmed={}",
+                    evaluation.attempt_id.as_str(),
+                    evaluation.cleanup_confirmed
+                ),
+            ),
+            EventKind::GateResolutionRecorded { resolution } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {:?} — {}",
+                    resolution.attempt_id.as_str(),
+                    resolution.disposition,
+                    resolution.rationale
+                ),
+            ),
+            EventKind::GateResolutionConsumed { consumption } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {:?} attempted; effect completion is separate",
+                    consumption.attempt_id.as_str(),
+                    consumption.action
+                ),
+            ),
             EventKind::PermissionRequested { request } => (
                 "permission".into(),
                 ansi::YELLOW,

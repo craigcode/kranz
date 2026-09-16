@@ -40,6 +40,12 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
     }
 
     match &event.kind {
+        EventKind::GateEvaluationRequested { .. }
+        | EventKind::GateEvaluationFinished { .. }
+        | EventKind::GateResolutionRecorded { .. }
+        | EventKind::GateResolutionConsumed { .. } => {
+            crate::gate_evaluation::lifecycle::fold(state, event)?
+        }
         EventKind::PermissionRequested { .. }
         | EventKind::PermissionResolved { .. }
         | EventKind::PermissionResponseRecorded { .. }
@@ -861,6 +867,8 @@ fn initial_state(event: &Event) -> Result<MissionState> {
     };
     Ok(MissionState {
         permissions: BTreeMap::new(),
+        gate_evaluations: BTreeMap::new(),
+        consumed_gate_resolutions: BTreeSet::new(),
         feature_base_shas: BTreeMap::new(),
         mission: Mission {
             id: event.mission_id.clone(),
