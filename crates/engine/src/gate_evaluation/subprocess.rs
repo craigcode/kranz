@@ -102,6 +102,7 @@ impl DockerEvaluator {
             &AtomicBool::new(false),
         )
         .await
+        .map_err(|error| format!("Docker {} control failed: {error}", args[0]))
     }
 
     pub async fn evaluate(
@@ -209,7 +210,8 @@ impl DockerEvaluator {
                     ),
                     cancelled,
                 )
-                .await?;
+                .await
+                .map_err(|error| format!("Docker evaluator start failed: {error}"))?;
             if output.code != Some(0) {
                 return Err(format!(
                     "evaluator or its control process exited unsuccessfully ({:?}): {}",
