@@ -23,6 +23,9 @@ pub struct ObservedCheck {
     pub command: String,
     pub exit_code: Option<i32>,
     pub assertions_executed: Option<u64>,
+    /// Bounded, scrubbed process output; never an assertion-count claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_summary: Option<String>,
 }
 
 /// Selected by stage policy, separately from whichever receipts happen to exist.
@@ -434,7 +437,11 @@ impl Parts {
         let mut required_ids = BTreeSet::new();
         let mut seen = BTreeSet::new();
         for receipt in checks.observed {
-            if receipt.command.trim().is_empty()
+            if receipt
+                .output_summary
+                .as_ref()
+                .is_some_and(|s| s.len() > 32768)
+                || receipt.command.trim().is_empty()
                 || receipt.command.len() > 8192
                 || !seen.insert((&receipt.check_id, receipt.sequence))
             {

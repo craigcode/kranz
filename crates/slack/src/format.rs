@@ -902,6 +902,20 @@ pub fn build_blocked(b: &Blocked, dashboard_url: Option<&str>) -> Vec<Value> {
     blocks
 }
 
+pub fn build_gate_review(
+    mission: &str,
+    gate: &str,
+    stage: &str,
+    reason: &str,
+    dashboard_url: Option<&str>,
+) -> Vec<Value> {
+    let mut blocks = vec![header(&format!("Gate review needed — {mission}")),
+        section(&clip(&format!("{} · {}\n{}", escape_mrkdwn(gate), escape_mrkdwn(stage), escape_mrkdwn(reason)))),
+        context("Inspect the evidence and correct the cause before retrying this stage. Required checks and consent still apply.")];
+    push_dashboard_button(&mut blocks, dashboard_url, mission);
+    blocks
+}
+
 /// Completion message: outcome header + summary + branch + optional cost +
 /// optional diff stat. When `dashboard_url` is set, an "Open in dashboard"
 /// deep-link button is appended. A completed mission also carries a **Merge**

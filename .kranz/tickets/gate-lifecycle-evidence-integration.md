@@ -1,5 +1,6 @@
 ---
 state: open
+state-note: All stage drivers implemented on PR 63, with local synthetic Docker proof; full CI and PR review remain required before acceptance. S6/S7 remain separate release gates.
 title: Gate lifecycle — bind every stage to evidence, authority and replay
 priority: 1
 schedule: once

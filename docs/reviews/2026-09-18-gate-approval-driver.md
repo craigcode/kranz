@@ -1,5 +1,9 @@
 # Gate approval driver checkpoint
 
+Historical checkpoint. Later stage integration is recorded in
+[the stage review](2026-09-18-gate-stage-integration.md); the limitations below
+describe this checkpoint's original scope.
+
 This is the first real S5 stage integration. It is a draft checkpoint; the
 mission configuration refusal remains in place. Revisions, milestone validation,
 final deliverable checks, scratch integration merge, and pending operator

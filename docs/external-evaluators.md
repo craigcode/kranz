@@ -1,10 +1,11 @@
 # External evaluators: explicit execution API
 
-S3 implements the [gate v1 contract](gate-evaluation-contract.md) as an engine
-library API. It runs a checker and returns evidence; it does not grant consent,
-merge a branch, waive Flight Rules or add a mission-stage consumer. S5 owns that
-integration. Configuring a pack with an external evaluator for a mission fails
-with an explicit S5 integration error, so the engine cannot silently omit a check.
+The [gate v1 contract](gate-evaluation-contract.md) has a contained engine
+library API and mission-stage adapters. The checker API returns evidence;
+the adapters retain consent, enforcement and consumption authority. Tracked,
+repo-relative packs can register approval, milestone, final and merge evaluators
+on macOS/Linux. External command-permission evaluators remain unavailable; the
+live one-call permission broker owns that stage.
 Existing schema-2/3/4 command gates keep their existing order and advisory posture.
 
 ## Registration and trusted bytes
@@ -56,10 +57,10 @@ stage's subject/plan/policy/registration bindings. A required authority role mus
 occur exactly once with engine provenance. Declared additional roles must exist.
 Findings bind to supplied artifact hashes and real UTF-8 line bounds.
 
-The caller selects the minimal evidence and establishes its provenance. S3 does
-not derive a real mission snapshot from an arbitrary checkout or turn a worker's
-claim into a test receipt. S5 must assemble these inputs from engine-observed
-state. The snapshot inventory API represents regular-file bytes, executable bits
+The caller selects the minimal evidence and establishes its provenance. The
+mission-stage adapters assemble source inventories and real command receipts
+from engine-observed state; the low-level API cannot establish provenance from
+a worker's claims. The snapshot inventory API represents regular-file bytes, executable bits
 and deletions; symlinks, submodules and unsupported path encodings fail readiness.
 Input bytes are stored by artifact label. A checker that needs a build tree must
 materialize the selected files and modes in `build/` itself.
@@ -111,9 +112,10 @@ new session. Dropping the caller future starts a bounded cleanup worker.
 
 A daemon outage or interrupted create can make cleanup uncertain. Such attempts
 never yield an accepted result and preserve a private `container.json` recovery
-ledger. A killed host process cannot run its Drop handler; the ledger supports
-operator recovery, and automated startup/replay recovery remains S5 work. Do not
-retry a live attempt without resolving ownership of its container.
+ledger. A killed host process cannot run its Drop handler. Mission replay closes
+unconsumed records without rerunning checks or effects; it does not sweep private
+recovery directories or certify daemon cleanup. Inspect the retained ledger and
+resolve container ownership before retrying an interrupted live attempt.
 
 Output files are opened component-by-component without following links. Import
 rejects hard links, FIFOs/devices, missing files, byte/count overflows and incorrect
@@ -131,6 +133,11 @@ raw stdout is identified as such; it is not a claim that the raw bytes remain
 available. Cleanup uncertainty preserves files for recovery regardless of the
 requested retention policy.
 
+Mission-stage adapters additionally keep scrubbed inputs/results under the
+mission's `runs/gates/<attempt>/` directory and log their retained hashes. After
+confirmed cleanup they remove their private temporary parent; interruption or
+uncertain cleanup preserves it under `~/.cache/kranz/evaluator-attempts/`.
+
 ## Validation and current availability
 
 The synthetic checker is in
@@ -139,6 +146,8 @@ needs no provider credentials. Portable tests cover the schemas, byte binding,
 Git pinning and refusal to skip configured evaluators. The Docker tests cover
 positive results, denial of host access, malformed responses, artifact attacks,
 normal descendant cleanup, cancellation, timeout and dropped caller futures.
+Stage proofs cover revised-plan consent, a real synthetic mission and local merge,
+blocking failures, interruption, configuration drift and stale merge evidence.
 
 ```sh
 docker pull python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d

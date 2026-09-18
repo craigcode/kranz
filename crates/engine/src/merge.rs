@@ -14,6 +14,8 @@
 //! `.git/hooks/*` never execute with the server's environment. This module
 //! never calls [`GitRepo::push_mission_branch`] or any other push.
 
+mod external;
+
 use crate::error::Result;
 use crate::gate::{Gate, GateVerdict};
 use crate::git_ops::{with_kranz_trailers, GitRepo, KranzCommitMetadata, MergeOutcome};
@@ -306,6 +308,76 @@ pub fn merge_mission_with_standards_evidence<F>(
 where
     F: Fn(&str, &Path) -> (bool, String),
 {
+    merge_with_external_stage(
+        repo,
+        base_branch,
+        base_sha,
+        mission_branch,
+        metadata,
+        standards_pin,
+        standards_evidence,
+        executor,
+        None,
+    )
+}
+
+/// Production merge with approval-pinned external gates and a single-writer
+/// audit session. The invoking capability supplies consent, never a checker.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_mission_with_external_evidence<F>(
+    repo: &GitRepo,
+    base_branch: &str,
+    base_sha: &str,
+    mission_branch: &str,
+    metadata: Option<KranzCommitMetadata>,
+    standards_pin: Option<&crate::types::StandardsPin>,
+    standards_evidence: &StandardsMergeEvidence,
+    executor: F,
+    paths: &crate::paths::MissionPaths,
+    actor: crate::live_permission::Actor,
+) -> Result<MergeReport>
+where
+    F: Fn(&str, &Path) -> (bool, String),
+{
+    let mut audit = external::Audit::open(repo, paths, actor)?;
+    if let Some(audit) = &audit {
+        audit.verify_target(base_branch, base_sha, mission_branch)?;
+    }
+    let report = merge_with_external_stage(
+        repo,
+        base_branch,
+        base_sha,
+        mission_branch,
+        metadata,
+        standards_pin,
+        standards_evidence,
+        executor,
+        audit.as_mut(),
+    );
+    if let Some(audit) = &mut audit {
+        // A failed audit write cannot undo an already-landed local merge.
+        if let Err(error) = audit.record_outcome(&report) {
+            tracing::error!(%error, "could not record merge outcome");
+        }
+    }
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_with_external_stage<F>(
+    repo: &GitRepo,
+    base_branch: &str,
+    base_sha: &str,
+    mission_branch: &str,
+    metadata: Option<KranzCommitMetadata>,
+    standards_pin: Option<&crate::types::StandardsPin>,
+    standards_evidence: &StandardsMergeEvidence,
+    executor: F,
+    mut external: Option<&mut external::Audit>,
+) -> Result<MergeReport>
+where
+    F: Fn(&str, &Path) -> (bool, String),
+{
     // Every git command this merge issues — primary tree and scratch worktree
     // alike — runs with hooks disabled: the scratch worktree shares the
     // primary `.git`, so mission-authored gate code could plant
@@ -384,6 +456,9 @@ where
         MergeOutcome::Clean => {}
     }
     let tested_commit = scratch.head_sha()?;
+    if let Some(audit) = &mut external {
+        audit.prepare(repo, &scratch, &live_base_sha)?;
+    }
 
     // Flight Rules policy-drift check (KRZ-342, design D-E): re-resolve the
     // LIVE base standards policy against the exact scratch integration diff
@@ -532,8 +607,8 @@ where
     // The suite runs through the first-class gate interface (gate.rs) —
     // behavior is unchanged: same commands, same declared order, stop at
     // first failure, suite bytes read from the live base branch above.
-    let outcome =
-        MergeSuiteGate::new(scratch.root(), &changed_paths, gate_suite, executor).evaluate();
+    let outcome = MergeSuiteGate::new(scratch.root(), &changed_paths, gate_suite.clone(), executor)
+        .evaluate();
     if outcome.verdict == GateVerdict::Fail {
         return Ok(MergeReport::GateFailed {
             gate: outcome.artefact.reference,
@@ -541,6 +616,20 @@ where
         });
     }
 
+    if let Some(audit) = &mut external {
+        if let Err(error) = audit.evaluate(
+            repo,
+            &scratch,
+            &live_base_sha,
+            &mission_tip_sha,
+            &gate_suite,
+            &changed_paths,
+        ) {
+            return Ok(MergeReport::RefusedPreMerge {
+                detail: error.to_string(),
+            });
+        }
+    }
     let post_gate_head = scratch.head_sha()?;
     let tracked_tree_clean = scratch.is_clean_tracked_strict()?;
     if post_gate_head != tested_commit || !tracked_tree_clean {

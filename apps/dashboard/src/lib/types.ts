@@ -485,7 +485,20 @@ export interface LivePermission {
   closed?: string;
 }
 
+export interface GateEvaluation {
+  requested: { request: { params: {
+    attemptId: string; gateId: string; stage: string; deadline: string;
+    subject: Record<string, unknown>; binding: Record<string, string>;
+  } } };
+  requestedSeq: number;
+  finished?: { outcome: { status: 'evaluated'; result: { rationale: string } } | { status: 'error'; message: string } };
+  resolution?: { disposition: 'proceed' | 'block' | 'require-human'; rationale: string };
+  consumed?: unknown;
+  closed?: string;
+}
+
 export interface MissionState {
+  gateEvaluations?: Record<string, GateEvaluation>;
   permissions?: Record<string, LivePermission>;
   mission: Mission;
   featureBaseShas?: Record<string, string>;

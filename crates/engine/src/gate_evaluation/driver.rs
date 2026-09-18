@@ -130,88 +130,120 @@ pub(crate) fn evaluate(
 ) -> Result<Record> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        evaluate_with(paths, built, consent, emit, |evidence, retention| {
-            let client = docker(paths)?;
-            // The synchronous approval/merge APIs may already run on Tokio.
-            // A scoped thread avoids a nested runtime on the caller's thread.
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        let parent = attempt_parent(paths)?;
-                        // Preserve the private recovery ledger on every error or panic.
-                        // Only confirmed namespace cleanup permits deleting it.
-                        let attempt = tempfile::tempdir_in(parent)?.keep();
-                        let outcome = runtime
-                            .block_on(client.evaluate(
-                                registration,
-                                evidence,
-                                super::subprocess::RunOptions {
-                                    attempt_parent: &attempt,
-                                    retain_private_inputs: false,
-                                },
-                                &std::sync::atomic::AtomicBool::new(false),
-                            ))
-                            .map_err(|error| {
-                                invalid(format!(
-                                    "{error}; private recovery directory: {}",
-                                    attempt.display()
-                                ))
-                            })?;
-                        let cleanup_confirmed = outcome.cleanup_confirmed;
-                        if cleanup_confirmed {
-                            std::fs::remove_dir_all(&attempt)?;
-                        }
-                        match outcome.evaluation {
-                            Ok(accepted) => {
-                                let mut artifacts = Vec::new();
-                                for (index, artifact) in accepted.artifacts.iter().enumerate() {
-                                    artifacts.push(retention.write_retained(
-                                        &format!("output-{index}"),
-                                        artifact.source.digest.clone(),
-                                        &artifact.retained_bytes,
-                                        artifact.transformation.clone(),
-                                    )?);
-                                }
-                                artifacts.push(retention.write(
-                                    "result.json",
-                                    &serde_json::to_vec(&accepted.result)?,
-                                )?);
-                                Ok(Finished {
-                                    attempt_id: evidence.request.params.attempt_id.clone(),
-                                    outcome: Outcome::Evaluated {
-                                        result: Box::new(accepted.result),
-                                        raw_stdout_digest: accepted.raw_stdout_digest,
-                                    },
-                                    exit_code: Some(accepted.exit_code),
-                                    cleanup_confirmed,
-                                    artifacts,
-                                })
-                            }
-                            Err(error) => Ok(Finished {
-                                attempt_id: evidence.request.params.attempt_id.clone(),
-                                outcome: Outcome::Error {
-                                    message: crate::scrub::scrub_and_truncate(&error, 8192),
-                                },
-                                exit_code: None,
-                                cleanup_confirmed,
-                                artifacts: vec![],
-                            }),
-                        }
-                    })
-                    .join()
-                    .map_err(|_| invalid("evaluator driver panicked"))?
-            })
-        })
+        let mut emit = emit;
+        let (record, retention) = begin(paths, &built, &mut emit)?;
+        // Synchronous approval/merge callers may already run on Tokio.
+        let outcome = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(run(paths, registration, &built.evidence, &retention))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(invalid("evaluator driver panicked")))
+        });
+        finish(record, outcome, consent, &mut emit)
     }
+
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (paths, registration, built, consent, emit);
         Err(invalid(
             "external mission evaluators are unavailable on this platform",
         ))
+    }
+}
+
+/// Async stage calls keep the runtime available while the checker is running.
+pub(crate) async fn evaluate_async(
+    paths: &MissionPaths,
+    registration: &PinnedRegistration,
+    built: BuiltInput,
+    consent: Option<Consent>,
+    mut emit: impl FnMut(EventKind) -> Result<Event>,
+) -> Result<Record> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let (record, retention) = begin(paths, &built, &mut emit)?;
+        let outcome = run(paths, registration, &built.evidence, &retention).await;
+        finish(record, outcome, consent, &mut emit)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (paths, registration, built, consent, &mut emit);
+        Err(invalid(
+            "external mission evaluators are unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn run(
+    paths: &MissionPaths,
+    registration: &PinnedRegistration,
+    evidence: &super::evidence::FrozenEvidence,
+    retention: &Retention,
+) -> Result<Finished> {
+    let client = docker(paths)?;
+    let parent = attempt_parent(paths)?;
+    // Preserve recovery files on errors, panic or dropped futures. Only
+    // confirmed namespace cleanup permits removing this private directory.
+    let attempt = tempfile::tempdir_in(parent)?.keep();
+    let outcome = client
+        .evaluate(
+            registration,
+            evidence,
+            super::subprocess::RunOptions {
+                attempt_parent: &attempt,
+                retain_private_inputs: false,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .map_err(|error| {
+            invalid(format!(
+                "{error}; private recovery directory: {}",
+                attempt.display()
+            ))
+        })?;
+    let cleanup_confirmed = outcome.cleanup_confirmed;
+    if cleanup_confirmed {
+        std::fs::remove_dir_all(&attempt)?;
+    }
+    match outcome.evaluation {
+        Ok(accepted) => {
+            let mut artifacts = Vec::new();
+            for (index, artifact) in accepted.artifacts.iter().enumerate() {
+                artifacts.push(retention.write_retained(
+                    &format!("output-{index}"),
+                    artifact.source.digest.clone(),
+                    &artifact.retained_bytes,
+                    artifact.transformation.clone(),
+                )?);
+            }
+            artifacts.push(retention.write("result.json", &serde_json::to_vec(&accepted.result)?)?);
+            Ok(Finished {
+                attempt_id: evidence.request.params.attempt_id.clone(),
+                outcome: Outcome::Evaluated {
+                    result: Box::new(accepted.result),
+                    raw_stdout_digest: accepted.raw_stdout_digest,
+                },
+                exit_code: Some(accepted.exit_code),
+                cleanup_confirmed,
+                artifacts,
+            })
+        }
+        Err(error) => Ok(Finished {
+            attempt_id: evidence.request.params.attempt_id.clone(),
+            outcome: Outcome::Error {
+                message: crate::scrub::scrub_and_truncate(&error, 8192),
+            },
+            exit_code: None,
+            cleanup_confirmed,
+            artifacts: vec![],
+        }),
     }
 }
 
@@ -233,13 +265,11 @@ fn attempt_parent(paths: &MissionPaths) -> Result<std::path::PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn evaluate_with(
+fn begin(
     paths: &MissionPaths,
-    built: BuiltInput,
-    consent: Option<Consent>,
-    mut emit: impl FnMut(EventKind) -> Result<Event>,
-    run: impl FnOnce(&super::evidence::FrozenEvidence, &Retention) -> Result<Finished>,
-) -> Result<Record> {
+    built: &BuiltInput,
+    emit: &mut impl FnMut(EventKind) -> Result<Event>,
+) -> Result<(Record, Retention)> {
     let evidence = &built.evidence;
     let retention = Retention::new(paths, &evidence.request.params.attempt_id)?;
     let mut retained_inputs = vec![
@@ -251,16 +281,26 @@ fn evaluate_with(
     }
     let requested = Requested {
         request: evidence.request.clone(),
-        policy: built.policy,
+        policy: built.policy.clone(),
         retained_inputs,
-        permission_request_id: built.permission_request_id,
+        permission_request_id: built.permission_request_id.clone(),
     };
     let event = emit(EventKind::GateEvaluationRequested {
         evaluation: Box::new(requested.clone()),
     })?;
-    let mut record = Record::new(requested, event.ts, event.seq).map_err(invalid)?;
-    let finished = run(evidence, &retention).unwrap_or_else(|error| Finished {
-        attempt_id: evidence.request.params.attempt_id.clone(),
+    let record = Record::new(requested, event.ts, event.seq).map_err(invalid)?;
+    Ok((record, retention))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn finish(
+    mut record: Record,
+    outcome: Result<Finished>,
+    consent: Option<Consent>,
+    emit: &mut impl FnMut(EventKind) -> Result<Event>,
+) -> Result<Record> {
+    let finished = outcome.unwrap_or_else(|error| Finished {
+        attempt_id: record.requested.request.params.attempt_id.clone(),
         outcome: Outcome::Error {
             message: crate::scrub::scrub_and_truncate(&error.to_string(), 8192),
         },
@@ -275,8 +315,8 @@ fn evaluate_with(
     let disposition = record.disposition(consent.as_ref()).map_err(invalid)?;
     let resolution = Resolution {
         id: id("resolution"),
-        attempt_id: evidence.request.params.attempt_id.clone(),
-        binding: evidence.request.params.binding.clone(),
+        attempt_id: record.requested.request.params.attempt_id.clone(),
+        binding: record.requested.request.params.binding.clone(),
         disposition,
         rationale: "Engine applied pinned enforcement, prerequisites and stage consent.".into(),
         consent,
@@ -322,41 +362,20 @@ pub(crate) struct StageEvaluation<'a> {
     pub diagnostics: &'a [crate::gate::GateReport],
     pub prior_findings: &'a [&'a Record],
     pub consent: Option<Consent>,
+    pub source_log_range: Option<LogRange>,
 }
 
 pub(crate) fn evaluate_stage(
     input: StageEvaluation<'_>,
     mut emit: impl FnMut(EventKind) -> Result<Event>,
 ) -> Result<Vec<Record>> {
-    use super::input_builder::{build, BuildInput};
     let mut records = Vec::new();
     for registration in input
         .registrations
         .iter()
         .filter(|r| r.declaration().stages.contains(&input.stage.stage()))
     {
-        let built = build(BuildInput {
-            mission_id: Id::try_from(input.paths.mission_id.clone()).map_err(invalid)?,
-            evaluation_id: id("evaluation"),
-            attempt_id: id("attempt"),
-            workspace_id: workspace_id(&input.paths.repo_root.to_string_lossy()),
-            plan_bytes: input.plan_bytes,
-            policy: Policy {
-                kind: registration.declaration().kind,
-                enforcement: registration.declaration().enforcement,
-                mission_policy_digest: input.mission_policy_digest.clone(),
-                mechanical_prerequisites_passed: true,
-            },
-            registration,
-            stage: input.stage.clone(),
-            checks: input.checks.clone(),
-            diagnostics: input.diagnostics,
-            prior_findings: input.prior_findings,
-            source_log_range: None,
-            deadline: chrono::Utc::now() + chrono::Duration::minutes(5),
-            limits: limits(),
-        })
-        .map_err(invalid)?;
+        let built = build_registration(&input, registration)?;
         let record = evaluate(
             input.paths,
             registration,
@@ -370,14 +389,87 @@ pub(crate) fn evaluate_stage(
             .expect("driver resolved")
             .disposition;
         if disposition != Disposition::Proceed {
-            return Err(invalid(format!(
-                "{:?} {:?} by {}; inspect gate evidence before retrying",
-                input.stage.stage(),
-                disposition,
-                registration.declaration().name.as_str()
-            )));
+            return Err(refusal(&record, registration));
         }
         records.push(record);
     }
     Ok(records)
+}
+
+fn build_registration(
+    input: &StageEvaluation<'_>,
+    registration: &PinnedRegistration,
+) -> Result<BuiltInput> {
+    super::input_builder::build(super::input_builder::BuildInput {
+        mission_id: Id::try_from(input.paths.mission_id.clone()).map_err(invalid)?,
+        evaluation_id: id("evaluation"),
+        attempt_id: id("attempt"),
+        workspace_id: workspace_id(&input.paths.repo_root.to_string_lossy()),
+        plan_bytes: input.plan_bytes,
+        policy: Policy {
+            kind: registration.declaration().kind,
+            enforcement: registration.declaration().enforcement,
+            mission_policy_digest: input.mission_policy_digest.clone(),
+            mechanical_prerequisites_passed: true,
+        },
+        registration,
+        stage: input.stage.clone(),
+        checks: input.checks.clone(),
+        diagnostics: input.diagnostics,
+        prior_findings: input.prior_findings,
+        source_log_range: input.source_log_range.clone(),
+        deadline: chrono::Utc::now() + chrono::Duration::minutes(5),
+        limits: limits(),
+    })
+    .map_err(invalid)
+}
+
+pub(crate) async fn evaluate_stage_async(
+    input: StageEvaluation<'_>,
+    mut emit: impl FnMut(EventKind) -> Result<Event>,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    for registration in input
+        .registrations
+        .iter()
+        .filter(|r| r.declaration().stages.contains(&input.stage.stage()))
+    {
+        let built = build_registration(&input, registration)?;
+        let record = evaluate_async(
+            input.paths,
+            registration,
+            built,
+            input.consent.clone(),
+            &mut emit,
+        )
+        .await?;
+        if record
+            .resolution
+            .as_ref()
+            .expect("driver resolved")
+            .disposition
+            != Disposition::Proceed
+        {
+            return Err(refusal(&record, registration));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn refusal(record: &Record, registration: &PinnedRegistration) -> EngineError {
+    let detail = match record.finished.as_ref().map(|f| &f.outcome) {
+        Some(Outcome::Error { message }) => message.as_str(),
+        Some(Outcome::Evaluated { result, .. }) => result.rationale.as_str(),
+        None => "attempt did not finish",
+    };
+    invalid(crate::scrub::scrub_and_truncate(
+        &format!(
+            "{:?} {:?} by {}: {detail}; inspect gate evidence before retrying",
+            record.requested.request.params.stage,
+            record.resolution.as_ref().map(|r| r.disposition),
+            registration.declaration().name.as_str()
+        ),
+        8192,
+    ))
 }

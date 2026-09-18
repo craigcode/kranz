@@ -1785,6 +1785,15 @@ impl MissionEngine {
         // so an unappliable PlanRevised can never be appended to the log (emit
         // appends before it folds; a failed fold on replay bricks the mission).
         reducer::dry_run_revised_plan(&self.state, &pending.plan, revision)?;
+        let revision_check = crate::gate::GateReport {
+            name: "revision-invariants".into(),
+            kind: crate::gate::GateKind::Deterministic,
+            outcome: crate::gate::GateOutcome::pass(
+                crate::gate::ArtefactRef::new(format!("revision:{revision}"))
+                    .with_detail("Revised-plan invariants and the reducer dry run passed; this is structural validation, not a command execution or test receipt."),
+            ),
+        };
+        self.external_revision_checks(&pending.plan, revision, &[revision_check])?;
         self.commit_revised_plan_record(&pending.plan, revision)?;
         if self.state.mission.status == MissionStatus::Blocked {
             if let Some(mi) = first_incomplete(&self.state) {
@@ -2341,6 +2350,7 @@ impl MissionEngine {
     /// `fixfeature.created`. The full revised plan is written + committed as
     /// `revised-plan.md`, and an `orchestrator.decision` summarizes the change.
     pub fn approve_revised_plan(&mut self, mut plan: Plan) -> Result<()> {
+        self.refuse_legacy_external_revision()?;
         crate::reviewer_independence::pin_plan(
             &mut plan,
             self.state.mission.reviewer_independence,
@@ -3167,6 +3177,9 @@ impl MissionEngine {
                     reason: "milestone skipped by orchestrator decision".to_string(),
                     validator_guidance: None,
                 })?;
+                if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+                    return Ok(Some(MissionStatus::Blocked));
+                }
                 let to_skip: Vec<String> = self.state.mission.milestones[mi]
                     .features
                     .iter()
@@ -5970,6 +5983,9 @@ impl MissionEngine {
             if !self.check_completion_review(Some(&milestone_id))? {
                 return Ok(());
             }
+            if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+                return Ok(());
+            }
             let tag = self.tag_milestone(&milestone_id);
             // Structured human questions (ticket
             // structured-human-question-events): asks scoped to this
@@ -6010,6 +6026,9 @@ impl MissionEngine {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 if !self.check_completion_review(Some(&milestone_id))? {
+                    return Ok(());
+                }
+                if !Box::pin(self.external_completion_checks(Some(mi))).await? {
                     return Ok(());
                 }
                 let tag = self.tag_milestone(&milestone_id);
@@ -6629,7 +6648,7 @@ impl MissionEngine {
             crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)
                 .ok()
                 .flatten();
-        let report = render_mission_report(
+        let mut report = render_mission_report(
             &self.state,
             &events,
             &plan,
@@ -6637,6 +6656,13 @@ impl MissionEngine {
             self.active_root(),
             workspace_contract.as_ref(),
         );
+        if self
+            .external_authority()?
+            .0
+            .applies(crate::gate_evaluation::protocol::Stage::FinalGate)
+        {
+            report.push_str("\n## External final evaluation\n\nThis source snapshot was committed before external final evaluation. The native contract results above do not establish mission completion. Consult `kranz status` or the event log for the final decision.\n");
+        }
 
         let active_paths = self.active_paths();
         let report_file = active_paths.mission_dir().join("report.md");

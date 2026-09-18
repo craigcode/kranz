@@ -236,6 +236,7 @@ fn gate_inputs_required_receipts_reject_zero_missing_stale_and_later_failures() 
         command: "cargo test".into(),
         exit_code: Some(0),
         assertions_executed: Some(3),
+        output_summary: None,
     };
     let mut alternatives = vec![vec![], vec![good.clone()]];
     for mode in 0..6 {
@@ -305,6 +306,7 @@ fn gate_inputs_snapshot_limits_and_drift_cannot_be_hidden_by_a_stable_head() {
         command: "cargo test".into(),
         exit_code: Some(0),
         assertions_executed: Some(3),
+        output_summary: None,
     }];
     let required = [RequiredCheck {
         id: id("check-1"),

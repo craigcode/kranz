@@ -537,7 +537,14 @@ pub fn workspace_id(path: &str) -> Id {
 fn validate_stage_status(state: &crate::types::MissionState, stage: Stage) -> Result<(), String> {
     use crate::types::MissionStatus;
     let ready = match stage {
-        Stage::PlanApproval => state.mission.status == MissionStatus::Planning,
+        Stage::PlanApproval => {
+            state.mission.status == MissionStatus::Planning
+                || (state.pending_revision.is_some()
+                    && matches!(
+                        state.mission.status,
+                        MissionStatus::Running | MissionStatus::Blocked
+                    ))
+        }
         Stage::CommandPermission | Stage::MilestoneValidation => matches!(
             state.mission.status,
             MissionStatus::Running | MissionStatus::Validating

@@ -42,7 +42,7 @@ use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::git_ops::KranzCommitMetadata;
 use kranz_engine::merge::{
-    merge_mission_with_standards_evidence, MergeReport, StandardsMergeEvidence,
+    merge_mission_with_external_evidence, MergeReport, StandardsMergeEvidence,
 };
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
@@ -816,9 +816,10 @@ impl MissionHost {
         if let Some(note) = gate_policy.degradation_note() {
             tracing::warn!(mission = %id, note = %note, "merge gate sandbox cannot wrap; gates fail closed");
         }
+        let merge_paths = paths.clone();
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            let report = merge_mission_with_standards_evidence(
+            let report = merge_mission_with_external_evidence(
                 &repo,
                 &base_branch,
                 &base_sha,
@@ -837,6 +838,8 @@ impl MissionHost {
                         gate_executor(cmd, cwd)
                     }
                 },
+                &merge_paths,
+                kranz_engine::live_permission::Actor::LocalMutationCapability,
             );
             // Explicit: the repo-busy hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.

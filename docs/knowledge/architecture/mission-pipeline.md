@@ -303,10 +303,14 @@ pause and policy changes cancel live workers before changing their authority.
 See [one-call consent](../../acp-live-permissions.md) and
 [the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
 
-The S5 initial approval driver records evaluation, engine resolution and
-consumption separately, then rechecks the pinned base before committing a plan.
-`gate.evaluation-closed` preserves why an unconsumed attempt cannot proceed;
-restart never replays its effect. The reducer, CLI tail and auditor export carry
-these records. Revisions and the milestone/final/merge drivers remain incomplete,
-so configured external missions are still refused.
-[Checkpoint review](../../reviews/2026-09-18-gate-approval-driver.md).
+The S5 stage drivers record evaluation, engine resolution and attempted
+consumption separately for initial approval, proposed revisions, milestone
+acceptance, final deliverables and local scratch-integration merge. Authority
+comes from the original sealed approval record; changing live `packDir` cannot
+remove checks. Source snapshots and current base/candidate refs are checked
+again before consumption. Recovery closes unfinished attempts without replaying
+checks or effects. CLI status, the dashboard and optional Slack expose blocked
+or escalated checks; a retry collects fresh evidence and never overrides a
+nonwaivable failure. External command-permission executables and Windows mission
+evaluators remain refused; S4's separate live permission consent path is unchanged.
+[Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).

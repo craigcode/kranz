@@ -452,6 +452,9 @@ jobs:
           for proof in records_real_checks_and_requires_fresh_consent refuses_base_drift_after_a_passing_checker; do
             grep -q "test gate_subprocess_v1_approval_${proof} ... ok" "$log"
           done
+          for proof in mission_stages_and_merge_bind_real_deliverables stage_failure_never_completes_or_consumes interrupted_stage_closes_without_replaying_effects merge_rejects_a_base_advance_after_pass revision_approval_uses_fresh_plan_consent config_cannot_remove_approved_evaluators; do
+            grep -q "test gate_subprocess_v1_${proof} ... ok" "$log"
+          done
           if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
             exit 1
           fi

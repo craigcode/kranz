@@ -1,5 +1,9 @@
 # Gate lifecycle foundation review
 
+Historical checkpoint. Later stage integration is recorded in
+[the stage review](2026-09-18-gate-stage-integration.md); the limitations below
+describe this checkpoint's original scope.
+
 This is a checkpoint within S5, not completion of the lifecycle integration
 ticket. Mission configuration still refuses external evaluators. No stage
 adapter can consume a subprocess result through this change alone.
