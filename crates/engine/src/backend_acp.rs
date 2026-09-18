@@ -555,6 +555,13 @@ fn peer_reported_model(session: &Value) -> Option<&str> {
 #[async_trait::async_trait]
 impl AgentBackend for AcpBackend {
     async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+        // Configuration admission is not the only caller of this public
+        // backend. Never silently discard an embedding caller's boundary.
+        if spec.sandbox.is_some() {
+            return Err(EngineError::Backend(
+                "acp backend: enforced containment is not certified; refusing the supplied sandbox before spawn".into(),
+            ));
+        }
         if spec.resume.is_some() {
             return Err(EngineError::Backend(
                 "acp backend: resume is unsupported (session/load is an optional v1 \

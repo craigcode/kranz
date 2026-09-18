@@ -61,6 +61,53 @@ fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> Se
     }
 }
 
+#[tokio::test]
+async fn acp_containment_v1_uncertified_sandbox_is_refused_before_peer_spawn() {
+    use kranz_engine::sandbox::{ResolvedSandbox, SandboxBackend, SandboxInputs};
+    use kranz_engine::types::SandboxEnforce;
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(
+        dir.path(),
+        "must-not-run.sh",
+        "#!/bin/sh\ntouch spawned\nexit 1\n",
+    );
+    for backend in [
+        SandboxBackend::Seatbelt,
+        SandboxBackend::Bubblewrap,
+        SandboxBackend::Container,
+        SandboxBackend::AppContainer,
+    ] {
+        let mut spec = spec(dir.path(), "uncertified-containment", true, &[]);
+        spec.sandbox = Some(ResolvedSandbox {
+            backend,
+            inputs: SandboxInputs {
+                enforce: SandboxEnforce::FsNet,
+                session_cwd: dir.path().into(),
+                mission_dir: dir.path().join(".kranz/missions/m-test"),
+                tmpdir: dir.path().join("scratch"),
+                extra_write: vec![],
+                egress: vec![],
+                validator_read_deny_roots: vec![],
+            },
+            container: None,
+        });
+        let error = match AcpBackend::new(&peer, vec![]).start(spec).await {
+            Ok(_) => panic!("an uncertified {backend:?} sandbox was admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing the supplied sandbox before spawn"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("spawned").exists(),
+            "{backend:?} executed outside its promised boundary"
+        );
+    }
+}
+
 // Transport-only fixtures act as an explicit test broker. Engine durability
 // and operator authority are exercised separately by the live-consent tests.
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
