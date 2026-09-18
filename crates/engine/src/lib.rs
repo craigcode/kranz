@@ -47,6 +47,7 @@ pub mod event_log;
 pub mod evidence_bundle;
 pub mod findings;
 pub mod gate;
+pub mod gate_evaluation;
 pub mod gate_results;
 pub mod gate_score_flags;
 pub mod gate_scores;
@@ -86,6 +87,7 @@ pub mod standards_enforcement;
 pub mod standards_metrics;
 pub mod standards_waiver;
 mod stream_bounds;
+mod strict_json;
 /// Runtime-gated test support: skip loudly, and fail where the capability is
 /// required, so a silent skip cannot masquerade as a pass.
 pub mod test_capability;

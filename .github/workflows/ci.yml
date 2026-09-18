@@ -420,6 +420,39 @@ jobs:
           fi
           grep -qE 'test result: ok\. 1 passed' "$log"
 
+  # S3: real Docker containment and lifecycle proof. No provider/model calls.
+  rust-linux-external-evaluator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the exact synthetic checker runtime
+        run: docker pull python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+      - name: Prove external evaluator containment and protocol failures
+        env:
+          KRANZ_GATE_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
+          set +e
+          cargo test --workspace gate_subprocess_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 7 passed' "$log"
+          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs; do
+            grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
+            exit 1
+          fi
+
   # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
   # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A
   # WRAPPED CONTRACT COMMAND through the gate sandbox wrap, proving a kranz
