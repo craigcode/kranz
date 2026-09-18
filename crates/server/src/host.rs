@@ -552,7 +552,10 @@ impl MissionHost {
     pub async fn approve(&self, id: &str, plan: Plan) -> Result<String, ApiError> {
         let cell = self.planning_cell_or_attach(id).await?;
         let mut engine = try_lock(&cell)?;
-        engine.approve_plan(plan)?;
+        engine.approve_plan_as(
+            plan,
+            kranz_engine::live_permission::Actor::LocalMutationCapability,
+        )?;
         self.set_pending_plan(id, None);
         Ok(engine.state().mission.mission_branch.clone())
     }
@@ -1279,7 +1282,10 @@ impl MissionHost {
                 parked: plan_identity(plan),
             });
         }
-        engine.approve_plan(plan.clone())?;
+        engine.approve_plan_as(
+            plan.clone(),
+            kranz_engine::live_permission::Actor::LocalMutationCapability,
+        )?;
         parked.take();
         Ok(PendingApproval::Approved(
             engine.state().mission.mission_branch.clone(),

@@ -438,10 +438,14 @@ fn render_summary(
         out.push_str("## External gate decisions\n\n");
         for record in &chain.gate_evaluations {
             let request = &record.requested.request.params;
-            let status = match &record.resolution {
-                Some(resolution) => format!("{:?}", resolution.disposition),
-                None if record.finished.is_some() => "awaiting engine resolution".into(),
-                None => "interrupted or pending evaluation".into(),
+            let status = if let Some(reason) = &record.closed {
+                format!("closed: {}", md_cell(reason))
+            } else {
+                match &record.resolution {
+                    Some(resolution) => format!("{:?}", resolution.disposition),
+                    None if record.finished.is_some() => "awaiting engine resolution".into(),
+                    None => "interrupted or pending evaluation".into(),
+                }
             };
             out.push_str(&format!(
                 "- `{}` / {:?} / `{}`: {}; consumed={} (effect completion is separate).\n",

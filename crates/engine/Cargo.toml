@@ -29,6 +29,7 @@ cap-std.workspace = true
 cap-primitives.workspace = true
 cap-fs-ext.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -54,5 +55,4 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-tempfile.workspace = true
 proptest = "1"

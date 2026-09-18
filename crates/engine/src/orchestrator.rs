@@ -86,6 +86,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod external_gates;
 mod finalization;
 mod live_permissions;
 
@@ -677,6 +678,9 @@ impl MissionEngine {
             None,
             "engine restarted; the former peer cannot receive a response",
         )?;
+        engine.close_external_gates(
+            "engine restarted; unconsumed evaluations require a fresh attempt",
+        )?;
         Ok(engine)
     }
 
@@ -1178,7 +1182,25 @@ impl MissionEngine {
     /// same helpers `run()` uses for the rest of the mission), so the primary
     /// checkout never moves off its starting branch. Checkout mode is
     /// unchanged: check out the branch in the primary tree and commit there.
-    pub fn approve_plan(&mut self, mut plan: Plan) -> Result<()> {
+    pub fn approve_plan(&mut self, plan: Plan) -> Result<()> {
+        self.approve_plan_as(
+            plan,
+            crate::live_permission::Actor::LocalRepositoryAuthority,
+        )
+    }
+
+    /// The authenticated caller supplies capability attribution; an evaluator
+    /// can never select or impersonate this principal.
+    pub fn approve_plan_as(
+        &mut self,
+        mut plan: Plan,
+        actor: crate::live_permission::Actor,
+    ) -> Result<()> {
+        if actor == crate::live_permission::Actor::Policy {
+            return Err(EngineError::InvalidState(
+                "policy is not plan consent".into(),
+            ));
+        }
         if self.state.mission.status != MissionStatus::Planning {
             return Err(EngineError::InvalidState(format!(
                 "approve_plan requires Planning status, mission is {:?}",
@@ -1400,8 +1422,26 @@ impl MissionEngine {
             &self.state.config,
         );
 
-        // Git first: if anything fails here, no event was emitted and
-        // approve_plan can simply be retried.
+        // Named, deterministic contract-validation gates (ticket
+        // contract-validation-gates.md): the defect classes behind the lint —
+        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
+        // evaluated through the gate plugin interface (gate.rs) so each
+        // verdict carries its class name into the approval decision and
+        // plan.md below. Static gates inspect the command text against the
+        // (still pristine) repo root; passes-on-base graduates the lint
+        // report. Advisory only, exactly like the lint: approval never
+        // blocks on these.
+
+        let mut gate_reports = contract_gates::contract_gate_reports(
+            &plan.validation_contract,
+            Some(&contract_lint_report),
+            &self.paths.repo_root,
+        );
+        gate_reports.extend(control_reports);
+        self.external_plan_checks(&plan, &base_sha, &gate_reports, actor)?;
+
+        // External checks have durable attempts, but plan.approved still
+        // follows the Git commit. Retrying always evaluates fresh inputs.
         if !self.repo.branch_exists(&branch)? {
             self.repo.create_branch(&branch, Some(&base_sha))?;
         }
@@ -1412,22 +1452,6 @@ impl MissionEngine {
         // `base_sha` was resolved before every base-owned read above and the
         // mission branch was created from that exact object. Never re-resolve
         // the moving base name during approval.
-
-        // Named, deterministic contract-validation gates (ticket
-        // contract-validation-gates.md): the defect classes behind the lint —
-        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
-        // evaluated through the gate plugin interface (gate.rs) so each
-        // verdict carries its class name into the approval decision and
-        // plan.md below. Static gates inspect the command text against the
-        // (still pristine) repo root; passes-on-base graduates the lint
-        // report. Advisory only, exactly like the lint: approval never
-        // blocks on these.
-        let mut gate_reports = contract_gates::contract_gate_reports(
-            &plan.validation_contract,
-            Some(&contract_lint_report),
-            &self.paths.repo_root,
-        );
-        gate_reports.extend(control_reports);
 
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).

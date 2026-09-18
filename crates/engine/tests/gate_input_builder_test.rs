@@ -100,6 +100,7 @@ impl Fixture {
                 observed: &[],
             },
             prior_findings: &[],
+            diagnostics: &[],
             source_log_range: None,
             deadline: Utc::now() + Duration::minutes(5),
             limits: Limits {
@@ -431,4 +432,30 @@ fn gate_inputs_identical_retry_material_stays_byte_identical_and_registration_ca
         .err()
         .unwrap()
         .contains("accepted feature receipts"));
+}
+
+#[test]
+fn gate_input_builder_retains_advisory_diagnostics_without_inventing_command_receipts() {
+    use kranz_engine::gate::{ArtefactRef, GateKind, GateOutcome, GateReport};
+    let fixture = Fixture::new("judgment");
+    let diagnostics = [GateReport {
+        name: "passes-on-base".into(),
+        kind: GateKind::Deterministic,
+        outcome: GateOutcome::fail(
+            ArtefactRef::new("approval lint").with_detail("advisory suspect"),
+        ),
+    }];
+    let mut input = fixture.input();
+    input.diagnostics = &diagnostics;
+    let built = build(input).unwrap();
+    assert!(built.policy.mechanical_prerequisites_passed);
+    let (diagnostic, bytes) = built
+        .evidence
+        .inputs()
+        .find(|(a, _)| a.id.as_str() == "diagnostic-0")
+        .unwrap();
+    let value: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(value["verdict"], "fail");
+    assert!(value.get("exitCode").is_none());
+    assert_eq!(diagnostic.content.digest, Digest::of(bytes));
 }

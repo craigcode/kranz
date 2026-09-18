@@ -40,7 +40,8 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
     }
 
     match &event.kind {
-        EventKind::GateEvaluationRequested { .. }
+        EventKind::GateEvaluationClosed { .. }
+        | EventKind::GateEvaluationRequested { .. }
         | EventKind::GateEvaluationFinished { .. }
         | EventKind::GateResolutionRecorded { .. }
         | EventKind::GateResolutionConsumed { .. } => {

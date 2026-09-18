@@ -2,8 +2,11 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-18
 verified_against:
+  - crates/engine/src/orchestrator/external_gates.rs
+  - crates/engine/src/gate_evaluation/driver.rs
+  - crates/engine/src/gate_evaluation/lifecycle.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -300,8 +303,10 @@ pause and policy changes cancel live workers before changing their authority.
 See [one-call consent](../../acp-live-permissions.md) and
 [the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
 
-The S5 foundation adds `gate.evaluation-requested`, `gate.evaluation-finished`,
-`gate.resolution-recorded` and `gate.resolution-consumed` as separate audit
-transitions. The reducer, CLI tail and existing evidence export understand them;
-mission stage drivers are still pending and configured external evaluators remain
-refused. [Checkpoint review](../../reviews/2026-09-16-gate-lifecycle-foundation.md).
+The S5 initial approval driver records evaluation, engine resolution and
+consumption separately, then rechecks the pinned base before committing a plan.
+`gate.evaluation-closed` preserves why an unconsumed attempt cannot proceed;
+restart never replays its effect. The reducer, CLI tail and auditor export carry
+these records. Revisions and the milestone/final/merge drivers remain incomplete,
+so configured external missions are still refused.
+[Checkpoint review](../../reviews/2026-09-18-gate-approval-driver.md).

@@ -144,6 +144,8 @@ pub struct Record {
     pub resolved_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed: Option<Consumed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
 }
 impl Record {
     pub fn new(requested: Requested, at: DateTime<Utc>, seq: u64) -> Result<Self, String> {
@@ -169,12 +171,14 @@ impl Record {
             resolution: None,
             resolved_at: None,
             consumed: None,
+            closed: None,
         })
     }
 
     pub fn finish(&mut self, finished: Finished, at: DateTime<Utc>) -> Result<(), String> {
         let request = &self.requested.request;
-        if self.finished.is_some()
+        if self.closed.is_some()
+            || self.finished.is_some()
             || finished.attempt_id != request.params.attempt_id
             || at < self.requested_at
         {
@@ -205,6 +209,9 @@ impl Record {
     }
 
     pub fn disposition(&self, consent: Option<&Consent>) -> Result<Disposition, String> {
+        if self.closed.is_some() {
+            return Ok(Disposition::Block);
+        }
         let finished = self
             .finished
             .as_ref()
@@ -252,7 +259,8 @@ impl Record {
 
     pub fn resolve(&mut self, resolution: Resolution, at: DateTime<Utc>) -> Result<(), String> {
         let request = &self.requested.request;
-        if self.finished_at.is_none_or(|finished| at < finished)
+        if self.closed.is_some()
+            || self.finished_at.is_none_or(|finished| at < finished)
             || self.resolution.is_some()
             || resolution.attempt_id != request.params.attempt_id
             || resolution.binding != request.params.binding
@@ -271,7 +279,8 @@ impl Record {
     pub fn consume(&mut self, consumed: Consumed, at: DateTime<Utc>) -> Result<(), String> {
         let resolution = self.resolution.as_ref().ok_or("gate has no resolution")?;
         let request = &self.requested.request;
-        if self.consumed.is_some()
+        if self.closed.is_some()
+            || self.consumed.is_some()
             || resolution.disposition != Disposition::Proceed
             || at >= deadline(request)?
             || self.resolved_at.is_none_or(|resolved| at < resolved)
@@ -283,6 +292,15 @@ impl Record {
             return Err("stale, duplicate or mismatched gate consumption".into());
         }
         self.consumed = Some(consumed);
+        Ok(())
+    }
+
+    pub fn close(&mut self, reason: String) -> Result<(), String> {
+        if self.closed.is_some() || self.consumed.is_some() {
+            return Err("gate attempt is already closed or consumed".into());
+        }
+        bounded(&reason, 8192)?;
+        self.closed = Some(reason);
         Ok(())
     }
 }
@@ -327,6 +345,14 @@ pub(crate) fn fold(
         return Err(invalid("foreign gate mission".into()));
     }
     match &event.kind {
+        EventKind::GateEvaluationClosed { attempt_id, reason } => {
+            state
+                .gate_evaluations
+                .get_mut(attempt_id.as_str())
+                .ok_or_else(|| invalid("closed gate has no request".into()))?
+                .close(reason.clone())
+                .map_err(invalid)?;
+        }
         EventKind::GateEvaluationRequested { evaluation } => {
             let request = &evaluation.request;
             validate_stage_status(state, request.params.stage).map_err(invalid)?;

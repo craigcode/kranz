@@ -232,6 +232,7 @@ S1 does not modify existing event/state/backend contracts or reinterpret logs.
 | `events.rs` | `gate.evaluation-requested` with complete immutable bindings and attempt/deadline | Engine persists before spawn |
 | `events.rs` | `gate.evaluation-finished` with accepted judged/escalated/error status, process exit and artifact joins | Engine after validation and process cleanup; subprocess never writes events |
 | `events.rs` | `gate.resolution-recorded` with disposition, policy explanation and separately authenticated consent when required | Engine checks stage authority and accepts at most one resolution |
+| `events.rs` | `gate.evaluation-closed` with attempt ID and reason | Engine recovery or explicit retry closes an unconsumed attempt; never replays effects |
 | `events.rs` | `gate.resolution-consumed` with the rechecked subject and the action the engine attempted | Engine alone; consumption is not proof that an external action completed |
 | `events.rs` | `permission.requested`, `permission.resolved`, `permission.response-recorded`, `permission.closed` | Durable one-call broker, distinct from legacy mission grants |
 | `types.rs` | Default-empty maps for pending evaluations/permissions and consumed resolution IDs | Fold validated events; cache is never authority |
@@ -325,3 +326,31 @@ Dot/dot-dot components, empty components, trailing spaces/dots, absolute paths,
 backslashes and alternate streams remain invalid. This additive change allows
 ordinary source labels such as `.github/workflows/ci.yml` without encoding them
 as unrelated filenames.
+
+## S5 approval checkpoint (2026-09-18)
+
+The engine approval driver resolves evaluator declarations and checker files from
+its pinned base, freezes the normalized plan and existing advisory diagnostics,
+and records request, result, resolution and consumption before `plan.approved`.
+Local repository authority and the authenticated local API have distinct actor
+attribution. Neither attribution proves physical human presence. A later checker
+failure consumes none of the earlier passing checks. Base or mission-branch
+drift refuses approval before branch creation or plan commit.
+
+Diagnostic gate verdicts are labelled separately from command execution
+receipts. A failed advisory approval lint is not promoted to a blocking floor,
+nor converted into a made-up exit code. Raw and retained artifact digests stay
+separate. Text retention is scrubbed; binary inputs retain an explicit omission
+marker, not a claim to retain their original bytes. Retention writes use
+no-follow directory handles and exclusive file creation.
+
+Recovery closes unconsumed attempts, preserving their original results and
+consent. It requires a fresh explicit attempt and never reruns a checker or
+consumes a saved approval. `gate.evaluation-closed` is an additive contract
+change; old records omit `closed` entirely.
+
+Mission configuration still refuses external evaluators. This checkpoint proves
+the initial approval API; revisions, milestone/final/merge drivers and pending
+operator actions remain required before enabling configured missions. The
+synthetic approval proof makes no provider, containment or release claim beyond
+the existing Docker evaluator boundary.

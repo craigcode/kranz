@@ -101,6 +101,11 @@ impl EventRenderer {
     /// One event → one human line (role-tagged, truncated to [`LINE_MAX`]).
     pub fn render(&mut self, event: &Event) -> String {
         let (tag, color, body) = match &event.kind {
+            EventKind::GateEvaluationClosed { attempt_id, reason } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!("{}: closed — {}", attempt_id.as_str(), reason),
+            ),
             EventKind::GateEvaluationRequested { evaluation } => (
                 "gate".into(),
                 ansi::YELLOW,

@@ -573,3 +573,36 @@ fn gate_lifecycle_invocation_joins_exact_live_authority_and_cannot_relabel_conse
         "replay never sends the answer"
     );
 }
+
+#[test]
+fn gate_lifecycle_closed_attempt_cannot_resolve_or_consume_after_recovery() {
+    let request = requested("plan-approval");
+    let finish = finished(&request, Status::Judged, Some(Verdict::Pass));
+    let mut interrupted = Record::new(request.clone(), at(), 2).unwrap();
+    interrupted.close("engine restarted".into()).unwrap();
+    assert!(interrupted.finish(finish.clone(), at()).is_err());
+    assert!(interrupted.close("again".into()).is_err());
+
+    let mut resolved = Record::new(request, at(), 2).unwrap();
+    resolved.finish(finish, at()).unwrap();
+    let decision = resolution(&resolved, Some(consent()));
+    resolved.resolve(decision.clone(), at()).unwrap();
+    resolved
+        .close("engine restarted before effect".into())
+        .unwrap();
+    assert_eq!(
+        resolved.disposition(Some(&consent())).unwrap(),
+        Disposition::Block
+    );
+    assert!(resolved
+        .consume(
+            Consumed {
+                attempt_id: decision.attempt_id,
+                resolution_id: decision.id,
+                rechecked_binding: decision.binding,
+                action: Action::ApprovePlan,
+            },
+            at()
+        )
+        .is_err());
+}

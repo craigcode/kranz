@@ -68,7 +68,7 @@ non-ASCII labels remain unsupported by this v1 path contract.
   close interrupted attempts without replaying effects.
 - Prove those real drivers end to end before removing the configuration refusal.
 
-Claude live compatibility and ACP containment remain separate unproved work.
+S2 now has bounded Claude and Codex live compatibility receipts in [PR #60](https://github.com/craigcode/kranz/pull/60). ACP containment remains separate unproved work.
 No provider or Keychain operation is needed for this checkpoint's tests.
 
 ## Validation
@@ -107,3 +107,11 @@ Follow-up validation: all six builder tests passed, followed by 2,998 passing
 workspace tests with zero failures and ten existing ignored tests, including
 the opt-in real container evaluator proofs. Workspace Clippy with warnings
 denied, formatting, build and knowledge refresh passed.
+
+
+## 2026-09-18 approval driver checkpoint
+
+The initial plan-approval API now executes the contained evaluator and consumes
+only a still-current, permitted resolution. See the [approval checkpoint review](2026-09-18-gate-approval-driver.md).
+The remaining list above describes full S5 acceptance; mission configuration is
+still refused until revisions and the other stage drivers are connected.

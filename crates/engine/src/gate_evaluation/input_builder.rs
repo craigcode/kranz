@@ -32,6 +32,7 @@ pub struct RequiredCheck {
     pub require_assertions: bool,
 }
 
+#[derive(Clone)]
 pub struct Checks<'a> {
     pub environment: Digest,
     pub required: &'a [RequiredCheck],
@@ -49,6 +50,7 @@ pub struct FeatureReceipt {
     pub independent_validation_attempt: Id,
 }
 
+#[derive(Clone)]
 pub enum StageInput<'a> {
     Plan {
         revision: u64,
@@ -72,6 +74,18 @@ pub enum StageInput<'a> {
     },
 }
 
+impl StageInput<'_> {
+    pub(crate) fn stage(&self) -> Stage {
+        match self {
+            Self::Plan { .. } => Stage::PlanApproval,
+            Self::Invocation(_) => Stage::CommandPermission,
+            Self::Milestone { .. } => Stage::MilestoneValidation,
+            Self::Deliverable { .. } => Stage::FinalGate,
+            Self::Integration { .. } => Stage::Merge,
+        }
+    }
+}
+
 pub struct BuildInput<'a> {
     pub mission_id: Id,
     pub evaluation_id: Id,
@@ -83,6 +97,9 @@ pub struct BuildInput<'a> {
     pub registration: &'a PinnedRegistration,
     pub stage: StageInput<'a>,
     pub checks: Checks<'a>,
+    /// Existing stage diagnostics retain their own verdict and posture. They
+    /// are not command exits and never satisfy required command receipts.
+    pub diagnostics: &'a [crate::gate::GateReport],
     /// Previously validated independent results selected from the engine log.
     pub prior_findings: &'a [&'a Record],
     pub source_log_range: Option<LogRange>,
@@ -264,6 +281,16 @@ pub fn build(input: BuildInput<'_>) -> Result<BuiltInput, String> {
         return Err("judgment requires current, nonvacuous mechanical evidence".into());
     }
     parts.prior_findings(input.prior_findings, &input.mission_id)?;
+    for (index, report) in input.diagnostics.iter().enumerate() {
+        parts.json(
+            &format!("diagnostic-{index}"),
+            ArtifactRole::CheckReceipt,
+            &serde_json::json!({"name":report.name,"kind":report.kind,
+                "verdict":report.outcome.verdict,"reference":report.outcome.artefact.reference,
+                "detail":report.outcome.artefact.detail,"ruleIds":report.outcome.rule_ids,
+                "authority":"existing-stage-policy; diagnostic is not an execution receipt"}),
+        )?;
+    }
     let policy_digest = parts.json("policy", ArtifactRole::Policy, &policy)?;
     let subject_digest = parts.json("subject", ArtifactRole::Subject, &subject)?;
     let binding = Binding {
@@ -484,7 +511,7 @@ impl Parts {
     }
 }
 
-fn git_object(value: &str) -> Result<GitObject, String> {
+pub(crate) fn git_object(value: &str) -> Result<GitObject, String> {
     let algorithm = match value.len() {
         40 => "sha1",
         64 => "sha256",

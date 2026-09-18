@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-18
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -61,8 +61,10 @@ only ever advanced locally.
 At plan approval `approve_plan` resolves the base branch tip exactly once
 (`self.repo.rev_parse(&base)`) and records it on the `plan.approved` event; it
 lands on `mission.base_sha` and is exported to worker/validator sessions as
-`KRANZ_BASE_SHA`. Every later diff (final gate, gated merge, out-of-contract
-sweep) uses the pinned sha, never the moving branch name.
+`KRANZ_BASE_SHA`. Mission deliverable diffs use the pinned sha, never a replacement resolved
+from the moving branch name. The external approval driver re-reads the branch
+only to detect drift and refuse consumption; it does not replace the pin. Merge
+separately binds its scratch integration to the live base it will advance.
 WHY: incident m-660ffc — a contract's `git diff main` assertion raced a commit
 landing on the base branch mid-mission (design.md deviation 6). Re-resolving the
 base anywhere after approval reintroduces that race.

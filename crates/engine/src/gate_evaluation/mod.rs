@@ -3,6 +3,7 @@
 pub mod protocol;
 
 pub mod artifacts;
+pub(crate) mod driver;
 pub mod evidence;
 pub mod input_builder;
 pub mod lifecycle;
