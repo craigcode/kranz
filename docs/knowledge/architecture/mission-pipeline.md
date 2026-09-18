@@ -2,8 +2,11 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-18
 verified_against:
+  - crates/engine/src/orchestrator/external_gates.rs
+  - crates/engine/src/gate_evaluation/driver.rs
+  - crates/engine/src/gate_evaluation/lifecycle.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -299,3 +302,15 @@ Replay recreates records, never response handles. Resume closes orphaned calls;
 pause and policy changes cancel live workers before changing their authority.
 See [one-call consent](../../acp-live-permissions.md) and
 [the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
+
+The S5 stage drivers record evaluation, engine resolution and attempted
+consumption separately for initial approval, proposed revisions, milestone
+acceptance, final deliverables and local scratch-integration merge. Authority
+comes from the original sealed approval record; changing live `packDir` cannot
+remove checks. Source snapshots and current base/candidate refs are checked
+again before consumption. Recovery closes unfinished attempts without replaying
+checks or effects. CLI status, the dashboard and optional Slack expose blocked
+or escalated checks; a retry collects fresh evidence and never overrides a
+nonwaivable failure. External command-permission executables and Windows mission
+evaluators remain refused; S4's separate live permission consent path is unchanged.
+[Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).

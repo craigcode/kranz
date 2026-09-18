@@ -50,6 +50,27 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
+    #[serde(rename = "gate.evaluation-closed")]
+    GateEvaluationClosed {
+        attempt_id: crate::gate_evaluation::protocol::Id,
+        reason: String,
+    },
+    #[serde(rename = "gate.evaluation-requested")]
+    GateEvaluationRequested {
+        evaluation: Box<crate::gate_evaluation::lifecycle::Requested>,
+    },
+    #[serde(rename = "gate.evaluation-finished")]
+    GateEvaluationFinished {
+        evaluation: Box<crate::gate_evaluation::lifecycle::Finished>,
+    },
+    #[serde(rename = "gate.resolution-recorded")]
+    GateResolutionRecorded {
+        resolution: crate::gate_evaluation::lifecycle::Resolution,
+    },
+    #[serde(rename = "gate.resolution-consumed")]
+    GateResolutionConsumed {
+        consumption: crate::gate_evaluation::lifecycle::Consumed,
+    },
     #[serde(rename = "permission.requested")]
     PermissionRequested {
         request: crate::live_permission::Request,
@@ -1172,6 +1193,11 @@ impl EventKind {
     /// The dotted wire name of this event (matches the serde rename).
     pub fn type_name(&self) -> &'static str {
         match self {
+            EventKind::GateEvaluationClosed { .. } => "gate.evaluation-closed",
+            EventKind::GateEvaluationRequested { .. } => "gate.evaluation-requested",
+            EventKind::GateEvaluationFinished { .. } => "gate.evaluation-finished",
+            EventKind::GateResolutionRecorded { .. } => "gate.resolution-recorded",
+            EventKind::GateResolutionConsumed { .. } => "gate.resolution-consumed",
             EventKind::PermissionRequested { .. } => "permission.requested",
             EventKind::PermissionResolved { .. } => "permission.resolved",
             EventKind::PermissionResponseRecorded { .. } => "permission.response-recorded",

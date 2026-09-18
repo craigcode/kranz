@@ -420,7 +420,7 @@ jobs:
           fi
           grep -qE 'test result: ok\. 1 passed' "$log"
 
-  # S3: real Docker containment and lifecycle proof. No provider/model calls.
+  # S3/S5: real Docker containment and approval proof. No provider/model calls.
   rust-linux-external-evaluator:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -448,6 +448,12 @@ jobs:
           grep -qE 'test result: ok\. 7 passed' "$log"
           for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs; do
             grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
+          done
+          for proof in records_real_checks_and_requires_fresh_consent refuses_base_drift_after_a_passing_checker; do
+            grep -q "test gate_subprocess_v1_approval_${proof} ... ok" "$log"
+          done
+          for proof in mission_stages_and_merge_bind_real_deliverables stage_failure_never_completes_or_consumes interrupted_stage_closes_without_replaying_effects merge_rejects_a_base_advance_after_pass revision_approval_uses_fresh_plan_consent config_cannot_remove_approved_evaluators; do
+            grep -q "test gate_subprocess_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
             exit 1

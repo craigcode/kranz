@@ -146,7 +146,7 @@ fn gate_subprocess_v1_pack_schema_and_mission_load_fail_closed() {
     };
     assert!(kranz_engine::pack::load_for_config(&config, f.tmp.path())
         .unwrap_err()
-        .contains("S5"));
+        .contains("tracked repo-relative"));
     for invalid in [
         text.replace("schema = 5", "schema = 4"),
         text.replace("schema = 5", "schema = 6"),

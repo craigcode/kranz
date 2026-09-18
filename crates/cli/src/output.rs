@@ -112,6 +112,24 @@ pub fn render_status(state: &MissionState) -> String {
         state.total_cost_usd
     ));
 
+    for record in state
+        .gate_evaluations
+        .values()
+        .filter(|r| r.closed.is_none() && r.consumed.is_none())
+    {
+        let Some(resolution) = &record.resolution else {
+            continue;
+        };
+        if resolution.disposition == kranz_engine::gate_evaluation::lifecycle::Disposition::Proceed
+        {
+            continue;
+        }
+        let request = &record.requested.request.params;
+        out.push_str(&format!("gate review: {} / {:?} / {:?} / {}\n  inspect evidence, correct the cause and retry this stage\n",
+            sanitize_untrusted(request.gate_id.as_str()), request.stage, resolution.disposition,
+            sanitize_untrusted(request.attempt_id.as_str())));
+    }
+
     if !state.pending_user_messages.is_empty() {
         out.push_str("pending user messages:\n");
         for message in &state.pending_user_messages {

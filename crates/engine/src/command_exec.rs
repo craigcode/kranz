@@ -1113,7 +1113,7 @@ pub(crate) async fn run_shell_command_sandboxed(
 /// [`run_shell_command_sandboxed`] with an explicit timeout and the real
 /// exit code (the [`run_shell_command_with_code`] shape), so the merge-gate
 /// runner and tests can drive the same path.
-async fn run_shell_command_sandboxed_with_code(
+pub(crate) async fn run_shell_command_sandboxed_with_code(
     cwd: &std::path::Path,
     command: &str,
     timeout: Duration,
@@ -1586,6 +1586,14 @@ where
 /// `worker.sandbox.enforce` is not `off`, the server routes to
 /// [`run_bounded_gate_command_sandboxed`] instead.
 pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
+    let (code, output) = run_bounded_gate_command_with_code(cwd, command);
+    (code == Some(0), output)
+}
+
+fn run_bounded_gate_command_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+) -> (Option<i32>, String) {
     // cache_only_cargo_home creates a fresh unpredictable dir under the
     // given base; the system temp dir keeps it out of the gated worktree
     // (an untracked `.cargo-cache-only-*` at the root would dirty every
@@ -1595,7 +1603,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
     let cargo_home = crate::agent_env::cache_only_cargo_home(std::env::temp_dir().as_path());
     if !cargo_home.is_dir() {
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's cache-only Cargo home at {}",
                 cargo_home.display()
@@ -1609,7 +1617,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => return (false, format!("failed to create gate runtime: {error}")),
+        Err(error) => return (None, format!("failed to create gate runtime: {error}")),
     };
     let (code, output) = runtime.block_on(run_shell_command_with_timeout_env(
         cwd,
@@ -1619,7 +1627,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         true,
     ));
     let _ = std::fs::remove_dir_all(&cargo_home);
-    (code == Some(0), output)
+    (code, output)
 }
 
 /// What the merge-gate path needs to wrap its gates (ticket
@@ -1744,8 +1752,7 @@ pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
     policy: &MergeGatePolicy,
 ) -> (Option<i32>, String) {
     if !policy.enforces_on_this_host() {
-        let (ok, output) = run_bounded_gate_command(cwd, command);
-        return (Some(i32::from(!ok)), output);
+        return run_bounded_gate_command_with_code(cwd, command);
     }
     let scratch =
         std::env::temp_dir().join(format!("kranz-gate-{}", uuid::Uuid::new_v4().simple()));

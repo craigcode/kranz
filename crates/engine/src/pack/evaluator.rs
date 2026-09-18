@@ -175,6 +175,64 @@ pub struct PinnedRegistration {
     pub(crate) bytes: Vec<u8>,
 }
 impl PinnedRegistration {
+    /// Resolve the configured evaluator set from the engine-pinned base,
+    /// including checker dependencies. A worker's pack edits cannot register,
+    /// remove or replace the checks used by this mission.
+    pub(crate) fn configured_at_ref(
+        repo: &GitRepo,
+        config: &crate::types::MissionConfig,
+        approved_ref: &str,
+    ) -> Result<Vec<Self>, String> {
+        let Some(directory) = config.pack_dir.as_deref() else {
+            return Ok(vec![]);
+        };
+        if std::path::Path::new(directory).is_absolute()
+            || directory.split('/').any(|part| part == "..")
+        {
+            let pack = super::load_for_config(config, repo.root())?;
+            if pack.is_some_and(|p| !p.evaluators.is_empty()) {
+                return Err(
+                    "external evaluators must be vendored in a repo-relative packDir".into(),
+                );
+            }
+            return Ok(vec![]);
+        }
+        let directory = directory.trim_end_matches('/');
+        let directory = if directory == "." { "" } else { directory };
+        if !directory.is_empty() {
+            super::validate_pack_relative_path(directory, "approved pack", "directory")?;
+        }
+        let path = if directory.is_empty() {
+            super::PACK_MANIFEST.to_string()
+        } else {
+            format!("{directory}/{}", super::PACK_MANIFEST)
+        };
+        let oid = repo.rev_parse(approved_ref).map_err(|e| e.to_string())?;
+        let Some(bytes) = repo.show_file(&oid, &path).map_err(|e| e.to_string())? else {
+            // Legacy local advisory packs remain supported; an untracked
+            // external evaluator must never disappear into that fallback.
+            if super::load_for_config(config, repo.root())?
+                .is_some_and(|p| !p.evaluators.is_empty())
+            {
+                return Err("external evaluator pack is absent from the approved base".into());
+            }
+            return Ok(vec![]);
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|_| "approved pack is not UTF-8")?;
+        let doc = super::toml::parse(text)?;
+        super::validate_sections(&doc)?;
+        let (_, schema) = super::manifest_header(&doc)?;
+        let declarations = declarations(&doc, schema)?;
+        if declarations.len() > 32 {
+            return Err("too many mission evaluators".into());
+        }
+        let mut pinned = declarations
+            .iter()
+            .map(|d| Self::at_ref(repo, &oid, directory, d.name.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        pinned.sort_by_key(|p| p.declaration.kind == Kind::Judgment);
+        Ok(pinned)
+    }
     pub fn checker_files(&self) -> impl Iterator<Item = (&WirePath, &[u8], bool)> {
         self.files
             .iter()

@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-18
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
@@ -33,8 +33,8 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Milestone / Feature** — plan structure. A milestone groups features; a
   worker implements one feature at a time.
 - **Validation contract** — per-plan assertions the mission must satisfy. Each
-  is a `Command` (a build/test/lint invocation) or an `AgentJudgement`
-  (re-evaluated by a validator/orchestrator). See
+  is a `Command` (a build/test/lint invocation), `AgentJudgement`
+  (a validator/orchestrator verdict), or `PtyScript` (an interactive terminal check). See
   [gates](validation/gates.md).
 - **Orchestrator** — the planning-and-judging agent role: drafts plans, proposes
   revisions, and renders final-gate verdicts. Claude uses a streaming session;
@@ -94,9 +94,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
   branch is unmerged, and **Landed** once merged.
 - **Drain** — running the per-repo execution queue (`kranz work`); serialized
   per repo.
-- **Gate** — a deterministic pass/fail check: the full-workspace
-  test/clippy/fmt suite, the merge pre-gate, the empty-deliverable net, and the
-  secret scan. See [gates](validation/gates.md).
+- **Gate** — a typed check that can be deterministic or model-judged. The
+  existing `Gate` interface reports pass/fail; the external protocol separates
+  evaluation, engine disposition and operator consent. See
+  [gates](validation/gates.md).
 - **Empty-deliverable net** — a mission with zero non-meta feature commits vs
   its pinned `base_sha` FAILs rather than falsely Completing.
 - **Anti-vacuity** — the contract rule that a filtered test run matching zero

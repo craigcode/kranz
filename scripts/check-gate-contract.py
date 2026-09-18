@@ -249,6 +249,17 @@ class GateV1Contract(unittest.TestCase):
         manifest['artifacts'][0]['content']['path'] = 'build/subject.json'
         self.assertFalse(EVIDENCE.is_valid(manifest))
 
+    def test_gate_contract_v1_dotfiles_and_spaces_remain_portable(self):
+        _, response, _ = self.example()
+        for path in ['.receipt', 'source/.gitignore', 'new source.rs']:
+            changed = copy.deepcopy(response)
+            changed['result']['artifacts'] = [{'path': path, 'digest': digest(b'x'), 'bytes': 1}]
+            self.assertTrue(RESPONSE.is_valid(changed), path)
+        for path in ['.', '..', 'a/../b', 'a/./b', 'a/file.', 'a/file ', 'a/ file']:
+            changed = copy.deepcopy(response)
+            changed['result']['artifacts'] = [{'path': path, 'digest': digest(b'x'), 'bytes': 1}]
+            self.assertFalse(RESPONSE.is_valid(changed), path)
+
     def test_gate_contract_v1_deadlines_and_limits_are_bounded(self):
         request, _, _ = self.example()
         for value in ['2030-02-30T00:00:00Z','2030-01-01T25:00:00Z','2030-01-01T00:00:00+01:00']:

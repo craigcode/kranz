@@ -409,7 +409,20 @@ pub fn load_for_config(cfg: &MissionConfig, repo_root: &Path) -> Result<Option<P
         ));
     };
     if !pack.evaluators.is_empty() {
-        return Err("external evaluators require the S5 mission-stage integration; this binary supports explicit evaluation only and will not skip configured checks".into());
+        if standards::trust_for_dir(repo_root, &dir) != standards::StandardsTrust::RepoTracked
+            || raw.is_absolute()
+        {
+            return Err("external evaluators require a tracked repo-relative pack".into());
+        }
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Err("external mission evaluators require a supported contained host".into());
+        }
+        if pack.evaluators.iter().any(|e| {
+            e.stages
+                .contains(&crate::gate_evaluation::protocol::Stage::CommandPermission)
+        }) {
+            return Err("external command-permission evaluators are not connected; use the live permission consent path".into());
+        }
     }
     Ok(Some(pack))
 }
@@ -439,7 +452,12 @@ pub fn render_lint(pack: &Pack) -> String {
         ));
     }
     for evaluator in &pack.evaluators {
-        out.push_str(&format!("external evaluator {}: {:?}, {:?}; explicit evaluation only, mission integration unavailable\n", evaluator.name.as_str(), evaluator.kind, evaluator.stages));
+        out.push_str(&format!(
+            "external evaluator {}: {:?}, {:?}; approval-pinned mission evaluation\n",
+            evaluator.name.as_str(),
+            evaluator.kind,
+            evaluator.stages
+        ));
     }
     out.push_str("prompts (appended to the target role's prompt):\n");
     if pack.prompts.is_empty() {

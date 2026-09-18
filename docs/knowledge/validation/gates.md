@@ -2,8 +2,11 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-18
 verified_against:
+  - crates/engine/src/orchestrator/external_gates.rs
+  - crates/engine/src/gate_evaluation/driver.rs
+  - crates/engine/src/gate_evaluation/lifecycle.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
@@ -31,8 +34,8 @@ verified_against:
 
 ## Explicit external evaluator checks
 
-The schema-5 evaluator implementation is separate from mission-stage consumption.
-`load_for_config` refuses configured external evaluators until S5 is wired; legacy
+The schema-5 evaluator runner is shared by explicit library calls and mission stages.
+`load_for_config` admits tracked external evaluators on supported contained hosts; legacy
 command gates and standards remain unchanged. `rust-linux-external-evaluator`
 runs `gate_subprocess_v1` with the Docker opt-in and a pinned synthetic Python
 image. Missing Docker/image support fails that job; ordinary workspace tests
@@ -331,3 +334,15 @@ access. Fragmented stdout survives cancelled reads, and an answer waits until
 an already-started protocol frame is complete. Future messages from a cooperative
 peer cannot be predicted; this protocol check is not containment.
 See [live consent](../../acp-live-permissions.md).
+
+The S5 stage drivers record evaluation, engine resolution and attempted
+consumption separately for initial approval, proposed revisions, milestone
+acceptance, final deliverables and local scratch-integration merge. Authority
+comes from the original sealed approval record; changing live `packDir` cannot
+remove checks. Source snapshots and current base/candidate refs are checked
+again before consumption. Recovery closes unfinished attempts without replaying
+checks or effects. CLI status, the dashboard and optional Slack expose blocked
+or escalated checks; a retry collects fresh evidence and never overrides a
+nonwaivable failure. External command-permission executables and Windows mission
+evaluators remain refused; S4's separate live permission consent path is unchanged.
+[Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).

@@ -1,6 +1,6 @@
 //! One contained process per evaluation. Docker is the trusted host control
 //! plane; only the explicitly assembled inputs/checker/scratch mounts cross
-//! into the untrusted process. No mission stage consumes this API yet.
+//! into the untrusted process. Mission stages share this contained runner.
 use super::{artifacts, evidence::FrozenEvidence, protocol::*};
 use crate::command_exec::evaluator_io::{self, Output};
 use crate::pack::evaluator::PinnedRegistration;
@@ -52,6 +52,7 @@ pub struct AttemptOutcome {
     /// Contains a scrubbed receipt; raw files remain only when explicitly
     /// retained or when container cleanup was not confirmed.
     pub directory: PathBuf,
+    pub cleanup_confirmed: bool,
     pub evaluation: Result<AcceptedEvaluation, String>,
 }
 
@@ -308,6 +309,7 @@ impl DockerEvaluator {
         }
         Ok(AttemptOutcome {
             directory: root,
+            cleanup_confirmed: !guard.armed,
             evaluation,
         })
     }

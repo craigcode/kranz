@@ -285,6 +285,8 @@ pub struct ProvenanceChain {
     /// logs.
     pub base_sha: Option<String>,
     pub gates: Vec<GateLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_evaluations: Vec<crate::gate_evaluation::lifecycle::Record>,
     pub sessions: Vec<SessionLink>,
     pub decisions: Vec<DecisionLink>,
     /// The divergence ledger (KRZ-304): comparison records and their
@@ -312,10 +314,10 @@ pub struct ProvenanceChain {
 /// IS the log's. Pure: no clock, no network, no git; the only I/O is the
 /// resolver's metadata probes under `mission_dir`.
 ///
-/// Fallible in exactly one place, by design: a `config.changed` patch that
-/// does not merge into a valid [`MissionConfig`] fails here exactly as it
-/// fails the reducer's fold (corruption, not a provenance gap). Artefact
-/// resolution is total and never contributes an error.
+/// Invalid configuration patches fail as they do in the reducer. Logs with
+/// external gate lifecycle events also use the reducer to reject corrupt
+/// authority transitions. Legacy partial logs keep their existing replay
+/// behavior. Artefact resolution is total and never contributes an error.
 pub fn provenance_chain(
     mission_dir: &Path,
     mission_id: &str,
@@ -328,12 +330,30 @@ pub fn provenance_chain(
         mission_branch: None,
         base_sha: None,
         gates: Vec::new(),
+        gate_evaluations: Vec::new(),
         sessions: Vec::new(),
         decisions: Vec::new(),
         divergences: Vec::new(),
         standards: None,
         outcome: None,
     };
+    if events.iter().any(|event| {
+        event.mission_id == mission_id
+            && matches!(event.kind, EventKind::GateEvaluationRequested { .. })
+    }) {
+        let mission_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.mission_id == mission_id)
+            .cloned()
+            .collect();
+        chain.gate_evaluations = crate::reducer::fold(&mission_events)?
+            .gate_evaluations
+            .into_values()
+            .collect();
+        chain
+            .gate_evaluations
+            .sort_by_key(|record| record.requested_seq);
+    }
     // The config in force at the current seq (backend derivation); set by
     // mission.created, evolved by config.changed through the reducer's merge.
     let mut config: Option<MissionConfig> = None;
@@ -1057,7 +1077,7 @@ mod tests {
         assert_eq!(chain.outcome, None);
     }
 
-    /// The one fallible path, by design: a config.changed patch that cannot
+    /// A legacy fallible path: a config.changed patch that cannot
     /// merge into a valid MissionConfig fails the replay with the reducer's
     /// own error — corruption, not a provenance gap.
     #[test]

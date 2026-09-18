@@ -26,6 +26,7 @@ import { ModelPanel } from './components/ModelPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
 import { PermissionRequestPanel } from './components/PermissionRequestPanel';
+import { GateReviewPanel } from './components/GateReviewPanel';
 import { QuestionRequestPanel } from './components/QuestionRequestPanel';
 import { HookStatusPanel } from './components/HookStatusPanel';
 import { RevisionPanel } from './components/RevisionPanel';
@@ -138,6 +139,7 @@ export default function App() {
             <WorkspacePanel />
             <GrantRequestPanel />
             <PermissionRequestPanel />
+            <GateReviewPanel />
             <QuestionRequestPanel />
             <HookStatusPanel />
             <RevisionPanel />

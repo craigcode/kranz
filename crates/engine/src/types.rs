@@ -882,6 +882,10 @@ pub struct ProvisionedPreview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gate_evaluations: BTreeMap<String, crate::gate_evaluation::lifecycle::Record>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub consumed_gate_resolutions: BTreeSet<String>,
     /// One-call consent history, distinct from mission-wide grants.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permissions: BTreeMap<String, crate::live_permission::Record>,

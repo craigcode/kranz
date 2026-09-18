@@ -86,6 +86,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod external_gates;
 mod finalization;
 mod live_permissions;
 
@@ -677,6 +678,9 @@ impl MissionEngine {
             None,
             "engine restarted; the former peer cannot receive a response",
         )?;
+        engine.close_external_gates(
+            "engine restarted; unconsumed evaluations require a fresh attempt",
+        )?;
         Ok(engine)
     }
 
@@ -1178,7 +1182,25 @@ impl MissionEngine {
     /// same helpers `run()` uses for the rest of the mission), so the primary
     /// checkout never moves off its starting branch. Checkout mode is
     /// unchanged: check out the branch in the primary tree and commit there.
-    pub fn approve_plan(&mut self, mut plan: Plan) -> Result<()> {
+    pub fn approve_plan(&mut self, plan: Plan) -> Result<()> {
+        self.approve_plan_as(
+            plan,
+            crate::live_permission::Actor::LocalRepositoryAuthority,
+        )
+    }
+
+    /// The authenticated caller supplies capability attribution; an evaluator
+    /// can never select or impersonate this principal.
+    pub fn approve_plan_as(
+        &mut self,
+        mut plan: Plan,
+        actor: crate::live_permission::Actor,
+    ) -> Result<()> {
+        if actor == crate::live_permission::Actor::Policy {
+            return Err(EngineError::InvalidState(
+                "policy is not plan consent".into(),
+            ));
+        }
         if self.state.mission.status != MissionStatus::Planning {
             return Err(EngineError::InvalidState(format!(
                 "approve_plan requires Planning status, mission is {:?}",
@@ -1400,8 +1422,26 @@ impl MissionEngine {
             &self.state.config,
         );
 
-        // Git first: if anything fails here, no event was emitted and
-        // approve_plan can simply be retried.
+        // Named, deterministic contract-validation gates (ticket
+        // contract-validation-gates.md): the defect classes behind the lint —
+        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
+        // evaluated through the gate plugin interface (gate.rs) so each
+        // verdict carries its class name into the approval decision and
+        // plan.md below. Static gates inspect the command text against the
+        // (still pristine) repo root; passes-on-base graduates the lint
+        // report. Advisory only, exactly like the lint: approval never
+        // blocks on these.
+
+        let mut gate_reports = contract_gates::contract_gate_reports(
+            &plan.validation_contract,
+            Some(&contract_lint_report),
+            &self.paths.repo_root,
+        );
+        gate_reports.extend(control_reports);
+        self.external_plan_checks(&plan, &base_sha, &gate_reports, actor)?;
+
+        // External checks have durable attempts, but plan.approved still
+        // follows the Git commit. Retrying always evaluates fresh inputs.
         if !self.repo.branch_exists(&branch)? {
             self.repo.create_branch(&branch, Some(&base_sha))?;
         }
@@ -1412,22 +1452,6 @@ impl MissionEngine {
         // `base_sha` was resolved before every base-owned read above and the
         // mission branch was created from that exact object. Never re-resolve
         // the moving base name during approval.
-
-        // Named, deterministic contract-validation gates (ticket
-        // contract-validation-gates.md): the defect classes behind the lint —
-        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
-        // evaluated through the gate plugin interface (gate.rs) so each
-        // verdict carries its class name into the approval decision and
-        // plan.md below. Static gates inspect the command text against the
-        // (still pristine) repo root; passes-on-base graduates the lint
-        // report. Advisory only, exactly like the lint: approval never
-        // blocks on these.
-        let mut gate_reports = contract_gates::contract_gate_reports(
-            &plan.validation_contract,
-            Some(&contract_lint_report),
-            &self.paths.repo_root,
-        );
-        gate_reports.extend(control_reports);
 
         // Human-readable twin, committed alongside: reviewable in any git UI
         // and diffable across re-plans (plan.json stays the durable source).
@@ -1761,6 +1785,15 @@ impl MissionEngine {
         // so an unappliable PlanRevised can never be appended to the log (emit
         // appends before it folds; a failed fold on replay bricks the mission).
         reducer::dry_run_revised_plan(&self.state, &pending.plan, revision)?;
+        let revision_check = crate::gate::GateReport {
+            name: "revision-invariants".into(),
+            kind: crate::gate::GateKind::Deterministic,
+            outcome: crate::gate::GateOutcome::pass(
+                crate::gate::ArtefactRef::new(format!("revision:{revision}"))
+                    .with_detail("Revised-plan invariants and the reducer dry run passed; this is structural validation, not a command execution or test receipt."),
+            ),
+        };
+        self.external_revision_checks(&pending.plan, revision, &[revision_check])?;
         self.commit_revised_plan_record(&pending.plan, revision)?;
         if self.state.mission.status == MissionStatus::Blocked {
             if let Some(mi) = first_incomplete(&self.state) {
@@ -2317,6 +2350,7 @@ impl MissionEngine {
     /// `fixfeature.created`. The full revised plan is written + committed as
     /// `revised-plan.md`, and an `orchestrator.decision` summarizes the change.
     pub fn approve_revised_plan(&mut self, mut plan: Plan) -> Result<()> {
+        self.refuse_legacy_external_revision()?;
         crate::reviewer_independence::pin_plan(
             &mut plan,
             self.state.mission.reviewer_independence,
@@ -3143,6 +3177,9 @@ impl MissionEngine {
                     reason: "milestone skipped by orchestrator decision".to_string(),
                     validator_guidance: None,
                 })?;
+                if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+                    return Ok(Some(MissionStatus::Blocked));
+                }
                 let to_skip: Vec<String> = self.state.mission.milestones[mi]
                     .features
                     .iter()
@@ -5946,6 +5983,9 @@ impl MissionEngine {
             if !self.check_completion_review(Some(&milestone_id))? {
                 return Ok(());
             }
+            if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+                return Ok(());
+            }
             let tag = self.tag_milestone(&milestone_id);
             // Structured human questions (ticket
             // structured-human-question-events): asks scoped to this
@@ -5986,6 +6026,9 @@ impl MissionEngine {
             FindingsConversion::Waive { waived } => {
                 self.emit_waive_decision(&waived)?;
                 if !self.check_completion_review(Some(&milestone_id))? {
+                    return Ok(());
+                }
+                if !Box::pin(self.external_completion_checks(Some(mi))).await? {
                     return Ok(());
                 }
                 let tag = self.tag_milestone(&milestone_id);
@@ -6605,7 +6648,7 @@ impl MissionEngine {
             crate::workspace_contract::load_workspace_contract(&self.paths.repo_root)
                 .ok()
                 .flatten();
-        let report = render_mission_report(
+        let mut report = render_mission_report(
             &self.state,
             &events,
             &plan,
@@ -6613,6 +6656,13 @@ impl MissionEngine {
             self.active_root(),
             workspace_contract.as_ref(),
         );
+        if self
+            .external_authority()?
+            .0
+            .applies(crate::gate_evaluation::protocol::Stage::FinalGate)
+        {
+            report.push_str("\n## External final evaluation\n\nThis source snapshot was committed before external final evaluation. The native contract results above do not establish mission completion. Consult `kranz status` or the event log for the final decision.\n");
+        }
 
         let active_paths = self.active_paths();
         let report_file = active_paths.mission_dir().join("report.md");
@@ -9774,6 +9824,8 @@ pub(crate) mod tests {
         runs.insert("run-2".to_string(), second_run);
         let state = MissionState {
             permissions: Default::default(),
+            gate_evaluations: Default::default(),
+            consumed_gate_resolutions: Default::default(),
             feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".to_string(),

@@ -208,7 +208,7 @@ authority/migration rules; runtime integration remains in the later slices.
 
 - [x] `gate-evaluation-contract-v1` — typed subjects, wire schemas, authority
   matrix and additive lifecycle contract-change proposals.
-- [ ] `acp-adapter-compatibility-proof` — released adapter/runtime fixtures,
+- [x] `acp-adapter-compatibility-proof` — released adapter/runtime fixtures,
   authentication, actual model/report/cost behavior and cancellation proof.
 - [ ] `gate-subprocess-evaluator` — contained, bounded JSON-RPC checker process
   registered through the existing pack contract.

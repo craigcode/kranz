@@ -232,6 +232,7 @@ S1 does not modify existing event/state/backend contracts or reinterpret logs.
 | `events.rs` | `gate.evaluation-requested` with complete immutable bindings and attempt/deadline | Engine persists before spawn |
 | `events.rs` | `gate.evaluation-finished` with accepted judged/escalated/error status, process exit and artifact joins | Engine after validation and process cleanup; subprocess never writes events |
 | `events.rs` | `gate.resolution-recorded` with disposition, policy explanation and separately authenticated consent when required | Engine checks stage authority and accepts at most one resolution |
+| `events.rs` | `gate.evaluation-closed` with attempt ID and reason | Engine recovery or explicit retry closes an unconsumed attempt; never replays effects |
 | `events.rs` | `gate.resolution-consumed` with the rechecked subject and the action the engine attempted | Engine alone; consumption is not proof that an external action completed |
 | `events.rs` | `permission.requested`, `permission.resolved`, `permission.response-recorded`, `permission.closed` | Durable one-call broker, distinct from legacy mission grants |
 | `types.rs` | Default-empty maps for pending evaluations/permissions and consumed resolution IDs | Fold validated events; cache is never authority |
@@ -310,3 +311,84 @@ the runtime enforces its requirements.
 References: [integration scope](scoping/acp-worker-gate-contract.md),
 [JSON-RPC 2.0](https://www.jsonrpc.org/specification),
 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12/json-schema-core).
+
+## S5 foundation checkpoint (2026-09-16)
+
+At this historical checkpoint the lifecycle branch implemented four audit events, pure folding,
+source snapshot identity, typed stage input assembly and retained-artifact export
+checks. The input builder derives prerequisite status from required checks and
+engine-observed receipts bound to content and environment. That checkpoint did not
+connect the mission stage drivers; configuration refused external evaluators. See the [review and remaining integration work](reviews/2026-09-16-gate-lifecycle-foundation.md).
+
+The v1 portable path alphabet now includes ASCII dotfiles and interior spaces.
+Dot/dot-dot components, empty components, trailing spaces/dots, absolute paths,
+backslashes and alternate streams remain invalid. This additive change allows
+ordinary source labels such as `.github/workflows/ci.yml` without encoding them
+as unrelated filenames.
+
+## S5 approval checkpoint (2026-09-18)
+
+The engine approval driver resolves evaluator declarations and checker files from
+its pinned base, freezes the normalized plan and existing advisory diagnostics,
+and records request, result, resolution and consumption before `plan.approved`.
+Local repository authority and the authenticated local API have distinct actor
+attribution. Neither attribution proves physical human presence. A later checker
+failure consumes none of the earlier passing checks. Base or mission-branch
+drift refuses approval before branch creation or plan commit.
+
+Diagnostic gate verdicts are labelled separately from command execution
+receipts. A failed advisory approval lint is not promoted to a blocking floor,
+nor converted into a made-up exit code. Raw and retained artifact digests stay
+separate. Text retention is scrubbed; binary inputs retain an explicit omission
+marker, not a claim to retain their original bytes. Retention writes use
+no-follow directory handles and exclusive file creation.
+
+Recovery closes unconsumed attempts, preserving their original results and
+consent. It requires a fresh explicit attempt and never reruns a checker or
+consumes a saved approval. `gate.evaluation-closed` is an additive contract
+change; old records omit `closed` entirely.
+
+That initial checkpoint kept mission admission disabled. The following stage
+integration supersedes that restriction; its synthetic proofs make no provider
+or release claim beyond the tested native engine and Docker evaluator boundary.
+
+
+## S5 stage integration (2026-09-18)
+
+Tracked repo-relative evaluators now run at initial and proposed-revision approval,
+milestone acceptance, final deliverable checks and local merge on macOS/Linux.
+The sealed first approval supplies the immutable checker set. Revisions preserve
+that set; the legacy partial re-plan API refuses configured external gates and
+requires the proposed-revision approval flow. External command-permission
+executables remain unsupported and are rejected at configuration; the separately
+implemented S4 broker supplies live one-call consent and its audit joins.
+
+The stage input manifest carries the source log range. Actual command receipts
+reference engine decision-event sequence numbers, checked content, environment,
+real exits and bounded scrubbed output. Generic shell exits do not claim a test
+count. Existing milestone contract commands remain advisory; final commands and
+live-base merge commands are required. The existing PTY harness supplies fresh
+final evidence. Required test-count checks in the input builder remain fail-closed
+when a producer cannot supply the count; stage drivers do not infer counts from
+exit zero. Legacy gate.result diagnostics retain their original meanings.
+
+Final evaluation happens after engine report/lesson writes and checks that same
+source snapshot. Accepted feature receipts refer to engine-recorded commits and
+independent validation runs (or consumed independent milestone checks), never
+worker test claims. Merge snapshots are captured before its legacy gate ladder;
+checker/manifest drift on the live base refuses the operation. Required merge
+commands currently run a second time through the typed receipt runner because
+the legacy injectable executor returns only a boolean. That extra cost is explicit.
+Both executions must pass, and neither may mutate the integration snapshot.
+
+The single-writer merge audit records consent, attempted consumption and the
+actual local merge outcome separately. No new push path exists. A changed source,
+base or mission branch closes unconsumed passing attempts. Dropped asynchronous
+stage evaluations leave a durable pending request that resume closes; replay
+never executes a checker or advances a ref.
+
+CLI status, dashboard and optional Slack display review obligations and evidence
+bindings. Escalation requires investigation and a fresh stage attempt after the
+cause is addressed; these views do not offer an override for blocking failures.
+See the [stage review](reviews/2026-09-18-gate-stage-integration.md) for validation
+and remaining acceptance work.

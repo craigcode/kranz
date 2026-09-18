@@ -1033,6 +1033,9 @@ impl MissionEngine {
             None => self.emit_decision("no cross-mission lesson captured", None)?,
         }
         self.write_mission_report(lesson_paths);
+        if !Box::pin(self.external_completion_checks(None)).await? {
+            return Ok(MissionStatus::Blocked);
+        }
         // Structured human questions (ticket
         // structured-human-question-events): questions do not park the run
         // loop, so an ask can still be open here — a completed mission makes
