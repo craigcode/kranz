@@ -241,6 +241,11 @@ pub enum Command {
         #[command(subcommand)]
         command: GrantCommand,
     },
+    /// Inspect or answer an exact live ACP invocation (no mission-wide grant).
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommand,
+    },
 
     /// Answer an open structured human question (the pending-decision
     /// projection the dashboard and Slack also render)
@@ -833,6 +838,26 @@ pub enum GrantCommand {
         /// Reason recorded on the denial
         #[arg(long, default_value = "denied by operator")]
         reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PermissionCommand {
+    /// Show pending requests, their complete action, binding and deadline.
+    List { id: String },
+    /// Allow exactly the invocation whose binding was inspected.
+    Allow {
+        id: String,
+        request_id: String,
+        #[arg(long)]
+        binding: String,
+    },
+    /// Refuse exactly the invocation whose binding was inspected.
+    Deny {
+        id: String,
+        request_id: String,
+        #[arg(long)]
+        binding: String,
     },
 }
 

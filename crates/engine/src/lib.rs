@@ -58,6 +58,7 @@ pub mod hooks;
 pub mod judgement;
 pub mod knowledge;
 pub mod lessons;
+pub mod live_permission;
 pub mod merge;
 pub mod merged;
 pub mod migrate_state;

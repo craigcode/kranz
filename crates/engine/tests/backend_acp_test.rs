@@ -61,11 +61,21 @@ fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> Se
     }
 }
 
+// Transport-only fixtures act as an explicit test broker. Engine durability
+// and operator authority are exercised separately by the live-consent tests.
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
-    session
+    let event = session
         .next_event()
         .await
-        .expect("next_event should not error")
+        .expect("next_event should not error");
+    if let Some(AgentEvent::PermissionRequested { proposal, .. }) = &event {
+        session
+            .permission_responder()
+            .unwrap()
+            .respond(proposal, proposal.prohibition.is_none())
+            .unwrap();
+    }
+    event
 }
 
 /// The mock-peer preamble: a read loop that answers `initialize` and
@@ -317,12 +327,10 @@ async fn backend_acp_disallowed_tool_is_refused_at_the_seam() {
                 assert_eq!(tool, "execute");
                 saw_tool_use = true;
             }
-            AgentEvent::ToolResult {
-                denied: true,
-                summary,
-                ..
-            } => {
-                denial_summaries.push(summary);
+            AgentEvent::PermissionRequested { proposal, .. } => {
+                if let Some(reason) = proposal.prohibition {
+                    denial_summaries.push(reason);
+                }
             }
             _ => {}
         }
@@ -337,8 +345,7 @@ async fn backend_acp_disallowed_tool_is_refused_at_the_seam() {
         "exactly one synthesized denial event is expected: {denial_summaries:?}"
     );
     assert!(
-        denial_summaries[0].contains("refused by kranz permission seam")
-            && denial_summaries[0].contains("Bash(git push*)"),
+        denial_summaries[0].contains("Bash(git push*)"),
         "the denial event names the seam and the rule: {}",
         denial_summaries[0]
     );
@@ -370,13 +377,10 @@ async fn backend_acp_read_only_session_refuses_mutating_kinds() {
 
     let mut denial_summaries = Vec::new();
     while let Some(event) = next(&mut session).await {
-        if let AgentEvent::ToolResult {
-            denied: true,
-            summary,
-            ..
-        } = event
-        {
-            denial_summaries.push(summary);
+        if let AgentEvent::PermissionRequested { proposal, .. } = event {
+            if let Some(reason) = proposal.prohibition {
+                denial_summaries.push(reason);
+            }
         }
     }
     assert_eq!(denial_summaries.len(), 1, "{denial_summaries:?}");
@@ -817,7 +821,8 @@ async fn acp_compat_v1_changed_permission_input_rechecks_the_current_command() {
     let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
     let mut denied = false;
     while let Some(event) = next(&mut session).await {
-        if matches!(event, AgentEvent::ToolResult { denied: true, .. }) {
+        if matches!(event, AgentEvent::PermissionRequested { proposal, .. } if proposal.prohibition.is_some())
+        {
             denied = true;
         }
     }
@@ -1043,7 +1048,7 @@ async fn acp_compat_v1_permission_requires_identity_and_a_valid_once_option() {
         assert_eq!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::ToolResult { denied: true, .. })),
+                .any(|event| matches!(event, AgentEvent::PermissionRequested { proposal, .. } if proposal.prohibition.is_some())),
             expected == "cancelled"
         );
         if expected == "selected" {
@@ -1197,4 +1202,158 @@ async fn acp_compat_v1_streaming_cost_uses_deltas_and_preserves_telemetry_gaps()
         assert_eq!(cost, expected);
     }
     session.abort().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_permission_pumps_output_before_consent_and_sends_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let mut body = permission_peer("execute", "printf fixture");
+    // A progress notification after the request must be readable before consent.
+    let progress = notification(
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"waiting for consent"}}"#,
+    );
+    // Insert directly after the permission request line, before the shell reads.
+    let start = body.find("session/request_permission").unwrap();
+    let needle = start + body[start..].find('\n').unwrap();
+    body.insert_str(needle + 1, &progress);
+    let peer = write_peer(dir.path(), "live-consent.sh", &body);
+    let mut request = spec(dir.path(), "live-permission-session", true, &[]);
+    request.env.insert(
+        "KRANZ_ACP_PEER_OUTCOME".into(),
+        outcome.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let mut proposal = None;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = session.next_event().await.unwrap() {
+            match event {
+                AgentEvent::PermissionRequested { proposal: p, .. } => proposal = Some(p),
+                AgentEvent::Text { text, .. } if text == "waiting for consent" => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!outcome.exists(), "no effect before consent");
+    let proposal = proposal.expect("live request delivered");
+    session
+        .permission_responder()
+        .unwrap()
+        .respond(&proposal, true)
+        .unwrap();
+    let events = drain_bounded(&mut session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::PermissionResponded {
+                    delivery: kranz_engine::live_permission::Delivery::Sent,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(outcome).unwrap().trim(), "allow");
+}
+
+#[tokio::test]
+async fn live_permission_changed_action_cannot_use_a_queued_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let ready = dir.path().join("fragment-written");
+    let release = dir.path().join("finish-frame");
+    let mut body = permission_peer("execute", "printf fixture");
+    let changed = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-mock-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","rawInput":{"command":"git push origin main"}}}}"#;
+    let (prefix, suffix) = changed.split_at(changed.len() / 2);
+    let fragmented = format!(
+        r#"      printf '%s' '{prefix}'
+      printf ready > "$KRANZ_ACP_PEER_READY"
+      while [ ! -f "$KRANZ_ACP_PEER_RELEASE" ]; do sleep 0.01; done
+      printf '%s\n' '{suffix}'
+"#
+    );
+    let start = body.find("session/request_permission").unwrap();
+    let needle = start + body[start..].find('\n').unwrap();
+    body.insert_str(needle + 1, &fragmented);
+    let peer = write_peer(dir.path(), "changed-live-consent.sh", &body);
+    let mut request = spec(dir.path(), "live-permission-changed", true, &[]);
+    for (name, path) in [
+        ("KRANZ_ACP_PEER_OUTCOME", &outcome),
+        ("KRANZ_ACP_PEER_READY", &ready),
+        ("KRANZ_ACP_PEER_RELEASE", &release),
+    ] {
+        request.env.insert(name.into(), path.display().to_string());
+    }
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let proposal = loop {
+        if let Some(AgentEvent::PermissionRequested { proposal, .. }) =
+            session.next_event().await.unwrap()
+        {
+            break proposal;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // No complete notification exists yet. Cancellation must preserve the
+    // fragment, and consent cannot overtake it while the peer holds the rest.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    session
+        .permission_responder()
+        .unwrap()
+        .respond(&proposal, true)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    assert!(!outcome.exists());
+    std::fs::write(release, "continue").unwrap();
+    drain_bounded(&mut session).await;
+    assert!(matches!(
+        session.exit_status(),
+        Some(SessionExit::Failed(_))
+    ));
+    assert!(!outcome.exists());
+}
+
+#[tokio::test]
+async fn live_permission_cancel_with_an_unanswered_request_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let peer = write_peer(
+        dir.path(),
+        "cancel-live-consent.sh",
+        &permission_peer("execute", "printf fixture"),
+    );
+    let mut request = spec(dir.path(), "live-permission-cancel", true, &[]);
+    request.env.insert(
+        "KRANZ_ACP_PEER_OUTCOME".into(),
+        outcome.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    while let Some(event) = session.next_event().await.unwrap() {
+        if matches!(event, AgentEvent::PermissionRequested { .. }) {
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), session.abort())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
+    assert!(!outcome.exists());
 }

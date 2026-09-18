@@ -2600,3 +2600,56 @@ fn clean_prunes_missions_index() {
     );
     assert!(index.contains("# Kranz missions"), "header kept: {index}");
 }
+
+#[test]
+fn live_permission_cli_requires_an_inspected_binding_and_never_falls_back_to_messages() {
+    use kranz_cli::cli::PermissionCommand;
+    assert!(Cli::try_parse_from(["kranz", "permission", "allow", "m-1", "permission-1"]).is_err());
+    for verb in ["allow", "deny"] {
+        let parsed = Cli::try_parse_from([
+            "kranz",
+            "permission",
+            verb,
+            "m-1",
+            "permission-1",
+            "--binding",
+            "exact-binding",
+        ])
+        .unwrap();
+        let Command::Permission { command } = parsed.command else {
+            panic!("wrong command");
+        };
+        match command {
+            PermissionCommand::Allow {
+                id,
+                request_id,
+                binding,
+            }
+            | PermissionCommand::Deny {
+                id,
+                request_id,
+                binding,
+            } => {
+                assert_eq!(id, "m-1");
+                assert_eq!(request_id, "permission-1");
+                assert_eq!(binding, "exact-binding");
+            }
+            _ => panic!("wrong permission command"),
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    seed_pending_grant(tmp.path(), "m-1", "npm test");
+    assert!(commands::cmd_permission_answer(
+        tmp.path(),
+        "m-1",
+        "permission-1",
+        "exact-binding",
+        true
+    )
+    .is_err());
+    assert!(
+        kranz_engine::control::drain(&kranz_engine::paths::MissionPaths::new(tmp.path(), "m-1"))
+            .unwrap()
+            .is_empty()
+    );
+}

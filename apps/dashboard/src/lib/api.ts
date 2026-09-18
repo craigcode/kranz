@@ -324,6 +324,13 @@ export const api = {
     );
   },
 
+  async answerPermission(id: string, requestId: string, bindingDigest: string, allow: boolean): Promise<void> {
+    await postJson<{ queued: boolean }>(
+      `/api/missions/${encodeURIComponent(id)}/permission/answer`,
+      { requestId, bindingDigest, allow },
+    );
+  },
+
   async approveGrant(id: string, command: string): Promise<void> {
     await postJson<{ queued: boolean }>(
       `/api/missions/${encodeURIComponent(id)}/grant/approve`,

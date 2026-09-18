@@ -29,6 +29,7 @@ use std::path::Path;
 /// [`crate::config::NotifyFlags`] and pick the formatter.
 #[derive(Debug, Clone)]
 pub enum Outbound {
+    PermissionReady(Box<kranz_engine::live_permission::Request>),
     PlanReady(PlanReady),
     RevisionReady(RevisionReady),
     GrantReady(GrantReady),
@@ -42,6 +43,7 @@ impl Outbound {
     /// on the payload variant.
     pub fn class(&self) -> NotifyClass {
         match self {
+            Outbound::PermissionReady(_) => NotifyClass::Blocked,
             Outbound::PlanReady(_) => NotifyClass::PlanReady,
             Outbound::RevisionReady(_) => NotifyClass::PlanReady,
             // A parked grant is an attention-needed block on the milestone, so
@@ -77,6 +79,9 @@ pub enum NotifyClass {
 /// degrades `diff_stat` to `None`, same as an unset cost.
 pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option<Outbound> {
     match &event.kind {
+        EventKind::PermissionRequested { request } if request.proposal.prohibition.is_none() => {
+            Some(Outbound::PermissionReady(Box::new(request.clone())))
+        }
         EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
             mission_id: state.mission.id.clone(),
             goal: plan.goal.clone(),
@@ -234,6 +239,7 @@ mod tests {
 
     fn base_state() -> MissionState {
         MissionState {
+            permissions: Default::default(),
             feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".into(),

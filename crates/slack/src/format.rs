@@ -52,6 +52,8 @@ pub const DENY_GRANT_ACTION_ID: &str = "kranz_deny_grant";
 /// `<mission-id>:<question-id>:<option-index>` — mission ids and the
 /// engine-minted question ids (`q-<n>`) never contain `:`, so the two colons
 /// split cleanly.
+pub const ALLOW_PERMISSION_ACTION_ID: &str = "kranz_permission_allow";
+pub const DENY_PERMISSION_ACTION_ID: &str = "kranz_permission_deny";
 pub const ANSWER_QUESTION_ACTION_ID: &str = "kranz_answer_question";
 
 /// `action_id` of the "Queue" button on a `/kranz todo` Reviewable-ticket row.
@@ -693,6 +695,42 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
         }),
     ];
     push_dashboard_button(&mut blocks, dashboard_url, &r.mission_id);
+    blocks
+}
+
+/// One invocation only. Never offer approval from a truncated action.
+pub fn build_permission_ready(
+    request: &kranz_engine::live_permission::Request,
+    dashboard_url: Option<&str>,
+) -> Vec<Value> {
+    let action = serde_json::to_string_pretty(&request.proposal.action).unwrap_or_default();
+    let workspace_complete = request.binding.workspace.chars().count() <= 1000;
+    let complete = !action.is_empty() && action.chars().count() <= 2400 && workspace_complete;
+    let workspace = if workspace_complete {
+        request.binding.workspace.as_str()
+    } else {
+        "Open the dashboard to inspect the complete workspace."
+    };
+    let mut blocks = vec![
+        header("One-call permission"),
+        section(
+            "Authorize this exact invocation once. Future calls require their own authorization.",
+        ),
+        json!({"type":"section","text":{"type":"plain_text","text":if complete { action } else { "Open the dashboard to inspect the complete action before allowing it.".into() }}}),
+        json!({"type":"context","elements":[{"type":"plain_text","text":format!("Mission {} · run {}\nWorkspace: {}\nExpires {}", request.binding.mission_id, request.binding.run_id, workspace, request.proposal.deadline)}]}),
+    ];
+    let value = format!(
+        "{}:{}:{}",
+        request.binding.mission_id, request.proposal.id, request.binding_digest
+    );
+    let mut buttons = Vec::new();
+    if complete && request.proposal.prohibition.is_none() && request.proposal.option(true).is_some()
+    {
+        buttons.push(json!({"type":"button","text":{"type":"plain_text","text":"Allow once"},"action_id":ALLOW_PERMISSION_ACTION_ID,"value":value}));
+    }
+    buttons.push(json!({"type":"button","text":{"type":"plain_text","text":"Deny once"},"action_id":DENY_PERMISSION_ACTION_ID,"value":value}));
+    blocks.push(json!({"type":"actions","elements":buttons}));
+    push_dashboard_button(&mut blocks, dashboard_url, &request.binding.mission_id);
     blocks
 }
 

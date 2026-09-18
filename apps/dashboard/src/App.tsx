@@ -25,6 +25,7 @@ import { TranscriptView } from './components/TranscriptView';
 import { ModelPanel } from './components/ModelPanel';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { GrantRequestPanel } from './components/GrantRequestPanel';
+import { PermissionRequestPanel } from './components/PermissionRequestPanel';
 import { QuestionRequestPanel } from './components/QuestionRequestPanel';
 import { HookStatusPanel } from './components/HookStatusPanel';
 import { RevisionPanel } from './components/RevisionPanel';
@@ -136,6 +137,7 @@ export default function App() {
             <ModelPanel />
             <WorkspacePanel />
             <GrantRequestPanel />
+            <PermissionRequestPanel />
             <QuestionRequestPanel />
             <HookStatusPanel />
             <RevisionPanel />

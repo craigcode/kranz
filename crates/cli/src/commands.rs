@@ -6,7 +6,9 @@
 //! work on machines without a `claude` binary installed.
 
 use crate::backlog;
-use crate::cli::{Cli, Command, GrantCommand, QuestionCommand, RevisionCommand, TicketCommand};
+use crate::cli::{
+    Cli, Command, GrantCommand, PermissionCommand, QuestionCommand, RevisionCommand, TicketCommand,
+};
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
 use crate::tail::{self, EventRenderer};
@@ -321,6 +323,37 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                     if let Some(hint) = control_queue_hint(&repo, &id) {
                         println!("{hint}");
                     }
+                }
+            }
+            Ok(0)
+        }
+        Command::Permission { command } => {
+            match command {
+                PermissionCommand::List { id } => {
+                    let state = load_state(&repo, &id)?;
+                    let now = chrono::Utc::now();
+                    let requests: Vec<_> = state
+                        .permissions
+                        .values()
+                        .filter(|r| r.pending(now))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&requests)?);
+                }
+                PermissionCommand::Allow {
+                    id,
+                    request_id,
+                    binding,
+                } => {
+                    cmd_permission_answer(&repo, &id, &request_id, &binding, true)?;
+                    println!("one-call permission answer queued; delivery is recorded separately");
+                }
+                PermissionCommand::Deny {
+                    id,
+                    request_id,
+                    binding,
+                } => {
+                    cmd_permission_answer(&repo, &id, &request_id, &binding, false)?;
+                    println!("one-call permission refusal queued");
                 }
             }
             Ok(0)
@@ -1432,6 +1465,34 @@ pub fn cmd_reject_revision(repo: &Path, mission_id: &str, revision: u32) -> Resu
     Ok(control::enqueue(
         &paths,
         &ControlCommand::RejectRevision { revision },
+    )?)
+}
+
+pub fn cmd_permission_answer(
+    repo: &Path,
+    mission_id: &str,
+    request_id: &str,
+    binding: &str,
+    allow: bool,
+) -> Result<PathBuf> {
+    let paths = require_revisable_mission(repo, mission_id)?;
+    let state = load_state(repo, mission_id)?;
+    let record = state
+        .permissions
+        .get(request_id)
+        .ok_or_else(|| anyhow!("unknown live permission"))?;
+    record.validate_answer(binding, allow, chrono::Utc::now())?;
+    Ok(control::enqueue(
+        &paths,
+        &ControlCommand::ResolvePermission {
+            resolution: kranz_engine::live_permission::Resolution {
+                request_id: request_id.into(),
+                binding_digest: binding.into(),
+                allow,
+                actor: kranz_engine::live_permission::Actor::LocalRepositoryAuthority,
+                reason: "operator answered through the local CLI".into(),
+            },
+        },
     )?)
 }
 

@@ -459,7 +459,34 @@ export interface MissionConfig {
   workerIsolation?: 'worktree' | 'checkout';
 }
 
+export interface LivePermission {
+  request: {
+    proposal: {
+      id: string;
+      engineSessionId: string;
+      peerSessionId: string;
+      peerRequestId: string | number;
+      toolCallId: string;
+      action: Record<string, unknown>;
+      options: Array<{ optionId: string; kind: string; name?: string }>;
+      actionDigest: string;
+      optionsDigest: string;
+      observedAt: string;
+      deadline: string;
+      prohibition: string | null;
+    };
+    binding: { missionId: string; runId: string; workspace: string; planDigest: string; policyDigest: string };
+    bindingDigest: string;
+  };
+  resolution?: { requestId: string; bindingDigest: string; allow: boolean; actor: { kind: string; id?: string }; reason: string };
+  resolvedAt?: string;
+  delivery?: 'sent' | 'uncertain';
+  respondedAt?: string;
+  closed?: string;
+}
+
 export interface MissionState {
+  permissions?: Record<string, LivePermission>;
   mission: Mission;
   featureBaseShas?: Record<string, string>;
   runs: Record<string, WorkerRun>;

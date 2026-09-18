@@ -2486,3 +2486,179 @@ async fn merge_route_surfaces_redacted_failing_gate_output_and_leaves_base_uncha
         .to_string();
     assert_eq!(base_before, base_after, "base branch must not advance");
 }
+
+#[tokio::test]
+async fn live_permission_api_requires_mutation_authority_and_exact_binding() {
+    use kranz_engine::live_permission::{
+        self, Actor, Binding, Proposal, Request as ConsentRequest,
+    };
+    let (_tmp, root, paths, app) = fixture();
+    let now = chrono::Utc::now();
+    let action = json!({"kind":"execute","rawInput":{"command":"npm test"}});
+    let options = vec![json!({"kind":"allow_once","optionId":"one"})];
+    let request = ConsentRequest::new(
+        Proposal {
+            id: "permission-api".into(),
+            engine_session_id: "permission-session".into(),
+            peer_session_id: "peer".into(),
+            peer_request_id: json!(1),
+            tool_call_id: "call".into(),
+            action_digest: live_permission::digest(&action).unwrap(),
+            options_digest: live_permission::digest(&options).unwrap(),
+            action,
+            options,
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(300),
+            prohibition: None,
+        },
+        Binding {
+            mission_id: MISSION_ID.into(),
+            run_id: "permission-run".into(),
+            workspace: root.display().to_string(),
+            plan_digest: live_permission::digest(&sample_plan()).unwrap(),
+            policy_digest: live_permission::digest(&"policy").unwrap(),
+        },
+    )
+    .unwrap();
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::WorkerSpawned {
+            backend: None,
+            run_id: "permission-run".into(),
+            role: Role::Worker,
+            feature_id: Some("f-1-1".into()),
+            milestone_id: Some("ms-1".into()),
+            candidate: None,
+            executor_route: None,
+            sdk_session_id: "permission-session".into(),
+            model: "fixture".into(),
+            quant: "n/a".into(),
+            weight_hash: None,
+            prompt_hash: "fixture".into(),
+            transcript_path: MissionPaths::transcript_rel("permission-run"),
+        })
+        .unwrap();
+        log.append(EventKind::PermissionRequested {
+            request: request.clone(),
+        })
+        .unwrap();
+    }
+    let uri = format!("/api/missions/{MISSION_ID}/permission/answer");
+    let body = json!({"requestId":request.proposal.id,"bindingDigest":request.binding_digest,"allow":true});
+    let read_capability = exchange_read_token(&app, TEST_TOKEN).await;
+    for token in [None, Some(read_capability.as_str())] {
+        let mut req = Request::post(&uri).header("content-type", "application/json");
+        if let Some(token) = token {
+            req = req.header(kranz_server::TOKEN_HEADER, token);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(control::drain(&paths).unwrap().is_empty());
+    }
+    for invalid in [
+        json!({"requestId":request.proposal.id,"bindingDigest":"wrong","allow":true}),
+        json!({"requestId":"foreign","bindingDigest":request.binding_digest,"allow":true}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(&uri)
+                    .header("content-type", "application/json")
+                    .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
+                    .body(Body::from(invalid.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(control::drain(&paths).unwrap().is_empty());
+    }
+    // The generic control endpoint must not permit a caller to forge a Slack identity.
+    let forged = ControlCommand::ResolvePermission {
+        resolution: live_permission::Resolution {
+            request_id: request.proposal.id.clone(),
+            binding_digest: request.binding_digest.clone(),
+            allow: true,
+            actor: Actor::SlackUser("forged-user".into()),
+            reason: "forged".into(),
+        },
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/missions/{MISSION_ID}/control"))
+                .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
+                .body(Body::from(serde_json::to_string(&forged).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(control::drain(&paths).unwrap().is_empty());
+    let mut spoofed = body.clone();
+    spoofed["actor"] = json!({"kind":"slack-user","id":"forged-user"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(&uri)
+                .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
+                .body(Body::from(spoofed.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(control::drain(&paths).unwrap().is_empty());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(&uri)
+                .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let queued = control::drain(&paths).unwrap();
+    assert_eq!(queued.len(), 1);
+    let ControlCommand::ResolvePermission { resolution } = &queued[0].1 else {
+        panic!("wrong command");
+    };
+    assert_eq!(resolution.actor, Actor::LocalMutationCapability);
+    assert_eq!(resolution.binding_digest, request.binding_digest);
+    // The API queues intent; it never claims delivery or edits authorization itself.
+    let events = EventLog::read_events(&paths.events_file()).unwrap();
+    assert!(!events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::PermissionResolved { .. } | EventKind::PermissionResponseRecorded { .. }
+    )));
+    control::acknowledge(&paths, &queued[0].0).unwrap();
+    {
+        let mut log = EventLog::acquire(&paths, MISSION_ID, Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::PermissionClosed {
+            request_id: request.proposal.id,
+            reason: "peer ended".into(),
+        })
+        .unwrap();
+    }
+    let response = app
+        .oneshot(
+            Request::post(&uri)
+                .header("content-type", "application/json")
+                .header(kranz_server::TOKEN_HEADER, TEST_TOKEN)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(control::drain(&paths).unwrap().is_empty());
+}

@@ -373,9 +373,10 @@ async fn main() -> Result<()> {
                     AgentEvent::Init { raw, .. } => ("init", raw, false, None),
                     AgentEvent::Text { raw, .. } => ("text", raw, false, None),
                     AgentEvent::Other { raw } => ("other", raw, false, None),
-                    AgentEvent::ToolUse { raw, .. } | AgentEvent::ToolResult { raw, .. } => {
-                        ("tool", raw, true, None)
-                    }
+                    AgentEvent::ToolUse { raw, .. }
+                    | AgentEvent::ToolResult { raw, .. }
+                    | AgentEvent::PermissionRequested { raw, .. }
+                    | AgentEvent::PermissionResponded { raw, .. } => ("tool", raw, true, None),
                     AgentEvent::Result {
                         text,
                         is_error,

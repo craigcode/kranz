@@ -120,6 +120,29 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin, cap: usize) -> Result<V
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn gate_subprocess_v1_io_delivers_eof_and_retains_exit_and_both_streams() {
+        let env = HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+        let result = run(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "cat; printf 'checker diagnostic' >&2; exit 7".into(),
+            ],
+            &env,
+            b"one request\n",
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            64,
+            64,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.code, Some(7));
+        assert_eq!(result.stdout, b"one request\n");
+        assert_eq!(result.stderr, b"checker diagnostic");
+    }
+    #[tokio::test]
     async fn gate_subprocess_v1_io_bounds_blocked_stdin_and_parallel_streams() {
         let env = HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
         let cancel = AtomicBool::new(false);

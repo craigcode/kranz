@@ -882,6 +882,9 @@ pub struct ProvisionedPreview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
+    /// One-call consent history, distinct from mission-wide grants.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permissions: BTreeMap<String, crate::live_permission::Record>,
     pub mission: Mission,
     /// Sequential feature baselines pinned before worker execution. Empty in
     /// older logs; reconstructed from feature.progress rather than trusted
@@ -1893,6 +1896,10 @@ impl MissionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlCommand {
+    /// Exact invocation consent; never changes a grant or deny exception.
+    ResolvePermission {
+        resolution: crate::live_permission::Resolution,
+    },
     Pause,
     Resume,
     Msg {

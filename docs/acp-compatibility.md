@@ -3,7 +3,9 @@
 S2 has deterministic transport tests, released-source inspection and live
 native-login text/report passes for both Claude and Codex on macOS arm64. The current
 ACP backend remains an opt-in worker backend. Validator use, same-feature resume,
-client filesystem/terminal services and enforced containment remain unavailable.
+client filesystem/terminal services and enforced containment remain unavailable. The
+[one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
+and operator controls.
 
 ## Released baseline
 

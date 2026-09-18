@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-15
+last_verified: 2026-09-16
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -320,3 +320,14 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
 
 Allowlist lives at `.kranz/secret-allowlist` (one fingerprint per line, `#`
 comments); add a line only for a reviewed false positive.
+
+## ACP permission checks
+
+S4 adds live one-call consent through the existing writer and control inbox,
+without widening command grants. CLI, mutation-authenticated REST, dashboard
+and optional Slack submit the exact request/binding digest. Tests use local
+peers and disposable authority data; they do not need provider login or Keychain
+access. Fragmented stdout survives cancelled reads, and an answer waits until
+an already-started protocol frame is complete. Future messages from a cooperative
+peer cannot be predicted; this protocol check is not containment.
+See [live consent](../../acp-live-permissions.md).
