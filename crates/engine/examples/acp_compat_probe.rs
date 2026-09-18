@@ -24,6 +24,9 @@ struct Config {
     credential_env: Option<String>,
     /// Explicit opt-in to minimal native login seeding; never the child HOME.
     native_login_home: Option<PathBuf>,
+    /// Explicit operator consent for the Claude CLI to use its macOS Keychain.
+    #[serde(default)]
+    allow_keychain: bool,
     receipt: PathBuf,
 }
 
@@ -31,7 +34,12 @@ impl Config {
     fn validate(&self) -> Result<()> {
         let native = self.native_login_home.is_some();
         let valid = match self.provider.as_str() {
-            "claude" => self.credential_env.as_deref() == Some("ANTHROPIC_API_KEY") || native,
+            "claude" => {
+                matches!(
+                    self.credential_env.as_deref(),
+                    Some("ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN")
+                ) || native
+            }
             "codex" => {
                 matches!(
                     self.credential_env.as_deref(),
@@ -43,6 +51,11 @@ impl Config {
         };
         if !valid || (native && self.credential_env.is_some()) {
             bail!("provider/credential channel is unsupported by this probe");
+        }
+        if self.allow_keychain
+            && (!cfg!(target_os = "macos") || self.provider != "claude" || !native)
+        {
+            bail!("allowKeychain requires an explicit Claude native login on macOS");
         }
         if self
             .native_login_home
@@ -67,10 +80,23 @@ fn seed_native_login(
         return Ok(());
     };
     if config.provider == "claude" {
-        // File-based credentials only. Never link or query the macOS Keychain.
+        if config.allow_keychain {
+            if !source_home.join("Library/Keychains").is_dir() {
+                bail!("authorized native Keychain directory is absent");
+            }
+            kranz_engine::backend_claude::seed_worker_scratch_home(
+                private,
+                Some(source_home),
+                None,
+            )?;
+            // As with the native backend, an explicit CLAUDE_CONFIG_DIR
+            // changes the CLI's credential lookup. HOME remains disposable.
+            return Ok(());
+        }
+        // Without explicit consent, only an existing credential file is used.
         if !source_home.join(".claude/.credentials.json").is_file() {
             bail!(
-                "Claude file-based login is absent; Keychain access is not supported by this probe"
+                "Claude file-based login is absent; Keychain access requires explicit allowKeychain consent on macOS"
             );
         }
         let (_, config_dir) = kranz_engine::backend_claude::seed_worker_scratch_home(
@@ -113,6 +139,7 @@ mod native_login_tests {
             args: vec![],
             credential_env: None,
             native_login_home: Some(root.to_owned()),
+            allow_keychain: false,
             receipt: root.join("new-receipt.jsonl"),
         }
     }
@@ -126,6 +153,51 @@ mod native_login_tests {
         assert!(cfg.validate().is_err());
         cfg.credential_env = None;
         cfg.provider = "fixture".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn claude_oauth_requires_an_explicit_credential_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "claude");
+        cfg.credential_env = Some("CLAUDE_CODE_OAUTH_TOKEN".into());
+        assert!(
+            cfg.validate().is_err(),
+            "native and explicit auth must not mix"
+        );
+        cfg.native_login_home = None;
+        cfg.validate().unwrap();
+        cfg.provider = "codex".into();
+        assert!(cfg.validate().is_err());
+        cfg.provider = "claude".into();
+        cfg.credential_env = Some("ARBITRARY_SECRET".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_keychain_requires_consent_and_keeps_the_private_home() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("Library/Keychains")).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let mut cfg = config(source.path(), "claude");
+        let mut env = HashMap::new();
+        assert!(seed_native_login(&cfg, private.path(), &mut env).is_err());
+        assert!(!private.path().join("home/Library/Keychains").exists());
+        cfg.allow_keychain = true;
+        cfg.validate().unwrap();
+        seed_native_login(&cfg, private.path(), &mut env).unwrap();
+        assert_eq!(
+            std::fs::read_link(private.path().join("home/Library/Keychains")).unwrap(),
+            source.path().join("Library/Keychains")
+        );
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!env.contains_key("HOME"));
+        cfg.provider = "codex".into();
+        assert!(cfg.validate().is_err());
+        cfg.provider = "claude".into();
+        cfg.native_login_home = None;
+        cfg.credential_env = Some("ANTHROPIC_API_KEY".into());
         assert!(cfg.validate().is_err());
     }
 
@@ -199,7 +271,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file()),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
+            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -249,7 +321,7 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else { "api-key-or-fixture" },"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
         credential.as_deref(),
         &root,
     )?;

@@ -1,8 +1,7 @@
 # ACP adapter compatibility
 
-S2 is in progress. Deterministic transport tests and released-source inspection
-are available. Codex has a live native-login text/report pass on macOS arm64;
-Claude remains pending after an authentication failure. The current
+S2 has deterministic transport tests, released-source inspection and live
+native-login text/report passes for both Claude and Codex on macOS arm64. The current
 ACP backend remains an opt-in worker backend. Validator use, same-feature resume,
 client filesystem/terminal services and enforced containment remain unavailable.
 
@@ -106,9 +105,17 @@ For an explicitly authorized existing CLI login, replace `credentialEnv` with
 `"nativeLoginHome": "/absolute/operator/home"`. Codex copies only
 `.codex/auth.json` into the disposable private home; it does not copy settings,
 hooks or history, and does not start an interactive login if that state fails.
-Claude supports only an existing `.claude/.credentials.json` file through this
-probe. An absent file fails before adapter launch. The probe does not query or
-link the macOS Keychain. API-key and native-login inputs are mutually exclusive;
+Claude defaults to an existing `.claude/.credentials.json` file through this
+probe. An absent file fails before adapter launch. On macOS only, an operator who
+explicitly authorizes Keychain access can also set `"allowKeychain": true` with
+`nativeLoginHome`. This reuses the native backend's scratch-HOME recipe: only
+allowlisted credential files and a `Library/Keychains` link cross; settings,
+hooks and history do not. `CLAUDE_CONFIG_DIR` remains unset on this path so it
+does not change the CLI's credential lookup. No browser login is started by the
+probe; any required sign-in remains an operator step. Without that opt-in the
+probe does not query or link the Keychain. An explicitly supplied
+`CLAUDE_CODE_OAUTH_TOKEN` is also accepted as a `credentialEnv` channel, with
+exact-value receipt redaction. API-key/token and native-login inputs are mutually exclusive;
 neither restores ambient HOME or configures authentication for ordinary missions.
 
 ```sh
@@ -144,8 +151,9 @@ not a live provider attestation.
 A live pass establishes only the exercised authentication, basic text report and
 normal completion path for the pinned release/platform. Explicit probe injection
 does not configure ordinary missions: `backend_acp` currently has no automatic
-provider credential selection or native-state seeding. S2 remains open until
-both live receipts and that readiness limitation have been reviewed.
+provider credential selection or native-state seeding. Both live receipts and
+that readiness limitation have been reviewed for this compatibility slice;
+ordinary governed-mission acceptance remains S7 work.
 
 ## Live results (2026-09-16 UTC)
 
@@ -158,12 +166,22 @@ adapters and native runtimes for this batch.
   partial report and successful cleanup. No API key was injected. Account display
   information is removed from the public receipt; its header hashes the private
   source. Missing cost remains unavailable.
-- Claude: the initial credential/Keychain-link setup reached the adapter but
-  returned `Authentication required` after 4.8 seconds. A subsequent local
-  experiment accessed the operator's Keychain and prompted macOS approval. The
-  operator prohibited further Keychain access; that path was removed, and no
-  Claude live pass is claimed. File credentials or an explicitly supplied API key
-  remain possible future inputs. No further Claude run is scheduled.
+- Claude: [retained redacted receipt](compatibility/acp/claude-agent-acp-native-login.jsonl).
+  After the operator explicitly authorized Keychain use, the native CLI login
+  passed one prompt in 5.7 seconds: `end_turn`, the exact partial report, an
+  unchanged empty workspace, no observed tool calls and successful cleanup.
+  No fresh browser OAuth was needed. The peer reported model selection
+  `default`, mode `default` (Manual), and USD cost telemetry of 0.07431; that is
+  reported usage, not proof of an account charge. The receipt retains the peer's
+  model usage details rather than treating Kranz's configured label as selected.
 
-These results do not complete S2 or justify merging its dependent implementation
-as fully accepted. The live Claude receipt is still required.
+The initial Claude credential/Keychain-link setup reached the adapter but
+returned `Authentication required` after 4.8 seconds. A subsequent local
+experiment accessed the operator's Keychain and prompted macOS approval. The
+operator prohibited further Keychain access and that path was removed. The
+later explicit authorization applies to the retained successful test above;
+it is not a new default. No further provider run is scheduled.
+
+These receipts complete the basic live-provider proof for S2. They do not prove
+client terminal routing, live permission behavior, contained ACP execution or
+the dependent S4/S5/S6/S7 acceptance requirements.
