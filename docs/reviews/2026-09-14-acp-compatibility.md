@@ -45,9 +45,9 @@ pin the actual providers. No ordinary-mission auth defaults changed.
 
 Claude's first live attempt returned `Authentication required`. A local Keychain
 experiment prompted macOS approval; the operator directed that Keychain access
-stop. The experiment was removed. The current probe neither queries nor links
-Keychain state and refuses absent file-based Claude credentials before launch.
-S2 remains open pending Claude live proof; the Codex result is not a claim about
+stop. The experiment was removed. At this point the probe neither queried nor
+linked Keychain state and refused absent file-based Claude credentials before
+launch. S2 remained open pending Claude live proof; the Codex result is not a claim about
 Claude authentication, contained execution or production readiness.
 
 The added auth-source validation rejects ambiguous API-key/native inputs. Fake
@@ -58,3 +58,45 @@ Validation after the follow-up: all four Rust workspace gates pass (2,953 tests,
 zero failures, ten existing ignored), plus both native-file seed tests and the
 synthetic probe driver. The native change is isolated to the explicit example;
 no runtime auth policy or ordinary mission configuration changed.
+
+## Authorized Claude native-login proof (2026-09-16 UTC)
+
+The operator subsequently explicitly authorized the Keychain-backed Claude test.
+The bounded probe passed one prompt in 5,657 ms through Claude ACP 0.77.0 and
+Agent SDK 0.3.270 on macOS arm64. The native CLI login worked without fresh browser
+OAuth. The retained receipt shows the distinct engine/peer IDs, peer default model
+and Manual mode, `end_turn`, the exact partial WorkerReport, no observed tool
+events and clean completion. The probe also verified that its empty workspace
+remained empty. Reported USD cost telemetry (0.07431) is not billing evidence.
+
+- Correctness: `allowKeychain` is false by default, requires a Claude native login
+  on macOS and cannot mix with an explicit credential environment channel. Missing
+  native state fails before adapter launch. The selected auth mode and consent
+  are recorded; diagnostics do not launch a CLI or authenticate.
+- Readability: the runbook separates the earlier authentication failure from this
+  authorized pass, and distinguishes the live receipt from source inspection.
+- Architecture: only the opt-in example changes. It reuses the native Claude
+  backend's scratch-HOME seeding; ordinary ACP mission authentication and backend
+  selection remain unchanged. No new dependencies or persisted schema changes.
+- Security: the child keeps a disposable HOME and cleared environment. Explicit
+  consent allows the existing minimal credential recipe and Keychain link;
+  settings, hooks and history are not copied. The Keychain path leaves
+  `CLAUDE_CONFIG_DIR` unset so it does not redirect the CLI's native lookup.
+  Public evidence removes account display data and operator/install paths, and
+  hashes the private source, executed probe and pinned installation lock.
+- Performance: one fixed prompt, existing time/capture limits and no retries or
+  additional provider calls. New auth tests use fake files and a fake Keychain
+  directory, never real account access.
+
+Both providers now have basic native-login text/report proof. This does not prove
+live permission grants, client terminal routing, containment or full governed
+missions; those remain separate S4/S5/S6/S7 requirements. S2's implementation
+review is a self-review, not an independent audit or merge approval.
+
+Validation for this follow-up: all four Rust workspace gates pass (2,953 tests,
+zero failures, ten existing ignored), four example auth tests pass, and the
+synthetic probe confirms no-spawn diagnostics, report parsing, environment
+filtering and refusal to reuse a receipt. Knowledge refresh and staged secret
+scans pass. The first full suite found two container tests could not reach the
+stopped local Docker runtime; the complete suite passed after starting it. No
+provider call was repeated for these regression checks.
