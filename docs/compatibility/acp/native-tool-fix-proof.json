@@ -1,0 +1,191 @@
+{
+  "schemaVersion": 1,
+  "kind": "offline-corrections-after-failed-native-tool-batch",
+  "date": "2026-09-19",
+  "sourceParent": "0d41f41cb633a28d04e1ad3048522bf29980b478",
+  "sourceSha256": {
+    "crates/engine/examples/acp_compat_probe.rs": "b72d6e81f38f42af05f89fabe180e9ac3416a9e373aad375dc4bfda63d3bcac2",
+    "crates/engine/examples/acp_compat_probe/tool_fixture.rs": "a15e5fe342125481a6c4a4732c514c2114943cf6a813ff4043b894f1cd51e958",
+    "scripts/check-acp-probe.py": "9b7a41c227955dc601953e0998cfd24ff2c851b62cb01e3100810007f974adb4",
+    "scripts/check-acp-tool-probe.py": "d1319b05bbab31378c16392fafa6c3695958eb77132e675667401900bd14a422"
+  },
+  "liveAttempts": "native-tool-attempts-v1.json",
+  "additionalProviderCalls": 0,
+  "additionalVendorCredentialReads": false,
+  "keychainAccess": false,
+  "productionAdmissionEnabled": false,
+  "workspaceTests": {
+    "passed": 3041,
+    "failed": 0,
+    "ignored": 10
+  },
+  "workspaceDockerOptIns": [
+    "KRANZ_MOUNT_CONTAINER_TESTS=1",
+    "KRANZ_ACP_CONTAINER_TESTS=1",
+    "KRANZ_GATE_CONTAINER_TESTS=1"
+  ],
+  "gates": [
+    {
+      "gate": "synthetic-tool",
+      "exit": 0,
+      "seconds": 56.55
+    },
+    {
+      "gate": "vendor-image-synthetic-tool",
+      "exit": 0,
+      "seconds": 52.94
+    },
+    {
+      "gate": "report-only-regression",
+      "exit": 0,
+      "seconds": 15.69
+    },
+    {
+      "gate": "example-tests",
+      "exit": 0,
+      "seconds": 2.5
+    },
+    {
+      "gate": "workspace-tests",
+      "exit": 0,
+      "seconds": 224.25
+    },
+    {
+      "gate": "clippy",
+      "exit": 0,
+      "seconds": 1.07
+    },
+    {
+      "gate": "format",
+      "exit": 0,
+      "seconds": 1.1
+    },
+    {
+      "gate": "build",
+      "exit": 0,
+      "seconds": 0.24
+    },
+    {
+      "gate": "build-probe",
+      "exit": 0,
+      "seconds": 0.15
+    }
+  ],
+  "logSha256": {
+    "format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "example-tests.log": "ac6b76c036da346e2facc7b01567d9a7102f7b9a1e10ce5bf30a16fe7a60eca3",
+    "report-only-regression.log": "d8c6c60005a7d0f85e3d1b5f2911036a04fd6827f0bb6f83e91f39049d5f0132",
+    "clippy.log": "8c446c92f96871e1b2d7f90ce0df604d8caddcc6ea822e4153ef4b139aa5cea5",
+    "vendor-image-synthetic-tool.log": "4c2528e5edf8985b2af9819cbbeab565b22cc528918e2bb1391de91aabf0daeb",
+    "build-probe.log": "4cf86278c1e6d659943a46a3d7e3da429ac15be90f0f17742e24ef85228e7d3e",
+    "synthetic-tool.log": "16ebe84d82206428791a1f13613624503a9ca8f2d00ddcf6fe4c1e2824fa5067",
+    "workspace-tests.log": "26f0bf101a1798e16632f73ba7220623d838341b669c30267ec9cc05803d8892",
+    "build.log": "2bc683fb4e4f4f21ee9ee39e2b8ecce2efe20d3b1be57bda5316aa519ab3d30a"
+  },
+  "syntheticImages": [
+    {
+      "image": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+      "vendorInvoked": false,
+      "cases": 29,
+      "positive": 5,
+      "refused": 24,
+      "resultsSha256": "a3667d42a74aef82bead67156cd73d48b6c5daa59a55a69c6d5cfa03a9f4697f"
+    },
+    {
+      "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+      "vendorInvoked": false,
+      "cases": 29,
+      "positive": 5,
+      "refused": 24,
+      "resultsSha256": "a3667d42a74aef82bead67156cd73d48b6c5daa59a55a69c6d5cfa03a9f4697f"
+    }
+  ],
+  "claudeStartupPolicy": {
+    "environment": {
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    },
+    "testedSyntheticChannels": [
+      "native-key",
+      "native-oauth",
+      "native-file-login",
+      "contained-key",
+      "contained-oauth",
+      "contained-file-login"
+    ],
+    "sourceEvidence": {
+      "type": "static inspection of binary copied from stopped pinned-image container; no vendor executed",
+      "sdkVersion": "0.3.270",
+      "nativeBinarySha256": "7bf9f33acc124df9abccf6f2366397a82a740378d535fa12d426fa77fdbc9946",
+      "sdkModuleSha256": "ad98da1735760c234efb02a1bc6aaa3b25911a773d8334fd1a7a1e6cf46e8b31",
+      "guardPath": "Datadog initialization checks Jg(), which consults RI(); RI() tests privacy mode y(), which reads CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC.",
+      "documentation": "https://code.claude.com/docs/en/env-vars"
+    },
+    "liveEffectAfterFix": "not yet tested"
+  },
+  "retainedSyntheticFailure": {
+    "error": "The first added wire-shape case attempted /usr/bin/bash in the minimal Python image, which has no Bash.",
+    "exit": 1,
+    "logSha256": "c21e521019d53dc15dba7aa8d52941340387d515b1572bd97a14e6df50250584",
+    "correction": "Synthetic peer executes the exact fixture payload using its own /bin/sh; the protocol message retains the observed Codex wrapper.",
+    "imageChanged": false
+  },
+  "retainedMountPreflightFailure": {
+    "case": "extra-authority",
+    "adapterEvents": 0,
+    "elapsedMillis": 95494,
+    "error": "Mount preflight start timed out; cleanup was unconfirmed within its own budget. No intended permission assertion was reached.",
+    "logSha256": "b77a10973ebb4029cc847f6ef6fc99f9fa66bd423f25762490c2d5c7c4bc6788",
+    "independentSubsequentContainerInventory": [],
+    "timeoutsRelaxed": false,
+    "productionCodeChanged": false
+  },
+  "retainedStartupTestFailure": {
+    "error": "Synthetic file-login case asserted absence of an unused dummy key string embedded in its own logged peer source argv. The file-login channel does not pass that dummy value to the scrubber.",
+    "exit": 1,
+    "logSha256": "47ecff5eff8eb16b1e5d44b338e19f92c02efaa7655299b5e6fbc13db33227a6",
+    "correction": "Limit that key-redaction assertion to key/OAuth runs, matching the existing Codex fixture; private-home, source-state and startup-policy assertions still apply to file login."
+  },
+  "preparedNextBatch": {
+    "binarySha256": "8eca2bae284b63f0cac1a43353682842ad67ed6199abf26596ea5dede70f929f",
+    "configSha256": {
+      "claude": "64aeb851fa214021a4a16536a5cea74a02b29805b5a52df5789d8d553b89685d",
+      "codex": "96ed2c8c6a0c3beee57e5a09231ca6cbd76648e65d53f7d73d1fe262302e2d4e"
+    },
+    "preflightOnly": true,
+    "credentialContentsRead": false,
+    "authorization": "pending new operator approval",
+    "promptLimitPerProvider": 1,
+    "permissionLimitPerProvider": 1,
+    "promptSeconds": 120,
+    "sessionSeconds": 180,
+    "outerSeconds": 240,
+    "hardDollarCap": false,
+    "keychain": false,
+    "noRetries": true
+  },
+  "precedingLinuxCI": {
+    "head": "0d41f41cb633a28d04e1ad3048522bf29980b478",
+    "conclusion": "success",
+    "job": "https://github.com/craigcode/kranz/actions/runs/35471361270/job/105972797363",
+    "toolCases": 24,
+    "logSha256": "7aa40d7b3ff2ab30457d628c36978ae0d67e411104df06d069b56c3b6d0e7603",
+    "coversCurrentCorrections": false,
+    "qualifiesVendor": false
+  },
+  "cleanup": {
+    "independentFinalInventory": {
+      "containers": [],
+      "networks": [
+        "bridge",
+        "host",
+        "none"
+      ],
+      "volumes": []
+    },
+    "inventorySha256": "9194d38d0c0462d6c7ebb7d605b8d007ea2613f85e8f2063adc70afe9d581e86",
+    "colimaRestoredToStopped": true,
+    "stopExit": 0,
+    "statusExit": 1,
+    "statusMessage": "colima is not running"
+  }
+}

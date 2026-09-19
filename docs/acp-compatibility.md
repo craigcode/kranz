@@ -214,8 +214,8 @@ seconds. Cleanup was confirmed. The earlier attempt remains recorded as failed
 on denied egress; the successful follow-up did not broaden the allowlist or
 access Keychain. See the [contained proof record](compatibility/acp/codex-contained-plugins-disabled-proof.json)
 and [containment guide](acp-containment.md) for both receipts and the remaining
-containment, configuration-admission and mission-acceptance work. This is a basic
-report/authentication pass, not full S6 certification or Linux-host proof.
+containment, configuration-admission and mission-acceptance work. This verifies report delivery and
+authentication; full S6 certification and Linux-host proof remain open.
 
 ## Contained Claude follow-up (2026-09-19 UTC)
 
@@ -264,7 +264,11 @@ The probe accepts only an exact command proposal with one unambiguous
 unknown input fields, durable/ambiguous choices, repeated requests and action
 drift. The request and fixture decision are flushed and synced before the
 response is queued; the transport's separate `Sent` event and matching successful
-tool completion are required. This decision is attributed to the
+tool completion are required. In addition to the bare fixture command, the
+permission matcher accepts exactly `/usr/bin/bash -lc 'echo kranz-acp-tool-fixture-v1 > fixture-result.txt'`,
+the wrapper observed from pinned Codex ACP. Other legacy wrappers are accepted
+only in tool notifications, not permission requests. No shell normalization or
+prefix matching is performed. This decision is attributed to the
 operator-authorized probe fixture, not to an invented human gate actor.
 
 A pass also requires the exact report and file bytes, no extra worktree paths,
@@ -301,10 +305,26 @@ cargo build --workspace --example acp_compat_probe
 python3 scripts/check-acp-tool-probe.py /absolute/target/debug/examples/acp_compat_probe python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
 ```
 
-It runs 24 real-container cases, including positive controls, malformed or
+It runs 29 real-container cases, including positive controls, malformed or
 missing consent, unexpected commands/paths/output, tool failure and duplicate
 requests. Each refusal must match its intended reason; every case checks daemon
 absence independently. Linux CI runs this script without credentials and retains
 its log. These are synthetic fixture proofs; native vendor tool-use qualification,
 Linux vendor receipts and ordinary enforced-ACP admission remain separate work.
-See the [fixture review](reviews/2026-09-19-acp-tool-probe.md).
+See the [fixture review](reviews/2026-09-19-acp-tool-probe.md) and
+[live-attempt follow-up](reviews/2026-09-19-acp-native-tool-attempts.md).
+
+The first approved live batch at `0d41f41` failed for both providers; its
+[projected receipts](compatibility/acp/native-tool-attempts-v1.json) retain the
+failures. Claude delivered one grant and reported tool completion, then failed
+on denied Datadog telemetry before host file/commit verification. Codex's wrapped
+permission command was rejected before any grant. Both namespaces were removed.
+
+The probe now sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` before Claude
+starts, for either mode and every supported credential channel. `--check` shows
+this fixed setting without applying it; the start receipt records its application.
+This follows Claude's [documented traffic policy](https://code.claude.com/docs/en/env-vars)
+and the pinned SDK's telemetry guard. It does not add a network destination or
+ignore denied traffic. Synthetic startup peers verify delivery of the setting;
+only a separately approved new live batch can verify vendor behavior after these
+fixes. The first batch's authorization is consumed; it is never retried.

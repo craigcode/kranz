@@ -1,5 +1,8 @@
 # Bounded native-tool qualification harness
 
+Historical preparation review at `0d41f41`; the later live attempts and
+compatibility corrections are recorded in the [follow-up](2026-09-19-acp-native-tool-attempts.md).
+
 This follow-up prepares the remaining S6 live tool-use check. It adds an opt-in
 `shell-once` mode to the existing compatibility example and a deterministic
 container test script. Ordinary ACP admission, mission permission policy,

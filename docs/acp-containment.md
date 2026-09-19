@@ -250,8 +250,11 @@ Remaining S6 work is:
    tools inside the wrapper, with private authentication/state, a real worktree
    change, permission evidence and confirmed cleanup. The existing report-only
    passes do not cover this. The [one-command fixture](acp-compatibility.md#contained-one-command-qualification-fixture)
-   is prepared and checked with synthetic peers; it still needs a new bounded
-   live-call authorization and real vendor receipts.
+   has two retained failed live attempts: Claude encountered denied telemetry
+   after a delivered grant/tool completion; Codex's shell wrapper was refused
+   before consent. See the [follow-up review](reviews/2026-09-19-acp-native-tool-attempts.md).
+   Probe compatibility fixes are checked offline; a fresh bounded authorization
+   and passing live receipts remain required.
 2. Retain equivalent adapter/runtime/image/platform receipts on Linux before
    admitting that combination. Linux synthetic CI proves the wrapper boundary;
    it does not launch or qualify the vendor adapters.

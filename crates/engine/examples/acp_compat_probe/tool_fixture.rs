@@ -220,10 +220,12 @@ impl Evidence {
             .get("command")
             .and_then(Value::as_str)
             .context("missing exact shell command")?;
-        // Codex command notifications include a shell argv rendered as a string;
-        // its permission presentation strips it. Enumerate literal encodings,
-        // never parse/evaluate or strip arbitrary shell syntax to approve it.
+        // Codex's pinned adapter leaves /usr/bin/bash in permission requests
+        // even when the announcement contains the bare command. Accept only
+        // that observed wrapper at consent; legacy notification encodings
+        // remain notification-only. Never parse or strip arbitrary shell syntax.
         let matches = command == COMMAND
+            || command == format!("/usr/bin/bash -lc '{COMMAND}'")
             || (wrapped
                 && ["/bin/bash", "/bin/sh", "/bin/zsh"].iter().any(|shell| {
                     ["-c", "-lc"]

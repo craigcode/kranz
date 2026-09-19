@@ -7,6 +7,7 @@ verified_against:
   - crates/engine/examples/acp_compat_probe.rs
   - crates/engine/examples/acp_compat_probe/tool_fixture.rs
   - scripts/check-acp-tool-probe.py
+  - scripts/check-acp-probe.py
   - crates/engine/src/acp_container.rs
   - crates/engine/src/acp_container/tests.rs
   - crates/engine/src/acp_container/peer.py
@@ -66,8 +67,11 @@ compatibility probe with deterministic contained peers, without provider
 credentials or model calls. The opt-in `shell-once` fixture additionally requires
 one exact command, a synced one-time permission decision, delivery and completion
 evidence, the expected file, an unchanged primary tree and a host-created feature
-commit. Twenty-four cases include targeted refusals and independent daemon-absence
-checks; the default report-only path still refuses tools. These checks cover the direct-backend Docker proof
+commit. Twenty-nine cases include targeted refusals and independent daemon-absence
+checks, including Codex's exact observed permission wrapper and rejection of
+added commands. Synthetic Claude peers also check fixed nonessential-traffic
+suppression before initialization across key/OAuth/file-login channels. The
+default report-only path still refuses tools. These checks cover the direct-backend Docker proof
 path; ordinary enforced-ACP mission configuration remains closed pending vendor
 qualification. See [ACP containment](../../acp-containment.md).
 

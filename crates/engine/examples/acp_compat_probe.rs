@@ -29,6 +29,7 @@ const PREFIX: &str = "Protocol compatibility fixture only. Do not use any tools,
 // Keep this no-tools fixture's startup policy in its disposable home instead.
 const CODEX_STARTUP_CONFIG: &str =
     "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n";
+const CLAUDE_TRAFFIC_POLICY: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -343,6 +344,13 @@ async fn main() -> Result<()> {
     let config: Config = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     config.validate()?;
     let tool_mode = config.mode == Mode::ShellOnce;
+    // Probe-only startup policy. Keep provider telemetry off without expanding
+    // the approved egress list; any remaining denied connection still fails.
+    let claude_startup_env: HashMap<String, String> = if config.provider == "claude" {
+        HashMap::from([(CLAUDE_TRAFFIC_POLICY.into(), "1".into())])
+    } else {
+        HashMap::new()
+    };
     let prompt = if tool_mode {
         tool_fixture::prompt()
     } else {
@@ -360,7 +368,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false})
+            json!({"adapterStarted":false,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"claudeStartupEnvironment":claude_startup_env,"claudeStartupEnvironmentApplied":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -393,6 +401,7 @@ async fn main() -> Result<()> {
         std::fs::create_dir(workspace.join(".kranz"))?;
     }
     let mut env = HashMap::from([("HOME".into(), home.display().to_string())]);
+    env.extend(claude_startup_env.clone());
     seed_native_login(&config, private.path(), &mut env)?;
     if let (Some(key), Some(value)) = (&config.credential_env, &credential) {
         env.insert(key.clone(), value.clone());
@@ -450,7 +459,7 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","container":config.container,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false,"proof":if tool_mode {"contained_shell_once"} else {"basic_text_report_only"}}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","claudeStartupEnvironment":claude_startup_env,"claudeStartupEnvironmentApplied":config.provider == "claude","container":config.container,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false,"proof":if tool_mode {"contained_shell_once"} else {"basic_text_report_only"}}),
         credential.as_deref(),
         &root,
     )?;

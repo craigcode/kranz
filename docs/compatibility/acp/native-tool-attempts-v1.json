@@ -1,0 +1,413 @@
+{
+  "schemaVersion": 1,
+  "kind": "failed-live-native-tool-batch",
+  "date": "2026-09-19",
+  "sourceCommit": "0d41f41cb633a28d04e1ad3048522bf29980b478",
+  "host": "macOS arm64 / Colima Linux arm64",
+  "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "adapterVersions": {
+    "claudeACP": "0.77.0",
+    "claudeAgentSDK": "0.3.270",
+    "codexACP": "1.11.0",
+    "codexCLI": "0.153.4"
+  },
+  "acpPrompts": 2,
+  "underlyingProviderRequests": "not independently counted",
+  "retryAttempted": false,
+  "keychainAccessed": false,
+  "allowlistExpanded": false,
+  "productionReadinessProven": false,
+  "toolFixtureProven": false,
+  "projection": {
+    "description": "Selected fields from private probe receipts, in original event order. Not a complete transcript.",
+    "omitted": [
+      "text chunks",
+      "available commands",
+      "account/quota/rate-limit metadata",
+      "unrelated session metadata",
+      "duplicate wire permission envelope",
+      "tool display content and vendor metadata"
+    ],
+    "paths": "Private probe roots were already replaced by [PROBE_ROOT] in the original receipts.",
+    "digests": "Permission digests describe the original action/options before path scrubbing; the projected action is not a digest preimage."
+  },
+  "attempts": [
+    {
+      "provider": "claude",
+      "authorization": {
+        "startedAt": "2026-09-19T22:59:44.885625+00:00",
+        "provider": "claude",
+        "promptLimit": 1,
+        "permissionLimit": 1,
+        "promptSeconds": 120,
+        "sessionSeconds": 180,
+        "outerSeconds": 240,
+        "hardDollarCap": false,
+        "keychain": false,
+        "binarySha256": "a58317b1d3e1e26e02442ad01e68d5f0f1378cf3d5a2b2f11da02759987b12f0",
+        "configSha256": "d17d90987e680f61115f7d1d4b74baca45968c9c82b05b17e4d19e9c3ff1ddb7"
+      },
+      "privateReceiptSha256": "c9f5f66177e501b9d531f68f0ee51245209e730d5ef6b3135ac67d9c1c3d86fd",
+      "privateReceiptRows": 48,
+      "projectedRows": 12,
+      "permissionRequests": 1,
+      "permissionGrants": 1,
+      "hostFileVerificationReached": false,
+      "hostFeatureCommitCreated": false,
+      "adapterReportedCostUsd": 0.063802,
+      "costNote": "Adapter-reported amount, not a hard cap or billing verification.",
+      "timeline": [
+        {
+          "sourceIndex": 0,
+          "event": "probe.started",
+          "provider": "claude",
+          "authentication": "explicit-oauth-token",
+          "keychainAuthorized": false,
+          "program": "/usr/local/bin/node",
+          "environmentKeys": [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "HOME",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "LANG",
+            "NO_PROXY",
+            "PATH",
+            "TMPDIR"
+          ],
+          "codexStartupConfig": null,
+          "codexStartupConfigWritten": false,
+          "container": {
+            "egress": [
+              "api.anthropic.com:443",
+              "claude.ai:443"
+            ],
+            "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743"
+          },
+          "mode": "shell-once",
+          "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+          "permissionLimit": 1,
+          "promptLimit": 1,
+          "promptSeconds": 120,
+          "overallSeconds": 180,
+          "hostGitOutsideSessionBudget": true,
+          "hardDollarCap": false
+        },
+        {
+          "sourceIndex": 12,
+          "event": "tool",
+          "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC",
+            "kind": "execute",
+            "status": "pending",
+            "rawInput": {}
+          }
+        },
+        {
+          "sourceIndex": 13,
+          "event": "other",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC",
+            "kind": "execute",
+            "rawInput": {
+              "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt"
+            }
+          }
+        },
+        {
+          "sourceIndex": 14,
+          "event": "other",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC",
+            "kind": "execute",
+            "rawInput": {
+              "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+              "description": "Write fixture string to fixture-result.txt"
+            }
+          }
+        },
+        {
+          "sourceIndex": 15,
+          "event": "permission.requested",
+          "proposal": {
+            "action": {
+              "content": [
+                {
+                  "content": {
+                    "text": "Write fixture string to fixture-result.txt",
+                    "type": "text"
+                  },
+                  "type": "content"
+                }
+              ],
+              "kind": "execute",
+              "locations": [
+                {
+                  "path": "[PROBE_ROOT]/workspace/fixture-result.txt"
+                }
+              ],
+              "name": "Bash",
+              "rawInput": {
+                "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+                "description": "Write fixture string to fixture-result.txt"
+              },
+              "status": "pending",
+              "title": "Write fixture string to fixture-result.txt",
+              "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC"
+            },
+            "actionDigest": "c83184d733194ca2f3f1ca36bcfbf90ab26e1c22316a5f3e9c8193011a98a321",
+            "deadline": "2026-09-19T23:04:58.406170Z",
+            "engineSessionId": "acp-probe-08d842b5-71f1-40d7-83cf-a40b7dcd560a",
+            "id": "permission-38d609be-9294-40cf-9c0f-bf32e9c6137a",
+            "observedAt": "2026-09-19T22:59:58.406170Z",
+            "options": [
+              {
+                "kind": "allow_once",
+                "name": "Yes",
+                "optionId": "allow-once"
+              },
+              {
+                "kind": "allow_always",
+                "name": "Yes, and allow access to workspace/ and echo kranz-acp-tool-fixture-v1 * commands",
+                "optionId": "allow-with-updates"
+              },
+              {
+                "kind": "reject_once",
+                "name": "No",
+                "optionId": "reject"
+              }
+            ],
+            "optionsDigest": "a64c9dfbdeb77320948be4d8d59a8b30da287fae34ad2556de04de5379919356",
+            "peerRequestId": 0,
+            "peerSessionId": "c8d95b65-03d8-4ece-ab7c-7b7c1699dab8",
+            "prohibition": null,
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC"
+          }
+        },
+        {
+          "sourceIndex": 16,
+          "event": "permission.resolved",
+          "actionDigest": "c83184d733194ca2f3f1ca36bcfbf90ab26e1c22316a5f3e9c8193011a98a321",
+          "actor": "operator-authorized-probe-fixture",
+          "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+          "decision": "allow_once",
+          "optionId": "allow-once",
+          "optionsDigest": "a64c9dfbdeb77320948be4d8d59a8b30da287fae34ad2556de04de5379919356",
+          "requestId": "permission-38d609be-9294-40cf-9c0f-bf32e9c6137a"
+        },
+        {
+          "sourceIndex": 18,
+          "event": "permission.responded",
+          "requestId": "permission-38d609be-9294-40cf-9c0f-bf32e9c6137a",
+          "delivery": "sent"
+        },
+        {
+          "sourceIndex": 19,
+          "event": "other",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC"
+          }
+        },
+        {
+          "sourceIndex": 20,
+          "event": "tool",
+          "update": {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_01734HwRehVNB7cZUwy83ALC",
+            "status": "completed",
+            "rawOutput": "(Bash completed with no output)"
+          }
+        },
+        {
+          "sourceIndex": 45,
+          "event": "result",
+          "adapterReportedCostUsd": 0.063802,
+          "isError": false,
+          "stopReason": "end_turn"
+        },
+        {
+          "sourceIndex": 46,
+          "event": "probe.egress.denied",
+          "denials": [
+            {
+              "host": "http-intake.logs.us5.datadoghq.com",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "sourceIndex": 47,
+          "event": "probe.finished",
+          "capturedBytes": 41735,
+          "containedSession": true,
+          "containmentProven": false,
+          "elapsedMillis": 15344,
+          "error": "container proof encountered denied egress; no allowlist expansion was attempted",
+          "events": 44,
+          "passed": false,
+          "productionReadinessProven": false,
+          "toolFixtureProven": false
+        }
+      ]
+    },
+    {
+      "provider": "codex",
+      "authorization": {
+        "startedAt": "2026-09-19T23:00:22.847948+00:00",
+        "provider": "codex",
+        "promptLimit": 1,
+        "permissionLimit": 1,
+        "promptSeconds": 120,
+        "sessionSeconds": 180,
+        "outerSeconds": 240,
+        "hardDollarCap": false,
+        "keychain": false,
+        "binarySha256": "a58317b1d3e1e26e02442ad01e68d5f0f1378cf3d5a2b2f11da02759987b12f0",
+        "configSha256": "c1cf4c269692587002b88616a5d28618ae969570cbeb4da4140f719e5d69f482"
+      },
+      "privateReceiptSha256": "c197ab2d352fe80f2471722ca920e4d023972188e197834bc0986e76f203a0c8",
+      "privateReceiptRows": 23,
+      "projectedRows": 5,
+      "permissionRequests": 1,
+      "permissionGrants": 0,
+      "hostFileVerificationReached": false,
+      "hostFeatureCommitCreated": false,
+      "adapterReportedCostUsd": null,
+      "costNote": "No cost was reported before abort; this does not mean zero cost.",
+      "timeline": [
+        {
+          "sourceIndex": 0,
+          "event": "probe.started",
+          "provider": "codex",
+          "authentication": "existing-cli-login",
+          "keychainAuthorized": false,
+          "program": "/opt/acp/node_modules/.bin/codex-acp",
+          "environmentKeys": [
+            "CODEX_HOME",
+            "HOME",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "INITIAL_AGENT_MODE",
+            "LANG",
+            "NO_BROWSER",
+            "NO_PROXY",
+            "PATH",
+            "TMPDIR"
+          ],
+          "codexStartupConfig": "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n",
+          "codexStartupConfigWritten": true,
+          "container": {
+            "egress": [
+              "chatgpt.com:443",
+              "auth.openai.com:443",
+              "api.openai.com:443"
+            ],
+            "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743"
+          },
+          "mode": "shell-once",
+          "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+          "permissionLimit": 1,
+          "promptLimit": 1,
+          "promptSeconds": 120,
+          "overallSeconds": 180,
+          "hostGitOutsideSessionBudget": true,
+          "hardDollarCap": false
+        },
+        {
+          "sourceIndex": 19,
+          "event": "tool",
+          "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "exec-5e340444-0280-49fc-8e8d-44048cef586b",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {
+              "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+              "cwd": "[PROBE_ROOT]/workspace"
+            }
+          }
+        },
+        {
+          "sourceIndex": 20,
+          "event": "permission.requested",
+          "proposal": {
+            "action": {
+              "kind": "execute",
+              "rawInput": {
+                "command": "/usr/bin/bash -lc 'echo kranz-acp-tool-fixture-v1 > fixture-result.txt'",
+                "cwd": "[PROBE_ROOT]/workspace"
+              },
+              "status": "pending",
+              "title": "Run command",
+              "toolCallId": "exec-5e340444-0280-49fc-8e8d-44048cef586b"
+            },
+            "actionDigest": "0d30537446cb2ac4160d43cd97325c6f0aeda7c44728ef4976bd96e6e1470262",
+            "deadline": "2026-09-19T23:05:33.455883Z",
+            "engineSessionId": "acp-probe-6121697f-61b0-475d-a763-90cb475bc8cc",
+            "id": "permission-2e25727f-348b-4221-abc6-88756d4e0bee",
+            "observedAt": "2026-09-19T23:00:33.455883Z",
+            "options": [
+              {
+                "kind": "allow_once",
+                "name": "Yes, proceed",
+                "optionId": "allow_once"
+              },
+              {
+                "kind": "allow_always",
+                "name": "Yes, and don't ask again for commands that start with `echo kranz-acp-tool-fixture-v1 > fixture-result.txt`",
+                "optionId": "accept_execpolicy_amendment"
+              },
+              {
+                "kind": "reject_once",
+                "name": "No, and tell Codex what to do differently",
+                "optionId": "cancel"
+              }
+            ],
+            "optionsDigest": "e50aea5ca0e575c70e4a320b520139b4ef3e9a2b22f138c8919bb63dae31e0e1",
+            "peerRequestId": 0,
+            "peerSessionId": "01a0bbe6-478c-73c1-9e41-bd8578d19b7e",
+            "prohibition": null,
+            "toolCallId": "exec-5e340444-0280-49fc-8e8d-44048cef586b"
+          }
+        },
+        {
+          "sourceIndex": 21,
+          "event": "probe.abort",
+          "error": null,
+          "returnedOk": true,
+          "sessionExit": "aborted"
+        },
+        {
+          "sourceIndex": 22,
+          "event": "probe.finished",
+          "capturedBytes": 20191,
+          "containedSession": true,
+          "containmentProven": false,
+          "elapsedMillis": 10732,
+          "error": "command differs from the authorized fixture",
+          "events": 20,
+          "passed": false,
+          "productionReadinessProven": false,
+          "toolFixtureProven": false
+        }
+      ]
+    }
+  ],
+  "cleanup": {
+    "independentFinalDaemonInventory": {
+      "containers": [],
+      "networks": [
+        "bridge",
+        "host",
+        "none"
+      ],
+      "volumes": []
+    },
+    "inventorySha256": "9194d38d0c0462d6c7ebb7d605b8d007ea2613f85e8f2063adc70afe9d581e86",
+    "containersAbsent": true,
+    "relayNetworksAbsent": true
+  }
+}

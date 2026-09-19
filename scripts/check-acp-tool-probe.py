@@ -28,6 +28,8 @@ def request(number=10):
 def deliver():
  if mode == 'wrong-output': Path('fixture-result.txt').write_text('wrong\n')
  elif mode == 'symlink': Path('fixture-result.txt').symlink_to('README')
+ # Test the adapter's wire encoding; the minimal Python image has no Bash.
+ # The synthetic peer always executes the authorized payload with its own sh.
  else: subprocess.run(['/bin/sh','-c',command],check=True)
  if mode == 'extra-file': Path('extra').write_text('unauthorized')
  if mode == 'primary-change':
@@ -71,6 +73,12 @@ for line in sys.stdin:
    if mode == 'wrapped-command': announced['rawInput']={'command':"/bin/bash -lc '"+command+"'",'cwd':str(Path.cwd())}
    if mode == 'streamed-input': announced['rawInput']={}
    update(announced)
+   if mode in ('codex-permission-wrapper', 'wrapped-inner-command', 'wrapped-outer-command', 'wrapped-shell', 'wrapped-permission-cwd'):
+    tool['rawInput']['command']="/usr/bin/bash -lc '"+command+"'"
+   if mode == 'wrapped-inner-command': tool['rawInput']['command']="/usr/bin/bash -lc '"+command+"; echo extra'"
+   if mode == 'wrapped-outer-command': tool['rawInput']['command'] += '; echo extra'
+   if mode == 'wrapped-shell': tool['rawInput']['command']="/usr/bin/env bash -lc '"+command+"'"
+   if mode == 'wrapped-permission-cwd': tool['rawInput']['cwd']='/tmp'
    if mode == 'permission-command': tool['rawInput']['command'] += '; echo extra'
    if mode == 'permission-cwd': tool['rawInput']['cwd']='/tmp'
    request()
@@ -87,8 +95,10 @@ for line in sys.stdin:
  else: raise AssertionError(method)
 '''
 (root / "peer.py").write_text(peer)
-cases = ["pass", "wrapped-command", "streamed-input", "primary-change", "permission-command", "permission-cwd", "wrong-command", "wrong-cwd", "extra-authority", "ambiguous-once", "durable-only", "option-extension", "early-write", "no-permission", "report-only", "wrong-output", "symlink", "extra-file", "tool-failed", "nonzero-exit", "repeat-request", "drift", "wrong-tool-id", "default-report"]
+cases = ["codex-permission-wrapper", "wrapped-inner-command", "wrapped-outer-command", "wrapped-shell", "wrapped-permission-cwd", "pass", "wrapped-command", "streamed-input", "primary-change", "permission-command", "permission-cwd", "wrong-command", "wrong-cwd", "extra-authority", "ambiguous-once", "durable-only", "option-extension", "early-write", "no-permission", "report-only", "wrong-output", "symlink", "extra-file", "tool-failed", "nonzero-exit", "repeat-request", "drift", "wrong-tool-id", "default-report"]
 errors = {
+    "wrapped-inner-command": "command differs", "wrapped-outer-command": "command differs",
+    "wrapped-shell": "command differs", "wrapped-permission-cwd": "unsupported tool input field: cwd",
     "default-report": "tool activity invalidates this no-tools fixture",
     "wrong-command": "command differs", "permission-command": "command differs",
     "wrong-cwd": "unsupported tool input field: cwd", "permission-cwd": "unsupported tool input field: cwd",
@@ -130,7 +140,7 @@ for mode in cases:
         assert time.monotonic() < deadline, f"{mode}: container cleanup unconfirmed"
         time.sleep(0.1)
     rows = [json.loads(line) for line in receipt.read_text().splitlines()]
-    expected = mode in ("pass", "wrapped-command", "streamed-input", "primary-change")
+    expected = mode in ("codex-permission-wrapper", "pass", "wrapped-command", "streamed-input", "primary-change")
     assert (run.returncode == 0) == expected, (mode, run.returncode, run.stderr, rows[-1])
     assert rows[-1]["event"] == "probe.finished" and rows[-1]["passed"] == expected
     assert rows[-1]["toolFixtureProven"] == expected and not rows[-1]["productionReadinessProven"]
@@ -142,6 +152,8 @@ for mode in cases:
         assert delivered["featureCommits"] == 1 and delivered["primaryUnchanged"]
         assert delivered["commit"] != delivered["base"] and not delivered["missionCompletionProven"]
     else:
+        if mode in ("wrapped-inner-command", "wrapped-outer-command", "wrapped-shell", "wrapped-permission-cwd"):
+            assert not any(row["event"] == "permission.resolved" for row in rows)
         assert errors[mode] in rows[-1]["error"], (mode, rows[-1])
         assert not any(row["event"] == "probe.tool.deliverable" for row in rows)
     results.append(dict(case=mode, expectedPass=expected, exit=run.returncode, error=rows[-1]["error"]))
