@@ -249,8 +249,9 @@ Remaining S6 work is:
 1. Qualify the pinned Claude and Codex adapters while actually using their native
    tools inside the wrapper, with private authentication/state, a real worktree
    change, permission evidence and confirmed cleanup. The existing report-only
-   passes do not cover this. Prepare a bounded workload before requesting a new
-   live-call authorization.
+   passes do not cover this. The [one-command fixture](acp-compatibility.md#contained-one-command-qualification-fixture)
+   is prepared and checked with synthetic peers; it still needs a new bounded
+   live-call authorization and real vendor receipts.
 2. Retain equivalent adapter/runtime/image/platform receipts on Linux before
    admitting that combination. Linux synthetic CI proves the wrapper boundary;
    it does not launch or qualify the vendor adapters.

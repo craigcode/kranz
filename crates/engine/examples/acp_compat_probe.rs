@@ -12,6 +12,17 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[path = "acp_compat_probe/tool_fixture.rs"]
+mod tool_fixture;
+
+#[derive(Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum Mode {
+    #[default]
+    ReportOnly,
+    ShellOnce,
+}
+
 const REPORT: &str = r#"{"result":"partial","summary":"kranz-acp-live-fixture-v1","filesTouched":[],"testsAdded":[],"dependenciesAdded":[],"knownGaps":["Protocol fixture only; no feature implemented or mission completion claimed."],"commits":[],"commandsRun":[],"escalation":null,"questions":[]}"#;
 const PREFIX: &str = "Protocol compatibility fixture only. Do not use any tools, read files, change files, call the network, create commits, or carry out another task. Return exactly this JSON object as the final assistant message, without Markdown fences:\n";
 // App-server performs plugin warmups before session-level configuration arrives.
@@ -23,6 +34,8 @@ const CODEX_STARTUP_CONFIG: &str =
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Config {
     provider: String,
+    #[serde(default)]
+    mode: Mode,
     program: PathBuf,
     args: Vec<String>,
     credential_env: Option<String>,
@@ -45,6 +58,9 @@ struct Container {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        if self.mode == Mode::ShellOnce && self.container.is_none() {
+            bail!("shell-once requires an enforced pinned container");
+        }
         let native = self.native_login_home.is_some();
         let valid = match self.provider.as_str() {
             "claude" => {
@@ -175,6 +191,7 @@ mod native_login_tests {
     fn config(root: &std::path::Path, provider: &str) -> Config {
         Config {
             provider: provider.into(),
+            mode: Mode::ReportOnly,
             program: std::env::current_exe().unwrap(),
             args: vec![],
             credential_env: None,
@@ -313,6 +330,7 @@ fn append_receipt(
     let _: Value = serde_json::from_str(&text).context("receipt redaction damaged JSON")?;
     writeln!(file, "{text}")?;
     file.flush()?;
+    file.sync_data()?;
     Ok(())
 }
 
@@ -324,6 +342,17 @@ async fn main() -> Result<()> {
     }
     let config: Config = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     config.validate()?;
+    let tool_mode = config.mode == Mode::ShellOnce;
+    let prompt = if tool_mode {
+        tool_fixture::prompt()
+    } else {
+        format!("{PREFIX}{REPORT}")
+    };
+    let expected_report = if tool_mode {
+        tool_fixture::REPORT
+    } else {
+        REPORT
+    };
     let credential_present = config
         .credential_env
         .as_ref()
@@ -331,7 +360,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
+            json!({"adapterStarted":false,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -351,9 +380,14 @@ async fn main() -> Result<()> {
     let root = private.path().display().to_string();
     let workspace = private.path().join("workspace");
     let home = private.path().join("home");
-    std::fs::create_dir(&workspace)?;
+    let tool_workspace = if tool_mode {
+        Some(tool_fixture::Workspace::prepare(private.path()).await?)
+    } else {
+        std::fs::create_dir(&workspace)?;
+        None
+    };
     std::fs::create_dir(&home)?;
-    if config.container.is_some() {
+    if config.container.is_some() && !tool_mode {
         // Docker needs a mountpoint for the existing read-only authority mask.
         // Include it in the initial fixture, then require it to remain empty.
         std::fs::create_dir(workspace.join(".kranz"))?;
@@ -416,14 +450,14 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","container":config.container,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","container":config.container,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false,"proof":if tool_mode {"contained_shell_once"} else {"basic_text_report_only"}}),
         credential.as_deref(),
         &root,
     )?;
     let paths = kranz_engine::paths::MissionPaths::new(private.path(), "m-acp-probe");
     let mut spec = SessionSpec {
         cwd: workspace.clone(),
-        prompt: PromptMode::SingleShot(format!("{PREFIX}{REPORT}")),
+        prompt: PromptMode::SingleShot(prompt),
         append_system_prompt: None,
         model: "unselected-probe".into(),
         effort: String::new(),
@@ -431,22 +465,26 @@ async fn main() -> Result<()> {
         resume: None,
         permission_mode: None,
         allowed_tools: vec![],
-        disallowed_tools: [
-            "Bash",
-            "Read",
-            "Write",
-            "Edit",
-            "NotebookEdit",
-            "Glob",
-            "Grep",
-            "WebSearch",
-            "WebFetch",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
+        disallowed_tools: if tool_mode {
+            vec![]
+        } else {
+            [
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "Glob",
+                "Grep",
+                "WebSearch",
+                "WebFetch",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        },
         tools: vec![],
-        writable: false,
+        writable: tool_mode,
         settings_json: None,
         json_schema: None,
         max_budget_usd: None,
@@ -476,24 +514,41 @@ async fn main() -> Result<()> {
     };
     let mut events = 0usize;
     let mut captured_bytes = 0usize;
+    let mut evidence = tool_fixture::Evidence::default();
     let run = async {
         let boundary =
             kranz_engine::egress_proxy::maybe_start_for_session(&mut spec, &paths).await?;
         let mut session = AcpBackend::new(&config.program, config.args.clone())
             .start(spec)
             .await?;
+        let responder = session.permission_responder();
         let mut final_text = None;
         let turn = async {
             while let Some(event) = session.next_event().await? {
                 events += 1;
-                let (kind, raw, tool, result) = match event {
-                    AgentEvent::Init { raw, .. } => ("init", raw, false, None),
-                    AgentEvent::Text { raw, .. } => ("text", raw, false, None),
-                    AgentEvent::Other { raw } => ("other", raw, false, None),
-                    AgentEvent::ToolUse { raw, .. }
-                    | AgentEvent::ToolResult { raw, .. }
-                    | AgentEvent::PermissionRequested { raw, .. }
-                    | AgentEvent::PermissionResponded { raw, .. } => ("tool", raw, true, None),
+                let (kind, raw, tool, result) = match &event {
+                    AgentEvent::Init { raw, .. } => ("init", raw.clone(), false, None),
+                    AgentEvent::Text { raw, .. } => ("text", raw.clone(), false, None),
+                    AgentEvent::Other { raw } => ("other", raw.clone(), false, None),
+                    AgentEvent::ToolUse { raw, .. } | AgentEvent::ToolResult { raw, .. } => {
+                        ("tool", raw.clone(), true, None)
+                    }
+                    AgentEvent::PermissionRequested { proposal, raw } => (
+                        "permission.requested",
+                        json!({"proposal":proposal,"raw":raw}),
+                        true,
+                        None,
+                    ),
+                    AgentEvent::PermissionResponded {
+                        request_id,
+                        delivery,
+                        raw,
+                    } => (
+                        "permission.responded",
+                        json!({"requestId":request_id,"delivery":delivery,"raw":raw}),
+                        true,
+                        None,
+                    ),
                     AgentEvent::Result {
                         text,
                         is_error,
@@ -504,7 +559,7 @@ async fn main() -> Result<()> {
                         "result",
                         json!({"raw":raw,"costUsd":cost_usd,"isError":is_error}),
                         false,
-                        Some((text, is_error)),
+                        Some((text.clone(), *is_error)),
                     ),
                 };
                 captured_bytes += serde_json::to_vec(&raw)?.len();
@@ -517,8 +572,27 @@ async fn main() -> Result<()> {
                     credential.as_deref(),
                     &root,
                 )?;
-                if tool {
+                if tool && !tool_mode {
                     bail!("tool activity invalidates this no-tools fixture");
+                }
+                if let Some(fixture) = &tool_workspace {
+                    if let AgentEvent::PermissionRequested { proposal, .. } = &event {
+                        fixture.verify(false)?;
+                        let option = evidence.authorize(proposal, &workspace)?;
+                        // This is a pre-authorized fixture decision, never a
+                        // fabricated human gate. Sync the receipt before send.
+                        append_receipt(
+                            &mut receipt,
+                            json!({"event":"permission.resolved","requestId":proposal.id,"actionDigest":proposal.action_digest,"optionsDigest":proposal.options_digest,"optionId":option,"decision":"allow_once","actor":"operator-authorized-probe-fixture","command":tool_fixture::COMMAND}),
+                            credential.as_deref(),
+                            &root,
+                        )?;
+                        responder
+                            .as_ref()
+                            .context("backend has no permission responder")?
+                            .respond(proposal, true)?;
+                    }
+                    evidence.observe(&event, &workspace)?;
                 }
                 if let Some((text, is_error)) = result {
                     if is_error {
@@ -530,10 +604,19 @@ async fn main() -> Result<()> {
             Result::<()>::Ok(())
         };
         let turn_result = tokio::time::timeout(Duration::from_secs(120), turn).await;
-        if !matches!(turn_result, Ok(Ok(()))) {
-            let _ = session.abort().await;
+        let abort_result = if !matches!(turn_result, Ok(Ok(()))) {
+            Some(session.abort().await)
+        } else {
+            None
+        };
+        if let Some(result) = &abort_result {
+            append_receipt(
+                &mut receipt,
+                json!({"event":"probe.abort","returnedOk":result.is_ok(),"sessionExit":session.exit_status(),"error":result.as_ref().err().map(ToString::to_string)}),
+                credential.as_deref(),
+                &root,
+            )?;
         }
-        turn_result.context("prompt exceeded 120 seconds")??;
         if let Some(boundary) = boundary {
             let denials = boundary.shutdown().await?;
             if !denials.is_empty() {
@@ -546,6 +629,7 @@ async fn main() -> Result<()> {
                 bail!("container proof encountered denied egress; no allowlist expansion was attempted");
             }
         }
+        turn_result.context("prompt exceeded 120 seconds")??;
         if session.exit_status() != Some(SessionExit::Completed) {
             bail!(
                 "adapter did not complete cleanly: {:?}",
@@ -554,10 +638,20 @@ async fn main() -> Result<()> {
         }
         let text = final_text.context("no terminal report")?;
         let report = parse_worker_report(&text).context("engine did not parse WorkerReport")?;
-        if serde_json::from_str::<Value>(&text)? != serde_json::from_str::<Value>(REPORT)?
-            || report.summary != "kranz-acp-live-fixture-v1"
+        if serde_json::from_str::<Value>(&text)? != serde_json::from_str::<Value>(expected_report)?
+            || report.summary
+                != if tool_mode {
+                    "kranz-acp-tool-fixture-v1"
+                } else {
+                    "kranz-acp-live-fixture-v1"
+                }
         {
             bail!("report differs from the fixed fixture");
+        }
+        if let Some(fixture) = &tool_workspace {
+            evidence.finish()?;
+            fixture.verify(true)?;
+            return Result::<()>::Ok(());
         }
         let changes: Vec<_> = std::fs::read_dir(&workspace)?
             .take(16)
@@ -577,13 +671,20 @@ async fn main() -> Result<()> {
         }
         Result::<()>::Ok(())
     };
-    let result = tokio::time::timeout(Duration::from_secs(180), run)
+    let mut result = tokio::time::timeout(Duration::from_secs(180), run)
         .await
         .context("session exceeded 180 seconds")
         .and_then(|result| result);
+    if result.is_ok() {
+        if let Some(fixture) = &tool_workspace {
+            result = fixture.commit().and_then(|value| {
+                append_receipt(&mut receipt, value, credential.as_deref(), &root)
+            });
+        }
+    }
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.finished","passed":result.is_ok(),"elapsedMillis":started.elapsed().as_millis(),"events":events,"capturedBytes":captured_bytes,"error":result.as_ref().err().map(|error|format!("{error:#}")),"containedSession":config.container.is_some(),"productionReadinessProven":false,"containmentProven":false}),
+        json!({"event":"probe.finished","passed":result.is_ok(),"elapsedMillis":started.elapsed().as_millis(),"events":events,"capturedBytes":captured_bytes,"error":result.as_ref().err().map(|error|format!("{error:#}")),"containedSession":config.container.is_some(),"toolFixtureProven":tool_mode && result.is_ok(),"productionReadinessProven":false,"containmentProven":false}),
         credential.as_deref(),
         &root,
     )?;
@@ -591,7 +692,7 @@ async fn main() -> Result<()> {
         bail!("probe failed; see the redacted receipt (no retry was attempted)");
     }
     println!(
-        "Basic ACP report probe passed; production readiness and containment certification remain separate."
+        "ACP compatibility fixture passed; production readiness and containment certification remain separate."
     );
     Ok(())
 }

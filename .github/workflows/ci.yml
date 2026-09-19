@@ -504,6 +504,15 @@ jobs:
           cargo test --workspace --example acp_compat_probe
           cargo build --workspace --example acp_compat_probe
           python3 scripts/check-acp-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+      - name: Check bounded tool-use probe with contained synthetic peers
+        run: |
+          log="$RUNNER_TEMP/kranz-acp-tool-proof.log"
+          set +e
+          python3 scripts/check-acp-tool-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          exit "$status"
       - name: Retain synthetic container proof logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -112,7 +112,7 @@ of `CODEX_API_KEY` or `OPENAI_API_KEY`. The probe supplies a non-secret
 Before starting either Codex authentication path, the probe writes its own
 `CODEX_HOME/config.toml` with file-only credential storage and both `plugins`
 and `remote_plugin` disabled. These startup settings suppress plugin warmups
-outside this no-tools fixture; session-level settings arrive too late. This
+outside the bounded fixture; session-level settings arrive too late. This
 policy is specific to the compatibility probe, not ordinary missions. The
 preflight and start receipt include the exact TOML as `codexStartupConfig`;
 `codexStartupConfigWritten` distinguishes the preview from a completed write.
@@ -244,3 +244,67 @@ This closes the basic Claude contained report/authentication check. The
 [mount-helper cleanup follow-up](reviews/2026-09-19-mount-helper-cleanup.md)
 addresses the separate preflight lifetime gap. Broader containment qualification,
 production admission and S7 mission acceptance remain open.
+
+## Contained one-command qualification fixture
+
+`"mode": "shell-once"` is an explicit opt-in to the next S6 probe. Omitting `mode`
+keeps `report-only`, which still refuses tool activity. Tool mode requires the
+pinned Docker wrapper; it cannot run natively or use macOS Keychain. `--check`
+prints the complete fixed prompt, command, one-permission limit and session
+bounds without opening credentials, starting an adapter or creating a receipt.
+
+The workload is exactly one native shell invocation, in the disposable worktree:
+
+```sh
+echo kranz-acp-tool-fixture-v1 > fixture-result.txt
+```
+
+The probe accepts only an exact command proposal with one unambiguous
+`allow_once` option. It rejects a different working directory, extra authority,
+unknown input fields, durable/ambiguous choices, repeated requests and action
+drift. The request and fixture decision are flushed and synced before the
+response is queued; the transport's separate `Sent` event and matching successful
+tool completion are required. This decision is attributed to the
+operator-authorized probe fixture, not to an invented human gate actor.
+
+A pass also requires the exact report and file bytes, no extra worktree paths,
+unchanged primary source/configuration/index/base ref, clean session shutdown and
+no denied egress. Only after shutdown does the host use hardened Git to commit
+the one expected file. The receipt must show one feature commit on the fixture
+branch; the primary branch remains at its base. This is a host checkpoint of a
+synthetic deliverable, not a completed mission or a human merge.
+
+Pinned Codex ACP 1.11.0 calls its initial mode `read-only`, but that preset uses
+`workspaceWrite` and `on-request`; it does not request permission for every
+workspace command. See its [mode definition](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts)
+and [shell approval tests](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/__tests__/CodexACPAgent/e2e/acp-e2e-shell-approval.test.ts).
+The fixture therefore asks for explicit escalation with no prefix rule and
+fails if consent evidence is missing. A successful cooperative permission
+exchange does not prove that every native command must use that exchange;
+the Docker boundary remains the enforcement mechanism.
+
+The fixed prompt allows one invocation and no retry. It keeps the 120-second
+prompt and 180-second session bounds, 512-event / 2 MiB capture limits, and no
+hard dollar cap. Local Git preparation/checkpoint verification is outside the
+session timer (reported by `hostGitOutsideSessionBudget`); use a 240-second outer
+process deadline for the whole attempt, retaining its timeout/failure receipt.
+One ACP prompt is not a verified count of underlying provider API requests.
+The earlier report-only authorizations do not authorize this different workload.
+Authorize the reviewed one-Claude/one-Codex batch before accessing credentials or
+running either vendor. Keep each attempt's new receipt and never auto-retry,
+expand egress, switch modes or broaden the allowed command to obtain a pass.
+
+Run the provider-free harness check with an installed pinned Python image:
+
+```sh
+cargo build --workspace --example acp_compat_probe
+python3 scripts/check-acp-tool-probe.py /absolute/target/debug/examples/acp_compat_probe python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+```
+
+It runs 24 real-container cases, including positive controls, malformed or
+missing consent, unexpected commands/paths/output, tool failure and duplicate
+requests. Each refusal must match its intended reason; every case checks daemon
+absence independently. Linux CI runs this script without credentials and retains
+its log. These are synthetic fixture proofs; native vendor tool-use qualification,
+Linux vendor receipts and ordinary enforced-ACP admission remain separate work.
+See the [fixture review](reviews/2026-09-19-acp-tool-probe.md).

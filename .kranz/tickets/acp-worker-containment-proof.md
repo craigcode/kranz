@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime and pinned-image fixtures implemented; basic contained Codex and Claude report checks passed. See docs/compatibility/acp/codex-contained-plugins-disabled-proof.json and docs/compatibility/acp/claude-contained-oauth-proof.json. The first Codex denied-egress failure and historical cleanup failures remain retained. Concurrent recovery/deletion races are addressed; mount-proof cleanup passed local and Linux Docker proofs and its dependency is closed. Detached MCP tool boundary proof added; see docs/reviews/2026-09-19-acp-mcp-descendant.md. Vendor tool-use qualification, Linux vendor receipts, production admission and S7 remain open.
+state-note: Docker lifetime and pinned-image fixtures implemented; basic contained Codex and Claude report checks passed. See docs/compatibility/acp/codex-contained-plugins-disabled-proof.json and docs/compatibility/acp/claude-contained-oauth-proof.json. The first Codex denied-egress failure and historical cleanup failures remain retained. Concurrent recovery/deletion races are addressed; mount-proof cleanup passed local and Linux Docker proofs and its dependency is closed. Detached MCP tool boundary proof added; see docs/reviews/2026-09-19-acp-mcp-descendant.md. A bounded shell-once qualification harness is prepared; see docs/reviews/2026-09-19-acp-tool-probe.md. Vendor tool-use qualification, Linux vendor receipts, production admission and S7 remain open.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once
