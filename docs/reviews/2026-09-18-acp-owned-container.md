@@ -132,3 +132,30 @@ The [concurrent cleanup follow-up](2026-09-19-acp-concurrent-cleanup.md) records
 two independently reproduced races, their bounded fixes and regression evidence.
 The historical cleanup failure remains retained, without claiming a definitive
 attribution that its original diagnostic cannot support.
+
+## Claude contained report follow-up
+
+After the operator provisioned a private OAuth token, one authorized contained
+Claude prompt passed on engine commit `31ad9c1` and the pinned Linux ARM64 image.
+The exact report, zero tool events and denied connections, unchanged workspace
+and cleanup all passed in 5.2 seconds. A separate query confirmed owner-label
+absence and empty container/egress inventories; Colima was returned to stopped.
+No retry or Keychain access occurred. The [proof summary](../compatibility/acp/claude-contained-oauth-proof.json)
+records the versions, source/export hashes, redactions and limits.
+
+Correctness: preserve the initial `Not logged in` notification despite the
+successful token-backed request; it is not an authentication verdict. Preserve
+both models named in usage rather than claiming the configured `default` is a
+specific model or that one ACP prompt implies one provider request. Security:
+the credential stays in the private provisioned file and ephemeral session
+channel; account limits and command inventories are removed from the export.
+Architecture: this changes evidence only, with production admission still
+closed. Readability: the guides distinguish basic provider passes from the open
+mount-proof and mission-acceptance work. Performance: one 5.2-second probe,
+with adapter-reported cost USD 0.0426852 and no hard dollar cap. This is a self-review.
+
+Engine source is unchanged from the prior four-gate validation: 3,029 tests,
+zero failures, ten existing ignores, Clippy, formatting and build passed.
+Linux CI has also passed the new live network-disappearance/name-reuse case on
+`31ad9c1`. This receipt addition receives JSON/hash, redaction, secret-scan,
+knowledge-freshness and domain-lint checks; no new full Rust run is claimed.

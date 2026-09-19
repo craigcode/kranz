@@ -34,18 +34,27 @@
   "focusedContainmentTests": 11,
   "requiredDaemonProofs": 8,
   "buildAndFixtureProviderCalls": 0,
-  "liveProbeCalls": 2,
-  "liveProbeReceipt": "codex-acp-contained-plugins-disabled.jsonl",
+  "liveProbeCalls": 3,
+  "liveProbeReceipt": "claude-acp-contained-oauth.jsonl",
   "liveProbePassed": true,
   "liveProbeHistory": [
     {
       "receipt": "codex-acp-contained-denied-egress.jsonl",
-      "passed": false
+      "passed": false,
+      "provider": "codex"
     },
     {
       "receipt": "codex-acp-contained-plugins-disabled.jsonl",
+      "passed": true,
+      "provider": "codex"
+    },
+    {
+      "provider": "claude",
+      "receipt": "claude-acp-contained-oauth.jsonl",
+      "proof": "claude-contained-oauth-proof.json",
       "passed": true
     }
   ],
-  "liveProbeProof": "codex-contained-plugins-disabled-proof.json"
+  "liveProbeProof": "claude-contained-oauth-proof.json",
+  "liveProbeCallsMeaning": "authorized probe invocations, not verified underlying provider request count"
 }

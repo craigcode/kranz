@@ -168,8 +168,19 @@ connections, unchanged workspace and confirmed cleanup. The peer reported
 and [proof summary](compatibility/acp/codex-contained-plugins-disabled-proof.json)
 retain the result, source-receipt digest and separate owner-label absence check.
 This supports the plugin-startup hypothesis but does not attribute the first
-run's five requests. The original failure remains a failure. Claude still needs
-a Linux-compatible credential and its own authorized probe.
+run's five requests. The original failure remains a failure.
+
+One newly authorized Claude run then used an operator-provisioned OAuth token
+with the same image and the configured Anthropic/Claude endpoint allowlist.
+It **passed** in 5.2 seconds: exact report, no tools, zero denied connections,
+unchanged workspace and confirmed cleanup. A separate owner-label query and
+final daemon inventory confirmed absence. No Keychain access or retry occurred.
+The [Claude proof summary](compatibility/acp/claude-contained-oauth-proof.json)
+links the receipt with account-limit and command-inventory metadata redacted.
+Its initial `Not logged in` notification is retained alongside the successful
+request, and usage names both Sonnet 5 and Haiku 4.5. See the
+[compatibility notes](acp-compatibility.md#contained-claude-follow-up-2026-09-19-utc)
+for authentication telemetry and prompt-budget limits.
 
 For a provider-free end-to-end check of the probe itself:
 
@@ -178,8 +189,9 @@ cargo build --workspace --example acp_compat_probe
 python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_probe sha256:<image-id>
 ```
 
-Remaining S6 work includes Claude's contained proof, qualification beyond the
-Codex no-tools report fixture and corresponding narrow configuration admission.
+Remaining S6 work includes mount-proof helper cleanup, qualification beyond the
+Claude/Codex no-tools report fixtures and corresponding narrow configuration
+admission.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
 deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).
 The historical failure remains retained; the race fixes do not establish broader
