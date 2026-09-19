@@ -78,3 +78,9 @@ probe on commit `6d64b4c`. Its knowledge-refresh check caught the newly changed
 CI file against the guide's prior UTC verification date; the guide was reviewed,
 updated to describe the new checks, and reverified. This is a five-axis
 self-review, not an independent audit.
+
+All reported CI checks on `9666dd5` subsequently passed, including Windows Rust;
+the optional smoke job was skipped. The [endpoint investigation](2026-09-19-codex-contained-egress.md)
+keeps the unexpected hostname blocked and records a credential-free configuration
+check against the pinned image. Plugin startup suppression is the proposed next
+probe change; no further live call or provider certification is claimed.

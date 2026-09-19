@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime, hostile/worktree and pinned-image fixtures implemented; one authorized contained Codex run authenticated but failed on denied egress. Endpoint policy, Claude credentials/proof, production admission and S7 remain open. See docs/acp-containment.md and docs/reviews/2026-09-18-acp-owned-container.md.
+state-note: Docker lifetime and pinned-image fixtures implemented; contained Codex authenticated but failed on denied egress. Source investigation and offline plugin configuration checks are recorded in docs/reviews/2026-09-19-codex-contained-egress.md; private startup configuration, a new authorized proof, Claude credentials/proof, production admission and S7 remain open.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

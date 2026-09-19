@@ -151,8 +151,12 @@ An offline comparison confirms the exact fixed report. The overall probe
 relay cleanup, and a separate daemon inventory confirmed the worker was absent.
 No retry or allowlist expansion followed. The export replaces the authentication
 account and its label; it preserves the failed terminal result. The additional
-endpoint needs a policy decision before another live attempt. Claude still needs
-a Linux-compatible credential and its own authorized probe.
+endpoint remains blocked. The [pinned-source investigation](reviews/2026-09-19-codex-contained-egress.md)
+identifies automatic account-plugin downloads as a plausible cause and verifies
+the proposed plugin-disable configuration offline. Exact request attribution
+remains unproven. Wire that configuration into the probe's private startup home
+before preparing another bounded live attempt. Claude still needs a
+Linux-compatible credential and its own authorized probe.
 
 For a provider-free end-to-end check of the probe itself:
 
