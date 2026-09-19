@@ -244,22 +244,21 @@ python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_pr
 
 The [MCP descendant follow-up](reviews/2026-09-19-acp-mcp-descendant.md) adds a
 synthetic tool-boundary proof and retains the later Linux gate-startup failure.
+The [second native shell batch](compatibility/acp/native-tool-proof-v2.json)
+passed for pinned Claude and Codex on macOS ARM64 / Colima: one grant, successful
+native tool completion, exact file bytes and one host checkpoint per provider,
+with unchanged primary state, zero denied egress and confirmed cleanup. See the
+[review](reviews/2026-09-19-acp-native-tool-pass.md). The first batch's failures
+remain retained; a subsequent pass does not rewrite them or certify all tools.
+
 Remaining S6 work is:
 
-1. Qualify the pinned Claude and Codex adapters while actually using their native
-   tools inside the wrapper, with private authentication/state, a real worktree
-   change, permission evidence and confirmed cleanup. The existing report-only
-   passes do not cover this. The [one-command fixture](acp-compatibility.md#contained-one-command-qualification-fixture)
-   has two retained failed live attempts: Claude encountered denied telemetry
-   after a delivered grant/tool completion; Codex's shell wrapper was refused
-   before consent. See the [follow-up review](reviews/2026-09-19-acp-native-tool-attempts.md).
-   Probe compatibility fixes are checked offline; a fresh bounded authorization
-   and passing live receipts remain required.
-2. Retain equivalent adapter/runtime/image/platform receipts on Linux before
-   admitting that combination. Linux synthetic CI proves the wrapper boundary;
-   it does not launch or qualify the vendor adapters.
-3. Wire only the qualified combinations through ordinary worker configuration,
+1. Retain equivalent adapter/runtime/image/platform receipts on native Linux
+   hosts before admitting that combination. Linux synthetic CI proves the
+   wrapper boundary; it does not launch or qualify the vendor adapters.
+2. Wire only the qualified combinations through ordinary worker configuration,
    preserving pre-spawn refusal for every unsupported pair and current defaults.
+   The direct-backend fixture does not by itself prove normal mission dispatch.
 
 Mount-helper cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and

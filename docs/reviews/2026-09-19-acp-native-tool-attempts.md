@@ -1,5 +1,8 @@
 # First contained native-tool attempts and probe corrections
 
+Historical review at `817180f`; the separately approved second batch
+[passed the native shell fixture](2026-09-19-acp-native-tool-pass.md).
+
 The approved one-Claude/one-Codex batch at `0d41f41` consumed exactly two ACP
 prompts, with no retries. Both attempts failed. Their [projected receipts](../compatibility/acp/native-tool-attempts-v1.json)
 retain the original failure decisions, command/permission evidence, source

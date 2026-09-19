@@ -309,8 +309,9 @@ It runs 29 real-container cases, including positive controls, malformed or
 missing consent, unexpected commands/paths/output, tool failure and duplicate
 requests. Each refusal must match its intended reason; every case checks daemon
 absence independently. Linux CI runs this script without credentials and retains
-its log. These are synthetic fixture proofs; native vendor tool-use qualification,
-Linux vendor receipts and ordinary enforced-ACP admission remain separate work.
+its log. These synthetic checks are separate from the scoped native shell
+qualification below; Linux vendor receipts and ordinary enforced-ACP admission
+remain open.
 See the [fixture review](reviews/2026-09-19-acp-tool-probe.md) and
 [live-attempt follow-up](reviews/2026-09-19-acp-native-tool-attempts.md).
 
@@ -325,6 +326,41 @@ starts, for either mode and every supported credential channel. `--check` shows
 this fixed setting without applying it; the start receipt records its application.
 This follows Claude's [documented traffic policy](https://code.claude.com/docs/en/env-vars)
 and the pinned SDK's telemetry guard. It does not add a network destination or
-ignore denied traffic. Synthetic startup peers verify delivery of the setting;
-only a separately approved new live batch can verify vendor behavior after these
-fixes. The first batch's authorization is consumed; it is never retried.
+ignore denied traffic. Synthetic startup peers verify delivery of the setting.
+A separately approved second batch at `817180f` also passed the live workload
+below. The first batch remains failed; neither batch was retried.
+
+
+## Contained native shell qualification (2026-09-19 UTC)
+
+The separately authorized second batch **passed for both providers** using the
+reviewed `817180f` probe and the same pinned ARM64 image/egress lists as before.
+The host was macOS ARM64 with Colima, not a native Linux engine host. See the
+[projected live receipts](compatibility/acp/native-tool-proof-v2.json) and
+[review](reviews/2026-09-19-acp-native-tool-pass.md).
+
+| Adapter / runtime | Elapsed | One-time grants | Host feature commits | Denied connections |
+| --- | ---: | ---: | ---: | ---: |
+| Claude ACP 0.77.0 / Agent SDK 0.3.270 | 21.978 s | 1 | 1 | 0 |
+| Codex ACP 1.11.0 / Codex 0.153.4 | 14.811 s | 1 | 1 | 0 |
+
+Each pass required the exact report and file bytes, a synced decision and a
+separate `sent` receipt, successful tool completion, unchanged primary state,
+clean shutdown and a host checkpoint containing only `fixture-result.txt`.
+The command was the fixed `echo` fixture above. The checkpoint was created by
+the probe host after shutdown, not by an autonomous Git tool invocation.
+Daemon inventories after each attempt contained no containers, relay networks
+or volumes; Colima was restored to stopped. There were no retries, Keychain
+accesses or allowlist changes. The two approved prompt slots are consumed.
+
+Claude used its private OAuth channel and the fixed nonessential-traffic flag;
+Codex used a minimal private copy of its existing file login and the fixed
+startup configuration. Model selection stayed with the peer: Claude announced
+`default`, while Codex announced `gpt-6-astra[medium]`. Those observations do not
+pin future default models. Claude reported USD 0.0615526; Codex supplied no cost
+figure. Neither is a verified API-request count or hard spending cap.
+
+This qualifies the observed native shell workload on this adapter/image/host
+combination. It does not certify every native tool, native Linux hosting,
+ordinary enforced-ACP admission or the S7 governed mission. The earlier failures
+and the independent synthetic namespace proofs remain separate evidence.
