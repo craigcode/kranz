@@ -82,5 +82,38 @@ self-review, not an independent audit.
 All reported CI checks on `9666dd5` subsequently passed, including Windows Rust;
 the optional smoke job was skipped. The [endpoint investigation](2026-09-19-codex-contained-egress.md)
 keeps the unexpected hostname blocked and records a credential-free configuration
-check against the pinned image. Plugin startup suppression is the proposed next
-probe change; no further live call or provider certification is claimed.
+check against the pinned image. The subsequent probe change writes file-only
+credential storage and disabled plugin features into the disposable Codex home
+before adapter startup. No further live call or provider certification is claimed.
+
+## Probe startup follow-up
+
+Correctness: both key and copied-login paths receive the same private startup
+file before spawn; preflight only previews it. The receipt distinguishes a
+completed write from a preview and does not claim effective runtime enforcement.
+Security: the file is created exclusively, uses private permissions on Unix and
+contains no credential. Native settings and history remain outside the child
+home, the endpoint stays blocked, and the original failed receipt is preserved.
+Architecture: this is confined to the no-tools probe, with no mission defaults
+or containment admission change. Readability: one TOML constant supplies both
+the file and receipt. Performance: it adds one small local file write per probe.
+
+The synthetic peer checks the startup file before reading ACP initialization.
+Both authentication paths pass natively and in the pinned vendor container,
+using fake credentials, and the source homes remain unchanged. The existing
+five probe policy tests pass. An initial test-only assertion incorrectly
+required redaction of the fake key literal in a copied-login run where no key
+was supplied; it now checks exact-value redaction on the explicit-key path.
+
+The same fixture checks also pass on CI's pinned Alpine Python image. One
+additional run on that image, concurrent with the full workspace suite, returned
+the report but failed cleanup confirmation. A subsequent daemon inventory was
+empty and no recovery ledger remained for that fixture. The serial rerun passed;
+the failing component was not identified, and cleanup deadlines and failure
+semantics were not relaxed. This remains an observed cleanup flake, not evidence
+that the earlier failed run passed.
+
+The follow-up workspace suite passed 3,022 tests with zero failures and ten
+existing ignores, with both Docker proof suites enabled. Workspace Clippy with
+warnings denied and formatting passed. Knowledge freshness and domain lint
+(984 files) passed.

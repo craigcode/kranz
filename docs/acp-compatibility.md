@@ -108,6 +108,16 @@ of `CODEX_API_KEY` or `OPENAI_API_KEY`. The probe supplies a non-secret
 `DEFAULT_AUTH_REQUEST` selecting `api-key`, `NO_BROWSER=1`, and initial mode
 `read-only`.
 
+Before starting either Codex authentication path, the probe writes its own
+`CODEX_HOME/config.toml` with file-only credential storage and both `plugins`
+and `remote_plugin` disabled. These startup settings suppress plugin warmups
+outside this no-tools fixture; session-level settings arrive too late. This
+policy is specific to the compatibility probe, not ordinary missions. The
+preflight and start receipt include the exact TOML as `codexStartupConfig`;
+`codexStartupConfigWritten` distinguishes the preview from a completed write.
+The receipt records intended startup policy, not independently verified runtime
+enforcement. See the [source trace and offline checks](reviews/2026-09-19-codex-contained-egress.md).
+
 For an explicitly authorized existing CLI login, replace `credentialEnv` with
 `"nativeLoginHome": "/absolute/operator/home"`. Codex copies only
 `.codex/auth.json` into the disposable private home; it does not copy settings,
@@ -130,9 +140,9 @@ target/debug/examples/acp_compat_probe --check /absolute/private-config.json
 target/debug/examples/acp_compat_probe --run /absolute/private-config.json
 ```
 
-`--check` never starts an adapter or reads a credential value. It reports only
-whether the configured variable or native credential file is present and the
-receipt path is unused. File presence is not an authentication verification.
+`--check` never starts an adapter, writes startup configuration or reads a
+credential value. It reports credential presence, receipt availability and the
+intended startup configuration. File presence is not authentication verification.
 `--run` requires a fresh receipt path and refuses to overwrite an earlier attempt.
 The driver sends exactly one prompt, uses a new empty workspace/private HOME,
 limits capture to 512 events and 2 MiB, and aborts on observed tool activity.

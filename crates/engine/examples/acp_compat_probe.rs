@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 const REPORT: &str = r#"{"result":"partial","summary":"kranz-acp-live-fixture-v1","filesTouched":[],"testsAdded":[],"dependenciesAdded":[],"knownGaps":["Protocol fixture only; no feature implemented or mission completion claimed."],"commits":[],"commandsRun":[],"escalation":null,"questions":[]}"#;
 const PREFIX: &str = "Protocol compatibility fixture only. Do not use any tools, read files, change files, call the network, create commits, or carry out another task. Return exactly this JSON object as the final assistant message, without Markdown fences:\n";
+// App-server performs plugin warmups before session-level configuration arrives.
+// Keep this no-tools fixture's startup policy in its disposable home instead.
+const CODEX_STARTUP_CONFIG: &str =
+    "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -327,7 +331,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
+            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -360,6 +364,19 @@ async fn main() -> Result<()> {
         env.insert(key.clone(), value.clone());
     }
     if config.provider == "codex" {
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(codex_home.join("config.toml"))?
+            .write_all(CODEX_STARTUP_CONFIG.as_bytes())?;
+        env.insert("CODEX_HOME".into(), codex_home.display().to_string());
         if config.credential_env.is_some() {
             env.insert(
                 "DEFAULT_AUTH_REQUEST".into(),
@@ -399,7 +416,7 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"container":config.container,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","container":config.container,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
         credential.as_deref(),
         &root,
     )?;

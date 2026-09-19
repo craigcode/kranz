@@ -70,9 +70,9 @@ The current [OpenAI configuration reference](https://developers.openai.com/codex
 documents the global feature switches and cautions that disabling an individual
 plugin does not prevent marketplace refresh from installing or refreshing it.
 
-## Proposed probe change and next acceptance
+## Probe change and next acceptance
 
-Before the next Codex adapter starts, the probe should write the following into
+Before a Codex adapter starts, the probe now writes the following into
 its own disposable `CODEX_HOME/config.toml`, after minimal credential seeding:
 
 ```toml
@@ -83,13 +83,15 @@ plugins = false
 remote_plugin = false
 ```
 
-This configuration has been checked offline; it is **not yet written by
-`acp_compat_probe`**. Apply it to both explicit-key and copied-login Codex probe
-paths, record the intended startup policy in the receipt, and test that it exists
-before spawn without copying or editing the operator's settings. Keep this
-restriction scoped to the no-tools compatibility probe; ordinary missions may
-need separately approved plugins. It is a workload reduction, not a replacement
-for the container network boundary.
+The implementation covers both explicit-key and copied-login Codex probe paths.
+`--check` previews the exact TOML without writing it; the start receipt records
+the completed private write. Synthetic peers inspect the configuration before
+ACP initialization, with fake credentials, and verify that the operator settings
+and history were neither copied nor modified. These checks run natively and in
+the container. The restriction stays scoped to the no-tools compatibility probe;
+ordinary missions may need separately approved plugins. It is a workload
+reduction, not a replacement for the container network boundary, and the receipt
+does not claim independent verification of the runtime's effective configuration.
 
 After that change passes review and regression checks, prepare one newly
 authorized run with the same image, credentials channel, fixed prompt, allowlist

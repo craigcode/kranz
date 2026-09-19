@@ -154,8 +154,10 @@ account and its label; it preserves the failed terminal result. The additional
 endpoint remains blocked. The [pinned-source investigation](reviews/2026-09-19-codex-contained-egress.md)
 identifies automatic account-plugin downloads as a plausible cause and verifies
 the proposed plugin-disable configuration offline. Exact request attribution
-remains unproven. Wire that configuration into the probe's private startup home
-before preparing another bounded live attempt. Claude still needs a
+remains unproven. The probe now writes that configuration into its private
+startup home before launching Codex; synthetic key/login peers verify it before
+ACP initialization in native and contained runs. A new bounded live attempt is
+still needed to test the effect on authenticated startup. Claude still needs a
 Linux-compatible credential and its own authorized probe.
 
 For a provider-free end-to-end check of the probe itself:
