@@ -260,6 +260,12 @@ Remaining S6 work is:
    preserving pre-spawn refusal for every unsupported pair and current defaults.
    The direct-backend fixture does not by itself prove normal mission dispatch.
 
+The [native Linux preparation review](reviews/2026-09-19-acp-linux-preparation.md)
+records a Linux ARM64 engine build and passing provider-free fixtures, the
+recovered physical-disk exhaustion during a later test build, and the concrete
+credential/startup/admission work still required. Its live batch is prepared but
+not authorized or run; it does not close either item above.
+
 Mount-helper cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
 deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).

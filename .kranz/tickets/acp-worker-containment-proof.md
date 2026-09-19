@@ -25,6 +25,7 @@ are not containment. Follow D-F/D-H and reuse sandbox.rs/command_exec primitives
 - Prove required adapter authentication/caches work without ambient authority.
 - Keep no-push/no-primary-write invariants and post-worker integrity checks.
 - Expose tested adapter/platform support explicitly; keep refusal for unproven combinations. Start macOS, then Linux; Windows needs proof before enablement.
+- Follow the remaining admission breakdown in docs/reviews/2026-09-19-acp-linux-preparation.md; Linux ARM64 provider-free preparation passes, but the new live batch, credential/startup integration and ordinary mission admission remain pending.
 
 - Out of scope: Reimplementing a sandbox, client filesystem/terminal RPC services, ACP validators, credential inheritance or changing defaults without proof.
 
