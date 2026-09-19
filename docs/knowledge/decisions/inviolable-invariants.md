@@ -2,10 +2,12 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-19
 verified_against:
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
+  - crates/engine/src/sandbox_container/mount_proof.rs
+  - crates/engine/src/sandbox_container/mount_proof/tests.rs
   - crates/engine/src/control.rs
   - crates/engine/src/paths.rs
   - AGENTS.md
@@ -210,6 +212,12 @@ untouched (AGENTS.md rules 1–3).
   without a continuous CI receipt must pass a bind-mount round trip before
   either a session or a gate resolves
   ([sandbox_container.rs](../../../crates/engine/src/sandbox_container.rs)).
+  The preflight must also own its helper and confirm daemon absence: a failed
+  exchange or uncertain cleanup never grants admission. Interrupted creation or
+  unconfirmed removal retains private recovery intent; a guest deadline bounds
+  the running helper after engine death. Required runtime mount proofs currently
+  support Docker on Linux/macOS and refuse other runtimes before spawn. See
+  [mount preflight ownership](../../acp-containment.md#mount-preflight-ownership).
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
   `tickets/`, `lessons/`, `hook-status/`), every SIBLING mission dir, the

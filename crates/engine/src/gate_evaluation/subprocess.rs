@@ -93,14 +93,30 @@ impl DockerEvaluator {
         )
         .await
     }
-    async fn control(&self, args: &[String]) -> Result<Output, String> {
+    pub(crate) fn attached_command(&self, args: &[String]) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(args).env_clear().envs(&self.env);
+        command
+    }
+
+    pub(crate) async fn control(&self, args: &[String]) -> Result<Output, String> {
+        self.bounded_control(args, Duration::from_secs(5), &AtomicBool::new(false))
+            .await
+    }
+
+    pub(crate) async fn bounded_control(
+        &self,
+        args: &[String],
+        wall: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Output, String> {
         self.command(
             args,
             b"",
-            Duration::from_secs(5),
+            wall,
             Duration::from_secs(1),
             (CONTROL_LIMIT, CONTROL_LIMIT),
-            &AtomicBool::new(false),
+            cancelled,
         )
         .await
         .map_err(|error| format!("Docker {} control failed: {error}", args[0]))

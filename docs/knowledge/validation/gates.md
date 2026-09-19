@@ -2,8 +2,11 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-19
 verified_against:
+  - crates/engine/src/acp_container.rs
+  - crates/engine/src/acp_container/tests.rs
+  - crates/engine/src/acp_container/peer.py
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
   - crates/engine/src/gate_evaluation/lifecycle.rs
@@ -41,8 +44,25 @@ runs `gate_subprocess_v1` with the Docker opt-in and a pinned synthetic Python
 image. Missing Docker/image support fails that job; ordinary workspace tests
 print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
 exercise protocol, byte pinning, artifact imports and containment without model
-calls. See [external evaluators](../../external-evaluators.md) for API boundaries,
+calls. That CI step runs unrelated fixtures sequentially so they do not compete
+for the unchanged five-second Docker control deadline; this is not a throughput
+qualification. The job retains its synthetic proof logs on failure as well as
+success. See [external evaluators](../../external-evaluators.md) for API boundaries,
 retention and recovery limits.
+
+The same Linux job also runs `acp_containment_v1` with
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine real daemon proofs by
+name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
+tests do not substitute for those proofs. Synthetic control tests additionally
+require confirmed absence after asynchronous deletion and failure when a
+namespace persists. The MCP descendant proof exchanges initialization and a
+tool call with a detached child, requires thirteen containment denials and a
+real tool-written deliverable, and confirms that no ACP callback mediated it.
+It then exercises the bounded ACP
+compatibility probe with a deterministic contained peer, without provider
+credentials or model calls. These checks cover the direct-backend Docker proof
+path; ordinary enforced-ACP mission configuration remains closed pending vendor
+qualification. See [ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite
 

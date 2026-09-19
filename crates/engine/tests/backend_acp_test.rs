@@ -61,6 +61,53 @@ fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> Se
     }
 }
 
+#[tokio::test]
+async fn acp_containment_v1_uncertified_sandbox_is_refused_before_peer_spawn() {
+    use kranz_engine::sandbox::{ResolvedSandbox, SandboxBackend, SandboxInputs};
+    use kranz_engine::types::SandboxEnforce;
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(
+        dir.path(),
+        "must-not-run.sh",
+        "#!/bin/sh\ntouch spawned\nexit 1\n",
+    );
+    for backend in [
+        SandboxBackend::Seatbelt,
+        SandboxBackend::Bubblewrap,
+        SandboxBackend::Container,
+        SandboxBackend::AppContainer,
+    ] {
+        let mut spec = spec(dir.path(), "uncertified-containment", true, &[]);
+        spec.sandbox = Some(ResolvedSandbox {
+            backend,
+            inputs: SandboxInputs {
+                enforce: SandboxEnforce::FsNet,
+                session_cwd: dir.path().into(),
+                mission_dir: dir.path().join(".kranz/missions/m-test"),
+                tmpdir: dir.path().join("scratch"),
+                extra_write: vec![],
+                egress: vec![],
+                validator_read_deny_roots: vec![],
+            },
+            container: None,
+        });
+        let error = match AcpBackend::new(&peer, vec![]).start(spec).await {
+            Ok(_) => panic!("an uncertified {backend:?} sandbox was admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing the supplied sandbox before spawn"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("spawned").exists(),
+            "{backend:?} executed outside its promised boundary"
+        );
+    }
+}
+
 // Transport-only fixtures act as an explicit test broker. Engine durability
 // and operator authority are exercised separately by the live-consent tests.
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
@@ -1133,19 +1180,45 @@ async fn acp_compat_v1_oversized_and_invalid_utf8_frames_fail_before_a_report() 
 
 #[tokio::test]
 async fn acp_compat_v1_handshake_rejects_version_and_missing_session_identity() {
-    for body in [
-        no_usage_peer().replace("\"protocolVersion\":1", "\"protocolVersion\":999"),
-        no_usage_peer().replace("\"sessionId\":\"acp-mock-session-1\"", "\"sessionId\":\"\""),
+    for (body, expected) in [
+        (
+            no_usage_peer().replace("\"protocolVersion\":1", "\"protocolVersion\":999"),
+            "negotiated protocol version 999",
+        ),
+        (
+            no_usage_peer().replace("\"sessionId\":\"acp-mock-session-1\"", "\"sessionId\":\"\""),
+            "session/new response carried no sessionId",
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
+        let body = body.replace("#!/bin/sh\n", "#!/bin/sh\necho $$ > peer.pid\n");
         let peer = write_peer(dir.path(), "bad-handshake.sh", &body);
+        // start() also prepares the isolated toolchain home and reaps the
+        // rejected peer. The semantic rejection, not a three-second host I/O
+        // benchmark, is this test's contract. A handshake timeout cannot pass.
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(35),
             AcpBackend::new(peer, vec![]).start(spec(dir.path(), "handshake", true, &[])),
         )
         .await
-        .unwrap();
-        assert!(result.is_err());
+        .expect("invalid handshake must reject and reap within its outer budget");
+        let error = match result {
+            Ok(_) => panic!("invalid handshake was accepted: {expected}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "wrong rejection: {error}");
+        assert!(!error.contains("cleanup unconfirmed"), "{error}");
+        let pid = std::fs::read_to_string(dir.path().join("peer.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "peer still exists");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "rejected peer must be reaped"
+        );
     }
 }
 

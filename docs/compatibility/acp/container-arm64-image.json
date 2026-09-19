@@ -1,0 +1,60 @@
+{
+  "node": "v22.23.1",
+  "platform": "linux",
+  "arch": "arm64",
+  "packages": {
+    "@agentclientprotocol/claude-agent-acp": "0.77.0",
+    "@agentclientprotocol/codex-acp": "1.11.0",
+    "@anthropic-ai/claude-agent-sdk": "0.3.270",
+    "@anthropic-ai/claude-agent-sdk-linux-arm64": "0.3.270",
+    "@openai/codex": "0.153.4",
+    "@openai/codex-linux-arm64": "0.153.4-linux-arm64"
+  },
+  "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "host": {
+    "os": "macos",
+    "arch": "arm64",
+    "runtime": "Colima / Linux Docker"
+  },
+  "baseImage": "python@sha256:ae8c3b6bb3d02ffffa2bee0bed8c7c99b9478bd042ff4d79a5bbd6eb10398864",
+  "nodeArchive": {
+    "url": "https://nodejs.org/dist/v22.23.1/node-v22.23.1-linux-arm64.tar.xz",
+    "sha256": "0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1"
+  },
+  "lockFile": "live-install-lock.json",
+  "lockSha256": "f366480f4e2c3328b9b7194bc70985f90cee937e9bf7b4e69ec3f23ec8bbdccd",
+  "dockerfile": "container-arm64.Dockerfile",
+  "dockerfileSha256": "5d21c6a94ddd47344a69c98e246474e00e5d53289b6f4672d23fdeb383726e87",
+  "installFlags": [
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund"
+  ],
+  "productionAdmissionEnabled": false,
+  "focusedContainmentTests": 11,
+  "requiredDaemonProofs": 8,
+  "buildAndFixtureProviderCalls": 0,
+  "liveProbeCalls": 3,
+  "liveProbeReceipt": "claude-acp-contained-oauth.jsonl",
+  "liveProbePassed": true,
+  "liveProbeHistory": [
+    {
+      "receipt": "codex-acp-contained-denied-egress.jsonl",
+      "passed": false,
+      "provider": "codex"
+    },
+    {
+      "receipt": "codex-acp-contained-plugins-disabled.jsonl",
+      "passed": true,
+      "provider": "codex"
+    },
+    {
+      "provider": "claude",
+      "receipt": "claude-acp-contained-oauth.jsonl",
+      "proof": "claude-contained-oauth-proof.json",
+      "passed": true
+    }
+  ],
+  "liveProbeProof": "claude-contained-oauth-proof.json",
+  "liveProbeCallsMeaning": "authorized probe invocations, not verified underlying provider request count"
+}

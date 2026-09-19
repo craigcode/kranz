@@ -652,11 +652,69 @@ fn output_text(output: &Output) -> String {
     crate::command_exec::last_chars_local(text.trim(), 1200)
 }
 
-fn owner_identity_hash(pid: i32) -> Option<String> {
+pub(crate) fn owner_identity_hash(pid: i32) -> Option<String> {
     crate::event_log::process_identity_token(pid).map(|identity| {
         let digest = Sha256::digest(identity.as_bytes());
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     })
+}
+
+// A sibling can remove its network after the recovery inventory is taken.
+// Only a successful fresh inventory can turn an inspection error into absence;
+// other daemon failures must still prevent a new boundary from starting.
+fn inspect_recovery_network(
+    network: &str,
+    mut docker: impl FnMut(&[String], &str) -> Result<Output>,
+) -> Result<Option<Output>> {
+    if network.len() != 64 || !network.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(EngineError::Backend(
+            "invalid container network identity".to_string(),
+        ));
+    }
+    let inspect = docker(
+        &[
+            "network".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            format!(
+                "{{{{index .Labels \"{OWNER_PID_LABEL}\"}}}}|{{{{index .Labels \"{OWNER_TOKEN_LABEL}\"}}}}|{{{{index .Labels \"{BOUNDARY_ID_LABEL}\"}}}}|{{{{index .Labels \"{CREDENTIAL_DIR_LABEL}\"}}}}"
+            ),
+            network.to_string(),
+        ],
+        "inspect container egress owner",
+    );
+    match inspect {
+        Ok(output) => Ok(Some(output)),
+        Err(error) => {
+            let list = docker(
+                &[
+                    "network".to_string(),
+                    "ls".to_string(),
+                    "--no-trunc".to_string(),
+                    "--format".to_string(),
+                    "{{.ID}}".to_string(),
+                ],
+                "confirm container egress network absence",
+            )?;
+            let inventory = std::str::from_utf8(&list.stdout).map_err(|_| {
+                EngineError::Backend("invalid container network inventory".to_string())
+            })?;
+            let ids: Vec<_> = inventory.lines().map(str::trim).collect();
+            if ids
+                .iter()
+                .any(|id| id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return Err(EngineError::Backend(
+                    "invalid container network inventory".to_string(),
+                ));
+            }
+            if ids.contains(&network) {
+                Err(error)
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
@@ -668,7 +726,8 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
             "--filter".to_string(),
             format!("label={RESOURCE_LABEL}=true"),
             "--format".to_string(),
-            "{{.Name}}".to_string(),
+            "{{.ID}}".to_string(),
+            "--no-trunc".to_string(),
         ],
         "list stale container egress networks",
     )?;
@@ -677,19 +736,12 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let inspect = docker_checked(
-            runtime,
-            &[
-                "network".to_string(),
-                "inspect".to_string(),
-                "--format".to_string(),
-                format!(
-                    "{{{{index .Labels \"{OWNER_PID_LABEL}\"}}}}|{{{{index .Labels \"{OWNER_TOKEN_LABEL}\"}}}}|{{{{index .Labels \"{BOUNDARY_ID_LABEL}\"}}}}|{{{{index .Labels \"{CREDENTIAL_DIR_LABEL}\"}}}}"
-                ),
-                network.to_string(),
-            ],
-            "inspect container egress owner",
-        )?;
+        let Some(inspect) = inspect_recovery_network(network, |args, action| {
+            docker_checked(runtime, args, action)
+        })?
+        else {
+            continue;
+        };
         let fields = String::from_utf8_lossy(&inspect.stdout);
         let mut fields = fields.trim().splitn(4, '|');
         let pid = fields.next().and_then(|value| value.parse::<i32>().ok());
@@ -783,6 +835,110 @@ mod tests {
     use crate::sandbox::{ResolvedSandbox, SandboxInputs};
     use std::collections::HashMap;
 
+    fn successful_output(stdout: &[u8]) -> Output {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_skips_only_a_confirmed_disappeared_network() {
+        let network = "a".repeat(64);
+        let other = "b".repeat(64);
+        let mut calls = 0;
+        let result = inspect_recovery_network(&network, |args, _| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(&args[..2], ["network", "inspect"]);
+                assert_eq!(args.last().unwrap(), &network);
+                return Err(EngineError::Backend("inspection failed".into()));
+            }
+            // No label filter: an inspection failure cannot be hidden by a
+            // network that still exists but no longer matches that filter.
+            assert_eq!(args, ["network", "ls", "--no-trunc", "--format", "{{.ID}}"]);
+            Ok(successful_output(format!("{other}\n").as_bytes()))
+        })
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn recovery_keeps_inspection_failure_when_network_still_exists() {
+        let network = "a".repeat(64);
+        let mut calls = 0;
+        let error = inspect_recovery_network(&network, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(EngineError::Backend("inspection unavailable".into()))
+            } else {
+                Ok(successful_output(format!("{network}\n").as_bytes()))
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("inspection unavailable"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn recovery_rejects_unconfirmed_or_malformed_network_absence() {
+        for inventory in [None, Some(b"truncated-id\n".as_slice()), Some(b"\xff")] {
+            let mut calls = 0;
+            let error = inspect_recovery_network(&"a".repeat(64), |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    Err(EngineError::Backend("inspection unavailable".into()))
+                } else if let Some(stdout) = inventory {
+                    Ok(successful_output(stdout))
+                } else {
+                    Err(EngineError::Backend("inventory unavailable".into()))
+                }
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if inventory.is_some() {
+                    "invalid container network inventory"
+                } else {
+                    "inventory unavailable"
+                }),
+                "{error}"
+            );
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_a_name_or_truncated_network_identity() {
+        for id in ["kranz-egress-reused-name", "abcdef012345", ""] {
+            let error = inspect_recovery_network(id, |_, _| {
+                panic!("invalid inventory identity must not reach Docker")
+            })
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("invalid container network identity"));
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_successful_owner_inspection() {
+        let mut calls = 0;
+        let output = inspect_recovery_network(&"a".repeat(64), |_, _| {
+            calls += 1;
+            Ok(successful_output(b"owner-labels"))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.stdout, b"owner-labels");
+        assert_eq!(calls, 1);
+    }
+
     fn session_spec(root: &Path, allowed_port: u16) -> SessionSpec {
         SessionSpec {
             cwd: root.to_path_buf(),
@@ -863,6 +1019,44 @@ mod tests {
                 crate::sandbox_container::DEFAULT_IMAGE.to_string(),
             ],
             "pull worker proof image",
+        )
+        .unwrap();
+
+        // Replay the list/inspect race without timing: the inventoried ID
+        // disappears and its name is reused before recovery inspects it.
+        let raced_name = format!("kranz-egress-race-{}", uuid::Uuid::new_v4().simple());
+        let create_network = || {
+            let output = docker_checked(
+                ContainerRuntime::Docker,
+                &["network".into(), "create".into(), raced_name.clone()],
+                "create recovery race network",
+            )
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let vanished_id = create_network();
+        docker_checked(
+            ContainerRuntime::Docker,
+            &["network".into(), "rm".into(), vanished_id.clone()],
+            "remove inventoried recovery network",
+        )
+        .unwrap();
+        let replacement_id = create_network();
+        assert_ne!(vanished_id, replacement_id);
+        assert!(inspect_recovery_network(&vanished_id, |args, action| {
+            docker_checked(ContainerRuntime::Docker, args, action)
+        })
+        .unwrap()
+        .is_none());
+        assert!(inspect_recovery_network(&replacement_id, |args, action| {
+            docker_checked(ContainerRuntime::Docker, args, action)
+        })
+        .unwrap()
+        .is_some());
+        docker_checked(
+            ContainerRuntime::Docker,
+            &["network".into(), "rm".into(), replacement_id],
+            "remove replacement recovery network",
         )
         .unwrap();
 

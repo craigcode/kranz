@@ -46,6 +46,10 @@
 //! load/resume methods; that does not imply Kranz negotiates or uses them.
 //! Configuration continues to restrict ACP to opt-in worker use and rejects
 //! enforced sandboxes, validator roles and automatic backend promotion.
+//! The direct backend API has a Docker containment proof path on macOS/Linux:
+//! a pinned, trusted Linux image must supply /usr/local/bin/python3. It reuses
+//! the container mount policy and a private host lease checked by guest PID 1.
+//! Vendor/image certification and configuration enablement remain separate.
 //!
 //! Child environments are cleared through `agent_session_env`. ACP has no
 //! implicit credential selection or native-state seeding: only explicit
@@ -555,6 +559,18 @@ fn peer_reported_model(session: &Value) -> Option<&str> {
 #[async_trait::async_trait]
 impl AgentBackend for AcpBackend {
     async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+        // Configuration admission is not the only caller of this public
+        // backend. Never silently discard an embedding caller's boundary.
+        let container_requested = spec.sandbox.as_ref().is_some_and(|sandbox| {
+            cfg!(any(target_os = "macos", target_os = "linux"))
+                && sandbox.backend == crate::sandbox::SandboxBackend::Container
+                && sandbox.container.is_some()
+        });
+        if spec.sandbox.is_some() && !container_requested {
+            return Err(EngineError::Backend(
+                "acp backend: enforced containment is not certified; refusing the supplied sandbox before spawn".into(),
+            ));
+        }
         if spec.resume.is_some() {
             return Err(EngineError::Backend(
                 "acp backend: resume is unsupported (session/load is an optional v1 \
@@ -564,20 +580,19 @@ impl AgentBackend for AcpBackend {
         }
         let model = spec.model.clone();
 
-        let mut command = tokio::process::Command::new(&self.program);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let (container, mut command) = if container_requested {
+            let (container, command) =
+                crate::acp_container::OwnedContainer::prepare(&spec, &self.program, &self.args)
+                    .await?;
+            (Some(container), command)
+        } else {
+            (None, self.native_command(&spec))
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let mut command = self.native_command(&spec);
         command
-            .args(&self.args)
             .current_dir(&spec.cwd)
-            // agent-env-clear: CLEARED env from the minimal allowlist. ACP
-            // defines no canonical auth env var, so NO ambient credential is
-            // injected (auth_env_name None) — the peer authenticates from
-            // its own config or fails loudly, never by inheritance.
-            .env_clear()
-            .envs(crate::agent_env::agent_session_env(
-                &spec.env,
-                &spec.session_id,
-                None,
-            ))
             // ACP is bidirectional: stdin carries the client's requests.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -649,11 +664,13 @@ impl AgentBackend for AcpBackend {
             model,
             spec,
             child,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            container,
             #[cfg(windows)]
             job,
             stdin: Some(stdin),
             child_status: None,
-            cleanup_failed: false,
+            cleanup_failure: None,
             drain_deadline: None,
             lines: BoundedLines::new_strict(stdout),
             stderr_buf,
@@ -682,9 +699,37 @@ impl AgentBackend for AcpBackend {
         // kills the child before the error crosses back.
         if let Err(e) = session.handshake().await {
             session.kill_child().await;
-            return Err(e);
+            let message = match e {
+                EngineError::Backend(message) => message,
+                other => other.to_string(),
+            };
+            return Err(EngineError::Backend(format!(
+                "{message}; startup stderr after cleanup: {}{}",
+                session.stderr_tail(),
+                session
+                    .cleanup_failure
+                    .map(|cause| format!("; cleanup unconfirmed: {cause}"))
+                    .unwrap_or_default(),
+            )));
         }
         Ok(Box::new(session))
+    }
+}
+
+impl AcpBackend {
+    fn native_command(&self, spec: &SessionSpec) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            // agent-env-clear: ACP has no implicit credential channel.
+            // Only explicit session variables cross the native boundary.
+            .env_clear()
+            .envs(crate::agent_env::agent_session_env(
+                &spec.env,
+                &spec.session_id,
+                None,
+            ));
+        command
     }
 }
 
@@ -709,11 +754,13 @@ pub struct AcpSession {
     /// Kept for permission decisions (`disallowed_tools`, `writable`).
     spec: SessionSpec,
     child: Child,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    container: Option<crate::acp_container::OwnedContainer>,
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
     stdin: Option<ChildStdin>,
     child_status: Option<ExitStatus>,
-    cleanup_failed: bool,
+    cleanup_failure: Option<&'static str>,
     drain_deadline: Option<tokio::time::Instant>,
     lines: BoundedLines<ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
@@ -887,6 +934,10 @@ impl AcpSession {
         self.acp_session_id = Some(acp_session_id.clone());
         self.handshake_complete = true;
         let reported_model = peer_reported_model(&new_result).map(str::to_owned);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let containment = self.container.as_ref().map(|container| container.receipt());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let containment: Option<Value> = None;
         // Configured attribution and peer-reported state are different facts.
         self.queue.push_back(AgentEvent::Init {
             session_id: acp_session_id,
@@ -900,6 +951,7 @@ impl AcpSession {
                 "configuredModel": self.model,
                 "modelSource": if reported_model.is_some() { "peer" } else { "unreported" },
                 "configuredModelSelectionApplied": false,
+                "containment": containment,
                 "synthesizedBy": "backend_acp",
             }),
         });
@@ -1607,6 +1659,14 @@ impl AcpSession {
                 self.child_status = Some(status);
             }
         }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(container) = self.container.as_mut() {
+            if let Err(error) = container.remove().await {
+                self.cleanup_failure
+                    .get_or_insert("container removal failed");
+                tracing::error!(%error, "ACP cleanup requires recovery");
+            }
+        }
         self.finish_stderr().await;
     }
 
@@ -1614,9 +1674,12 @@ impl AcpSession {
         if let Some(mut task) = self.stderr_task.take() {
             match tokio::time::timeout(CLEANUP_TIMEOUT, &mut task).await {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => self.cleanup_failed = true,
+                Ok(Err(_)) => {
+                    self.cleanup_failure
+                        .get_or_insert("stderr drain task failed");
+                }
                 Err(_) => {
-                    self.cleanup_failed = true;
+                    self.cleanup_failure.get_or_insert("stderr drain timed out");
                     task.abort();
                     let _ = task.await;
                 }
@@ -1645,12 +1708,12 @@ impl AcpSession {
             }
             self.kill_child().await;
         } else {
-            self.finish_stderr().await;
+            self.kill_child().await;
         }
-        if self.cleanup_failed {
-            self.exit = Some(SessionExit::Failed(
-                "acp stderr did not close cleanly after process cleanup".into(),
-            ));
+        if let Some(cause) = self.cleanup_failure {
+            self.exit = Some(SessionExit::Failed(format!(
+                "acp cleanup could not be confirmed: {cause}"
+            )));
             return;
         }
         self.exit = Some(match self.child_status {
@@ -1765,6 +1828,19 @@ impl AgentSession for AcpSession {
             .await;
         }
         self.kill_child().await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let container_cleanup_failed = self.container.is_some()
+            && (self.cleanup_failure.is_some() || self.child_status.is_none());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let container_cleanup_failed = false;
+        if container_cleanup_failed {
+            let cause = self
+                .cleanup_failure
+                .unwrap_or("host process did not reap within cleanup deadline");
+            let message = format!("acp abort cleanup could not be confirmed: {cause}");
+            self.exit = Some(SessionExit::Failed(message.clone()));
+            return Err(EngineError::Backend(message));
+        }
         self.exit = Some(SessionExit::Aborted);
         Ok(())
     }

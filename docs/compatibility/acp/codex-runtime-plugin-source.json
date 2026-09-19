@@ -1,0 +1,66 @@
+{
+  "repository": "openai/codex",
+  "tag": "rust-v0.153.4",
+  "commit": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+  "files": [
+    {
+      "path": "codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs",
+      "sha256": "c9f1025f8ddf2f0d5601834cebee515662dfe37b5cc685e896130d3021b4efce",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core-plugins/src/remote/remote_installed_plugin_sync.rs"
+    },
+    {
+      "path": "codex-rs/core-plugins/src/remote_bundle.rs",
+      "sha256": "dcaea1a0eb784f090e4fa2e0977e3e2499c52f185a5c61f74354a81cb8773bc4",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core-plugins/src/remote_bundle.rs"
+    },
+    {
+      "path": "codex-rs/core-plugins/src/manager.rs",
+      "sha256": "bb3536e18db992785b92c51b8175de785242b095dd514235dfd9b0d25a28936e",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core-plugins/src/manager.rs"
+    },
+    {
+      "path": "codex-rs/features/src/lib.rs",
+      "sha256": "b7ef7bb1bb5517a82ae7c7294f2d7a072cb00f151a3d8f5025aa2e967b036937",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/features/src/lib.rs"
+    },
+    {
+      "path": "codex-rs/cloud-config/src/backend.rs",
+      "sha256": "f32d3eb308b9ee605fd018308f0600c75c05ddcf04235ebb94cdb9b8a2f6320e",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/cloud-config/src/backend.rs"
+    },
+    {
+      "path": "codex-rs/core-plugins/src/remote.rs",
+      "sha256": "3300172da48b0a96c32e4f17dd7c9c86d7f51382da6cdf7c4598fcf496b9aa2c",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core-plugins/src/remote.rs"
+    },
+    {
+      "path": "codex-rs/app-server/src/message_processor.rs",
+      "sha256": "e060124c3cec98dfccc02e73e0622212ffee2989c36e470043393adb966fcdb6",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server/src/message_processor.rs"
+    },
+    {
+      "path": "codex-rs/core/src/config/mod.rs",
+      "sha256": "b3eb0a9751522f7f6f7a7bd1b21253f2fcb4e669955819bfb6d0a7425e1fed9e",
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/config/mod.rs"
+    }
+  ],
+  "proof": "Read-only pinned release source inspection; source blobs verified against the release commit tree. No authenticated provider calls.",
+  "tagObject": "042fb41b7c813ac7999105e886b2b7aa715b5081",
+  "adapter": {
+    "repository": "agentclientprotocol/codex-acp",
+    "tag": "v1.11.0",
+    "commit": "51d6247ac7448485bfcf534b813196fafc26df59",
+    "files": [
+      {
+        "path": "src/CodexJsonRpcConnection.ts",
+        "sha256": "47a2aedbe704b49b850cc61ec29c3653b4d7282a703ca71905e085edb2048529",
+        "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexJsonRpcConnection.ts"
+      },
+      {
+        "path": "src/index.ts",
+        "sha256": "c9cddb3bd3bb653079785debde08991d521cf68e8eded15586b05681280d4693",
+        "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/index.ts"
+      }
+    ]
+  }
+}

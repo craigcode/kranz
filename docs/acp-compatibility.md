@@ -3,9 +3,15 @@
 S2 has deterministic transport tests, released-source inspection and live
 native-login text/report passes for both Claude and Codex on macOS arm64. The current
 ACP backend remains an opt-in worker backend. Validator use, same-feature resume,
-client filesystem/terminal services and enforced containment remain unavailable. The
-[one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
+client filesystem/terminal services and enforced containment in ordinary missions
+remain unavailable. The [one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
 and operator controls.
+
+The [S6 container proof path](acp-containment.md) now exercises the direct
+backend API with deterministic peers and basic contained Claude/Codex report
+passes using private authentication on the pinned Linux ARM64 image. Ordinary
+mission configuration still refuses enforced ACP; these narrow checks do not
+certify arbitrary images, Linux hosts or governed missions.
 
 ## Released baseline
 
@@ -103,6 +109,16 @@ of `CODEX_API_KEY` or `OPENAI_API_KEY`. The probe supplies a non-secret
 `DEFAULT_AUTH_REQUEST` selecting `api-key`, `NO_BROWSER=1`, and initial mode
 `read-only`.
 
+Before starting either Codex authentication path, the probe writes its own
+`CODEX_HOME/config.toml` with file-only credential storage and both `plugins`
+and `remote_plugin` disabled. These startup settings suppress plugin warmups
+outside this no-tools fixture; session-level settings arrive too late. This
+policy is specific to the compatibility probe, not ordinary missions. The
+preflight and start receipt include the exact TOML as `codexStartupConfig`;
+`codexStartupConfigWritten` distinguishes the preview from a completed write.
+The receipt records intended startup policy, not independently verified runtime
+enforcement. See the [source trace and offline checks](reviews/2026-09-19-codex-contained-egress.md).
+
 For an explicitly authorized existing CLI login, replace `credentialEnv` with
 `"nativeLoginHome": "/absolute/operator/home"`. Codex copies only
 `.codex/auth.json` into the disposable private home; it does not copy settings,
@@ -125,9 +141,9 @@ target/debug/examples/acp_compat_probe --check /absolute/private-config.json
 target/debug/examples/acp_compat_probe --run /absolute/private-config.json
 ```
 
-`--check` never starts an adapter or reads a credential value. It reports only
-whether the configured variable or native credential file is present and the
-receipt path is unused. File presence is not an authentication verification.
+`--check` never starts an adapter, writes startup configuration or reads a
+credential value. It reports credential presence, receipt availability and the
+intended startup configuration. File presence is not authentication verification.
 `--run` requires a fresh receipt path and refuses to overwrite an earlier attempt.
 The driver sends exactly one prompt, uses a new empty workspace/private HOME,
 limits capture to 512 events and 2 MiB, and aborts on observed tool activity.
@@ -187,3 +203,44 @@ it is not a new default. No further provider run is scheduled.
 These receipts complete the basic live-provider proof for S2. They do not prove
 client terminal routing, live permission behavior, contained ACP execution or
 the dependent S4/S5/S6/S7 acceptance requirements.
+
+## Contained Codex follow-up (2026-09-19 UTC)
+
+With plugins disabled in its private startup configuration, the pinned Linux
+ARM64 Codex image passed the same one-prompt fixture under Docker on the macOS
+Colima host. It used an isolated copy of the existing CLI login and returned the
+exact report with no tools, denied connections or workspace changes, in 8.5
+seconds. Cleanup was confirmed. The earlier attempt remains recorded as failed
+on denied egress; the successful follow-up did not broaden the allowlist or
+access Keychain. See the [contained proof record](compatibility/acp/codex-contained-plugins-disabled-proof.json)
+and [containment guide](acp-containment.md) for both receipts and the remaining
+containment, configuration-admission and mission-acceptance work. This is a basic
+report/authentication pass, not full S6 certification or Linux-host proof.
+
+## Contained Claude follow-up (2026-09-19 UTC)
+
+The same pinned Linux ARM64 image passed one authorized Claude report prompt
+under Docker on macOS/Colima using an explicitly provisioned
+`CLAUDE_CODE_OAUTH_TOKEN`. Claude ACP 0.77.0 / Agent SDK 0.3.270 returned the
+exact fixture in 5.2 seconds: no tool events, denied connections or workspace
+changes. Cleanup passed, and a separate owner-label query and daemon inventory
+confirmed absence. No retry, allowlist expansion or Keychain access occurred.
+The [proof summary](compatibility/acp/claude-contained-oauth-proof.json) links the
+[redacted receipt](compatibility/acp/claude-acp-contained-oauth.jsonl) and hashes
+both its private source and public export. Account-limit metadata and available
+command inventories are removed; the token and private workspace paths were
+scrubbed by the probe before persistence.
+
+The adapter initially emitted `kind: none` / `Not logged in`, despite the later
+successful environment-token-backed request. That notification is retained as
+observed, not treated as an authentication verdict. Model selection was the
+peer's `default`; usage named both `claude-sonnet-5` and
+`claude-haiku-4-5-20251001`, with an adapter-reported cost of USD 0.0426852.
+One ACP prompt is the enforced call budget; the underlying provider request
+count is not independently verified. The 120-second prompt and 180-second
+session limits remain time bounds, not a hard monetary cap.
+
+This closes the basic Claude contained report/authentication check. The
+[mount-helper cleanup follow-up](reviews/2026-09-19-mount-helper-cleanup.md)
+addresses the separate preflight lifetime gap. Broader containment qualification,
+production admission and S7 mission acceptance remain open.
