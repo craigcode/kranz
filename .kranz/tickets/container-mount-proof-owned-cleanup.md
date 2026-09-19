@@ -1,5 +1,6 @@
 ---
 state: open
+state-note: Owned Docker preflight implementation and local proofs are on PR 69; keep open until the new Linux Docker CI proof passes. See docs/reviews/2026-09-19-mount-helper-cleanup.md.
 title: Container mount proof — own and confirm helper cleanup on timeout
 priority: 1
 schedule: once

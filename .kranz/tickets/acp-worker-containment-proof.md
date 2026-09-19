@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime and pinned-image fixtures implemented; basic contained Codex and Claude report checks passed. See docs/compatibility/acp/codex-contained-plugins-disabled-proof.json and docs/compatibility/acp/claude-contained-oauth-proof.json. The first Codex denied-egress failure and historical cleanup failures remain retained. Concurrent recovery/deletion races are addressed; mount-proof timeout cleanup remains a blocking dependency. Broader qualification, production admission and S7 remain open.
+state-note: Docker lifetime and pinned-image fixtures implemented; basic contained Codex and Claude report checks passed. See docs/compatibility/acp/codex-contained-plugins-disabled-proof.json and docs/compatibility/acp/claude-contained-oauth-proof.json. The first Codex denied-egress failure and historical cleanup failures remain retained. Concurrent recovery/deletion races are addressed; mount-proof cleanup is implemented and awaiting its new Linux CI proof before the dependency is closed. Broader qualification, production admission and S7 remain open.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

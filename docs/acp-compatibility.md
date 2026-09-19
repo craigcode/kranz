@@ -241,5 +241,6 @@ count is not independently verified. The 120-second prompt and 180-second
 session limits remain time bounds, not a hard monetary cap.
 
 This closes the basic Claude contained report/authentication check. The
-mount-proof helper cleanup dependency, broader containment qualification,
+[mount-helper cleanup follow-up](reviews/2026-09-19-mount-helper-cleanup.md)
+addresses the separate preflight lifetime gap. Broader containment qualification,
 production admission and S7 mission acceptance remain open.

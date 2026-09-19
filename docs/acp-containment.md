@@ -64,6 +64,49 @@ hash and lease posture separately from the peer's capabilities/model report.
 `providerCompatibilityCertified: false` is deliberate until the corresponding
 live adapter/runtime/image pass has been reviewed.
 
+## Mount preflight ownership
+
+The bind-mount sentinel helper has separate ownership from the ACP worker.
+Its private recovery intent is written before Docker creation, and its random
+owner label identifies the full container ID used for removal. The host command
+has the existing 90-second proof deadline; cleanup has a separate 15-second
+budget, including up to five seconds for confirmed daemon absence. A timed-out
+or cancelled proof remains failed even when cleanup succeeds.
+
+The helper runs a fixed shell script as PID 1 in a private Linux namespace,
+with no network, no capabilities and a read-only image. Only its fresh sentinel
+directory is writable. A separate 85-second guest watchdog interrupts PID 1
+without reading the mount being tested, bounding the sentinel script even after
+engine death or blocked guest filesystem I/O. The inspected image ID is frozen
+before creation; the helper overrides the image entrypoint. The ordinary
+preflight still pulls a missing configured image within its deadline; the ACP
+worker's separate requirement for an already installed pinned image is unchanged.
+
+A crash between create and start can leave a stopped container. An interrupted
+create can also complete late. These cases retain the private
+`kranz-mount-owner-*/owner.json` intent and probe directory; an empty early
+inventory does not prove a cancelled create will never appear. A failed inventory
+or uncertain removal never grants admission. Recovery uses the original Docker
+endpoint, the recorded owner label and inspected full IDs, followed by a successful
+empty inventory. Never remove by name or use a broad prune. The ledger contains
+no provider credentials and is not mounted in the guest. After engine death it
+remains even if the guest watchdog and Docker `--rm` have removed the helper.
+
+This helper ownership path is supported for Docker on macOS/Linux. Calls that
+require a mount proof refuse Podman, nerdctl, Apple Container and unsupported
+hosts before creating a probe. Ordinary Linux paths that rely on the existing CI
+mount contract rather than runtime preflight are unchanged.
+
+Run the deterministic and real Docker preflight proofs with:
+
+```sh
+KRANZ_MOUNT_CONTAINER_TESTS=1 cargo test --workspace mount_helper_v1 -- --nocapture
+```
+
+The CI proof job requires every real test by name and rejects its skip marker.
+See the [mount-helper review](reviews/2026-09-19-mount-helper-cleanup.md) for the
+retained test results and limitations.
+
 ## Proofs and next acceptance boundary
 
 `acp_containment_v1` tests use the real ACP backend and a deterministic Python
@@ -189,9 +232,9 @@ cargo build --workspace --example acp_compat_probe
 python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_probe sha256:<image-id>
 ```
 
-Remaining S6 work includes mount-proof helper cleanup, qualification beyond the
-Claude/Codex no-tools report fixtures and corresponding narrow configuration
-admission.
+Remaining S6 work includes qualification beyond the Claude/Codex no-tools
+report fixtures and corresponding narrow configuration admission. Mount-helper
+cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
 deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).
 The historical failure remains retained; the race fixes do not establish broader

@@ -477,6 +477,25 @@ jobs:
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
             exit 1
           fi
+      - name: Prove mount helper ownership and interrupted cleanup
+        env:
+          KRANZ_MOUNT_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-mount-helper-proof.log"
+          set +e
+          cargo test --workspace mount_helper_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          for proof in real_round_trip_and_concurrent_helpers real_timeout_and_guest_watchdog_remove_blocked_writer real_cancellation_and_dropped_future_cleanup real_name_collision_preserves_unrelated_container real_engine_death_bounds_guest_and_retains_intent real_interrupted_creation_removes_the_daemon_object real_unavailable_inventory_fails_with_private_recovery; do
+            grep -q "test sandbox_container::mount_proof::tests::mount_helper_v1_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-MOUNT-HELPER' "$log"; then
+            exit 1
+          fi
       - name: Check the bounded ACP probe without a provider
         run: |
           cargo test --workspace --example acp_compat_probe
