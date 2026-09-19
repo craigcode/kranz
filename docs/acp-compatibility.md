@@ -202,3 +202,16 @@ it is not a new default. No further provider run is scheduled.
 These receipts complete the basic live-provider proof for S2. They do not prove
 client terminal routing, live permission behavior, contained ACP execution or
 the dependent S4/S5/S6/S7 acceptance requirements.
+
+## Contained Codex follow-up (2026-09-19 UTC)
+
+With plugins disabled in its private startup configuration, the pinned Linux
+ARM64 Codex image passed the same one-prompt fixture under Docker on the macOS
+Colima host. It used an isolated copy of the existing CLI login and returned the
+exact report with no tools, denied connections or workspace changes, in 8.5
+seconds. Cleanup was confirmed. The earlier attempt remains recorded as failed
+on denied egress; the successful follow-up did not broaden the allowlist or
+access Keychain. See the [contained proof record](compatibility/acp/codex-contained-plugins-disabled-proof.json)
+and [containment guide](acp-containment.md) for both receipts and the remaining
+Claude, configuration-admission and mission-acceptance work. This is a basic
+report/authentication pass, not full S6 certification or Linux-host proof.

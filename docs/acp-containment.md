@@ -149,16 +149,25 @@ An offline comparison confirms the exact fixed report. The overall probe
 **failed**: five connection attempts to
 `sdmntprsouthcentralus.oaiusercontent.com:443` were denied. The probe confirmed
 relay cleanup, and a separate daemon inventory confirmed the worker was absent.
-No retry or allowlist expansion followed. The export replaces the authentication
+That invocation made no retry or allowlist expansion. The export replaces the authentication
 account and its label; it preserves the failed terminal result. The additional
 endpoint remains blocked. The [pinned-source investigation](reviews/2026-09-19-codex-contained-egress.md)
 identifies automatic account-plugin downloads as a plausible cause and verifies
-the proposed plugin-disable configuration offline. Exact request attribution
+the plugin-disable configuration offline. Exact request attribution
 remains unproven. The probe now writes that configuration into its private
 startup home before launching Codex; synthetic key/login peers verify it before
-ACP initialization in native and contained runs. A new bounded live attempt is
-still needed to test the effect on authenticated startup. Claude still needs a
-Linux-compatible credential and its own authorized probe.
+ACP initialization in native and contained runs.
+
+After the operator's new go-ahead, one further contained Codex run used the same
+image, login channel, prompt, time bounds and allowlist with that startup policy.
+It **passed** in 8.5 seconds: exact report, no tool events, zero denied
+connections, unchanged workspace and confirmed cleanup. The peer reported
+`gpt-6-astra`. The [redacted receipt](compatibility/acp/codex-acp-contained-plugins-disabled.jsonl)
+and [proof summary](compatibility/acp/codex-contained-plugins-disabled-proof.json)
+retain the result, source-receipt digest and separate owner-label absence check.
+This supports the plugin-startup hypothesis but does not attribute the first
+run's five requests. The original failure remains a failure. Claude still needs
+a Linux-compatible credential and its own authorized probe.
 
 For a provider-free end-to-end check of the probe itself:
 
@@ -167,8 +176,10 @@ cargo build --workspace --example acp_compat_probe
 python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_probe sha256:<image-id>
 ```
 
-Remaining S6 work is pinned vendor-image/runtime/authentication proof and the
-corresponding narrow configuration admission. S7 then exercises the full mission,
+Remaining S6 work includes Claude's contained proof, qualification beyond the
+Codex no-tools report fixture and corresponding narrow configuration admission.
+The observed synthetic cleanup flake is recorded in the
+[review](reviews/2026-09-18-acp-owned-container.md). S7 then exercises the full mission,
 one-call consent, independent defect detection/repair, exact-tree merge and
 portable audit export. These fixtures do not authorize provider calls, certify
 arbitrary images, enable client filesystem/terminal RPCs or change defaults.

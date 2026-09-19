@@ -1,0 +1,39 @@
+{
+  "recordedAt": "2026-09-19T05:22:56.687766+00:00",
+  "engineCommit": "a94e61cc764be4d81bcf00cfb41504637b503dcc",
+  "provider": "codex",
+  "adapter": {
+    "name": "@agentclientprotocol/codex-acp",
+    "title": "Codex",
+    "version": "1.11.0"
+  },
+  "runtime": "0.153.4",
+  "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "modelReportedByPeer": "gpt-6-astra",
+  "receipt": "codex-acp-contained-plugins-disabled.jsonl",
+  "privateReceiptSha256": "f2a9444beab79a720c040cc5cbfd7ac2eef052f0782a40facfc25cf9d0f360f6",
+  "exportRedactions": [
+    "raw.params.authStatus.account",
+    "raw.params.authStatus.label"
+  ],
+  "promptLimit": 1,
+  "promptSeconds": 120,
+  "overallSeconds": 180,
+  "hardDollarCap": false,
+  "keychainUsed": false,
+  "authentication": "private copy of existing CLI login",
+  "allowlistExpanded": false,
+  "startupConfig": "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n",
+  "passed": true,
+  "toolEvents": 0,
+  "deniedConnections": 0,
+  "workspaceUnchanged": true,
+  "exactReportVerified": true,
+  "elapsedMillis": 8534,
+  "containerAbsenceConfirmedByOwnerLabel": true,
+  "daemonInventoryEmptyAfterRun": true,
+  "initialFailurePreserved": "codex-acp-contained-denied-egress.jsonl",
+  "exactOriginalEndpointAttributionProven": false,
+  "productionAdmissionEnabled": false,
+  "fullContainmentCertification": false
+}

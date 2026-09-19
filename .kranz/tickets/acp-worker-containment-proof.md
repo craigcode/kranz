@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime and pinned-image fixtures implemented; contained Codex authenticated but failed on denied egress. Private plugin-disabled startup configuration and synthetic key/login checks now follow docs/reviews/2026-09-19-codex-contained-egress.md; a new authorized live proof, Claude credentials/proof, production admission and S7 remain open.
+state-note: Docker lifetime and pinned-image fixtures implemented; a newly authorized contained Codex report check passed with plugins disabled and the allowlist unchanged, preserving the first denied-egress failure. See docs/compatibility/acp/codex-contained-plugins-disabled-proof.json. Claude proof, broader qualification including the recorded synthetic cleanup flake, production admission and S7 remain open.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

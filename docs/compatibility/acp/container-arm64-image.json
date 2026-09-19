@@ -34,7 +34,18 @@
   "focusedContainmentTests": 11,
   "requiredDaemonProofs": 8,
   "buildAndFixtureProviderCalls": 0,
-  "liveProbeCalls": 1,
-  "liveProbeReceipt": "codex-acp-contained-denied-egress.jsonl",
-  "liveProbePassed": false
+  "liveProbeCalls": 2,
+  "liveProbeReceipt": "codex-acp-contained-plugins-disabled.jsonl",
+  "liveProbePassed": true,
+  "liveProbeHistory": [
+    {
+      "receipt": "codex-acp-contained-denied-egress.jsonl",
+      "passed": false
+    },
+    {
+      "receipt": "codex-acp-contained-plugins-disabled.jsonl",
+      "passed": true
+    }
+  ],
+  "liveProbeProof": "codex-contained-plugins-disabled-proof.json"
 }

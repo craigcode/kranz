@@ -93,13 +93,19 @@ ordinary missions may need separately approved plugins. It is a workload
 reduction, not a replacement for the container network boundary, and the receipt
 does not claim independent verification of the runtime's effective configuration.
 
-After that change passes review and regression checks, prepare one newly
-authorized run with the same image, credentials channel, fixed prompt, allowlist
-and time bounds. Preserve the original failure and write a new receipt. Require
-zero denied connections, the exact report, no tool use or workspace changes,
-and confirmed cleanup. If denials persist, stop and collect narrowly scrubbed
-component diagnostics before considering any endpoint policy change. Avoid
-publishing raw plugin download URLs, which may contain signed query strings.
+After review and the full regression gates, the operator's new go-ahead covered
+one further run with the same image, credentials channel, fixed prompt, allowlist
+and time bounds. The [new proof summary](../compatibility/acp/codex-contained-plugins-disabled-proof.json)
+and linked redacted receipt record a pass in 8.5 seconds: zero denied connections,
+the exact report, no tools or workspace changes, and confirmed cleanup. A
+separate owner-label query also confirmed container absence. The peer reported
+`gpt-6-astra`. The original failed receipt is preserved.
+
+This result is consistent with the plugin-startup explanation; it is not direct
+attribution of the original five requests. If the destination reappears in later
+authorized qualification, retain the failure and collect narrowly scrubbed
+component diagnostics before considering any endpoint policy change. Raw plugin
+download URLs may contain signed query strings and should not be published.
 
 This investigation changes neither production ACP admission nor the S6/S7
 completion state. Claude still needs its own Linux-compatible credential and
@@ -108,8 +114,9 @@ authorized contained proof.
 ## Review
 
 Correctness: observed failure, offline configuration behavior and inferred cause
-are separate claims. Architecture: the proposed control belongs to probe startup,
+are separate claims. Architecture: the control belongs to probe startup,
 outside session prompts. Security: the endpoint remains denied and no additional
 authority was granted. Readability: source and runtime receipts are linked from
 the operator guide. Performance: the investigation made three bounded offline
-configuration queries and no provider calls. This is a self-review.
+configuration queries and no provider calls; the subsequent implementation
+received one separately authorized live check. This is a self-review.

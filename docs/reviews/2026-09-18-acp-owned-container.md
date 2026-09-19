@@ -84,7 +84,8 @@ the optional smoke job was skipped. The [endpoint investigation](2026-09-19-code
 keeps the unexpected hostname blocked and records a credential-free configuration
 check against the pinned image. The subsequent probe change writes file-only
 credential storage and disabled plugin features into the disposable Codex home
-before adapter startup. No further live call or provider certification is claimed.
+before adapter startup. The separately authorized follow-up is recorded below;
+full provider containment certification remains open.
 
 ## Probe startup follow-up
 
@@ -115,5 +116,14 @@ that the earlier failed run passed.
 
 The follow-up workspace suite passed 3,022 tests with zero failures and ten
 existing ignores, with both Docker proof suites enabled. Workspace Clippy with
-warnings denied and formatting passed. Knowledge freshness and domain lint
+warnings denied, formatting and build passed. Knowledge freshness and domain lint
 (984 files) passed.
+
+One newly authorized contained Codex call then passed with that policy in 8.5
+seconds, reporting `gpt-6-astra`. The fixed report, no-tool constraint, zero denied
+connections and unchanged workspace passed the probe, including cleanup. A
+separate daemon query by immutable owner label confirmed absence. The
+[proof summary](../compatibility/acp/codex-contained-plugins-disabled-proof.json)
+links the account-redacted receipt and hashes its private source. No retry,
+allowlist expansion or Keychain access occurred. This closes this basic Codex
+report check, not Claude proof, production admission or S7 acceptance.
