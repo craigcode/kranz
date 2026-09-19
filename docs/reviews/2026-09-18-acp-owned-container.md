@@ -73,5 +73,8 @@ run without concurrent compiler jobs. The earlier native cancellation regression
 was fixed without changing sandbox-off semantics, and all 27 native ACP tests
 pass.
 
-Linux CI must verify the new required proofs on the pushed commit before this
-slice is accepted. This is a five-axis self-review, not an independent audit.
+Linux CI verified the required daemon proofs and the provider-free contained
+probe on commit `6d64b4c`. Its knowledge-refresh check caught the newly changed
+CI file against the guide's prior UTC verification date; the guide was reviewed,
+updated to describe the new checks, and reverified. This is a five-axis
+self-review, not an independent audit.

@@ -2,8 +2,10 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-19
 verified_against:
+  - crates/engine/src/acp_container.rs
+  - crates/engine/src/acp_container/tests.rs
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
   - crates/engine/src/gate_evaluation/lifecycle.rs
@@ -43,6 +45,15 @@ print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
 exercise protocol, byte pinning, artifact imports and containment without model
 calls. See [external evaluators](../../external-evaluators.md) for API boundaries,
 retention and recovery limits.
+
+The same Linux job also runs `acp_containment_v1` with
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all eight real daemon proofs by
+name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
+tests do not substitute for those proofs. It then exercises the bounded ACP
+compatibility probe with a deterministic contained peer, without provider
+credentials or model calls. These checks cover the direct-backend Docker proof
+path; ordinary enforced-ACP mission configuration remains closed pending vendor
+qualification. See [ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite
 
