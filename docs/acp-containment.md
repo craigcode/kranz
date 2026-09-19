@@ -115,6 +115,10 @@ peer. Required Docker tests cover:
 - normal completion and an actual feature commit in an isolated worktree;
 - protected token, audit, Git and outside-workspace I/O, including shell and
   nested detached children;
+- a detached stdio MCP tool reached through initialize, initialized, tools/list
+  and tools/call, exercising those same thirteen denials without ACP callbacks;
+  positive controls require the tool to write its private HOME and the actual
+  workspace deliverable, with Docker control variables absent;
 - read-only lease and supervisor-memory attacks;
 - cancellation, Drop and engine `SIGKILL` with detached children, ignored stdin,
   a full input pipe and an attempted `SIGSTOP` against the supervisor;
@@ -133,6 +137,12 @@ On a Mac whose VM shares only the home directory, set `KRANZ_SCRATCH_ROOT` to
 an existing, shared, private scratch base. The fixtures and control directories
 are created beneath it. CI requires each real proof by name and rejects the
 explicit skip marker; a green default suite alone does not establish containment.
+
+The MCP fixture pins the [2025-03-26 lifecycle](https://modelcontextprotocol.io/specification/2025-03-26/basic/lifecycle)
+and [tool-call envelope](https://modelcontextprotocol.io/specification/2025-03-26/server/tools).
+It proves a descendant boundary, not vendor MCP integration or general MCP
+protocol conformance. The engine commits the actual tool-written file and checks
+that the primary checkout and protected base ref stayed unchanged.
 
 The same tests can be run against a prepared vendor image by setting
 `KRANZ_ACP_PROOF_IMAGE` to its immutable image ID. This changes only the test
@@ -232,9 +242,22 @@ cargo build --workspace --example acp_compat_probe
 python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_probe sha256:<image-id>
 ```
 
-Remaining S6 work includes qualification beyond the Claude/Codex no-tools
-report fixtures and corresponding narrow configuration admission. Mount-helper
-cleanup has its own proof and review above; it does not close S6.
+The [MCP descendant follow-up](reviews/2026-09-19-acp-mcp-descendant.md) adds a
+synthetic tool-boundary proof and retains the later Linux gate-startup failure.
+Remaining S6 work is:
+
+1. Qualify the pinned Claude and Codex adapters while actually using their native
+   tools inside the wrapper, with private authentication/state, a real worktree
+   change, permission evidence and confirmed cleanup. The existing report-only
+   passes do not cover this. Prepare a bounded workload before requesting a new
+   live-call authorization.
+2. Retain equivalent adapter/runtime/image/platform receipts on Linux before
+   admitting that combination. Linux synthetic CI proves the wrapper boundary;
+   it does not launch or qualify the vendor adapters.
+3. Wire only the qualified combinations through ordinary worker configuration,
+   preserving pre-spawn refusal for every unsupported pair and current defaults.
+
+Mount-helper cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
 deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).
 The historical failure remains retained; the race fixes do not establish broader

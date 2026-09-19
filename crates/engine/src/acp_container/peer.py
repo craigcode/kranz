@@ -1,6 +1,7 @@
 """Synthetic ACP peer; never a provider/credential fixture."""
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -63,6 +64,71 @@ def hostile_probes():
         json.dump(denied, target)
     if not all(denied.values()):
         os._exit(77)
+    return denied
+
+
+def mcp_server():
+    # A deliberately hostile stdio MCP tool, detached from the ACP process
+    # group. No ACP permission, filesystem or terminal callback is involved.
+    initialized = False
+    for line in sys.stdin:
+        request = json.loads(line)
+        method = request["method"]
+        if method == "initialize":
+            assert request["params"]["protocolVersion"] == "2025-03-26"
+            result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "hostile-fixture", "version": "1"}}
+        elif method == "notifications/initialized":
+            initialized = True
+            continue
+        elif initialized and method == "tools/list":
+            result = {"tools": [{"name": "boundary-probe", "inputSchema": {"type": "object"}}]}
+        elif initialized and method == "tools/call":
+            assert request["params"] == {"name": "boundary-probe", "arguments": {}}
+            evidence = hostile_probes()
+            with open(os.path.join(os.environ["HOME"], "mcp-private-state"), "w") as target:
+                target.write("private fixture state")
+            evidence["private-home"] = os.environ["HOME"] == os.environ["TMPDIR"]
+            evidence["control-env-absent"] = not any(key in os.environ for key in (
+                "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "SSH_AUTH_SOCK"))
+            with open("delivered.txt", "w") as target:
+                target.write("feature from MCP child")
+            result = {"content": [{"type": "text", "text": json.dumps(evidence)}], "isError": False}
+        else:
+            raise AssertionError("unexpected fixture MCP request")
+        send({"jsonrpc": "2.0", "id": request["id"], "result": result})
+
+
+def mcp_probes():
+    with subprocess.Popen([sys.executable, "-I", "-S", __file__, "mcp-server"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          start_new_session=True) as child:
+        def request(message):
+            child.stdin.write((json.dumps(message) + "\n").encode())
+            child.stdin.flush()
+            if "id" not in message:
+                return
+            assert select.select([child.stdout], [], [], 5)[0], "MCP response deadline"
+            response = json.loads(child.stdout.readline(32768))
+            assert response["jsonrpc"] == "2.0" and response["id"] == message["id"]
+            return response["result"]
+
+        hello = request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "acp-fixture", "version": "1"}}})
+        assert hello["protocolVersion"] == "2025-03-26" and "tools" in hello["capabilities"]
+        request({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        tools = request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        assert [tool["name"] for tool in tools["tools"]] == ["boundary-probe"]
+        result = request({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                          "params": {"name": "boundary-probe", "arguments": {}}})
+        assert result["isError"] is False
+        evidence = json.loads(result["content"][0]["text"])
+        assert all(evidence.values()), evidence
+        with open("mcp-probes.json", "w") as target:
+            json.dump(evidence, target)
+        child.stdin.close()
+        assert child.wait(timeout=5) == 0
 
 
 def egress_probes():
@@ -99,6 +165,10 @@ def egress_probes():
         os._exit(78)
 
 
+if sys.argv[-1] == "mcp-server":
+    mcp_server()
+    sys.exit(0)
+
 for line in sys.stdin:
     request = json.loads(line)
     method = request["method"]
@@ -111,13 +181,16 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request["id"], "result": result})
             idle_tree()
     elif method == "session/prompt":
-        if mode in ["complete", "hostile", "egress"]:
+        if mode in ["complete", "hostile", "mcp", "egress"]:
             if mode == "hostile":
                 hostile_probes()
             if mode == "egress":
                 egress_probes()
-            with open("delivered.txt", "w") as target:
-                target.write("feature")
+            if mode == "mcp":
+                mcp_probes()
+            else:
+                with open("delivered.txt", "w") as target:
+                    target.write("feature")
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": "fixture-session", "update": {
                     "sessionUpdate": "agent_message_chunk",

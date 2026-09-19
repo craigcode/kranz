@@ -510,6 +510,17 @@ fn git(root: &Path, args: &[&str]) -> String {
 
 #[tokio::test]
 async fn acp_containment_v1_hostile_io_and_worktree_delivery() {
+    hostile_worktree_delivery("hostile").await;
+}
+
+#[tokio::test]
+async fn acp_containment_v1_mcp_child_cannot_bypass_boundary() {
+    tokio::time::timeout(Duration::from_secs(90), hostile_worktree_delivery("mcp"))
+        .await
+        .expect("bounded MCP descendant proof");
+}
+
+async fn hostile_worktree_delivery(mode: &str) {
     if !enabled() {
         return;
     }
@@ -547,7 +558,7 @@ async fn acp_containment_v1_hostile_io_and_worktree_delivery() {
     std::fs::write(&outside, "unchanged").unwrap();
     let config = std::fs::read(primary.join(".git/config")).unwrap();
     let name = name();
-    let mut spec = spec(root, &name, "hostile");
+    let mut spec = spec(root, &name, mode);
     for (key, path) in [
         ("FIXTURE_OUTSIDE", outside.clone()),
         ("FIXTURE_GIT_CONFIG", primary.join(".git/config")),
@@ -562,7 +573,15 @@ async fn acp_containment_v1_hostile_io_and_worktree_delivery() {
     .start(spec)
     .await
     .unwrap();
-    while session.next_event().await.unwrap().is_some() {}
+    while let Some(event) = session.next_event().await.unwrap() {
+        assert!(
+            !matches!(
+                event,
+                AgentEvent::PermissionRequested { .. } | AgentEvent::ToolUse { .. }
+            ),
+            "fixture must bypass ACP callbacks: {event:?}"
+        );
+    }
     assert!(
         matches!(session.exit_status(), Some(SessionExit::Completed)),
         "{:?}",
@@ -572,6 +591,22 @@ async fn acp_containment_v1_hostile_io_and_worktree_delivery() {
         serde_json::from_slice(&std::fs::read(workspace.join("probes.json")).unwrap()).unwrap();
     assert_eq!(probes.len(), 13);
     assert!(probes.values().all(|v| *v), "{probes:?}");
+    if mode == "mcp" {
+        let mut mcp: HashMap<String, bool> =
+            serde_json::from_slice(&std::fs::read(workspace.join("mcp-probes.json")).unwrap())
+                .unwrap();
+        assert_eq!(mcp.remove("private-home"), Some(true));
+        assert_eq!(mcp.remove("control-env-absent"), Some(true));
+        assert_eq!(mcp, probes, "tool response must carry all boundary probes");
+        assert_eq!(
+            std::fs::read_to_string(root.join("home/mcp-private-state")).unwrap(),
+            "private fixture state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("delivered.txt")).unwrap(),
+            "feature from MCP child"
+        );
+    }
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
     assert_eq!(std::fs::read(primary.join(".git/config")).unwrap(), config);
     assert_eq!(git(&primary, &["rev-parse", "HEAD"]), base);

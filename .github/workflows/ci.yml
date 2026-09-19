@@ -438,7 +438,10 @@ jobs:
         run: |
           log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
           set +e
-          cargo test --workspace gate_subprocess_v1 -- --nocapture >"$log" 2>&1
+          # These are lifecycle proofs, not a daemon throughput benchmark.
+          # Keep unrelated fixtures from competing for the five-second control
+          # deadline; deliberate concurrency remains inside its own proofs.
+          cargo test --workspace gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
@@ -471,7 +474,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery filtered_egress_uses_existing_relay_and_records_denial; do
+          for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
             grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
@@ -501,6 +504,13 @@ jobs:
           cargo test --workspace --example acp_compat_probe
           cargo build --workspace --example acp_compat_probe
           python3 scripts/check-acp-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+      - name: Retain synthetic container proof logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: synthetic-container-proof-logs
+          path: ${{ runner.temp }}/kranz-*-proof.log
+          if-no-files-found: warn
 
   # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
   # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A

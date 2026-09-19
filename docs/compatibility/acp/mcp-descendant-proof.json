@@ -1,0 +1,130 @@
+{
+  "proof": "acp-mcp-descendant-v1",
+  "dateUtc": "2026-09-19",
+  "host": "macOS ARM64 / Colima Linux Docker",
+  "fixtureImage": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+  "vendorImage": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "vendorImageMeaning": "Synthetic peers only; installed vendor adapters were not invoked.",
+  "providerCalls": 0,
+  "vendorCredentialAccess": false,
+  "keychainAccess": false,
+  "productionAdmissionEnabled": false,
+  "sourceSha256": {
+    ".github/workflows/ci.yml": "6669c551920200ac5a07fb63068c256d0af150a7a0672904cd8d5135b2847b85",
+    "crates/engine/src/acp_container/peer.py": "6551a1b50277ff6b736c6d3020b21e1b030b7f6d40713e53b8561281482b0b73",
+    "crates/engine/src/acp_container/tests.rs": "79e84eb505f9535b69b79321ff899d3fd80ccfdc612da4e7e0d046e2c558faf8",
+    "crates/engine/tests/backend_acp_test.rs": "9499beab4347cb008eb9928422e93ddd549f51f849a9d1a7e84dd01443d6bfc5"
+  },
+  "mcpProtocolVersion": "2025-03-26",
+  "mcpSequence": [
+    "initialize",
+    "notifications/initialized",
+    "tools/list",
+    "tools/call"
+  ],
+  "denialProbes": 13,
+  "requiredDaemonProofs": 9,
+  "positiveControls": [
+    "MCP tool response carries all denial results",
+    "Tool writes private HOME state",
+    "Tool writes actual committed worktree deliverable",
+    "Docker control and SSH-agent variables absent",
+    "No ACP permission or tool-use callback"
+  ],
+  "workspaceTests": {
+    "passed": 3041,
+    "failed": 0,
+    "ignored": 10,
+    "logSha256": "ac31fdae68c570c8d987d0c715796b816cafc9c8aca0845353983870d6eb45c2",
+    "allThreeDockerProofOptInsEnabled": true
+  },
+  "gates": [
+    {
+      "gate": "workspace-tests",
+      "exit": 0,
+      "seconds": 222.7
+    },
+    {
+      "gate": "clippy",
+      "exit": 0,
+      "seconds": 12.36
+    },
+    {
+      "gate": "format",
+      "exit": 0,
+      "seconds": 1.1
+    },
+    {
+      "gate": "build",
+      "exit": 0,
+      "seconds": 0.38
+    },
+    {
+      "gate": "build-probe",
+      "exit": 0,
+      "seconds": 0.14
+    }
+  ],
+  "focusedMcp": {
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "logSha256": "965443537d84f55ec14c8ff7bd7af283c99dfca4a936c58c0f652cb17d3d6d27"
+  },
+  "vendorImageSynthetic": {
+    "passed": 15,
+    "failed": 0,
+    "ignored": 0,
+    "logSha256": "763d926b9b28ea09b3c58c7ee08309efb51c2b52cc7c0228353368fc91b55eee"
+  },
+  "serializedEvaluatorSuite": {
+    "passed": 17,
+    "failed": 0,
+    "ignored": 0,
+    "logSha256": "dbbd520b97f359a88d1cad5451f1b62ec8e43c36cf067adc95cf28cd97de996d"
+  },
+  "nativeHandshakeRejectionAndTimeout": {
+    "passed": 2,
+    "failed": 0,
+    "ignored": 0,
+    "logSha256": "3a6f2f58e62d56cc86ad53e26d0004af6b11f89f7a5790bbe05bf7875d463b0f"
+  },
+  "retainedFailures": [
+    {
+      "kind": "Linux concurrent evaluator startup",
+      "head": "8e03511fedc3edf33e859922c88b7c4b060ecf5d",
+      "job": "https://github.com/craigcode/kranz/actions/runs/35460318903/job/105942887576",
+      "passed": false,
+      "failedTests": 4,
+      "observed": "Docker create control exceeded five seconds before ACP/mount proof stages",
+      "cause": "Host/daemon cause unproven; concurrent contention is a hypothesis",
+      "change": "Serialize unrelated CI lifecycle cases; no production deadline or retry change",
+      "logSha256": "39df5c533939714ae5adbfe35529c22fbfc62c7c894c098df1869882ee4c3da5"
+    },
+    {
+      "kind": "Local workspace native handshake rejection",
+      "passed": false,
+      "failedTests": 1,
+      "test": "acp_compat_v1_handshake_rejects_version_and_missing_session_identity",
+      "observed": "Three-second outer test deadline elapsed",
+      "cause": "Exact elapsed-time source unproven",
+      "change": "Require precise semantic rejection and ESRCH after cleanup; test-only outer budget 35 seconds; production deadlines unchanged",
+      "logSha256": "8a66eca13b98b599f5babb360e0d619b53d75978fb139382c02db3256c25692f"
+    }
+  ],
+  "requiredLinuxCheck": "rust-linux-external-evaluator",
+  "review": "docs/reviews/2026-09-19-acp-mcp-descendant.md",
+  "scopeLimits": [
+    "Vendor tool-use qualification remains open",
+    "Linux vendor adapter receipts remain open",
+    "No production ACP admission",
+    "No S7 governed-mission acceptance claim"
+  ],
+  "dockerServerVersion": "29.2.1",
+  "finalDaemonInventory": {
+    "containers": 0,
+    "egressNetworks": 0,
+    "volumes": 0
+  },
+  "colimaRestoredToStopped": true
+}
