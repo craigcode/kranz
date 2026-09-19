@@ -376,6 +376,66 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
 }
 
 #[tokio::test]
+async fn acp_containment_v1_removal_waits_for_confirmed_daemon_absence() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let docker = root.path().join("fake-docker");
+    // The daemon rejects a concurrent rm, then lists the deleting container
+    // once more before it disappears. There must be no repeated rm request.
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1" in
+    container)
+        if [ ! -e "$0.removing" ]; then
+            printf '%064d\n' 1
+        elif [ ! -e "$0.observed" ]; then
+            touch "$0.observed"
+            printf '%064d\n' 1
+        fi
+        ;;
+    rm)
+        printf 'request\n' >> "$0.requests"
+        [ ! -e "$0.removing" ] || exit 99
+        touch "$0.removing"
+        echo 'removal is already in progress' >&2
+        exit 1
+        ;;
+    *) exit 98 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = DockerEvaluator::new(&docker).unwrap();
+    remove(&client, "fixture-owner", true, true).await.unwrap();
+    assert!(root.path().join("fake-docker.observed").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("fake-docker.requests")).unwrap(),
+        "request\n"
+    );
+}
+
+#[tokio::test]
+async fn acp_containment_v1_removal_never_accepts_a_persisting_namespace() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let docker = root.path().join("fake-docker");
+    std::fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1\" in\ncontainer) printf '%064d\\n' 1 ;;\nrm) exit 0 ;;\n*) exit 98 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = DockerEvaluator::new(&docker).unwrap();
+    let result = remove(&client, "fixture-owner", true, true).await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("daemon removal could not be confirmed within deadline"));
+}
+
+#[tokio::test]
 async fn acp_containment_v1_name_collision_never_removes_an_unowned_container() {
     if !enabled() {
         return;

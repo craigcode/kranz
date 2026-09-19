@@ -45,7 +45,9 @@ and [dumpability](https://man7.org/linux/man-pages/man2/PR_SET_DUMPABLE.2const.h
 Normal completion, cancellation and dropped futures also request daemon removal.
 A random immutable owner label identifies the container; cleanup deletes the
 inspected container ID, never an arbitrary caller-supplied name. A successful
-daemon inventory must confirm absence. A name collision cannot confer ownership.
+daemon inventory must confirm absence. If Docker's automatic deletion is still
+pending, cleanup polls within a five-second confirmation budget; a removal
+acknowledgement alone is insufficient. A name collision cannot confer ownership.
 Unconfirmed creation or cleanup retains the private ledger and fails visibly;
 it does not become a successful run. The ledger includes image, supervisor hash,
 owner identity and container name, without recording host control credentials.
@@ -178,8 +180,10 @@ python3 scripts/check-acp-probe.py /absolute/target/debug/examples/acp_compat_pr
 
 Remaining S6 work includes Claude's contained proof, qualification beyond the
 Codex no-tools report fixture and corresponding narrow configuration admission.
-The observed synthetic cleanup flake is recorded in the
-[review](reviews/2026-09-18-acp-owned-container.md). S7 then exercises the full mission,
+The observed synthetic cleanup flake and subsequently reproduced recovery and
+deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).
+The historical failure remains retained; the race fixes do not establish broader
+provider qualification. S7 then exercises the full mission,
 one-call consent, independent defect detection/repair, exact-tree merge and
 portable audit export. These fixtures do not authorize provider calls, certify
 arbitrary images, enable client filesystem/terminal RPCs or change defaults.

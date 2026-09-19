@@ -49,7 +49,9 @@ retention and recovery limits.
 The same Linux job also runs `acp_containment_v1` with
 `KRANZ_ACP_CONTAINER_TESTS=1`. It requires all eight real daemon proofs by
 name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
-tests do not substitute for those proofs. It then exercises the bounded ACP
+tests do not substitute for those proofs. Synthetic control tests additionally
+require confirmed absence after asynchronous deletion and failure when a
+namespace persists. It then exercises the bounded ACP
 compatibility probe with a deterministic contained peer, without provider
 credentials or model calls. These checks cover the direct-backend Docker proof
 path; ordinary enforced-ACP mission configuration remains closed pending vendor

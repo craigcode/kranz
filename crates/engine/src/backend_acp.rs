@@ -670,7 +670,7 @@ impl AgentBackend for AcpBackend {
             job,
             stdin: Some(stdin),
             child_status: None,
-            cleanup_failed: false,
+            cleanup_failure: None,
             drain_deadline: None,
             lines: BoundedLines::new_strict(stdout),
             stderr_buf,
@@ -706,11 +706,10 @@ impl AgentBackend for AcpBackend {
             return Err(EngineError::Backend(format!(
                 "{message}; startup stderr after cleanup: {}{}",
                 session.stderr_tail(),
-                if session.cleanup_failed {
-                    "; cleanup unconfirmed"
-                } else {
-                    ""
-                },
+                session
+                    .cleanup_failure
+                    .map(|cause| format!("; cleanup unconfirmed: {cause}"))
+                    .unwrap_or_default(),
             )));
         }
         Ok(Box::new(session))
@@ -761,7 +760,7 @@ pub struct AcpSession {
     job: Option<win_job::JobHandle>,
     stdin: Option<ChildStdin>,
     child_status: Option<ExitStatus>,
-    cleanup_failed: bool,
+    cleanup_failure: Option<&'static str>,
     drain_deadline: Option<tokio::time::Instant>,
     lines: BoundedLines<ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
@@ -1663,7 +1662,8 @@ impl AcpSession {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(container) = self.container.as_mut() {
             if let Err(error) = container.remove().await {
-                self.cleanup_failed = true;
+                self.cleanup_failure
+                    .get_or_insert("container removal failed");
                 tracing::error!(%error, "ACP cleanup requires recovery");
             }
         }
@@ -1674,9 +1674,12 @@ impl AcpSession {
         if let Some(mut task) = self.stderr_task.take() {
             match tokio::time::timeout(CLEANUP_TIMEOUT, &mut task).await {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => self.cleanup_failed = true,
+                Ok(Err(_)) => {
+                    self.cleanup_failure
+                        .get_or_insert("stderr drain task failed");
+                }
                 Err(_) => {
-                    self.cleanup_failed = true;
+                    self.cleanup_failure.get_or_insert("stderr drain timed out");
                     task.abort();
                     let _ = task.await;
                 }
@@ -1707,10 +1710,10 @@ impl AcpSession {
         } else {
             self.kill_child().await;
         }
-        if self.cleanup_failed {
-            self.exit = Some(SessionExit::Failed(
-                "acp process, container or stderr cleanup could not be confirmed".into(),
-            ));
+        if let Some(cause) = self.cleanup_failure {
+            self.exit = Some(SessionExit::Failed(format!(
+                "acp cleanup could not be confirmed: {cause}"
+            )));
             return;
         }
         self.exit = Some(match self.child_status {
@@ -1826,17 +1829,17 @@ impl AgentSession for AcpSession {
         }
         self.kill_child().await;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let container_cleanup_failed =
-            self.container.is_some() && (self.cleanup_failed || self.child_status.is_none());
+        let container_cleanup_failed = self.container.is_some()
+            && (self.cleanup_failure.is_some() || self.child_status.is_none());
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let container_cleanup_failed = false;
         if container_cleanup_failed {
-            self.exit = Some(SessionExit::Failed(
-                "acp abort cleanup could not be confirmed".into(),
-            ));
-            return Err(EngineError::Backend(
-                "acp abort cleanup could not be confirmed".into(),
-            ));
+            let cause = self
+                .cleanup_failure
+                .unwrap_or("host process did not reap within cleanup deadline");
+            let message = format!("acp abort cleanup could not be confirmed: {cause}");
+            self.exit = Some(SessionExit::Failed(message.clone()));
+            return Err(EngineError::Backend(message));
         }
         self.exit = Some(SessionExit::Aborted);
         Ok(())

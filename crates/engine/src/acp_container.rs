@@ -436,10 +436,19 @@ async fn remove(
             .await
             .map_err(error)?;
     }
-    if !owned_ids(client, owner).await?.is_empty() {
-        return Err(error("daemon removal could not be confirmed"));
-    }
-    Ok(())
+    // `--rm` can start asynchronous deletion before our explicit rm arrives.
+    // A successful rm request or an "already in progress" response is not an
+    // absence receipt. Poll within the existing five-second control budget.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if owned_ids(client, owner).await?.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| error("daemon removal could not be confirmed within deadline"))?
 }
 
 fn pinned_image(image: &str) -> bool {

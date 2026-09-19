@@ -127,3 +127,8 @@ separate daemon query by immutable owner label confirmed absence. The
 links the account-redacted receipt and hashes its private source. No retry,
 allowlist expansion or Keychain access occurred. This closes this basic Codex
 report check, not Claude proof, production admission or S7 acceptance.
+
+The [concurrent cleanup follow-up](2026-09-19-acp-concurrent-cleanup.md) records
+two independently reproduced races, their bounded fixes and regression evidence.
+The historical cleanup failure remains retained, without claiming a definitive
+attribution that its original diagnostic cannot support.
