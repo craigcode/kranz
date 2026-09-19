@@ -81,6 +81,21 @@ The prior failed stress receipts remain unchanged. This closes only the mount
 preflight cleanup work after its supported-host checks; broader S6 qualification,
 production ACP admission and S7 mission acceptance remain separate.
 
+Final local validation passed all four workspace gates: 3,040 tests passed,
+zero failed and ten existing ignores; Clippy with warnings denied, formatting
+and workspace build passed. The final daemon inventory contained zero containers,
+Kranz egress networks or volumes, and Colima was restored to stopped. Secret
+scanning, domain lint and local knowledge refresh passed.
+
+The [Linux Docker CI job](https://github.com/craigcode/kranz/actions/runs/35459712133/job/105941259008)
+on `5510afe3585c2f3f314b7f698d02f150e5049467` passed all eleven helper tests, the
+external evaluator proofs, ACP lifetime proofs and bounded end-to-end probe.
+The cleanup ticket is therefore closed. That first CI run also correctly flagged
+an older verification date in the invariants knowledge note after the source
+commit. The note has been reviewed, updated with the helper ownership rule and
+its new source references, and locally rechecked; this documentation follow-up
+changes no engine code.
+
 ## Five-axis self-review
 
 Correctness: both sentinel directions must close, and daemon absence is a separate

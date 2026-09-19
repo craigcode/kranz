@@ -178,8 +178,15 @@
     "kranzEgressVolumes": 0
   },
   "linuxCi": {
-    "status": "pending",
-    "requiredBeforeTicketClosure": true
+    "status": "passed",
+    "headSha": "5510afe3585c2f3f314b7f698d02f150e5049467",
+    "runId": 35459712133,
+    "job": "rust-linux-external-evaluator",
+    "jobId": 105941259008,
+    "url": "https://github.com/craigcode/kranz/actions/runs/35459712133/job/105941259008",
+    "allElevenMountHelperTestsVerified": true,
+    "requiredNamedProofsAndSkipRejection": true,
+    "privateLogSha256": "a3609169fb1933670c2bc661b7f3a64673d2ead8796436a93ac1f9d02777fade"
   },
   "limitations": [
     "Engine death between create and start can leave a stopped container with retained recovery intent.",
@@ -187,5 +194,6 @@
     "Daemon or kernel failure can prevent removal; uncertainty remains a failed proof with recovery evidence.",
     "Non-Docker required mount preflight refuses before spawn.",
     "This proof does not close broader S6 qualification, production ACP admission or S7."
-  ]
+  ],
+  "colimaRestoredToStopped": true
 }
