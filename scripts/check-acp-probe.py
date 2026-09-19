@@ -22,7 +22,7 @@ for line in sys.stdin:
 ''')
 config={'provider':'fixture','program':sys.executable,'args':[str(root/'peer.py'),str(root/'started')],'credentialEnv':None,'receipt':str(root/'receipt.jsonl')}
 (root/'config.json').write_text(json.dumps(config))
-binary=str(pathlib.Path(sys.argv[1]).resolve()) if len(sys.argv) == 2 else str(pathlib.Path('target/debug/examples/acp_compat_probe').resolve())
+binary=str(pathlib.Path(sys.argv[1]).resolve()) if len(sys.argv) >= 2 else str(pathlib.Path('target/debug/examples/acp_compat_probe').resolve())
 env=dict(os.environ,KRANZ_PROBE_UNRELATED_SECRET='test')
 check=subprocess.run([binary,'--check',str(root/'config.json')],capture_output=True,text=True,env=env,timeout=5)
 assert check.returncode==0,(check.returncode,check.stderr)
@@ -39,3 +39,19 @@ assert repeat.returncode!=0 and (root/'started').stat().st_mtime_ns==before
 (root/'test-receipt.json').write_text(json.dumps({'proof':'deterministic fixture only','checkDoesNotSpawn':True,'actualProbePasses':True,'unrelatedEnvAbsent':True,'repeatRejectedBeforeSpawn':True},indent=2))
 print(root)
 print('PASS: check does not spawn; fixture report parses; private environment; existing receipt prevents retry.')
+if len(sys.argv) == 3:
+    image=sys.argv[2]
+    peer=(root/'peer.py').read_text().replace("Path(sys.argv[1]).write_text('started')", "assert not Path('/kranz-owned-session/lease').stat().st_mode & 0o022")
+    config.update(program='/usr/local/bin/python3',args=['-c',peer],container={'image':image,'egress':[]},receipt=str(root/'contained-receipt.jsonl'))
+    (root/'contained-config.json').write_text(json.dumps(config))
+    check=subprocess.run([binary,'--check',str(root/'contained-config.json')],capture_output=True,text=True,env=env,timeout=5)
+    assert check.returncode==0 and not (root/'contained-receipt.jsonl').exists(),check.stderr
+    run=subprocess.run([binary,'--run',str(root/'contained-config.json')],capture_output=True,text=True,env=env,timeout=210)
+    assert run.returncode==0,(run.returncode,run.stderr,(root/'contained-receipt.jsonl').read_text())
+    rows=[json.loads(x) for x in (root/'contained-receipt.jsonl').read_text().splitlines()]
+    assert rows[-1]['passed'] and rows[-1]['containedSession']
+    assert not rows[-1]['containmentProven'] and not rows[-1]['productionReadinessProven']
+    init=next(r['raw'] for r in rows if r['event']=='init')
+    assert init['containment']['image']==image
+    assert init['containment']['providerCompatibilityCertified'] is False
+    print('PASS: contained fixture uses the pinned image, parses its report, and confirms cleanup; no vendor invoked.')

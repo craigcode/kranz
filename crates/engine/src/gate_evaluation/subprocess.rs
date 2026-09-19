@@ -93,7 +93,13 @@ impl DockerEvaluator {
         )
         .await
     }
-    async fn control(&self, args: &[String]) -> Result<Output, String> {
+    pub(crate) fn attached_command(&self, args: &[String]) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(args).env_clear().envs(&self.env);
+        command
+    }
+
+    pub(crate) async fn control(&self, args: &[String]) -> Result<Output, String> {
         self.command(
             args,
             b"",

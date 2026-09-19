@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Preflight closes direct-backend sandbox downgrade; actual wrapper, whole-descendant lifetime and live adapter proofs remain open. See docs/reviews/2026-09-18-acp-containment-preflight.md.
+state-note: Docker lifetime, hostile/worktree and pinned-image fixtures implemented; one authorized contained Codex run authenticated but failed on denied egress. Endpoint policy, Claude credentials/proof, production admission and S7 remain open. See docs/acp-containment.md and docs/reviews/2026-09-18-acp-owned-container.md.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

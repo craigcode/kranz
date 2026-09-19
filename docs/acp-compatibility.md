@@ -7,6 +7,11 @@ client filesystem/terminal services and enforced containment remain unavailable.
 [one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
 and operator controls.
 
+The [S6 container proof path](acp-containment.md) now exercises the direct
+backend API with deterministic peers. Ordinary mission configuration still
+refuses enforced ACP; the existing live receipts below do not certify a
+container image, private authentication setup or governed mission.
+
 ## Released baseline
 
 The inspected releases are:

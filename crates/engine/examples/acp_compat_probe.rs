@@ -27,7 +27,16 @@ struct Config {
     /// Explicit operator consent for the Claude CLI to use its macOS Keychain.
     #[serde(default)]
     allow_keychain: bool,
+    /// Direct-backend proof only; does not enable ACP mission configuration.
+    container: Option<Container>,
     receipt: PathBuf,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Container {
+    image: String,
+    egress: Vec<String>,
 }
 
 impl Config {
@@ -64,8 +73,35 @@ impl Config {
         {
             bail!("nativeLoginHome must name an existing absolute operator home");
         }
-        if !self.program.is_absolute() || !self.program.is_file() || !self.receipt.is_absolute() {
-            bail!("program and new receipt path must be absolute; program must exist");
+        if self.container.is_some() && self.allow_keychain {
+            bail!("a Linux container cannot use the native macOS Keychain channel");
+        }
+        if let Some(container) = &self.container {
+            let digest = container.image.strip_prefix("sha256:").or_else(|| {
+                container
+                    .image
+                    .rsplit_once("@sha256:")
+                    .map(|(_, digest)| digest)
+            });
+            if !cfg!(any(target_os = "macos", target_os = "linux"))
+                || !digest.is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                bail!("container proof requires macOS/Linux and an immutable installed image");
+            }
+            if self.provider != "fixture" && container.egress.is_empty() {
+                bail!("live container proof requires an explicit provider egress allowlist");
+            }
+        }
+        if !self.program.is_absolute()
+            || (self.container.is_none() && !self.program.is_file())
+            || !self.receipt.is_absolute()
+        {
+            bail!("program and new receipt path must be absolute; a native program must exist");
         }
         Ok(())
     }
@@ -140,6 +176,7 @@ mod native_login_tests {
             credential_env: None,
             native_login_home: Some(root.to_owned()),
             allow_keychain: false,
+            container: None,
             receipt: root.join("new-receipt.jsonl"),
         }
     }
@@ -171,6 +208,25 @@ mod native_login_tests {
         assert!(cfg.validate().is_err());
         cfg.provider = "claude".into();
         cfg.credential_env = Some("ARBITRARY_SECRET".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn contained_probe_requires_a_pin_and_refuses_keychain() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "claude");
+        cfg.container = Some(Container {
+            image: format!("sha256:{}", "a".repeat(64)),
+            egress: vec!["api.anthropic.com:443".into()],
+        });
+        cfg.program = "/guest-only/adapter".into();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            cfg.validate().unwrap();
+        }
+        cfg.allow_keychain = true;
+        assert!(cfg.validate().is_err());
+        cfg.allow_keychain = false;
+        cfg.container.as_mut().unwrap().image = "floating:latest".into();
         assert!(cfg.validate().is_err());
     }
 
@@ -271,7 +327,7 @@ async fn main() -> Result<()> {
     if args[1] == "--check" {
         println!(
             "{}",
-            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
+            json!({"adapterStarted":false,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false})
         );
         return Ok(());
     }
@@ -283,12 +339,21 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(std::env::var)
         .transpose()?;
-    let private = tempfile::tempdir()?;
+    let private = if config.container.is_some() {
+        tempfile::tempdir_in(kranz_engine::backend_claude::scratch_root_base())?
+    } else {
+        tempfile::tempdir()?
+    };
     let root = private.path().display().to_string();
     let workspace = private.path().join("workspace");
     let home = private.path().join("home");
     std::fs::create_dir(&workspace)?;
     std::fs::create_dir(&home)?;
+    if config.container.is_some() {
+        // Docker needs a mountpoint for the existing read-only authority mask.
+        // Include it in the initial fixture, then require it to remain empty.
+        std::fs::create_dir(workspace.join(".kranz"))?;
+    }
     let mut env = HashMap::from([("HOME".into(), home.display().to_string())]);
     seed_native_login(&config, private.path(), &mut env)?;
     if let (Some(key), Some(value)) = (&config.credential_env, &credential) {
@@ -305,7 +370,20 @@ async fn main() -> Result<()> {
         env.insert("INITIAL_AGENT_MODE".into(), "read-only".into());
     }
     let engine_id = format!("acp-probe-{}", uuid::Uuid::new_v4());
-    let effective = kranz_engine::agent_env::agent_session_env(&env, &engine_id, None);
+    let effective = if let Some(container) = &config.container {
+        let mut effective = env.clone();
+        for key in ["PATH", "LANG", "TMPDIR"] {
+            effective.entry(key.into()).or_default();
+        }
+        if !container.egress.is_empty() {
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"] {
+                effective.entry(key.into()).or_default();
+            }
+        }
+        effective
+    } else {
+        kranz_engine::agent_env::agent_session_env(&env, &engine_id, None)
+    };
     let mut env_keys: Vec<_> = effective.keys().cloned().collect();
     env_keys.sort();
     let mut open = std::fs::OpenOptions::new();
@@ -321,11 +399,12 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"container":config.container,"prompt":format!("{PREFIX}{REPORT}"),"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hardDollarCap":false,"proof":"basic_text_report_only"}),
         credential.as_deref(),
         &root,
     )?;
-    let spec = SessionSpec {
+    let paths = kranz_engine::paths::MissionPaths::new(private.path(), "m-acp-probe");
+    let mut spec = SessionSpec {
         cwd: workspace.clone(),
         prompt: PromptMode::SingleShot(format!("{PREFIX}{REPORT}")),
         append_system_prompt: None,
@@ -356,12 +435,33 @@ async fn main() -> Result<()> {
         max_budget_usd: None,
         max_turns: None,
         env,
-        sandbox: None,
+        sandbox: config.container.as_ref().map(|container| {
+            kranz_engine::sandbox::ResolvedSandbox {
+                backend: kranz_engine::sandbox::SandboxBackend::Container,
+                inputs: kranz_engine::sandbox::SandboxInputs {
+                    enforce: kranz_engine::types::SandboxEnforce::FsNet,
+                    session_cwd: workspace.clone(),
+                    mission_dir: paths.mission_dir(),
+                    tmpdir: home.clone(),
+                    extra_write: vec![],
+                    egress: container.egress.clone(),
+                    validator_read_deny_roots: vec![],
+                },
+                container: Some(kranz_engine::sandbox_container::ContainerSpec {
+                    runtime: kranz_engine::sandbox_container::ContainerRuntime::Docker,
+                    image: container.image.clone(),
+                    network: None,
+                    name: None,
+                }),
+            }
+        }),
         hook_status: None,
     };
     let mut events = 0usize;
     let mut captured_bytes = 0usize;
     let run = async {
+        let boundary =
+            kranz_engine::egress_proxy::maybe_start_for_session(&mut spec, &paths).await?;
         let mut session = AcpBackend::new(&config.program, config.args.clone())
             .start(spec)
             .await?;
@@ -417,6 +517,18 @@ async fn main() -> Result<()> {
             let _ = session.abort().await;
         }
         turn_result.context("prompt exceeded 120 seconds")??;
+        if let Some(boundary) = boundary {
+            let denials = boundary.shutdown().await?;
+            if !denials.is_empty() {
+                append_receipt(
+                    &mut receipt,
+                    json!({"event":"probe.egress.denied","denials":denials}),
+                    credential.as_deref(),
+                    &root,
+                )?;
+                bail!("container proof encountered denied egress; no allowlist expansion was attempted");
+            }
+        }
         if session.exit_status() != Some(SessionExit::Completed) {
             bail!(
                 "adapter did not complete cleanly: {:?}",
@@ -430,8 +542,21 @@ async fn main() -> Result<()> {
         {
             bail!("report differs from the fixed fixture");
         }
-        if std::fs::read_dir(&workspace)?.next().is_some() {
-            bail!("probe workspace changed");
+        let changes: Vec<_> = std::fs::read_dir(&workspace)?
+            .take(16)
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        let unchanged = if config.container.is_some() {
+            changes == [std::ffi::OsString::from(".kranz")]
+                && std::fs::symlink_metadata(workspace.join(".kranz"))?.is_dir()
+                && std::fs::read_dir(workspace.join(".kranz"))?
+                    .next()
+                    .is_none()
+        } else {
+            changes.is_empty()
+        };
+        if !unchanged {
+            bail!("probe workspace changed: {changes:?}");
         }
         Result::<()>::Ok(())
     };
@@ -441,7 +566,7 @@ async fn main() -> Result<()> {
         .and_then(|result| result);
     append_receipt(
         &mut receipt,
-        json!({"event":"probe.finished","passed":result.is_ok(),"elapsedMillis":started.elapsed().as_millis(),"events":events,"capturedBytes":captured_bytes,"error":result.as_ref().err().map(|error|format!("{error:#}")),"productionReadinessProven":false,"containmentProven":false}),
+        json!({"event":"probe.finished","passed":result.is_ok(),"elapsedMillis":started.elapsed().as_millis(),"events":events,"capturedBytes":captured_bytes,"error":result.as_ref().err().map(|error|format!("{error:#}")),"containedSession":config.container.is_some(),"productionReadinessProven":false,"containmentProven":false}),
         credential.as_deref(),
         &root,
     )?;
@@ -449,7 +574,7 @@ async fn main() -> Result<()> {
         bail!("probe failed; see the redacted receipt (no retry was attempted)");
     }
     println!(
-        "Basic ACP report probe passed; production readiness and containment remain unproven."
+        "Basic ACP report probe passed; production readiness and containment certification remain separate."
     );
     Ok(())
 }

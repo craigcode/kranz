@@ -652,7 +652,7 @@ fn output_text(output: &Output) -> String {
     crate::command_exec::last_chars_local(text.trim(), 1200)
 }
 
-fn owner_identity_hash(pid: i32) -> Option<String> {
+pub(crate) fn owner_identity_hash(pid: i32) -> Option<String> {
     crate::event_log::process_identity_token(pid).map(|identity| {
         let digest = Sha256::digest(identity.as_bytes());
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
