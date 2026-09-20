@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-15
+last_verified: 2026-09-20
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -17,6 +17,12 @@ verified_against:
 A positioning decision about M5's remaining "skill capture" bullet, made
 2026-08-17. Work that contradicts it should be flagged against this ADR,
 not reconciled quietly.
+
+Rechecked 2026-09-16 (UTC) against the
+[review/evidence follow-ups](../../roadmap.md#scheduled-follow-up--review-efficiency-and-evidence-2026-09-16)
+and the positioning decision. Their reporting and measurement scopes neither
+generate agent skills nor introduce automatic prompt optimization; the boundary
+below is unchanged.
 
 **Kranz does not propose, generate, or install agent skill files.**
 Turning repeated mission lessons into Claude/Codex/Cursor skills is
