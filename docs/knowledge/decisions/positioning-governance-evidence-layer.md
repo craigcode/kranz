@@ -29,6 +29,12 @@ credentials and containment through the existing dispatch seam; their admission
 is implemented on the integration branch awaiting review/merge. S7 still gates
 release.
 
+Rechecked 2026-09-16 (UTC) against the
+[review/evidence follow-ups](../../roadmap.md#scheduled-follow-up--review-efficiency-and-evidence-2026-09-16).
+Review packets, comparable receipts, outcome reporting and a bounded review
+pilot extend governance and evidence; they add no code-generation orchestration
+or autonomous remediation.
+
 **Kranz is a governance and evidence layer for agent work. It is not an
 execution harness. One line: kranz dispatches, gates, records and proves.
 It does not write code.**
