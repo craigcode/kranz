@@ -50,6 +50,12 @@ Format:
 
 ## Later / gated
 
+- **Review efficiency and evidence** - review packets, baseline/candidate receipts, outcome reasons and a bounded pilot.
+  Why: Make current evidence and human decisions easier to assess; measure review effort separately from waiting.
+  Trigger: After ACP acceptance; the pilot follows the three implementations. Backlog dependencies, not automatic execution.
+  Source: docs/roadmap.md
+  Ticket: gate-review-packet; baseline-candidate-evidence; mission-outcome-reasons; review-effort-pilot
+
 - **Gas City pack publish remainder** - human `gc pack registry` / `gc pack release` after Stage 1 receipt and a second consumer.
   Why: CI lint and publish metadata landed; publishing with no consumer only exports the Stage 1 gap.
   Trigger: A second operator wants to `gc pack fetch` the pack, and Stage 1 has a receipt.
