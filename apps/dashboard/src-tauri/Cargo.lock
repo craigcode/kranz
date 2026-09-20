@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-dashboard"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "kranz-engine",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-engine"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-server"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

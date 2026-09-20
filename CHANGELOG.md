@@ -3,6 +3,38 @@
 Notable user-visible changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.3.0 - 2026-09-20
+
+- Added opt-in, qualified Claude and Codex ACP workers in pinned Linux ARM64
+  Docker images on macOS/Linux ARM64 hosts. Profiles pin adapter versions,
+  credential channels and egress; unsupported combinations fail before spawn.
+  Existing worker defaults remain unchanged. See [ACP containment](docs/acp-containment.md)
+  for the tested host/runtime combinations and setup requirements.
+- Added durable one-call ACP permission decisions through the existing operator
+  surfaces. Requests bind to the exact invocation, expire safely and cannot
+  become session-wide or persistent grants; stale decisions cannot authorize a
+  later command.
+- Added content-pinned external gate evaluators with bounded JSON-RPC stdio,
+  isolated evidence inputs and retained results. Initial/revised plan approval,
+  milestone validation, final checks and local merge now consume these checks
+  on macOS/Linux through the existing authority rules. External command-permission
+  evaluators remain unsupported; the one-call consent broker owns that stage.
+  Evaluator results never replace required human consent or waive engine prohibitions.
+- Added stage evidence and audit exports that bind decisions to approved inputs,
+  observed checks and the exact integration tree. Missing retained artifacts
+  remain explicitly unresolved after cleanup; exports never replay effects.
+- Hardened ACP protocol limits, cancellation, process supervision and container
+  cleanup. Namespace leases bound execution after engine death, orphan processes
+  are reaped without losing adapter exit status, and uncertain cleanup fails
+  visibly. Container mount probes now have their own ownership and recovery
+  records.
+- Added deterministic hostile-process and governed-mission proofs, plus bounded
+  live Claude/Codex worker receipts. Live runs used scripted controllers and
+  reviewers; they do not establish live model judgment or universal adapter
+  compatibility. No ACP filesystem/terminal provider or Windows ACP containment
+  is included.
+- Fixed a Windows contract-lint timing fixture that depended on a network timeout.
+
 ## 0.2.3 - 2026-09-14
 
 - Security: updated rustls from 0.23.44 to 0.23.45 for
