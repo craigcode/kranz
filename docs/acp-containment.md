@@ -368,9 +368,10 @@ is now implemented by the explicit profiles above. The
 that integration from S7 acceptance. The
 [S7 fixture review](reviews/2026-09-20-acp-governed-fixtures.md) adds synthetic
 defect/repair evidence. The [governed live-worker record](reviews/2026-09-20-acp-governed-live-preparation.md)
-adds a passing Codex mission through local merge and export, with scripted
-controller/reviewers. It also retains the failed Claude attempt caused by
-fixture errors; a successful Claude pass and independent branch review remain.
+adds passing Claude and Codex missions through local merge and export on
+macOS ARM64/Colima, with scripted controller/reviewers. The separately authorized
+Claude pass retains the earlier failed attempt caused by fixture errors.
+Independent branch review and review of the combined S7 evidence remain.
 Earlier preparation evidence retains the recovered physical-disk
 exhaustion during a later test build; that failed build is not reclassified by
 the live pass or this implementation.

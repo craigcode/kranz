@@ -111,6 +111,7 @@ spend. Independent branch review and landing the stacked PRs also remain. S7
 stays open; no default promotion, release or remote mission push is implied.
 
 The subsequent [live-worker record](2026-09-20-acp-governed-live-preparation.md)
-tracks the newly authorized attempts, including the passing Codex mission and
-the failed Claude attempt caused by fixture errors. It does not replace the
-synthetic defect/repair evidence above or establish live model judgment.
+tracks the newly authorized attempts, including passing Claude and Codex
+missions and the retained failed Claude attempt caused by fixture errors.
+It does not replace the synthetic defect/repair evidence above or establish
+live model judgment.

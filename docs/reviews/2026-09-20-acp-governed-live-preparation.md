@@ -1,4 +1,4 @@
-# Governed ACP live-worker acceptance preparation
+# Governed ACP live-worker acceptance record
 
 PR #69's `5dc355d` Linux external-evaluator job passed, including the delayed
 create and governed failure/repair fixtures. The separate Ubuntu workspace job
@@ -107,7 +107,7 @@ accepts the intended file and rejects different bytes in the qualified image.
 ## Live results
 
 The [projected receipts](../compatibility/acp/governed-worker-attempts-v1.json)
-retain both attempts, private artifact hashes and the runner executable digest
+retain all three attempts, private artifact hashes and the runner executable digest
 for each preparation. Raw transcripts and exports stay private. The current
 source hashes describe the corrected runner, not the earlier Claude executable.
 
@@ -136,13 +136,34 @@ A separate postmortem export verified all 45 payload hashes and retained two
 unresolved entries; exporting it does not resume or reclassify the mission.
 
 The original allowance authorized one attempt per provider with no retries.
-Codex's corrected preparation replaced an unconsumed preparation; Claude needs
-an additional explicit allowance. S7 remains open for review of the combined
-acceptance evidence and a successful Claude governed pass. These scripted
-reviewers do not establish live independent model judgment.
+Codex's corrected preparation replaced an unconsumed preparation. The operator
+subsequently requested completion of the corrected Claude proof, authorizing
+one additional attempt with the previously prepared bounds. Preparation
+`d43ae1d32aac8f4ee21149c56ab5acda44841502469abf92becaaa0539b1770e`
+and the runner executable were unchanged; no new login or Keychain access was
+needed, and the original failed attempt was preserved.
 
+The additional Claude mission `m-74fe75` passed in 19.921 seconds with one live
+worker, one feature, one delivered permission, the expected file/report and
+four consumed external stages. The merge tree matched the judged integration
+tree, and all 85 exported payload hashes were independently recomputed during
+projection. The export explicitly retains one unresolved `research.md` entry;
+this fixed-plan fixture does not produce a research memo. The completed live
+worker reported $0.059583; scripted usage is excluded. No timeout, automatic
+retry or denied-egress event occurred. Before/after inventory matched with no
+containers, volumes or private worker homes. Colima was restored to stopped
+after validation.
+
+Both supported profiles now have a passing bounded governed-worker fixture on
+macOS ARM64/Colima. S7 stays open for independent branch review and review of
+the combined acceptance evidence. The controller and reviewers remain scripted;
+these runs do not establish live independent model judgment or new platform
+qualification.
 
 ## Final local validation
+
+All four workspace gates were rerun after the additional Claude pass, with
+ACP, evaluator and mount Docker proofs enabled for the test suite.
 
 - `cargo test --workspace`: 3,063 passed, zero failed, 10 ignored, with ACP,
   external-evaluator and mount Docker proofs enabled. The six new example tests
@@ -158,6 +179,11 @@ reviewers do not establish live independent model judgment.
   original stopped state. Private live evidence and
   failed-run recovery records remain retained.
 
-These are local results. Current-revision CI and independent branch review
-remain required before landing; the earlier Ubuntu CI failure stays recorded.
-No release bump or default backend change is part of this checkpoint.
+All scheduled CI checks for runner revision `0627086` subsequently passed
+([workspace CI](https://github.com/craigcode/kranz/actions/runs/35496472400)),
+including Ubuntu, Windows, the wrapped macOS suite and Linux external evaluators
+(the conditional smoke job was skipped). The original Ubuntu failure remains
+recorded above. This additional live pass changes only evidence and status
+documents; the corrected runner is unchanged. Independent branch review and
+CI for the evidence commit remain required before landing. No release bump or
+default backend change is part of this checkpoint.

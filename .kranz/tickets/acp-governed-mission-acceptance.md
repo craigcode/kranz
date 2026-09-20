@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Qualified profiles and synthetic failure/repair coverage are implemented. The bounded live Codex mission passed through permission, checks, exact-tree local merge and export with scripted controller/reviewers. The first Claude governed attempt failed because of fixture errors, now corrected; another Claude attempt requires an additional allowance. All local workspace gates pass (3063 tests); current-revision CI and independent branch review remain. See docs/reviews/2026-09-20-acp-governed-live-preparation.md.
+state-note: Qualified profiles and synthetic failure/repair coverage are implemented. Bounded live Claude and Codex missions passed through one-call permission, checks, exact-tree local merge and export on macOS ARM64/Colima, with scripted controller/reviewers. The separately authorized Claude pass retains the earlier failed fixture attempt. Local workspace gates pass (3063 tests) and runner revision 0627086 passed CI; evidence-commit CI and independent review of the branch and combined S7 evidence remain. See docs/reviews/2026-09-20-acp-governed-live-preparation.md.
 title: Governed ACP acceptance — prove consent, independent gates and portable evidence
 priority: 2
 schedule: once

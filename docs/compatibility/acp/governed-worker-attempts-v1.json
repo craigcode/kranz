@@ -125,6 +125,59 @@
         "inventoryAfter": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
         "exportManifest": "sha256:f611c68d8149835b06e2b3f4736038bb4bea7d0d9be60598dab71fc9ab900431"
       }
+    },
+    {
+      "provider": "claude",
+      "mission": "m-74fe75",
+      "passed": true,
+      "sourceCommit": "0627086a5b381cf0c45b013eded719a86e0e0c7c",
+      "authorizationScope": "One separately authorized additional Claude attempt after the original fixture failure; no automated retry",
+      "preparationDigest": "sha256:d43ae1d32aac8f4ee21149c56ab5acda44841502469abf92becaaa0539b1770e",
+      "runnerExecutableDigest": "sha256:69d2a2feb19a2e7235baf0cbf491f08e27d99babd20026b1c9c09e6e63c48a2e",
+      "supervisor": {
+        "provider": "claude",
+        "exit": 0,
+        "timedOut": false,
+        "elapsedSeconds": 19.921,
+        "runnerPassed": true,
+        "inventoryRestored": true,
+        "denialRows": 0,
+        "retryAttempted": false,
+        "resultSha256": "63dcaf01f0354073edbe9743e38b64d0812a1fb4f133fe95962a18193b602c87"
+      },
+      "observed": {
+        "liveWorkerSpawnReceipts": 1,
+        "featureStarts": 1,
+        "permissionDeliveries": 1,
+        "workerResult": "pass",
+        "workerReportedCostUsd": 0.059583,
+        "providerSelectedModel": null,
+        "modelNote": "worker.spawned model is the configured role label, not evidence of the provider-selected model",
+        "scriptedUsageExcluded": true,
+        "consumedExternalStages": [
+          "plan-approval",
+          "milestone-validation",
+          "final-gate",
+          "merge"
+        ],
+        "missionCompleted": true,
+        "primaryUnchangedBeforeMerge": true,
+        "integrationTree": "a304452f149f22f2a1bcfd72b99b2dd9e0a2c668",
+        "exportedPayloadHashesVerified": 85,
+        "exportUnresolvedEntries": 1
+      },
+      "privateArtifactHashes": {
+        "preparation": "sha256:d43ae1d32aac8f4ee21149c56ab5acda44841502469abf92becaaa0539b1770e",
+        "authorization": "sha256:d76bf376ef7aa16aee3b0011a5c9753ebb63fbb67b0071acc196126f75a1ef3f",
+        "attempt": "sha256:9bb136c2e7d10dbaa06eca80377d3f52829659c6b1ab0fb220aad561433f3062",
+        "result": "sha256:63dcaf01f0354073edbe9743e38b64d0812a1fb4f133fe95962a18193b602c87",
+        "supervisorResult": "sha256:9767f54dd90500c1ef2eafd15b0e387beb1c29de8931592f75695ef73b82daa7",
+        "events": "sha256:1d9a690420de4e0183512bc96ba2603a32bad2721fab58f81da73f59fa1e548e",
+        "workerTranscript": "sha256:3b4365fbbe9c7188119e1ec0b75d744c17b26e51095f24c18792d8d272c32bc4",
+        "inventoryBefore": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "inventoryAfter": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "exportManifest": "sha256:cefb268ae27d5bd98545e60ab06559f7deea4a45a11351ccb84a31928abe4553"
+      }
     }
   ]
 }
