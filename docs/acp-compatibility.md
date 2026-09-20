@@ -310,8 +310,8 @@ missing consent, unexpected commands/paths/output, tool failure and duplicate
 requests. Each refusal must match its intended reason; every case checks daemon
 absence independently. Linux CI runs this script without credentials and retains
 its log. These synthetic checks are separate from the scoped native shell
-qualification below; Linux vendor receipts and ordinary enforced-ACP admission
-remain open.
+qualification below. The macOS and Linux ARM64 live receipts are separate from
+these fixtures; ordinary enforced-ACP admission remains open.
 See the [fixture review](reviews/2026-09-19-acp-tool-probe.md) and
 [live-attempt follow-up](reviews/2026-09-19-acp-native-tool-attempts.md).
 
@@ -364,3 +364,30 @@ This qualifies the observed native shell workload on this adapter/image/host
 combination. It does not certify every native tool, native Linux hosting,
 ordinary enforced-ACP admission or the S7 governed mission. The earlier failures
 and the independent synthetic namespace proofs remain separate evidence.
+
+## Native Linux engine shell qualification (2026-09-20 UTC)
+
+The newly approved Linux batch **passed for both providers**, using the same
+vendor image, startup policies, endpoint lists and fixed shell workload. The
+engine ran directly on Ubuntu 24.04.4 ARM64, kernel 6.8.0-100-generic, inside the
+local Colima VM, with its source and worktrees on the Linux filesystem. See the
+[projected receipts](compatibility/acp/linux-native-tool-proof-v1.json) and
+[review](reviews/2026-09-20-acp-linux-native-tool-pass.md).
+
+| Adapter / runtime | Elapsed | One-time grants | Host feature commits | Denied connections |
+| --- | ---: | ---: | ---: | ---: |
+| Claude ACP 0.77.0 / Agent SDK 0.3.270 | 23.330 s | 1 | 1 | 0 |
+| Codex ACP 1.11.0 / Codex 0.153.4 | 13.230 s | 1 | 1 | 0 |
+
+Both passed exact file/report and unchanged-primary checks. Temporary credential
+source removal and empty container/volume inventories were confirmed; Colima
+returned to stopped. Credentials followed the explicitly approved local SSH
+transfer path. No Keychain access, retry or allowlist expansion occurred. Both
+new prompt slots are consumed.
+
+Claude usage reported `claude-sonnet-5` and USD 0.0667802; Codex announced
+`gpt-6-astra[medium]` and supplied no cost figure. These are observations, not
+future model pins or verified billing. The scope remains the native shell
+fixture on this specific Linux ARM64 engine/image combination. It does not
+qualify bare-metal Linux, x86_64, every native tool, ordinary enforced-ACP
+admission or the S7 governed mission.

@@ -1,5 +1,11 @@
 # Native Linux preparation and remaining admission work
 
+Historical preparation record: the subsequently approved live batch passed for
+both providers. See the [Linux live review](2026-09-20-acp-linux-native-tool-pass.md)
+and [receipts](../compatibility/acp/linux-native-tool-proof-v1.json). The pending
+approval statements below describe preparation time; the retained build failure
+and remaining admission breakdown still apply.
+
 The engine probe now builds and runs directly on Ubuntu 24.04.4 ARM64, kernel
 6.8.0-100-generic, inside the local Colima VM. Its source, scratch directories,
 disposable repositories and Docker socket are on Linux. The worker runs in the

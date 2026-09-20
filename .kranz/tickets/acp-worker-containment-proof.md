@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime, pinned-image and hostile descendant proofs implemented; mount-proof dependency is closed. Basic contained Claude/Codex report checks and the separately authorized native shell batch now pass on macOS ARM64 / Colima, with one-time consent, exact file verification, one host feature commit, unchanged primary state and confirmed cleanup per provider. See docs/compatibility/acp/native-tool-proof-v2.json and docs/reviews/2026-09-19-acp-native-tool-pass.md. Earlier denied-egress, permission-encoding, cleanup and synthetic failures remain retained. Native Linux vendor receipts, qualified ordinary mission admission and S7 remain open; no new provider calls are authorized by these receipts.
+state-note: Docker lifetime, pinned-image and hostile descendant proofs implemented; mount-proof dependency is closed. Bounded Claude/Codex native shell checks pass on macOS ARM64 and with the engine running directly on Ubuntu ARM64 in the local Colima VM, each with one-time consent, exact file/report, one host checkpoint, unchanged primary state and confirmed cleanup. See docs/compatibility/acp/native-tool-proof-v2.json and docs/compatibility/acp/linux-native-tool-proof-v1.json. Earlier failures remain retained. Qualified ordinary mission admission with credential/startup integration and S7 remain open; both approved Linux provider slots are consumed.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once
@@ -25,7 +25,7 @@ are not containment. Follow D-F/D-H and reuse sandbox.rs/command_exec primitives
 - Prove required adapter authentication/caches work without ambient authority.
 - Keep no-push/no-primary-write invariants and post-worker integrity checks.
 - Expose tested adapter/platform support explicitly; keep refusal for unproven combinations. Start macOS, then Linux; Windows needs proof before enablement.
-- Follow the remaining admission breakdown in docs/reviews/2026-09-19-acp-linux-preparation.md; Linux ARM64 provider-free preparation passes, but the new live batch, credential/startup integration and ordinary mission admission remain pending.
+- Follow the remaining admission breakdown in docs/reviews/2026-09-19-acp-linux-preparation.md; Linux ARM64 synthetic and bounded live shell checks pass, while credential/startup integration and ordinary mission admission remain pending. See docs/reviews/2026-09-20-acp-linux-native-tool-pass.md for the live scope and limits.
 
 - Out of scope: Reimplementing a sandbox, client filesystem/terminal RPC services, ACP validators, credential inheritance or changing defaults without proof.
 

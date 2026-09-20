@@ -61,8 +61,9 @@ and a confirmed clean daemon are distinct facts.
 
 The engine-generated ACP initialization receipt records the image, supervisor
 hash and lease posture separately from the peer's capabilities/model report.
-`providerCompatibilityCertified: false` is deliberate until the corresponding
-live adapter/runtime/image pass has been reviewed.
+`providerCompatibilityCertified: false` remains the direct proof path's value.
+Reviewed live receipts qualify their stated workload separately; they do not
+change ordinary mission admission or promote that field automatically.
 
 ## Mount preflight ownership
 
@@ -251,20 +252,23 @@ with unchanged primary state, zero denied egress and confirmed cleanup. See the
 [review](reviews/2026-09-19-acp-native-tool-pass.md). The first batch's failures
 remain retained; a subsequent pass does not rewrite them or certify all tools.
 
-Remaining S6 work is:
+The separately authorized [native Linux batch](compatibility/acp/linux-native-tool-proof-v1.json)
+also passed for both providers with the engine running directly on Ubuntu
+24.04.4 ARM64 in the local Colima VM. Claude completed in 23.330 seconds and
+Codex in 13.230 seconds, each with one delivered permission, exact file/report,
+one host checkpoint, unchanged primary state, zero denied egress and confirmed
+cleanup. These receipts qualify this shell fixture on that Linux combination;
+bare-metal hosts, x86_64 and other configurations are not inferred. See the
+[review](reviews/2026-09-20-acp-linux-native-tool-pass.md).
 
-1. Retain equivalent adapter/runtime/image/platform receipts on native Linux
-   hosts before admitting that combination. Linux synthetic CI proves the
-   wrapper boundary; it does not launch or qualify the vendor adapters.
-2. Wire only the qualified combinations through ordinary worker configuration,
-   preserving pre-spawn refusal for every unsupported pair and current defaults.
-   The direct-backend fixture does not by itself prove normal mission dispatch.
-
-The [native Linux preparation review](reviews/2026-09-19-acp-linux-preparation.md)
-records a Linux ARM64 engine build and passing provider-free fixtures, the
-recovered physical-disk exhaustion during a later test build, and the concrete
-credential/startup/admission work still required. Its live batch is prepared but
-not authorized or run; it does not close either item above.
+Remaining S6 work is to wire the qualified combinations through ordinary worker
+configuration, including their minimal credential and startup preparation,
+while preserving pre-spawn refusal for unsupported pairs and current defaults.
+The direct-backend fixture does not by itself prove normal mission dispatch.
+The [admission breakdown](reviews/2026-09-19-acp-linux-preparation.md#ordinary-mission-admission-concrete-remaining-work)
+records the concrete integration work. Its earlier preparation evidence retains
+the recovered physical-disk exhaustion during a later test build; that failed
+build is not reclassified by the live pass.
 
 Mount-helper cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
