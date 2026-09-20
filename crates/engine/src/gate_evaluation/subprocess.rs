@@ -52,6 +52,7 @@ pub struct AttemptOutcome {
     /// Contains a scrubbed receipt; raw files remain only when explicitly
     /// retained or when container cleanup was not confirmed.
     pub directory: PathBuf,
+    pub cleanup_confirmed: bool,
     pub evaluation: Result<AcceptedEvaluation, String>,
 }
 
@@ -93,13 +94,23 @@ impl DockerEvaluator {
         .await
     }
     async fn control(&self, args: &[String]) -> Result<Output, String> {
+        self.bounded_control(args, Duration::from_secs(5), &AtomicBool::new(false))
+            .await
+    }
+
+    async fn bounded_control(
+        &self,
+        args: &[String],
+        wall: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Output, String> {
         self.command(
             args,
             b"",
-            Duration::from_secs(5),
+            wall,
             Duration::from_secs(1),
             (CONTROL_LIMIT, CONTROL_LIMIT),
-            &AtomicBool::new(false),
+            cancelled,
         )
         .await
         .map_err(|error| format!("Docker {} control failed: {error}", args[0]))
@@ -178,7 +189,16 @@ impl DockerEvaluator {
                 .map_err(|e| e.to_string())?,
             )?;
             guard.armed = true;
-            let create = self.control(&args).await?;
+            // Creation can materialize a cold image's root filesystem. Charge
+            // it to the evaluation's existing deadline, not the short control
+            // timeout used for inspection/cleanup. Never retry an uncertain create.
+            let create = self
+                .bounded_control(
+                    &args,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    cancelled,
+                )
+                .await?;
             let id = std::str::from_utf8(&create.stdout)
                 .map_err(|_| "invalid container ID")?
                 .trim();
@@ -308,6 +328,7 @@ impl DockerEvaluator {
         }
         Ok(AttemptOutcome {
             directory: root,
+            cleanup_confirmed: !guard.armed,
             evaluation,
         })
     }

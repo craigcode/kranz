@@ -438,15 +438,18 @@ jobs:
         run: |
           log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
           set +e
-          cargo test --workspace gate_subprocess_v1 -- --nocapture >"$log" 2>&1
+          # These are lifecycle proofs, not a daemon throughput benchmark.
+          # Keep unrelated fixtures from competing for bounded inspection and
+          # cleanup; deliberate concurrency remains inside its own proofs.
+          cargo test --workspace gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          grep -qE 'test result: ok\. 7 passed' "$log"
-          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs; do
+          grep -qE 'test result: ok\. 8 passed' "$log"
+          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs creation_uses_evaluation_budget_and_cleans_on_interrupt; do
             grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
