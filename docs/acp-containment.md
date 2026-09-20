@@ -133,6 +133,8 @@ The supervisor runs as guest PID 1, disables dumpability before launching the
 peer, and forwards bounded chunks through separate I/O threads. A peer blocking
 stdin or output cannot block lease checks. When PID 1 exits, Linux kills the
 namespace's remaining processes, including detached sessions and nested children.
+While the peer runs, bounded reap sweeps release exited orphan processes and
+preserve the peer's actual exit status without delaying lease checks.
 The dumpability restriction prevents a same-uid peer from changing supervisor
 memory or using its `/proc` handles. See the Linux documentation for
 [PID namespace termination and signals](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
@@ -223,6 +225,8 @@ peer. Required Docker tests cover:
 - read-only lease and supervisor-memory attacks;
 - cancellation, Drop and engine `SIGKILL` with detached children, ignored stdin,
   a full input pipe and an attempted `SIGSTOP` against the supervisor;
+- sequential background-process exits without accumulating zombies, with both
+  successful and nonzero peer exits preserved;
 - delayed daemon startup after the host owner has died;
 - failed cleanup retaining evidence and colliding names preserving unrelated
   containers;

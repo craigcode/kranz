@@ -177,6 +177,43 @@ async fn acp_containment_v1_completion_preserves_report_and_removes_namespace() 
 }
 
 #[tokio::test]
+async fn acp_containment_v1_reaps_orphans_and_preserves_peer_exit() {
+    if !enabled() {
+        return;
+    }
+    for mode in ["orphans-complete", "orphans-failed"] {
+        let root = fixture();
+        let name = name();
+        let mut session = start(root.path(), &name, mode).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut result = false;
+            while let Some(event) = session.next_event().await.unwrap() {
+                if let AgentEvent::Result { text, .. } = event {
+                    assert_eq!(text, "fixture-delivery");
+                    result = true;
+                }
+            }
+            assert!(result, "{:?}", session.exit_status());
+        })
+        .await
+        .expect("orphan reaping deadline");
+        match (mode, session.exit_status()) {
+            ("orphans-complete", Some(SessionExit::Completed)) => {}
+            ("orphans-failed", Some(SessionExit::Failed(message))) => {
+                assert!(message.contains("23"), "{message}");
+            }
+            (_, exit) => panic!("unexpected peer exit: {exit:?}"),
+        }
+        let proof: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("workspace/orphan-probes.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proof, serde_json::json!({"orphans": 640, "zombies": 0}));
+        absent(root.path(), &name).await;
+    }
+}
+
+#[tokio::test]
 async fn acp_containment_v1_engine_sigkill_expires_guest_lease() {
     if !enabled() {
         return;

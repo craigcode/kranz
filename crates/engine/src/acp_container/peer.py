@@ -34,6 +34,37 @@ def idle_tree():
         time.sleep(1)
 
 
+def orphan_probes():
+    # Sequential background tools must not leave PID-1 zombies for the whole
+    # session. More than the namespace's 512-task limit finish in small batches.
+    for batch in range(40):
+        for _ in range(16):
+            child = os.fork()
+            if child == 0:
+                if os.fork() == 0:
+                    os._exit(0)
+                os._exit(0)
+            os.waitpid(child, 0)
+        deadline = time.monotonic() + 3
+        while True:
+            zombies = 0
+            for name in os.listdir("/proc"):
+                if name.isdigit():
+                    try:
+                        with open("/proc/" + name + "/stat") as source:
+                            fields = source.read().rsplit(")", 1)[1].split()
+                        zombies += fields[0] == "Z" and fields[1] == "1"
+                    except OSError:
+                        pass
+            if zombies == 0:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("supervisor retained orphan zombies: " + str(zombies))
+            time.sleep(0.02)
+    with open("orphan-probes.json", "w") as target:
+        json.dump({"orphans": (batch + 1) * 16, "zombies": zombies}, target)
+
+
 def hostile_probes():
     denied = {}
 
@@ -181,7 +212,9 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request["id"], "result": result})
             idle_tree()
     elif method == "session/prompt":
-        if mode in ["complete", "hostile", "mcp", "egress"]:
+        if mode in ["complete", "hostile", "mcp", "egress", "orphans-complete", "orphans-failed"]:
+            if mode.startswith("orphans-"):
+                orphan_probes()
             if mode == "hostile":
                 hostile_probes()
             if mode == "egress":
@@ -198,6 +231,8 @@ for line in sys.stdin:
                 },
             }})
             send({"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}})
+            if mode == "orphans-failed":
+                sys.exit(23)
             break
         idle_tree()
     if result is not None:

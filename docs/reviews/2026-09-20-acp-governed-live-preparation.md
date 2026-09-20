@@ -187,3 +187,8 @@ recorded above. This additional live pass changes only evidence and status
 documents; the corrected runner is unchanged. Independent branch review and
 CI for the evidence commit remain required before landing. No release bump or
 default backend change is part of this checkpoint.
+
+The subsequent [independent review](2026-09-20-acp-independent-review.md)
+records the fresh branch reviews, artifact-hash audit and orphan-process
+supervisor correction. These live receipts remain tied to the versions actually
+run; the correction has separate deterministic containment proof.

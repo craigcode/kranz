@@ -22,6 +22,22 @@ def stop(code):
     os._exit(code)
 
 
+def reap_children(peer):
+    # PID 1 also adopts exited background tools. Bound each sweep so even a
+    # continuously forking peer cannot starve lease checks. This is the sole
+    # waiter; preserve the peer status instead of racing Popen.poll().
+    for _ in range(64):
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            break
+        if pid == peer.pid:
+            peer.returncode = os.waitstatus_to_exitcode(status)
+    return peer.returncode
+
+
 def main():
     global stage
     if os.getpid() != 1:
@@ -112,8 +128,9 @@ def main():
             stop(124)
         if failed.is_set():
             stop(125)
+        observed = reap_children(peer)
         if code is None:
-            code = peer.poll()
+            code = observed
             if code is not None:
                 ended_at = now
         if ended_at is not None:
@@ -122,9 +139,6 @@ def main():
             # A detached child holding output open must not outlive the peer.
             if now - ended_at >= 1.0:
                 stop(125)
-        # Adopted orphans die with this bounded namespace on peer exit.
-        # Do not call waitpid(-1) here: it
-        # would race Popen's exit observation and fabricate a zero status.
         time.sleep(POLL_SECONDS)
 
 
