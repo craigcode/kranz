@@ -222,6 +222,8 @@ authority/migration rules; runtime integration remains in the later slices.
   are not a sandbox.
 - [ ] `acp-governed-mission-acceptance` — seeded defect, human consent,
   independent checks, local merge and portable evidence in one synthetic mission.
+  [Integrated fixture coverage](reviews/2026-09-20-acp-governed-fixtures.md) is on
+  the containment branch; bounded live acceptance and review remain.
 
 Sequence: contract and compatibility first; evaluator/lifecycle and live consent
 next; containment before the integrated acceptance claim. Proposed core scope

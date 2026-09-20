@@ -195,7 +195,16 @@ impl DockerEvaluator {
                 .map_err(|e| e.to_string())?,
             )?;
             guard.armed = true;
-            let create = self.control(&args).await?;
+            // Creation can materialize a cold image's root filesystem. Charge
+            // it to the evaluation's existing deadline, not the short control
+            // timeout used for inspection/cleanup. Never retry an uncertain create.
+            let create = self
+                .bounded_control(
+                    &args,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    cancelled,
+                )
+                .await?;
             let id = std::str::from_utf8(&create.stdout)
                 .map_err(|_| "invalid container ID")?
                 .trim();

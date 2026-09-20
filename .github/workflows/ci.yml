@@ -439,8 +439,8 @@ jobs:
           log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
           set +e
           # These are lifecycle proofs, not a daemon throughput benchmark.
-          # Keep unrelated fixtures from competing for the five-second control
-          # deadline; deliberate concurrency remains inside its own proofs.
+          # Keep unrelated fixtures from competing for bounded inspection and
+          # cleanup; deliberate concurrency remains inside its own proofs.
           cargo test --workspace gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
           status=$?
           set -e
@@ -448,8 +448,8 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          grep -qE 'test result: ok\. 7 passed' "$log"
-          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs; do
+          grep -qE 'test result: ok\. 8 passed' "$log"
+          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs creation_uses_evaluation_budget_and_cleans_on_interrupt; do
             grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
           done
           for proof in records_real_checks_and_requires_fresh_consent refuses_base_drift_after_a_passing_checker; do
@@ -477,7 +477,7 @@ jobs:
           for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
             grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
           done
-          for proof in ordinary_mission_delivers_with_one_call_consent credential_echo_fails_and_cleans_home; do
+          for proof in ordinary_mission_delivers_with_one_call_consent defect_requires_repair_and_fresh_consent interrupt_rejects_late_consent policy_drift_refuses_merge checker_failure_blocks_completed_worker credential_echo_fails_and_cleans_home; do
             grep -q "test acp_worker::tests::acp_containment_v1_profile_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then

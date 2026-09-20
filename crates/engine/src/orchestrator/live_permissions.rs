@@ -590,36 +590,60 @@ mod tests {
 
     #[test]
     fn live_permission_restart_closes_without_replay_or_extending_deadline() {
-        let Some((_dir, mut engine)) = engine() else {
-            return;
-        };
-        let request = seed_request(&mut engine);
-        let paths = engine.paths.clone();
-        drop(engine);
-        let mut restored = MissionEngine::resume(
-            Arc::new(crate::backend_mock::MockBackend::new()),
-            &paths.repo_root,
-            &paths.mission_id,
-            LockForce::No,
-        )
-        .unwrap();
-        let (_relay, _receiver) = restored.permission_channel().unwrap();
-        let record = &restored.state.permissions[&request.proposal.id];
-        assert!(record.closed.is_some());
-        assert!(record.resolution.is_none());
-        assert!(record.delivery.is_none());
-        assert_eq!(record.request.proposal.deadline, request.proposal.deadline);
-        let before = std::fs::read(paths.events_file()).unwrap();
-        assert!(restored
-            .resolve_live_permission(Resolution {
-                request_id: request.proposal.id,
-                binding_digest: request.binding_digest,
-                allow: true,
-                actor: Actor::LocalRepositoryAuthority,
-                reason: "stale click".into(),
-            })
-            .is_err());
-        assert_eq!(std::fs::read(paths.events_file()).unwrap(), before);
+        for checkpoint in ["requested", "decided", "sent"] {
+            let Some((_dir, mut engine)) = engine() else {
+                return;
+            };
+            let request = seed_request(&mut engine);
+            if checkpoint != "requested" {
+                engine
+                    .emit(EventKind::PermissionResolved {
+                        resolution: Resolution {
+                            request_id: request.proposal.id.clone(),
+                            binding_digest: request.binding_digest.clone(),
+                            allow: true,
+                            actor: Actor::LocalRepositoryAuthority,
+                            reason: "synthetic crash-window consent".into(),
+                        },
+                    })
+                    .unwrap();
+            }
+            if checkpoint == "sent" {
+                engine
+                    .emit(EventKind::PermissionResponseRecorded {
+                        request_id: request.proposal.id.clone(),
+                        delivery: crate::live_permission::Delivery::Sent,
+                    })
+                    .unwrap();
+            }
+            let before_restart = engine.state.permissions[&request.proposal.id].clone();
+            let paths = engine.paths.clone();
+            drop(engine);
+            let mut restored = MissionEngine::resume(
+                Arc::new(crate::backend_mock::MockBackend::new()),
+                &paths.repo_root,
+                &paths.mission_id,
+                LockForce::No,
+            )
+            .unwrap();
+            let (_relay, _receiver) = restored.permission_channel().unwrap();
+            let record = &restored.state.permissions[&request.proposal.id];
+            assert!(record.closed.is_some());
+            assert_eq!(record.resolution, before_restart.resolution, "{checkpoint}");
+            assert_eq!(record.delivery, before_restart.delivery, "{checkpoint}");
+            assert_eq!(record.request.proposal.deadline, request.proposal.deadline);
+            let before = std::fs::read(paths.events_file()).unwrap();
+            assert!(restored
+                .resolve_live_permission(Resolution {
+                    request_id: request.proposal.id,
+                    binding_digest: request.binding_digest,
+                    allow: true,
+                    actor: Actor::LocalRepositoryAuthority,
+                    reason: "stale click".into(),
+                })
+                .is_err());
+            assert_eq!(std::fs::read(paths.events_file()).unwrap(), before);
+        }
     }
 
     #[test]

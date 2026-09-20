@@ -5,6 +5,8 @@ freshness: check-on-touch
 last_verified: 2026-09-20
 verified_against:
   - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_worker/tests.rs
+  - crates/engine/src/gate_evaluation/subprocess.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/examples/acp_compat_probe.rs
   - crates/engine/examples/acp_compat_probe/tool_fixture.rs
@@ -51,13 +53,15 @@ image. Missing Docker/image support fails that job; ordinary workspace tests
 print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
 exercise protocol, byte pinning, artifact imports and containment without model
 calls. That CI step runs unrelated fixtures sequentially so they do not compete
-for the unchanged five-second Docker control deadline; this is not a throughput
-qualification. The job retains its synthetic proof logs on failure as well as
+for bounded Docker inspection and cleanup. Creation consumes the evaluation's
+remaining wall-time budget instead of a separate five-second cap; it is never
+retried automatically. Delayed creation, deadline expiry and cancellation have
+a real-Docker regression. This is not a throughput qualification. The job retains its synthetic proof logs on failure as well as
 success. See [external evaluators](../../external-evaluators.md) for API boundaries,
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine descendant/lifetime daemon proofs and the two ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine descendant/lifetime daemon proofs and the six ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. Synthetic control tests additionally
 require confirmed absence after asynchronous deletion and failure when a
@@ -79,8 +83,12 @@ macOS/Linux ARM64 Docker. A test-only profile proves approval, one-call consent,
 contained shell delivery, host checkpoint, fresh scripted review, external gates,
 offline local merge and portable export; a separate credential-echo case checks
 refusal and cleanup. The new Docker fixtures hold the shared environment-test
-lock so another test's fake runtime cannot redirect them. S7's seeded repair,
-interruption/policy drift and bounded live governed missions remain open. See
+lock so another test's fake runtime cannot redirect them. The S7 fixture matrix
+adds a seeded defect and repair with fresh consent/review, pause with a stale
+click, post-approval policy drift, checker failure, exact-tree merge and export
+after runtime cleanup. A paused sequential feature returns to the run loop before
+checkpoint, judgment or retry. These scripted fixtures do not qualify live
+governed missions. See
 [ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite

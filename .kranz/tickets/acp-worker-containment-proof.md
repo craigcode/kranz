@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Implementation and author review now include qualified ordinary worker profiles, private file credentials/startup, offline contract/merge checks, and a synthetic mission with one-call consent, nonempty checkpoint, external gates, local merge and export. Full-workspace tests (3,052 passed), clippy, fmt and build are green; awaiting CI and branch review/merge; S7 defect/repair and bounded live governed missions remain open. See docs/reviews/2026-09-20-acp-worker-profile-admission.md. Prior approved provider slots remain consumed.
+state-note: Qualified ordinary profiles and synthetic mission integration are implemented. Follow-up coverage exercises defect/repair, pause, policy drift, checker failure and export; it fixes the premature evaluator-create deadline and a retry after Pause. All local workspace gates pass (3057 tests); current-revision CI and independent branch review remain. S7 live governed missions remain open and prior approved provider slots are consumed. See docs/reviews/2026-09-20-acp-governed-fixtures.md.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

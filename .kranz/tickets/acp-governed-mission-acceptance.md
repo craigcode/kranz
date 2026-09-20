@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: The S6 profile fixture now connects ordinary contained dispatch, one-call consent, host checkpoint, scripted fresh review, external gates, offline local merge and audit export. S7 still needs seeded defect/repair and interruption/policy-drift coverage in that flow, reviewed portable evidence, and separately bounded live governed missions. See docs/reviews/2026-09-20-acp-worker-profile-admission.md.
+state-note: Integrated synthetic coverage now includes defect/repair with fresh consent, pause and late-click refusal, policy drift, checker failure, exact-tree merge and portable evidence after runtime cleanup. Request/decision/send replay checkpoints are also covered. All local workspace gates pass (3057 tests); current-revision CI and independent branch review remain. Live governed missions require prepared budgets and fresh operator authorization. See docs/reviews/2026-09-20-acp-governed-fixtures.md.
 title: Governed ACP acceptance — prove consent, independent gates and portable evidence
 priority: 2
 schedule: once

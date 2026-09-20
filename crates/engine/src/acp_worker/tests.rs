@@ -384,8 +384,47 @@ fn docker_enabled() -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[allow(clippy::await_holding_lock)]
 async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_consent() {
+    profile_mission(ProfileScenario::Clean).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_containment_v1_profile_defect_requires_repair_and_fresh_consent() {
+    profile_mission(ProfileScenario::Repair).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_containment_v1_profile_interrupt_rejects_late_consent() {
+    profile_mission(ProfileScenario::Interrupt).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_containment_v1_profile_policy_drift_refuses_merge() {
+    profile_mission(ProfileScenario::PolicyDrift).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_containment_v1_profile_checker_failure_blocks_completed_worker() {
+    profile_mission(ProfileScenario::CheckerFailure).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy, PartialEq)]
+enum ProfileScenario {
+    Clean,
+    Repair,
+    Interrupt,
+    PolicyDrift,
+    CheckerFailure,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::await_holding_lock)]
+async fn profile_mission(scenario: ProfileScenario) {
     use crate::backend_mock::{mock_init, mock_result_text, mock_text, MockBackend, MockScript};
     use crate::events::EventKind;
     use crate::live_permission::{Actor, Delivery, Resolution};
@@ -400,28 +439,44 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
     let f = Fixture::new();
     let complete = r#"{"decision":"complete","guidance":"","summary":"accepted fixture"}"#;
     let checkpoint = r#"{"action":"commit-as-is","note":"host checkpoint"}"#;
-    let backend = Arc::new(MockBackend::with_scripts(vec![
+    let repair = scenario == ProfileScenario::Repair;
+    let fix = json!({"fixFeatures":[{"title":"repair seeded defect","spec":"write changed newline to source.txt","validationCriteria":["source changed"]}],"summary":"repair the failed contract"}).to_string();
+    let mut replies = vec![checkpoint, complete];
+    if repair {
+        replies.extend([fix.as_str(), checkpoint, complete]);
+    }
+    replies.push("NONE");
+    let clean_review = json!({"findings":[],"summary":"scripted fresh fixture review"});
+    let mut scripts = vec![
         MockScript::streaming(vec![
             mock_init("orchestrator-fixture"),
             mock_result_text("ready"),
         ])
-        .responding(vec![
-            vec![mock_text(checkpoint), mock_result_text(checkpoint)],
-            vec![mock_text(complete), mock_result_text(complete)],
-            vec![mock_text("NONE"), mock_result_text("NONE")],
-        ]),
-        MockScript::single_shot_json(
-            &json!({"findings":[],"summary":"independent fixture review"}),
-        )
-        .with_session_id("independent-fixture"),
-    ]));
+        .responding(
+            replies
+                .into_iter()
+                .map(|r| vec![mock_text(r), mock_result_text(r)])
+                .collect(),
+        ),
+        MockScript::single_shot_json(&clean_review).with_session_id("independent-fixture"),
+    ];
+    if repair {
+        scripts.extend([
+            MockScript::single_shot_json(&json!({"findings":[{"subject":"source changed","severity":"major","evidence":"source.txt:1 contains defect; engine contract a-1 failed","suggestedFix":"write changed newline"}],"summary":"seeded defect rejected"})).with_session_id("functional-defect"),
+            MockScript::single_shot_json(&clean_review).with_session_id("scrutiny-after-repair"),
+            MockScript::single_shot_json(&clean_review).with_session_id("functional-after-repair"),
+        ]);
+    }
+    let backend = Arc::new(MockBackend::with_scripts(scripts));
     std::fs::create_dir(f.primary.join("pack")).unwrap();
     std::fs::write(f.primary.join("pack/pack.toml"),format!("[pack]\nname='profile-checker'\nschema=5\n[[evaluator]]\nname='profile-checker'\nimage='{}'\nexecutable='/usr/local/bin/python3'\nargs=['-I','-S','/checker/checker.py','pass']\nfiles=['checker.py']\nstages=['plan-approval','milestone-validation','final-gate','merge']\nevidence=['scope','check-receipt']\nkind='mechanical'\nenforcement='blocking'\n",f.profile.definition().unwrap().image)).unwrap();
-    std::fs::write(
-        f.primary.join("pack/checker.py"),
-        include_str!("../../tests/fixtures/gate-evaluator/checker.py"),
-    )
-    .unwrap();
+    let checker = include_str!("../../tests/fixtures/gate-evaluator/checker.py");
+    let checker = if scenario == ProfileScenario::CheckerFailure {
+        checker.replace("request = json.load(sys.stdin)", "request = json.load(sys.stdin)\nif request['params']['stage'] == 'milestone-validation': sys.exit(17)")
+    } else {
+        checker.to_string()
+    };
+    std::fs::write(f.primary.join("pack/checker.py"), checker).unwrap();
     std::fs::write(
         f.primary.join(".kranz/merge-gates.json"),
         r#"{"gates":[{"command":"grep -qx changed source.txt"}]}"#,
@@ -431,22 +486,37 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
     git(&f.primary, &["commit", "-qm", "synthetic checker policy"]);
     let mut cfg = config(f.profile.clone());
     cfg.pack_dir = Some("pack".into());
-    cfg.skip_functional = true;
+    cfg.skip_functional = !repair;
     cfg.validator_allow_uncontained_degrade = true;
-    let mut engine =
-        crate::orchestrator::MissionEngine::create(backend, &f.primary, "contained profile", cfg)
-            .unwrap();
-    let plan:Plan=serde_json::from_value(json!({"goal":"contained profile","touchSet":["source.txt"],"validationContract":[{"id":"a-1","statement":"source changed","check":"command","command":"grep -qx changed source.txt"}],"milestones":[{"title":"delivery","features":[{"title":"change source","spec":"write changed newline to source.txt","validationCriteria":["source changed"]}]}]})).unwrap();
+    let mut engine = crate::orchestrator::MissionEngine::create(
+        backend.clone(),
+        &f.primary,
+        "contained profile",
+        cfg,
+    )
+    .unwrap();
+    let spec = if repair {
+        "fixture-seeded-defect: write changed newline to source.txt"
+    } else {
+        "write changed newline to source.txt"
+    };
+    let plan:Plan=serde_json::from_value(json!({"goal":"contained profile","touchSet":["source.txt"],"validationContract":[{"id":"a-1","statement":"source changed","check":"command","command":"grep -qx changed source.txt"}],"milestones":[{"title":"delivery","features":[{"title":"change source","spec":spec,"validationCriteria":["source changed"]}]}]})).unwrap();
     engine.approve_plan(plan).unwrap();
     let base = engine.state().mission.base_sha.clone().unwrap();
     let branch = engine.state().mission.mission_branch.clone();
     let paths = engine.paths().clone();
+    let expected_workers = if repair { 2 } else { 1 };
     let observer = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(90), async {
+            let mut answered = std::collections::HashSet::new();
             loop {
                 let events = crate::event_log::EventLog::read_events(&paths.events_file()).unwrap();
                 if let Some(request) = events.into_iter().find_map(|e| match e.kind {
-                    EventKind::PermissionRequested { request } => Some(request),
+                    EventKind::PermissionRequested { request }
+                        if !answered.contains(&request.proposal.id) =>
+                    {
+                        Some(request)
+                    }
                     _ => None,
                 }) {
                     assert!(
@@ -454,6 +524,10 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
                         "{:?}",
                         request.proposal.prohibition
                     );
+                    answered.insert(request.proposal.id.clone());
+                    if scenario == ProfileScenario::Interrupt {
+                        crate::control::enqueue(&paths, &ControlCommand::Pause).unwrap();
+                    }
                     crate::control::enqueue(
                         &paths,
                         &ControlCommand::ResolvePermission {
@@ -467,7 +541,9 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
                         },
                     )
                     .unwrap();
-                    break;
+                    if answered.len() == expected_workers {
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -475,14 +551,121 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
         .await
         .expect("permission was not requested");
     });
-    let result = tokio::time::timeout(Duration::from_secs(180), engine.run())
+    let log = engine.paths().events_file();
+    let mut mission_run = Box::pin(engine.run());
+    let result = if scenario == ProfileScenario::Interrupt {
+        // run() deliberately parks on Pause until Resume. Stop polling it only
+        // after the engine has closed the worker and durably entered Paused.
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let parked = async {
+                loop {
+                    let events = crate::event_log::EventLog::read_events(&log).unwrap();
+                    if events
+                        .iter()
+                        .any(|e| matches!(e.kind, EventKind::MissionPaused { .. }))
+                    {
+                        let paused = events
+                            .iter()
+                            .find(|e| matches!(e.kind, EventKind::MissionPaused { .. }))
+                            .unwrap()
+                            .seq;
+                        // Keep polling run() after pause. Dropping it immediately
+                        // would hide a retry loop that dispatches while paused.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let later = crate::event_log::EventLog::read_events(&log).unwrap();
+                        assert!(
+                            !later.iter().any(|e| e.seq > paused
+                                && matches!(
+                                    e.kind,
+                                    EventKind::WorkerSpawned { .. }
+                                        | EventKind::OrchestratorDecision { .. }
+                                )),
+                            "paused mission continued work"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut mission_run => panic!("pause must park the mission: {result:?}"),
+                () = parked => Ok(MissionStatus::Paused),
+            }
+        })
         .await
-        .expect("bounded mission");
+        .expect("mission did not park after interruption")
+    } else {
+        tokio::time::timeout(Duration::from_secs(180), &mut mission_run)
+            .await
+            .expect("bounded mission")
+    };
+    drop(mission_run);
     if let Err(error) = &result {
         observer.abort();
         panic!("mission failed: {error}");
     }
     observer.await.unwrap();
+    if scenario == ProfileScenario::Interrupt {
+        assert_eq!(result.unwrap(), MissionStatus::Paused);
+        assert_eq!(git(&f.primary, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            git(&f.primary, &["show", &format!("{branch}:source.txt")]),
+            "base"
+        );
+        assert_eq!(engine.state().permissions.len(), 1);
+        let permission = engine.state().permissions.values().next().unwrap();
+        assert!(permission.closed.is_some());
+        assert!(permission.resolution.is_none());
+        assert!(permission.delivery.is_none());
+        let workspace = permission.request.binding.workspace.clone();
+        let paths = engine.paths().clone();
+        drop(engine);
+        let restored = crate::orchestrator::MissionEngine::resume(
+            Arc::new(MockBackend::new()),
+            &f.primary,
+            &paths.mission_id,
+            crate::event_log::LockForce::No,
+        )
+        .unwrap();
+        assert_eq!(restored.state().mission.status, MissionStatus::Paused);
+        assert!(restored
+            .state()
+            .permissions
+            .values()
+            .all(|p| p.closed.is_some() && p.resolution.is_none()));
+        drop(restored);
+        git(&f.primary, &["worktree", "remove", "--force", &workspace]);
+        return;
+    }
+    if scenario == ProfileScenario::CheckerFailure {
+        assert_eq!(result.unwrap(), MissionStatus::Blocked);
+        assert_eq!(git(&f.primary, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            git(&f.primary, &["show", &format!("{branch}:source.txt")]),
+            "changed"
+        );
+        let gate = engine
+            .state()
+            .gate_evaluations
+            .values()
+            .find(|r| {
+                r.requested.request.params.stage
+                    == crate::gate_evaluation::protocol::Stage::MilestoneValidation
+            })
+            .unwrap();
+        assert!(gate.consumed.is_none());
+        let finished = gate.finished.as_ref().unwrap();
+        assert!(finished.cleanup_confirmed);
+        assert!(
+            matches!(&finished.outcome, crate::gate_evaluation::lifecycle::Outcome::Error { message } if message.contains("unsuccessfully"))
+        );
+        let events =
+            crate::event_log::EventLog::read_events(&engine.paths().events_file()).unwrap();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::MissionCompleted {})));
+        return;
+    }
     assert_eq!(
         result.unwrap(),
         MissionStatus::Complete,
@@ -499,10 +682,11 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
         "changed"
     );
     let state = engine.state();
-    assert_eq!(state.permissions.len(), 1);
-    let permission = state.permissions.values().next().unwrap();
-    assert_eq!(permission.delivery, Some(Delivery::Sent));
-    assert!(permission.resolution.as_ref().unwrap().allow);
+    assert_eq!(state.permissions.len(), expected_workers);
+    for permission in state.permissions.values() {
+        assert_eq!(permission.delivery, Some(Delivery::Sent));
+        assert!(permission.resolution.as_ref().unwrap().allow);
+    }
     assert!(!state.mission.milestones[0].features[0].commits.is_empty());
     let events = crate::event_log::EventLog::read_events(&engine.paths().events_file()).unwrap();
     let encoded = serde_json::to_string(&events).unwrap();
@@ -536,7 +720,49 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
             }
         }
     }
-    assert_eq!(profile_receipts, 1);
+    assert_eq!(profile_receipts, expected_workers);
+    if repair {
+        assert_eq!(state.mission.milestones[0].fix_cycles, 1);
+        let specs = backend.started_specs();
+        let tasks: Vec<_> = specs
+            .iter()
+            .filter_map(|s| match &s.prompt {
+                PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.contains("[a-1] `grep -qx changed source.txt` → FAIL")),
+            "{tasks:?}"
+        );
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.contains("[a-1] `grep -qx changed source.txt` → PASS")),
+            "{tasks:?}"
+        );
+        let finding = events.iter().position(|e| matches!(&e.kind, EventKind::ValidationFinding { finding, .. } if finding.evidence.contains("source.txt:1 contains defect"))).unwrap();
+        let fix = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::FixFeatureCreated { .. }))
+            .unwrap();
+        let requests: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                matches!(e.kind, EventKind::PermissionRequested { .. }).then_some(i)
+            })
+            .collect();
+        assert!(requests[0] < finding && finding < fix && fix < requests[1]);
+        let sessions: std::collections::HashSet<_> = state
+            .permissions
+            .values()
+            .map(|p| &p.request.proposal.engine_session_id)
+            .collect();
+        assert_eq!(sessions.len(), 2, "repair requires a fresh worker session");
+    }
     use crate::gate_evaluation::protocol::Stage;
     for stage in [
         Stage::PlanApproval,
@@ -557,6 +783,41 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
         mission_dir: active_paths.mission_dir(),
     };
     drop(engine);
+    if scenario == ProfileScenario::PolicyDrift {
+        let mut log = crate::event_log::EventLog::acquire(
+            &active_paths,
+            &active_paths.mission_id,
+            Duration::ZERO,
+            crate::event_log::LockForce::No,
+        )
+        .unwrap();
+        log.append(EventKind::ConfigChanged {
+            patch: json!({"packDir":null}),
+        })
+        .unwrap();
+        drop(log);
+        let error = crate::merge::merge_mission_with_external_evidence(
+            &crate::git_ops::GitRepo::open(&f.primary).unwrap(),
+            "main",
+            &base,
+            &branch,
+            None,
+            None,
+            &Default::default(),
+            |_, _| panic!("policy drift must refuse before commands"),
+            &active_paths,
+            Actor::LocalRepositoryAuthority,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("evaluator pack changed after approval"),
+            "{error}"
+        );
+        assert_eq!(git(&f.primary, &["rev-parse", "HEAD"]), base);
+        return;
+    }
     let primary = f.primary.clone();
     let merged = tokio::task::spawn_blocking(move || {
         crate::merge::merge_mission_with_external_evidence(
@@ -598,6 +859,16 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
         .find(|r| r.requested.request.params.stage == Stage::Merge)
         .unwrap();
     assert!(merge.consumed.is_some());
+    let crate::gate_evaluation::protocol::Subject::Integration {
+        integration_tree, ..
+    } = &merge.requested.request.params.subject
+    else {
+        panic!("merge must judge an integration tree")
+    };
+    assert_eq!(
+        integration_tree.value,
+        git(&f.primary, &["rev-parse", "HEAD^{tree}"])
+    );
     assert_eq!(
         merge
             .resolution
@@ -618,6 +889,53 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
         .iter()
         .all(|file| !String::from_utf8_lossy(&file.bytes)
             .contains("synthetic-login-no-authority-12345")));
+    if repair {
+        for entry in &bundle.manifest.entries {
+            if let Some(path) = &entry.path {
+                let bytes = std::fs::read(export.join(path)).unwrap();
+                assert_eq!(
+                    entry.sha256.as_deref(),
+                    crate::gate_evaluation::protocol::Digest::of(&bytes)
+                        .as_str()
+                        .strip_prefix("sha256:")
+                );
+            }
+        }
+        let exported_events =
+            crate::event_log::EventLog::read_events(&export.join("events.jsonl")).unwrap();
+        let exported = crate::reducer::fold(&exported_events).unwrap();
+        assert_eq!(exported.permissions.len(), 2);
+        assert_eq!(exported.mission.milestones[0].fix_cycles, 1);
+        assert!(exported
+            .gate_evaluations
+            .values()
+            .any(|r| r.requested.request.params.stage == Stage::Merge && r.consumed.is_some()));
+        let before = std::fs::read(final_paths.events_file()).unwrap();
+        std::fs::remove_dir_all(final_paths.runs_dir()).unwrap();
+        let cleaned =
+            crate::evidence_bundle::assemble_evidence_bundle(&f.primary, &mission_id).unwrap();
+        let missing = |bundle: &crate::evidence_bundle::EvidenceBundle| {
+            bundle
+                .manifest
+                .entries
+                .iter()
+                .filter(|e| e.status == Some(crate::provenance::ArtefactStatus::Unresolved))
+                .count()
+        };
+        assert!(
+            missing(&cleaned) > missing(&bundle),
+            "cleaned runtime evidence must remain visibly unresolved"
+        );
+        assert_eq!(
+            std::fs::read(final_paths.events_file()).unwrap(),
+            before,
+            "export cannot replay an effect"
+        );
+        assert_eq!(
+            git(&f.primary, &["rev-parse", "HEAD^{tree}"]),
+            integration_tree.value
+        );
+    }
 }
 
 #[test]

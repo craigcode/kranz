@@ -3574,6 +3574,13 @@ impl MissionEngine {
             // judgement digest reflects them.
             self.drain_control().await?;
 
+            // A permission-time pause has already stopped the owned worker.
+            // Return to the run loop's idle park before any checkpoint, model
+            // judgement or retry. Keep partial work for explicit resume.
+            if self.state.mission.status == MissionStatus::Paused {
+                return Ok(());
+            }
+
             // Infrastructure failure, not worker quality (ticket
             // worker-spawn-auth-failure-budget): a spawn that died in seconds
             // on a backend auth/dead-binary signature never ran, so it must

@@ -94,11 +94,15 @@ refusal before transcript emission; stderr literals are redacted. This does not
 promise detection of arbitrary transformed or split secrets. Model selection and
 cost retain the limitations in [ACP compatibility](acp-compatibility.md).
 
-The synthetic ordinary-mission test exercises one-call consent, a real host
+The synthetic ordinary-mission tests exercise one-call consent, a real host
 checkpoint, fresh fixture review, external gates, local merge and evidence export.
+They also cover seeded defect/repair, interruption with a late consent click,
+policy drift and checker failure. Exported evidence binds the merged tree and
+retains missing runtime artifacts as unresolved after cleanup.
 It uses a test-only Python profile that does not exist in production builds.
 The [admission review](reviews/2026-09-20-acp-worker-profile-admission.md) records
-verification and the remaining S7 boundary.
+verification; the [S7 fixture review](reviews/2026-09-20-acp-governed-fixtures.md)
+records the integrated failure cases and remaining live acceptance boundary.
 
 ## Boundary
 
@@ -361,8 +365,10 @@ The ordinary admission work described by the earlier
 [breakdown](reviews/2026-09-19-acp-linux-preparation.md#ordinary-mission-admission-concrete-remaining-work)
 is now implemented by the explicit profiles above. The
 [admission review](reviews/2026-09-20-acp-worker-profile-admission.md) separates
-that integration from the remaining S7 defect/repair and live governed-mission
-acceptance. Earlier preparation evidence retains the recovered physical-disk
+that integration from S7 acceptance. The
+[S7 fixture review](reviews/2026-09-20-acp-governed-fixtures.md) adds synthetic
+defect/repair evidence; live governed-mission acceptance remains separate.
+Earlier preparation evidence retains the recovered physical-disk
 exhaustion during a later test build; that failed build is not reclassified by
 the live pass or this implementation.
 

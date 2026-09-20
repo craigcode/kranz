@@ -46,6 +46,8 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "profile-fixture-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": login_value}}}})
             continue
         command = "printf 'changed\\n' > source.txt"
+        if "fixture-seeded-defect" in str(request) and Path("source.txt").read_text() == "base\n":
+            command = "printf 'defect\\n' > source.txt"
         send({"jsonrpc": "2.0", "id": "one-action", "method": "session/request_permission", "params": {
             "sessionId": "profile-fixture-session", "toolCall": {"toolCallId": "write-source", "title": "write synthetic deliverable", "kind": "execute", "rawInput": {"command": command}},
             "options": [{"optionId": "once", "name": "Allow once", "kind": "allow_once"}, {"optionId": "deny", "name": "Deny once", "kind": "reject_once"}]}})

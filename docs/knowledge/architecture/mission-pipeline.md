@@ -35,6 +35,11 @@ verified_against:
 
 ## The one invariant
 
+A sequential worker interrupted by Pause returns to the outer idle loop after
+recording its existing commits and closing live permissions. It must not enter
+checkpoint, judgment or respawn while paused. A later permission click cannot
+revive the old peer; explicit resume starts with the recorded partial work.
+
 `events.jsonl` (append-only JSONL, one `Event` per line) is the sole source of
 truth. Everything else — `MissionState`, `state.json`, the dashboard — is
 derived by folding that log. If you change how state is computed, change the

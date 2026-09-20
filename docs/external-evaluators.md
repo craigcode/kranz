@@ -104,6 +104,10 @@ container removal. `judged/fail` is an accepted finding of failure; `escalate` h
 no verdict; an RPC/process/protocol error is an unsuccessful attempt. None of
 these alone is a stage disposition or human approval.
 
+Container creation consumes the evaluation's remaining wall-time budget;
+inspection and cleanup each keep a five-second control limit. A slow create
+does not receive a fresh evaluation deadline or an automatic retry.
+
 Duplicate or missing responses, trailing output, forged authority fields,
 nonzero exits after pass JSON, overflow, expiry and cancellation cannot pass.
 The host CLI's process group is killed before reaping its leader. Container
