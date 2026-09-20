@@ -2,8 +2,10 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-20
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
@@ -84,7 +86,7 @@ Project vocabulary. Terms link to the note that explains them in depth.
   (`<repo>/.kranz/config.json`) may not set because each names a program the
   engine runs, an endpoint it talks to outside the sandbox, a credential, or a
   containment escape: `claudeBinary`, `packDir`, `contractEnvPassthrough`,
-  `slack`, `hookStatus`, `<role>.baseUrl`, the `<role>.sandbox.*` widening
+  `slack`, `hookStatus`, `<role>.baseUrl`, `<role>.acpProfile`, the `<role>.sandbox.*` widening
   keys, and the `dangerouslyAllowAll` family. They are settable from the global
   layer only. A repository may RAISE `sandbox.enforce`, never lower it.
   Runtime `config-change` patches carry the same split by source: the
@@ -108,6 +110,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Backend** — the dispatch target a role runs on: `claude`, `codex`, `droid`,
   `kimi`, `cursor`, an OpenAI-compatible `local` endpoint, or a worker-only
   `acp` agent executable. Selection and sandbox support are validated per role.
+- **ACP worker profile** — operator-selected `worker.acpProfile` fixing a
+  qualified adapter/image, private file credential, startup policy and configured
+  egress. It requires contained worktree workers; generic ACP enforcement remains
+  refused. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
 - **Mutation authority** — a validated, nonempty token required by the server's
   mutation-capable constructors. Convenience routers mint an undisclosed token,
   so reads work and unauthenticated mutations are refused.

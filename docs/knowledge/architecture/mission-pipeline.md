@@ -2,8 +2,10 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-20
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
   - crates/engine/src/gate_evaluation/lifecycle.rs
@@ -288,6 +290,19 @@ backend converts cost to a per-turn delta before `worker.completed` adds it
 to mission totals. Raw provider totals remain in the transcript. Conversation
 resets start a new segment; missing or zeroed crash results do not erase prior
 spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
+
+## Qualified ACP workers
+
+An operator-only `worker.acpProfile` admits the reviewed Claude/Codex container
+profiles to ordinary worktree missions. It fixes guest argv, image, explicit
+file credential, startup settings and configured egress; defaults remain
+unchanged. Generic enforced ACP, validators, session resume and dispatch-pool
+profiles are refused. The profile supplies a private HOME with an unmounted
+private parent. Existing permission, checkpoint and event machinery remains
+in use; engine-run checks use the same image offline without the worker login.
+The synthetic mission reaches local merge and export, while S7 defect/repair
+and live governed-mission acceptance remain open. See
+[ACP containment](../../acp-containment.md).
 
 ## Live one-call consent
 

@@ -89,9 +89,12 @@ Final local gates passed on macOS ARM64:
   `RUST_TEST_THREADS=4` and VM-shared mission/scratch paths were used.
 - `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `cargo build --workspace`: passed.
-- Engine secret scan and domain lint: 26 changed files, no findings or skips.
+- Engine secret scan and domain lint: 35 changed files including the refreshed knowledge notes, no findings or skips.
   Staged gitleaks found no leaks. Workflow actionlint, changed-document local
   links and whitespace checks passed.
+- Knowledge refresh: all 10 notes passed after reviewing the nine notes whose
+  sources changed. The existing Slack command citation remains intentionally
+  unexecuted by report-only refresh; Slack tests passed in the workspace suite.
 - Cleanup: no containers, volumes, extra Docker networks or private profile
   homes remained. Colima was restored to its original stopped state.
 

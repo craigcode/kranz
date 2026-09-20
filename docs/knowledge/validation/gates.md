@@ -2,8 +2,10 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-19
+last_verified: 2026-09-20
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/examples/acp_compat_probe.rs
   - crates/engine/examples/acp_compat_probe/tool_fixture.rs
   - scripts/check-acp-tool-probe.py
@@ -55,8 +57,8 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine real daemon proofs by
-name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine descendant/lifetime daemon proofs and the two ordinary-profile
+mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. Synthetic control tests additionally
 require confirmed absence after asynchronous deletion and failure when a
 namespace persists. The MCP descendant proof exchanges initialization and a
@@ -72,8 +74,14 @@ checks, including Codex's exact observed permission wrapper and rejection of
 added commands. Synthetic Claude peers also check fixed nonessential-traffic
 suppression before initialization across key/OAuth/file-login channels. The
 default report-only path still refuses tools. These checks cover the direct-backend Docker proof
-path; ordinary enforced-ACP mission configuration remains closed pending vendor
-qualification. See [ACP containment](../../acp-containment.md).
+path. Two explicit qualified profiles now admit ordinary worktree workers on
+macOS/Linux ARM64 Docker. A test-only profile proves approval, one-call consent,
+contained shell delivery, host checkpoint, fresh scripted review, external gates,
+offline local merge and portable export; a separate credential-echo case checks
+refusal and cleanup. The new Docker fixtures hold the shared environment-test
+lock so another test's fake runtime cannot redirect them. S7's seeded repair,
+interruption/policy drift and bounded live governed missions remain open. See
+[ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite
 
@@ -236,7 +244,9 @@ Once all milestones complete, `final_gate()` runs the mission's
   `active_root()` with the sanitized `contract_command_env(base_sha)`, which exports
   `KRANZ_BASE_SHA` set to the sha pinned at approval (never the live base
   branch). When enforcement is enabled, the resolved worker sandbox also wraps
-  the gate; `off` keeps the environment-only posture. The timeout is 10 minutes
+  the gate. Qualified ACP profiles derive an offline gate policy with the same
+  pinned image and no selected provider login; `off` keeps the environment-only
+  posture. The timeout is 10 minutes
   (`COMMAND_TIMEOUT`). A non-zero exit produces a critical, non-waivable
   `command-assertion` finding.
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown

@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-20
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs

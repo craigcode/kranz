@@ -2,8 +2,10 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-19
+last_verified: 2026-09-20
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - crates/engine/src/sandbox_container/mount_proof.rs
@@ -216,7 +218,11 @@ untouched (AGENTS.md rules 1–3).
   exchange or uncertain cleanup never grants admission. Interrupted creation or
   unconfirmed removal retains private recovery intent; a guest deadline bounds
   the running helper after engine death. Required runtime mount proofs currently
-  support Docker on Linux/macOS and refuse other runtimes before spawn. See
+  support Docker on Linux/macOS and refuse other runtimes before spawn. Session
+  preflight uses the configured image; a missing pinned image is refused without
+  pulling. Qualified ACP worker profiles also pin argv, private file credentials
+  and startup settings, and require worktree isolation. Their engine-run checks
+  stay offline and receive no selected worker login. See
   [mount preflight ownership](../../acp-containment.md#mount-preflight-ownership).
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
@@ -249,5 +255,7 @@ of the effect. Prohibited or incomplete actions cannot be approved, and only
 unique certified once-only options qualify. Expiry, action drift, a dead peer
 or a lost response channel closes the request without retrying the effect.
 Local capability authority is recorded as such; only a verified Slack interaction
-supplies a Slack user identity. ACP remains cooperative until separate containment
-proof exists. See [consent operations](../../acp-live-permissions.md).
+supplies a Slack user identity. Permission callbacks alone remain cooperative;
+only the explicit qualified worker profiles add the separately proven container
+boundary. See [consent operations](../../acp-live-permissions.md) and
+[profile admission](../../acp-containment.md#qualified-ordinary-workers).
