@@ -94,9 +94,10 @@ kranz work                      # drain the queue (run missions)
     prompt-injectable child spawns `env_clear`d (`agent_env.rs`) — never
     reintroduce ambient inheritance; the sanctioned credential channels are
     `contractEnvPassthrough` (contract commands) and the workspace contract's
-    `secrets` (bootstrap/data hooks). Enforced sandboxes are honored only by
-    the claude backend (validation rejects other pairs — don't widen without
-    a real spawn wrapper). `serve.token` is mutation authority, `serve.read.token`
+    `secrets` (bootstrap/data hooks). Enforced sandboxes are honored by the native claude backend and the two
+    explicit ACP worker profiles (docs/acp-containment.md). ACP profiles pin
+    image, startup and selected file credentials; generic ACP commands and all
+    other unsupported pairs remain refused. Do not widen without proof. `serve.token` is mutation authority, `serve.read.token`
     reads only; both must stay unreadable inside sandboxes
     (`authority_read_deny_paths`). Engine-run gates (validation-round,
     final-gate, and merge-gate commands) also execute worker-authored code:

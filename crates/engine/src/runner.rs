@@ -1342,7 +1342,11 @@ fn build_worker_spec(
     let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
     seed_worker_env(
         &mut spec,
-        auth_verdict,
+        if role_cfg.acp_profile.is_some() {
+            AuthVerdict::Inconclusive
+        } else {
+            auth_verdict
+        },
         real_home.as_deref(),
         real_config_dir.as_deref(),
     );

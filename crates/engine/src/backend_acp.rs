@@ -44,17 +44,18 @@
 //! Client fs/terminal services and same-feature resume remain unsupported.
 //! Unexpected client requests receive -32601. Released adapters may support
 //! load/resume methods; that does not imply Kranz negotiates or uses them.
-//! Configuration continues to restrict ACP to opt-in worker use and rejects
-//! enforced sandboxes, validator roles and automatic backend promotion.
+//! Configuration restricts ACP to opt-in worker use. Enforced missions require
+//! an explicit qualified `acpProfile`; arbitrary commands, validator roles and
+//! automatic backend promotion remain refused.
 //! The direct backend API has a Docker containment proof path on macOS/Linux:
 //! a pinned, trusted Linux image must supply /usr/local/bin/python3. It reuses
 //! the container mount policy and a private host lease checked by guest PID 1.
-//! Vendor/image certification and configuration enablement remain separate.
+//! Profile admission pins that image, startup policy and credential channel.
 //!
 //! Child environments are cleared through `agent_session_env`. ACP has no
-//! implicit credential selection or native-state seeding: only explicit
-//! SessionSpec.env credentials cross. Private HOME is retained; ambient HOME
-//! and provider credentials are never restored by this backend.
+//! implicit credential selection: direct callers supply SessionSpec.env, while
+//! profiles seed only the operator-selected credential file in a private home.
+//! Ambient HOME and provider credentials are never restored by this backend.
 //!
 //! Single-shot completion closes stdin, allows a short exit grace and then
 //! cleans up the owned process group. macOS/Linux observe exit with WNOWAIT
@@ -513,6 +514,7 @@ fn tool_result_summary(update: &Value, tracked: &ToolCallInfo, status: &str) -> 
 pub struct AcpBackend {
     program: PathBuf,
     args: Vec<String>,
+    profile: Option<crate::acp_worker::AcpWorkerProfile>,
 }
 
 impl AcpBackend {
@@ -522,6 +524,30 @@ impl AcpBackend {
         AcpBackend {
             program: program.into(),
             args,
+            profile: None,
+        }
+    }
+
+    /// Ordinary-worker construction. Profile argv and startup policy are fixed;
+    /// the credential is read only at session start, after boundary checks.
+    pub fn for_worker(cfg: &crate::types::RoleConfig) -> Result<Self> {
+        if let Some(profile) = &cfg.acp_profile {
+            profile.validate_config(
+                crate::types::Role::Worker,
+                cfg,
+                crate::types::WorkerIsolation::Worktree,
+            )?;
+            let definition = profile.definition()?;
+            Ok(Self {
+                program: definition.program.into(),
+                args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
+                profile: Some(profile.clone()),
+            })
+        } else {
+            let command = cfg.acp_command.as_ref().ok_or_else(|| {
+                EngineError::Config("ACP worker requires acpCommand or acpProfile".into())
+            })?;
+            Ok(Self::new(command, cfg.acp_args.clone()))
         }
     }
 
@@ -558,7 +584,7 @@ fn peer_reported_model(session: &Value) -> Option<&str> {
 
 #[async_trait::async_trait]
 impl AgentBackend for AcpBackend {
-    async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+    async fn start(&self, mut spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
         // Configuration admission is not the only caller of this public
         // backend. Never silently discard an embedding caller's boundary.
         let container_requested = spec.sandbox.as_ref().is_some_and(|sandbox| {
@@ -578,6 +604,11 @@ impl AgentBackend for AcpBackend {
                     .to_string(),
             ));
         }
+        let profile_home = self
+            .profile
+            .as_ref()
+            .map(|profile| profile.prepare(&mut spec))
+            .transpose()?;
         let model = spec.model.clone();
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -666,6 +697,7 @@ impl AgentBackend for AcpBackend {
             child,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             container,
+            profile_home,
             #[cfg(windows)]
             job,
             stdin: Some(stdin),
@@ -756,6 +788,7 @@ pub struct AcpSession {
     child: Child,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     container: Option<crate::acp_container::OwnedContainer>,
+    profile_home: Option<crate::acp_worker::PreparedProfile>,
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
     stdin: Option<ChildStdin>,
@@ -952,6 +985,7 @@ impl AcpSession {
                 "modelSource": if reported_model.is_some() { "peer" } else { "unreported" },
                 "configuredModelSelectionApplied": false,
                 "containment": containment,
+                "workerProfile": self.profile_home.as_ref().map(|p| &p.receipt),
                 "synthesizedBy": "backend_acp",
             }),
         });
@@ -1101,6 +1135,25 @@ impl AcpSession {
             match read {
                 Ok(Some(line)) if line.trim().is_empty() => continue,
                 Ok(Some(line)) => {
+                    if self.profile_home.is_some()
+                        && crate::strict_json::parse(line.as_bytes()).is_err()
+                    {
+                        // Do not retain malformed credential-bearing peer input,
+                        // including duplicate keys hiding an escaped token.
+                        return Err(EngineError::Backend(
+                            "acp profile peer emitted invalid unique-key JSON; frame refused"
+                                .into(),
+                        ));
+                    }
+                    if self
+                        .profile_home
+                        .as_ref()
+                        .is_some_and(|p| p.contains_secret(&line))
+                    {
+                        return Err(EngineError::Backend(
+                            "acp peer exposed a configured credential; frame refused".into(),
+                        ));
+                    }
                     if !self.handshake_complete {
                         self.handshake_bytes = self.handshake_bytes.saturating_add(line.len());
                         if self.handshake_bytes > STDOUT_LINE_CAP {
@@ -1667,6 +1720,13 @@ impl AcpSession {
                 tracing::error!(%error, "ACP cleanup requires recovery");
             }
         }
+        if let Some(profile) = self.profile_home.as_mut() {
+            if let Err(error) = profile.close() {
+                self.cleanup_failure
+                    .get_or_insert("private credential home cleanup failed");
+                tracing::error!(%error, "ACP private home requires recovery");
+            }
+        }
         self.finish_stderr().await;
     }
 
@@ -1739,6 +1799,10 @@ impl AcpSession {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let captured = self
+            .profile_home
+            .as_ref()
+            .map_or_else(|| captured.clone(), |p| p.scrub(captured.clone()));
         last_chars(captured.trim_end(), STDERR_TAIL_CHARS)
     }
 }

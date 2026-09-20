@@ -217,7 +217,9 @@ authority/migration rules; runtime integration remains in the later slices.
 - [ ] `gate-lifecycle-evidence-integration` — approval, permission, milestone,
   final and merge joins, restricted validator inputs and replay/export.
 - [ ] `acp-worker-containment-proof` — real adapter/descendant wrappers and
-  explicit platform support; callbacks alone are not a sandbox.
+  explicit platform support; [qualified worker admission](acp-containment.md)
+  implemented on the integration branch, awaiting review/merge. Callbacks alone
+  are not a sandbox.
 - [ ] `acp-governed-mission-acceptance` — seeded defect, human consent,
   independent checks, local merge and portable evidence in one synthetic mission.
 

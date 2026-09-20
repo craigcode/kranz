@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Docker lifetime, pinned-image and hostile descendant proofs implemented; mount-proof dependency is closed. Bounded Claude/Codex native shell checks pass on macOS ARM64 and with the engine running directly on Ubuntu ARM64 in the local Colima VM, each with one-time consent, exact file/report, one host checkpoint, unchanged primary state and confirmed cleanup. See docs/compatibility/acp/native-tool-proof-v2.json and docs/compatibility/acp/linux-native-tool-proof-v1.json. Earlier failures remain retained. Qualified ordinary mission admission with credential/startup integration and S7 remain open; both approved Linux provider slots are consumed.
+state-note: Implementation and author review now include qualified ordinary worker profiles, private file credentials/startup, offline contract/merge checks, and a synthetic mission with one-call consent, nonempty checkpoint, external gates, local merge and export. Full-workspace tests (3,052 passed), clippy, fmt and build are green; awaiting CI and branch review/merge; S7 defect/repair and bounded live governed missions remain open. See docs/reviews/2026-09-20-acp-worker-profile-admission.md. Prior approved provider slots remain consumed.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once
@@ -14,8 +14,8 @@ whose filesystem, authority, network and process boundaries have been proven.
 
 ## Context
 
-S6 of docs/scoping/acp-worker-gate-contract.md. ACP currently declares no
-sandbox enforcement. Client fs/terminal capabilities and permission callbacks
+S6 of docs/scoping/acp-worker-gate-contract.md. Generic ACP continues to declare
+no sandbox enforcement; the qualified worker profiles provide the explicit exception. Client fs/terminal capabilities and permission callbacks
 are not containment. Follow D-F/D-H and reuse sandbox.rs/command_exec primitives.
 
 ## Scoping answers
@@ -25,7 +25,7 @@ are not containment. Follow D-F/D-H and reuse sandbox.rs/command_exec primitives
 - Prove required adapter authentication/caches work without ambient authority.
 - Keep no-push/no-primary-write invariants and post-worker integrity checks.
 - Expose tested adapter/platform support explicitly; keep refusal for unproven combinations. Start macOS, then Linux; Windows needs proof before enablement.
-- Follow the remaining admission breakdown in docs/reviews/2026-09-19-acp-linux-preparation.md; Linux ARM64 synthetic and bounded live shell checks pass, while credential/startup integration and ordinary mission admission remain pending. See docs/reviews/2026-09-20-acp-linux-native-tool-pass.md for the live scope and limits.
+- The admission breakdown in docs/reviews/2026-09-19-acp-linux-preparation.md is implemented by the explicit profiles in docs/acp-containment.md. The live scope and limits remain in docs/reviews/2026-09-20-acp-linux-native-tool-pass.md; ordinary mission integration and review are in docs/reviews/2026-09-20-acp-worker-profile-admission.md.
 
 - Out of scope: Reimplementing a sandbox, client filesystem/terminal RPC services, ACP validators, credential inheritance or changing defaults without proof.
 

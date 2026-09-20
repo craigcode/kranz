@@ -71,7 +71,7 @@ impl MissionEngine {
             std::env::consts::OS,
             std::env::consts::ARCH,
             &root,
-            &self.state.config.worker.sandbox,
+            &crate::command_exec::worker_gate_sandbox(&self.state.config)?,
             &self.state.workspace_pin,
             &env,
         ))?);

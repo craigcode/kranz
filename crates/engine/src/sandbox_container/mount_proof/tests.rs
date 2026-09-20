@@ -487,3 +487,26 @@ async fn mount_helper_v1_real_engine_death_bounds_guest_and_retains_intent() {
     std::fs::remove_dir_all(ledger).unwrap();
     std::fs::remove_dir_all(record["root"].as_str().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn mount_helper_v1_missing_configured_image_never_pulls() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("pulled");
+    let (_fake, mut helper) = fake(&format!(
+        "[ \"$1\" = pull ] && touch '{}'\nexit 1",
+        marker.display()
+    ));
+    helper.creation_started = false;
+    let result = helper
+        .round_trip(
+            IMAGE,
+            Duration::from_secs(2),
+            85,
+            &AtomicBool::new(false),
+            "/host",
+            "/guest",
+        )
+        .await;
+    assert!(result.unwrap_err().contains("must already be installed"));
+    assert!(!marker.exists());
+}

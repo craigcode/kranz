@@ -804,7 +804,7 @@ impl MissionHost {
         // runtime) error loudly at resolve rather than running unsandboxed
         // (13th-pass review, P1).
         let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
-            sandbox: state.config.worker.sandbox.clone(),
+            sandbox: kranz_engine::command_exec::worker_gate_sandbox(&state.config)?,
             mission_dir: paths.mission_dir(),
         };
         // A container-provider mission whose host has NO container runtime

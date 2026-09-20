@@ -990,20 +990,14 @@ impl MissionEngine {
             }
             BackendKind::Acp => {
                 let role_cfg = self.state.config.role(role);
-                // `config::validate` has already guaranteed acp_command is
-                // present for an acp-backed role (worker only). Like local,
+                // Validation requires either a command or a qualified profile
+                // for the ACP worker. Like local,
                 // there is no binary discovery: ACP defines no `--version`
                 // convention, so the initialize handshake at session start
                 // IS the probe — a non-ACP executable fails there, loudly,
                 // and there is no claude fallback to hide that behind.
-                let acp_command = role_cfg
-                    .acp_command
-                    .clone()
-                    .expect("validate guarantees acp_command for backend = acp");
-                let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_acp::AcpBackend::new(
-                    acp_command,
-                    role_cfg.acp_args.clone(),
-                ));
+                let backend: Arc<dyn AgentBackend> =
+                    Arc::new(crate::backend_acp::AcpBackend::for_worker(role_cfg)?);
                 Ok(backend)
             }
         }
@@ -1389,7 +1383,7 @@ impl MissionEngine {
             let _lint_worktree = ApprovalLintWorktree::create(&self.repo, &lint_root, &base_sha)?;
             let scratch = self.paths.runs_dir().join("approval-contract-home");
             let mut sandbox = crate::command_exec::resolve_gate_sandbox(
-                &self.state.config.worker.sandbox,
+                &crate::command_exec::worker_gate_sandbox(&self.state.config)?,
                 &lint_root,
                 &self.paths.mission_dir(),
                 &scratch,
@@ -5357,7 +5351,7 @@ impl MissionEngine {
     /// runtime on PATH) fail closed, mirroring session resolution.
     fn gate_sandbox(&mut self, root: &std::path::Path) -> Result<crate::command_exec::GateSandbox> {
         let resolution = crate::command_exec::resolve_gate_sandbox(
-            &self.state.config.worker.sandbox,
+            &crate::command_exec::worker_gate_sandbox(&self.state.config)?,
             root,
             &self.paths.mission_dir(),
             &self.paths.runs_dir().join("contract-home"),

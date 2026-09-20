@@ -1130,8 +1130,8 @@ pub struct RoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Executable of the ACP (Agent Client Protocol) agent for
-    /// `backend = "acp"`. Required and validated when a role selects the acp
-    /// backend (KRZ-301; worker role only for now).
+    /// `backend = "acp"`. Required without a qualified `acpProfile`, and
+    /// forbidden with one (the profile owns argv). Worker role only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<String>,
     /// Extra argv for `acpCommand` (model flags, agent-specific options —
@@ -1150,6 +1150,10 @@ pub struct RoleConfig {
     /// Per-role OS sandbox opt-in.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Explicit operator-owned ACP worker qualification and credential source.
+    /// Absent on old persisted configurations; never implies generic ACP support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_profile: Option<crate::acp_worker::AcpWorkerProfile>,
 }
 
 /// OS sandbox enforcement level for a role's sessions.
@@ -1767,6 +1771,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             worker: RoleConfig {
@@ -1781,6 +1786,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_scrutiny: RoleConfig {
@@ -1795,6 +1801,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_functional: RoleConfig {
@@ -1809,6 +1816,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             skip_scrutiny: false,

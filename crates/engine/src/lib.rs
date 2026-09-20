@@ -21,6 +21,7 @@ pub mod paths;
 pub mod plan_fit;
 pub mod types;
 
+pub mod acp_worker;
 pub mod agent_env;
 #[cfg(windows)]
 pub(crate) mod appcontainer_windows;

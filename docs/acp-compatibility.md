@@ -3,15 +3,16 @@
 S2 has deterministic transport tests, released-source inspection and live
 native-login text/report passes for both Claude and Codex on macOS arm64. The current
 ACP backend remains an opt-in worker backend. Validator use, same-feature resume,
-client filesystem/terminal services and enforced containment in ordinary missions
-remain unavailable. The [one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
+client filesystem/terminal services remain unavailable. Enforced ordinary workers
+require a [qualified profile](acp-containment.md#qualified-ordinary-workers). The [one-call consent guide](acp-live-permissions.md) covers the separate S4 broker
 and operator controls.
 
 The [S6 container proof path](acp-containment.md) now exercises the direct
 backend API with deterministic peers and basic contained Claude/Codex report
 passes using private authentication on the pinned Linux ARM64 image. Ordinary
-mission configuration still refuses enforced ACP; these narrow checks do not
-certify arbitrary images, Linux hosts or governed missions.
+mission configuration now admits only the two explicit pinned profiles described
+in that guide. Those narrow checks do not certify arbitrary images, all Linux
+host installations or the complete S7 governed mission.
 
 ## Released baseline
 
@@ -52,7 +53,7 @@ See the released [Claude permission extension](https://github.com/agentclientpro
 and [Codex permission extension](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/docs/permission-extension.md).
 A selected `allow_once` is still an adapter-owned mapping, not an OS security
 boundary. A peer that does not request permission can bypass this cooperative
-policy; no compatibility result removes the enforced-sandbox refusal.
+policy; containment comes from the qualified spawn wrapper, not this callback.
 
 ## What the tests establish
 
@@ -113,7 +114,8 @@ Before starting either Codex authentication path, the probe writes its own
 `CODEX_HOME/config.toml` with file-only credential storage and both `plugins`
 and `remote_plugin` disabled. These startup settings suppress plugin warmups
 outside the bounded fixture; session-level settings arrive too late. This
-policy is specific to the compatibility probe, not ordinary missions. The
+policy is also used by the qualified Codex worker profile; generic ACP commands
+do not receive it implicitly. The
 preflight and start receipt include the exact TOML as `codexStartupConfig`;
 `codexStartupConfigWritten` distinguishes the preview from a completed write.
 The receipt records intended startup policy, not independently verified runtime
@@ -168,9 +170,9 @@ not a live provider attestation.
 
 A live pass establishes only the exercised authentication, basic text report and
 normal completion path for the pinned release/platform. Explicit probe injection
-does not configure ordinary missions: `backend_acp` currently has no automatic
-provider credential selection or native-state seeding. Both live receipts and
-that readiness limitation have been reviewed for this compatibility slice;
+does not configure ordinary missions: generic ACP commands have no automatic
+provider credential selection or native-state seeding. Qualified profiles require
+the separate explicit operator configuration described in the containment guide;
 ordinary governed-mission acceptance remains S7 work.
 
 ## Live results (2026-09-16 UTC)
@@ -311,7 +313,8 @@ requests. Each refusal must match its intended reason; every case checks daemon
 absence independently. Linux CI runs this script without credentials and retains
 its log. These synthetic checks are separate from the scoped native shell
 qualification below. The macOS and Linux ARM64 live receipts are separate from
-these fixtures; ordinary enforced-ACP admission remains open.
+these fixtures. Ordinary profile admission was implemented subsequently; see
+[the admission review](reviews/2026-09-20-acp-worker-profile-admission.md).
 See the [fixture review](reviews/2026-09-19-acp-tool-probe.md) and
 [live-attempt follow-up](reviews/2026-09-19-acp-native-tool-attempts.md).
 

@@ -244,7 +244,10 @@ pub(crate) fn session_mount_proof(
     Some(crate::sandbox_container::prove_mount_roots(
         runtime,
         &crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write),
-        crate::sandbox_container::DEFAULT_IMAGE,
+        role_sandbox
+            .image
+            .as_deref()
+            .unwrap_or(crate::sandbox_container::DEFAULT_IMAGE),
     ))
 }
 

@@ -477,6 +477,9 @@ jobs:
           for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
             grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
           done
+          for proof in ordinary_mission_delivers_with_one_call_consent credential_echo_fails_and_cleans_home; do
+            grep -q "test acp_worker::tests::acp_containment_v1_profile_${proof} ... ok" "$log"
+          done
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
             exit 1
           fi

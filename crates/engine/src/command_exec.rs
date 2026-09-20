@@ -832,6 +832,24 @@ pub(crate) fn resolve_gate_sandbox(
     )
 }
 
+/// Engine-run checks never receive a profile's provider network access or
+/// credential home. Keep the qualified image and filesystem boundary, with
+/// `--network none`; unprofiled configurations retain their existing policy.
+pub fn worker_gate_sandbox(
+    config: &crate::types::MissionConfig,
+) -> crate::error::Result<crate::types::SandboxConfig> {
+    let mut sandbox = config.worker.sandbox.clone();
+    if let Some(profile) = &config.worker.acp_profile {
+        profile.validate_config(
+            crate::types::Role::Worker,
+            &config.worker,
+            config.worker_isolation,
+        )?;
+        sandbox.egress.clear();
+    }
+    Ok(sandbox)
+}
+
 /// The gate-shaped [`crate::sandbox::SandboxInputs`], shared by every
 /// enforced provider arm: the gate cwd fills the session profile's
 /// `session_cwd` slot so the writable-root computation is REUSED, never

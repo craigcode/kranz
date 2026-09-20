@@ -165,7 +165,7 @@ impl Audit {
             return Ok(());
         }
         let policy = crate::command_exec::MergeGatePolicy {
-            sandbox: self.state.config.worker.sandbox.clone(),
+            sandbox: crate::command_exec::worker_gate_sandbox(&self.state.config)?,
             mission_dir: self.paths.mission_dir(),
         };
         let environment = Digest::of(&serde_json::to_vec(&(

@@ -1,10 +1,104 @@
 # ACP containment proof path
 
-Ordinary mission configuration still refuses `backend: "acp"` with enforced
-sandbox settings. The direct backend API now has a Docker proof path on macOS
-and Linux. This is S6 implementation work, not completion of vendor certification
-or S7 governed-mission acceptance. Native Seatbelt, bubblewrap, Windows and
+Ordinary missions can opt into the two qualified ACP worker profiles below.
+They fix the adapter command, Linux ARM64 image, credential channel, startup
+settings and configured egress. macOS/Linux ARM64 with Docker is the admitted
+host tuple; mount sharing and runtime ownership must also pass before dispatch.
+The live evidence covers macOS with Colima and Ubuntu ARM64 inside its VM,
+not every host installation or workload. S7 governed-mission acceptance remains
+open. Native Seatbelt, bubblewrap, Windows, x86_64 production workers and
 non-Docker container runtimes remain refused by this path.
+
+## Qualified ordinary workers
+
+Set the profile in the operator's `~/.kranz/config.json`. Repository config and
+runtime patches cannot change `acpProfile`, including its credential path.
+Existing configuration omits the optional field and retains its current behavior.
+There is no default promotion, adapter discovery or credential fallback.
+
+```json
+{
+  "allowBelowDefaultWorkerModel": true,
+  "workerIsolation": "worktree",
+  "worker": {
+    "backend": "acp",
+    "acpProfile": {
+      "id": "codex-acp-1.11.0-arm64-v1",
+      "credentialFile": "/absolute/operator-owned/auth.json"
+    },
+    "sandbox": {
+      "provider": "container",
+      "enforce": "fs+net",
+      "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+      "extraWrite": [],
+      "egress": ["chatgpt.com:443", "auth.openai.com:443", "api.openai.com:443"]
+    }
+  }
+}
+```
+
+Omit `acpCommand` and `acpArgs`: the profile owns the guest command. Codex uses
+ACP 1.11.0 / Codex 0.153.4 and an existing CLI OAuth `auth.json`; API-key login
+is not qualified. Only that file is copied into a new private HOME, alongside
+engine-authored `config.toml` selecting file-only auth and disabling `plugins`
+and `remote_plugin`. It starts with `NO_BROWSER=1` and
+`INITIAL_AGENT_MODE=read-only`. No other provider configuration is copied. Session refreshes are not written
+back to the selected source file; an expired or superseded login needs operator
+renewal. The engine does not repair it through an interactive fallback.
+
+For Claude, use profile `claude-acp-0.77.0-arm64-v1`, the same image, and exactly
+`["api.anthropic.com:443", "claude.ai:443"]` as the configured egress list.
+The selected private JSON file must contain `credentialEnv` equal to
+`CLAUDE_CODE_OAUTH_TOKEN` and a `value` containing the operator-provisioned token.
+Do not put that value in Kranz config, a ticket or a transcript. The profile
+uses Claude ACP 0.77.0 / Agent SDK 0.3.270, seeds only that token, and sets
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. It never reads Keychain or starts
+an interactive login.
+
+Both source files must be absolute, owner-only regular files (for example mode
+0600), owned by the engine user, single-linked, at most 48,000 bytes, and outside
+the repository and worker-writable roots. Symlinks, duplicate JSON keys, unknown
+profiles, custom argv, boundary drift and unexpected caller environment variables
+fail before the adapter starts. The configured egress set is exact; the existing
+proxy's effective default Anthropic floor also applies. Extra egress grants do
+not widen a qualified worker. A missing configured image fails without a pull;
+a rebuilt image with another ID needs its own qualification.
+
+On macOS, Docker must share the repository, mission worktrees, gate scratch and
+private worker home. `TMPDIR` controls ordinary worktree/gate temporary paths;
+`KRANZ_SCRATCH_ROOT` controls the ACP scratch base. Point both at existing private,
+shared directories when the VM does not share the system temporary directory.
+
+Engine-run approval, validation, final and merge checks use the same pinned
+image and filesystem boundary with **no network**. They do not inherit the
+worker's provider login or network access. Checks therefore require dependencies
+already present in the image/worktree or the engine's permitted caches. The
+profile does not qualify the separate negative-control snapshot mechanism for
+containers; its existing process-only refusal remains.
+
+Only the inner HOME is mounted writable. Its engine-owned mode-0700 parent is
+outside the guest mounts, so a worker chmod cannot expose credentials to other
+host users through a shared temporary directory.
+
+Normal completion, abort and Drop remove the private credential home after
+worker cleanup. An unconfirmed cleanup fails the run. Engine SIGKILL cannot run
+a destructor: the namespace lease bounds execution, but private scratch and
+launch data can remain for operator recovery. Confirm the recorded owner is
+absent before removing its retained private directories. A process-lifetime
+proof is not a promise of crash-time disk erasure.
+
+The raw ACP Init records `workerProfile` with profile ID, startup policy, host
+tuple and proof references; it records no credential value or source path there.
+Known whole credential literals, including JSON-escaped values, cause a frame
+refusal before transcript emission; stderr literals are redacted. This does not
+promise detection of arbitrary transformed or split secrets. Model selection and
+cost retain the limitations in [ACP compatibility](acp-compatibility.md).
+
+The synthetic ordinary-mission test exercises one-call consent, a real host
+checkpoint, fresh fixture review, external gates, local merge and evidence export.
+It uses a test-only Python profile that does not exist in production builds.
+The [admission review](reviews/2026-09-20-acp-worker-profile-admission.md) records
+verification and the remaining S7 boundary.
 
 ## Boundary
 
@@ -63,7 +157,8 @@ The engine-generated ACP initialization receipt records the image, supervisor
 hash and lease posture separately from the peer's capabilities/model report.
 `providerCompatibilityCertified: false` remains the direct proof path's value.
 Reviewed live receipts qualify their stated workload separately; they do not
-change ordinary mission admission or promote that field automatically.
+promote that field automatically. Ordinary profile admission is the separate
+explicit configuration described above.
 
 ## Mount preflight ownership
 
@@ -80,7 +175,8 @@ directory is writable. A separate 85-second guest watchdog interrupts PID 1
 without reading the mount being tested, bounding the sentinel script even after
 engine death or blocked guest filesystem I/O. The inspected image ID is frozen
 before creation; the helper overrides the image entrypoint. The ordinary
-preflight still pulls a missing configured image within its deadline; the ACP
+preflight may pull its default image within its deadline; a missing pinned
+image is refused. The ACP
 worker's separate requirement for an already installed pinned image is unchanged.
 
 A crash between create and start can leave a stopped container. An interrupted
@@ -261,14 +357,14 @@ cleanup. These receipts qualify this shell fixture on that Linux combination;
 bare-metal hosts, x86_64 and other configurations are not inferred. See the
 [review](reviews/2026-09-20-acp-linux-native-tool-pass.md).
 
-Remaining S6 work is to wire the qualified combinations through ordinary worker
-configuration, including their minimal credential and startup preparation,
-while preserving pre-spawn refusal for unsupported pairs and current defaults.
-The direct-backend fixture does not by itself prove normal mission dispatch.
-The [admission breakdown](reviews/2026-09-19-acp-linux-preparation.md#ordinary-mission-admission-concrete-remaining-work)
-records the concrete integration work. Its earlier preparation evidence retains
-the recovered physical-disk exhaustion during a later test build; that failed
-build is not reclassified by the live pass.
+The ordinary admission work described by the earlier
+[breakdown](reviews/2026-09-19-acp-linux-preparation.md#ordinary-mission-admission-concrete-remaining-work)
+is now implemented by the explicit profiles above. The
+[admission review](reviews/2026-09-20-acp-worker-profile-admission.md) separates
+that integration from the remaining S7 defect/repair and live governed-mission
+acceptance. Earlier preparation evidence retains the recovered physical-disk
+exhaustion during a later test build; that failed build is not reclassified by
+the live pass or this implementation.
 
 Mount-helper cleanup has its own proof and review above; it does not close S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and

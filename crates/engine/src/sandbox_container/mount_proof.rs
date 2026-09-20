@@ -172,6 +172,9 @@ impl Helper {
             )
             .await?;
         if inspected.code != Some(0) {
+            if image.starts_with("sha256:") || image.contains("@sha256:") {
+                return Err("pinned mount proof image must already be installed".into());
+            }
             // Preserve the existing default-image pull behavior, within the
             // same proof deadline and frozen host client environment.
             let pulled = self
