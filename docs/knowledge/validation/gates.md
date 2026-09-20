@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-20
 verified_against:
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
@@ -43,6 +43,9 @@ print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
 exercise protocol, byte pinning, artifact imports and containment without model
 calls. See [external evaluators](../../external-evaluators.md) for API boundaries,
 retention and recovery limits.
+Container creation consumes the evaluation deadline; inspection and cleanup keep
+their short control bounds. The serial CI lane requires the delayed-create,
+deadline and cancellation regression without retrying uncertain creation.
 
 ## The full-workspace gate suite
 

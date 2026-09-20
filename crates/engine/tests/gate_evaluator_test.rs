@@ -230,6 +230,102 @@ mod container {
             .unwrap()
     }
     #[tokio::test]
+    async fn gate_subprocess_v1_container_creation_uses_evaluation_budget_and_cleans_on_interrupt()
+    {
+        let Some(_) = docker() else {
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|p| p.join("docker"))
+            .find(|p| p.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        for mode in ["pass", "deadline", "cancel"] {
+            let mut f = Fixture::new("pass", true);
+            if mode == "deadline" {
+                f.evidence = evidence(
+                    &f.registration,
+                    Some(|request, _, _| request["params"]["limits"]["wallTimeMs"] = json!(5000)),
+                )
+                .unwrap();
+            }
+            let marker = f.tmp.path().join("created");
+            let wrapper = f.tmp.path().join("slow-docker");
+            // Real Docker creates the namespace, but the control client does not
+            // finish for six seconds. This used to exhaust a separate five-second
+            // cap even when the evaluation still had ample time remaining.
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = create ]; then\n  {} \"$@\" || exit $?\n  touch {}\n  sleep {}\nelse\n  exec {} \"$@\"\nfi\n",
+                    quote(&executable), quote(&marker), if mode == "pass" { 6 } else { 30 }, quote(&executable)
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let client = DockerEvaluator::new(&wrapper).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancellation = if mode == "cancel" {
+                let cancelled = cancelled.clone();
+                let marker = marker.clone();
+                Some(tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !marker.exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("real Docker creation did not finish");
+                    cancelled.store(true, Ordering::Release);
+                }))
+            } else {
+                None
+            };
+            let started = std::time::Instant::now();
+            let outcome = client
+                .evaluate(
+                    &f.registration,
+                    &f.evidence,
+                    RunOptions {
+                        attempt_parent: f.tmp.path(),
+                        retain_private_inputs: true,
+                    },
+                    &cancelled,
+                )
+                .await
+                .unwrap();
+            if let Some(cancellation) = cancellation {
+                cancellation.await.unwrap();
+            }
+            assert!(
+                marker.exists(),
+                "{mode}: creation must precede interruption"
+            );
+            assert!(outcome.cleanup_confirmed, "{mode}: {outcome:?}");
+            if mode == "pass" {
+                outcome.evaluation.unwrap();
+                assert!(started.elapsed() >= Duration::from_secs(6));
+            } else {
+                let error = outcome.evaluation.unwrap_err();
+                assert!(
+                    if mode == "deadline" {
+                        error.contains("deadline") || error.contains("timed out")
+                    } else {
+                        error.contains("cancelled")
+                    },
+                    "{mode}: {error}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "{mode}: {error}"
+                );
+            }
+        }
+    }
+    #[tokio::test]
     async fn gate_subprocess_v1_container_accepts_synthetic_checker_and_denies_host_access() {
         let Some(client) = docker() else {
             return;
