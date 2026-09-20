@@ -59,10 +59,12 @@ pub(crate) fn write_line(text: &str, path: &str) -> String {
 /// Block for at least `millis`, without relying on a `sleep` binary.
 pub(crate) fn sleep_millis(millis: u64) -> String {
     if cfg!(windows) {
-        // `timeout /t` refuses to run when stdin is redirected, which it
-        // always is here. `ping` to an unroutable TEST-NET-1 address waits out
-        // its `-w` timeout and needs no console.
-        format!("ping -n 1 -w {millis} 192.0.2.1 >nul")
+        // Redirected stdin rules out `timeout /t`; a ping can fail immediately
+        // when the network rejects it. Use the stock local timer, with neither
+        // a console nor a user PowerShell profile involved.
+        format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Milliseconds {millis}"
+        )
     } else {
         let seconds = millis as f64 / 1000.0;
         format!("sleep {seconds}")
