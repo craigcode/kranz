@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-20",
+  "sourceBaseCommit": "5dc355d8da8b91dfd16f9b4e395aefee0680a0e6",
+  "sourceFileHashes": {
+    "crates/engine/examples/acp_governed_probe.rs": "sha256:69765c89e55eb2b5f3dfe9477754dc20026a8056de2a9683d42a4fa8a33a7f90",
+    "crates/engine/examples/acp_compat_probe/tool_fixture.rs": "sha256:7e35562a41708402102f94b8308475e348dc058f7be73bb78fcf1566b4622a23"
+  },
+  "host": "macOS ARM64 with Colima Linux ARM64 Docker",
+  "workerImage": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "scope": "Live worker; scripted controller and two scripted reviewers; real command checks, external checker lifecycle, local merge and evidence export. No independent model judgment claim.",
+  "bounds": {
+    "workerSessionsPerAuthorization": 1,
+    "workerSeconds": 120,
+    "missionSeconds": 240,
+    "overallSeconds": 480,
+    "externalSeconds": 600,
+    "retries": 0,
+    "hardDollarCap": null,
+    "keychain": false
+  },
+  "projection": "Allowlisted facts and private artifact hashes only. Raw transcripts, export and credentials are not published. Hashes are integrity references, not independent attestation.",
+  "attempts": [
+    {
+      "provider": "claude",
+      "mission": "m-70aa36",
+      "passed": false,
+      "preparationDigest": "sha256:d423bd31e99c580fd142358d5765d80beb55caaeacd7fe1db224792d4226b208",
+      "runnerExecutableDigest": "sha256:111c150ee117daa553a7dc302fb139b524d6542025cc35fd85ad04843624552e",
+      "supervisor": {
+        "provider": "claude",
+        "exit": 1,
+        "timedOut": false,
+        "elapsedSeconds": 19.47,
+        "runnerPassed": false,
+        "inventoryRestored": true,
+        "denialRows": 0,
+        "retryAttempted": false,
+        "resultSha256": "36ef9facd445891a7ec8d7d7c81742a2320060757df4134974ec3ebc468bb009"
+      },
+      "observed": {
+        "liveWorkerSpawnReceipts": 1,
+        "featureStarts": 2,
+        "permissionDeliveries": 1,
+        "workerResult": "partial",
+        "workerReportedCostUsd": 0.0599496,
+        "providerSelectedModel": null,
+        "modelNote": "worker.spawned model is the configured role label, not evidence of the provider-selected model",
+        "scriptedUsageExcluded": true,
+        "consumedExternalStages": [
+          "plan-approval",
+          "milestone-validation"
+        ],
+        "missionCompleted": false,
+        "postmortemExportedAfterFailure": true,
+        "postmortemPayloadHashesVerified": 45,
+        "postmortemUnresolvedEntries": 2
+      },
+      "privateArtifactHashes": {
+        "preparation": "sha256:d423bd31e99c580fd142358d5765d80beb55caaeacd7fe1db224792d4226b208",
+        "authorization": "sha256:0d8b20bce6f95d6a8564a84e95eba49c198f5230489b891d6f2bf4c0120a037c",
+        "attempt": "sha256:3563adfc9e1f41ff6bd5119bd40bf1ca0221aad29abf8a9408588e6b6718714e",
+        "result": "sha256:36ef9facd445891a7ec8d7d7c81742a2320060757df4134974ec3ebc468bb009",
+        "supervisorResult": "sha256:20db57a9047be7dc4892100462891ef150041c65420ed35040b29175f65e1dda",
+        "events": "sha256:949cf12d3c18cb312160d560183ce8c79131d61408f6e33b7547c0e2070c119b",
+        "workerTranscript": "sha256:6e9c96a074173b978aafd621c956cd2b0668af28b62d9ca56aaf2c25a3effe8c",
+        "inventoryBefore": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "inventoryAfter": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "postmortemExportManifest": "sha256:ae490bfc1793470d818b7c136cfaf8a4898b06534f51cdc7e4de8f8b90c0cefe"
+      },
+      "failure": {
+        "runnerError": "second feature is not authorized",
+        "cause": "Fixture requested unsupported report result complete, then its command check used python3 outside the gate PATH. Claude performed the requested write.",
+        "corrections": "Typed pass report, absolute Python path, synchronous refusal of repair conversion and reseed.",
+        "secondDispatch": "Second feature began before the old monitor stopped the run; its transcript is empty. No second worker Init/prompt was recorded. Underlying startup HTTP requests are unavailable.",
+        "retryPerformed": false
+      }
+    },
+    {
+      "provider": "codex",
+      "mission": "m-ea1058",
+      "passed": true,
+      "preparationDigest": "sha256:58b435ab29acd0add3f1152913f6a551f5f9c30ac187c9c4c8f6dc12605a8728",
+      "runnerExecutableDigest": "sha256:69d2a2feb19a2e7235baf0cbf491f08e27d99babd20026b1c9c09e6e63c48a2e",
+      "supervisor": {
+        "provider": "codex",
+        "exit": 0,
+        "timedOut": false,
+        "elapsedSeconds": 25.451,
+        "runnerPassed": true,
+        "inventoryRestored": true,
+        "denialRows": 0,
+        "retryAttempted": false,
+        "resultSha256": "4e853d1cf3932cb5e71ec4b848229842d060d0cd5d2ee8fd9fecc84b07f103cd"
+      },
+      "observed": {
+        "liveWorkerSpawnReceipts": 1,
+        "featureStarts": 1,
+        "permissionDeliveries": 1,
+        "workerResult": "pass",
+        "workerReportedCostUsd": null,
+        "providerSelectedModel": null,
+        "modelNote": "worker.spawned model is the configured role label, not evidence of the provider-selected model",
+        "scriptedUsageExcluded": true,
+        "consumedExternalStages": [
+          "plan-approval",
+          "milestone-validation",
+          "final-gate",
+          "merge"
+        ],
+        "missionCompleted": true,
+        "primaryUnchangedBeforeMerge": true,
+        "integrationTree": "fa6ae9a47bb9294c6d9d8dab6acc0d1b0fdea0e3",
+        "exportedPayloadHashesVerified": 85
+      },
+      "privateArtifactHashes": {
+        "preparation": "sha256:58b435ab29acd0add3f1152913f6a551f5f9c30ac187c9c4c8f6dc12605a8728",
+        "authorization": "sha256:f9c393dc7ecb867b4920b3ebefa55ecc8b7f9e29bc617a36bcb8fdfd26bc03ab",
+        "attempt": "sha256:8d3f3eddf695478e8cbdd341304805f71c23dbc85728d303621205970f785478",
+        "result": "sha256:4e853d1cf3932cb5e71ec4b848229842d060d0cd5d2ee8fd9fecc84b07f103cd",
+        "supervisorResult": "sha256:81e50cc02fad4049ea995d3378c3f3b5f3b801f241930f52192297c40c4856fe",
+        "events": "sha256:75c31c0f230c00945febad8f021186510fec1d2e49b41700a58353011379bd48",
+        "workerTranscript": "sha256:e2bcc7160a45028e0465633720311bd1a1093d601682ad990d6ee5912332fc3a",
+        "inventoryBefore": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "inventoryAfter": "sha256:935136d60d6c8cfc34d1d661f42111424f14dc3b768b4a4445152403a69d1e2c",
+        "exportManifest": "sha256:f611c68d8149835b06e2b3f4736038bb4bea7d0d9be60598dab71fc9ab900431"
+      }
+    }
+  ]
+}

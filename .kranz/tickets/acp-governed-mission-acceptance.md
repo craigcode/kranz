@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Integrated synthetic coverage now includes defect/repair with fresh consent, pause and late-click refusal, policy drift, checker failure, exact-tree merge and portable evidence after runtime cleanup. Request/decision/send replay checkpoints are also covered. All local workspace gates pass (3057 tests); current-revision CI and independent branch review remain. Live governed missions require prepared budgets and fresh operator authorization. See docs/reviews/2026-09-20-acp-governed-fixtures.md.
+state-note: Qualified profiles and synthetic failure/repair coverage are implemented. The bounded live Codex mission passed through permission, checks, exact-tree local merge and export with scripted controller/reviewers. The first Claude governed attempt failed because of fixture errors, now corrected; another Claude attempt requires an additional allowance. All local workspace gates pass (3063 tests); current-revision CI and independent branch review remain. See docs/reviews/2026-09-20-acp-governed-live-preparation.md.
 title: Governed ACP acceptance — prove consent, independent gates and portable evidence
 priority: 2
 schedule: once

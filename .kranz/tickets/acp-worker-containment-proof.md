@@ -1,6 +1,6 @@
 ---
 state: open
-state-note: Qualified ordinary profiles and synthetic mission integration are implemented. Follow-up coverage exercises defect/repair, pause, policy drift, checker failure and export; it fixes the premature evaluator-create deadline and a retry after Pause. All local workspace gates pass (3057 tests); current-revision CI and independent branch review remain. S7 live governed missions remain open and prior approved provider slots are consumed. See docs/reviews/2026-09-20-acp-governed-fixtures.md.
+state-note: Qualified profiles and synthetic failure/repair coverage are implemented. The bounded live Codex mission passed through permission, checks, exact-tree local merge and export with scripted controller/reviewers. The first Claude governed attempt failed because of fixture errors, now corrected; another Claude attempt requires an additional allowance. All local workspace gates pass (3063 tests); current-revision CI and independent branch review remain. See docs/reviews/2026-09-20-acp-governed-live-preparation.md.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

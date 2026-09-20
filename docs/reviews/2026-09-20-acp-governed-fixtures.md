@@ -103,8 +103,14 @@ available locally alongside the failed-run logs.
 
 ## Remaining S7 boundary
 
-Live governed missions for the pinned Claude and Codex profiles still need a
-prepared workload, exact call/time budget and fresh operator authorization.
+At this checkpoint, live governed missions for the pinned Claude and Codex
+profiles still needed a prepared workload, exact call/time budget and fresh
+operator authorization.
 Earlier approved provider slots are consumed; these tests do not authorize new
 spend. Independent branch review and landing the stacked PRs also remain. S7
 stays open; no default promotion, release or remote mission push is implied.
+
+The subsequent [live-worker record](2026-09-20-acp-governed-live-preparation.md)
+tracks the newly authorized attempts, including the passing Codex mission and
+the failed Claude attempt caused by fixture errors. It does not replace the
+synthetic defect/repair evidence above or establish live model judgment.

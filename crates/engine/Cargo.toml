@@ -56,3 +56,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 proptest = "1"
+
+[[example]]
+name = "acp_governed_probe"
+test = true

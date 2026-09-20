@@ -1576,6 +1576,30 @@ mod discovery_tests {
     #[test]
     fn claude_discovery_failed_and_hung_overrides_never_execute_working_fallback() {
         use std::os::unix::fs::PermissionsExt as _;
+        const ISOLATED: &str = "KRANZ_DISCOVERY_OVERRIDE_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            // Concurrent forks can briefly retain a fixture's writable fd on
+            // Linux, causing ETXTBSY even after close/rename in this process.
+            // Exercise the real probe in a child with no other fixture writers.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "backend_claude::discovery_tests::claude_discovery_failed_and_hung_overrides_never_execute_working_fallback",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"));
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let staged = root.path().join(format!(".{name}.tmp"));

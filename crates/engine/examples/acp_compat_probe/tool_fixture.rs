@@ -252,11 +252,21 @@ impl Evidence {
     }
 
     pub fn authorize(&mut self, proposal: &Proposal, workspace: &Path) -> Result<String> {
+        self.authorize_at(proposal, workspace, chrono::Utc::now())
+    }
+
+    pub fn authorize_at(
+        &mut self,
+        proposal: &Proposal,
+        workspace: &Path,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String> {
         proposal.validate()?;
         if self.request_id.is_some()
             || self.completed
             || proposal.prohibition.is_some()
-            || chrono::Utc::now() >= proposal.deadline
+            || at < proposal.observed_at
+            || at >= proposal.deadline
         {
             bail!("permission is repeated, prohibited, stale or after completion");
         }
