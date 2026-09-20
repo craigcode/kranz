@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-18
+last_verified: 2026-09-20
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
@@ -25,6 +25,12 @@ Its consent, external-check and evidence work uses the shipped dispatch seams;
 it adds no code-generation pool, prompt optimizer or cross-feature context reuse.
 The roadmap now records basic Claude/Codex compatibility as complete; S5's
 stage integration remains governance work and S6/S7 still gate release.
+
+Rechecked 2026-09-16 (UTC) against the
+[review/evidence follow-ups](../../roadmap.md#scheduled-follow-up--review-efficiency-and-evidence-2026-09-16).
+Review packets, comparable receipts, outcome reporting and a bounded review
+pilot extend governance and evidence; they add no code-generation orchestration
+or autonomous remediation.
 
 **Kranz is a governance and evidence layer for agent work. It is not an
 execution harness. One line: kranz dispatches, gates, records and proves.

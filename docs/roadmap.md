@@ -234,6 +234,50 @@ bytes untouched, and explains authorization, changes, checks and remaining human
 work from its exported evidence. Existing advisory/floor/waiver behavior stays
 intact. No push or automatic ACP-default promotion is part of this scope.
 
+## Scheduled follow-up — review efficiency and evidence (2026-09-16)
+
+The operator authorized these follow-ups after reviewing
+[Vercel's software factory article](https://vercel.com/blog/building-a-software-factory-for-ai-sdk).
+They extend Kranz's review and evidence surfaces within the existing positioning
+boundary. The current ACP integration, containment and S7 (governed mission
+acceptance) remain ahead of this work; no new release prerequisite is added to
+that scope. S5 and S7 are defined in the
+[ACP/gate implementation sequence](scoping/acp-worker-gate-contract.md#delivery-slices-and-effort).
+
+- [ ] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,
+  current evidence and the human decision.
+- [ ] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
+  — comparable observations across actual revisions, extending existing controls.
+- [ ] [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) —
+  explain recorded causes without changing mission states or authority.
+- [ ] [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) — a bounded
+  assessment of evidence gaps and human work after the implementations land.
+
+Ticket frontmatter owns priority, one-shot scheduling and admission dependencies.
+It ranks the review packet first after S7; the baseline and outcome extensions
+can be planned independently, and the pilot waits for all three. These are
+backlog entries, not dated or recurring executions. Normal plan review and
+approval still precede execution.
+
+The [dependency gate](tickets.md#dependencies-blocked-by) requires recorded
+Complete missions, not a ticket's `done` label alone. For an implementation
+merged outside a mission, the operator must verify the prerequisite and
+explicitly choose the documented `kranz ticket approve <slug> --force` override
+to admit a dependent. That override does not fabricate a completed mission or
+bypass cycle detection.
+
+S5 (stage/evidence integration) continues to own authoritative stage inputs,
+receipts and freshness checks.
+The follow-ups make that evidence easier to assess and compare. Human review
+packets may expose a wider audit chain than fresh validators receive. Outcome
+categories explain existing states without creating new authority or automated
+remediation. The pilot separates active review effort from approval waiting time
+and records missing data honestly before proposing more product machinery.
+
+Specialist prompts and code-generation workflows stay with external harnesses
+or consumer packs. A Sgian desk may present and act through Kranz's decisions;
+terminal/editor/factory UI and cloud orchestration remain outside these tickets.
+
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; Railway live deploy operator-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP
