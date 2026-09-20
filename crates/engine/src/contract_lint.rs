@@ -412,11 +412,14 @@ mod tests {
 
     #[test]
     fn approval_lint_runner_times_out_slow_command() {
-        let contract = vec![command_assertion("a1", &sleep_millis(5_000))];
         let scratch = tempfile::tempdir().unwrap();
+        let contract = vec![command_assertion(
+            "a1",
+            &sleep_millis(scratch.path(), 5_000),
+        )];
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
-            &std::env::temp_dir(),
+            scratch.path(),
             scratch.path(),
             None,
             &contract,
@@ -442,15 +445,18 @@ mod tests {
 
     #[test]
     fn approval_lint_runner_budget_skips_remainder() {
+        let scratch = tempfile::Builder::new()
+            .prefix("kranz timer's ")
+            .tempdir()
+            .unwrap();
         let contract = vec![
-            command_assertion("a1", &sleep_millis(200)),
+            command_assertion("a1", &sleep_millis(scratch.path(), 200)),
             command_assertion("a2", SUCCEED),
             command_assertion("a3", FAIL),
         ];
-        let scratch = tempfile::tempdir().unwrap();
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
-            &std::env::temp_dir(),
+            scratch.path(),
             scratch.path(),
             None,
             &contract,
@@ -470,6 +476,13 @@ mod tests {
             a1.output_tail
         );
         assert!(start.elapsed() >= Duration::from_millis(200));
+        if cfg!(windows) {
+            assert!(
+                a1.output_tail.contains("KRANZ_TEST_SLEEP_COMPLETED=200"),
+                "timer fixture did not complete: {}",
+                a1.output_tail
+            );
+        }
         let a2 = report.results.iter().find(|r| r.id == "a2").unwrap();
         let a3 = report.results.iter().find(|r| r.id == "a3").unwrap();
         assert_eq!(a2.outcome, AssertionLintOutcome::NotLinted);

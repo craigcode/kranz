@@ -20,10 +20,18 @@ separate release operations governed by [releasing](../releasing.md).
 The previous Windows CI failed the contract-lint overall-budget fixture: its
 second command ran instead of being skipped. The fixture used an ICMP timeout
 as a delay, which can return early when networking rejects it. The correction
-uses the stock noninteractive PowerShell timer without a user profile or inner
-command quotes. Positive-control assertions require the first command to
-succeed and consume the intended delay before checking that the rest is skipped.
-A fresh reviewer checked the Windows argument handling before commit.
+initially used the stock noninteractive PowerShell timer without a user profile
+or inner command quotes. The subsequent
+[Windows run](https://github.com/craigcode/kranz/actions/runs/35543954869/job/106166455383)
+showed that command exceeding the fixture's ten-second limit; its underlying
+PowerShell cause is not established. The final fixture copies the existing Rust
+test executable into its temporary working directory and invokes one exact
+ignored timer test by a fixed relative filename. Its delay is set inside the
+cleared child environment. A completion marker prevents a mistyped test filter
+from passing with zero tests. The positive-control success, elapsed-delay and
+skipped-command assertions remain, including a working directory with spaces
+and an apostrophe. A fresh reviewer checked this correction. Production command
+execution, environment policy and timeout budgets are unchanged.
 
 The earlier evaluator slice also retained a five-second Docker-create cap.
 The new [PR #62 Linux failure](https://github.com/craigcode/kranz/actions/runs/35543954391/job/106166453415)

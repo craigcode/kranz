@@ -57,16 +57,34 @@ pub(crate) fn write_line(text: &str, path: &str) -> String {
 }
 
 /// Block for at least `millis`, without relying on a `sleep` binary.
-pub(crate) fn sleep_millis(millis: u64) -> String {
+pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
     if cfg!(windows) {
-        // Redirected stdin rules out `timeout /t`; a ping can fail immediately
-        // when the network rejects it. Use the stock local timer, with neither
-        // a console nor a user PowerShell profile involved.
+        // Use this test binary as the timer: ping can return early and
+        // PowerShell exceeded the fixture's timeout in Windows CI.
+        // A relative executable name also avoids cmd's nested quote handling
+        // when the temporary directory or original binary path has spaces.
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            cwd.join("kranz-sleep-fixture.exe"),
+        )
+        .unwrap();
         format!(
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Milliseconds {millis}"
+            "set KRANZ_TEST_SLEEP_MILLIS={millis}&& .\\kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
         )
     } else {
         let seconds = millis as f64 / 1000.0;
         format!("sleep {seconds}")
     }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess timer, invoked by contract-lint tests"]
+fn sleep_fixture() {
+    let millis: u64 = std::env::var("KRANZ_TEST_SLEEP_MILLIS")
+        .expect("timer duration")
+        .parse()
+        .expect("numeric timer duration");
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+    println!("KRANZ_TEST_SLEEP_COMPLETED={millis}");
 }
