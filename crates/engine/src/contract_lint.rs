@@ -448,19 +448,28 @@ mod tests {
             command_assertion("a3", FAIL),
         ];
         let scratch = tempfile::tempdir().unwrap();
+        let start = Instant::now();
         let report = run_contract_lint_with_limits(
             &std::env::temp_dir(),
             scratch.path(),
             None,
             &contract,
             true,
-            Duration::from_secs(600),
+            Duration::from_secs(10),
             Duration::from_millis(50),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
         );
 
         assert_eq!(report.results.len(), 3);
+        let a1 = report.results.iter().find(|r| r.id == "a1").unwrap();
+        assert_eq!(
+            a1.outcome,
+            AssertionLintOutcome::PassedOnBase,
+            "{}",
+            a1.output_tail
+        );
+        assert!(start.elapsed() >= Duration::from_millis(200));
         let a2 = report.results.iter().find(|r| r.id == "a2").unwrap();
         let a3 = report.results.iter().find(|r| r.id == "a3").unwrap();
         assert_eq!(a2.outcome, AssertionLintOutcome::NotLinted);
