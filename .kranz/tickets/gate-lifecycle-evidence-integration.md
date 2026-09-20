@@ -1,6 +1,6 @@
 ---
-state: open
-state-note: All stage drivers implemented on PR 63, with local synthetic Docker proof; full CI and PR review remain required before acceptance. S6/S7 remain separate release gates.
+state: done
+state-note: Approval, revision, milestone, final and exact-tree local merge checks, retained evidence and replay/export completed and reviewed. S4 supplies permission joins. Accepted with the v0.3.0 integration; see docs/reviews/2026-09-20-v030-integration.md.
 title: Gate lifecycle — bind every stage to evidence, authority and replay
 priority: 1
 schedule: once

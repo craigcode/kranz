@@ -23,11 +23,10 @@ Rechecked 2026-09-20 (UTC) against the
 [v1 contract](../../gate-evaluation-contract.md).
 Its consent, external-check and evidence work uses the shipped dispatch seams;
 it adds no code-generation pool, prompt optimizer or cross-feature context reuse.
-The roadmap now records basic Claude/Codex compatibility as complete; S5's
-stage integration remains governance work. S6's qualified worker profiles bind
-credentials and containment through the existing dispatch seam; their admission
-is implemented on the integration branch awaiting review/merge. S7 still gates
-release.
+The v0.3.0 integration completes S5 stage evidence and the bounded S6/S7
+acceptance scope. Qualified profiles bind credentials and containment through
+the existing dispatch seam. Explicit platform limits, unchanged defaults and
+release gates remain; no execution-factory or prompt-optimization primitive is added.
 
 Rechecked 2026-09-16 (UTC) against the
 [review/evidence follow-ups](../../roadmap.md#scheduled-follow-up--review-efficiency-and-evidence-2026-09-16).

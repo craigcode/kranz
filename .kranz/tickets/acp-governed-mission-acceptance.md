@@ -1,6 +1,6 @@
 ---
-state: open
-state-note: Bounded live Claude and Codex missions passed consent, checks, exact-tree local merge and export with scripted controller/reviewers; the earlier failed Claude fixture remains retained. Fresh independent branch review found one orphan-process reaping bug, now fixed and independently re-reviewed with a real-Docker regression. Local workspace gates pass (3064 tests); corrected-revision CI and stacked integration remain before closure. See docs/reviews/2026-09-20-acp-independent-review.md and docs/reviews/2026-09-20-acp-governed-live-preparation.md.
+state: done
+state-note: Integrated fixtures prove defect/repair, stale consent, policy drift, checker failures, exact-tree local merge and portable export. Bounded live Claude/Codex workers passed with scripted controllers/reviewers; the failed Claude attempt and unresolved research memo remain explicit. Fresh independent implementation review completed. Accepted with the v0.3.0 integration; see docs/reviews/2026-09-20-v030-integration.md. No live-model judgment or default promotion is claimed.
 title: Governed ACP acceptance — prove consent, independent gates and portable evidence
 priority: 2
 schedule: once

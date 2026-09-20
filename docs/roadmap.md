@@ -123,23 +123,21 @@ Done when: a 2-milestone mission with independent features completes in
 materially less wall-clock than sequential at comparable cost, with zero
 event-log corruption across 20 repeated runs.
 
-## M4 — Windows first-class ✅; v0.2.0 public distribution in progress
+## M4 — Windows first-class and public CLI distribution ✅
 
 The code is path-safe and lock-file based per §9 and is proven on Windows CI,
-including kill/resume. The historical v0.1.0 preview remains only in the
-private archive and is not a supported distribution. On 2026-08-22 the owner
-approved a version-aligned v0.2.0 public release from the clean origin. The
-repository stays private and the release switch stays locked until the
-[public-readiness gate](public-readiness.md) passes. See the
-[operator-readiness packet](reviews/m4-m6-operator-readiness.md).
+including kill/resume. The historical v0.1.0 preview is unsupported. The original
+v0.2.0 distribution plan was superseded: v0.2.1 remained an unpublished candidate,
+then v0.2.2 and v0.2.3 shipped matching GitHub binaries and crates.io packages.
+The repository is public. New releases retain the
+[public-readiness gate](public-readiness.md), source/history audits, native archive
+checks and owner approval of GitHub publication. The Tauri shell is build-checked,
+not a supported signed desktop distribution. See [releasing](releasing.md).
 
 - [x] Run the CI matrix on Ubuntu, Windows, and macOS.
 - [x] Prove the Windows kill/resume path.
-- [x] Preserve release automation and packaging templates without publishing.
-- [ ] Publish one version-aligned v0.2.0 release after the public-readiness gate.
-
-Done when: the supported source-install path and cross-platform CI are green,
-and clean-host Cargo and GitHub binary installs agree on v0.2.0.
+- [x] Publish matching CLI versions through GitHub binaries and crates.io.
+- [x] Verify native archives, provenance, checksums and embedded license notices.
 
 ## M5 — Deeper validation & automation ✅ (exec, functional QA, OTEL, secret scanning shipped; skill-capture decided wontfix 2026-08-17)
 
@@ -195,57 +193,55 @@ merge requires reapproval/revalidation; and old/no-pack missions remain
 unchanged. The executable evidence matrix and closure record are in
 [`docs/reviews/flight-rules-m55-proof.md`](reviews/flight-rules-m55-proof.md).
 
-## Scoped follow-up — ACP worker and external gate contract (2026-09-14)
+## ACP worker and external gate contract — integrated for v0.3.0
 
-The ACP backend, internal gate interface, pack contract and evidence spine
-already shipped (KRZ-301/311/312/313/325/326). The remaining work is to connect
-them into governed live dispatch: exact one-call permissions, external checks
-over pinned evidence, stage-specific authority and proven adapter containment.
-Design and selected D-A…D-H decisions:
+The shipped ACP backend, internal gate interface, pack contract and evidence spine
+(KRZ-301/311/312/313/325/326) now connect governed live dispatch: exact one-call
+permissions, external checks over pinned evidence, stage-specific authority and
+qualified adapter containment. Design and selected D-A…D-H decisions:
 [`docs/scoping/acp-worker-gate-contract.md`](scoping/acp-worker-gate-contract.md).
 The [v1 contract](gate-evaluation-contract.md) defines the wire schemas and
-authority/migration rules; runtime integration remains in the later slices.
+authority/migration rules.
 
 - [x] `gate-evaluation-contract-v1` — typed subjects, wire schemas, authority
-  matrix and additive lifecycle contract-change proposals.
+  matrix and additive lifecycle contracts.
 - [x] `acp-adapter-compatibility-proof` — released adapter/runtime fixtures,
   authentication, actual model/report/cost behavior and cancellation proof.
-- [ ] `gate-subprocess-evaluator` — contained, bounded JSON-RPC checker process
+- [x] `gate-subprocess-evaluator` — contained, bounded JSON-RPC checker process
   registered through the existing pack contract.
-- [ ] `acp-live-permission-consent` — durable one-call decisions through the
+- [x] `acp-live-permission-consent` — durable one-call decisions through the
   CLI, server, Slack and dashboard without widening mission-wide grants.
-- [ ] `gate-lifecycle-evidence-integration` — approval, permission, milestone,
+- [x] `gate-lifecycle-evidence-integration` — approval, permission, milestone,
   final and merge joins, restricted validator inputs and replay/export.
-- [ ] `acp-worker-containment-proof` — real adapter/descendant wrappers and
-  explicit platform support; [qualified worker admission](acp-containment.md)
-  implemented on the integration branch, awaiting review/merge. Callbacks alone
+- [x] `acp-worker-containment-proof` — real adapter/descendant wrappers and
+  explicit [qualified worker profiles](acp-containment.md). Callbacks alone
   are not a sandbox.
-- [ ] `acp-governed-mission-acceptance` — seeded defect, human consent,
-  independent checks, local merge and portable evidence in one synthetic mission.
-  [Integrated fixture coverage](reviews/2026-09-20-acp-governed-fixtures.md) is on
-  the containment branch; bounded live acceptance and review remain.
+- [x] `acp-governed-mission-acceptance` — synthetic defect/repair, human-consent
+  controls, independent checks, local merge and portable evidence. Bounded live
+  Claude/Codex worker passes use scripted controllers and reviewers; they do not
+  establish live model judgment. Historical failures and unresolved evidence stay
+  visible. See the [integration record](reviews/2026-09-20-v030-integration.md).
 
-Sequence: contract and compatibility first; evaluator/lifecycle and live consent
-next; containment before the integrated acceptance claim. Proposed core scope
-is 25–41 engineering days for one contributor, including tests/review, subject
-to the design decisions and adapter/platform findings. Client fs/terminal
-mediation and same-feature ACP resume are separately estimated later slices.
+The qualified workers require the pinned Linux ARM64 Docker image on admitted
+macOS/Linux ARM64 hosts. External evaluators run on macOS/Linux; external
+command-permission evaluators remain unsupported, with S4 owning one-call
+consent. Client fs/terminal mediation, same-feature ACP resume and additional
+platform/provider qualifications remain separate work. Defaults are unchanged.
 
-Done when: the acceptance mission delivers a nonempty change, binds every
-decision to exact policy/evidence, rejects stale consent and failed checks,
-survives interruption without replaying authorization, keeps primary checkout
-bytes untouched, and explains authorization, changes, checks and remaining human
-work from its exported evidence. Existing advisory/floor/waiver behavior stays
-intact. No push or automatic ACP-default promotion is part of this scope.
+The acceptance fixtures deliver nonempty changes, bind decisions to exact
+policy/evidence, reject stale consent and failed checks, survive interruption
+without replaying authorization, preserve primary checkout bytes, and explain
+authorization, changes, checks and remaining human work from exported evidence.
+Existing advisory/floor/waiver behavior stays intact. Mission execution never
+pushes. Publication remains subject to the release gates.
 
 ## Scheduled follow-up — review efficiency and evidence (2026-09-16)
 
 The operator authorized these follow-ups after reviewing
 [Vercel's software factory article](https://vercel.com/blog/building-a-software-factory-for-ai-sdk).
 They extend Kranz's review and evidence surfaces within the existing positioning
-boundary. The current ACP integration, containment and S7 (governed mission
-acceptance) remain ahead of this work; no new release prerequisite is added to
-that scope. S5 and S7 are defined in the
+boundary. They follow the v0.3.0 ACP integration and S7 (governed mission
+acceptance); they are not additional release prerequisites. S5 and S7 are defined in the
 [ACP/gate implementation sequence](scoping/acp-worker-gate-contract.md#delivery-slices-and-effort).
 
 - [ ] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,

@@ -1,7 +1,9 @@
 # Gate evaluation contract v1
 
-S1 design contract, 2026-09-14. This document and its schemas specify the next
-integration slices; they do not enable external gates or change runtime behavior.
+Version 1 contract, designed 2026-09-14 and integrated for v0.3.0.
+[External evaluators](external-evaluators.md) documents the implemented runtime
+and supported stages; [ACP containment](acp-containment.md) covers worker profiles.
+The dated checkpoints below retain the implementation history.
 
 Kranz owns authority and evidence. An evaluator supplies a check result; it
 cannot authorize an action, change a policy, claim a human identity or waive an

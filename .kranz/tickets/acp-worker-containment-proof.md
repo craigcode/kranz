@@ -1,6 +1,6 @@
 ---
-state: open
-state-note: Bounded live Claude and Codex missions passed consent, checks, exact-tree local merge and export with scripted controller/reviewers; the earlier failed Claude fixture remains retained. Fresh independent branch review found one orphan-process reaping bug, now fixed and independently re-reviewed with a real-Docker regression. Local workspace gates pass (3064 tests); corrected-revision CI and stacked integration remain before closure. See docs/reviews/2026-09-20-acp-independent-review.md and docs/reviews/2026-09-20-acp-governed-live-preparation.md.
+state: done
+state-note: Qualified pinned Claude/Codex ARM64 Docker profiles passed macOS/Colima and native Linux worker proofs, hostile descendants, cleanup and ordinary mission fixtures. Fresh review found and verified the orphan-reaping correction. Accepted with the v0.3.0 integration; see docs/reviews/2026-09-20-v030-integration.md. Other tuples remain refused; historical failures and cleanup limits remain documented.
 title: ACP containment — wrap adapters and prove the complete descendant boundary
 priority: 1
 schedule: once

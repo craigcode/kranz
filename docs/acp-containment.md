@@ -5,8 +5,9 @@ They fix the adapter command, Linux ARM64 image, credential channel, startup
 settings and configured egress. macOS/Linux ARM64 with Docker is the admitted
 host tuple; mount sharing and runtime ownership must also pass before dispatch.
 The live evidence covers macOS with Colima and Ubuntu ARM64 inside its VM,
-not every host installation or workload. S7 governed-mission acceptance remains
-open. Native Seatbelt, bubblewrap, Windows, x86_64 production workers and
+not every host installation or workload. The [v0.3.0 integration record](reviews/2026-09-20-v030-integration.md)
+combines the S7 fixture, live-worker and independent implementation reviews.
+Native Seatbelt, bubblewrap, Windows, x86_64 production workers and
 non-Docker container runtimes remain refused by this path.
 
 ## Qualified ordinary workers
@@ -102,7 +103,8 @@ retains missing runtime artifacts as unresolved after cleanup.
 It uses a test-only Python profile that does not exist in production builds.
 The [admission review](reviews/2026-09-20-acp-worker-profile-admission.md) records
 verification; the [S7 fixture review](reviews/2026-09-20-acp-governed-fixtures.md)
-records the integrated failure cases and remaining live acceptance boundary.
+records the integrated failure cases; the later [live-worker record](reviews/2026-09-20-acp-governed-live-preparation.md)
+retains the authorized provider attempts and their limits.
 
 ## Boundary
 
@@ -375,16 +377,18 @@ defect/repair evidence. The [governed live-worker record](reviews/2026-09-20-acp
 adds passing Claude and Codex missions through local merge and export on
 macOS ARM64/Colima, with scripted controller/reviewers. The separately authorized
 Claude pass retains the earlier failed attempt caused by fixture errors.
-Independent branch review and review of the combined S7 evidence remain.
+The [independent branch review](reviews/2026-09-20-acp-independent-review.md)
+found and verified an orphan-reaping correction. The combined acceptance and
+release checks are recorded in the [integration record](reviews/2026-09-20-v030-integration.md).
 Earlier preparation evidence retains the recovered physical-disk
 exhaustion during a later test build; that failed build is not reclassified by
 the live pass or this implementation.
 
-Mount-helper cleanup has its own proof and review above; it does not close S6.
+Mount-helper cleanup has its own proof and review above; it is one part of S6.
 The observed synthetic cleanup flake and subsequently reproduced recovery and
 deletion races are recorded in the [concurrent cleanup review](reviews/2026-09-19-acp-concurrent-cleanup.md).
 The historical failure remains retained; the race fixes do not establish broader
-provider qualification. S7 then exercises the full mission,
+provider qualification. The combined S7 evidence exercises the full mission,
 one-call consent, independent defect detection/repair, exact-tree merge and
 portable audit export. These fixtures do not authorize provider calls, certify
 arbitrary images, enable client filesystem/terminal RPCs or change defaults.
