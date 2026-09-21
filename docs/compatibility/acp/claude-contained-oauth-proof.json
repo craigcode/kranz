@@ -1,0 +1,72 @@
+{
+  "recordedAt": "2026-09-19T06:00:08.208909+00:00",
+  "engineCommit": "31ad9c1cceea9bd3279cb1b82b7d218f28e664e9",
+  "provider": "claude",
+  "adapter": {
+    "name": "@agentclientprotocol/claude-agent-acp",
+    "title": "Claude Agent",
+    "version": "0.77.0"
+  },
+  "runtime": {
+    "name": "@anthropic-ai/claude-agent-sdk",
+    "version": "0.3.270"
+  },
+  "host": {
+    "os": "macos",
+    "arch": "arm64",
+    "runtime": "Colima / Linux Docker"
+  },
+  "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "modelSelection": "default",
+  "modelsReportedInUsage": [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5"
+  ],
+  "adapterReportedCostUsd": 0.0426852,
+  "receipt": "claude-acp-contained-oauth.jsonl",
+  "privateReceiptSha256": "7e73a8bbe00aabd5ffb0e9883a194a45329776077a1c6fb235654ae9c17f61c3",
+  "exportReceiptSha256": "9394b2b7a5411781e727af540078cc10fa55a323ff8a7d48a275e3703991e554",
+  "exportRedactions": [
+    "events[3].raw.params.update.availableCommands",
+    "events[4].raw.params.update.availableCommands",
+    "events[7].raw.params.update._meta._claude/rateLimit"
+  ],
+  "promptLimit": 1,
+  "promptSeconds": 120,
+  "overallSeconds": 180,
+  "hardDollarCap": false,
+  "underlyingProviderRequestCountVerified": false,
+  "keychainUsed": false,
+  "authentication": "operator-provisioned CLAUDE_CODE_OAUTH_TOKEN",
+  "initialAuthStatus": {
+    "kind": "none",
+    "label": "Not logged in"
+  },
+  "initialAuthStatusIsAuthenticationVerdict": false,
+  "configuredEgress": [
+    "api.anthropic.com:443",
+    "claude.ai:443"
+  ],
+  "effectiveEgress": [
+    "api.anthropic.com:443",
+    "*.anthropic.com:443",
+    "claude.ai:443"
+  ],
+  "allowlistExpandedDuringRun": false,
+  "passed": true,
+  "toolEvents": 0,
+  "deniedConnections": 0,
+  "workspaceUnchanged": true,
+  "exactReportVerified": true,
+  "elapsedMillis": 5178,
+  "containerAbsenceConfirmedByOwnerLabel": true,
+  "daemonInventory": {
+    "ownerContainers": 0,
+    "allContainers": 0,
+    "egressNetworks": 0,
+    "egressVolumes": 0
+  },
+  "productionAdmissionEnabled": false,
+  "fullContainmentCertification": false,
+  "remainingBlocker": "container-mount-proof-owned-cleanup"
+}

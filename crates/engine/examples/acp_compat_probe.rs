@@ -1,0 +1,707 @@
+//! Explicit, single-prompt ACP compatibility probe. See docs/acp-compatibility.md.
+//! Building or running --check never starts an adapter. --run requires a fresh
+//! receipt path and an operator-approved call budget; it never retries.
+use anyhow::{bail, Context, Result};
+use kranz_engine::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
+use kranz_engine::backend_acp::AcpBackend;
+use kranz_engine::runner::parse_worker_report;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+#[path = "acp_compat_probe/tool_fixture.rs"]
+mod tool_fixture;
+
+#[derive(Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum Mode {
+    #[default]
+    ReportOnly,
+    ShellOnce,
+}
+
+const REPORT: &str = r#"{"result":"partial","summary":"kranz-acp-live-fixture-v1","filesTouched":[],"testsAdded":[],"dependenciesAdded":[],"knownGaps":["Protocol fixture only; no feature implemented or mission completion claimed."],"commits":[],"commandsRun":[],"escalation":null,"questions":[]}"#;
+const PREFIX: &str = "Protocol compatibility fixture only. Do not use any tools, read files, change files, call the network, create commits, or carry out another task. Return exactly this JSON object as the final assistant message, without Markdown fences:\n";
+// App-server performs plugin warmups before session-level configuration arrives.
+// Keep this no-tools fixture's startup policy in its disposable home instead.
+const CODEX_STARTUP_CONFIG: &str =
+    "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n";
+const CLAUDE_TRAFFIC_POLICY: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Config {
+    provider: String,
+    #[serde(default)]
+    mode: Mode,
+    program: PathBuf,
+    args: Vec<String>,
+    credential_env: Option<String>,
+    /// Explicit opt-in to minimal native login seeding; never the child HOME.
+    native_login_home: Option<PathBuf>,
+    /// Explicit operator consent for the Claude CLI to use its macOS Keychain.
+    #[serde(default)]
+    allow_keychain: bool,
+    /// Direct-backend proof only; does not enable ACP mission configuration.
+    container: Option<Container>,
+    receipt: PathBuf,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Container {
+    image: String,
+    egress: Vec<String>,
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        if self.mode == Mode::ShellOnce && self.container.is_none() {
+            bail!("shell-once requires an enforced pinned container");
+        }
+        let native = self.native_login_home.is_some();
+        let valid = match self.provider.as_str() {
+            "claude" => {
+                matches!(
+                    self.credential_env.as_deref(),
+                    Some("ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN")
+                ) || native
+            }
+            "codex" => {
+                matches!(
+                    self.credential_env.as_deref(),
+                    Some("CODEX_API_KEY" | "OPENAI_API_KEY")
+                ) || native
+            }
+            "fixture" => self.credential_env.is_none() && !native,
+            _ => false,
+        };
+        if !valid || (native && self.credential_env.is_some()) {
+            bail!("provider/credential channel is unsupported by this probe");
+        }
+        if self.allow_keychain
+            && (!cfg!(target_os = "macos") || self.provider != "claude" || !native)
+        {
+            bail!("allowKeychain requires an explicit Claude native login on macOS");
+        }
+        if self
+            .native_login_home
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute() || !p.is_dir())
+        {
+            bail!("nativeLoginHome must name an existing absolute operator home");
+        }
+        if self.container.is_some() && self.allow_keychain {
+            bail!("a Linux container cannot use the native macOS Keychain channel");
+        }
+        if let Some(container) = &self.container {
+            let digest = container.image.strip_prefix("sha256:").or_else(|| {
+                container
+                    .image
+                    .rsplit_once("@sha256:")
+                    .map(|(_, digest)| digest)
+            });
+            if !cfg!(any(target_os = "macos", target_os = "linux"))
+                || !digest.is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                bail!("container proof requires macOS/Linux and an immutable installed image");
+            }
+            if self.provider != "fixture" && container.egress.is_empty() {
+                bail!("live container proof requires an explicit provider egress allowlist");
+            }
+        }
+        if !self.program.is_absolute()
+            || (self.container.is_none() && !self.program.is_file())
+            || !self.receipt.is_absolute()
+        {
+            bail!("program and new receipt path must be absolute; a native program must exist");
+        }
+        Ok(())
+    }
+}
+
+fn seed_native_login(
+    config: &Config,
+    private: &std::path::Path,
+    env: &mut HashMap<String, String>,
+) -> Result<()> {
+    let Some(source_home) = &config.native_login_home else {
+        return Ok(());
+    };
+    if config.provider == "claude" {
+        if config.allow_keychain {
+            if !source_home.join("Library/Keychains").is_dir() {
+                bail!("authorized native Keychain directory is absent");
+            }
+            kranz_engine::backend_claude::seed_worker_scratch_home(
+                private,
+                Some(source_home),
+                None,
+            )?;
+            // As with the native backend, an explicit CLAUDE_CONFIG_DIR
+            // changes the CLI's credential lookup. HOME remains disposable.
+            return Ok(());
+        }
+        // Without explicit consent, only an existing credential file is used.
+        if !source_home.join(".claude/.credentials.json").is_file() {
+            bail!(
+                "Claude file-based login is absent; Keychain access requires explicit allowKeychain consent on macOS"
+            );
+        }
+        let (_, config_dir) = kranz_engine::backend_claude::seed_worker_scratch_home(
+            private,
+            None,
+            Some(&source_home.join(".claude")),
+        )?;
+        env.insert("CLAUDE_CONFIG_DIR".into(), config_dir.display().to_string());
+    } else {
+        let source = source_home.join(".codex/auth.json");
+        let metadata =
+            std::fs::symlink_metadata(&source).context("native Codex auth.json is absent")?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            bail!("native Codex auth.json must be a bounded regular file");
+        }
+        let dest = private.join("home/.codex");
+        std::fs::create_dir_all(&dest)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(dest.join("auth.json"))?;
+        file.write_all(&std::fs::read(source)?)?;
+        env.insert("CODEX_HOME".into(), dest.display().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod native_login_tests {
+    use super::*;
+
+    fn config(root: &std::path::Path, provider: &str) -> Config {
+        Config {
+            provider: provider.into(),
+            mode: Mode::ReportOnly,
+            program: std::env::current_exe().unwrap(),
+            args: vec![],
+            credential_env: None,
+            native_login_home: Some(root.to_owned()),
+            allow_keychain: false,
+            container: None,
+            receipt: root.join("new-receipt.jsonl"),
+        }
+    }
+
+    #[test]
+    fn native_login_requires_explicit_exclusive_auth_source() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "codex");
+        cfg.validate().unwrap();
+        cfg.credential_env = Some("OPENAI_API_KEY".into());
+        assert!(cfg.validate().is_err());
+        cfg.credential_env = None;
+        cfg.provider = "fixture".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn claude_oauth_requires_an_explicit_credential_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "claude");
+        cfg.credential_env = Some("CLAUDE_CODE_OAUTH_TOKEN".into());
+        assert!(
+            cfg.validate().is_err(),
+            "native and explicit auth must not mix"
+        );
+        cfg.native_login_home = None;
+        cfg.validate().unwrap();
+        cfg.provider = "codex".into();
+        assert!(cfg.validate().is_err());
+        cfg.provider = "claude".into();
+        cfg.credential_env = Some("ARBITRARY_SECRET".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn contained_probe_requires_a_pin_and_refuses_keychain() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), "claude");
+        cfg.container = Some(Container {
+            image: format!("sha256:{}", "a".repeat(64)),
+            egress: vec!["api.anthropic.com:443".into()],
+        });
+        cfg.program = "/guest-only/adapter".into();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            cfg.validate().unwrap();
+        }
+        cfg.allow_keychain = true;
+        assert!(cfg.validate().is_err());
+        cfg.allow_keychain = false;
+        cfg.container.as_mut().unwrap().image = "floating:latest".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_keychain_requires_consent_and_keeps_the_private_home() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("Library/Keychains")).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let mut cfg = config(source.path(), "claude");
+        let mut env = HashMap::new();
+        assert!(seed_native_login(&cfg, private.path(), &mut env).is_err());
+        assert!(!private.path().join("home/Library/Keychains").exists());
+        cfg.allow_keychain = true;
+        cfg.validate().unwrap();
+        seed_native_login(&cfg, private.path(), &mut env).unwrap();
+        assert_eq!(
+            std::fs::read_link(private.path().join("home/Library/Keychains")).unwrap(),
+            source.path().join("Library/Keychains")
+        );
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!env.contains_key("HOME"));
+        cfg.provider = "codex".into();
+        assert!(cfg.validate().is_err());
+        cfg.provider = "claude".into();
+        cfg.native_login_home = None;
+        cfg.credential_env = Some("ANTHROPIC_API_KEY".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn native_login_seeds_credentials_without_settings_or_history() {
+        let source = tempfile::tempdir().unwrap();
+        for provider in ["codex", "claude"] {
+            let dir = source.path().join(format!(".{provider}"));
+            std::fs::create_dir(&dir).unwrap();
+            let name = if provider == "codex" {
+                "auth.json"
+            } else {
+                ".credentials.json"
+            };
+            std::fs::write(dir.join(name), b"opaque-fixture-credential").unwrap();
+            for unwanted in ["settings.json", "config.toml", "history.jsonl"] {
+                std::fs::write(dir.join(unwanted), b"must-not-cross").unwrap();
+            }
+            let private = tempfile::tempdir().unwrap();
+            let mut env = HashMap::new();
+            seed_native_login(&config(source.path(), provider), private.path(), &mut env).unwrap();
+            let dest = private.path().join(format!("home/.{provider}"));
+            assert_eq!(
+                std::fs::read(dest.join(name)).unwrap(),
+                b"opaque-fixture-credential"
+            );
+            for unwanted in ["settings.json", "config.toml", "history.jsonl"] {
+                assert!(!dest.join(unwanted).exists());
+            }
+            assert!(!env
+                .values()
+                .any(|value| value == &source.path().display().to_string()));
+        }
+    }
+}
+
+fn clean_text(text: &str, credential: Option<&str>, private_root: &str) -> String {
+    let text = match credential {
+        Some(value) if !value.is_empty() => text.replace(value, "[PROBE_CREDENTIAL]"),
+        _ => text.to_string(),
+    };
+    kranz_engine::scrub::scrub(&text.replace(private_root, "[PROBE_ROOT]"))
+}
+
+fn append_receipt(
+    file: &mut std::fs::File,
+    value: Value,
+    credential: Option<&str>,
+    root: &str,
+) -> Result<()> {
+    let text = clean_text(&serde_json::to_string(&value)?, credential, root);
+    // scrub preserves JSON in ordinary cases; do not persist ambiguous output.
+    let _: Value = serde_json::from_str(&text).context("receipt redaction damaged JSON")?;
+    writeln!(file, "{text}")?;
+    file.flush()?;
+    file.sync_data()?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() != 3 || !matches!(args[1].as_str(), "--check" | "--run") {
+        bail!("usage: acp_compat_probe --check|--run /absolute/config.json");
+    }
+    let config: Config = serde_json::from_slice(&std::fs::read(&args[2])?)?;
+    config.validate()?;
+    let tool_mode = config.mode == Mode::ShellOnce;
+    // Probe-only startup policy. Keep provider telemetry off without expanding
+    // the approved egress list; any remaining denied connection still fails.
+    let claude_startup_env: HashMap<String, String> = if config.provider == "claude" {
+        HashMap::from([(CLAUDE_TRAFFIC_POLICY.into(), "1".into())])
+    } else {
+        HashMap::new()
+    };
+    let prompt = if tool_mode {
+        tool_fixture::prompt()
+    } else {
+        format!("{PREFIX}{REPORT}")
+    };
+    let expected_report = if tool_mode {
+        tool_fixture::REPORT
+    } else {
+        REPORT
+    };
+    let credential_present = config
+        .credential_env
+        .as_ref()
+        .is_none_or(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    if args[1] == "--check" {
+        println!(
+            "{}",
+            json!({"adapterStarted":false,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"provider":config.provider,"credentialVariable":config.credential_env,"credentialPresent":config.credential_env.as_ref().map(|_| credential_present),"nativeLogin":config.native_login_home.is_some(),"keychainAuthorized":config.allow_keychain,"nativeLoginStateAvailable":config.native_login_home.as_ref().map(|home| if config.allow_keychain { home.join("Library/Keychains").is_dir() } else { home.join(if config.provider == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" }).is_file() }),"authenticationVerified":false,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":false,"claudeStartupEnvironment":claude_startup_env,"claudeStartupEnvironmentApplied":false,"receiptAvailable":!config.receipt.exists(),"container":config.container,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false})
+        );
+        return Ok(());
+    }
+    if !credential_present {
+        bail!("approved credential variable is absent; adapter was not started");
+    }
+    let credential = config
+        .credential_env
+        .as_ref()
+        .map(std::env::var)
+        .transpose()?;
+    let private = if config.container.is_some() {
+        tempfile::tempdir_in(kranz_engine::backend_claude::scratch_root_base())?
+    } else {
+        tempfile::tempdir()?
+    };
+    let root = private.path().display().to_string();
+    let workspace = private.path().join("workspace");
+    let home = private.path().join("home");
+    let tool_workspace = if tool_mode {
+        Some(tool_fixture::Workspace::prepare(private.path()).await?)
+    } else {
+        std::fs::create_dir(&workspace)?;
+        None
+    };
+    std::fs::create_dir(&home)?;
+    if config.container.is_some() && !tool_mode {
+        // Docker needs a mountpoint for the existing read-only authority mask.
+        // Include it in the initial fixture, then require it to remain empty.
+        std::fs::create_dir(workspace.join(".kranz"))?;
+    }
+    let mut env = HashMap::from([("HOME".into(), home.display().to_string())]);
+    env.extend(claude_startup_env.clone());
+    seed_native_login(&config, private.path(), &mut env)?;
+    if let (Some(key), Some(value)) = (&config.credential_env, &credential) {
+        env.insert(key.clone(), value.clone());
+    }
+    if config.provider == "codex" {
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(codex_home.join("config.toml"))?
+            .write_all(CODEX_STARTUP_CONFIG.as_bytes())?;
+        env.insert("CODEX_HOME".into(), codex_home.display().to_string());
+        if config.credential_env.is_some() {
+            env.insert(
+                "DEFAULT_AUTH_REQUEST".into(),
+                r#"{"methodId":"api-key"}"#.into(),
+            );
+        }
+        env.insert("NO_BROWSER".into(), "1".into());
+        env.insert("INITIAL_AGENT_MODE".into(), "read-only".into());
+    }
+    let engine_id = format!("acp-probe-{}", uuid::Uuid::new_v4());
+    let effective = if let Some(container) = &config.container {
+        let mut effective = env.clone();
+        for key in ["PATH", "LANG", "TMPDIR"] {
+            effective.entry(key.into()).or_default();
+        }
+        if !container.egress.is_empty() {
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"] {
+                effective.entry(key.into()).or_default();
+            }
+        }
+        effective
+    } else {
+        kranz_engine::agent_env::agent_session_env(&env, &engine_id, None)
+    };
+    let mut env_keys: Vec<_> = effective.keys().cloned().collect();
+    env_keys.sort();
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut receipt = open
+        .open(&config.receipt)
+        .context("receipt must be new; this probe never retries an attempt")?;
+    let started = Instant::now();
+    append_receipt(
+        &mut receipt,
+        json!({"event":"probe.started","provider":config.provider,"authentication":if config.native_login_home.is_some() { "existing-cli-login" } else if config.credential_env.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN") { "explicit-oauth-token" } else { "api-key-or-fixture" },"keychainAuthorized":config.allow_keychain,"engineSessionId":engine_id,"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"program":config.program,"args":config.args,"environmentKeys":env_keys,"codexStartupConfig":(config.provider == "codex").then_some(CODEX_STARTUP_CONFIG),"codexStartupConfigWritten":config.provider == "codex","claudeStartupEnvironment":claude_startup_env,"claudeStartupEnvironmentApplied":config.provider == "claude","container":config.container,"mode":config.mode,"command":tool_mode.then_some(tool_fixture::COMMAND),"permissionLimit":if tool_mode {1} else {0},"prompt":prompt,"promptLimit":1,"promptSeconds":120,"overallSeconds":180,"hostGitOutsideSessionBudget":tool_mode,"hardDollarCap":false,"proof":if tool_mode {"contained_shell_once"} else {"basic_text_report_only"}}),
+        credential.as_deref(),
+        &root,
+    )?;
+    let paths = kranz_engine::paths::MissionPaths::new(private.path(), "m-acp-probe");
+    let mut spec = SessionSpec {
+        cwd: workspace.clone(),
+        prompt: PromptMode::SingleShot(prompt),
+        append_system_prompt: None,
+        model: "unselected-probe".into(),
+        effort: String::new(),
+        session_id: engine_id,
+        resume: None,
+        permission_mode: None,
+        allowed_tools: vec![],
+        disallowed_tools: if tool_mode {
+            vec![]
+        } else {
+            [
+                "Bash",
+                "Read",
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "Glob",
+                "Grep",
+                "WebSearch",
+                "WebFetch",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        },
+        tools: vec![],
+        writable: tool_mode,
+        settings_json: None,
+        json_schema: None,
+        max_budget_usd: None,
+        max_turns: None,
+        env,
+        sandbox: config.container.as_ref().map(|container| {
+            kranz_engine::sandbox::ResolvedSandbox {
+                backend: kranz_engine::sandbox::SandboxBackend::Container,
+                inputs: kranz_engine::sandbox::SandboxInputs {
+                    enforce: kranz_engine::types::SandboxEnforce::FsNet,
+                    session_cwd: workspace.clone(),
+                    mission_dir: paths.mission_dir(),
+                    tmpdir: home.clone(),
+                    extra_write: vec![],
+                    egress: container.egress.clone(),
+                    validator_read_deny_roots: vec![],
+                },
+                container: Some(kranz_engine::sandbox_container::ContainerSpec {
+                    runtime: kranz_engine::sandbox_container::ContainerRuntime::Docker,
+                    image: container.image.clone(),
+                    network: None,
+                    name: None,
+                }),
+            }
+        }),
+        hook_status: None,
+    };
+    let mut events = 0usize;
+    let mut captured_bytes = 0usize;
+    let mut evidence = tool_fixture::Evidence::default();
+    let run = async {
+        let boundary =
+            kranz_engine::egress_proxy::maybe_start_for_session(&mut spec, &paths).await?;
+        let mut session = AcpBackend::new(&config.program, config.args.clone())
+            .start(spec)
+            .await?;
+        let responder = session.permission_responder();
+        let mut final_text = None;
+        let turn = async {
+            while let Some(event) = session.next_event().await? {
+                events += 1;
+                let (kind, raw, tool, result) = match &event {
+                    AgentEvent::Init { raw, .. } => ("init", raw.clone(), false, None),
+                    AgentEvent::Text { raw, .. } => ("text", raw.clone(), false, None),
+                    AgentEvent::Other { raw } => ("other", raw.clone(), false, None),
+                    AgentEvent::ToolUse { raw, .. } | AgentEvent::ToolResult { raw, .. } => {
+                        ("tool", raw.clone(), true, None)
+                    }
+                    AgentEvent::PermissionRequested { proposal, raw } => (
+                        "permission.requested",
+                        json!({"proposal":proposal,"raw":raw}),
+                        true,
+                        None,
+                    ),
+                    AgentEvent::PermissionResponded {
+                        request_id,
+                        delivery,
+                        raw,
+                    } => (
+                        "permission.responded",
+                        json!({"requestId":request_id,"delivery":delivery,"raw":raw}),
+                        true,
+                        None,
+                    ),
+                    AgentEvent::Result {
+                        text,
+                        is_error,
+                        cost_usd,
+                        raw,
+                        ..
+                    } => (
+                        "result",
+                        json!({"raw":raw,"costUsd":cost_usd,"isError":is_error}),
+                        false,
+                        Some((text.clone(), *is_error)),
+                    ),
+                };
+                captured_bytes += serde_json::to_vec(&raw)?.len();
+                if events > 512 || captured_bytes > 2 * 1024 * 1024 {
+                    bail!("probe output exceeded its capture budget");
+                }
+                append_receipt(
+                    &mut receipt,
+                    json!({"event":kind,"raw":raw}),
+                    credential.as_deref(),
+                    &root,
+                )?;
+                if tool && !tool_mode {
+                    bail!("tool activity invalidates this no-tools fixture");
+                }
+                if let Some(fixture) = &tool_workspace {
+                    if let AgentEvent::PermissionRequested { proposal, .. } = &event {
+                        fixture.verify(false)?;
+                        let option = evidence.authorize(proposal, &workspace)?;
+                        // This is a pre-authorized fixture decision, never a
+                        // fabricated human gate. Sync the receipt before send.
+                        append_receipt(
+                            &mut receipt,
+                            json!({"event":"permission.resolved","requestId":proposal.id,"actionDigest":proposal.action_digest,"optionsDigest":proposal.options_digest,"optionId":option,"decision":"allow_once","actor":"operator-authorized-probe-fixture","command":tool_fixture::COMMAND}),
+                            credential.as_deref(),
+                            &root,
+                        )?;
+                        responder
+                            .as_ref()
+                            .context("backend has no permission responder")?
+                            .respond(proposal, true)?;
+                    }
+                    evidence.observe(&event, &workspace)?;
+                }
+                if let Some((text, is_error)) = result {
+                    if is_error {
+                        bail!("prompt did not finish with end_turn");
+                    }
+                    final_text = Some(text);
+                }
+            }
+            Result::<()>::Ok(())
+        };
+        let turn_result = tokio::time::timeout(Duration::from_secs(120), turn).await;
+        let abort_result = if !matches!(turn_result, Ok(Ok(()))) {
+            Some(session.abort().await)
+        } else {
+            None
+        };
+        if let Some(result) = &abort_result {
+            append_receipt(
+                &mut receipt,
+                json!({"event":"probe.abort","returnedOk":result.is_ok(),"sessionExit":session.exit_status(),"error":result.as_ref().err().map(ToString::to_string)}),
+                credential.as_deref(),
+                &root,
+            )?;
+        }
+        if let Some(boundary) = boundary {
+            let denials = boundary.shutdown().await?;
+            if !denials.is_empty() {
+                append_receipt(
+                    &mut receipt,
+                    json!({"event":"probe.egress.denied","denials":denials}),
+                    credential.as_deref(),
+                    &root,
+                )?;
+                bail!("container proof encountered denied egress; no allowlist expansion was attempted");
+            }
+        }
+        turn_result.context("prompt exceeded 120 seconds")??;
+        if session.exit_status() != Some(SessionExit::Completed) {
+            bail!(
+                "adapter did not complete cleanly: {:?}",
+                session.exit_status()
+            );
+        }
+        let text = final_text.context("no terminal report")?;
+        let report = parse_worker_report(&text).context("engine did not parse WorkerReport")?;
+        if serde_json::from_str::<Value>(&text)? != serde_json::from_str::<Value>(expected_report)?
+            || report.summary
+                != if tool_mode {
+                    "kranz-acp-tool-fixture-v1"
+                } else {
+                    "kranz-acp-live-fixture-v1"
+                }
+        {
+            bail!("report differs from the fixed fixture");
+        }
+        if let Some(fixture) = &tool_workspace {
+            evidence.finish()?;
+            fixture.verify(true)?;
+            return Result::<()>::Ok(());
+        }
+        let changes: Vec<_> = std::fs::read_dir(&workspace)?
+            .take(16)
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        let unchanged = if config.container.is_some() {
+            changes == [std::ffi::OsString::from(".kranz")]
+                && std::fs::symlink_metadata(workspace.join(".kranz"))?.is_dir()
+                && std::fs::read_dir(workspace.join(".kranz"))?
+                    .next()
+                    .is_none()
+        } else {
+            changes.is_empty()
+        };
+        if !unchanged {
+            bail!("probe workspace changed: {changes:?}");
+        }
+        Result::<()>::Ok(())
+    };
+    let mut result = tokio::time::timeout(Duration::from_secs(180), run)
+        .await
+        .context("session exceeded 180 seconds")
+        .and_then(|result| result);
+    if result.is_ok() {
+        if let Some(fixture) = &tool_workspace {
+            result = fixture.commit().and_then(|value| {
+                append_receipt(&mut receipt, value, credential.as_deref(), &root)
+            });
+        }
+    }
+    append_receipt(
+        &mut receipt,
+        json!({"event":"probe.finished","passed":result.is_ok(),"elapsedMillis":started.elapsed().as_millis(),"events":events,"capturedBytes":captured_bytes,"error":result.as_ref().err().map(|error|format!("{error:#}")),"containedSession":config.container.is_some(),"toolFixtureProven":tool_mode && result.is_ok(),"productionReadinessProven":false,"containmentProven":false}),
+        credential.as_deref(),
+        &root,
+    )?;
+    if result.is_err() {
+        bail!("probe failed; see the redacted receipt (no retry was attempted)");
+    }
+    println!(
+        "ACP compatibility fixture passed; production readiness and containment certification remain separate."
+    );
+    Ok(())
+}

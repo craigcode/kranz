@@ -1,0 +1,58 @@
+{
+  "proof": "offline_pinned_codex_feature_configuration_only",
+  "recordedAt": "2026-09-19T04:18:11.933480+00:00",
+  "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+  "platform": "linux/arm64",
+  "host": "macOS ARM64 / Colima",
+  "network": "none",
+  "hostBindMounts": [],
+  "readOnlyRoot": true,
+  "credentialsProvided": false,
+  "keychainAvailable": false,
+  "appServerStarted": false,
+  "adapterStarted": false,
+  "modelPrompts": 0,
+  "checks": [
+    {
+      "case": "defaults",
+      "runtime": "codex-cli 0.153.4",
+      "config": "",
+      "effectiveFeatures": {
+        "plugins": true,
+        "remote_plugin": true
+      },
+      "exitCode": 0,
+      "credentialFilePresent": false
+    },
+    {
+      "case": "remote-only",
+      "runtime": "codex-cli 0.153.4",
+      "config": "[features]\nremote_plugin = false\n",
+      "effectiveFeatures": {
+        "plugins": true,
+        "remote_plugin": false
+      },
+      "exitCode": 0,
+      "credentialFilePresent": false
+    },
+    {
+      "case": "plugins-disabled",
+      "runtime": "codex-cli 0.153.4",
+      "config": "[features]\nplugins = false\nremote_plugin = false\n",
+      "effectiveFeatures": {
+        "plugins": false,
+        "remote_plugin": false
+      },
+      "exitCode": 0,
+      "credentialFilePresent": false
+    }
+  ],
+  "containerAbsentAfterCheck": true,
+  "liveAttributionProven": false,
+  "providerCompatibilityCertified": false,
+  "commands": [
+    "/usr/local/bin/node /opt/acp/node_modules/@openai/codex/bin/codex.js --version",
+    "/usr/local/bin/node /opt/acp/node_modules/@openai/codex/bin/codex.js features list"
+  ],
+  "privateConfigPreamble": "cli_auth_credentials_store = \"file\"\n"
+}

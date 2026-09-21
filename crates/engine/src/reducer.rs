@@ -40,6 +40,17 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
     }
 
     match &event.kind {
+        EventKind::GateEvaluationClosed { .. }
+        | EventKind::GateEvaluationRequested { .. }
+        | EventKind::GateEvaluationFinished { .. }
+        | EventKind::GateResolutionRecorded { .. }
+        | EventKind::GateResolutionConsumed { .. } => {
+            crate::gate_evaluation::lifecycle::fold(state, event)?
+        }
+        EventKind::PermissionRequested { .. }
+        | EventKind::PermissionResolved { .. }
+        | EventKind::PermissionResponseRecorded { .. }
+        | EventKind::PermissionClosed { .. } => crate::live_permission::fold(state, event)?,
         EventKind::MissionCreated { .. } => {
             return Err(EngineError::InvalidState(format!(
                 "mission.created at seq {} is only valid as the first event",
@@ -856,6 +867,9 @@ fn initial_state(event: &Event) -> Result<MissionState> {
         )));
     };
     Ok(MissionState {
+        permissions: BTreeMap::new(),
+        gate_evaluations: BTreeMap::new(),
+        consumed_gate_resolutions: BTreeSet::new(),
         feature_base_shas: BTreeMap::new(),
         mission: Mission {
             id: event.mission_id.clone(),

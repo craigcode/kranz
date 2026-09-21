@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Durable invocation-bound consent, crash/stale-click handling and CLI/server/Slack/dashboard surfaces completed and reviewed. Workspace and dashboard gates passed. Accepted with the v0.3.0 integration; see docs/reviews/2026-09-20-v030-integration.md. Persistent/session-wide grants remain excluded.
+state: done
 title: ACP live permissions — durable one-call consent across existing operator surfaces
 priority: 1
 schedule: once

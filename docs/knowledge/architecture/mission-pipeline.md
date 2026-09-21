@@ -2,8 +2,13 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-21
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
+  - crates/engine/src/orchestrator/external_gates.rs
+  - crates/engine/src/gate_evaluation/driver.rs
+  - crates/engine/src/gate_evaluation/lifecycle.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/reducer.rs
   - crates/engine/src/events.rs
@@ -29,6 +34,11 @@ verified_against:
 ---
 
 ## The one invariant
+
+A sequential worker interrupted by Pause returns to the outer idle loop after
+recording its existing commits and closing live permissions. It must not enter
+checkpoint, judgment or respawn while paused. A later permission click cannot
+revive the old peer; explicit resume starts with the recorded partial work.
 
 `events.jsonl` (append-only JSONL, one `Event` per line) is the sole source of
 truth. Everything else — `MissionState`, `state.json`, the dashboard — is
@@ -285,3 +295,46 @@ backend converts cost to a per-turn delta before `worker.completed` adds it
 to mission totals. Raw provider totals remain in the transcript. Conversation
 resets start a new segment; missing or zeroed crash results do not erase prior
 spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
+
+## Qualified ACP workers
+
+An operator-only `worker.acpProfile` admits the reviewed Claude/Codex container
+profiles to ordinary worktree missions. It fixes guest argv, image, explicit
+file credential, startup settings and configured egress; defaults remain
+unchanged. Generic enforced ACP, validators, session resume and dispatch-pool
+profiles are refused. The profile supplies a private HOME with an unmounted
+private parent. Existing permission, checkpoint and event machinery remains
+in use; engine-run checks use the same image offline without the worker login.
+The synthetic mission reaches local merge and export; bounded S7 defect/repair
+and live worker evidence are recorded in the acceptance reviews. Controllers
+and reviewers in those live runs were scripted. Contained single-shot completion
+closes input, lets the trusted supervisor stop lingering peers after a one-second
+grace, and requires the Docker client's status within five seconds. A delayed
+or missing failure status cannot become successful forced cleanup. See
+[ACP containment](../../acp-containment.md).
+
+## Live one-call consent
+
+ACP workers relay `permission.requested` to the engine writer while their output
+continues to drain. The broker binds the request to the approved plan, current
+policy, run, workspace and exact action/options. It persists `permission.resolved`
+before sending a response; `permission.response-recorded` says sent or uncertain,
+not that a tool completed. `permission.closed` preserves why a request can no
+longer be answered. These events fold into `MissionState.permissions`.
+
+Replay recreates records, never response handles. Resume closes orphaned calls;
+pause and policy changes cancel live workers before changing their authority.
+See [one-call consent](../../acp-live-permissions.md) and
+[the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
+
+The S5 stage drivers record evaluation, engine resolution and attempted
+consumption separately for initial approval, proposed revisions, milestone
+acceptance, final deliverables and local scratch-integration merge. Authority
+comes from the original sealed approval record; changing live `packDir` cannot
+remove checks. Source snapshots and current base/candidate refs are checked
+again before consumption. Recovery closes unfinished attempts without replaying
+checks or effects. CLI status, the dashboard and optional Slack expose blocked
+or escalated checks; a retry collects fresh evidence and never overrides a
+nonwaivable failure. External command-permission executables and Windows mission
+evaluators remain refused; S4's separate live permission consent path is unchanged.
+[Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).

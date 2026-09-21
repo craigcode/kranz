@@ -243,6 +243,18 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
     // initialize handshake at session start is the real probe). Never
     // panics; a missing/relative command downgrades to an honest Unknown.
     if kind == BackendKind::Acp {
+        if let Some(profile) = &cfg.role(role).acp_profile {
+            return RoleReadiness {
+                role: role_key.into(),
+                backend,
+                status: ReadinessStatus::Unknown,
+                detail: format!(
+                    "ACP profile {} configured; image, private credential and initialize handshake checked at worker start; authentication not probed",
+                    profile.id
+                ),
+                next_action: "ensure the pinned image is installed and the selected credential file is private".into(),
+            };
+        }
         let configured = cfg.role(role).acp_command.clone();
         let (status, detail, next_action) = match configured.as_deref() {
             Some(command) if !command.trim().is_empty() => (
@@ -858,5 +870,19 @@ mod tests {
             role.status,
             ReadinessStatus::Missing | ReadinessStatus::Unknown
         ));
+    }
+
+    #[test]
+    fn acp_profile_readiness_never_reads_or_probes_a_login() {
+        let mut cfg = MissionConfig::default();
+        cfg.worker.backend = Some("acp".into());
+        cfg.worker.acp_profile = Some(crate::acp_worker::AcpWorkerProfile {
+            id: crate::acp_worker::CODEX.into(),
+            credential_file: std::env::temp_dir().join("missing-profile-auth.json"),
+        });
+        let role = probe_role(Role::Worker, &cfg);
+        assert_eq!(role.status, ReadinessStatus::Unknown);
+        assert!(role.detail.contains("authentication not probed"));
+        assert!(!role.next_action.contains("acpCommand"));
     }
 }

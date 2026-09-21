@@ -1,0 +1,344 @@
+{
+  "proof": "acp-shell-once-probe-v1",
+  "dateUtc": "2026-09-19",
+  "sourceParent": "7f1021e21801cb0269784f4dae66d3d26a72a7c9",
+  "host": "macOS ARM64 / Colima Linux Docker",
+  "providerCalls": 0,
+  "vendorCredentialAccess": false,
+  "keychainAccess": false,
+  "productionAdmissionEnabled": false,
+  "sourceSha256": {
+    ".github/workflows/ci.yml": "8dd027940f67f01bdf26587975c41f4bc4fb69c08f7f4d08d3fb76b11575ed9b",
+    "crates/engine/examples/acp_compat_probe.rs": "3ab505587c5aa2abfb159e5bac69dc3311c479f813e9fd2aa35ca790ac4b17d5",
+    "crates/engine/examples/acp_compat_probe/tool_fixture.rs": "632f0712f40821010a40ad15d7f66e676a7c2c44f1b45bd61078d541962543ee",
+    "scripts/check-acp-tool-probe.py": "ffe1af6f3c2b99620f3d33f319f50a6f7d1e7595e7dea520878010795d188087"
+  },
+  "command": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+  "mode": "shell-once",
+  "promptLimit": 1,
+  "permissionLimit": 1,
+  "promptSeconds": 120,
+  "sessionSeconds": 180,
+  "hostGitOutsideSessionBudget": true,
+  "preparedLiveOuterSeconds": 240,
+  "hardDollarCap": false,
+  "workspaceTests": {
+    "passed": 3041,
+    "failed": 0,
+    "ignored": 10
+  },
+  "gates": [
+    {
+      "gate": "synthetic-tool",
+      "exit": 0,
+      "seconds": 46.65
+    },
+    {
+      "gate": "vendor-image-synthetic-tool",
+      "exit": 0,
+      "seconds": 43.67
+    },
+    {
+      "gate": "report-only-regression",
+      "exit": 0,
+      "seconds": 7.21
+    },
+    {
+      "gate": "example-tests",
+      "exit": 0,
+      "seconds": 2.11
+    },
+    {
+      "gate": "workspace-tests",
+      "exit": 0,
+      "seconds": 225.84
+    },
+    {
+      "gate": "clippy",
+      "exit": 0,
+      "seconds": 1.19
+    },
+    {
+      "gate": "format",
+      "exit": 0,
+      "seconds": 1.22
+    },
+    {
+      "gate": "build",
+      "exit": 0,
+      "seconds": 0.34
+    },
+    {
+      "gate": "build-probe",
+      "exit": 0,
+      "seconds": 0.24
+    }
+  ],
+  "finalSyntheticGates": [
+    {
+      "gate": "synthetic-tool-final",
+      "exit": 0,
+      "seconds": 48.96
+    },
+    {
+      "gate": "vendor-image-synthetic-tool-final",
+      "exit": 0,
+      "seconds": 51.6
+    }
+  ],
+  "logSha256": {
+    "synthetic-tool-refined.log": "73ca8da98aa8022f143ff2cf7f5d9bbacf88f6a60578d45417f85e2d435b53b4",
+    "format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "example-tests.log": "5d723dcb24bc2f3aa68c667b68ee4ed8dc4a95b038d73459988bdecefa130ee3",
+    "report-only-regression.log": "8b51d05a8dda9206b52992c723670c98fa1fa0452d1b012adc3010854202e65a",
+    "clippy.log": "1b8c7a27630aeb13b05f8774761f768575a8b4b68a6c428c5bad7414cab22ed1",
+    "vendor-image-synthetic-tool.log": "41408ede325d7eae6a52172f71b826cd6c047a00a6f89be0d95e3be3d6ede6ab",
+    "synthetic-tool-final.log": "b03f988be033b0544b12b59c2b9a9d6bb09624587c66325e766ab3eb409118e2",
+    "vendor-image-synthetic-tool-final.log": "4a85ec189edd6bc83c4842c548afcd25081d4cc4cc4b3568323be486a33c9ce4",
+    "build-probe.log": "d7dae192715495fa89ccbe279af3efb9792c1dae1768228e369035e68a1df673",
+    "synthetic-tool.log": "5db5fbe1efee704a72eb56ed210b75a43df2ef95d55d097189b1b0aad22a2df2",
+    "workspace-tests.log": "f22bf55898f67dc7837943b95b692c5bb85b2dab098cecef8f63da614b533897",
+    "build.log": "8b1fd2394f7b6f177ede882431154a419bd9f404f00add314c912e91a7fc0ec0"
+  },
+  "syntheticImages": [
+    {
+      "image": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+      "vendorInvoked": false,
+      "cases": 24,
+      "positive": 4,
+      "refused": 20,
+      "resultsSha256": "8a61d1eae189f8cc6b58b78d68714dbe22660f62250785772641df7b0b19d108",
+      "receiptsDigest": "e339dc11b3cb3d72cf05e4fec8f5166a6628b2ed7fec5e7089a4430a6b9c55f2",
+      "independentDaemonAbsenceChecked": true
+    },
+    {
+      "image": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+      "vendorInvoked": false,
+      "cases": 24,
+      "positive": 4,
+      "refused": 20,
+      "resultsSha256": "8a61d1eae189f8cc6b58b78d68714dbe22660f62250785772641df7b0b19d108",
+      "receiptsDigest": "a967b42e5f3eda9b99a0e2258538ac24535243d83755ac3095abf475a63b37a6",
+      "independentDaemonAbsenceChecked": true
+    }
+  ],
+  "requiredLinuxCiStep": "Check bounded tool-use probe with contained synthetic peers",
+  "linuxToolFixtureCi": "pending at preparation",
+  "retainedFailure": "An added guest-side config-is-file assertion failed because the primary Git directory is deliberately outside the guest namespace. Final fixture verifies the target path equals the host-verified config and accepts only inaccessible/read-only errors. No containment policy changed.",
+  "limits": [
+    "Author self-review only; no independent validator verdict.",
+    "Only observed protocol tool activity is counted; hidden commands or transient modify/restore are not excluded.",
+    "A host-created feature commit is not a complete mission or a human merge.",
+    "Vendor tool-use, Linux vendor qualification and production admission remain open."
+  ],
+  "commands": [
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo fmt --all --check",
+    "cargo build --workspace",
+    "cargo test --workspace --example acp_compat_probe",
+    "cargo build --workspace --example acp_compat_probe",
+    "python3 scripts/check-acp-probe.py <binary> <python-image>",
+    "python3 scripts/check-acp-tool-probe.py <binary> <image>"
+  ],
+  "caseOutcomes": [
+    {
+      "case": "pass",
+      "expectedPass": true,
+      "exit": 0,
+      "error": null
+    },
+    {
+      "case": "wrapped-command",
+      "expectedPass": true,
+      "exit": 0,
+      "error": null
+    },
+    {
+      "case": "streamed-input",
+      "expectedPass": true,
+      "exit": 0,
+      "error": null
+    },
+    {
+      "case": "primary-change",
+      "expectedPass": true,
+      "exit": 0,
+      "error": null
+    },
+    {
+      "case": "permission-command",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "command differs from the authorized fixture"
+    },
+    {
+      "case": "permission-cwd",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "unsupported tool input field: cwd"
+    },
+    {
+      "case": "wrong-command",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "command differs from the authorized fixture"
+    },
+    {
+      "case": "wrong-cwd",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "unsupported tool input field: cwd"
+    },
+    {
+      "case": "extra-authority",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "unsupported tool input field: additionalPermissions"
+    },
+    {
+      "case": "ambiguous-once",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "permission is repeated, prohibited, stale or after completion"
+    },
+    {
+      "case": "durable-only",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "permission is repeated, prohibited, stale or after completion"
+    },
+    {
+      "case": "option-extension",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "permission option carries unsupported extensions"
+    },
+    {
+      "case": "early-write",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "fixture workspace has unexpected paths"
+    },
+    {
+      "case": "no-permission",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "tool did not complete after a delivered one-time grant"
+    },
+    {
+      "case": "report-only",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "missing tool/permission/completion evidence"
+    },
+    {
+      "case": "wrong-output",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "fixture output differs"
+    },
+    {
+      "case": "symlink",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "fixture file is not regular: [PROBE_ROOT]/workspace/fixture-result.txt"
+    },
+    {
+      "case": "extra-file",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "fixture workspace has unexpected paths"
+    },
+    {
+      "case": "tool-failed",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "tool did not complete after a delivered one-time grant"
+    },
+    {
+      "case": "nonzero-exit",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "tool output reports failure or unknown exit status"
+    },
+    {
+      "case": "repeat-request",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "permission is repeated, prohibited, stale or after completion"
+    },
+    {
+      "case": "drift",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "command differs from the authorized fixture"
+    },
+    {
+      "case": "wrong-tool-id",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "more than one tool invocation"
+    },
+    {
+      "case": "default-report",
+      "expectedPass": false,
+      "exit": 1,
+      "error": "tool activity invalidates this no-tools fixture"
+    }
+  ],
+  "adapterSources": [
+    {
+      "repository": "agentclientprotocol/codex-acp",
+      "commit": "51d6247ac7448485bfcf534b813196fafc26df59",
+      "files": [
+        {
+          "path": "src/AgentMode.ts",
+          "sha256": "2c014d971fff367710779f102557dda9ec1a56c4b5faebc745bb2642280388e7",
+          "url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts"
+        },
+        {
+          "path": "src/permissions/presentation.ts",
+          "sha256": "786b0e120a6d9e521d9c8378f4e5f4a0991a4063e03d796cb53a77305488e6cb",
+          "url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/permissions/presentation.ts"
+        },
+        {
+          "path": "src/permissions/options.ts",
+          "sha256": "f23d018ebd41640b4b95cce49b9c6f16d519344e45180dd65e962d266ec2af8d",
+          "url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/permissions/options.ts"
+        },
+        {
+          "path": "src/CodexToolCallMapper.ts",
+          "sha256": "97f26f19d02e870a09a6807224374f80338a8934934fe708dece49dbe09d5e3c",
+          "url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexToolCallMapper.ts"
+        },
+        {
+          "path": "src/__tests__/CodexACPAgent/e2e/acp-e2e-shell-approval.test.ts",
+          "sha256": "26cb9324cc234ffa1268b535060edbf0d2105646ddd84e69168732be076778ea",
+          "url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/__tests__/CodexACPAgent/e2e/acp-e2e-shell-approval.test.ts"
+        }
+      ]
+    },
+    {
+      "repository": "agentclientprotocol/claude-agent-acp",
+      "commit": "dfe823b9581979cd22db40272d4469cc7e42b77e",
+      "files": [
+        {
+          "path": "src/acp-agent.ts",
+          "sha256": "ca9108ad699a3f580ffd88cd2d2751dd84e90c3fdc508defddd54cf7ec8e623e",
+          "url": "https://github.com/agentclientprotocol/claude-agent-acp/blob/dfe823b9581979cd22db40272d4469cc7e42b77e/src/acp-agent.ts"
+        },
+        {
+          "path": "src/tools.ts",
+          "sha256": "bca46505d7663d1b85494c17f580dbc9463624f2cf7c961576011c879c9eac9e",
+          "url": "https://github.com/agentclientprotocol/claude-agent-acp/blob/dfe823b9581979cd22db40272d4469cc7e42b77e/src/tools.ts"
+        },
+        {
+          "path": "src/permissions/options/shared.ts",
+          "sha256": "c0c992c6198239be75670090176eda8f665c230e9cf78110e31912f9428f8716",
+          "url": "https://github.com/agentclientprotocol/claude-agent-acp/blob/dfe823b9581979cd22db40272d4469cc7e42b77e/src/permissions/options/shared.ts"
+        }
+      ]
+    }
+  ]
+}

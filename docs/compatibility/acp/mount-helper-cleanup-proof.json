@@ -1,0 +1,199 @@
+{
+  "proof": "owned-mount-helper-v1",
+  "dateUtc": "2026-09-19",
+  "host": "macOS ARM64 / Colima Linux Docker",
+  "dockerServerVersion": "29.2.1",
+  "fixtureImage": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+  "providerCalls": 0,
+  "vendorCredentialAccess": false,
+  "keychainAccess": false,
+  "sourceSha256": {
+    "crates/engine/src/sandbox_container.rs": "0195aa6d83360863ff82882d7bf127a1323f986801eb6a9e02bf2f00a671bbe3",
+    "crates/engine/src/sandbox_container/mount_proof.rs": "77b58d2678753b7ea75aa85d56b24e82bca60cb8b65a0d5761d978b73ccbf94a",
+    "crates/engine/src/sandbox_container/mount_proof/tests.rs": "031050f965059b60e48487447fc8bf932e5db0c98aeaf92905dd8085166d58b5",
+    "crates/engine/src/gate_evaluation/subprocess.rs": "78420fbec9ab80a039aa970268270fdaf1b845bced7dc3569292d47495e95af5",
+    ".github/workflows/ci.yml": "5995f3046a8582d8b2cdfa02a362195a0efc8367cd4113c8f300f32a33137b7a"
+  },
+  "workspaceTests": {
+    "passed": 3040,
+    "failed": 0,
+    "ignored": 10,
+    "allThreeDockerProofOptInsEnabled": true,
+    "logSha256": "7b8775ff27f45c439290a5d100824173931b823780fd8baa562e815875bd9326"
+  },
+  "gates": [
+    {
+      "gate": "workspace-tests",
+      "exit": 0,
+      "seconds": 286.61
+    },
+    {
+      "gate": "clippy",
+      "exit": 0,
+      "seconds": 13.3
+    },
+    {
+      "gate": "format",
+      "exit": 0,
+      "seconds": 1.11
+    },
+    {
+      "gate": "build",
+      "exit": 0,
+      "seconds": 13.3
+    },
+    {
+      "gate": "build-probe",
+      "exit": 0,
+      "seconds": 0.33
+    }
+  ],
+  "mountHelperTests": [
+    "mount_helper_v1_deletes_only_the_created_id_and_waits_for_absence",
+    "mount_helper_v1_deletion_acknowledgement_is_not_absence",
+    "mount_helper_v1_inventory_errors_and_uncertain_creation_retain_evidence",
+    "mount_helper_v1_real_cancellation_and_dropped_future_cleanup",
+    "mount_helper_v1_real_engine_death_bounds_guest_and_retains_intent",
+    "mount_helper_v1_real_interrupted_creation_removes_the_daemon_object",
+    "mount_helper_v1_real_name_collision_preserves_unrelated_container",
+    "mount_helper_v1_real_round_trip_and_concurrent_helpers",
+    "mount_helper_v1_real_timeout_and_guest_watchdog_remove_blocked_writer",
+    "mount_helper_v1_real_unavailable_inventory_fails_with_private_recovery",
+    "mount_helper_v1_unsupported_runtime_refuses_before_creating_probe"
+  ],
+  "concurrentHarness": {
+    "invocations": 8,
+    "parallelism": 4,
+    "sessionsPerInvocation": {
+      "native": 3,
+      "contained": 3
+    },
+    "runs": [
+      {
+        "run": 0,
+        "exit": 0,
+        "seconds": 15.66
+      },
+      {
+        "run": 1,
+        "exit": 0,
+        "seconds": 16.26
+      },
+      {
+        "run": 2,
+        "exit": 0,
+        "seconds": 15.9
+      },
+      {
+        "run": 3,
+        "exit": 0,
+        "seconds": 16.19
+      },
+      {
+        "run": 4,
+        "exit": 0,
+        "seconds": 7.6
+      },
+      {
+        "run": 5,
+        "exit": 0,
+        "seconds": 7.56
+      },
+      {
+        "run": 6,
+        "exit": 0,
+        "seconds": 7.6
+      },
+      {
+        "run": 7,
+        "exit": 0,
+        "seconds": 7.55
+      }
+    ],
+    "privateResultsSha256": "82fe121dd3400c6b01550812286042b6c1e6b5477bd0fadbff139fbc44237bdb"
+  },
+  "retainedFailure": {
+    "test": "acp_compat_v1_handshake_rejects_version_and_missing_session_identity",
+    "stage": "existing native ACP test outer three-second timeout",
+    "workspaceExit": 101,
+    "allElevenMountHelperTestsPassed": true,
+    "isolatedFollowUp": {
+      "exit": 0,
+      "testSeconds": 0.64
+    },
+    "timeoutChanged": false,
+    "exactCauseProven": false,
+    "logSha256": "c83c305384a08b20f3813f3189c0dfd4cfc479ac17045bedac938a29ecba27dc"
+  },
+  "retainedMissingRootBatch": {
+    "invocations": [
+      {
+        "run": 0,
+        "exit": 1,
+        "seconds": 1.48
+      },
+      {
+        "run": 1,
+        "exit": 1,
+        "seconds": 1.54
+      },
+      {
+        "run": 2,
+        "exit": 1,
+        "seconds": 1.54
+      },
+      {
+        "run": 3,
+        "exit": 1,
+        "seconds": 1.54
+      },
+      {
+        "run": 4,
+        "exit": 1,
+        "seconds": 0.84
+      },
+      {
+        "run": 5,
+        "exit": 1,
+        "seconds": 0.85
+      },
+      {
+        "run": 6,
+        "exit": 1,
+        "seconds": 0.85
+      },
+      {
+        "run": 7,
+        "exit": 1,
+        "seconds": 0.83
+      }
+    ],
+    "privateResultsSha256": "836cb14f2ca73be76516a8fdd8c8b2037538d0739563f2d61cdaf16a22c67b6a",
+    "acpInitializationReached": false,
+    "fix": "Preserve creation of missing declared mount roots; regression added to the real round-trip test. Local harness TMPDIR now explicitly uses the shared scratch base."
+  },
+  "finalDaemonInventory": {
+    "containers": 0,
+    "kranzEgressNetworks": 0,
+    "kranzEgressVolumes": 0
+  },
+  "linuxCi": {
+    "status": "passed",
+    "headSha": "5510afe3585c2f3f314b7f698d02f150e5049467",
+    "runId": 35459712133,
+    "job": "rust-linux-external-evaluator",
+    "jobId": 105941259008,
+    "url": "https://github.com/craigcode/kranz/actions/runs/35459712133/job/105941259008",
+    "allElevenMountHelperTestsVerified": true,
+    "requiredNamedProofsAndSkipRejection": true,
+    "privateLogSha256": "a3609169fb1933670c2bc661b7f3a64673d2ead8796436a93ac1f9d02777fade"
+  },
+  "limitations": [
+    "Engine death between create and start can leave a stopped container with retained recovery intent.",
+    "Interrupted creation can finish late; an empty early inventory is not proof of absence.",
+    "Daemon or kernel failure can prevent removal; uncertainty remains a failed proof with recovery evidence.",
+    "Non-Docker required mount preflight refuses before spawn.",
+    "This proof does not close broader S6 qualification, production ACP admission or S7."
+  ],
+  "colimaRestoredToStopped": true
+}

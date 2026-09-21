@@ -2,8 +2,22 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-21
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_worker/tests.rs
+  - crates/engine/src/gate_evaluation/subprocess.rs
+  - crates/engine/src/backend_acp.rs
+  - crates/engine/examples/acp_compat_probe.rs
+  - crates/engine/examples/acp_compat_probe/tool_fixture.rs
+  - scripts/check-acp-tool-probe.py
+  - scripts/check-acp-probe.py
+  - crates/engine/src/acp_container.rs
+  - crates/engine/src/acp_container/tests.rs
+  - crates/engine/src/acp_container/peer.py
+  - crates/engine/src/orchestrator/external_gates.rs
+  - crates/engine/src/gate_evaluation/driver.rs
+  - crates/engine/src/gate_evaluation/lifecycle.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
   - AGENTS.md
@@ -29,7 +43,62 @@ verified_against:
   - docs/tickets.md
 ---
 
+## Explicit external evaluator checks
+
+The schema-5 evaluator runner is shared by explicit library calls and mission stages.
+`load_for_config` admits tracked external evaluators on supported contained hosts; legacy
+command gates and standards remain unchanged. `rust-linux-external-evaluator`
+runs `gate_subprocess_v1` with the Docker opt-in and a pinned synthetic Python
+image. Missing Docker/image support fails that job; ordinary workspace tests
+print `SKIP-EXTERNAL-EVALUATOR` when the explicit opt-in is absent. These tests
+exercise protocol, byte pinning, artifact imports and containment without model
+calls. That CI step runs unrelated fixtures sequentially so they do not compete
+for bounded Docker inspection and cleanup. Creation consumes the evaluation's
+remaining wall-time budget instead of a separate five-second cap; it is never
+retried automatically. Delayed creation, deadline expiry and cancellation have
+a real-Docker regression. This is not a throughput qualification. The job retains its synthetic proof logs on failure as well as
+success. See [external evaluators](../../external-evaluators.md) for API boundaries,
+retention and recovery limits.
+
+The same Linux job also runs `acp_containment_v1` with
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine descendant/lifetime daemon proofs and the six ordinary-profile
+mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
+tests do not substitute for those proofs. Synthetic control tests additionally
+require confirmed absence after asynchronous deletion and failure when a
+namespace persists. The MCP descendant proof exchanges initialization and a
+tool call with a detached child, requires thirteen containment denials and a
+real tool-written deliverable, and confirms that no ACP callback mediated it.
+It then exercises the bounded ACP
+compatibility probe with deterministic contained peers, without provider
+credentials or model calls. The opt-in `shell-once` fixture additionally requires
+one exact command, a synced one-time permission decision, delivery and completion
+evidence, the expected file, an unchanged primary tree and a host-created feature
+commit. Twenty-nine cases include targeted refusals and independent daemon-absence
+checks, including Codex's exact observed permission wrapper and rejection of
+added commands. Synthetic Claude peers also check fixed nonessential-traffic
+suppression before initialization across key/OAuth/file-login channels. The
+default report-only path still refuses tools. These checks cover the direct-backend Docker proof
+path. Two explicit qualified profiles now admit ordinary worktree workers on
+macOS/Linux ARM64 Docker. A test-only profile proves approval, one-call consent,
+contained shell delivery, host checkpoint, fresh scripted review, external gates,
+offline local merge and portable export; a separate credential-echo case checks
+refusal and cleanup. The new Docker fixtures hold the shared environment-test
+lock so another test's fake runtime cannot redirect them. The S7 fixture matrix
+adds a seeded defect and repair with fresh consent/review, pause with a stale
+click, post-approval policy drift, checker failure, exact-tree merge and export
+after runtime cleanup. A paused sequential feature returns to the run loop before
+checkpoint, judgment or retry. These scripted fixtures do not qualify live
+governed missions. See
+[ACP containment](../../acp-containment.md).
+
 ## The full-workspace gate suite
+
+The contained ACP completion regressions delay an earned nonzero Docker exit
+past the native grace, require a missing status to fail at the contained
+deadline, and prove that EOF shutdown stops a successful but lingering peer
+and its detached descendants. CI requires both named proofs. The Windows
+contract-lint timer fixture runs the test executable itself and requires its
+post-sleep marker, avoiding both network-based delays and PowerShell startup.
 
 Before declaring any Rust change done, run all four — bare, reading raw exit
 codes ([AGENTS.md](../../../AGENTS.md) rules 1–3):
@@ -60,7 +129,9 @@ dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
 tests, and lint. The Even G2 lane runs install, high-severity audit, tests,
 package construction (including type/build checks and license notices), and lint.
-Physical glasses acceptance remains a separate operator receipt.
+Physical glasses acceptance remains a separate operator receipt. Ubuntu and
+macOS also build and exercise the bounded ACP compatibility probe with a local
+synthetic peer; this check requires no provider credentials or model calls.
 
 The supply-chain job also checks the four package MIT notices, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
@@ -188,7 +259,9 @@ Once all milestones complete, `final_gate()` runs the mission's
   `active_root()` with the sanitized `contract_command_env(base_sha)`, which exports
   `KRANZ_BASE_SHA` set to the sha pinned at approval (never the live base
   branch). When enforcement is enabled, the resolved worker sandbox also wraps
-  the gate; `off` keeps the environment-only posture. The timeout is 10 minutes
+  the gate. Qualified ACP profiles derive an offline gate policy with the same
+  pinned image and no selected provider login; `off` keeps the environment-only
+  posture. The timeout is 10 minutes
   (`COMMAND_TIMEOUT`). A non-zero exit produces a critical, non-waivable
   `command-assertion` finding.
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown
@@ -306,3 +379,26 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
 
 Allowlist lives at `.kranz/secret-allowlist` (one fingerprint per line, `#`
 comments); add a line only for a reviewed false positive.
+
+## ACP permission checks
+
+S4 adds live one-call consent through the existing writer and control inbox,
+without widening command grants. CLI, mutation-authenticated REST, dashboard
+and optional Slack submit the exact request/binding digest. Tests use local
+peers and disposable authority data; they do not need provider login or Keychain
+access. Fragmented stdout survives cancelled reads, and an answer waits until
+an already-started protocol frame is complete. Future messages from a cooperative
+peer cannot be predicted; this protocol check is not containment.
+See [live consent](../../acp-live-permissions.md).
+
+The S5 stage drivers record evaluation, engine resolution and attempted
+consumption separately for initial approval, proposed revisions, milestone
+acceptance, final deliverables and local scratch-integration merge. Authority
+comes from the original sealed approval record; changing live `packDir` cannot
+remove checks. Source snapshots and current base/candidate refs are checked
+again before consumption. Recovery closes unfinished attempts without replaying
+checks or effects. CLI status, the dashboard and optional Slack expose blocked
+or escalated checks; a retry collects fresh evidence and never overrides a
+nonwaivable failure. External command-permission executables and Windows mission
+evaluators remain refused; S4's separate live permission consent path is unchanged.
+[Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).

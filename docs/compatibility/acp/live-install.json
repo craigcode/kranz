@@ -1,0 +1,38 @@
+{
+  "platform": "Darwin",
+  "arch": "arm64",
+  "node": "v22.23.1",
+  "lockFile": "live-install-lock.json",
+  "lockSha256": "f366480f4e2c3328b9b7194bc70985f90cee937e9bf7b4e69ec3f23ec8bbdccd",
+  "installFlags": [
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund"
+  ],
+  "providers": {
+    "@agentclientprotocol/claude-agent-acp": {
+      "version": "0.77.0",
+      "integrity": "sha512-m8mhsAOc5+m/QZNsKCrfyIRv4KQrCLqSYHZP/aUvL3X0Xn0f9n4wKKNpOpOv0Kblh/2Mkpd4SW0KypN1dZkJfg=="
+    },
+    "@agentclientprotocol/codex-acp": {
+      "version": "1.11.0",
+      "integrity": "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=="
+    },
+    "@anthropic-ai/claude-agent-sdk": {
+      "version": "0.3.270",
+      "integrity": "sha512-sSfcm5Nhb+WHeBCxqeHRRQMUKPmFTL+zgv5xcRUVaFMLttfNEbn3IZJE+fLJJmy4h3J8zdc5sXdSa1JxyB8ppQ=="
+    },
+    "@anthropic-ai/claude-agent-sdk-darwin-arm64": {
+      "version": "0.3.270",
+      "integrity": "sha512-nk7BP+i559rheYz9DIwAfevd4DulQXP0mXPP+MeO2fGuIGFmzhE/c0JRm9YswXv5HdaYJvSzjGIB7dVA01NehA=="
+    },
+    "@openai/codex": {
+      "version": "0.153.4",
+      "integrity": "sha512-wbHDmit7S/YvBGVX1DQmk13xtWblZ2cApeJ/pB7xDZ10Cna+DZc5ij7f0F4OxdsXN4FW1oLT48OpogUI1+8Y2w=="
+    },
+    "@openai/codex-darwin-arm64": {
+      "version": "0.153.4-darwin-arm64",
+      "integrity": "sha512-B1qhN3fa1ay0R0wGziXqgwSkB5icpYChNKHhtBHff/0UtSTC7z+l8aTtvMlGjH3E8HEvY3+njIJelM9CAAoVWg=="
+    }
+  }
+}

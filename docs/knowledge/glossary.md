@@ -2,8 +2,10 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-21
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
   - crates/engine/src/orchestrator.rs
@@ -33,8 +35,8 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Milestone / Feature** — plan structure. A milestone groups features; a
   worker implements one feature at a time.
 - **Validation contract** — per-plan assertions the mission must satisfy. Each
-  is a `Command` (a build/test/lint invocation) or an `AgentJudgement`
-  (re-evaluated by a validator/orchestrator). See
+  is a `Command` (a build/test/lint invocation), `AgentJudgement`
+  (a validator/orchestrator verdict), or `PtyScript` (an interactive terminal check). See
   [gates](validation/gates.md).
 - **Orchestrator** — the planning-and-judging agent role: drafts plans, proposes
   revisions, and renders final-gate verdicts. Claude uses a streaming session;
@@ -84,7 +86,7 @@ Project vocabulary. Terms link to the note that explains them in depth.
   (`<repo>/.kranz/config.json`) may not set because each names a program the
   engine runs, an endpoint it talks to outside the sandbox, a credential, or a
   containment escape: `claudeBinary`, `packDir`, `contractEnvPassthrough`,
-  `slack`, `hookStatus`, `<role>.baseUrl`, the `<role>.sandbox.*` widening
+  `slack`, `hookStatus`, `<role>.baseUrl`, `<role>.acpProfile`, the `<role>.sandbox.*` widening
   keys, and the `dangerouslyAllowAll` family. They are settable from the global
   layer only. A repository may RAISE `sandbox.enforce`, never lower it.
   Runtime `config-change` patches carry the same split by source: the
@@ -94,9 +96,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
   branch is unmerged, and **Landed** once merged.
 - **Drain** — running the per-repo execution queue (`kranz work`); serialized
   per repo.
-- **Gate** — a deterministic pass/fail check: the full-workspace
-  test/clippy/fmt suite, the merge pre-gate, the empty-deliverable net, and the
-  secret scan. See [gates](validation/gates.md).
+- **Gate** — a typed check that can be deterministic or model-judged. The
+  existing `Gate` interface reports pass/fail; the external protocol separates
+  evaluation, engine disposition and operator consent. See
+  [gates](validation/gates.md).
 - **Empty-deliverable net** — a mission with zero non-meta feature commits vs
   its pinned `base_sha` FAILs rather than falsely Completing.
 - **Anti-vacuity** — the contract rule that a filtered test run matching zero
@@ -107,6 +110,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **Backend** — the dispatch target a role runs on: `claude`, `codex`, `droid`,
   `kimi`, `cursor`, an OpenAI-compatible `local` endpoint, or a worker-only
   `acp` agent executable. Selection and sandbox support are validated per role.
+- **ACP worker profile** — operator-selected `worker.acpProfile` fixing a
+  qualified adapter/image, private file credential, startup policy and configured
+  egress. It requires contained worktree workers; generic ACP enforcement remains
+  refused. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
 - **Mutation authority** — a validated, nonempty token required by the server's
   mutation-capable constructors. Convenience routers mint an undisclosed token,
   so reads work and unauthenticated mutations are refused.
@@ -117,3 +124,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   fix-cycle is counted when a validation round emits repair features; a
   fix-feature is a feature created to resolve a finding. Waiving findings
   does not consume a repair round.
+
+- **One-call permission** — a short-lived ACP request bound to one action, offered
+  options, peer/session/run, workspace and approved plan/policy. Its durable
+  resolution precedes the response; delivery and tool outcome remain separate.
+  It never becomes a mission-wide command grant. See
+  [live consent](../acp-live-permissions.md).

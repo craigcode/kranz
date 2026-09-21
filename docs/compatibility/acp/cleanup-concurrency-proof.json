@@ -1,0 +1,298 @@
+{
+  "schemaVersion": 1,
+  "proof": "synthetic-acp-concurrent-cleanup",
+  "dateUtc": "2026-09-19",
+  "baseCommit": "3650df93c32d0c28ebcb0bdcf3284ab97c965e60",
+  "sourceSha256": {
+    "crates/engine/src/acp_container.rs": "65569b588c552bfa3231238d4d49a1688b815dd7d7cf684226ce5117adb03391",
+    "crates/engine/src/acp_container/tests.rs": "5a8b6fb0b26706f7e38a95ecaf5775fff2986520e61fe1fb0501e0a38fba7e87",
+    "crates/engine/src/backend_acp.rs": "b82403f1ccb6ec375edfd1379d10a52a0889ac39073b13dcc0c4c461d1cec1c4",
+    "crates/engine/src/container_egress.rs": "a3d2805517d5e9c196e0aef926db96556baf24079678fc7529ce12426b57c31f",
+    "scripts/check-acp-probe.py": "f52d1b409d5a360ee83e44c9f261c8e3a5e8a1b4defb5762797b29bf2b88dd57"
+  },
+  "platform": "macOS arm64 with Colima Linux Docker daemon",
+  "image": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+  "harness": "scripts/check-acp-probe.py",
+  "maxConcurrentInvocations": 4,
+  "sessionsPerCompletedInvocation": {
+    "native": 3,
+    "contained": 3
+  },
+  "vendorAdaptersStarted": 0,
+  "providerCalls": 0,
+  "keychainAccess": false,
+  "productionAdmissionEnabled": false,
+  "fullContainmentCertification": false,
+  "batches": [
+    {
+      "stage": "diagnostics-only",
+      "invocations": 8,
+      "failures": 1,
+      "failureClass": "network disappeared between inventory and inspection",
+      "privateResultSha256": "191d73d9b51c388abf5c348924979f5ad8875f8201ea72e6d1b1722142adb9cf",
+      "runs": [
+        {
+          "run": 0,
+          "exit": 0,
+          "seconds": 8.33
+        },
+        {
+          "run": 1,
+          "exit": 0,
+          "seconds": 8.39
+        },
+        {
+          "run": 2,
+          "exit": 0,
+          "seconds": 8.01
+        },
+        {
+          "run": 3,
+          "exit": 0,
+          "seconds": 8.25
+        },
+        {
+          "run": 4,
+          "exit": 1,
+          "seconds": 4.67
+        },
+        {
+          "run": 5,
+          "exit": 0,
+          "seconds": 7.24
+        },
+        {
+          "run": 6,
+          "exit": 0,
+          "seconds": 7.47
+        },
+        {
+          "run": 7,
+          "exit": 0,
+          "seconds": 7.04
+        }
+      ]
+    },
+    {
+      "stage": "network-recovery-fix",
+      "invocations": 12,
+      "failures": 0,
+      "failureClass": null,
+      "privateResultSha256": "6ea3a402a4437512f23e16776b16f87724e1b1d472921739558de43ac4c756e5",
+      "runs": [
+        {
+          "run": 0,
+          "exit": 0,
+          "seconds": 8.15
+        },
+        {
+          "run": 1,
+          "exit": 0,
+          "seconds": 8.34
+        },
+        {
+          "run": 2,
+          "exit": 0,
+          "seconds": 8.04
+        },
+        {
+          "run": 3,
+          "exit": 0,
+          "seconds": 8.09
+        },
+        {
+          "run": 4,
+          "exit": 0,
+          "seconds": 7.3
+        },
+        {
+          "run": 5,
+          "exit": 0,
+          "seconds": 7.6
+        },
+        {
+          "run": 6,
+          "exit": 0,
+          "seconds": 7.55
+        },
+        {
+          "run": 7,
+          "exit": 0,
+          "seconds": 7.37
+        },
+        {
+          "run": 8,
+          "exit": 0,
+          "seconds": 7.25
+        },
+        {
+          "run": 9,
+          "exit": 0,
+          "seconds": 7.52
+        },
+        {
+          "run": 10,
+          "exit": 0,
+          "seconds": 7.57
+        },
+        {
+          "run": 11,
+          "exit": 0,
+          "seconds": 7.71
+        }
+      ]
+    },
+    {
+      "stage": "network-fix-overlapping-workspace-gates",
+      "invocations": 4,
+      "failures": 4,
+      "failureClass": "container removal unconfirmed or already in progress",
+      "privateResultSha256": "2c6ef2d602530c187a2b027a089696b2ca78dec6a568e56bc9caee93c68acc0f",
+      "runs": [
+        {
+          "run": 0,
+          "exit": 1,
+          "seconds": 10.45
+        },
+        {
+          "run": 1,
+          "exit": 1,
+          "seconds": 10.87
+        },
+        {
+          "run": 2,
+          "exit": 1,
+          "seconds": 11.1
+        },
+        {
+          "run": 3,
+          "exit": 1,
+          "seconds": 11.3
+        }
+      ]
+    },
+    {
+      "stage": "both-fixes-overlapping-workspace-gates",
+      "invocations": 12,
+      "failures": 1,
+      "failureClass": "90-second mount preflight timeout before ACP initialization",
+      "privateResultSha256": "d820e8c90b5450461143cf742cac8b5786b4e67efb48bb1d3b768176e1ab2f74",
+      "runs": [
+        {
+          "run": 0,
+          "exit": 0,
+          "seconds": 10.5
+        },
+        {
+          "run": 1,
+          "exit": 0,
+          "seconds": 10.24
+        },
+        {
+          "run": 2,
+          "exit": 0,
+          "seconds": 10.01
+        },
+        {
+          "run": 3,
+          "exit": 0,
+          "seconds": 10.27
+        },
+        {
+          "run": 4,
+          "exit": 0,
+          "seconds": 7.97
+        },
+        {
+          "run": 5,
+          "exit": 0,
+          "seconds": 7.58
+        },
+        {
+          "run": 6,
+          "exit": 0,
+          "seconds": 8.12
+        },
+        {
+          "run": 7,
+          "exit": 0,
+          "seconds": 7.82
+        },
+        {
+          "run": 8,
+          "exit": 1,
+          "seconds": 90.9
+        },
+        {
+          "run": 9,
+          "exit": 0,
+          "seconds": 10.06
+        },
+        {
+          "run": 10,
+          "exit": 0,
+          "seconds": 9.85
+        },
+        {
+          "run": 11,
+          "exit": 0,
+          "seconds": 9.76
+        }
+      ]
+    }
+  ],
+  "mountPreflightFailure": {
+    "run": 8,
+    "elapsedSeconds": 90.9,
+    "acpEvents": 0,
+    "helperRemainedAfterTimeout": true,
+    "manualRemovalByInspectedIdSucceeded": true,
+    "absenceConfirmedBySubsequentInspect": true,
+    "followUpTicket": "container-mount-proof-owned-cleanup"
+  },
+  "limitations": [
+    "The historical cleanup failure had no stage diagnostic; these reproductions cannot prove its exact cause.",
+    "The final concurrent batch failed mount preflight and is not a qualification pass.",
+    "Synthetic concurrency checks do not certify a vendor runtime or Linux host."
+  ],
+  "finalValidation": {
+    "workspaceTests": {
+      "passed": 3029,
+      "failed": 0,
+      "ignored": 10,
+      "dockerProofsEnabled": true
+    },
+    "gates": [
+      {
+        "gate": "build-probe",
+        "exit": 0,
+        "seconds": 12.24
+      },
+      {
+        "gate": "workspace-tests",
+        "exit": 0,
+        "seconds": 283.87
+      },
+      {
+        "gate": "clippy",
+        "exit": 0,
+        "seconds": 13.6
+      },
+      {
+        "gate": "format",
+        "exit": 0,
+        "seconds": 1.11
+      },
+      {
+        "gate": "build",
+        "exit": 0,
+        "seconds": 13.88
+      }
+    ],
+    "finalDaemonInventory": {
+      "containers": 0,
+      "kranzEgressNetworks": 0,
+      "kranzEgressVolumes": 0
+    }
+  }
+}

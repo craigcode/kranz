@@ -42,7 +42,7 @@ use kranz_engine::event_log::{EventLog, LockForce};
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::git_ops::KranzCommitMetadata;
 use kranz_engine::merge::{
-    merge_mission_with_standards_evidence, MergeReport, StandardsMergeEvidence,
+    merge_mission_with_external_evidence, MergeReport, StandardsMergeEvidence,
 };
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
@@ -552,7 +552,10 @@ impl MissionHost {
     pub async fn approve(&self, id: &str, plan: Plan) -> Result<String, ApiError> {
         let cell = self.planning_cell_or_attach(id).await?;
         let mut engine = try_lock(&cell)?;
-        engine.approve_plan(plan)?;
+        engine.approve_plan_as(
+            plan,
+            kranz_engine::live_permission::Actor::LocalMutationCapability,
+        )?;
         self.set_pending_plan(id, None);
         Ok(engine.state().mission.mission_branch.clone())
     }
@@ -801,7 +804,7 @@ impl MissionHost {
         // runtime) error loudly at resolve rather than running unsandboxed
         // (13th-pass review, P1).
         let gate_policy = kranz_engine::command_exec::MergeGatePolicy {
-            sandbox: state.config.worker.sandbox.clone(),
+            sandbox: kranz_engine::command_exec::worker_gate_sandbox(&state.config)?,
             mission_dir: paths.mission_dir(),
         };
         // A container-provider mission whose host has NO container runtime
@@ -813,9 +816,10 @@ impl MissionHost {
         if let Some(note) = gate_policy.degradation_note() {
             tracing::warn!(mission = %id, note = %note, "merge gate sandbox cannot wrap; gates fail closed");
         }
+        let merge_paths = paths.clone();
         let report = tokio::task::spawn_blocking(move || {
             let repo = GitRepo::open(&repo_root)?;
-            let report = merge_mission_with_standards_evidence(
+            let report = merge_mission_with_external_evidence(
                 &repo,
                 &base_branch,
                 &base_sha,
@@ -834,6 +838,8 @@ impl MissionHost {
                         gate_executor(cmd, cwd)
                     }
                 },
+                &merge_paths,
+                kranz_engine::live_permission::Actor::LocalMutationCapability,
             );
             // Explicit: the repo-busy hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.
@@ -1279,7 +1285,10 @@ impl MissionHost {
                 parked: plan_identity(plan),
             });
         }
-        engine.approve_plan(plan.clone())?;
+        engine.approve_plan_as(
+            plan.clone(),
+            kranz_engine::live_permission::Actor::LocalMutationCapability,
+        )?;
         parked.take();
         Ok(PendingApproval::Approved(
             engine.state().mission.mission_branch.clone(),

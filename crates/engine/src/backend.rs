@@ -124,6 +124,17 @@ pub struct SessionSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum AgentEvent {
+    /// A live one-call request. It cannot be answered through a user message.
+    PermissionRequested {
+        proposal: Box<crate::live_permission::Proposal>,
+        raw: serde_json::Value,
+    },
+    /// Transport receipt, distinct from the tool's eventual effect.
+    PermissionResponded {
+        request_id: String,
+        delivery: crate::live_permission::Delivery,
+        raw: serde_json::Value,
+    },
     /// First message of a session (`type: "system", subtype: "init"`).
     Init {
         session_id: String,
@@ -184,6 +195,11 @@ pub enum SessionExit {
 /// `exit_status`.
 #[async_trait::async_trait]
 pub trait AgentSession: Send {
+    /// A bounded response handle, independent of the output pump borrow.
+    fn permission_responder(&self) -> Option<crate::live_permission::PermissionResponder> {
+        None
+    }
+
     /// The session id actually in use (== spec.session_id unless resumed).
     fn session_id(&self) -> String;
 

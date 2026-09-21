@@ -63,7 +63,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 use crate::sandbox::SandboxInputs;
 
@@ -212,8 +211,8 @@ pub fn host_mount_contract_proof(runtime: ContainerRuntime) -> MountProof {
 /// Guest path the bind-mount proof mounts its probe directory at.
 pub const MOUNT_PROOF_GUEST_DIR: &str = "/kranz-mount-proof";
 
-/// How long one probe container may take before the proof gives up.
-const MOUNT_PROOF_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod mount_proof;
 
 /// Whether this host's runtime actually shares a bind-mounted directory with
 /// the container, as opposed to accepting the `-v` flag and sharing nothing.
@@ -243,29 +242,29 @@ pub enum MountProof {
 /// The probe argv: mount `host_dir` rw, read the host's sentinel from inside,
 /// and write the guest's sentinel back out. One container run proves both
 /// directions, because a mount can be visible one way and stale the other.
+/// This renders the sentinel command; use [`prove_bind_mount`] for owned,
+/// bounded execution and confirmed daemon cleanup.
 pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> Vec<String> {
     vec![
         "run".to_string(),
         "--rm".to_string(),
         "-v".to_string(),
-        format!(
-            "{}:{MOUNT_PROOF_GUEST_DIR}",
-            container_host_path(host_dir)
-        ),
+        format!("{}:{MOUNT_PROOF_GUEST_DIR}", container_host_path(host_dir)),
         image.to_string(),
         "sh".to_string(),
         "-c".to_string(),
-        // Exit non-zero ONLY when the runtime itself fails. A missing
-        // sentinel is a finding to report on stdout, not a shell error: if
-        // `cat` decides the exit code, an unshared mount and a dead daemon
-        // become the same failure, and only one of them has a remedy the
-        // operator can act on.
-        format!(
-            "if [ -r {MOUNT_PROOF_GUEST_DIR}/host.txt ]; then cat {MOUNT_PROOF_GUEST_DIR}/host.txt; \
+        mount_proof_script(guest_sentinel),
+    ]
+}
+
+fn mount_proof_script(guest_sentinel: &str) -> String {
+    // A missing sentinel is a finding, not a shell error: distinguish an
+    // unshared mount from a failed daemon so the operator gets the right remedy.
+    format!(
+        "if [ -r {MOUNT_PROOF_GUEST_DIR}/host.txt ]; then cat {MOUNT_PROOF_GUEST_DIR}/host.txt; \
              else printf %s no-host-sentinel; fi; \
              printf %s {guest_sentinel} > {MOUNT_PROOF_GUEST_DIR}/guest.txt 2>/dev/null || true"
-        ),
-    ]
+    )
 }
 
 /// Run the round trip under `host_dir` and report whether the mount is real.
@@ -275,86 +274,22 @@ pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> V
 /// a probe under `$HOME` passes while the same probe under `TMPDIR` shares
 /// nothing, so proving the wrong path proves nothing.
 pub fn prove_bind_mount(runtime: ContainerRuntime, host_dir: &Path, image: &str) -> MountProof {
-    let probe = host_dir.join(format!(
-        "kranz-mount-proof-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    if let Err(error) = std::fs::create_dir_all(&probe) {
-        return MountProof::Failed(format!(
-            "could not create the mount probe directory {}: {error}",
-            probe.display()
-        ));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if runtime == ContainerRuntime::Docker {
+        return mount_proof::prove(host_dir, image);
     }
-    let host_sentinel = uuid::Uuid::new_v4().simple().to_string();
-    let guest_sentinel = uuid::Uuid::new_v4().simple().to_string();
-    let proof = run_mount_proof(
-        runtime,
-        host_dir,
-        &probe,
-        image,
-        &host_sentinel,
-        &guest_sentinel,
-    );
-    let _ = std::fs::remove_dir_all(&probe);
-    proof
-}
-
-fn run_mount_proof(
-    runtime: ContainerRuntime,
-    host_dir: &Path,
-    probe: &Path,
-    image: &str,
-    host_sentinel: &str,
-    guest_sentinel: &str,
-) -> MountProof {
-    if let Err(error) = std::fs::write(probe.join("host.txt"), host_sentinel) {
-        return MountProof::Failed(format!(
-            "could not write the host sentinel in {}: {error}",
-            probe.display()
-        ));
-    }
-    let argv = mount_proof_argv(probe, image, guest_sentinel);
-    let Some(output) = crate::command_exec::run_with_timeout(
-        Path::new(runtime.binary()),
-        &argv,
-        MOUNT_PROOF_TIMEOUT,
-    ) else {
-        return MountProof::Failed(format!(
-            "the {} mount proof did not finish within {}s: {}",
-            runtime.binary(),
-            MOUNT_PROOF_TIMEOUT.as_secs(),
-            argv.join(" ")
-        ));
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() {
-        return MountProof::Failed(format!(
-            "the {} mount proof exited {:?}: {}",
-            runtime.binary(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    if stdout != host_sentinel {
-        return MountProof::Failed(unshared_path_reason(
-            runtime,
-            host_dir,
-            "the host sentinel was not visible inside the container",
-        ));
-    }
-    match std::fs::read_to_string(probe.join("guest.txt")) {
-        Ok(written) if written.trim() == guest_sentinel => MountProof::Proven,
-        Ok(_) | Err(_) => MountProof::Failed(unshared_path_reason(
-            runtime,
-            host_dir,
-            "the container's write did not reach the host",
-        )),
-    }
+    MountProof::Failed(format!(
+        "{} bind-mount proof refused before spawn: owned helper cleanup is supported only \
+         with Docker on Linux/macOS (path {}, image {image})",
+        runtime.binary(),
+        host_dir.display()
+    ))
 }
 
 /// The message an operator can act on. Naming the path matters more than
 /// naming the runtime, because the fix is almost always to share that path
 /// or to move the mission's scratch under one the runtime already shares.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn unshared_path_reason(runtime: ContainerRuntime, host_dir: &Path, symptom: &str) -> String {
     let mut reason = format!(
         "{} accepted a bind mount of {} and shared nothing: {symptom}. \

@@ -1,0 +1,58 @@
+{
+  "repository": "agentclientprotocol/codex-acp",
+  "tag": "v1.11.0",
+  "commit": "51d6247ac7448485bfcf534b813196fafc26df59",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "b6f7935f0656551ad17ffd7132f196b18832e562699121bb336c1b42aadb64dc",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/README.md"
+    },
+    {
+      "path": "package.json",
+      "sha256": "1ba98cab096e9eadd91638a81c0ad966b9857e874ad443edb90471ebfa2f7ede",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/package.json"
+    },
+    {
+      "path": "src/CodexAcpServer.ts",
+      "sha256": "e4bae51f8e35cdccef227719719c4f857b295c3b120b970adcf4f78be7168b2d",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts"
+    },
+    {
+      "path": "src/CodexCli.ts",
+      "sha256": "7eb720413f4207b6e805a8acbfd16d4012efccb94fdf32e6bf984594d1778247",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexCli.ts"
+    },
+    {
+      "path": "src/CodexAuthMethod.ts",
+      "sha256": "1ccba2fd911f3af01d1e66da7a9b572e22785503439894822dc34e6511a67035",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAuthMethod.ts"
+    },
+    {
+      "path": "src/ModelConfigOption.ts",
+      "sha256": "bbc6e350be537be036390950a940c3c17b021e3757061a071f01484220b6862b",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/src/ModelConfigOption.ts"
+    },
+    {
+      "path": "docs/permission-extension.md",
+      "sha256": "71242f7309414e4ac36dd12c352ccf1afb2437bdbc0f3ddef4ec4189446195b7",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/docs/permission-extension.md"
+    },
+    {
+      "path": "package-lock.json",
+      "sha256": "ef7a28b18ecec377058926838c4637231ba6e3d7b1e8463d66a5acacd609d69d",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/codex-acp/51d6247ac7448485bfcf534b813196fafc26df59/package-lock.json"
+    }
+  ],
+  "proof": "Read-only released source inspection; no runtime/auth/model execution.",
+  "package": "@agentclientprotocol/codex-acp",
+  "version": "1.11.0",
+  "registryIntegrity": "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ==",
+  "underlyingRuntime": {
+    "package": "@openai/codex",
+    "version": "0.153.4"
+  },
+  "liveProof": true,
+  "liveReceipt": "codex-acp-native-login.jsonl",
+  "liveProofScope": "macOS arm64 existing auth.json login; one no-tools text/report turn. Not containment or ordinary mission credential provisioning."
+}

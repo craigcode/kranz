@@ -35,14 +35,15 @@
 //! - anything else → [`Action::Ignore`].
 
 use crate::format::{
-    ANSWER_QUESTION_ACTION_ID, APPROVE_ACTION_ID, APPROVE_GRANT_ACTION_ID,
-    APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION, CONFIG_BACKEND_BLOCK, CONFIG_CALLBACK_ID,
-    CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK, CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK,
-    CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK, CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK,
-    DENY_GRANT_ACTION_ID, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
-    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
-    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK,
-    QUEUE_TICKET_ACTION_ID, REJECT_REVISION_ACTION_ID, START_ACTION_ID,
+    ALLOW_PERMISSION_ACTION_ID, ANSWER_QUESTION_ACTION_ID, APPROVE_ACTION_ID,
+    APPROVE_GRANT_ACTION_ID, APPROVE_REVISION_ACTION_ID, CONFIG_BACKEND_ACTION,
+    CONFIG_BACKEND_BLOCK, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
+    CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
+    CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, DENY_GRANT_ACTION_ID, DENY_PERMISSION_ACTION_ID,
+    MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
+    NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK,
+    NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID,
+    REJECT_REVISION_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -314,6 +315,14 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
+    ResolvePermission {
+        mission_id: String,
+        request_id: String,
+        binding_digest: String,
+        allow: bool,
+        user_id: Option<String>,
+        response_url: Option<String>,
+    },
     /// Answer an open structured question from an option button (ticket
     /// `structured-human-question-events`). The option INDEX is validated
     /// against the parked question at enqueue (same stale-decision
@@ -438,6 +447,8 @@ fn route_interactive(payload: &Value) -> Action {
         ApproveGrant,
         DenyGrant,
         AnswerQuestion,
+        AllowPermission,
+        DenyPermission,
     }
     for action in actions {
         let kind = match action.get("action_id").and_then(Value::as_str) {
@@ -450,6 +461,8 @@ fn route_interactive(payload: &Value) -> Action {
             Some(id) if id == APPROVE_GRANT_ACTION_ID => ButtonKind::ApproveGrant,
             Some(id) if id == DENY_GRANT_ACTION_ID => ButtonKind::DenyGrant,
             Some(id) if id == ANSWER_QUESTION_ACTION_ID => ButtonKind::AnswerQuestion,
+            Some(id) if id == ALLOW_PERMISSION_ACTION_ID => ButtonKind::AllowPermission,
+            Some(id) if id == DENY_PERMISSION_ACTION_ID => ButtonKind::DenyPermission,
             _ => continue,
         };
         // The mission id or ticket slug rides in the button `value`.
@@ -470,6 +483,24 @@ fn route_interactive(payload: &Value) -> Action {
                     .map(str::to_string);
                 let value = value.to_string();
                 return match kind {
+                    ButtonKind::AllowPermission | ButtonKind::DenyPermission => {
+                        let parts: Vec<_> = value.split(':').collect();
+                        if parts.len() != 3
+                            || parts.iter().any(|part| part.is_empty())
+                            || parts[2].len() != 64
+                            || !parts[2].bytes().all(|b| b.is_ascii_hexdigit())
+                        {
+                            return Action::Ignore;
+                        }
+                        Action::ResolvePermission {
+                            mission_id: parts[0].into(),
+                            request_id: parts[1].into(),
+                            binding_digest: parts[2].into(),
+                            allow: matches!(kind, ButtonKind::AllowPermission),
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::ApproveRevision => {
                         let Some((mission_id, revision)) = parse_revision_button_value(&value)
                         else {
@@ -1463,6 +1494,40 @@ fn strip_ci_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn live_permission_buttons_bind_exactly_and_attribute_the_verified_clicker() {
+        let binding = "a".repeat(64);
+        for (action_id, allow) in [
+            (ALLOW_PERMISSION_ACTION_ID, true),
+            (DENY_PERMISSION_ACTION_ID, false),
+        ] {
+            let mut envelope = json!({"type":"interactive","envelope_id":"e-1","payload":{
+            "type":"block_actions","user":{"id":"U-real"},"actions":[{
+                "action_id":action_id,"value":format!("m-1:permission-1:{binding}"),"userId":"U-forged"
+            }]}});
+            assert_eq!(
+                route(&envelope, &lookup_none()).action,
+                Action::ResolvePermission {
+                    mission_id: "m-1".into(),
+                    request_id: "permission-1".into(),
+                    binding_digest: binding.clone(),
+                    allow,
+                    user_id: Some("U-real".into()),
+                    response_url: None,
+                }
+            );
+            for invalid in [
+                "m-1:permission-1",
+                "m-1:permission-1:short",
+                "::",
+                "m-1:permission-1:binding:extra",
+            ] {
+                envelope["payload"]["actions"][0]["value"] = json!(invalid);
+                assert_eq!(route(&envelope, &lookup_none()).action, Action::Ignore);
+            }
+        }
+    }
 
     /// A lookup that knows exactly one thread→mission mapping.
     fn lookup_one(thread: &'static str, mission: &'static str) -> impl ThreadLookup {

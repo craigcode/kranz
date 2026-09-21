@@ -135,6 +135,9 @@
 //! through the real wrap and asserts a green exit, reporting the
 //! skip-under-wrap marker count.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod evaluator_io;
+
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -829,6 +832,24 @@ pub(crate) fn resolve_gate_sandbox(
     )
 }
 
+/// Engine-run checks never receive a profile's provider network access or
+/// credential home. Keep the qualified image and filesystem boundary, with
+/// `--network none`; unprofiled configurations retain their existing policy.
+pub fn worker_gate_sandbox(
+    config: &crate::types::MissionConfig,
+) -> crate::error::Result<crate::types::SandboxConfig> {
+    let mut sandbox = config.worker.sandbox.clone();
+    if let Some(profile) = &config.worker.acp_profile {
+        profile.validate_config(
+            crate::types::Role::Worker,
+            &config.worker,
+            config.worker_isolation,
+        )?;
+        sandbox.egress.clear();
+    }
+    Ok(sandbox)
+}
+
 /// The gate-shaped [`crate::sandbox::SandboxInputs`], shared by every
 /// enforced provider arm: the gate cwd fills the session profile's
 /// `session_cwd` slot so the writable-root computation is REUSED, never
@@ -1110,7 +1131,7 @@ pub(crate) async fn run_shell_command_sandboxed(
 /// [`run_shell_command_sandboxed`] with an explicit timeout and the real
 /// exit code (the [`run_shell_command_with_code`] shape), so the merge-gate
 /// runner and tests can drive the same path.
-async fn run_shell_command_sandboxed_with_code(
+pub(crate) async fn run_shell_command_sandboxed_with_code(
     cwd: &std::path::Path,
     command: &str,
     timeout: Duration,
@@ -1281,7 +1302,7 @@ impl Drop for ControlChild {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn control_leader_exited(pid: u32) -> std::io::Result<()> {
+pub(crate) async fn control_leader_exited(pid: u32) -> std::io::Result<()> {
     loop {
         let exited = {
             // SAFETY: zeroed siginfo_t is a valid output buffer. WNOWAIT
@@ -1363,26 +1384,40 @@ async fn run_control_command_bounded(
         // remains safe to target directly; do not wait indefinitely for it.
         let _ = child.0.start_kill();
     }
-    let status = child.0.wait().await;
     if let Err(error) = result {
+        let _ = child.0.wait().await;
         return (None, error);
     }
-    let status = match status {
+    let drained = match output {
+        Some(output) => Ok(output),
+        None => {
+            // Keep the owned zombie until pipe EOF. A descendant already in
+            // fork when SIGKILL was sent can appear after the first group
+            // signal; repeat while draining without ever signalling a reaped
+            // (and therefore reusable) leader PID.
+            let drain = async {
+                loop {
+                    tokio::select! {
+                        result = &mut capture => break result.map_err(|error| format!("control output failed: {error}")),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            crate::backend_claude::kill_unreaped_group(&child.0);
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap_or_else(|_| Err("control output remained open after group cleanup".into()))
+        }
+    };
+    crate::backend_claude::kill_unreaped_group(&child.0);
+    let status = match child.0.wait().await {
         Ok(status) => status,
         Err(error) => return (None, format!("control reap failed: {error}")),
     };
-    let (stdout, stderr) = match output {
-        Some(output) => output,
-        None => match tokio::time::timeout(Duration::from_secs(1), &mut capture).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => return (None, format!("control output failed: {error}")),
-            Err(_) => {
-                return (
-                    None,
-                    "control output remained open after group cleanup".into(),
-                )
-            }
-        },
+    let (stdout, stderr) = match drained {
+        Ok(output) => output,
+        Err(error) => return (None, error),
     };
     let mut combined = stdout;
     if !stderr.trim().is_empty() {
@@ -1569,6 +1604,14 @@ where
 /// `worker.sandbox.enforce` is not `off`, the server routes to
 /// [`run_bounded_gate_command_sandboxed`] instead.
 pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, String) {
+    let (code, output) = run_bounded_gate_command_with_code(cwd, command);
+    (code == Some(0), output)
+}
+
+fn run_bounded_gate_command_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+) -> (Option<i32>, String) {
     // cache_only_cargo_home creates a fresh unpredictable dir under the
     // given base; the system temp dir keeps it out of the gated worktree
     // (an untracked `.cargo-cache-only-*` at the root would dirty every
@@ -1578,7 +1621,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
     let cargo_home = crate::agent_env::cache_only_cargo_home(std::env::temp_dir().as_path());
     if !cargo_home.is_dir() {
         return (
-            false,
+            None,
             format!(
                 "could not create the gate's cache-only Cargo home at {}",
                 cargo_home.display()
@@ -1592,7 +1635,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => return (false, format!("failed to create gate runtime: {error}")),
+        Err(error) => return (None, format!("failed to create gate runtime: {error}")),
     };
     let (code, output) = runtime.block_on(run_shell_command_with_timeout_env(
         cwd,
@@ -1602,7 +1645,7 @@ pub fn run_bounded_gate_command(cwd: &std::path::Path, command: &str) -> (bool, 
         true,
     ));
     let _ = std::fs::remove_dir_all(&cargo_home);
-    (code == Some(0), output)
+    (code, output)
 }
 
 /// What the merge-gate path needs to wrap its gates (ticket
@@ -1727,8 +1770,7 @@ pub(crate) fn run_bounded_gate_command_sandboxed_with_code(
     policy: &MergeGatePolicy,
 ) -> (Option<i32>, String) {
     if !policy.enforces_on_this_host() {
-        let (ok, output) = run_bounded_gate_command(cwd, command);
-        return (Some(i32::from(!ok)), output);
+        return run_bounded_gate_command_with_code(cwd, command);
     }
     let scratch =
         std::env::temp_dir().join(format!("kranz-gate-{}", uuid::Uuid::new_v4().simple()));
@@ -2153,7 +2195,7 @@ esac
                     assert_eq!(
                         code,
                         Some(if mode == "nonzero" { 7 } else { 0 }),
-                        "{output}"
+                        "{mode}: {output}"
                     );
                     assert!(output.contains("control-stdout"), "{output}");
                     assert!(output.contains("control-stderr"), "{output}");

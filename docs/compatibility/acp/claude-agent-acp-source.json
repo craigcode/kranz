@@ -1,0 +1,53 @@
+{
+  "repository": "agentclientprotocol/claude-agent-acp",
+  "tag": "v0.77.0",
+  "commit": "dfe823b9581979cd22db40272d4469cc7e42b77e",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "90be6e06919d7bf620d37afc6144319d7f9bed24e0719802da11ced8910fb492",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/README.md"
+    },
+    {
+      "path": "package.json",
+      "sha256": "ce5328cc14804202774668805790b1c395414a5bbe5ec2f54861e597f4cadcb9",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/package.json"
+    },
+    {
+      "path": "src/acp-agent.ts",
+      "sha256": "ca9108ad699a3f580ffd88cd2d2751dd84e90c3fdc508defddd54cf7ec8e623e",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/src/acp-agent.ts"
+    },
+    {
+      "path": "src/session-model.ts",
+      "sha256": "72954e91842918dc1036aeb4e290d9a45a94778d0a358aea3de6c2a6d8b01b94",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/src/session-model.ts"
+    },
+    {
+      "path": "src/auth-status.ts",
+      "sha256": "f85d7ccb8c659db2a38829a4399df2df6c75d6bc4df6c8edffb45e149788a3c5",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/src/auth-status.ts"
+    },
+    {
+      "path": "src/permissions/response.ts",
+      "sha256": "58822e8a4f995ba57ae482a7292561eef96eab96ef353555c1ad30e12f98617f",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/src/permissions/response.ts"
+    },
+    {
+      "path": "docs/permission-extension.md",
+      "sha256": "72076f6d9a5d90056f5aa91de991d8496b2156379d02a15a84eeb2c58ea53e12",
+      "url": "https://raw.githubusercontent.com/agentclientprotocol/claude-agent-acp/dfe823b9581979cd22db40272d4469cc7e42b77e/docs/permission-extension.md"
+    }
+  ],
+  "proof": "The file hashes above record read-only released source inspection. Separate runtime/auth/model evidence is linked by liveReceipt below.",
+  "package": "@agentclientprotocol/claude-agent-acp",
+  "version": "0.77.0",
+  "registryIntegrity": "sha512-m8mhsAOc5+m/QZNsKCrfyIRv4KQrCLqSYHZP/aUvL3X0Xn0f9n4wKKNpOpOv0Kblh/2Mkpd4SW0KypN1dZkJfg==",
+  "underlyingRuntime": {
+    "package": "@anthropic-ai/claude-agent-sdk",
+    "version": "0.3.270"
+  },
+  "liveProof": true,
+  "liveReceipt": "claude-agent-acp-native-login.jsonl",
+  "liveProofScope": "macOS arm64 existing CLI login with explicit Keychain consent; one no-tools text/report turn. Not containment or ordinary mission credential provisioning."
+}

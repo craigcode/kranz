@@ -1234,6 +1234,7 @@ pub(crate) fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::Revise { .. }
         | Action::ApproveRevision { .. }
         | Action::RejectRevision { .. }
+        | Action::ResolvePermission { .. }
         | Action::ApproveGrant { .. }
         | Action::DenyGrant { .. }
         | Action::AnswerQuestion { .. }
@@ -2325,6 +2326,70 @@ fn enqueue_revision_control(
     Ok(mission_id)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn permission_control(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+    mission_id: &str,
+    request_id: &str,
+    binding_digest: &str,
+    allow: bool,
+    user_id: Option<&str>,
+    response_url: Option<&str>,
+) {
+    if !cfg.is_authorized(user_id) || user_id.is_none() {
+        reply_ephemeral(cfg, client, response_url, &not_authorized_blocks_for(cfg)).await;
+        return;
+    }
+    let outcome = enqueue_permission_control(
+        repo_root,
+        mission_id,
+        request_id,
+        binding_digest,
+        allow,
+        user_id.expect("checked above"),
+    );
+    let message = match outcome {
+        Ok(()) => {
+            "One-call answer queued; delivery and tool outcome are recorded separately.".to_string()
+        }
+        Err(error) => format!("Could not queue one-call answer: {error}"),
+    };
+    reply_ephemeral(cfg, client, response_url, &error_blocks(&message)).await;
+}
+
+fn enqueue_permission_control(
+    repo_root: &Path,
+    mission_id: &str,
+    request_id: &str,
+    binding_digest: &str,
+    allow: bool,
+    user_id: &str,
+) -> Result<()> {
+    let mission_id = resolve_active_config_target(repo_root, Some(mission_id))?;
+    let paths = MissionPaths::new(repo_root, &mission_id);
+    let state = read_mission_state(&paths)?;
+    let record = state
+        .permissions
+        .get(request_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown live permission"))?;
+    record.validate_answer(binding_digest, allow, chrono::Utc::now())?;
+    kranz_engine::control::enqueue(
+        &paths,
+        &ControlCommand::ResolvePermission {
+            resolution: kranz_engine::live_permission::Resolution {
+                request_id: request_id.into(),
+                binding_digest: binding_digest.into(),
+                allow,
+                actor: kranz_engine::live_permission::Actor::SlackUser(user_id.into()),
+                reason: "operator answered through an authorized Slack interaction".into(),
+            },
+        },
+    )?;
+    Ok(())
+}
+
 /// Allowlist-gate a grant approve/deny button, enqueue it, and ack over the
 /// button's `response_url`. Mirrors [`revision_control`].
 #[allow(clippy::too_many_arguments)]
@@ -3052,6 +3117,149 @@ mod tests {
         };
         let line = serde_json::to_string(&event).unwrap();
         std::fs::write(paths.events_file(), format!("{line}\n")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_permission_slack_rejects_unlisted_and_missing_actors_and_queues_exact_consent() {
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::events::EventKind;
+        use kranz_engine::live_permission::{self, Actor, Binding, Proposal, Request};
+        let tmp = TempDir::new().unwrap();
+        seed_mission(tmp.path(), "m-permission", "goal");
+        append_plan_approved(tmp.path(), "m-permission", "goal");
+        let paths = MissionPaths::new(tmp.path(), "m-permission");
+        let now = chrono::Utc::now();
+        let action = json!({"kind":"execute","rawInput":{"command":"npm test"}});
+        let options = vec![json!({"kind":"allow_once","optionId":"one"})];
+        let request = Request::new(
+            Proposal {
+                id: "permission-1".into(),
+                engine_session_id: "session-1".into(),
+                peer_session_id: "peer-1".into(),
+                peer_request_id: json!(4),
+                tool_call_id: "call-1".into(),
+                action_digest: live_permission::digest(&action).unwrap(),
+                options_digest: live_permission::digest(&options).unwrap(),
+                action,
+                options,
+                observed_at: now,
+                deadline: now + chrono::Duration::seconds(300),
+                prohibition: None,
+            },
+            Binding {
+                mission_id: "m-permission".into(),
+                run_id: "run-1".into(),
+                workspace: tmp.path().display().to_string(),
+                plan_digest: live_permission::digest(&"plan").unwrap(),
+                policy_digest: live_permission::digest(&"policy").unwrap(),
+            },
+        )
+        .unwrap();
+        {
+            let mut log = EventLog::acquire(
+                &paths,
+                "m-permission",
+                std::time::Duration::ZERO,
+                LockForce::No,
+            )
+            .unwrap();
+            log.append(EventKind::WorkerSpawned {
+                backend: None,
+                run_id: "run-1".into(),
+                role: kranz_engine::types::Role::Worker,
+                feature_id: None,
+                milestone_id: None,
+                candidate: None,
+                executor_route: None,
+                sdk_session_id: "session-1".into(),
+                model: "fixture".into(),
+                quant: "n/a".into(),
+                weight_hash: None,
+                prompt_hash: "fixture".into(),
+                transcript_path: MissionPaths::transcript_rel("run-1"),
+            })
+            .unwrap();
+            log.append(EventKind::PermissionRequested {
+                request: request.clone(),
+            })
+            .unwrap();
+        }
+        let cfg = SlackConfig {
+            bot_token: "xoxb".into(),
+            app_token: "xapp".into(),
+            channel: "C1".into(),
+            notify: NotifyFlags::default(),
+            allow_users: vec!["U-allowed".into()],
+            allow_all_users: false,
+            dashboard_url: None,
+            instance_name: None,
+        };
+        let client = SlackClient::new(&cfg).unwrap();
+        for actor in [Some("U-outsider"), None] {
+            permission_control(
+                &cfg,
+                &client,
+                tmp.path(),
+                "m-permission",
+                "permission-1",
+                &request.binding_digest,
+                true,
+                actor,
+                None,
+            )
+            .await;
+            assert!(kranz_engine::control::drain(&paths).unwrap().is_empty());
+        }
+        permission_control(
+            &cfg,
+            &client,
+            tmp.path(),
+            "m-permission",
+            "permission-1",
+            "wrong-binding",
+            true,
+            Some("U-allowed"),
+            None,
+        )
+        .await;
+        assert!(kranz_engine::control::drain(&paths).unwrap().is_empty());
+        permission_control(
+            &cfg,
+            &client,
+            tmp.path(),
+            "m-permission",
+            "permission-1",
+            &request.binding_digest,
+            true,
+            Some("U-allowed"),
+            None,
+        )
+        .await;
+        let queued = kranz_engine::control::drain(&paths).unwrap();
+        assert_eq!(queued.len(), 1);
+        let ControlCommand::ResolvePermission { resolution } = &queued[0].1 else {
+            panic!("wrong command");
+        };
+        assert_eq!(resolution.actor, Actor::SlackUser("U-allowed".into()));
+        assert_eq!(resolution.binding_digest, request.binding_digest);
+        assert!(resolution.allow);
+        let blocks = crate::format::build_permission_ready(&request, None);
+        assert!(serde_json::to_string(&blocks)
+            .unwrap()
+            .contains(crate::format::ALLOW_PERMISSION_ACTION_ID));
+        let mut large = request;
+        large.proposal.action = json!({"command":"x".repeat(2500)});
+        let blocks = crate::format::build_permission_ready(&large, None);
+        let rendered = serde_json::to_string(&blocks).unwrap();
+        assert!(!rendered.contains(crate::format::ALLOW_PERMISSION_ACTION_ID));
+        assert!(rendered.contains(crate::format::DENY_PERMISSION_ACTION_ID));
+        assert!(rendered.contains("complete action"));
+        large.proposal.action = json!({"command":"npm test"});
+        large.binding.workspace = "x".repeat(1001);
+        let rendered =
+            serde_json::to_string(&crate::format::build_permission_ready(&large, None)).unwrap();
+        assert!(!rendered.contains(crate::format::ALLOW_PERMISSION_ACTION_ID));
+        assert!(rendered.contains("complete workspace"));
     }
 
     /// The Slack answer path (ticket structured-human-question-events): the

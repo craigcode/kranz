@@ -468,6 +468,11 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
         "it names a remote workspace URL and the env var holding its token",
     ),
     ConfigTrustRule::operator_only(
+        "<role>.acpProfile",
+        PatchClass::Never,
+        "it selects a qualified worker profile and the operator's credential source",
+    ),
+    ConfigTrustRule::operator_only(
         "<role>.acpCommand",
         PatchClass::Never,
         "it names the ACP agent program",
@@ -1095,6 +1100,11 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 .into(),
         ));
     }
+    if cfg.worker.acp_profile.is_some() && !cfg.worker_candidates.is_empty() {
+        return Err(EngineError::Config(
+            "qualified ACP profiles cannot be combined with workerCandidates".into(),
+        ));
+    }
     for (i, candidate) in cfg.worker_candidates.iter().enumerate() {
         let kind = parse_backend(Some(&candidate.backend)).map_err(|other| {
             EngineError::Config(format!(
@@ -1191,17 +1201,22 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 "{name}.backend must be one of None, \"claude\", \"codex\", \"droid\", \"kimi\", \"local\", \"acp\", \"cursor\", got {other:?}"
             ))
         })?;
-        // Fail closed on a silently-unenforced sandbox: only the claude
-        // backend wraps its sessions in the engine-resolved OS sandbox
-        // (fs/extraWrite/egress policy, container provider); every other
-        // backend spawns unsandboxed and discards the requested enforcement.
-        // Reject the pair at validation so a mission never runs with the
-        // operator believing workers are contained when they are not.
-        if role_cfg.sandbox.enforce != SandboxEnforce::Off && !kind.supports_sandbox_enforcement() {
+        // Native Claude honors the resolved sandbox. ACP admission is narrower:
+        // a reviewed profile owns the image, argv, credential and startup policy.
+        // Other backend/profile combinations still fail before spawn.
+        let qualified_acp = if let Some(profile) = &role_cfg.acp_profile {
+            profile.validate_config(role, role_cfg, cfg.worker_isolation)?;
+            true
+        } else {
+            false
+        };
+        if role_cfg.sandbox.enforce != SandboxEnforce::Off
+            && !kind.supports_sandbox_enforcement()
+            && !qualified_acp
+        {
             return Err(EngineError::Config(format!(
-                "{name}.backend {:?} cannot honor sandbox.enforce={:?}: only the claude backend \
-                 applies the resolved OS sandbox; run with sandbox.enforce=off to proceed \
-                 unsandboxed, or use the claude backend",
+                "{name}.backend {:?} cannot honor sandbox.enforce={:?}: use the claude backend \
+                 or a qualified ACP worker profile; sandbox.enforce=off is explicitly unsandboxed",
                 kind.as_str(),
                 role_cfg.sandbox.enforce.as_str()
             )));
@@ -1316,6 +1331,7 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 )));
             }
             match role_cfg.acp_command.as_deref() {
+                None if qualified_acp => {}
                 Some(command) if !command.trim().is_empty() => {}
                 _ => {
                     return Err(EngineError::Config(format!(

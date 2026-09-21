@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-16
+last_verified: 2026-09-20
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
@@ -18,11 +18,15 @@ verified_against:
 A strategic decision about what kranz is, made 2026-07-29. Work that
 contradicts it should be flagged against this ADR, not reconciled quietly.
 
-Rechecked 2026-09-15 (UTC) against the
+Rechecked 2026-09-20 (UTC) against the
 [ACP/gate integration scope](../../scoping/acp-worker-gate-contract.md) and
 [v1 contract](../../gate-evaluation-contract.md).
 Its consent, external-check and evidence work uses the shipped dispatch seams;
 it adds no code-generation pool, prompt optimizer or cross-feature context reuse.
+The v0.3.0 integration completes S5 stage evidence and the bounded S6/S7
+acceptance scope. Qualified profiles bind credentials and containment through
+the existing dispatch seam. Explicit platform limits, unchanged defaults and
+release gates remain; no execution-factory or prompt-optimization primitive is added.
 
 Rechecked 2026-09-16 (UTC) against the
 [review/evidence follow-ups](../../roadmap.md#scheduled-follow-up--review-efficiency-and-evidence-2026-09-16).

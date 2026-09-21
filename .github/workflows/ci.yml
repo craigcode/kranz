@@ -305,6 +305,12 @@ jobs:
                 && 'git,bwrap,container,grep'
                 || 'git' }}
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Check bounded ACP probe with a synthetic peer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --example acp_compat_probe
+          python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
       # What the run did NOT exercise. libtest captures a passing test's
       # output, and a skipping test passes, so without this ledger the skips
       # are invisible in exactly the case that matters.
@@ -370,6 +376,12 @@ jobs:
         env:
           KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Check bounded ACP probe with a synthetic peer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo build --example acp_compat_probe
+          python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
       - name: Report capabilities macOS skipped
         if: always()
         run: |
@@ -407,6 +419,110 @@ jobs:
             exit "$status"
           fi
           grep -qE 'test result: ok\. 1 passed' "$log"
+
+  # S3/S5/S6: real Docker containment and approval proof. No provider/model calls.
+  rust-linux-external-evaluator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the exact synthetic checker runtime
+        run: docker pull python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+      - name: Prove external evaluator containment and protocol failures
+        env:
+          KRANZ_GATE_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-external-evaluator-proof.log"
+          set +e
+          # These are lifecycle proofs, not a daemon throughput benchmark.
+          # Keep unrelated fixtures from competing for bounded inspection and
+          # cleanup; deliberate concurrency remains inside its own proofs.
+          cargo test --workspace gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 8 passed' "$log"
+          for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs creation_uses_evaluation_budget_and_cleans_on_interrupt; do
+            grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
+          done
+          for proof in records_real_checks_and_requires_fresh_consent refuses_base_drift_after_a_passing_checker; do
+            grep -q "test gate_subprocess_v1_approval_${proof} ... ok" "$log"
+          done
+          for proof in mission_stages_and_merge_bind_real_deliverables stage_failure_never_completes_or_consumes interrupted_stage_closes_without_replaying_effects merge_rejects_a_base_advance_after_pass revision_approval_uses_fresh_plan_consent config_cannot_remove_approved_evaluators; do
+            grep -q "test gate_subprocess_v1_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
+            exit 1
+          fi
+      - name: Prove ACP namespace lifetime and hostile I/O
+        env:
+          KRANZ_ACP_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-acp-containment-proof.log"
+          set +e
+          cargo test --workspace acp_containment_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace reaps_orphans_and_preserves_peer_exit delayed_attach_status_cannot_hide_failure input_eof_supervisor_stops_lingering_peer engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
+            grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
+          done
+          for proof in ordinary_mission_delivers_with_one_call_consent defect_requires_repair_and_fresh_consent interrupt_rejects_late_consent policy_drift_refuses_merge checker_failure_blocks_completed_worker credential_echo_fails_and_cleans_home; do
+            grep -q "test acp_worker::tests::acp_containment_v1_profile_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
+            exit 1
+          fi
+      - name: Prove mount helper ownership and interrupted cleanup
+        env:
+          KRANZ_MOUNT_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-mount-helper-proof.log"
+          set +e
+          cargo test --workspace mount_helper_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          for proof in real_round_trip_and_concurrent_helpers real_timeout_and_guest_watchdog_remove_blocked_writer real_cancellation_and_dropped_future_cleanup real_name_collision_preserves_unrelated_container real_engine_death_bounds_guest_and_retains_intent real_interrupted_creation_removes_the_daemon_object real_unavailable_inventory_fails_with_private_recovery; do
+            grep -q "test sandbox_container::mount_proof::tests::mount_helper_v1_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-MOUNT-HELPER' "$log"; then
+            exit 1
+          fi
+      - name: Check the bounded ACP probe without a provider
+        run: |
+          cargo test --workspace --example acp_compat_probe
+          cargo build --workspace --example acp_compat_probe
+          python3 scripts/check-acp-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
+      - name: Check bounded tool-use probe with contained synthetic peers
+        run: |
+          log="$RUNNER_TEMP/kranz-acp-tool-proof.log"
+          set +e
+          python3 scripts/check-acp-tool-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          exit "$status"
+      - name: Retain synthetic container proof logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: synthetic-container-proof-logs
+          path: ${{ runner.temp }}/kranz-*-proof.log
+          if-no-files-found: warn
 
   # The dogfood proving ground (ticket gate-sandbox-supervision-dogfood):
   # runs this repo's mandatory merge gate — `cargo test --workspace` — AS A

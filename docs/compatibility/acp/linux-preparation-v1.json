@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "proof": "native Linux engine preparation; synthetic peers only",
+  "sourceCommit": "e7e83aba7cdb8a194ede8344cf139449f7f8b44a",
+  "host": {
+    "platform": "linux-aarch64",
+    "kernel": "6.8.0-100-generic",
+    "os": "Ubuntu 24.04.4 LTS",
+    "virtualization": "Colima VM on macOS ARM64; engine executes directly on Linux, not inside a container"
+  },
+  "dockerServerVersion": "29.2.1",
+  "artifacts": {
+    "probeSha256": "bfed0b3ea6e1185b8f948d0b8c173aa5f4d07ca5f6e9192f865822643c8d0769",
+    "runnerSha256": "2bc08f4b2b57ff45e771b287250e9e89dabd772a76f50037938d0a031d35bb69",
+    "launcherSha256": "4b4a29b8534c20bffaff4df9928c90e7a8c9657914d2aaa543950dba9cb6d70f",
+    "selfTestSourceSha256": "33eb33c51fe609257ddf8c5b8ad7e91b718bcfdb9b3f0b7829ff080c15e2d399",
+    "privateManifestSha256": "5c87029c85516420aa75ba1676078e8ac251bfad4988a22b1010ba1c92d0b479",
+    "configSha256": {
+      "claude": "11a7dc5ecc4c75e740cb070d644fe1e941b114325536fa6e8e1e091e360c4e99",
+      "codex": "2b2d7b45ea5fbc2e78807274433c56c92785d86cd0a79c273f8495358f315937"
+    },
+    "workerImage": "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743",
+    "buildImage": "sha256:c932e0f511ff0c152807ecc8d8789849bc94f4a4fff0ebd22f2a00bfa196f4a0",
+    "cargoLockSha256": "87e50817d6f5520cb42f193bbedf95af64408aa29e1649758a1ab0e8c1076706"
+  },
+  "logs": {
+    "linuxProbeBuild": {
+      "sha256": "544c51ac227a75e1e5b532de5a59f512c0ef00face85ebd9b834de75f62e31f0",
+      "exit": 0
+    },
+    "syntheticToolCases": {
+      "sha256": "7ee3689a7d12c39479f920aa988ac316173069952f5635e1d9c1c9e6f7b6f5e1",
+      "exit": 0
+    },
+    "syntheticStartupCases": {
+      "sha256": "7a4599a2846e56d47ee6d3c6df545b459eb6924b630edc69c4cc8f7ef73f4097",
+      "exit": 0
+    },
+    "laterWorkspaceTestBuild": {
+      "sha256": "ea6590cae9d9bc8b2c129a15a3cdb2c5dddf23b03eca93373941ad8e7ba8382f",
+      "exit": 1
+    },
+    "dummyCredentialRunnerChecks": {
+      "sha256": "03b8c5f6f3c6798402c79bbf34baae1395b20edad2eaf44dd48047d9eef774df",
+      "exit": 0
+    }
+  },
+  "checks": {
+    "toolCases": 29,
+    "accepted": 5,
+    "requiredRefusals": 24,
+    "startupCases": "native and contained Claude key/OAuth/file-login, Codex key/file-login; deterministic peers only",
+    "runner": {
+      "passed": true,
+      "checks": [
+        "live batch refuses absent approval before consuming a slot",
+        "configuration hash drift refuses before consuming a slot",
+        "claude: dummy credential crosses private stdin path, synthetic shell succeeds, cleanup confirmed",
+        "claude: consumed slot refuses repeat before credential ingestion",
+        "codex: dummy credential crosses private stdin path, synthetic shell succeeds, cleanup confirmed",
+        "codex: consumed slot refuses repeat before credential ingestion"
+      ],
+      "vendorCalls": 0,
+      "realCredentialContentsRead": false
+    },
+    "hostCredentialReader": [
+      "dummy regular owner-only file accepted",
+      "permissive mode refused",
+      "symlink refused",
+      "oversize refused"
+    ],
+    "preflights": {
+      "claude": {
+        "adapterStarted": false,
+        "authenticationVerified": false,
+        "keychainAuthorized": false,
+        "receiptAvailable": true,
+        "promptLimit": 1,
+        "permissionLimit": 1,
+        "promptSeconds": 120,
+        "overallSeconds": 180,
+        "hardDollarCap": false
+      },
+      "codex": {
+        "adapterStarted": false,
+        "authenticationVerified": false,
+        "keychainAuthorized": false,
+        "receiptAvailable": true,
+        "promptLimit": 1,
+        "permissionLimit": 1,
+        "promptSeconds": 120,
+        "overallSeconds": 180,
+        "hardDollarCap": false
+      }
+    }
+  },
+  "retainedFailure": {
+    "command": "cargo test --locked --workspace --no-run",
+    "passed": false,
+    "reason": "Physical macOS disk exhausted while the VM disk grew; Linux linker and Docker metadata writes returned I/O errors",
+    "testsExecuted": false,
+    "recovery": "Removed only task compilation output and an earlier temporary vendor-binary inspection copy; restarted VM; trimmed freed blocks; artifact hashes rechecked; dummy runner checks passed after recovery",
+    "physicalHostFreeGiBAfterRecovery": 7.7,
+    "fullWorkspaceNativePassClaimed": false
+  },
+  "cleanup": {
+    "containers": 0,
+    "volumes": 0,
+    "networks": [
+      "bridge",
+      "host",
+      "none"
+    ],
+    "linuxCredentialSourcePresent": false,
+    "originalColimaState": "stopped",
+    "restoredColimaState": "stopped"
+  },
+  "liveBatch": {
+    "approved": false,
+    "attempts": 0,
+    "realCredentialContentsRead": false,
+    "providers": {
+      "claude": {
+        "adapter": "0.77.0",
+        "sdk": "0.3.270",
+        "modelSelection": "peer default; not pinned by ACP v1 probe"
+      },
+      "codex": {
+        "adapter": "1.11.0",
+        "runtime": "0.153.4",
+        "modelSelection": "peer default; not pinned by ACP v1 probe"
+      }
+    },
+    "workload": "echo kranz-acp-tool-fixture-v1 > fixture-result.txt",
+    "promptLimitPerProvider": 1,
+    "permissionLimitPerProvider": 1,
+    "promptSeconds": 120,
+    "sessionSeconds": 180,
+    "outerSeconds": 240,
+    "transportSeconds": 300,
+    "retries": 0,
+    "hardDollarCap": false,
+    "keychain": false,
+    "credentialScope": "On new approval only: existing explicit Claude OAuth token and private Codex login copy, transmitted over local SSH stdin; temporary Linux credential source cleanup required"
+  },
+  "limitations": [
+    "No vendor adapter or provider call was run in this preparation",
+    "No native Linux vendor compatibility, bare-metal Linux or x86_64 qualification is claimed",
+    "Source full-workspace CI is separate evidence; the local later test build failed",
+    "Ordinary enforced ACP admission and S7 remain open",
+    "Private-runner hashes identify prepared local artifacts; this projection is not their source archive"
+  ]
+}

@@ -882,6 +882,13 @@ pub struct ProvisionedPreview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissionState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gate_evaluations: BTreeMap<String, crate::gate_evaluation::lifecycle::Record>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub consumed_gate_resolutions: BTreeSet<String>,
+    /// One-call consent history, distinct from mission-wide grants.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permissions: BTreeMap<String, crate::live_permission::Record>,
     pub mission: Mission,
     /// Sequential feature baselines pinned before worker execution. Empty in
     /// older logs; reconstructed from feature.progress rather than trusted
@@ -1123,8 +1130,8 @@ pub struct RoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Executable of the ACP (Agent Client Protocol) agent for
-    /// `backend = "acp"`. Required and validated when a role selects the acp
-    /// backend (KRZ-301; worker role only for now).
+    /// `backend = "acp"`. Required without a qualified `acpProfile`, and
+    /// forbidden with one (the profile owns argv). Worker role only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<String>,
     /// Extra argv for `acpCommand` (model flags, agent-specific options —
@@ -1143,6 +1150,10 @@ pub struct RoleConfig {
     /// Per-role OS sandbox opt-in.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Explicit operator-owned ACP worker qualification and credential source.
+    /// Absent on old persisted configurations; never implies generic ACP support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_profile: Option<crate::acp_worker::AcpWorkerProfile>,
 }
 
 /// OS sandbox enforcement level for a role's sessions.
@@ -1760,6 +1771,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             worker: RoleConfig {
@@ -1774,6 +1786,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_scrutiny: RoleConfig {
@@ -1788,6 +1801,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             validator_functional: RoleConfig {
@@ -1802,6 +1816,7 @@ impl Default for MissionConfig {
                 temperature: None,
                 acp_command: None,
                 acp_args: vec![],
+                acp_profile: None,
                 sandbox: SandboxConfig::default(),
             },
             skip_scrutiny: false,
@@ -1893,6 +1908,10 @@ impl MissionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlCommand {
+    /// Exact invocation consent; never changes a grant or deny exception.
+    ResolvePermission {
+        resolution: crate::live_permission::Resolution,
+    },
     Pause,
     Resume,
     Msg {

@@ -1,110 +1,81 @@
-//! ACP (Agent Client Protocol) agent backend: spawns and supervises an
-//! external agent process speaking JSON-RPC 2.0 over NDJSON stdio (KRZ-301 —
-//! the vendor-neutrality seam: any agent that speaks ACP can drive a kranz
-//! mission role without a per-vendor CLI parser).
+//! ACP (Agent Client Protocol) worker backend: JSON-RPC 2.0 over NDJSON
+//! stdin/stdout. Protocol version 1 is required; optional capabilities are
+//! negotiated separately from that major version. Released adapter pins and
+//! live-proof limits are recorded in `docs/acp-compatibility.md`.
 //!
-//! **Schema version targeted:** ACP protocol version **1** — the stable
-//! `schema/v1/schema.json` of `agentclientprotocol/agent-client-protocol`
-//! (meta.json `"version": 1`, crate release v1.6.0, 2026-07-21). v2 shapes
-//! (schema.unstable.json) are deliberately NOT used: unstable discriminators
-//! would tie the seam to a moving target. Protocol versions are MAJOR-only,
-//! so a peer answering `initialize` with anything other than 1 is rejected.
+//! `initialize` and `session/new` synthesize `Init`. Its session ID is the
+//! peer's ID; `AgentSession::session_id()` retains the engine ID. The raw
+//! event records both IDs, capabilities and the configured model label.
+//! Model attribution comes from the peer's model config option or legacy
+//! `models.currentModelId`, else `unreported`. Kranz does not apply the
+//! configured model/effort label as an ACP model-selection request.
 //!
-//! ## Wire → event mapping
+//! Existing role instructions and task text travel in the prompt, as with
+//! the Codex/Droid backends. There is no native JSON-schema enforcement.
+//! Message chunks become `Text`; tool announcements/results become
+//! `ToolUse`/`ToolResult`; remaining valid notifications become `Other`.
+//! A `session/prompt` response creates `Result` from the accumulated final
+//! message. Only `end_turn` is a successful result: cancellation, truncation,
+//! refusal and missing/unknown stop reasons fail honestly.
 //!
-//! | ACP message | maps to |
-//! |---|---|
-//! | `initialize` + `session/new` responses | synthesized [`AgentEvent::Init`] (the peer's `sessionId`; model recorded from config — ACP v1 has no standard model-reporting field) |
-//! | `session/update` `agent_message_chunk` (text) | [`AgentEvent::Text`] per chunk (deltas) |
-//! | `session/update` `tool_call` | [`AgentEvent::ToolUse`] (`tool` = ACP `kind`, `summary` = `title`) |
-//! | `session/update` `tool_call_update` with terminal status (`completed`/`failed`) | [`AgentEvent::ToolResult`] (`denied: false` — a failed tool is a normal failure, not a denial, mirroring `backend_codex`) |
-//! | `session/request_permission` refused at the seam | synthesized [`AgentEvent::ToolResult`] with `denied: true` (the refusal IS the event — the peer may report nothing itself) |
-//! | `session/update` `usage_update` | remembered; its `cost` (USD only) lands on the terminal `Result.cost_usd` |
-//! | `session/prompt` response (`stopReason`) | synthesized terminal [`AgentEvent::Result`]: text stitched from the LAST assistant message's chunks (mirrors `backend_codex` "last agent_message wins"; `messageId` changes delimit messages), `is_error` ⇔ `stopReason != "end_turn"` — ACP v1 names `end_turn` as the ONLY natural completion, so `refusal`, `max_tokens`, `max_turn_requests`, `cancelled`, and any missing/unknown reason all fail honestly (12th-pass review: a truncated or cancelled validator report must never read as a pass) |
-//! | everything else (`plan`, `agent_thought_chunk`, `available_commands_update`, unknown kinds, unparseable lines) | [`AgentEvent::Other`] — kept for transcripts, never dropped |
+//! Session updates and permissions must name the established peer session.
+//! Malformed JSON-RPC, duplicate JSON keys, invalid UTF-8, oversized frames
+//! and oversized retained message/tool state fail closed. A malformed frame
+//! that can be retained is a diagnostic `Other`, never a later valid report.
 //!
-//! ## What is NOT on this wire (absent, never fabricated)
+//! Context-window usage is not a billable input/output token split. Tokens
+//! remain unavailable (the existing zero default). A finite nonnegative USD
+//! session cost becomes a turn delta only when adjacent totals are known;
+//! missing telemetry or a decreasing total yields no attributed turn cost.
 //!
-//! ACP v1's `usage_update` reports context-window state (`used`/`size`
-//! tokens) and an optional cumulative `cost` — NOT an input/output/cache
-//! token split. [`AgentEvent::Result`] `usage` therefore stays the zero
-//! default (a fabricated split would be invented data), and `cost_usd` is
-//! `Some` only when the peer reported a USD amount. There is likewise no
-//! client-side price-table fallback: kranz cannot price an arbitrary ACP
-//! peer's model, so unreported cost stays `None`. Model selection is the
-//! peer's own concern (encoded in the configured command/args); the
-//! configured model string is recorded on `Init` for attribution only.
+//! Permission decisions use current action identity, kind and raw arguments.
+//! Deny patterns run before the read-only posture. Unclassified operations
+//! and mode changes are refused. A display title cannot stand in for shell
+//! arguments. Only an offered, unambiguous one-time option may be selected;
+//! durable or malformed options cancel. The engine records each request and
+//! resolution before its separately callable responder can send an answer.
+//! Understood calls require one-time operator consent; prohibitions are denied
+//! by policy. Output continues while a request waits, with a five-minute limit.
+//! Delivery receipts are separate from the eventual tool outcome.
+//! This is a cooperative permission policy, not shell parsing or containment:
+//! an adapter can perform actions without asking. `allowed_tools` is not an
+//! enforced allowlist here, and read-only roles may still execute commands.
 //!
-//! ## Permission mapping (the allow/deny seam)
+//! Client fs/terminal services and same-feature resume remain unsupported.
+//! Unexpected client requests receive -32601. Released adapters may support
+//! load/resume methods; that does not imply Kranz negotiates or uses them.
+//! Configuration restricts ACP to opt-in worker use. Enforced missions require
+//! an explicit qualified `acpProfile`; arbitrary commands, validator roles and
+//! automatic backend promotion remain refused.
+//! The direct backend API has a Docker containment proof path on macOS/Linux:
+//! a pinned, trusted Linux image must supply /usr/local/bin/python3. It reuses
+//! the container mount policy and a private host lease checked by guest PID 1.
+//! Profile admission pins that image, startup policy and credential channel.
 //!
-//! The peer asks before acting via `session/request_permission`; the answer
-//! is computed from the [`SessionSpec`] (see [`decide_permission`]):
+//! Child environments are cleared through `agent_session_env`. ACP has no
+//! implicit credential selection: direct callers supply SessionSpec.env, while
+//! profiles seed only the operator-selected credential file in a private home.
+//! Ambient HOME and provider credentials are never restored by this backend.
 //!
-//! - **Disallowed patterns** (`spec.disallowed_tools`, claude-shaped strings
-//!   like `Bash(git push*)`) are matched against the ACP `kind` via
-//!   [`TOOL_NAME_KINDS`] (`Bash`↔`execute`, `Edit`/`Write`↔`edit`, …) and a
-//!   `*`-wildcard glob against the call's subject (command for `execute`,
-//!   path for the file kinds, title otherwise). A match refuses the call —
-//!   this is where the no-push/no-publish invariants land.
-//! - **Read-only sessions** (`writable: false`) refuse the filesystem-
-//!   mutating kinds `edit`/`delete`/`move` outright; `execute` stays allowed
-//!   unless disallowed-matched, because a read-only role still runs
-//!   read-only commands (`git diff`, `cargo test`) and ACP's `execute` kind
-//!   does not split reads from writes. This is the ACP equivalent posture;
-//!   what it CANNOT do is constrain a peer that never asks permission —
-//!   there is no client-side fs proxy in v1, and `BackendKind::Acp` reports
-//!   `supports_sandbox_enforcement() == false`, so `config::validate`
-//!   refuses an enforced OS sandbox on this backend rather than letting the
-//!   gap go silent. `spec.allowed_tools` is not interpreted yet (the peer's
-//!   permission request IS the ask; auto-approving without one would weaken
-//!   the seam).
-//!
-//! - **Missing wire fields fail CLOSED.** ACP v1 leaves `title` optional and
-//!   `rawInput` free-form, so a call can arrive with no subject at all; every
-//!   glob then matches nothing and the deny list would silently vacate. When
-//!   a deny pattern's tool name covers the call's kind but the subject is
-//!   empty, the call is refused and the reason names the missing field. Same
-//!   for a read-only session when the peer omits `kind` (it arrives as
-//!   `"other"`, which `MUTATING_KINDS` cannot classify).
-//!
-//! A refusal picks the first `reject_once` (else `reject_always`) option the
-//! peer offered, falling back to the `cancelled` outcome when it offered
-//! none; an approval picks the first `allow_once` (else `allow_always`,
-//! else first) option.
-//!
-//! ## Process supervision
-//!
-//! House discipline, mirroring `backend_kimi`/`backend_codex`: env-cleared
-//! spawn ([`crate::agent_env::agent_session_env`] — ACP has no canonical
-//! auth env var, so NO ambient credential crosses; the peer authenticates
-//! from its own config), unix process-group + post-reap sweep /
-//! windows Job Object tree kill, `kill_on_drop`, bounded stdout lines and a
-//! bounded stderr tail ([`crate::stream_bounds`]). A killed peer's torn
-//! final NDJSON line is never a parse failure: [`BoundedLines`] returns it
-//! as one last unterminated line, which routes to [`AgentEvent::Other`]
-//! like any unparseable line, so the events already surfaced stay complete
-//! and the session simply ends `Aborted`/`Failed`.
-//!
-//! `resume` is rejected at the seam (`session/load` is an optional v1
-//! capability this backend does not negotiate; `session/resume` is
-//! unstable-v2 only). Client capabilities advertise `fs`/`terminal` as
-//! unsupported, so a conformant peer never calls `fs/*`/`terminal/*`; one
-//! that does gets a JSON-RPC `-32601` error response, not silent service.
+//! Native single-shot completion closes stdin, allows a short exit grace and then
+//! cleans up the owned process group. macOS/Linux observe exit with WNOWAIT
+//! so group identity stays owned until cleanup, before reaping. Windows
+//! requires Job Object assignment. Writes, cancellation, reap and diagnostic
+//! drain have deadlines. Same-group cleanup is not containment against a
+//! descendant that escapes its group; that requires the separate S6 proof.
 
 use crate::backend::{
     AgentBackend, AgentEvent, AgentSession, PromptMode, SessionExit, SessionSpec,
 };
-#[cfg(unix)]
-use crate::backend_claude::kill_group;
 #[cfg(windows)]
 use crate::backend_claude::win_job;
 use crate::error::{EngineError, Result};
-use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP};
+use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP, STDOUT_LINE_CAP};
 use crate::types::TokenUsage;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
@@ -119,12 +90,16 @@ const STDERR_TAIL_CHARS: usize = 500;
 const ACP_PROTOCOL_VERSION: u64 = 1;
 
 /// Deadline for one handshake request (`initialize`, `session/new`). Both
-/// are capability negotiation — no model call — so a peer that cannot answer
-/// within this window is hung or not an ACP agent; bounding it keeps
+/// may involve adapter startup and authentication. The limit keeps
 /// `start()` from parking the run loop forever. The prompt turn itself is
 /// deliberately unbounded here: turn/stall budgets are the engine's call
 /// (runner-level), not the transport's.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const COMPLETION_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+const CONTAINER_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const CANCEL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// JSON-RPC method names, stable schema v1 (`meta.json`).
 mod method {
@@ -167,8 +142,14 @@ const MUTATING_KINDS: &[&str] = &["edit", "delete", "move"];
 /// request, a peer request we must answer, or a notification.
 #[derive(Debug)]
 enum Frame {
+    /// In-process broker messages; never constructible from peer JSON.
+    PermissionAnswer(crate::live_permission::Answer),
+    PermissionExpired,
     /// `result`/`error` for a client-issued request id.
-    Response { id: u64, outcome: RpcOutcome },
+    Response {
+        id: u64,
+        outcome: RpcOutcome,
+    },
     /// Peer→client request (`session/request_permission`, or an unsupported
     /// client method). The `id` is echoed back verbatim — it may be a string
     /// or a number per JSON-RPC, so it is kept as a raw [`Value`].
@@ -184,7 +165,7 @@ enum Frame {
         params: Value,
         raw: Value,
     },
-    /// Not JSON-RPC-shaped (or not JSON at all) — transcript only.
+    /// Malformed protocol input: retained diagnostic, then session failure.
     Unrecognized(Value),
 }
 
@@ -201,7 +182,7 @@ enum RpcOutcome {
 /// [`Frame::Unrecognized`] with `raw = {"unparsed": <line>}` so nothing is
 /// ever dropped from transcripts (mirrors `backend_codex::parse_codex_line`).
 fn classify_line(line: &str) -> Frame {
-    let value = match serde_json::from_str::<Value>(line) {
+    let value = match crate::strict_json::parse(line.as_bytes()) {
         Ok(value) => value,
         Err(_) => return Frame::Unrecognized(json!({ "unparsed": line })),
     };
@@ -213,7 +194,16 @@ fn classify_value(value: Value) -> Frame {
         Some(obj) => obj,
         None => return Frame::Unrecognized(value),
     };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Frame::Unrecognized(value);
+    }
     let has_id = obj.contains_key("id");
+    if obj.contains_key("method") && (obj.contains_key("result") || obj.contains_key("error")) {
+        return Frame::Unrecognized(value);
+    }
+    if has_id && !(obj["id"].is_string() || obj["id"].is_i64() || obj["id"].is_u64()) {
+        return Frame::Unrecognized(value);
+    }
     let method = obj.get("method").and_then(Value::as_str);
     match (method, has_id) {
         // Request: method + id.
@@ -234,7 +224,7 @@ fn classify_value(value: Value) -> Frame {
         (None, true) => {
             let id = obj.get("id").and_then(Value::as_u64);
             match (id, obj.get("result"), obj.get("error")) {
-                (Some(id), Some(result), _) => Frame::Response {
+                (Some(id), Some(result), None) => Frame::Response {
                     id,
                     outcome: RpcOutcome::Result(result.clone()),
                 },
@@ -276,7 +266,8 @@ struct ToolCallInfo {
 
 /// Extract the matchable subject from a tool-call-shaped value
 /// (`rawInput.command`/`cmd` for execute, `locations[0].path` or
-/// `rawInput.path` for the file kinds, `title` as the last resort).
+/// `rawInput.path` for file kinds). Explicit raw input invalidates display
+/// fallback; execute never trusts a title as its command.
 fn tool_call_subject(kind: &str, title: &str, call: &Value) -> String {
     let raw_input = call.get("rawInput").cloned().unwrap_or(Value::Null);
     let str_at = |value: &Value, keys: &[&str]| -> Option<String> {
@@ -284,9 +275,8 @@ fn tool_call_subject(kind: &str, title: &str, call: &Value) -> String {
             .find_map(|k| value.get(*k).and_then(Value::as_str).map(str::to_string))
     };
     if kind == "execute" {
-        if let Some(command) = str_at(&raw_input, &["command", "cmd"]) {
-            return command;
-        }
+        // Display titles and file locations are not executable arguments.
+        return str_at(&raw_input, &["command", "cmd"]).unwrap_or_default();
     }
     if let Some(path) = call
         .get("locations")
@@ -299,6 +289,9 @@ fn tool_call_subject(kind: &str, title: &str, call: &Value) -> String {
     }
     if let Some(path) = str_at(&raw_input, &["path", "filePath", "file_path"]) {
         return path;
+    }
+    if call.get("rawInput").is_some() || call.get("locations").is_some() {
+        return String::new();
     }
     title.to_string()
 }
@@ -374,6 +367,26 @@ fn pattern_matches(pattern: &str, kind: &str, subject: &str) -> bool {
 /// both cases the guard cannot be evaluated, so the call is refused and the
 /// reason names the field the peer left out.
 fn decide_permission(spec: &SessionSpec, call: &ToolCallInfo) -> PermissionDecision {
+    if call.kind == "switch_mode" {
+        return PermissionDecision::Deny(
+            "agent mode changes require an explicit human decision".into(),
+        );
+    }
+    if ![
+        "read",
+        "edit",
+        "delete",
+        "move",
+        "search",
+        "execute",
+        "think",
+        "fetch",
+        "switch_mode",
+    ]
+    .contains(&call.kind.as_str())
+    {
+        return PermissionDecision::Deny("tool call carries an unknown or missing ACP kind".into());
+    }
     if call.subject.trim().is_empty() {
         if let Some(pattern) = spec
             .disallowed_tools
@@ -412,40 +425,37 @@ fn decide_permission(spec: &SessionSpec, call: &ToolCallInfo) -> PermissionDecis
     PermissionDecision::Allow
 }
 
-/// Build the JSON-RPC result answering a permission request. `Allow` picks
-/// the first `allow_once` option, then `allow_always`, then the first
-/// option at all; `Deny` picks the first `reject_once`, then
-/// `reject_always`, and falls back to the `cancelled` outcome when the peer
-/// offered no reject option (the only refusal the stable schema guarantees).
+/// Select only a well-formed, unambiguous one-time option. Adapter option
+/// IDs are opaque: the kind supplies semantics, never an ID spelling.
 fn permission_response(decision: &PermissionDecision, options: &[Value]) -> Value {
-    let option_kind = |opt: &Value| -> String {
-        opt.get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+    let mut ids = std::collections::HashSet::new();
+    let valid = !options.is_empty()
+        && options.len() <= 32
+        && options.iter().all(|option| {
+            option
+                .get("optionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+                .is_some_and(|id| ids.insert(id))
+        });
+    let kind = match decision {
+        PermissionDecision::Allow => "allow_once",
+        PermissionDecision::Deny(_) => "reject_once",
     };
-    let option_id = |opt: &Value| opt.get("optionId").cloned().unwrap_or(Value::Null);
-    let pick = |kinds: &[&str]| -> Option<Value> {
-        options
-            .iter()
-            .find(|opt| kinds.contains(&option_kind(opt).as_str()))
-            .map(option_id)
-    };
-    let selected = match decision {
-        PermissionDecision::Allow => pick(&["allow_once"])
-            .or_else(|| pick(&["allow_always"]))
-            .or_else(|| options.first().map(option_id)),
-        PermissionDecision::Deny(_) => pick(&["reject_once"]).or_else(|| pick(&["reject_always"])),
-    };
+    let selected = valid
+        .then(|| {
+            let mut matching = options
+                .iter()
+                .filter(|option| option.get("kind").and_then(Value::as_str) == Some(kind));
+            let first = matching.next()?;
+            matching.next().is_none().then_some(first)
+        })
+        .flatten();
     match selected {
-        Some(option_id) => json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-        None => match decision {
-            PermissionDecision::Allow => {
-                // No allow option at all: the only safe answer is refusal.
-                json!({ "outcome": { "outcome": "cancelled" } })
-            }
-            PermissionDecision::Deny(_) => json!({ "outcome": { "outcome": "cancelled" } }),
-        },
+        Some(option) => {
+            json!({ "outcome": { "outcome": "selected", "optionId": option["optionId"] } })
+        }
+        None => json!({ "outcome": { "outcome": "cancelled" } }),
     }
 }
 
@@ -505,6 +515,7 @@ fn tool_result_summary(update: &Value, tracked: &ToolCallInfo, status: &str) -> 
 pub struct AcpBackend {
     program: PathBuf,
     args: Vec<String>,
+    profile: Option<crate::acp_worker::AcpWorkerProfile>,
 }
 
 impl AcpBackend {
@@ -514,6 +525,30 @@ impl AcpBackend {
         AcpBackend {
             program: program.into(),
             args,
+            profile: None,
+        }
+    }
+
+    /// Ordinary-worker construction. Profile argv and startup policy are fixed;
+    /// the credential is read only at session start, after boundary checks.
+    pub fn for_worker(cfg: &crate::types::RoleConfig) -> Result<Self> {
+        if let Some(profile) = &cfg.acp_profile {
+            profile.validate_config(
+                crate::types::Role::Worker,
+                cfg,
+                crate::types::WorkerIsolation::Worktree,
+            )?;
+            let definition = profile.definition()?;
+            Ok(Self {
+                program: definition.program.into(),
+                args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
+                profile: Some(profile.clone()),
+            })
+        } else {
+            let command = cfg.acp_command.as_ref().ok_or_else(|| {
+                EngineError::Config("ACP worker requires acpCommand or acpProfile".into())
+            })?;
+            Ok(Self::new(command, cfg.acp_args.clone()))
         }
     }
 
@@ -523,9 +558,46 @@ impl AcpBackend {
     }
 }
 
+fn effective_prompt(spec: &SessionSpec) -> String {
+    let text = match &spec.prompt {
+        PromptMode::SingleShot(text) | PromptMode::Streaming(text) => text,
+    };
+    match &spec.append_system_prompt {
+        Some(system) if !system.is_empty() => format!("{system}\n\n{text}"),
+        _ => text.clone(),
+    }
+}
+
+fn peer_reported_model(session: &Value) -> Option<&str> {
+    session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options.iter().find_map(|option| {
+                (option.get("category").and_then(Value::as_str) == Some("model"))
+                    .then(|| option.get("currentValue").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .or_else(|| session.get("models")?.get("currentModelId")?.as_str())
+        .filter(|model| !model.trim().is_empty() && model.len() <= 256)
+}
+
 #[async_trait::async_trait]
 impl AgentBackend for AcpBackend {
-    async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+    async fn start(&self, mut spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+        // Configuration admission is not the only caller of this public
+        // backend. Never silently discard an embedding caller's boundary.
+        let container_requested = spec.sandbox.as_ref().is_some_and(|sandbox| {
+            cfg!(any(target_os = "macos", target_os = "linux"))
+                && sandbox.backend == crate::sandbox::SandboxBackend::Container
+                && sandbox.container.is_some()
+        });
+        if spec.sandbox.is_some() && !container_requested {
+            return Err(EngineError::Backend(
+                "acp backend: enforced containment is not certified; refusing the supplied sandbox before spawn".into(),
+            ));
+        }
         if spec.resume.is_some() {
             return Err(EngineError::Backend(
                 "acp backend: resume is unsupported (session/load is an optional v1 \
@@ -533,22 +605,26 @@ impl AgentBackend for AcpBackend {
                     .to_string(),
             ));
         }
+        let profile_home = self
+            .profile
+            .as_ref()
+            .map(|profile| profile.prepare(&mut spec))
+            .transpose()?;
         let model = spec.model.clone();
 
-        let mut command = tokio::process::Command::new(&self.program);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let (container, mut command) = if container_requested {
+            let (container, command) =
+                crate::acp_container::OwnedContainer::prepare(&spec, &self.program, &self.args)
+                    .await?;
+            (Some(container), command)
+        } else {
+            (None, self.native_command(&spec))
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let mut command = self.native_command(&spec);
         command
-            .args(&self.args)
             .current_dir(&spec.cwd)
-            // agent-env-clear: CLEARED env from the minimal allowlist. ACP
-            // defines no canonical auth env var, so NO ambient credential is
-            // injected (auth_env_name None) — the peer authenticates from
-            // its own config or fails loudly, never by inheritance.
-            .env_clear()
-            .envs(crate::agent_env::agent_session_env(
-                &spec.env,
-                &spec.session_id,
-                None,
-            ))
             // ACP is bidirectional: stdin carries the client's requests.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -572,12 +648,18 @@ impl AgentBackend for AcpBackend {
             Some(handle) => match win_job::JobHandle::create_and_assign(handle) {
                 Ok(job) => Some(job),
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to create Job Object for acp child; \
-                        tree-kill on abort will be unavailable");
-                    None
+                    let _ = child.kill().await;
+                    return Err(EngineError::Backend(format!(
+                        "acp Job Object assignment failed: {e}"
+                    )));
                 }
             },
-            None => None,
+            None => {
+                let _ = child.kill().await;
+                return Err(EngineError::Backend(
+                    "acp child has no process handle".into(),
+                ));
+            }
         };
 
         let stdin = child
@@ -606,27 +688,42 @@ impl AgentBackend for AcpBackend {
             })
         };
 
+        let (permission_responder, permission_answers) =
+            crate::live_permission::PermissionResponder::channel();
         let mut session = AcpSession {
             session_id: spec.session_id.clone(),
             acp_session_id: None,
             model,
             spec,
             child,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            container,
+            profile_home,
             #[cfg(windows)]
             job,
-            stdin,
-            lines: BoundedLines::new(stdout),
+            stdin: Some(stdin),
+            child_status: None,
+            cleanup_failure: None,
+            drain_deadline: None,
+            lines: BoundedLines::new_strict(stdout),
             stderr_buf,
             stderr_task: Some(stderr_task),
             queue: VecDeque::new(),
             next_request_id: 1,
             prompt_request_id: None,
             tool_calls: HashMap::new(),
+            permission_responder,
+            permission_answers,
+            deferred_permission_answer: None,
+            pending_permissions: HashMap::new(),
+            seen_permission_ids: std::collections::HashSet::new(),
             message_text: String::new(),
             message_id: None,
             last_usage: None,
+            previous_cost_total: None,
+            handshake_bytes: 0,
+            handshake_complete: false,
             saw_result: false,
-            saw_success_result: false,
             exit: None,
         };
 
@@ -635,9 +732,37 @@ impl AgentBackend for AcpBackend {
         // kills the child before the error crosses back.
         if let Err(e) = session.handshake().await {
             session.kill_child().await;
-            return Err(e);
+            let message = match e {
+                EngineError::Backend(message) => message,
+                other => other.to_string(),
+            };
+            return Err(EngineError::Backend(format!(
+                "{message}; startup stderr after cleanup: {}{}",
+                session.stderr_tail(),
+                session
+                    .cleanup_failure
+                    .map(|cause| format!("; cleanup unconfirmed: {cause}"))
+                    .unwrap_or_default(),
+            )));
         }
         Ok(Box::new(session))
+    }
+}
+
+impl AcpBackend {
+    fn native_command(&self, spec: &SessionSpec) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            // agent-env-clear: ACP has no implicit credential channel.
+            // Only explicit session variables cross the native boundary.
+            .env_clear()
+            .envs(crate::agent_env::agent_session_env(
+                &spec.env,
+                &spec.session_id,
+                None,
+            ));
+        command
     }
 }
 
@@ -647,12 +772,13 @@ impl AgentBackend for AcpBackend {
 
 /// A live ACP session (the [`AgentSession`] impl).
 ///
-/// Reading is INLINE in [`AcpSession::next_event`] (no reader task), which
-/// keeps memory bounded by [`BoundedLines`] and is deadlock-free for this
-/// protocol: the peer blocks waiting for each permission answer, and the
-/// read loop answers permission requests synchronously as they arrive, so
-/// stdin writes never wait on a peer that is itself waiting on a full
-/// stdout pipe.
+/// Reading is inline in `next_event`. Every write is bounded: a peer that
+/// stops reading stdin cannot block cancellation indefinitely.
+struct PendingPermission {
+    proposal: crate::live_permission::Proposal,
+    expires_at: tokio::time::Instant,
+}
+
 pub struct AcpSession {
     session_id: String,
     /// The peer-issued session id (`session/new` response).
@@ -661,9 +787,15 @@ pub struct AcpSession {
     /// Kept for permission decisions (`disallowed_tools`, `writable`).
     spec: SessionSpec,
     child: Child,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    container: Option<crate::acp_container::OwnedContainer>,
+    profile_home: Option<crate::acp_worker::PreparedProfile>,
     #[cfg(windows)]
     job: Option<win_job::JobHandle>,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
+    child_status: Option<ExitStatus>,
+    cleanup_failure: Option<&'static str>,
+    drain_deadline: Option<tokio::time::Instant>,
     lines: BoundedLines<ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
     stderr_task: Option<JoinHandle<()>>,
@@ -677,6 +809,11 @@ pub struct AcpSession {
     /// `tool_call_update` or permission request resolves to what is known
     /// about the call.
     tool_calls: HashMap<String, ToolCallInfo>,
+    permission_responder: crate::live_permission::PermissionResponder,
+    permission_answers: tokio::sync::mpsc::Receiver<crate::live_permission::Answer>,
+    deferred_permission_answer: Option<crate::live_permission::Answer>,
+    pending_permissions: HashMap<String, PendingPermission>,
+    seen_permission_ids: std::collections::HashSet<String>,
     /// Accumulated text of the CURRENT assistant message (chunks with the
     /// same `messageId` concatenate; a changed/missing-`messageId` boundary
     /// starts a new message, and the last message wins the terminal Result,
@@ -686,8 +823,10 @@ pub struct AcpSession {
     /// Latest `usage_update` (context state + optional cumulative USD cost);
     /// its cost lands on the terminal `Result` (see module docs).
     last_usage: Option<Value>,
+    previous_cost_total: Option<f64>,
+    handshake_bytes: usize,
+    handshake_complete: bool,
     saw_result: bool,
-    saw_success_result: bool,
     exit: Option<SessionExit>,
 }
 
@@ -695,6 +834,33 @@ pub struct AcpSession {
 impl Drop for AcpSession {
     fn drop(&mut self) {
         crate::backend_claude::kill_unreaped_group(&self.child);
+    }
+}
+
+async fn wait_for_peer_exit(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let pid = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("acp child already reaped"))?;
+        crate::command_exec::control_leader_exited(pid).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        child.wait().await.map(|_| ())
+    }
+}
+
+fn kill_owned_peer(child: &mut Child, #[cfg(windows)] job: Option<&win_job::JobHandle>) {
+    #[cfg(unix)]
+    crate::backend_claude::kill_unreaped_group(child);
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.kill();
+    }
+    // Also target the still-owned leader if it changed its process group.
+    if child.id().is_some() {
+        let _ = child.start_kill();
     }
 }
 
@@ -711,13 +877,22 @@ impl AcpSession {
         let mut line = serde_json::to_string(&message)
             .map_err(|e| EngineError::Backend(format!("failed to encode acp message: {e}")))?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            EngineError::Backend(format!("failed to write to acp agent stdin: {e}"))
-        })?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| EngineError::Backend(format!("failed to flush acp agent stdin: {e}")))?;
+        if line.len() > STDOUT_LINE_CAP {
+            return Err(EngineError::Backend(
+                "acp request exceeds the frame byte limit".into(),
+            ));
+        }
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| EngineError::Backend("acp stdin is closed".into()))?;
+        tokio::time::timeout(WRITE_TIMEOUT, async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| EngineError::Backend("acp stdin write timed out".into()))?
+        .map_err(|e| EngineError::Backend(format!("failed to write to acp agent stdin: {e}")))?;
         Ok(())
     }
 
@@ -785,28 +960,38 @@ impl AcpSession {
         let acp_session_id = new_result
             .get("sessionId")
             .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 256)
             .ok_or_else(|| {
                 EngineError::Backend("acp session/new response carried no sessionId".to_string())
             })?
             .to_string();
         self.acp_session_id = Some(acp_session_id.clone());
-        self.session_id = acp_session_id.clone();
-        // Init is synthesized from the handshake (no wire line carries it),
-        // mirroring backend_kimi: the configured model is recorded for
-        // attribution — ACP v1 has no model-reporting field.
+        self.handshake_complete = true;
+        let reported_model = peer_reported_model(&new_result).map(str::to_owned);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let containment = self.container.as_ref().map(|container| container.receipt());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let containment: Option<Value> = None;
+        // Configured attribution and peer-reported state are different facts.
         self.queue.push_back(AgentEvent::Init {
             session_id: acp_session_id,
-            model: self.model.clone(),
+            model: reported_model
+                .clone()
+                .unwrap_or_else(|| "unreported".into()),
             raw: json!({
                 "initialize": init_result,
                 "sessionNew": new_result,
+                "engineSessionId": self.session_id,
+                "configuredModel": self.model,
+                "modelSource": if reported_model.is_some() { "peer" } else { "unreported" },
+                "configuredModelSelectionApplied": false,
+                "containment": containment,
+                "workerProfile": self.profile_home.as_ref().map(|p| &p.receipt),
                 "synthesizedBy": "backend_acp",
             }),
         });
 
-        let prompt_text = match &self.spec.prompt {
-            PromptMode::SingleShot(text) | PromptMode::Streaming(text) => text.clone(),
-        };
+        let prompt_text = effective_prompt(&self.spec);
         self.send_prompt(&prompt_text).await
     }
 
@@ -831,6 +1016,7 @@ impl AcpSession {
         // last message.
         self.message_text.clear();
         self.message_id = None;
+        self.last_usage = None;
         Ok(())
     }
 
@@ -885,9 +1071,100 @@ impl AcpSession {
     /// keepalive must not fabricate events).
     async fn read_frame(&mut self) -> Result<Option<Frame>> {
         loop {
-            match self.lines.next_line().await {
+            let permission_wait = self
+                .pending_permissions
+                .values()
+                .map(|p| {
+                    p.expires_at
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(
+                            (p.proposal.deadline - chrono::Utc::now())
+                                .to_std()
+                                .unwrap_or_default(),
+                        )
+                })
+                .min()
+                .unwrap_or(std::time::Duration::from_secs(86400));
+            if permission_wait.is_zero() {
+                return Ok(Some(Frame::PermissionExpired));
+            }
+            let can_answer = !self.lines.has_partial_line();
+            let read = {
+                let line = self.lines.next_line();
+                tokio::pin!(line);
+                let read = if let Some(deadline) = self.drain_deadline {
+                    tokio::time::timeout_at(deadline, &mut line)
+                        .await
+                        .map_err(|_| {
+                            EngineError::Backend(
+                                "acp stdout remained open after peer cleanup".into(),
+                            )
+                        })?
+                } else {
+                    tokio::select! {
+                        biased;
+                        // Drain already-buffered action changes before applying
+                        // a queued answer to the older invocation description.
+                        read = &mut line => read,
+                        answer = async {
+                            if let Some(answer) = self.deferred_permission_answer.take() {
+                                Some(answer)
+                            } else {
+                                self.permission_answers.recv().await
+                            }
+                        }, if can_answer => {
+                            return Ok(answer.map(Frame::PermissionAnswer));
+                        }
+                        _ = tokio::time::sleep(permission_wait), if !self.pending_permissions.is_empty() => {
+                            return Ok(Some(Frame::PermissionExpired));
+                        }
+                        exited = wait_for_peer_exit(&mut self.child) => {
+                            exited.map_err(|e| EngineError::Backend(format!("acp process observation failed: {e}")))?;
+                            kill_owned_peer(&mut self.child, #[cfg(windows)] self.job.as_ref());
+                            self.child_status = Some(self.child.wait().await.map_err(|e| {
+                                EngineError::Backend(format!("acp process reap failed: {e}"))
+                            })?);
+                            let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+                            self.drain_deadline = Some(deadline);
+                            tokio::time::timeout_at(deadline, &mut line).await
+                                .map_err(|_| EngineError::Backend("acp stdout remained open after peer cleanup".into()))?
+                        }
+                    }
+                };
+                read
+            };
+            match read {
                 Ok(Some(line)) if line.trim().is_empty() => continue,
-                Ok(Some(line)) => return Ok(Some(classify_line(&line))),
+                Ok(Some(line)) => {
+                    if self.profile_home.is_some()
+                        && crate::strict_json::parse(line.as_bytes()).is_err()
+                    {
+                        // Do not retain malformed credential-bearing peer input,
+                        // including duplicate keys hiding an escaped token.
+                        return Err(EngineError::Backend(
+                            "acp profile peer emitted invalid unique-key JSON; frame refused"
+                                .into(),
+                        ));
+                    }
+                    if self
+                        .profile_home
+                        .as_ref()
+                        .is_some_and(|p| p.contains_secret(&line))
+                    {
+                        return Err(EngineError::Backend(
+                            "acp peer exposed a configured credential; frame refused".into(),
+                        ));
+                    }
+                    if !self.handshake_complete {
+                        self.handshake_bytes = self.handshake_bytes.saturating_add(line.len());
+                        if self.handshake_bytes > STDOUT_LINE_CAP {
+                            return Err(EngineError::Backend(
+                                "acp handshake output exceeded its byte limit".into(),
+                            ));
+                        }
+                    }
+                    return Ok(Some(classify_line(&line)));
+                }
                 Ok(None) => return Ok(None),
                 Err(e) => {
                     return Err(EngineError::Backend(format!(
@@ -903,13 +1180,21 @@ impl AcpSession {
     /// answers, tool tracking, usage capture, terminal-Result synthesis).
     async fn handle_frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
+            Frame::PermissionAnswer(answer) => self.answer_permission(answer).await?,
+            Frame::PermissionExpired => {
+                // Do not manufacture or replay a denial resolution. Terminating
+                // the peer closes its requests without authorizing an effect.
+                return Err(EngineError::Backend(
+                    "live permission deadline expired".into(),
+                ));
+            }
             Frame::Notification {
                 method,
                 params,
                 raw,
             } => {
                 if method == method::SESSION_UPDATE {
-                    self.handle_session_update(&params, raw);
+                    self.handle_session_update(&params, raw)?;
                 } else {
                     self.queue.push_back(AgentEvent::Other { raw });
                 }
@@ -959,14 +1244,80 @@ impl AcpSession {
             }
             Frame::Unrecognized(raw) => {
                 self.queue.push_back(AgentEvent::Other { raw });
+                return Err(EngineError::Backend(
+                    "acp peer emitted malformed JSON-RPC".into(),
+                ));
             }
         }
         Ok(())
     }
 
+    fn track_tool_call(&mut self, id: String, info: ToolCallInfo) -> Result<()> {
+        if id.trim().is_empty() || id.len() > 256 {
+            return Err(EngineError::Backend(
+                "acp tool update has no valid toolCallId".into(),
+            ));
+        }
+        let bytes = info.kind.len() + info.title.len() + info.subject.len();
+        let retained = self
+            .tool_calls
+            .iter()
+            .filter(|(key, _)| *key != &id)
+            .map(|(key, value)| {
+                key.len() + value.kind.len() + value.title.len() + value.subject.len()
+            })
+            .sum::<usize>();
+        if self.tool_calls.len() >= 1024
+            || retained.saturating_add(bytes).saturating_add(id.len()) > STDOUT_LINE_CAP
+        {
+            return Err(EngineError::Backend(
+                "acp tool-call tracking exceeded its limit".into(),
+            ));
+        }
+        self.tool_calls.insert(id, info);
+        Ok(())
+    }
+
     /// Map one `session/update` notification onto events (see module docs).
-    fn handle_session_update(&mut self, params: &Value, raw: Value) {
+    fn handle_session_update(&mut self, params: &Value, raw: Value) -> Result<()> {
+        let Some(expected) = self.acp_session_id.as_deref() else {
+            // No prompt has been sent: pre-session notices are diagnostic only.
+            self.queue.push_back(AgentEvent::Other { raw });
+            return Ok(());
+        };
+        if params.get("sessionId").and_then(Value::as_str) != Some(expected) {
+            return Err(EngineError::Backend(
+                "acp update has a foreign or missing sessionId".into(),
+            ));
+        }
         let update = params.get("update").cloned().unwrap_or(Value::Null);
+        if let Some(call_id) = update.get("toolCallId").and_then(Value::as_str) {
+            if let Some(pending) = self
+                .pending_permissions
+                .values()
+                .map(|p| &p.proposal)
+                .find(|p| p.tool_call_id == call_id)
+            {
+                // Compare complete effect-bearing fields, including content.
+                // A same-title/same-path edit can still contain different bytes.
+                let changed = ["kind", "rawInput", "locations", "content"]
+                    .iter()
+                    .any(|key| {
+                        update
+                            .get(*key)
+                            .is_some_and(|value| pending.action.get(*key) != Some(value))
+                    });
+                let terminal = update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s == "completed" || s == "failed" || s == "in_progress");
+                if changed || terminal {
+                    return Err(EngineError::Backend(
+                        "ACP invocation changed or started while consent was pending".into(),
+                    ));
+                }
+            }
+        }
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("agent_message_chunk") => {
                 let text = update
@@ -976,7 +1327,7 @@ impl AcpSession {
                     .unwrap_or("");
                 if text.is_empty() {
                     self.queue.push_back(AgentEvent::Other { raw });
-                    return;
+                    return Ok(());
                 }
                 // Message boundaries: a changed messageId starts a new
                 // message; the LAST message wins the terminal Result.
@@ -987,6 +1338,11 @@ impl AcpSession {
                 if chunk_id.is_some() && chunk_id != self.message_id {
                     self.message_text.clear();
                     self.message_id = chunk_id;
+                }
+                if self.message_text.len().saturating_add(text.len()) > STDOUT_LINE_CAP {
+                    return Err(EngineError::Backend(
+                        "acp assistant message exceeded its byte limit".into(),
+                    ));
                 }
                 self.message_text.push_str(text);
                 self.queue.push_back(AgentEvent::Text {
@@ -1011,14 +1367,14 @@ impl AcpSession {
                     .unwrap_or_default()
                     .to_string();
                 let subject = tool_call_subject(&kind, &title, &update);
-                self.tool_calls.insert(
+                self.track_tool_call(
                     id,
                     ToolCallInfo {
                         kind: kind.clone(),
                         title: title.clone(),
                         subject,
                     },
-                );
+                )?;
                 self.queue.push_back(AgentEvent::ToolUse {
                     tool: kind,
                     summary: truncate_chars(&title, SUMMARY_MAX_CHARS),
@@ -1036,15 +1392,20 @@ impl AcpSession {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                {
-                    let tracked = self.tool_calls.entry(id).or_default();
-                    if let Some(kind) = update.get("kind").and_then(Value::as_str) {
-                        tracked.kind = kind.to_string();
-                    }
-                    if let Some(title) = update.get("title").and_then(Value::as_str) {
-                        tracked.title = title.to_string();
-                    }
+                let mut tracked = self.tool_calls.get(&id).cloned().unwrap_or_default();
+                if let Some(kind) = update.get("kind").and_then(Value::as_str) {
+                    tracked.kind = kind.to_string();
                 }
+                if let Some(title) = update.get("title").and_then(Value::as_str) {
+                    tracked.title = title.to_string();
+                }
+                if update.get("kind").is_some()
+                    || update.get("rawInput").is_some()
+                    || update.get("locations").is_some()
+                {
+                    tracked.subject = tool_call_subject(&tracked.kind, &tracked.title, &update);
+                }
+                self.track_tool_call(id.clone(), tracked.clone())?;
                 match status.as_str() {
                     // Terminal statuses surface as first-class ToolResult
                     // events; progress updates (pending/in_progress) are
@@ -1052,16 +1413,7 @@ impl AcpSession {
                     // denial (mirrors backend_codex) — denials are
                     // synthesized at the permission seam.
                     "completed" | "failed" => {
-                        let tracked = self
-                            .tool_calls
-                            .get(
-                                update
-                                    .get("toolCallId")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default(),
-                            )
-                            .cloned()
-                            .unwrap_or_default();
+                        self.tool_calls.remove(&id);
                         self.queue.push_back(AgentEvent::ToolResult {
                             tool: Some(tracked.kind.clone()),
                             denied: false,
@@ -1082,6 +1434,7 @@ impl AcpSession {
             }
             _ => self.queue.push_back(AgentEvent::Other { raw }),
         }
+        Ok(())
     }
 
     /// Answer one `session/request_permission` at the seam; a refusal is
@@ -1093,12 +1446,25 @@ impl AcpSession {
         params: &Value,
         raw: Value,
     ) -> Result<()> {
+        if self.acp_session_id.is_none()
+            || params.get("sessionId").and_then(Value::as_str) != self.acp_session_id.as_deref()
+        {
+            self.write_message(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "outcome": { "outcome": "cancelled" } },
+            }))
+            .await?;
+            return Err(EngineError::Backend(
+                "acp permission has a foreign or missing sessionId".into(),
+            ));
+        }
         let call_update = params.get("toolCall").cloned().unwrap_or(Value::Null);
         let call_id = call_update
             .get("toolCallId")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .filter(|id| !id.trim().is_empty() && id.len() <= 256);
+        let missing_id = call_id.is_none();
+        let call_id = call_id.unwrap_or_default().to_string();
         // Merge what the request carries with what the tool_call/update
         // stream already told us about this call.
         let mut info = self.tool_calls.get(&call_id).cloned().unwrap_or_default();
@@ -1111,50 +1477,144 @@ impl AcpSession {
         if let Some(title) = call_update.get("title").and_then(Value::as_str) {
             info.title = title.to_string();
         }
-        if info.subject.is_empty() {
+        if info.subject.is_empty()
+            || call_update.get("kind").is_some()
+            || call_update.get("rawInput").is_some()
+            || call_update.get("locations").is_some()
+        {
             info.subject = tool_call_subject(&info.kind, &info.title, &call_update);
         }
-        self.tool_calls.insert(call_id.clone(), info.clone());
+        if !missing_id {
+            self.track_tool_call(call_id.clone(), info.clone())?;
+        }
 
-        let decision = decide_permission(&self.spec, &info);
+        let decision = if missing_id {
+            PermissionDecision::Deny("tool call has no valid action identity (toolCallId)".into())
+        } else {
+            match decide_permission(&self.spec, &info) {
+                PermissionDecision::Allow
+                    if !call_update.get("rawInput").is_some_and(Value::is_object)
+                        || info.subject.trim().is_empty() =>
+                {
+                    PermissionDecision::Deny(
+                        "the complete action is unavailable for one-call consent".into(),
+                    )
+                }
+                decision => decision,
+            }
+        };
+        let peer_id = serde_json::to_string(&id)?;
+        if self.pending_permissions.len() >= crate::live_permission::MAX_PENDING
+            || self.seen_permission_ids.len() >= 1024
+            || !self.seen_permission_ids.insert(peer_id)
+            || self
+                .pending_permissions
+                .values()
+                .any(|p| p.proposal.tool_call_id == call_id)
+        {
+            return Err(EngineError::Backend(
+                "duplicate or excessive ACP permission requests".into(),
+            ));
+        }
         let options = params
             .get("options")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let result = permission_response(&decision, &options);
-        self.write_message(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }))
-        .await?;
-
-        if let PermissionDecision::Deny(reason) = &decision {
-            tracing::info!(
-                session_id = %self.session_id,
-                tool_call_id = %call_id,
-                kind = %info.kind,
-                decision = "deny",
-                reason = %reason,
-                "acp permission request refused at the kranz seam"
-            );
-            self.queue.push_back(AgentEvent::ToolResult {
-                tool: Some(info.kind.clone()),
-                denied: true,
-                summary: truncate_chars(
-                    &format!("refused by kranz permission seam: {reason}"),
-                    SUMMARY_MAX_CHARS,
-                ),
-                raw,
-            });
-        } else {
-            // The approval itself is not an event — the peer's own
-            // tool_call_update reports the outcome. The request line stays
-            // in the transcript.
-            self.queue.push_back(AgentEvent::Other { raw });
+        let mut action = call_update;
+        if let Some(fields) = action.as_object_mut() {
+            fields.insert("kind".into(), Value::String(info.kind));
         }
+        let now = chrono::Utc::now();
+        let mut proposal = crate::live_permission::Proposal {
+            id: format!("permission-{}", uuid::Uuid::new_v4()),
+            engine_session_id: self.session_id.clone(),
+            peer_session_id: self.acp_session_id.clone().expect("validated above"),
+            peer_request_id: id,
+            tool_call_id: call_id,
+            action_digest: crate::live_permission::digest(&action)?,
+            options_digest: crate::live_permission::digest(&options)?,
+            action,
+            options,
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(crate::live_permission::REQUEST_TTL_SECS),
+            prohibition: match decision {
+                PermissionDecision::Deny(reason) => Some(reason),
+                PermissionDecision::Allow => None,
+            },
+        };
+        if proposal.option(true).is_none() && proposal.prohibition.is_none() {
+            proposal.prohibition = Some("no unique certified allow_once option was offered".into());
+        }
+        proposal.validate()?;
+        self.pending_permissions.insert(
+            proposal.id.clone(),
+            PendingPermission {
+                proposal: proposal.clone(),
+                expires_at: tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(
+                        crate::live_permission::REQUEST_TTL_SECS as u64,
+                    ),
+            },
+        );
+        self.queue.push_back(AgentEvent::PermissionRequested {
+            proposal: Box::new(proposal),
+            raw,
+        });
         Ok(())
+    }
+
+    async fn answer_permission(&mut self, answer: crate::live_permission::Answer) -> Result<()> {
+        // The biased read may have consumed a fragment before yielding. Do
+        // not authorize against an earlier description until that frame has
+        // been classified. The existing permission deadline bounds this wait.
+        if self.lines.has_partial_line() {
+            self.deferred_permission_answer = Some(answer);
+            return Ok(());
+        }
+        let Some(pending) = self.pending_permissions.get(&answer.proposal.id) else {
+            return Err(EngineError::Backend(
+                "permission response names no live request".into(),
+            ));
+        };
+        if pending.proposal != answer.proposal
+            || chrono::Utc::now() >= pending.proposal.deadline
+            || tokio::time::Instant::now() >= pending.expires_at
+            || (answer.allow
+                && (pending.proposal.prohibition.is_some()
+                    || pending.proposal.option(true).is_none()))
+        {
+            return Err(EngineError::Backend(
+                "stale or prohibited permission response".into(),
+            ));
+        }
+        let proposal = self
+            .pending_permissions
+            .remove(&answer.proposal.id)
+            .expect("checked above")
+            .proposal;
+        let decision = if answer.allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny("one-call consent refused".into())
+        };
+        let result = permission_response(&decision, &proposal.options);
+        let sent = self
+            .write_message(json!({
+                "jsonrpc": "2.0", "id": proposal.peer_request_id, "result": result,
+            }))
+            .await;
+        let delivery = if sent.is_ok() {
+            crate::live_permission::Delivery::Sent
+        } else {
+            crate::live_permission::Delivery::Uncertain
+        };
+        self.queue.push_back(AgentEvent::PermissionResponded {
+            request_id: proposal.id.clone(),
+            delivery: delivery.clone(),
+            raw: json!({"permissionResponse":proposal.id,"delivery":delivery}),
+        });
+        sent
     }
 
     /// Synthesize the terminal `Result` from a `session/prompt` response
@@ -1173,7 +1633,7 @@ impl AcpSession {
     /// and the reason string rides the raw payload so the failure is
     /// diagnosable (`null` when the peer omitted the field entirely).
     fn synthesize_result(&mut self, outcome: RpcOutcome, request_id: u64) {
-        let last_cost_usd = self
+        let cumulative_cost_usd = self
             .last_usage
             .as_ref()
             .and_then(|u| u.get("cost"))
@@ -1181,7 +1641,18 @@ impl AcpSession {
                 cost.get("currency").and_then(Value::as_str) == Some("USD")
                     && cost.get("amount").and_then(Value::as_f64).is_some()
             })
-            .and_then(|cost| cost.get("amount").and_then(Value::as_f64));
+            .and_then(|cost| cost.get("amount").and_then(Value::as_f64))
+            .filter(|amount| amount.is_finite() && *amount >= 0.0);
+        let last_cost_usd = match (
+            self.saw_result,
+            self.previous_cost_total,
+            cumulative_cost_usd,
+        ) {
+            (false, _, total) => total,
+            (true, Some(previous), Some(total)) if total >= previous => Some(total - previous),
+            _ => None,
+        };
+        self.previous_cost_total = cumulative_cost_usd;
         let (text, is_error, raw) = match outcome {
             RpcOutcome::Result(result) => {
                 let stop_reason = result.get("stopReason").and_then(Value::as_str);
@@ -1191,6 +1662,7 @@ impl AcpSession {
                     json!({
                         "promptResponse": result,
                         "usageUpdate": self.last_usage,
+                        "costScope": "turn_delta_from_reported_session_total",
                         "synthesizedBy": "backend_acp",
                         // The classification input, verbatim: exactly what the
                         // peer sent, `null` when it sent nothing — the raw
@@ -1222,65 +1694,109 @@ impl AcpSession {
     }
 
     fn observe(&mut self, event: &AgentEvent) {
-        if let AgentEvent::Result { is_error, .. } = event {
+        if let AgentEvent::Result { .. } = event {
             self.saw_result = true;
-            if !is_error {
-                self.saw_success_result = true;
-            }
         }
     }
 
-    /// Kill the child and reap it, best-effort; also joins the stderr
-    /// capture task. Mirrors `backend_kimi::KimiSession::kill_child`
-    /// exactly: unix process-group SIGKILL (with a post-reap sweep for
-    /// stragglers that raced a mid-fork), windows kill-on-close Job Object.
+    /// Kill only while the leader is still owned. Never signal a cached PID
+    /// after reaping; the same-group cleanup precedes Child::wait.
     async fn kill_child(&mut self) {
-        #[cfg(unix)]
-        {
-            let pgid = self
-                .child
-                .id()
-                .and_then(|pid| i32::try_from(pid).ok())
-                .filter(|pid| *pid > 0);
-            let group_killed = matches!(pgid, Some(pgid) if kill_group(pgid));
-            if !group_killed {
-                let _ = self.child.start_kill();
+        self.stdin.take();
+        if self.child_status.is_none() {
+            kill_owned_peer(
+                &mut self.child,
+                #[cfg(windows)]
+                self.job.as_ref(),
+            );
+            if let Ok(Ok(status)) = tokio::time::timeout(CLEANUP_TIMEOUT, self.child.wait()).await {
+                self.child_status = Some(status);
             }
-            let _ = self.child.wait().await;
-            if group_killed {
-                if let Some(pgid) = pgid {
-                    let _ = kill_group(pgid);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(container) = self.container.as_mut() {
+            if let Err(error) = container.remove().await {
+                self.cleanup_failure
+                    .get_or_insert("container removal failed");
+                tracing::error!(%error, "ACP cleanup requires recovery");
+            }
+        }
+        if let Some(profile) = self.profile_home.as_mut() {
+            if let Err(error) = profile.close() {
+                self.cleanup_failure
+                    .get_or_insert("private credential home cleanup failed");
+                tracing::error!(%error, "ACP private home requires recovery");
+            }
+        }
+        self.finish_stderr().await;
+    }
+
+    async fn finish_stderr(&mut self) {
+        if let Some(mut task) = self.stderr_task.take() {
+            match tokio::time::timeout(CLEANUP_TIMEOUT, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    self.cleanup_failure
+                        .get_or_insert("stderr drain task failed");
+                }
+                Err(_) => {
+                    self.cleanup_failure.get_or_insert("stderr drain timed out");
+                    task.abort();
+                    let _ = task.await;
                 }
             }
-        }
-        #[cfg(windows)]
-        {
-            match &self.job {
-                Some(job) => job.kill(),
-                None => {
-                    let _ = self.child.start_kill();
-                }
-            }
-            let _ = self.child.wait().await;
-        }
-        #[cfg(all(not(unix), not(windows)))]
-        {
-            let _ = self.child.start_kill();
-            let _ = self.child.wait().await;
-        }
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
         }
     }
 
-    async fn finish_at_eof(&mut self) {
-        let status = self.child.wait().await;
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
+    /// A single-shot ACP turn ends with its response, even if the adapter is
+    /// a long-lived server. Give it a short stdin-EOF grace, then terminate
+    /// our owned process group. Contained peers terminate under the trusted
+    /// supervisor; the Docker client's exit status must arrive before success.
+    async fn finish_session(&mut self) {
+        self.stdin.take();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let contained = self.container.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let contained = false;
+        let completion_timeout = if contained {
+            CONTAINER_COMPLETION_TIMEOUT
+        } else {
+            COMPLETION_GRACE
+        };
+        let mut forced = false;
+        if self.child_status.is_none() {
+            match tokio::time::timeout(completion_timeout, wait_for_peer_exit(&mut self.child))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.kill_child().await;
+                    self.exit = Some(SessionExit::Failed(format!(
+                        "acp process observation failed: {error}"
+                    )));
+                    return;
+                }
+                Err(_) if contained => {
+                    self.cleanup_failure
+                        .get_or_insert("container completion deadline expired");
+                }
+                Err(_) => forced = true,
+            }
+            self.kill_child().await;
+        } else {
+            self.kill_child().await;
         }
-        let exit = match status {
-            Ok(status) if status.success() && self.saw_result => SessionExit::Completed,
-            Ok(status) => SessionExit::Failed(format!(
+        if let Some(cause) = self.cleanup_failure {
+            self.exit = Some(SessionExit::Failed(format!(
+                "acp cleanup could not be confirmed: {cause}"
+            )));
+            return;
+        }
+        self.exit = Some(match self.child_status {
+            Some(status) if self.saw_result && (status.success() || forced) => {
+                SessionExit::Completed
+            }
+            Some(status) => SessionExit::Failed(format!(
                 "acp agent exited with {status}{}; stderr tail: {}",
                 if self.saw_result {
                     ""
@@ -1289,12 +1805,8 @@ impl AcpSession {
                 },
                 self.stderr_tail(),
             )),
-            Err(e) => SessionExit::Failed(format!(
-                "failed to reap acp agent process: {e}; stderr tail: {}",
-                self.stderr_tail(),
-            )),
-        };
-        self.exit = Some(exit);
+            None => SessionExit::Failed("acp process did not reap within cleanup deadline".into()),
+        });
     }
 
     fn stderr_tail(&self) -> String {
@@ -1303,12 +1815,20 @@ impl AcpSession {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let captured = self
+            .profile_home
+            .as_ref()
+            .map_or_else(|| captured.clone(), |p| p.scrub(captured.clone()));
         last_chars(captured.trim_end(), STDERR_TAIL_CHARS)
     }
 }
 
 #[async_trait::async_trait]
 impl AgentSession for AcpSession {
+    fn permission_responder(&self) -> Option<crate::live_permission::PermissionResponder> {
+        Some(self.permission_responder.clone())
+    }
+
     fn session_id(&self) -> String {
         self.session_id.clone()
     }
@@ -1321,10 +1841,14 @@ impl AgentSession for AcpSession {
             if self.exit.is_some() {
                 return Ok(None);
             }
+            if self.saw_result && matches!(self.spec.prompt, PromptMode::SingleShot(_)) {
+                self.finish_session().await;
+                return Ok(None);
+            }
             let frame = match self.read_frame().await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
-                    self.finish_at_eof().await;
+                    self.finish_session().await;
                     return Ok(None);
                 }
                 Err(e) => {
@@ -1338,7 +1862,8 @@ impl AgentSession for AcpSession {
                 // peer is gone): fail the session honestly rather than hang.
                 self.kill_child().await;
                 self.exit = Some(SessionExit::Failed(e.to_string()));
-                return Ok(None);
+                // Preserve the rejected frame's diagnostic event.
+                continue;
             }
         }
     }
@@ -1354,30 +1879,49 @@ impl AgentSession for AcpSession {
                 "acp session not established yet; cannot send a message".to_string(),
             ));
         }
+        if matches!(self.spec.prompt, PromptMode::SingleShot(_)) || self.prompt_request_id.is_some()
+        {
+            return Err(EngineError::Backend(
+                "acp session cannot accept an overlapping or single-shot follow-up".into(),
+            ));
+        }
         self.send_prompt(text).await
     }
 
     async fn abort(&mut self) -> Result<()> {
+        if self.exit.is_some() {
+            return Ok(());
+        }
         // Best-effort graceful cancel first (the peer MAY stop its turn
         // cleanly and answer the prompt with stopReason "cancelled"), then
         // the house tree-kill regardless — abort must never depend on the
         // peer honoring the notification.
         if let Some(acp_session_id) = self.acp_session_id.clone() {
-            let _ = self
-                .write_message(json!({
+            let _ = tokio::time::timeout(
+                CANCEL_WRITE_TIMEOUT,
+                self.write_message(json!({
                     "jsonrpc": "2.0",
                     "method": method::SESSION_CANCEL,
                     "params": { "sessionId": acp_session_id },
-                }))
-                .await;
+                })),
+            )
+            .await;
         }
-        let already_exited = matches!(self.child.try_wait(), Ok(Some(_)));
         self.kill_child().await;
-        if self.saw_success_result && already_exited {
-            self.exit = Some(SessionExit::Completed);
-        } else {
-            self.exit = Some(SessionExit::Aborted);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let container_cleanup_failed = self.container.is_some()
+            && (self.cleanup_failure.is_some() || self.child_status.is_none());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let container_cleanup_failed = false;
+        if container_cleanup_failed {
+            let cause = self
+                .cleanup_failure
+                .unwrap_or("host process did not reap within cleanup deadline");
+            let message = format!("acp abort cleanup could not be confirmed: {cause}");
+            self.exit = Some(SessionExit::Failed(message.clone()));
+            return Err(EngineError::Backend(message));
         }
+        self.exit = Some(SessionExit::Aborted);
         Ok(())
     }
 
@@ -1426,7 +1970,7 @@ mod tests {
             notification,
             Frame::Notification { ref method, .. } if method == "session/update"
         ));
-        // Garbage is never a hard failure — transcript only.
+        // Classification retains the diagnostic; the session fails on it.
         let torn = classify_line(r#"{"jsonrpc":"2.0","method":"session/upda"#);
         assert!(matches!(torn, Frame::Unrecognized(_)));
     }
@@ -1598,18 +2142,17 @@ mod tests {
                 decide_permission(&ro, &call)
             );
         }
-        // A writable session still allows an unclassified kind: the read-only
-        // posture is the only thing that turns on the kind.
+        // Unknown kinds cannot bypass deny rules in writable sessions either.
         let writable = spec_with(true, &[]);
         let other = ToolCallInfo {
             kind: "other".to_string(),
             title: "think".to_string(),
             subject: "think".to_string(),
         };
-        assert_eq!(
+        assert!(matches!(
             decide_permission(&writable, &other),
-            PermissionDecision::Allow
-        );
+            PermissionDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -1629,5 +2172,18 @@ mod tests {
             &[options[0].clone()],
         );
         assert_eq!(deny_no_reject["outcome"]["outcome"], json!("cancelled"));
+        for (kind, decision) in [
+            ("allow_once", PermissionDecision::Allow),
+            ("reject_once", PermissionDecision::Deny("refused".into())),
+        ] {
+            let ambiguous = vec![
+                json!({"optionId":"a","kind":kind}),
+                json!({"optionId":"b","kind":kind}),
+            ];
+            assert_eq!(
+                permission_response(&decision, &ambiguous)["outcome"]["outcome"],
+                "cancelled"
+            );
+        }
     }
 }

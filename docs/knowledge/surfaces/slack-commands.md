@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-20
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -181,3 +181,15 @@ approve and queue, `/kranz work run` to execute, and the **Merge** button to
 merge. The interactive deep-link buttons resolved via `slack.dashboardUrl`
 (configured to http://127.0.0.1:4560/ for this run). No other CLI commands
 were used — the CLI's role was limited to starting the bridge process.
+
+## ACP one-call permission cards
+
+`PermissionReady` shows the mission, run, workspace, deadline and complete action.
+The card offers **Allow once** only when the action and workspace fit the card
+and policy permits it; otherwise it points to the dashboard and retains deny.
+Permission buttons carry the exact mission/request/binding digest. The bridge
+requires a nonempty verified user ID even under `allowAllUsers`, checks the
+existing allowlist, and enqueues a signed `ResolvePermission` command with that
+Slack identity. A queued answer is distinct from durable resolution and delivery.
+No response URL or display label can invent the actor.
+See [setup and usage](../../acp-live-permissions.md).

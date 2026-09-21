@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Contained evaluator API, pinned registrations and hostile-checker proofs completed and independently reviewed in the ACP/gate stack. Creation-budget correction is included before downstream integration. Accepted with the v0.3.0 integration; see docs/reviews/2026-09-20-v030-integration.md. External command-permission evaluators remain unsupported.
+state: done
 title: External gate evaluator — contained JSON-RPC subprocess and pack registration
 priority: 1
 schedule: once
@@ -44,3 +45,12 @@ seams; deterministic command gates and Flight Rules remain supported.
 ## Out of scope
 
 Plugin daemons, remote protocols, a marketplace and domain-specific checkers.
+
+## Implementation candidate (2026-09-15 UTC)
+
+The explicit engine API and schema-5 registration are implemented on
+`codex/gate-subprocess-evaluator`. See `docs/external-evaluators.md` and the
+five-axis author review in `docs/reviews/2026-09-14-gate-subprocess-evaluator.md`.
+At that checkpoint, local macOS/Colima hostile-checker proof was green and the
+ticket stayed open pending Linux containment proof and remote regression checks.
+Mission-stage consumption and automated replay/recovery remain S5, as scoped.

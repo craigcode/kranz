@@ -29,6 +29,13 @@ use std::path::Path;
 /// [`crate::config::NotifyFlags`] and pick the formatter.
 #[derive(Debug, Clone)]
 pub enum Outbound {
+    GateReview {
+        mission_id: String,
+        gate: String,
+        stage: String,
+        reason: String,
+    },
+    PermissionReady(Box<kranz_engine::live_permission::Request>),
     PlanReady(PlanReady),
     RevisionReady(RevisionReady),
     GrantReady(GrantReady),
@@ -42,6 +49,8 @@ impl Outbound {
     /// on the payload variant.
     pub fn class(&self) -> NotifyClass {
         match self {
+            Outbound::GateReview { .. } => NotifyClass::Blocked,
+            Outbound::PermissionReady(_) => NotifyClass::Blocked,
             Outbound::PlanReady(_) => NotifyClass::PlanReady,
             Outbound::RevisionReady(_) => NotifyClass::PlanReady,
             // A parked grant is an attention-needed block on the milestone, so
@@ -77,6 +86,31 @@ pub enum NotifyClass {
 /// degrades `diff_stat` to `None`, same as an unset cost.
 pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option<Outbound> {
     match &event.kind {
+        EventKind::GateResolutionRecorded { resolution }
+            if resolution.disposition
+                != kranz_engine::gate_evaluation::lifecycle::Disposition::Proceed =>
+        {
+            let record = state.gate_evaluations.get(resolution.attempt_id.as_str())?;
+            let reason = match record.finished.as_ref().map(|f| &f.outcome) {
+                Some(kranz_engine::gate_evaluation::lifecycle::Outcome::Evaluated {
+                    result,
+                    ..
+                }) => result.rationale.clone(),
+                Some(kranz_engine::gate_evaluation::lifecycle::Outcome::Error { message }) => {
+                    message.clone()
+                }
+                None => resolution.rationale.clone(),
+            };
+            Some(Outbound::GateReview {
+                mission_id: state.mission.id.clone(),
+                gate: record.requested.request.params.gate_id.as_str().into(),
+                stage: format!("{:?}", record.requested.request.params.stage),
+                reason,
+            })
+        }
+        EventKind::PermissionRequested { request } if request.proposal.prohibition.is_none() => {
+            Some(Outbound::PermissionReady(Box::new(request.clone())))
+        }
         EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
             mission_id: state.mission.id.clone(),
             goal: plan.goal.clone(),
@@ -234,6 +268,9 @@ mod tests {
 
     fn base_state() -> MissionState {
         MissionState {
+            permissions: Default::default(),
+            gate_evaluations: Default::default(),
+            consumed_gate_resolutions: Default::default(),
             feature_base_shas: Default::default(),
             mission: Mission {
                 id: "m-1".into(),

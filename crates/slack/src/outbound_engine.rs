@@ -444,6 +444,13 @@ async fn post_outbound(
 ) -> Result<()> {
     let dash = cfg.dashboard_url.as_deref();
     let blocks = match outbound {
+        Outbound::GateReview {
+            mission_id,
+            gate,
+            stage,
+            reason,
+        } => crate::format::build_gate_review(mission_id, gate, stage, reason, dash),
+        Outbound::PermissionReady(p) => crate::format::build_permission_ready(p, dash),
         Outbound::PlanReady(p) => crate::format::build_plan_ready(p, dash),
         Outbound::RevisionReady(r) => crate::format::build_revision_ready(r, dash),
         Outbound::GrantReady(g) => crate::format::build_grant_ready(g, dash),

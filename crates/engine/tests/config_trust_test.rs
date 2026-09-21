@@ -72,6 +72,7 @@ fn sensitive_keys_and_children_preserve_project_operator_and_inbox_policies() {
             "tools",
             "acpCommand",
             "acpArgs",
+            "acpProfile",
             "baseUrl",
             "sandbox.extraWrite",
             "sandbox.egress",

@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-21
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -46,6 +46,10 @@ left to per-mission capture:
   validation assertion; completed milestones are frozen.
 - **kranz never pushes by default.** The explicit cloud handoff can push only
   a completed `kranz/*` branch; see the invariants note.
+- **Own preflight helpers.** A host CLI timeout does not remove its daemon
+  container. Bound the guest lifetime, delete only owned full IDs, and require
+  confirmed absence; retain recovery intent when creation or cleanup is uncertain.
+  See mount preflight ownership in the invariants note.
 - **Sandbox mount ordering.** Restoring a writable private workspace must
   preserve covered Git/cache write protections and later authority masks;
   see the authority-material rule in the invariants note.

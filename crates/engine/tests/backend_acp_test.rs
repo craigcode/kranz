@@ -61,11 +61,68 @@ fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> Se
     }
 }
 
+#[tokio::test]
+async fn acp_containment_v1_uncertified_sandbox_is_refused_before_peer_spawn() {
+    use kranz_engine::sandbox::{ResolvedSandbox, SandboxBackend, SandboxInputs};
+    use kranz_engine::types::SandboxEnforce;
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(
+        dir.path(),
+        "must-not-run.sh",
+        "#!/bin/sh\ntouch spawned\nexit 1\n",
+    );
+    for backend in [
+        SandboxBackend::Seatbelt,
+        SandboxBackend::Bubblewrap,
+        SandboxBackend::Container,
+        SandboxBackend::AppContainer,
+    ] {
+        let mut spec = spec(dir.path(), "uncertified-containment", true, &[]);
+        spec.sandbox = Some(ResolvedSandbox {
+            backend,
+            inputs: SandboxInputs {
+                enforce: SandboxEnforce::FsNet,
+                session_cwd: dir.path().into(),
+                mission_dir: dir.path().join(".kranz/missions/m-test"),
+                tmpdir: dir.path().join("scratch"),
+                extra_write: vec![],
+                egress: vec![],
+                validator_read_deny_roots: vec![],
+            },
+            container: None,
+        });
+        let error = match AcpBackend::new(&peer, vec![]).start(spec).await {
+            Ok(_) => panic!("an uncertified {backend:?} sandbox was admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing the supplied sandbox before spawn"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("spawned").exists(),
+            "{backend:?} executed outside its promised boundary"
+        );
+    }
+}
+
+// Transport-only fixtures act as an explicit test broker. Engine durability
+// and operator authority are exercised separately by the live-consent tests.
 async fn next(session: &mut Box<dyn AgentSession>) -> Option<AgentEvent> {
-    session
+    let event = session
         .next_event()
         .await
-        .expect("next_event should not error")
+        .expect("next_event should not error");
+    if let Some(AgentEvent::PermissionRequested { proposal, .. }) = &event {
+        session
+            .permission_responder()
+            .unwrap()
+            .respond(proposal, proposal.prohibition.is_none())
+            .unwrap();
+    }
+    event
 }
 
 /// The mock-peer preamble: a read loop that answers `initialize` and
@@ -188,18 +245,17 @@ async fn backend_acp_full_session_streams_ordered_events() {
         .await
         .expect("handshake should succeed");
 
-    // Init is synthesized from the handshake with the PEER's session id and
-    // the CONFIGURED model (ACP v1 reports no model on the wire).
+    // This peer reports no model. Configured attribution is not confirmation.
     match next(&mut session).await.expect("init") {
         AgentEvent::Init {
             session_id, model, ..
         } => {
             assert_eq!(session_id, "acp-mock-session-1");
-            assert_eq!(model, "acp-configured-model");
+            assert_eq!(model, "unreported");
         }
         other => panic!("expected Init, got {other:?}"),
     }
-    assert_eq!(session.session_id(), "acp-mock-session-1");
+    assert_eq!(session.session_id(), "kranz-sess-1");
 
     match next(&mut session).await.expect("chunk 1") {
         AgentEvent::Text { text, .. } => assert_eq!(text, "Hello "),
@@ -318,12 +374,10 @@ async fn backend_acp_disallowed_tool_is_refused_at_the_seam() {
                 assert_eq!(tool, "execute");
                 saw_tool_use = true;
             }
-            AgentEvent::ToolResult {
-                denied: true,
-                summary,
-                ..
-            } => {
-                denial_summaries.push(summary);
+            AgentEvent::PermissionRequested { proposal, .. } => {
+                if let Some(reason) = proposal.prohibition {
+                    denial_summaries.push(reason);
+                }
             }
             _ => {}
         }
@@ -338,8 +392,7 @@ async fn backend_acp_disallowed_tool_is_refused_at_the_seam() {
         "exactly one synthesized denial event is expected: {denial_summaries:?}"
     );
     assert!(
-        denial_summaries[0].contains("refused by kranz permission seam")
-            && denial_summaries[0].contains("Bash(git push*)"),
+        denial_summaries[0].contains("Bash(git push*)"),
         "the denial event names the seam and the rule: {}",
         denial_summaries[0]
     );
@@ -371,13 +424,10 @@ async fn backend_acp_read_only_session_refuses_mutating_kinds() {
 
     let mut denial_summaries = Vec::new();
     while let Some(event) = next(&mut session).await {
-        if let AgentEvent::ToolResult {
-            denied: true,
-            summary,
-            ..
-        } = event
-        {
-            denial_summaries.push(summary);
+        if let AgentEvent::PermissionRequested { proposal, .. } = event {
+            if let Some(reason) = proposal.prohibition {
+                denial_summaries.push(reason);
+            }
         }
     }
     assert_eq!(denial_summaries.len(), 1, "{denial_summaries:?}");
@@ -426,7 +476,7 @@ async fn backend_acp_kill_mid_session_leaves_a_clean_aborted_stream() {
 }
 
 #[tokio::test]
-async fn backend_acp_torn_final_line_is_not_a_parse_failure() {
+async fn backend_acp_torn_final_line_is_retained_as_a_failed_protocol_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let peer = write_peer(dir.path(), "mock-acp-die.sh", &torn_then_die_peer());
     let backend = AcpBackend::new(peer, vec![]);
@@ -436,17 +486,20 @@ async fn backend_acp_torn_final_line_is_not_a_parse_failure() {
         .await
         .unwrap();
     let mut texts = Vec::new();
-    // Drain: next_event must never error on the torn tail — it surfaces at
-    // most as an Other transcript entry.
+    let mut torn_receipt = false;
+    // The malformed tail is retained, and the session fails closed.
     while let Some(event) = next(&mut session).await {
-        if let AgentEvent::Text { text, .. } = event {
-            texts.push(text);
+        match event {
+            AgentEvent::Text { text, .. } => texts.push(text),
+            AgentEvent::Other { raw } if raw.get("unparsed").is_some() => torn_receipt = true,
+            _ => {}
         }
     }
+    assert!(torn_receipt);
     assert_eq!(texts, vec!["partial work"]);
     match session.exit_status() {
         Some(SessionExit::Failed(msg)) => assert!(
-            msg.contains("without answering session/prompt"),
+            msg.contains("malformed JSON-RPC"),
             "peer death mid-turn is an honest failure: {msg}"
         ),
         other => panic!("expected Failed, got {other:?}"),
@@ -723,4 +776,657 @@ async fn backend_acp_acp_stop_reason_truncated_turn_validator_cannot_pass() {
         "a max_tokens validator turn must fail honestly, got {:?}",
         outcome.result
     );
+}
+
+#[tokio::test]
+async fn acp_compat_v1_reports_peer_model_and_preserves_role_prompt_and_engine_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let captured = dir.path().join("prompt.json");
+    let body = full_session_peer()
+        .replace(
+            r#""result":{"sessionId":"acp-mock-session-1"}"#,
+            r#""result":{"sessionId":"acp-mock-session-1","models":{"currentModelId":"legacy-label"},"configOptions":[{"id":"model","category":"model","currentValue":"peer-model"}]}"#,
+        )
+        .replace(
+            "    *'\"method\":\"session/prompt\"'*)\n",
+            "    *'\"method\":\"session/prompt\"'*)\n      printf '%s' \"$line\" > \"$KRANZ_ACP_PROMPT_CAPTURE\"\n",
+        );
+    let peer = write_peer(dir.path(), "model-and-prompt.sh", &body);
+    let mut request = spec(dir.path(), "engine-identity", true, &[]);
+    request.append_system_prompt = Some("Existing worker role instructions.".into());
+    request.env.insert(
+        "KRANZ_ACP_PROMPT_CAPTURE".into(),
+        captured.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    match next(&mut session).await.unwrap() {
+        AgentEvent::Init {
+            session_id,
+            model,
+            raw,
+        } => {
+            assert_eq!(session_id, "acp-mock-session-1");
+            assert_eq!(model, "peer-model");
+            assert_eq!(raw["engineSessionId"], "engine-identity");
+            assert_eq!(raw["configuredModel"], "acp-configured-model");
+            assert_eq!(raw["modelSource"], "peer");
+            assert_eq!(raw["configuredModelSelectionApplied"], false);
+        }
+        event => panic!("expected Init, got {event:?}"),
+    }
+    assert_eq!(session.session_id(), "engine-identity");
+    while next(&mut session).await.is_some() {}
+    let sent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+    assert_eq!(
+        sent["params"]["prompt"][0]["text"],
+        "Existing worker role instructions.\n\ndo the thing"
+    );
+    assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+}
+
+#[tokio::test]
+async fn acp_compat_v1_foreign_updates_cannot_supply_the_worker_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = full_session_peer().replace(
+        r#""params":{"sessionId":"acp-mock-session-1""#,
+        r#""params":{"sessionId":"another-session""#,
+    );
+    let peer = write_peer(dir.path(), "foreign-update.sh", &body);
+    let mut session = AcpBackend::new(peer, vec![])
+        .start(spec(dir.path(), "engine-foreign", true, &[]))
+        .await
+        .unwrap();
+    while let Some(event) = next(&mut session).await {
+        assert!(!matches!(
+            event,
+            AgentEvent::Text { .. } | AgentEvent::Result { .. }
+        ));
+    }
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Failed(reason)) if reason.contains("sessionId"))
+    );
+}
+
+#[tokio::test]
+async fn acp_compat_v1_changed_permission_input_rechecks_the_current_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let captured = dir.path().join("permission-outcome");
+    // The announced call was harmless; the permission request changes its raw
+    // command while reusing the same tool ID. Only the mock writes the receipt.
+    let body = permission_peer("execute", "git push origin main").replacen(
+        r#""rawInput":{"command":"git push origin main"}"#,
+        r#""rawInput":{"command":"cargo test --workspace"}"#,
+        1,
+    );
+    let peer = write_peer(dir.path(), "changed-permission.sh", &body);
+    let mut request = spec(dir.path(), "engine-permission", true, &["Bash(git push*)"]);
+    request.env.insert(
+        "KRANZ_ACP_PEER_OUTCOME".into(),
+        captured.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let mut denied = false;
+    while let Some(event) = next(&mut session).await {
+        if matches!(event, AgentEvent::PermissionRequested { proposal, .. } if proposal.prohibition.is_some())
+        {
+            denied = true;
+        }
+    }
+    assert!(denied);
+    assert_eq!(std::fs::read_to_string(captured).unwrap().trim(), "reject");
+}
+
+#[tokio::test]
+async fn acp_compat_v1_stalled_prompt_stdin_has_a_bounded_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // Reply to session/new, then stop reading before the much larger prompt.
+    let body = r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r new_session
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"acp-mock-session-1"}}'
+sleep 300
+"#;
+    let peer = write_peer(dir.path(), "stalled-stdin.sh", body);
+    let mut request = spec(dir.path(), "engine-stalled", true, &[]);
+    request.prompt = PromptMode::SingleShot("x".repeat(1024 * 1024));
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        AcpBackend::new(peer, vec![]).start(request),
+    )
+    .await
+    .expect("a stalled write must not park backend start indefinitely");
+    assert!(matches!(result, Err(error) if error.to_string().contains("stdin write timed out")));
+}
+
+async fn drain_bounded(session: &mut Box<dyn AgentSession>) -> Vec<AgentEvent> {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let mut events = Vec::new();
+        while let Some(event) = next(session).await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("ACP session must finish within its cleanup bound")
+}
+
+fn process_running(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        if status
+            .lines()
+            .any(|line| line.starts_with("State:") && line.contains('Z'))
+        {
+            return false;
+        }
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_completion_and_peer_death_kill_same_group_descendants() {
+    // Exercise all three lifecycle paths, including a descendant that keeps
+    // stdout/stderr open after its parent has already exited.
+    for scenario in ["daemon", "peer-death", "closed-stdout"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = no_usage_peer().replace(
+            "    *'\"method\":\"session/prompt\"'*)\n",
+            "    *'\"method\":\"session/prompt\"'*)\n      sleep 300 &\n      echo $! > descendant.pid\n",
+        );
+        body = match scenario {
+            "daemon" => body.replace("      exit 0\n", "      sleep 300\n"),
+            "peer-death" => body.replace(
+                "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":'\"$id\"',\"result\":{\"stopReason\":\"end_turn\"}}'\n      exit 0\n",
+                "      exit 3\n",
+            ),
+            _ => body.replace("      exit 0\n", "      exec 1>&-\n      sleep 300\n"),
+        };
+        let peer = write_peer(dir.path(), "descendants.sh", &body);
+        let mut session = AcpBackend::new(peer, vec![])
+            .start(spec(dir.path(), scenario, true, &[]))
+            .await
+            .unwrap();
+        let events = drain_bounded(&mut session).await;
+        let pid: i32 = std::fs::read_to_string(dir.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while process_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same-group descendant survived session completion");
+        if scenario == "peer-death" {
+            assert!(matches!(
+                session.exit_status(),
+                Some(SessionExit::Failed(_))
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Result { .. })));
+        } else {
+            assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Result {
+                    is_error: false,
+                    ..
+                }
+            )));
+        }
+    }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_nonzero_exit_after_report_is_not_hidden_by_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(
+        dir.path(),
+        "nonzero.sh",
+        &no_usage_peer().replace("exit 0", "exit 23"),
+    );
+    let mut session = AcpBackend::new(peer, vec![])
+        .start(spec(dir.path(), "nonzero", true, &[]))
+        .await
+        .unwrap();
+    let events = drain_bounded(&mut session).await;
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Result { .. })));
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Failed(reason)) if reason.contains("23"))
+    );
+}
+
+#[tokio::test]
+async fn acp_compat_v1_malformed_frames_cannot_be_followed_by_a_successful_report() {
+    for malformed in [
+        r#"{"jsonrpc":"1.0","id":3,"result":{"stopReason":"end_turn"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"result":{},"error":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled","stopReason":"end_turn"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"id":3,"result":{"stopReason":"end_turn"}}"#,
+        "not JSON",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let body = no_usage_peer().replace(
+            "    *'\"method\":\"session/prompt\"'*)\n",
+            &format!(
+                "    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{malformed}'\n"
+            ),
+        );
+        let peer = write_peer(dir.path(), "malformed.sh", &body);
+        let mut session = AcpBackend::new(peer, vec![])
+            .start(spec(dir.path(), "malformed", true, &[]))
+            .await
+            .unwrap();
+        let events = drain_bounded(&mut session).await;
+        assert!(
+            matches!(session.exit_status(), Some(SessionExit::Failed(_))),
+            "{malformed}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Result { .. })),
+            "{malformed}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Other { .. })));
+    }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_permission_requires_identity_and_a_valid_once_option() {
+    use serde_json::json;
+    let cases = [
+        (
+            "tc-1",
+            json!([{"optionId":"persist","kind":"allow_always"}]),
+            "cancelled",
+        ),
+        (
+            "tc-1",
+            json!([{"optionId":"unknown","kind":"surprise"}]),
+            "cancelled",
+        ),
+        (
+            "tc-1",
+            json!([{"optionId":"","kind":"allow_once"}]),
+            "cancelled",
+        ),
+        (
+            "tc-1",
+            json!([{"optionId":"same","kind":"allow_once"},{"optionId":"same","kind":"reject_once"}]),
+            "cancelled",
+        ),
+        (
+            "",
+            json!([{"optionId":"opaque-allow","kind":"allow_once"}]),
+            "cancelled",
+        ),
+        (
+            "tc-1",
+            json!([{"optionId":"opaque-adapter-id","kind":"allow_once"}]),
+            "selected",
+        ),
+    ];
+    for (action_id, options, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let permission = json!({"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{
+            "sessionId":"acp-mock-session-1","toolCall":{"toolCallId":action_id,"kind":"execute","rawInput":{"command":"cargo test"}},"options":options
+        }});
+        let body = format!("{PEER_PREAMBLE}    *'\"method\":\"session/prompt\"'*)\n      printf '%s\\n' '{permission}'\n      IFS= read -r answer\n      printf '%s' \"$answer\" > permission.json\n      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"stopReason\":\"end_turn\"}}}}'\n      exit 0\n      ;;\n{PEER_SUFFIX}");
+        let peer = write_peer(dir.path(), "permission-options.sh", &body);
+        let mut session = AcpBackend::new(peer, vec![])
+            .start(spec(dir.path(), "options", true, &[]))
+            .await
+            .unwrap();
+        let events = drain_bounded(&mut session).await;
+        let answer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("permission.json")).unwrap())
+                .unwrap();
+        assert_eq!(answer["result"]["outcome"]["outcome"], expected);
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::PermissionRequested { proposal, .. } if proposal.prohibition.is_some())),
+            expected == "cancelled"
+        );
+        if expected == "selected" {
+            assert_eq!(answer["result"]["outcome"]["optionId"], "opaque-adapter-id");
+        }
+    }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_actual_worker_runner_parses_report_from_a_persistent_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = MissionPaths::new(dir.path(), "m-acp-report");
+    let mut log = EventLog::acquire(&paths, "m-acp-report", Duration::ZERO, LockForce::No).unwrap();
+    let feature = Feature {
+        id: "f-1".into(),
+        title: "Protocol fixture".into(),
+        spec: "Return the protocol fixture".into(),
+        validation_criteria: vec!["report parses".into()],
+        origin: FeatureOrigin::Plan,
+        status: FeatureStatus::Pending,
+        worker_runs: vec![],
+        commits: vec![],
+        respawns: 0,
+    };
+    let update = serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":r#"{"result":"partial","summary":"kranz-acp-live-fixture-v1","knownGaps":["Protocol fixture only"],"escalation":null}"#}});
+    let body = format!("{PEER_PREAMBLE}    *'\"method\":\"session/prompt\"'*)\n      printf '%s' \"$line\" > prompt.json\n{}      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"stopReason\":\"end_turn\"}}}}'\n      sleep 300\n      ;;\n{PEER_SUFFIX}", notification(&update.to_string()));
+    let peer = write_peer(dir.path(), "runner-report.sh", &body);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(6),
+        kranz_engine::runner::run_worker(
+            &AcpBackend::new(peer, vec![]),
+            &mut log,
+            &paths,
+            &MissionConfig::default(),
+            &feature,
+            "Protocol fixture",
+            "Compatibility",
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            AuthVerdict::Inconclusive,
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("worker runner must not wait for the adapter daemon to exit")
+    .unwrap();
+    assert_eq!(outcome.exit, SessionExit::Completed);
+    assert_eq!(outcome.result, RunResult::Partial);
+    assert_eq!(outcome.report.unwrap().summary, "kranz-acp-live-fixture-v1");
+    assert_eq!(outcome.cost_usd, None);
+    assert_ne!(outcome.session_id, "acp-mock-session-1");
+    let prompt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("prompt.json")).unwrap()).unwrap();
+    let text = prompt["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("filesTouched"),
+        "the existing worker report instructions must reach ACP"
+    );
+}
+
+#[tokio::test]
+async fn acp_compat_v1_oversized_and_invalid_utf8_frames_fail_before_a_report() {
+    for emit in [
+        "dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\\000' x\nsleep 300",
+        "printf '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"acp-mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"\\377\"}}}}\\n'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let body = no_usage_peer().replace("    *'\"method\":\"session/prompt\"'*)\n", &format!("    *'\"method\":\"session/prompt\"'*)\n{emit}\n"));
+        let peer = write_peer(dir.path(), "bad-bytes.sh", &body);
+        let mut session = AcpBackend::new(peer, vec![]).start(spec(dir.path(), "bad-bytes", true, &[])).await.unwrap();
+        let events = drain_bounded(&mut session).await;
+        assert!(matches!(session.exit_status(), Some(SessionExit::Failed(_))));
+        assert!(!events.iter().any(|event| matches!(event, AgentEvent::Text { .. } | AgentEvent::Result { .. })));
+    }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_handshake_rejects_version_and_missing_session_identity() {
+    for (body, expected) in [
+        (
+            no_usage_peer().replace("\"protocolVersion\":1", "\"protocolVersion\":999"),
+            "negotiated protocol version 999",
+        ),
+        (
+            no_usage_peer().replace("\"sessionId\":\"acp-mock-session-1\"", "\"sessionId\":\"\""),
+            "session/new response carried no sessionId",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let body = body.replace("#!/bin/sh\n", "#!/bin/sh\necho $$ > peer.pid\n");
+        let peer = write_peer(dir.path(), "bad-handshake.sh", &body);
+        // start() also prepares the isolated toolchain home and reaps the
+        // rejected peer. The semantic rejection, not a three-second host I/O
+        // benchmark, is this test's contract. A handshake timeout cannot pass.
+        let result = tokio::time::timeout(
+            Duration::from_secs(35),
+            AcpBackend::new(peer, vec![]).start(spec(dir.path(), "handshake", true, &[])),
+        )
+        .await
+        .expect("invalid handshake must reject and reap within its outer budget");
+        let error = match result {
+            Ok(_) => panic!("invalid handshake was accepted: {expected}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "wrong rejection: {error}");
+        assert!(!error.contains("cleanup unconfirmed"), "{error}");
+        let pid = std::fs::read_to_string(dir.path().join("peer.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "peer still exists");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "rejected peer must be reaped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn acp_compat_v1_handshake_timeout_reaps_the_unresponsive_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = write_peer(
+        dir.path(),
+        "handshake-timeout.sh",
+        "#!/bin/sh\necho $$ > peer.pid\nexec sleep 300\n",
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(35),
+        AcpBackend::new(peer, vec![]).start(spec(dir.path(), "timeout", true, &[])),
+    )
+    .await
+    .expect("handshake timeout must be bounded");
+    assert!(matches!(result, Err(error) if error.to_string().contains("handshake timeout")));
+    let pid = std::fs::read_to_string(dir.path().join("peer.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!process_running(pid));
+}
+
+#[tokio::test]
+async fn acp_compat_v1_streaming_cost_uses_deltas_and_preserves_telemetry_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let update = |amount| {
+        notification(&format!(
+            r#"{{"sessionUpdate":"usage_update","used":100,"size":200000,"cost":{{"currency":"USD","amount":{amount}}}}}"#
+        ))
+    };
+    let body = format!("turn=0\n{PEER_PREAMBLE}").replace("turn=0\n#!/bin/sh", "#!/bin/sh\nturn=0") + &format!(
+        "    *'\"method\":\"session/prompt\"'*)\n      turn=$((turn + 1))\n      case $turn in\n      1)\n{}      ;;\n      2)\n{}      ;;\n      4)\n{}      ;;\n      esac\n      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":'\"$id\"',\"result\":{{\"stopReason\":\"end_turn\"}}}}'\n      ;;\n{PEER_SUFFIX}", update(0.5), update(0.75), update(1.5));
+    let peer = write_peer(dir.path(), "cost-deltas.sh", &body);
+    let mut request = spec(dir.path(), "costs", true, &[]);
+    request.prompt = PromptMode::Streaming("first".into());
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    for (turn, expected) in [Some(0.5), Some(0.25), None, None].into_iter().enumerate() {
+        if turn > 0 {
+            session.send_user_message("next").await.unwrap();
+        }
+        let cost = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(AgentEvent::Result { cost_usd, .. }) = next(&mut session).await {
+                    break cost_usd;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cost, expected);
+    }
+    session.abort().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_permission_pumps_output_before_consent_and_sends_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let mut body = permission_peer("execute", "printf fixture");
+    // A progress notification after the request must be readable before consent.
+    let progress = notification(
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"waiting for consent"}}"#,
+    );
+    // Insert directly after the permission request line, before the shell reads.
+    let start = body.find("session/request_permission").unwrap();
+    let needle = start + body[start..].find('\n').unwrap();
+    body.insert_str(needle + 1, &progress);
+    let peer = write_peer(dir.path(), "live-consent.sh", &body);
+    let mut request = spec(dir.path(), "live-permission-session", true, &[]);
+    request.env.insert(
+        "KRANZ_ACP_PEER_OUTCOME".into(),
+        outcome.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let mut proposal = None;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = session.next_event().await.unwrap() {
+            match event {
+                AgentEvent::PermissionRequested { proposal: p, .. } => proposal = Some(p),
+                AgentEvent::Text { text, .. } if text == "waiting for consent" => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!outcome.exists(), "no effect before consent");
+    let proposal = proposal.expect("live request delivered");
+    session
+        .permission_responder()
+        .unwrap()
+        .respond(&proposal, true)
+        .unwrap();
+    let events = drain_bounded(&mut session).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::PermissionResponded {
+                    delivery: kranz_engine::live_permission::Delivery::Sent,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(outcome).unwrap().trim(), "allow");
+}
+
+#[tokio::test]
+async fn live_permission_changed_action_cannot_use_a_queued_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let ready = dir.path().join("fragment-written");
+    let release = dir.path().join("finish-frame");
+    let mut body = permission_peer("execute", "printf fixture");
+    let changed = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-mock-session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","rawInput":{"command":"git push origin main"}}}}"#;
+    let (prefix, suffix) = changed.split_at(changed.len() / 2);
+    let fragmented = format!(
+        r#"      printf '%s' '{prefix}'
+      printf ready > "$KRANZ_ACP_PEER_READY"
+      while [ ! -f "$KRANZ_ACP_PEER_RELEASE" ]; do sleep 0.01; done
+      printf '%s\n' '{suffix}'
+"#
+    );
+    let start = body.find("session/request_permission").unwrap();
+    let needle = start + body[start..].find('\n').unwrap();
+    body.insert_str(needle + 1, &fragmented);
+    let peer = write_peer(dir.path(), "changed-live-consent.sh", &body);
+    let mut request = spec(dir.path(), "live-permission-changed", true, &[]);
+    for (name, path) in [
+        ("KRANZ_ACP_PEER_OUTCOME", &outcome),
+        ("KRANZ_ACP_PEER_READY", &ready),
+        ("KRANZ_ACP_PEER_RELEASE", &release),
+    ] {
+        request.env.insert(name.into(), path.display().to_string());
+    }
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    let proposal = loop {
+        if let Some(AgentEvent::PermissionRequested { proposal, .. }) =
+            session.next_event().await.unwrap()
+        {
+            break proposal;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // No complete notification exists yet. Cancellation must preserve the
+    // fragment, and consent cannot overtake it while the peer holds the rest.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    session
+        .permission_responder()
+        .unwrap()
+        .respond(&proposal, true)
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), session.next_event())
+            .await
+            .is_err()
+    );
+    assert!(!outcome.exists());
+    std::fs::write(release, "continue").unwrap();
+    drain_bounded(&mut session).await;
+    assert!(matches!(
+        session.exit_status(),
+        Some(SessionExit::Failed(_))
+    ));
+    assert!(!outcome.exists());
+}
+
+#[tokio::test]
+async fn live_permission_cancel_with_an_unanswered_request_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = dir.path().join("effect");
+    let peer = write_peer(
+        dir.path(),
+        "cancel-live-consent.sh",
+        &permission_peer("execute", "printf fixture"),
+    );
+    let mut request = spec(dir.path(), "live-permission-cancel", true, &[]);
+    request.env.insert(
+        "KRANZ_ACP_PEER_OUTCOME".into(),
+        outcome.display().to_string(),
+    );
+    let mut session = AcpBackend::new(peer, vec![]).start(request).await.unwrap();
+    while let Some(event) = session.next_event().await.unwrap() {
+        if matches!(event, AgentEvent::PermissionRequested { .. }) {
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), session.abort())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
+    assert!(!outcome.exists());
 }

@@ -21,6 +21,7 @@ pub mod paths;
 pub mod plan_fit;
 pub mod types;
 
+pub mod acp_worker;
 pub mod agent_env;
 #[cfg(windows)]
 pub(crate) mod appcontainer_windows;
@@ -47,6 +48,7 @@ pub mod event_log;
 pub mod evidence_bundle;
 pub mod findings;
 pub mod gate;
+pub mod gate_evaluation;
 pub mod gate_results;
 pub mod gate_score_flags;
 pub mod gate_scores;
@@ -57,6 +59,7 @@ pub mod hooks;
 pub mod judgement;
 pub mod knowledge;
 pub mod lessons;
+pub mod live_permission;
 pub mod merge;
 pub mod merged;
 pub mod migrate_state;
@@ -86,6 +89,7 @@ pub mod standards_enforcement;
 pub mod standards_metrics;
 pub mod standards_waiver;
 mod stream_bounds;
+mod strict_json;
 /// Runtime-gated test support: skip loudly, and fail where the capability is
 /// required, so a silent skip cannot masquerade as a pass.
 pub mod test_capability;
@@ -106,6 +110,8 @@ pub mod workspace_gate;
 pub mod workspace_provider;
 pub mod workspace_remote;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod acp_container;
 pub mod backend_acp;
 pub mod backend_claude;
 pub mod backend_codex;

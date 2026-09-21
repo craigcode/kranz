@@ -155,11 +155,21 @@ where
 pub(crate) struct BoundedLines<R> {
     reader: BufReader<R>,
     cap: usize,
+    strict: bool,
+    window: TailWindow,
 }
 
 impl<R: AsyncRead + Unpin> BoundedLines<R> {
     pub(crate) fn new(inner: R) -> Self {
         Self::with_cap(inner, STDOUT_LINE_CAP)
+    }
+
+    /// Protocols with authority-bearing JSON reject oversized lines and
+    /// invalid UTF-8 instead of accepting a lossy or truncated rendering.
+    pub(crate) fn new_strict(inner: R) -> Self {
+        let mut lines = Self::new(inner);
+        lines.strict = true;
+        lines
     }
 
     /// Explicit cap, separated so tests can exercise truncation without
@@ -168,6 +178,8 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
         BoundedLines {
             reader: BufReader::new(inner),
             cap,
+            strict: false,
+            window: TailWindow::new(cap),
         }
     }
 
@@ -176,29 +188,47 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
     /// final unterminated line is still returned. Unlike `Lines`, invalid
     /// UTF-8 is lossy-converted rather than an error (strictly more
     /// tolerant; the unparsed-line path handles it downstream).
+    /// Partial bytes survive cancellation (e.g. an ACP permission arriving
+    /// while stdout is fragmented). Only a completed line resets the window.
     pub(crate) async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        let mut window = TailWindow::new(self.cap);
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
+                if self.strict {
+                    std::str::from_utf8(self.window.tail())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                }
                 // EOF: retained bytes are one last unterminated line; a
                 // pristine window is a clean end of stream.
-                return Ok(if window.is_empty() {
-                    None
-                } else {
-                    Some(window.render_line())
-                });
+                let line = (!self.window.is_empty()).then(|| self.window.render_line());
+                self.window = TailWindow::new(self.cap);
+                return Ok(line);
             }
             let (take, found_newline) = match available.iter().position(|b| *b == b'\n') {
                 Some(pos) => (pos + 1, true),
                 None => (available.len(), false),
             };
-            window.push(&available[..take]);
+            self.window.push(&available[..take]);
             self.reader.consume(take);
+            if self.strict && self.window.truncated {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "protocol line exceeded its byte limit",
+                ));
+            }
             if found_newline {
-                return Ok(Some(window.render_line()));
+                if self.strict {
+                    std::str::from_utf8(self.window.tail())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                }
+                let line = self.window.render_line();
+                self.window = TailWindow::new(self.cap);
+                return Ok(Some(line));
             }
         }
+    }
+    pub(crate) fn has_partial_line(&self) -> bool {
+        !self.window.is_empty()
     }
 }
 
@@ -208,6 +238,66 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bounded_lines_keeps_fragment_and_cap_after_cancelled_read() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use tokio::io::AsyncWriteExt;
+        for strict in [false, true] {
+            let (reader, mut writer) = tokio::io::duplex(64);
+            let mut lines = BoundedLines::with_cap(reader, 16);
+            lines.strict = strict;
+            writer.write_all(b"first half").await.unwrap();
+            {
+                let read = lines.next_line();
+                tokio::pin!(read);
+                poll_fn(|cx| {
+                    assert!(read.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            assert!(lines.has_partial_line());
+            writer.write_all(b" and more bytes\nnext\n").await.unwrap();
+            let first = lines.next_line().await;
+            if strict {
+                assert_eq!(first.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            } else {
+                let first = first.unwrap().unwrap();
+                assert!(first.contains("more bytes"));
+                assert!(first.contains(TRUNCATION_MARKER));
+                assert!(!lines.has_partial_line());
+                assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("next"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_keeps_complete_json_after_cancelled_read() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use tokio::io::AsyncWriteExt;
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let mut lines = BoundedLines::new_strict(reader);
+        writer.write_all(b"{\"action\":").await.unwrap();
+        {
+            let read = lines.next_line();
+            tokio::pin!(read);
+            poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        writer.write_all(b"\"changed\"}\n").await.unwrap();
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some(r#"{"action":"changed"}"#)
+        );
+        assert!(!lines.has_partial_line());
+        drop(writer);
+        assert_eq!(lines.next_line().await.unwrap(), None);
+    }
     #[test]
     fn tail_window_keeps_everything_under_the_cap() {
         let mut window = TailWindow::new(16);

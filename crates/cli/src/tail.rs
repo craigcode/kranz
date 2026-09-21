@@ -101,6 +101,79 @@ impl EventRenderer {
     /// One event → one human line (role-tagged, truncated to [`LINE_MAX`]).
     pub fn render(&mut self, event: &Event) -> String {
         let (tag, color, body) = match &event.kind {
+            EventKind::GateEvaluationClosed { attempt_id, reason } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!("{}: closed — {}", attempt_id.as_str(), reason),
+            ),
+            EventKind::GateEvaluationRequested { evaluation } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{} {:?}: evaluation requested (attempt {})",
+                    evaluation.request.params.gate_id.as_str(),
+                    evaluation.request.params.stage,
+                    evaluation.request.params.attempt_id.as_str()
+                ),
+            ),
+            EventKind::GateEvaluationFinished { evaluation } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: evaluator finished; cleanup confirmed={}",
+                    evaluation.attempt_id.as_str(),
+                    evaluation.cleanup_confirmed
+                ),
+            ),
+            EventKind::GateResolutionRecorded { resolution } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {:?} — {}",
+                    resolution.attempt_id.as_str(),
+                    resolution.disposition,
+                    resolution.rationale
+                ),
+            ),
+            EventKind::GateResolutionConsumed { consumption } => (
+                "gate".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {:?} attempted; effect completion is separate",
+                    consumption.attempt_id.as_str(),
+                    consumption.action
+                ),
+            ),
+            EventKind::PermissionRequested { request } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!(
+                    "{} awaits one-call consent (run {}, expires {})",
+                    request.proposal.id, request.binding.run_id, request.proposal.deadline
+                ),
+            ),
+            EventKind::PermissionResolved { resolution } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!(
+                    "{}: {} once; response pending",
+                    resolution.request_id,
+                    if resolution.allow { "allow" } else { "deny" }
+                ),
+            ),
+            EventKind::PermissionResponseRecorded {
+                request_id,
+                delivery,
+            } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!("{request_id}: response {delivery:?}; tool outcome is separate"),
+            ),
+            EventKind::PermissionClosed { request_id, reason } => (
+                "permission".into(),
+                ansi::YELLOW,
+                format!("{request_id}: closed ({reason})"),
+            ),
             EventKind::MissionCreated { goal, .. } => (
                 "mission".to_string(),
                 ansi::YELLOW,

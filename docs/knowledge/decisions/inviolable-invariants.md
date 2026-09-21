@@ -2,10 +2,14 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-13
+last_verified: 2026-09-21
 verified_against:
+  - crates/engine/src/acp_worker.rs
+  - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
+  - crates/engine/src/sandbox_container/mount_proof.rs
+  - crates/engine/src/sandbox_container/mount_proof/tests.rs
   - crates/engine/src/control.rs
   - crates/engine/src/paths.rs
   - AGENTS.md
@@ -61,8 +65,10 @@ only ever advanced locally.
 At plan approval `approve_plan` resolves the base branch tip exactly once
 (`self.repo.rev_parse(&base)`) and records it on the `plan.approved` event; it
 lands on `mission.base_sha` and is exported to worker/validator sessions as
-`KRANZ_BASE_SHA`. Every later diff (final gate, gated merge, out-of-contract
-sweep) uses the pinned sha, never the moving branch name.
+`KRANZ_BASE_SHA`. Mission deliverable diffs use the pinned sha, never a replacement resolved
+from the moving branch name. The external approval driver re-reads the branch
+only to detect drift and refuse consumption; it does not replace the pin. Merge
+separately binds its scratch integration to the live base it will advance.
 WHY: incident m-660ffc — a contract's `git diff main` assertion raced a commit
 landing on the base branch mid-mission (design.md deviation 6). Re-resolving the
 base anywhere after approval reintroduces that race.
@@ -208,6 +214,18 @@ untouched (AGENTS.md rules 1–3).
   without a continuous CI receipt must pass a bind-mount round trip before
   either a session or a gate resolves
   ([sandbox_container.rs](../../../crates/engine/src/sandbox_container.rs)).
+  The preflight must also own its helper and confirm daemon absence: a failed
+  exchange or uncertain cleanup never grants admission. Interrupted creation or
+  unconfirmed removal retains private recovery intent; a guest deadline bounds
+  the running helper after engine death. Required runtime mount proofs currently
+  support Docker on Linux/macOS and refuse other runtimes before spawn. Session
+  preflight uses the configured image; a missing pinned image is refused without
+  pulling. Qualified ACP worker profiles also pin argv, private file credentials
+  and startup settings, and require worktree isolation. Their engine-run checks
+  stay offline and receive no selected worker login. Contained ACP completion
+  requires an observed Docker-client exit status; expiration of its bounded
+  wait fails closed, and killing that client cannot establish success. See
+  [mount preflight ownership](../../acp-containment.md#mount-preflight-ownership).
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
   `tickets/`, `lessons/`, `hook-status/`), every SIBLING mission dir, the
@@ -230,3 +248,16 @@ untouched (AGENTS.md rules 1–3).
   a contained worker could once overwrite the trust root it could not read, or
   forge approvals into a sibling mission's inbox (the 2026-09-01 adversarial
   audit, H2/H3/H7/H8/H11/H12).
+
+## One-call consent never widens mission policy
+
+An ACP answer names an exact request and binding digest. The engine must persist
+the resolution before writing the protocol response; a sent receipt is not proof
+of the effect. Prohibited or incomplete actions cannot be approved, and only
+unique certified once-only options qualify. Expiry, action drift, a dead peer
+or a lost response channel closes the request without retrying the effect.
+Local capability authority is recorded as such; only a verified Slack interaction
+supplies a Slack user identity. Permission callbacks alone remain cooperative;
+only the explicit qualified worker profiles add the separately proven container
+boundary. See [consent operations](../../acp-live-permissions.md) and
+[profile admission](../../acp-containment.md#qualified-ordinary-workers).
