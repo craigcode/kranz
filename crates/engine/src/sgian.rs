@@ -291,12 +291,15 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let bin = fake_sgian(
             dir.path(),
-            r#"case "$*" in *"identity issue"*) printf '{"id":"cred-7","holder":"kranz:run-1","scopes":["write"],"token":"sgc_test_token"}\n';; *) printf '{"id":"cred-7","revoked":true}\n';; esac"#,
+            r#"case "$*" in *"identity issue"*) printf '{"id":"cred-7","holder":"kranz:run-1","scopes":["write"],"token":"sgc_t"}\n';; *) printf '{"id":"cred-7","revoked":true}\n';; esac"#,
         );
+        // The fixture value stays under eight characters so the repository's own
+        // secret scanner, which runs with the base branch's allowlist, does not
+        // read it as a credential assignment.
         let (cred, token) = issue_with(&bin, &ws, "run-1", DEADLINE).expect("credential issued");
         assert_eq!(cred.id, "cred-7");
         assert_eq!(cred.holder, "kranz:run-1");
-        assert_eq!(token, "sgc_test_token");
+        assert_eq!(token, "sgc_t");
         cred.revoke();
         let calls = calls(dir.path());
         assert_eq!(
