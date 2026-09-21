@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-21
 verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
@@ -222,7 +222,9 @@ untouched (AGENTS.md rules 1–3).
   preflight uses the configured image; a missing pinned image is refused without
   pulling. Qualified ACP worker profiles also pin argv, private file credentials
   and startup settings, and require worktree isolation. Their engine-run checks
-  stay offline and receive no selected worker login. See
+  stay offline and receive no selected worker login. Contained ACP completion
+  requires an observed Docker-client exit status; expiration of its bounded
+  wait fails closed, and killing that client cannot establish success. See
   [mount preflight ownership](../../acp-containment.md#mount-preflight-ownership).
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,

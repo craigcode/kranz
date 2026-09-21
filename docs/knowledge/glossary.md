@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-21
 verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs

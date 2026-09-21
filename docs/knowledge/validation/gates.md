@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-21
 verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/acp_worker/tests.rs
@@ -92,6 +92,13 @@ governed missions. See
 [ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite
+
+The contained ACP completion regressions delay an earned nonzero Docker exit
+past the native grace, require a missing status to fail at the contained
+deadline, and prove that EOF shutdown stops a successful but lingering peer
+and its detached descendants. CI requires both named proofs. The Windows
+contract-lint timer fixture runs the test executable itself and requires its
+post-sleep marker, avoiding both network-based delays and PowerShell startup.
 
 Before declaring any Rust change done, run all four — bare, reading raw exit
 codes ([AGENTS.md](../../../AGENTS.md) rules 1–3):

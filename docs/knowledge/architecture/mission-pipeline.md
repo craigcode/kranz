@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-21
 verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
@@ -305,8 +305,12 @@ unchanged. Generic enforced ACP, validators, session resume and dispatch-pool
 profiles are refused. The profile supplies a private HOME with an unmounted
 private parent. Existing permission, checkpoint and event machinery remains
 in use; engine-run checks use the same image offline without the worker login.
-The synthetic mission reaches local merge and export, while S7 defect/repair
-and live governed-mission acceptance remain open. See
+The synthetic mission reaches local merge and export; bounded S7 defect/repair
+and live worker evidence are recorded in the acceptance reviews. Controllers
+and reviewers in those live runs were scripted. Contained single-shot completion
+closes input, lets the trusted supervisor stop lingering peers after a one-second
+grace, and requires the Docker client's status within five seconds. A delayed
+or missing failure status cannot become successful forced cleanup. See
 [ACP containment](../../acp-containment.md).
 
 ## Live one-call consent
