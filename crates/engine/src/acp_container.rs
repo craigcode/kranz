@@ -13,11 +13,15 @@ use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 
 const SUPERVISOR: &str = include_str!("acp_container/supervisor.py");
 const GUEST_CONTROL: &str = "/kranz-owned-session";
+const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LAUNCH_BYTES: usize = 1024 * 1024;
 
 fn error(message: impl std::fmt::Display) -> EngineError {
     EngineError::Backend(format!("ACP container: {message}"))
@@ -29,6 +33,7 @@ pub(crate) struct OwnedContainer {
     owner: String,
     image: String,
     root: Option<tempfile::TempDir>,
+    launch: Option<Vec<u8>>,
     heartbeat: Option<JoinHandle<()>>,
     creation_started: bool,
     creation_finished: bool,
@@ -206,12 +211,14 @@ impl OwnedContainer {
         let mut argv = vec![program.display().to_string()];
         argv.extend_from_slice(args);
         private_write(&canonical.join("supervisor.py"), SUPERVISOR.as_bytes())?;
-        private_write(
-            &canonical.join("launch.json"),
-            &serde_json::to_vec(&serde_json::json!({
-                "argv":argv, "cwd":crate::sandbox::absolutize(&spec.cwd), "env":env,
-            }))?,
-        )?;
+        // Credentials cross only the attached stdin, never Docker arguments or
+        // the recovery directory, which must survive unconfirmed cleanup.
+        let launch = serde_json::to_vec(&serde_json::json!({
+            "argv":argv, "cwd":crate::sandbox::absolutize(&spec.cwd), "env":env,
+        }))?;
+        if launch.len() > MAX_LAUNCH_BYTES {
+            return Err(error("launch data exceeds byte limit"));
+        }
         private_write(&canonical.join("lease"), &0_u64.to_be_bytes())?;
         private_write(
             &canonical.join("container.json"),
@@ -228,6 +235,7 @@ impl OwnedContainer {
             owner: owner.clone(),
             image: container.image.clone(),
             root: Some(root),
+            launch: Some(launch),
             heartbeat: None,
             creation_started: false,
             creation_finished: false,
@@ -268,15 +276,7 @@ impl OwnedContainer {
                 format!("com.kranz.acp-owner={owner}"),
             ],
         );
-        owned.creation_started = true;
-        let created = owned.client.control(&create).await.map_err(error)?;
-        let id = std::str::from_utf8(&created.stdout)
-            .unwrap_or_default()
-            .trim();
-        if created.code != Some(0) || id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(error("could not create owned namespace"));
-        }
-        owned.creation_finished = true;
+        owned.create(&create, CREATE_TIMEOUT).await?;
         let mut lease = std::fs::OpenOptions::new()
             .write(true)
             .open(canonical.join("lease"))
@@ -303,6 +303,43 @@ impl OwnedContainer {
             name,
         ]);
         Ok((owned, command))
+    }
+
+    async fn create(&mut self, args: &[String], timeout: Duration) -> Result<()> {
+        self.creation_started = true;
+        let created = self
+            .client
+            .bounded_control(args, timeout, &AtomicBool::new(false))
+            .await
+            .map_err(error)?;
+        let id = std::str::from_utf8(&created.stdout)
+            .unwrap_or_default()
+            .trim();
+        if created.code != Some(0) || id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(error("could not create owned namespace"));
+        }
+        self.creation_finished = true;
+        Ok(())
+    }
+
+    pub(crate) async fn write_launch(
+        &mut self,
+        stdin: &mut tokio::process::ChildStdin,
+    ) -> Result<()> {
+        let launch = self
+            .launch
+            .take()
+            .ok_or_else(|| error("launch already sent"))?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            stdin
+                .write_all(&(launch.len() as u32).to_be_bytes())
+                .await?;
+            stdin.write_all(&launch).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| error("launch input timed out"))?
+        .map_err(error)
     }
 
     pub(crate) fn receipt(&self) -> serde_json::Value {

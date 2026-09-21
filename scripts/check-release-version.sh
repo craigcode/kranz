@@ -65,6 +65,26 @@ if ! grep -Fq "## ${workspace_version} -" CHANGELOG.md; then
   exit 1
 fi
 
+# README is also the crates.io readme: every install command and versioned
+# package/release link must describe the version being published.
+python3 - "$workspace_version" <<'PYTHON'
+import pathlib
+import re
+import sys
+
+version = sys.argv[1]
+readme = pathlib.Path("README.md").read_text()
+patterns = [
+    r"cargo install kranz --version ([^\s]+)",
+    r"https://crates\.io/crates/(?:kranz|kranz-engine|kranz-server|kranz-slack)/([^/)\s]+)",
+    r"https://github\.com/craigcode/kranz/releases/tag/v([^/)\s]+)",
+]
+for pattern in patterns:
+    found = re.findall(pattern, readme)
+    if not found or any(value != version for value in found):
+        sys.exit(f"release check: README install/package/release versions must all be {version}")
+PYTHON
+
 if [ "${KRANZ_RELEASE_SKIP_MAIN_CHECK:-0}" != 1 ]; then
   if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${GH_TOKEN:-}" ]; then
     # CI supplies authentication only to this fetch, never repository config.

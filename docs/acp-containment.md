@@ -83,9 +83,9 @@ host users through a shared temporary directory.
 
 Normal completion, abort and Drop remove the private credential home after
 worker cleanup. An unconfirmed cleanup fails the run. Engine SIGKILL cannot run
-a destructor: the namespace lease bounds execution, but private scratch and
-launch data can remain for operator recovery. Confirm the recorded owner is
-absent before removing its retained private directories. A process-lifetime
+a destructor: the namespace lease bounds execution, but the private credential
+home and recovery metadata can remain for operator recovery. Confirm the recorded
+owner is absent before removing its retained private directories. A process-lifetime
 proof is not a promise of crash-time disk erasure.
 
 The raw ACP Init records `workerProfile` with profile ID, startup policy, host
@@ -124,9 +124,14 @@ and never becomes the worker environment. Native provider homes and the macOS
 Keychain are not mounted or queried.
 
 An engine-owned control directory, outside all worker-writable roots, is mounted
-read-only. It contains the fixed supervisor, launch data, a lease and a recovery
-ledger. The host updates the lease every 500 ms. The guest requires a renewal
-observed after startup before launching the peer, and stops after five seconds
+read-only. It contains the fixed supervisor, a lease and a recovery ledger.
+Launch arguments, working directory and environment cross a bounded,
+length-prefixed stdin prelude before ACP traffic. This payload is never written
+to the control directory; provider credentials do not enter Docker arguments.
+The supervisor consumes exactly that prelude (at most 1 MiB) and checks lease
+expiry even while waiting for partial input. The host updates
+the lease every 500 ms. The guest requires a renewal observed after startup
+before launching the peer, and stops after five seconds
 without an observed renewal. Missing/unreadable lease data never extends that
 deadline. Host suspension or shared-filesystem trouble can therefore stop a
 healthy session; it cannot silently extend authority.
@@ -155,9 +160,13 @@ inspected container ID, never an arbitrary caller-supplied name. A successful
 daemon inventory must confirm absence. If Docker's automatic deletion is still
 pending, cleanup polls within a five-second confirmation budget; a removal
 acknowledgement alone is insufficient. A name collision cannot confer ownership.
+Worker container creation has a 30-second startup budget; inspection and cleanup
+keep their five-second control limits. Creation is attempted once.
 Unconfirmed creation or cleanup retains the private ledger and fails visibly;
 it does not become a successful run. The ledger includes image, supervisor hash,
-owner identity and container name, without recording host control credentials.
+owner identity and container name, without recording session environment values
+or host control credentials. This does not make the separate provider credential
+home safe to retain indefinitely after an engine crash.
 
 Engine `SIGKILL` cannot run a Rust destructor. Lease expiry stops the worker in
 that case, while the private ledger remains as recovery evidence. This does not

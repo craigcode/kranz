@@ -28,6 +28,9 @@ Notable user-visible changes are documented here. This project follows
   are reaped without losing adapter exit status, and uncertain cleanup fails
   visibly. Container mount probes now have their own ownership and recovery
   records.
+- Prevented ACP recovery ledgers from retaining session credentials, excluded
+  nested private paths and PEM private keys from evaluator inputs, and corrected
+  startup and multi-check gate deadlines.
 - Added deterministic hostile-process and governed-mission proofs, plus bounded
   live Claude/Codex worker receipts. Live runs used scripted controllers and
   reviewers; they do not establish live model judgment or universal adapter

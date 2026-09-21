@@ -365,17 +365,46 @@ pub(crate) struct StageEvaluation<'a> {
     pub source_log_range: Option<LogRange>,
 }
 
+// All decisions are consumed together after the final subject recheck. Pin one
+// deadline before the first evaluator: each checker keeps its two-minute cap,
+// with three minutes left for setup, cleanup and the final authority recheck.
+fn stage_deadline(input: &StageEvaluation<'_>) -> Result<chrono::DateTime<chrono::Utc>> {
+    let count = input
+        .registrations
+        .iter()
+        .filter(|r| r.declaration().stages.contains(&input.stage.stage()))
+        .count();
+    deadline_for_checks(chrono::Utc::now(), count)
+}
+
+fn deadline_for_checks(
+    now: chrono::DateTime<chrono::Utc>,
+    count: usize,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    let millis = u64::try_from(count.max(1))
+        .ok()
+        .and_then(|count| limits().wall_time_ms.checked_mul(count))
+        .and_then(|millis| i64::try_from(millis).ok())
+        .ok_or_else(|| invalid("stage time budget overflow"))?;
+    let budget = chrono::Duration::try_milliseconds(millis)
+        .and_then(|wall| wall.checked_add(&chrono::Duration::minutes(3)))
+        .ok_or_else(|| invalid("stage time budget overflow"))?;
+    now.checked_add_signed(budget)
+        .ok_or_else(|| invalid("stage deadline overflow"))
+}
+
 pub(crate) fn evaluate_stage(
     input: StageEvaluation<'_>,
     mut emit: impl FnMut(EventKind) -> Result<Event>,
 ) -> Result<Vec<Record>> {
+    let deadline = stage_deadline(&input)?;
     let mut records = Vec::new();
     for registration in input
         .registrations
         .iter()
         .filter(|r| r.declaration().stages.contains(&input.stage.stage()))
     {
-        let built = build_registration(&input, registration)?;
+        let built = build_registration(&input, registration, deadline)?;
         let record = evaluate(
             input.paths,
             registration,
@@ -399,6 +428,7 @@ pub(crate) fn evaluate_stage(
 fn build_registration(
     input: &StageEvaluation<'_>,
     registration: &PinnedRegistration,
+    deadline: chrono::DateTime<chrono::Utc>,
 ) -> Result<BuiltInput> {
     super::input_builder::build(super::input_builder::BuildInput {
         mission_id: Id::try_from(input.paths.mission_id.clone()).map_err(invalid)?,
@@ -418,7 +448,7 @@ fn build_registration(
         diagnostics: input.diagnostics,
         prior_findings: input.prior_findings,
         source_log_range: input.source_log_range.clone(),
-        deadline: chrono::Utc::now() + chrono::Duration::minutes(5),
+        deadline,
         limits: limits(),
     })
     .map_err(invalid)
@@ -428,13 +458,14 @@ pub(crate) async fn evaluate_stage_async(
     input: StageEvaluation<'_>,
     mut emit: impl FnMut(EventKind) -> Result<Event>,
 ) -> Result<Vec<Record>> {
+    let deadline = stage_deadline(&input)?;
     let mut records = Vec::new();
     for registration in input
         .registrations
         .iter()
         .filter(|r| r.declaration().stages.contains(&input.stage.stage()))
     {
-        let built = build_registration(&input, registration)?;
+        let built = build_registration(&input, registration, deadline)?;
         let record = evaluate_async(
             input.paths,
             registration,
@@ -472,4 +503,114 @@ fn refusal(record: &Record, registration: &PinnedRegistration) -> EngineError {
         ),
         8192,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::evaluator::{Enforcement, Kind};
+    use chrono::{Duration, SecondsFormat, Utc};
+
+    #[test]
+    fn gate_stage_deadline_keeps_early_decisions_consumable_after_three_full_checks() {
+        let now = "2026-09-21T12:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        let deadline = deadline_for_checks(now, 3).unwrap();
+        assert_eq!(
+            deadline_for_checks(now, 1).unwrap(),
+            now + Duration::minutes(5)
+        );
+        assert!(deadline_for_checks(now, usize::MAX).is_err());
+        let policy = Policy {
+            kind: Kind::Mechanical,
+            enforcement: Enforcement::Blocking,
+            mission_policy_digest: Digest::of(b"fixture policy"),
+            mechanical_prerequisites_passed: true,
+        };
+        let mut records = Vec::new();
+        for index in 0..3 {
+            let mut request = Request::from_bytes(include_bytes!(
+                "../../schemas/fixtures/gate-v1/final-gate/request.json"
+            ))
+            .unwrap();
+            request.params.deadline = deadline.to_rfc3339_opts(SecondsFormat::Secs, true);
+            request.params.limits = limits();
+            request.params.binding.policy_digest = policy.digest();
+            request.params.attempt_id = id("attempt");
+            request.id = request.params.attempt_id.clone();
+            let result = EvaluationResult {
+                schema_version: 1,
+                evaluation_id: request.params.evaluation_id.clone(),
+                attempt_id: request.params.attempt_id.clone(),
+                binding: request.params.binding.clone(),
+                evidence_digest: request.params.evidence.digest.clone(),
+                status: Status::Judged,
+                verdict: Some(Verdict::Pass),
+                rationale: "fixture".into(),
+                artifacts: vec![],
+                findings: None,
+                confidence: None,
+            };
+            let mut record = Record::new(
+                Requested {
+                    request,
+                    policy: policy.clone(),
+                    retained_inputs: vec![],
+                    permission_request_id: None,
+                },
+                now + Duration::minutes(index * 2),
+                1,
+            )
+            .unwrap();
+            let finished_at = now + Duration::minutes((index + 1) * 2);
+            record
+                .finish(
+                    Finished {
+                        attempt_id: result.attempt_id.clone(),
+                        outcome: Outcome::Evaluated {
+                            result: Box::new(result),
+                            raw_stdout_digest: Digest::of(b"fixture"),
+                        },
+                        exit_code: Some(0),
+                        cleanup_confirmed: true,
+                        artifacts: vec![],
+                    },
+                    finished_at,
+                )
+                .unwrap();
+            record
+                .resolve(
+                    Resolution {
+                        id: id("resolution"),
+                        attempt_id: record.requested.request.params.attempt_id.clone(),
+                        binding: record.requested.request.params.binding.clone(),
+                        disposition: Disposition::Proceed,
+                        rationale: "fixture".into(),
+                        consent: None,
+                    },
+                    finished_at,
+                )
+                .unwrap();
+            records.push(record);
+        }
+        for mut record in records {
+            let consumed = Consumed {
+                attempt_id: record.requested.request.params.attempt_id.clone(),
+                resolution_id: record.resolution.as_ref().unwrap().id.clone(),
+                rechecked_binding: record.requested.request.params.binding.clone(),
+                action: Action::AcceptDeliverable,
+            };
+            assert!(record.clone().consume(consumed.clone(), deadline).is_err());
+            let mut changed = consumed.clone();
+            changed.rechecked_binding.subject_digest = Digest::of(b"changed subject");
+            assert!(record
+                .clone()
+                .consume(changed, now + Duration::minutes(6))
+                .is_err());
+            record
+                .consume(consumed, now + Duration::minutes(6))
+                .unwrap();
+        }
+    }
 }

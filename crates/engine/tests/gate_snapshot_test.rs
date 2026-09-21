@@ -197,11 +197,16 @@ fn gate_snapshot_private_path_selection_is_case_insensitive_and_directory_bounde
         ".kranz/missions/m-1/report.md",
         "src/.env.local",
         ".NPMRC",
+        "packages/ui/.NPMRC",
+        "nested/.ssh/id_ed25519",
+        "examples/.kranz/serve.token",
     ] {
         assert!(excluded(private), "{private}");
     }
     for source in [
         ".claude-notes.md",
+        "nested/.claude-notes.md",
+        "nested/.kranz/workspace.json",
         "src/env.rs",
         ".kranz/workspace.json",
         ".kranz/tickets/gate.md",
@@ -238,4 +243,52 @@ fn gate_snapshot_portable_dotfiles_and_spaces_keep_traversal_and_alias_denials()
     ] {
         assert!(WirePath::try_from(path.to_string()).is_err(), "{path}");
     }
+}
+
+#[test]
+fn gate_snapshot_excludes_nested_credentials_and_private_pem_but_keeps_public_certificates() {
+    let (dir, repo) = repo();
+    // Build non-secret fixtures at runtime so source scanners keep rejecting
+    // actual committed private-key blocks without a test-file waiver.
+    let key =
+        |kind| format!("-----BEGIN {kind}-----\nnested-credential-marker\n-----END {kind}-----\n");
+    let rsa = key("RSA PRIVATE KEY");
+    let pkcs8 = key("PRIVATE KEY");
+    for (name, content) in [
+        ("packages/ui/.npmrc", "nested-credential-marker"),
+        ("nested/.ssh/id_rsa", "nested-credential-marker"),
+        ("nested/.kranz/config.json", "nested-credential-marker"),
+        ("tls/client.pem", rsa.as_str()),
+        ("tls/no-extension", pkcs8.as_str()),
+        (
+            "tls/public.pem",
+            "-----BEGIN CERTIFICATE-----\npublic-certificate-marker\n-----END CERTIFICATE-----\n",
+        ),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    // Tracked private files must also be excluded; Git ignore rules are not a boundary.
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "credential fixtures"]);
+    let snapshot = SourceSnapshot::capture(&repo, "HEAD").unwrap();
+    assert_eq!(snapshot.excluded_paths.len(), 5);
+    assert!(snapshot
+        .files
+        .values()
+        .all(|bytes| !String::from_utf8_lossy(bytes).contains("nested-credential-marker")));
+    assert!(snapshot
+        .files
+        .values()
+        .any(|bytes| String::from_utf8_lossy(bytes).contains("public-certificate-marker")));
+    let selection: serde_json::Value = serde_json::from_slice(&snapshot.selection).unwrap();
+    assert_eq!(
+        selection["excludedPaths"],
+        serde_json::json!(snapshot.excluded_paths)
+    );
+    snapshot.verify_current(&repo).unwrap();
+    // Becoming private changes the selection binding, even if HEAD stays fixed.
+    std::fs::write(dir.path().join("tls/public.pem"), key("EC PRIVATE KEY")).unwrap();
+    assert!(snapshot.verify_current(&repo).is_err());
 }

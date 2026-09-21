@@ -6,6 +6,7 @@ control directory. No model output, workspace module or shell is evaluated here.
 import ctypes
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
@@ -14,6 +15,7 @@ import time
 LEASE_SECONDS = 5.0
 POLL_SECONDS = 0.1
 COMPLETION_SECONDS = 1.0
+MAX_LAUNCH_BYTES = 1024 * 1024
 stage = "initialization"
 
 
@@ -76,9 +78,30 @@ def main():
         time.sleep(POLL_SECONDS)
     previous = current
     changed_at = time.monotonic()
-    stage = "launch-file"
-    with open(root + "/launch.json", encoding="utf-8") as source:
-        launch = json.load(source)
+    stage = "launch-input"
+
+    def read_launch_bytes(count):
+        nonlocal previous, changed_at
+        chunks = bytearray()
+        while len(chunks) < count:
+            current = read_lease()
+            now = time.monotonic()
+            if current is not None and current != previous:
+                previous, changed_at = current, now
+            if now - changed_at >= LEASE_SECONDS:
+                stop(124)
+            if select.select([0], [], [], POLL_SECONDS)[0]:
+                # Read exactly the prelude, leaving ACP bytes for the peer.
+                chunk = os.read(0, count - len(chunks))
+                if not chunk:
+                    raise EOFError("incomplete launch")
+                chunks.extend(chunk)
+        return chunks
+
+    length = int.from_bytes(read_launch_bytes(4), "big")
+    if not 0 < length <= MAX_LAUNCH_BYTES:
+        raise ValueError("launch size")
+    launch = json.loads(read_launch_bytes(length))
     stage = "peer-spawn"
     peer = subprocess.Popen(
         launch["argv"], cwd=launch["cwd"], env=launch["env"],
