@@ -474,7 +474,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace reaps_orphans_and_preserves_peer_exit engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
+          for proof in abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace reaps_orphans_and_preserves_peer_exit delayed_attach_status_cannot_hide_failure input_eof_supervisor_stops_lingering_peer engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial; do
             grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
           done
           for proof in ordinary_mission_delivers_with_one_call_consent defect_requires_repair_and_fresh_consent interrupt_rejects_late_consent policy_drift_refuses_merge checker_failure_blocks_completed_worker credential_echo_fails_and_cleans_home; do

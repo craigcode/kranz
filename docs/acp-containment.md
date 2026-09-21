@@ -137,6 +137,11 @@ stdin or output cannot block lease checks. When PID 1 exits, Linux kills the
 namespace's remaining processes, including detached sessions and nested children.
 While the peer runs, bounded reap sweeps release exited orphan processes and
 preserve the peer's actual exit status without delaying lease checks.
+After host input closes for single-shot completion, the supervisor closes the
+peer's input and allows one second for its exit. It preserves an observed peer
+failure and terminates any still-running peer and descendants itself. Kranz
+waits up to five seconds for the Docker client's resulting status; a missing
+status fails closed. Killing a delayed Docker client never establishes success.
 The dumpability restriction prevents a same-uid peer from changing supervisor
 memory or using its `/proc` handles. See the Linux documentation for
 [PID namespace termination and signals](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)

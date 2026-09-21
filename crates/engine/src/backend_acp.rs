@@ -57,7 +57,7 @@
 //! profiles seed only the operator-selected credential file in a private home.
 //! Ambient HOME and provider credentials are never restored by this backend.
 //!
-//! Single-shot completion closes stdin, allows a short exit grace and then
+//! Native single-shot completion closes stdin, allows a short exit grace and then
 //! cleans up the owned process group. macOS/Linux observe exit with WNOWAIT
 //! so group identity stays owned until cleanup, before reaping. Windows
 //! requires Job Object assignment. Writes, cancellation, reap and diagnostic
@@ -97,6 +97,7 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const COMPLETION_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+const CONTAINER_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const CANCEL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -1749,12 +1750,23 @@ impl AcpSession {
 
     /// A single-shot ACP turn ends with its response, even if the adapter is
     /// a long-lived server. Give it a short stdin-EOF grace, then terminate
-    /// our owned process group. An observed nonzero exit still fails.
+    /// our owned process group. Contained peers terminate under the trusted
+    /// supervisor; the Docker client's exit status must arrive before success.
     async fn finish_session(&mut self) {
         self.stdin.take();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let contained = self.container.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let contained = false;
+        let completion_timeout = if contained {
+            CONTAINER_COMPLETION_TIMEOUT
+        } else {
+            COMPLETION_GRACE
+        };
         let mut forced = false;
         if self.child_status.is_none() {
-            match tokio::time::timeout(COMPLETION_GRACE, wait_for_peer_exit(&mut self.child)).await
+            match tokio::time::timeout(completion_timeout, wait_for_peer_exit(&mut self.child))
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -1763,6 +1775,10 @@ impl AcpSession {
                         "acp process observation failed: {error}"
                     )));
                     return;
+                }
+                Err(_) if contained => {
+                    self.cleanup_failure
+                        .get_or_insert("container completion deadline expired");
                 }
                 Err(_) => forced = true,
             }

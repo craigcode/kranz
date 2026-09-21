@@ -13,6 +13,7 @@ import time
 
 LEASE_SECONDS = 5.0
 POLL_SECONDS = 0.1
+COMPLETION_SECONDS = 1.0
 stage = "initialization"
 
 
@@ -85,13 +86,16 @@ def main():
         close_fds=True, start_new_session=True, bufsize=0,
     )
     failed = threading.Event()
+    input_eof = threading.Event()
     stage = "supervision"
 
     def forward(source, target, close_target=False):
+        reached_eof = False
         try:
             while True:
                 chunk = os.read(source, 65536)
                 if not chunk:
+                    reached_eof = True
                     break
                 while chunk:
                     written = os.write(target, chunk)
@@ -106,6 +110,8 @@ def main():
         finally:
             if close_target:
                 os.close(target)
+                if reached_eof:
+                    input_eof.set()
 
     input_thread = threading.Thread(
         target=forward, args=(0, peer.stdin.fileno(), True), daemon=True,
@@ -118,6 +124,7 @@ def main():
     for thread in outputs:
         thread.start()
     ended_at = None
+    eof_at = None
     code = None
     while True:
         current = read_lease()
@@ -139,6 +146,21 @@ def main():
             # A detached child holding output open must not outlive the peer.
             if now - ended_at >= 1.0:
                 stop(125)
+        elif input_eof.is_set():
+            if eof_at is None:
+                eof_at = now
+            if now - eof_at >= COMPLETION_SECONDS:
+                # Host stdin EOF ends a completed single-shot session. The
+                # trusted supervisor owns intentional shutdown, so the host
+                # never mistakes a killed Docker client for successful work.
+                # Check the peer directly before stopping: an orphan backlog
+                # must not hide an already-earned nonzero peer exit.
+                pid, status = os.waitpid(peer.pid, os.WNOHANG)
+                if pid == peer.pid:
+                    peer.returncode = os.waitstatus_to_exitcode(status)
+                    code, ended_at = peer.returncode, now
+                else:
+                    stop(0)
         time.sleep(POLL_SECONDS)
 
 

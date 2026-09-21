@@ -16,7 +16,7 @@ def send(message):
     print(json.dumps(message), flush=True)
 
 
-def idle_tree():
+def detached_heartbeat():
     # A namespace peer must not be able to stop PID 1's lease checks.
     os.kill(1, signal.SIGSTOP)
     pid = os.fork()
@@ -30,6 +30,10 @@ def idle_tree():
         time.sleep(0.01)
     with open("ready", "w") as target:
         target.write(str(pid))
+
+
+def idle_tree():
+    detached_heartbeat()
     while True:
         time.sleep(1)
 
@@ -212,7 +216,7 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request["id"], "result": result})
             idle_tree()
     elif method == "session/prompt":
-        if mode in ["complete", "hostile", "mcp", "egress", "orphans-complete", "orphans-failed"]:
+        if mode in ["complete", "hostile", "mcp", "egress", "orphans-complete", "orphans-failed", "report-linger"]:
             if mode.startswith("orphans-"):
                 orphan_probes()
             if mode == "hostile":
@@ -224,6 +228,8 @@ for line in sys.stdin:
             else:
                 with open("delivered.txt", "w") as target:
                     target.write("feature")
+            if mode == "report-linger":
+                detached_heartbeat()
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": "fixture-session", "update": {
                     "sessionUpdate": "agent_message_chunk",
@@ -233,6 +239,9 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}})
             if mode == "orphans-failed":
                 sys.exit(23)
+            if mode == "report-linger":
+                while True:
+                    time.sleep(1)
             break
         idle_tree()
     if result is not None:

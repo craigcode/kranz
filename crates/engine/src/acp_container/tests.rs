@@ -213,6 +213,111 @@ async fn acp_containment_v1_reaps_orphans_and_preserves_peer_exit() {
     }
 }
 
+#[test]
+fn acp_containment_v1_delayed_attach_status_cannot_hide_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    if !enabled()
+        || crate::agent_env::isolated_global_home_test(
+            "acp_container::tests::acp_containment_v1_delayed_attach_status_cannot_hide_failure",
+        )
+    {
+        return;
+    }
+    let root = fixture();
+    let docker =
+        trusted_docker(&spec(root.path(), "fixture", "idle").sandbox.unwrap().inputs).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let wrapper = bin.path().join("docker");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let _env = crate::agent_env::EnvTestGuard::engage(&[
+        ("PATH", path.to_str().unwrap()),
+        (
+            crate::backend_claude::SCRATCH_ROOT_ENV,
+            scratch.path().to_str().unwrap(),
+        ),
+    ]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for (delay, expected) in [("0.5", "23"), ("6", "container completion deadline expired")] {
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" != start ]; then exec {docker} \"$@\"; fi\n{docker} \"$@\"\nstatus=$?\nprintf '%s\\n' \"$status\" > {receipt}\nsleep {delay}\nexit \"$status\"\n",
+                    docker = quote(&docker),
+                    receipt = quote(&bin.path().join("attach-exit")),
+                ),
+            )
+            .unwrap();
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+                match std::fs::remove_file(bin.path().join("attach-exit")) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("clear previous attach receipt: {error}"),
+                }
+                let name = name();
+            let mut session = start(root.path(), &name, "orphans-failed").await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while session.next_event().await.unwrap().is_some() {}
+            })
+            .await
+            .expect("bounded delayed attach completion");
+            assert!(
+                matches!(session.exit_status(), Some(SessionExit::Failed(ref message)) if message.contains(expected)),
+                "delayed guest failure was lost: {:?}",
+                session.exit_status()
+            );
+            assert_eq!(
+                std::fs::read_to_string(bin.path().join("attach-exit")).unwrap().trim(),
+                "23"
+            );
+            absent(root.path(), &name).await;
+            }
+        });
+}
+
+#[tokio::test]
+async fn acp_containment_v1_input_eof_supervisor_stops_lingering_peer() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let mut session = start(root.path(), &name, "report-linger").await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut result = false;
+        while let Some(event) = session.next_event().await.unwrap() {
+            if let AgentEvent::Result { is_error, .. } = event {
+                assert!(!is_error);
+                result = true;
+            }
+        }
+        assert!(result);
+    })
+    .await
+    .expect("bounded EOF completion");
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Completed)),
+        "{:?}",
+        session.exit_status()
+    );
+    absent(root.path(), &name).await;
+    let heartbeat = std::fs::read(root.path().join("workspace/child-heartbeat")).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        heartbeat,
+        std::fs::read(root.path().join("workspace/child-heartbeat")).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn acp_containment_v1_engine_sigkill_expires_guest_lease() {
     if !enabled() {

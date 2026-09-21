@@ -33,6 +33,23 @@ skipped-command assertions remain, including a working directory with spaces
 and an apostrophe. A fresh reviewer checked this correction. Production command
 execution, environment policy and timeout budgets are unchanged.
 
+A later full Docker suite exposed a separate completion race: the guest exited
+23, but a delayed host Docker client exceeded the native 200 ms grace and the
+forced-cleanup path reported completion. A deterministic wrapper retaining
+exit 23 for half a second reproduced that failure. Contained completion now
+closes input and lets the trusted supervisor own bounded shutdown; the host
+requires its actual status within five seconds and fails closed otherwise.
+Regression coverage includes delayed failure, a status beyond that deadline,
+and a reported-success peer that lingers with detached descendants. Native ACP
+completion retains its existing behavior. Earlier live-worker records remain
+evidence of their recorded source revisions, not new live runs of this change.
+A fresh reviewer approved the implementation across all five axes and exercised
+the actual supervisor logic offline for successful exit, failed exit, lingering
+completion, peer failure behind orphan backlog and lease expiry. Its suggestion
+to clear each delayed-attach receipt between scenarios is included. The first
+real-Docker containment run passed 24 matching tests; the final full workspace
+and cross-platform runs remain required before merge.
+
 The earlier evaluator slice also retained a five-second Docker-create cap.
 The new [PR #62 Linux failure](https://github.com/craigcode/kranz/actions/runs/35543954391/job/106166453415)
 reproduced that limit. The already-reviewed correction from PR #69 was moved
@@ -47,8 +64,9 @@ Merging current main required only knowledge-note freshness conflict resolution.
 Propagating the evaluator correction preserved the complete top-of-stack tree
 `fca464ab53e015b09e9dd2b02f7120e28d437ff9` byte-for-byte. The versioned candidate
 at `6a3091b` and its subsequent ancestry-only integration at `b195b1c` likewise
-share tree `de28cd3d884969955c769ade205f69c262ff7e90`. Later changes in this
-release PR close tickets and correct documentation; they add no runtime behavior.
+share tree `de28cd3d884969955c769ade205f69c262ff7e90`. Commit `3574a39` added
+ticket closures and documentation only. Subsequent integration checks required
+the Windows fixture and contained-completion corrections described above.
 Superseded CI runs were cancelled, not reclassified as passes. The final PR must
 pass its own required checks and the Linux evaluator/containment job before merge.
 
