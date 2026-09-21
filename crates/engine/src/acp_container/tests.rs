@@ -493,10 +493,10 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
     let root = fixture();
     let name = name();
     let mut session_spec = spec(root.path(), &name, "idle");
-    let secret = "synthetic-launch-secret-never-retained";
+    let marker = "synthetic-launch-secret-never-retained";
     session_spec
         .env
-        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), secret.into());
+        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), marker.into());
     let (mut owned, _) = OwnedContainer::prepare(
         &session_spec,
         Path::new("/usr/local/bin/python3"),
@@ -518,7 +518,7 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
     assert!(!ledger.join("launch.json").exists());
     for entry in std::fs::read_dir(ledger).unwrap() {
         let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        assert!(!String::from_utf8_lossy(&bytes).contains(marker));
     }
     owned.client = client;
     owned.remove().await.unwrap();
@@ -892,16 +892,16 @@ async fn acp_containment_v1_launch_prelude_delivers_environment_without_consumin
     }
     let root = fixture();
     let name = name();
-    let secret = "synthetic-launch-secret";
+    let marker = "synthetic-launch-secret";
     std::fs::write(
         root.path().join("workspace/peer.py"),
-        format!("import os\nassert os.environ['CLAUDE_CODE_OAUTH_TOKEN'] == '{secret}'\n{PEER}"),
+        format!("import os\nassert os.environ['CLAUDE_CODE_OAUTH_TOKEN'] == '{marker}'\n{PEER}"),
     )
     .unwrap();
     let mut session_spec = spec(root.path(), &name, "complete");
     session_spec
         .env
-        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), secret.into());
+        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), marker.into());
     let mut session = AcpBackend::new(
         "/usr/local/bin/python3",
         vec![root.path().join("workspace/peer.py").display().to_string()],

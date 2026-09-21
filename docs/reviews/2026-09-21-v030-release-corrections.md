@@ -63,7 +63,11 @@ public tree/history audits and package-license checks passed. The standalone ACP
 proof also passed all 26 matching tests. The release-version check accepted 0.3.0
 and rejected a stale README command. Secret scanning identified a dummy PEM test
 block; the fixture now constructs its non-secret header at runtime, without a
-scanner waiver. Cross-platform results are recorded with the correction PR.
+scanner waiver. The first PR secret-scan job additionally identified two dummy
+credential assignments under the generic assignment rule. Their local binding
+is now named `marker`; the synthetic bytes and assertions are unchanged, and
+no scanner policy or allowlist is modified. Cross-platform results are recorded
+with the correction PR.
 Required CI, a new release rehearsal and native archive smoke checks must pass
 on the resulting main commit before tagging. This document does not claim a tag,
 GitHub release or registry publication.
