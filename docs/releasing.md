@@ -59,7 +59,8 @@ Versions are workspace-inherited. Update:
 - `kranz-engine`, `kranz-server`, and `kranz-slack` version requirements under
   root `[workspace.dependencies]`;
 - `apps/dashboard/src-tauri/tauri.conf.json`;
-- `apps/dashboard/src-tauri/Cargo.toml`; and
+- `apps/dashboard/src-tauri/Cargo.toml`;
+- README install commands and versioned registry/release links; and
 - `CHANGELOG.md`, moving the relevant Unreleased entries into a dated version
   section.
 

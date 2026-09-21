@@ -81,6 +81,13 @@ parent. Docker mounts only these newly created roots:
 | `/gate/outputs`, `/gate/build`, `/gate/home` | Writable scratch |
 | Image filesystem | Read-only trusted runtime |
 
+Source selection excludes conventional private paths at any directory depth
+(case-insensitive and directory-bounded), including nested `.npmrc`, provider
+homes and private `.kranz` runtime paths. Files containing a PEM private-key
+BEGIN line are excluded in full; public certificate PEM files remain eligible.
+The selection receipt names excluded paths and binds this policy. This is a
+conventional credential exclusion policy, not a complete arbitrary-secret scan.
+
 The real checkout, shared Git directory, provider login state, host home and
 Docker socket are not mounted. Network is disabled, Linux capabilities are
 dropped, privilege escalation is disabled, and PID/memory/CPU/per-file-size
@@ -107,6 +114,12 @@ these alone is a stage disposition or human approval.
 Container creation consumes the evaluation's remaining wall-time budget;
 inspection and cleanup each keep a five-second control limit. A slow create
 does not receive a fresh evaluation deadline or an automatic retry.
+
+Mission-stage evaluators share an absolute deadline fixed before the first check:
+two minutes per applicable checker plus three minutes for setup, cleanup and the
+final subject/authority recheck. Each checker still has a two-minute execution
+cap. Earlier decisions remain consumable while later checks run, but expiry,
+changed subjects and missing human authority still fail closed.
 
 Duplicate or missing responses, trailing output, forged authority fields,
 nonzero exits after pass JSON, overflow, expiry and cancellation cannot pass.

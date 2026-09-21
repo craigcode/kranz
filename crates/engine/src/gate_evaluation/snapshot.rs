@@ -44,12 +44,25 @@ pub fn excluded(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
     path.split('/')
         .any(|part| part == ".env" || part.starts_with(".env."))
-        || EXCLUDED_PREFIXES.iter().any(|prefix| {
-            path == *prefix
-                || path
-                    .strip_prefix(prefix)
-                    .is_some_and(|tail| tail.starts_with('/'))
-        })
+        || std::iter::once(path.as_str())
+            .chain(path.match_indices('/').map(|(index, _)| &path[index + 1..]))
+            .any(|suffix| {
+                EXCLUDED_PREFIXES.iter().any(|prefix| {
+                    suffix == *prefix
+                        || suffix
+                            .strip_prefix(prefix)
+                            .is_some_and(|tail| tail.starts_with('/'))
+                })
+            })
+}
+
+fn contains_private_key(bytes: &[u8]) -> bool {
+    bytes.split(|b| *b == b'\n').any(|line| {
+        let line = line.trim_ascii();
+        line.strip_prefix(b"-----BEGIN ")
+            .and_then(|label| label.strip_suffix(b"PRIVATE KEY-----"))
+            .is_some_and(|kind| kind.iter().all(|b| b.is_ascii_uppercase() || *b == b' '))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +114,10 @@ impl SourceSnapshot {
             if total > MAX_SOURCE_BYTES {
                 return Err("gate source snapshot exceeds byte limit".into());
             }
+            if contains_private_key(&bytes) {
+                excluded_paths.push(path.as_str().to_string());
+                continue;
+            }
             let label_digest = Digest::of(path.as_str().as_bytes());
             let artifact_id = Id::try_from(format!("source-{}", &label_digest.as_str()[7..]))?;
             entries.push(SnapshotEntry::File {
@@ -124,6 +141,8 @@ impl SourceSnapshot {
         .map_err(|e| e.to_string())?;
         let selection = serde_json::to_vec(&serde_json::json!({
             "prefixes": EXCLUDED_PREFIXES,
+            "prefixMatching": "directory-bounded at any depth, ASCII case-insensitive",
+            "privateKeys": "files containing a PEM private-key BEGIN line are excluded in full",
             "environmentFiles": ".env and .env.* at any depth, ASCII case-insensitive",
             "ignoredFiles": "Git standard excludes at capture; ignored caches are not evidence",
             "excludedPaths": excluded_paths,

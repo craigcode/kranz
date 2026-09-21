@@ -915,6 +915,12 @@ impl AcpSession {
     /// `initialize` + `session/new`, then the first `session/prompt` (its
     /// response streams in through `next_event` like any later turn).
     async fn handshake(&mut self) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(container) = &mut self.container {
+            container
+                .write_launch(self.stdin.as_mut().expect("startup stdin"))
+                .await?;
+        }
         let init_id = self
             .send_request(
                 method::INITIALIZE,

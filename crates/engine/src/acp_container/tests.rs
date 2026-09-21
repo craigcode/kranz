@@ -492,8 +492,13 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
     use std::os::unix::fs::PermissionsExt;
     let root = fixture();
     let name = name();
+    let mut session_spec = spec(root.path(), &name, "idle");
+    let marker = "synthetic-launch-secret-never-retained";
+    session_spec
+        .env
+        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), marker.into());
     let (mut owned, _) = OwnedContainer::prepare(
-        &spec(root.path(), &name, "idle"),
+        &session_spec,
         Path::new("/usr/local/bin/python3"),
         &[root.path().join("workspace/peer.py").display().to_string()],
     )
@@ -509,6 +514,12 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
         .root
         .as_ref()
         .is_some_and(|r| r.path().join("container.json").exists());
+    let ledger = owned.root.as_ref().unwrap().path();
+    assert!(!ledger.join("launch.json").exists());
+    for entry in std::fs::read_dir(ledger).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(marker));
+    }
     owned.client = client;
     owned.remove().await.unwrap();
     assert!(failed.is_err());
@@ -872,4 +883,157 @@ async fn acp_containment_v1_filtered_egress_uses_existing_relay_and_records_deni
     assert_eq!(evidence.len(), 3);
     assert!(evidence.values().all(|v| *v));
     absent(root.path(), &worker).await;
+}
+
+#[tokio::test]
+async fn acp_containment_v1_launch_prelude_delivers_environment_without_consuming_acp() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let marker = "synthetic-launch-secret";
+    std::fs::write(
+        root.path().join("workspace/peer.py"),
+        format!("import os\nassert os.environ['CLAUDE_CODE_OAUTH_TOKEN'] == '{marker}'\n{PEER}"),
+    )
+    .unwrap();
+    let mut session_spec = spec(root.path(), &name, "complete");
+    session_spec
+        .env
+        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), marker.into());
+    let mut session = AcpBackend::new(
+        "/usr/local/bin/python3",
+        vec![root.path().join("workspace/peer.py").display().to_string()],
+    )
+    .start(session_spec)
+    .await
+    .unwrap();
+    let mut delivered = false;
+    while let Some(event) = session.next_event().await.unwrap() {
+        if let AgentEvent::Result { text, is_error, .. } = event {
+            assert!(!is_error);
+            assert_eq!(text, "fixture-delivery");
+            delivered = true;
+        }
+    }
+    assert!(delivered);
+    assert!(matches!(
+        session.exit_status(),
+        Some(SessionExit::Completed)
+    ));
+    absent(root.path(), &name).await;
+}
+
+#[tokio::test]
+async fn acp_containment_v1_launch_prelude_rejects_overflow_eof_and_expired_owner() {
+    if !enabled() {
+        return;
+    }
+    for mode in ["overflow", "eof", "expired-owner"] {
+        let root = fixture();
+        let name = name();
+        let (mut owned, mut command) = OwnedContainer::prepare(
+            &spec(root.path(), &name, "complete"),
+            Path::new("/usr/local/bin/python3"),
+            &[root.path().join("workspace/peer.py").display().to_string()],
+        )
+        .await
+        .unwrap();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let prelude = if mode == "overflow" {
+            u32::MAX.to_be_bytes()
+        } else {
+            10_u32.to_be_bytes()
+        };
+        stdin.write_all(&prelude).await.unwrap();
+        if mode == "eof" {
+            stdin.shutdown().await.unwrap();
+            drop(stdin);
+        } else {
+            // Keep input open while waiting: a stalled prelude cannot hold the lease alive.
+            if mode == "expired-owner" {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                owned.stop_lease();
+            }
+            let output = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            owned.remove().await.unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if mode == "overflow" { 125 } else { 124 }),
+                "{mode}"
+            );
+            assert!(!root.path().join("workspace/delivered.txt").exists());
+            continue;
+        }
+        let output = tokio::time::timeout(Duration::from_secs(12), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        owned.remove().await.unwrap();
+        assert_eq!(output.status.code(), Some(125));
+        assert!(!root.path().join("workspace/delivered.txt").exists());
+    }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_state() {
+    use std::os::unix::fs::PermissionsExt;
+    for deadline in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let wrapper = root.path().join("slow-docker");
+        std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = create ]; then\n touch \"$0.created\"\n sleep 6\n printf '%064d\\n' 1\nfi\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut owned = OwnedContainer {
+            client: DockerEvaluator::new(&wrapper).unwrap(),
+            name: "kranz-fixture".into(),
+            owner: "fixture".into(),
+            image: IMAGE.into(),
+            root: Some(tempfile::tempdir().unwrap()),
+            launch: None,
+            heartbeat: None,
+            creation_started: false,
+            creation_finished: false,
+            removed: false,
+        };
+        let started = std::time::Instant::now();
+        let result = owned
+            .create(
+                &["create".into()],
+                if deadline {
+                    Duration::from_millis(250)
+                } else {
+                    CREATE_TIMEOUT
+                },
+            )
+            .await;
+        assert!(root.path().join("slow-docker.created").exists());
+        assert!(owned.creation_started);
+        if deadline {
+            assert!(result.is_err());
+            assert!(!owned.creation_finished);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                owned.remove().await.is_err(),
+                "an empty inventory cannot prove an interrupted create is gone"
+            );
+            assert!(owned.root.as_ref().unwrap().path().exists());
+            // No real daemon exists in this fixture; remove its synthetic recovery root.
+            owned.creation_started = false;
+        } else {
+            result.unwrap();
+            assert!(owned.creation_finished);
+            assert!(started.elapsed() >= Duration::from_secs(6));
+            owned.remove().await.unwrap();
+        }
+    }
 }
