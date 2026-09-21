@@ -2783,3 +2783,87 @@ async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
         "no pin ⇒ the recorded hash is the bare template hash, as before"
     );
 }
+
+/// A worker run inside a repository that a Sgian daemon serves identifies
+/// itself there as `kranz:<run-id>`: the engine issues a `write` credential
+/// before the session starts, the session sees the token as
+/// `SGIAN_CLIENT_TOKEN`, and the credential is revoked once the run ends.
+/// `KRANZ_SGIAN_BIN` points the lane at a fake `sgian` here. The variable is
+/// process-wide, so the fake records every call and the assertions filter
+/// on this test's own workspace path.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_worker_issues_and_revokes_a_sgian_credential() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+    let cfg = MissionConfig::default();
+    let calls = dir.path().join("sgian-calls");
+    let fake = dir.path().join("sgian");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *'identity issue'*) \
+             printf '{{\"id\":\"cred-9\",\"holder\":\"%s\",\"scopes\":[\"write\"],\
+             \"token\":\"sgc_fake_%s\"}}\\n' \"$8\" \"$8\";; *) printf '{{\"id\":\"cred-9\"}}\\n';; esac\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var(kranz_engine::sgian::BIN_ENV, &fake);
+
+    let backend =
+        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    let outcome = run_worker(
+        &backend,
+        &mut log,
+        &p,
+        &cfg,
+        &feature(),
+        "ship the auth system",
+        "Auth",
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        AuthVerdict::Inconclusive,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var(kranz_engine::sgian::BIN_ENV);
+
+    let holder = kranz_engine::sgian::holder_for(&outcome.run_id);
+    let specs = backend.started_specs();
+    assert_eq!(
+        specs[0]
+            .env
+            .get(kranz_engine::sgian::TOKEN_ENV)
+            .map(String::as_str),
+        Some(format!("sgc_fake_{holder}").as_str()),
+        "the session env carries the token the fake daemon issued for this run"
+    );
+    let workspace = p.repo_root.display().to_string();
+    let recorded: Vec<String> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(&workspace))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            format!(
+                "ctl --workspace {workspace} --json identity issue --holder {holder} --scope write"
+            ),
+            format!("ctl --workspace {workspace} --json identity revoke cred-9"),
+        ],
+        "issue before the session, revoke after it"
+    );
+}
