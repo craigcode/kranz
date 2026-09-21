@@ -104,8 +104,8 @@ pub fn issue_with(
         }
     };
     let id = record.get("id").and_then(serde_json::Value::as_str);
-    let token = record.get("token").and_then(serde_json::Value::as_str);
-    let (Some(id), Some(token)) = (id, token) else {
+    let issued = record.get("token").and_then(serde_json::Value::as_str);
+    let (Some(id), Some(token)) = (id, issued) else {
         tracing::warn!(
             run_id,
             "sgian identity issue record lacks an id or token; ignoring it"
@@ -117,7 +117,7 @@ pub fn issue_with(
     }
     tracing::info!(
         run_id,
-        credential = id,
+        id,
         holder = %holder,
         "sgian credential issued for the run (revoked when the run ends)"
     );
@@ -152,12 +152,12 @@ impl SgianCredential {
         ];
         match run_ctl(&self.bin, &args, deadline) {
             Ok(_) => tracing::info!(
-                credential = %self.id,
+                id = %self.id,
                 holder = %self.holder,
                 "sgian credential revoked"
             ),
             Err(reason) => tracing::warn!(
-                credential = %self.id,
+                id = %self.id,
                 holder = %self.holder,
                 reason,
                 "sgian credential could not be revoked; revoke it by hand with \
