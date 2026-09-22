@@ -261,6 +261,10 @@ export const api = {
     return getJson(`/api/missions/${encodeURIComponent(id)}/report.md`);
   },
 
+  reviewPacket(id: string): Promise<{ packet: { missionId: string; throughSeq: number; observedAt: string }; markdown: string }> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/review-packet`);
+  },
+
   diffStat(id: string): Promise<{ diffStat: string; baseSha: string; tip: string }> {
     return getJson(`/api/missions/${encodeURIComponent(id)}/diff-stat`);
   },

@@ -627,6 +627,26 @@ fn sandbox_enforce_label(enforce: SandboxEnforce) -> &'static str {
     }
 }
 
+/// Human-only observation; never persists evidence or queues a decision.
+pub(crate) async fn mission_review_packet(
+    Extension(reads): Extension<ReadWork>,
+    State(server): State<Arc<ServerState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !paths.events_file().is_file() {
+                return Err(unknown_mission(&id));
+            }
+            let packet =
+                kranz_engine::review_packet::compute_review_packet(&server.repo_root, &id)?;
+            let markdown = kranz_engine::review_packet::render_markdown(&packet);
+            Ok(Json(json!({ "packet": packet, "markdown": markdown })))
+        })
+        .await
+}
+
 /// `GET /api/missions/:id/events?since=<seq>` — events with `seq > since`
 /// (all events when `since` is omitted).
 pub(crate) async fn mission_events(
@@ -748,21 +768,35 @@ pub(crate) async fn mission_revision_diff(
         .await
 }
 
-/// `GET /api/missions/:id/report.md` — rendered mission report markdown;
-/// 404 until the mission completes and report.md is written.
+#[derive(Default, Deserialize)]
+pub(crate) struct ReportQuery {
+    #[serde(default)]
+    pub(crate) review: bool,
+}
+
+/// Report markdown; the authenticated `review=true` view adds an ephemeral
+/// human packet without writing it into the source tree.
 pub(crate) async fn mission_report_md(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
+    Query(query): Query<ReportQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    crate::read_work::run(move || {
-        let paths = mission_paths(&server, &id)?;
-        let markdown = read_file_or_404_sync(
-            &paths.report_file(),
-            format!("mission '{id}' has no report yet"),
-        )?;
-        Ok(Json(json!({ "markdown": markdown })))
-    })
-    .await
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            let mut markdown = read_file_or_404_sync(
+                &paths.report_file(),
+                format!("mission '{id}' has no report yet"),
+            )?;
+            if query.review {
+                let packet =
+                    kranz_engine::review_packet::compute_review_packet(&server.repo_root, &id)?;
+                markdown.push_str(&kranz_engine::review_packet::render_markdown(&packet));
+            }
+            Ok(Json(json!({ "markdown": markdown })))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/diff-stat` — `git diff --stat` of the pinned

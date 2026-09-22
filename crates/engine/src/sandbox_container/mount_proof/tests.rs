@@ -58,7 +58,11 @@ async fn mount_helper_v1_deletes_only_the_created_id_and_waits_for_absence() {
     assert!(marker.exists());
     helper.creation_started = false;
     let (_fake, mut helper) = fake(&format!("echo {}", "b".repeat(64)));
-    assert!(helper.cleanup().await.unwrap_err().contains("differs"));
+    let error = helper.cleanup().await.unwrap_err();
+    assert!(
+        error.contains("differs"),
+        "unexpected cleanup error: {error}"
+    );
     helper.creation_started = false;
 }
 

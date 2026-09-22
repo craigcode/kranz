@@ -2,8 +2,9 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-21
+last_verified: 2026-09-22
 verified_against:
+  - crates/engine/src/review_packet.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/orchestrator/external_gates.rs
@@ -70,6 +71,15 @@ events now carry optional typed ownership and causes. A present context controls
 automatic workspace recovery; only old events without it use the historical
 message fallback. Display wording cannot grant a new typed block an automatic
 lift.
+
+## Human review projection
+
+`review_packet::compute_review_packet` folds the sealed log and verifies retained
+evidence against the observed candidate. Its Git inventory includes dirty and
+untracked paths through the existing hardened, bounded read helpers. The CLI,
+dashboard and on-demand report share this projection; it creates no mission
+state, consent or validator input. Missing worktrees retain a committed diff
+without claiming current check freshness. See [review packets](../../review-packets.md).
 
 ## Log rules (event_log.rs)
 

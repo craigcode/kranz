@@ -2,8 +2,10 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-21
+last_verified: 2026-09-22
 verified_against:
+  - crates/engine/src/review_packet.rs
+  - crates/server/src/lib.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
@@ -117,6 +119,12 @@ mid-run, so a forged append or a rollback by truncation is a live consent
 bypass, not only an audit gap.
 
 ## The consent substrate is authenticated, and its key lives outside the repo
+
+Human review packets observe existing authority; they never issue consent or
+replace a gate. Their HTTP views require a header capability even on otherwise
+anonymous loopback servers and are generated in memory, outside validator
+inputs and committed reports. Existing controls recheck the exact request and
+binding when the operator acts. [Review packet boundary](../../review-packets.md).
 
 The control inbox (`.kranz/missions/<id>/control/*.json`) carries operator
 consent: grant approvals, revision decisions, answers, config changes. Every

@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-21
+last_verified: 2026-09-22
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -44,6 +44,9 @@ left to per-mission capture:
   `... 2>&1 | grep -qE 'test result: ok\. [1-9]'`.
 - **Contract-file additivity.** A revision may not weaken or drop an existing
   validation assertion; completed milestones are frozen.
+- **Separate human review from validator inputs.** Human packets require the
+  existing read capability and stay out of committed reports and fresh
+  validator inputs. Decision controls still recheck identity and freshness.
 - **kranz never pushes by default.** The explicit cloud handoff can push only
   a completed `kranz/*` branch; see the invariants note.
 - **Own preflight helpers.** A host CLI timeout does not remove its daemon

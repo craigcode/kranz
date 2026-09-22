@@ -2475,3 +2475,10 @@ button {
     width: 240px;
   }
 }
+.panel-review-packet .revision-body {
+  overflow-wrap: anywhere;
+}
+
+.panel-review-packet details {
+  margin-top: 12px;
+}

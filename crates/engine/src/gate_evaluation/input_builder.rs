@@ -7,12 +7,12 @@ use super::snapshot::SourceSnapshot;
 use crate::pack::evaluator::{Kind, PinnedRegistration};
 use crate::types::Plan;
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Engine-observed execution metadata. Do not construct these from a worker's
 /// report or infer an assertion count from the subprocess exit code.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservedCheck {
     pub check_id: Id,

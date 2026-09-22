@@ -56,6 +56,8 @@ Absent fields retain legacy behavior.
 | `GET /api/missions/:id/plan.md` | `{"markdown": "<plan.md contents>"}` (404 if not approved yet) |
 | `GET /api/missions/:id/revision-diff` | pending revised-plan review artifact: `{"revision", "instructions", "markdown", "diff"}`. `markdown` is the proposed revised plan rendering; `diff` is a simple line diff from current plan.md to revised-plan.md. 404 if no revision is awaiting approval |
 | `GET /api/missions/:id/report.md` | `{"markdown": "<report.md contents>"}` (404 until the mission completes) |
+| `GET /api/missions/:id/review-packet` | `{ "packet", "markdown" }` — read-only [human review projection](review-packets.md); always requires the existing read or mutation capability in `x-kranz-token`, including loopback |
+| `GET /api/missions/:id/report.md?review=true` | `{ "markdown" }` — report plus a fresh human review packet, generated without writing the report; always requires the header capability |
 | `GET /api/missions/:id/diff-stat` | `{"diffStat", "baseSha", "tip"}` — `git diff --stat` of the pinned `base_sha` (set at plan approval) against the mission branch tip. 404 if the plan is not approved yet (no `base_sha`) or the mission branch does not exist yet |
 | `GET /api/missions/:id/pr-handoff` | PR handoff for a COMPLETE mission (never pushes): `{"kind":"needsPush","command",…}` \| `{"kind":"readyToCreate",…}` \| `{"kind":"unavailable","reason"}`. Probes whether `origin` advertises the mission branch (`git ls-remote`); missing remote branch → copyable `git push` only |
 | `POST /api/missions/:id/pr-handoff/create` | runs `gh pr create` only when handoff is `readyToCreate` (remote branch already present). Never `git push`. `409` otherwise |
@@ -161,6 +163,8 @@ Every `POST /api/...` requires the per-serve session token via the
 `x-kranz-token` header. GETs and WS stay tokenless on the default loopback
 posture; `--read-auth` or any non-loopback bind gates them with either the
 mutation token or the separate read-only token described below.
+Human review packets and `report.md?review=true` requests always
+require a header capability, even on loopback; see [human review packets](review-packets.md).
 ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
 cannot present the token, so that route authenticates with its own per-repo
 HMAC signature and refuses closed when unconfigured (see §Webhooks).

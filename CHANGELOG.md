@@ -5,6 +5,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added a read-only human review packet in the CLI, dashboard and authenticated
+  report view. It brings approved scope, candidate changes, check freshness,
+  findings, explicit exceptions and pending decisions together, with references
+  to their recorded evidence. Dirty edits make prior checks historical; missing
+  evidence remains visible. Human packets stay outside validator inputs and
+  use the existing decision controls. See [review packets](docs/review-packets.md).
+
 - Worker runs in a repository served by a Sgian daemon now identify
   themselves there as `kranz:<run-id>`: the engine issues a write-scoped
   credential before the session, passes it as `SGIAN_CLIENT_TOKEN`, and
