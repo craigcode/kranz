@@ -43,7 +43,7 @@ in configuration. Other backends have role and sandbox restrictions; run
 `kranz ready` before the first mission.
 
 ```sh
-cargo install kranz --version 0.3.0 --locked
+cargo install kranz --version 0.4.0 --locked
 cd /path/to/your/repo             # must be a git repo
 
 # 0. Onboard the repo. This detects common Rust/Node/Python gates, adds the
@@ -84,17 +84,17 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 ## Install
 
 **With Cargo.** Install the published
-[v0.3.0 release](https://crates.io/crates/kranz/0.3.0), including the embedded
+[v0.4.0 release](https://crates.io/crates/kranz/0.4.0), including the embedded
 web dashboard:
 
 ```sh
-cargo install kranz --version 0.3.0 --locked
+cargo install kranz --version 0.4.0 --locked
 ```
 
 Most users install only `kranz`; Cargo builds its three library dependencies
 automatically.
 
-**Prebuilt binaries.** [Download v0.3.0 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.3.0)
+**Prebuilt binaries.** [Download v0.4.0 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.4.0)
 for Linux x86_64, macOS Apple Silicon or Intel, and Windows ARM64 or x86_64.
 Extract the archive and put `kranz` (`kranz.exe` on Windows) on your `PATH`.
 The release includes checksums, build provenance attestations, an SBOM, and
@@ -137,13 +137,13 @@ are reusable components of the product:
 
 | Crate | Provides |
 |---|---|
-| [`kranz`](https://crates.io/crates/kranz/0.3.0) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
-| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.3.0) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
-| [`kranz-server`](https://crates.io/crates/kranz-server/0.3.0) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
-| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.3.0) | The Slack Socket Mode bridge for operating and observing missions. |
+| [`kranz`](https://crates.io/crates/kranz/0.4.0) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
+| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.4.0) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
+| [`kranz-server`](https://crates.io/crates/kranz-server/0.4.0) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
+| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.4.0) | The Slack Socket Mode bridge for operating and observing missions. |
 
 The three library crates are public for reuse, but their Rust APIs are early
-and evolving in the v0.3 line. Pin exact versions if embedding them; semantic
+and evolving in the v0.4 line. Pin exact versions if embedding them; semantic
 compatibility is not yet promised beyond Cargo's normal pre-1.0 rules.
 
 ## The four roles

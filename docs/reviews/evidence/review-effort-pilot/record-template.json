@@ -1,0 +1,75 @@
+{
+  "recordKind": "manual-pilot-template",
+  "protocol": "docs/scoping/review-effort-pilot.md",
+  "caseId": null,
+  "round": null,
+  "status": "not-started",
+  "fixtureOrLive": "fixture",
+  "taskClass": null,
+  "riskClass": null,
+  "selectionReason": null,
+  "knownDifferences": [],
+  "reviewer": {
+    "identity": null,
+    "method": null,
+    "authoredFixture": null,
+    "priorSeedKnowledge": null,
+    "assistantContribution": null
+  },
+  "runtime": {
+    "kranzCommit": null,
+    "kranzTree": null,
+    "cliVersion": null,
+    "osArchitecture": null,
+    "toolVersions": [],
+    "containment": null
+  },
+  "source": {
+    "repository": null,
+    "missionId": null,
+    "baselineCommit": null,
+    "candidateCommit": null,
+    "checkerDigest": null,
+    "environmentDigest": null,
+    "answerKeyDigest": null
+  },
+  "artifacts": [],
+  "validatorInputs": {
+    "manifestReference": null,
+    "workerTranscriptMarkerAbsent": null,
+    "verificationReference": null
+  },
+  "activeReview": {
+    "intervals": [],
+    "seconds": null,
+    "source": null
+  },
+  "approvalAndQueueWait": {
+    "intervals": [],
+    "seconds": null,
+    "source": null
+  },
+  "manualEvidenceCollection": null,
+  "questions": null,
+  "humanInterventions": null,
+  "repairRoundsObserved": null,
+  "seedResults": null,
+  "decision": {
+    "value": null,
+    "rationale": null,
+    "source": null
+  },
+  "escapeObservation": {
+    "from": null,
+    "through": null,
+    "observedDefects": null,
+    "source": null
+  },
+  "delivery": {
+    "code": "not-started",
+    "localMerge": "not-started",
+    "productRelease": "not-applicable",
+    "productionCutover": "not-applicable"
+  },
+  "incompleteReason": null
+}

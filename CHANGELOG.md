@@ -5,6 +5,8 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-22
+
 - Added read-only recorded outcome reasons in the CLI, API, dashboard and
   evidence export. Explicit authentication blocks, checker findings and human
   boundaries remain distinct; ambiguous failures stay unknown. Activity-window
@@ -28,9 +30,13 @@ Notable user-visible changes are documented here. This project follows
 - Worker runs in a repository served by a Sgian daemon now identify
   themselves there as `kranz:<run-id>`: the engine issues a write-scoped
   credential before the session, passes it as `SGIAN_CLIENT_TOKEN`, and
-  revokes it when the run ends. Silent when `sgian` or its daemon is absent;
+  attempts revocation when the run ends, including dropped worker futures. Silent when `sgian` or its daemon is absent;
   `KRANZ_SGIAN_BIN` overrides or disables the lane. See
-  [Sgian coordination](docs/sgian-coordination.md).
+  [Sgian coordination](docs/sgian-coordination.md). Control calls now use bounded
+  process-tree supervision and an explicit environment allowlist; helper reply
+  bytes are excluded from error logs. The shared scrubber recognizes Sgian client
+  credentials in worker output and evidence. Failed revocation or engine death still
+  requires operator reconciliation.
 
 ## 0.3.0 - 2026-09-20
 

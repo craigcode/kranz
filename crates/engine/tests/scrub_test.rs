@@ -15,6 +15,19 @@ const MARKER: &str = "[REDACTED]";
 const TRUNCATED: &str = "… [truncated]";
 
 #[test]
+fn scrub_sgian_client_credentials_in_bare_and_structured_output() {
+    let credential = format!("sgc_{}", "0123456789abcdef".repeat(4));
+    assert_eq!(scrub(&format!("reply: {credential}")), "reply: [REDACTED]");
+    let findings = scan_text(&credential);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "sgian-client-token");
+    let value = serde_json::json!({"result": format!("echoed {credential}")});
+    let redacted: serde_json::Value = serde_json::from_str(&scrub(&value.to_string())).unwrap();
+    assert_eq!(redacted["result"], "echoed [REDACTED]");
+    assert_eq!(scrub("sgc_short_example"), "sgc_short_example");
+}
+
+#[test]
 fn python_suite_headers_are_not_credential_assignments() {
     let dir = tempfile::tempdir().unwrap();
     let source = "if supplied != VALID_TOKEN:\n    self._send_json(403, {})\n";

@@ -7,8 +7,8 @@
 //! token to the worker through `SGIAN_CLIENT_TOKEN`, and revokes the
 //! credential when the run ends. Sgian then attributes every pane the worker
 //! drives, every lease it takes and every ledger record it produces to the
-//! run rather than to the operator, and the token stops working the moment
-//! the run is over.
+//! run rather than to the operator. Revocation is best-effort, including on
+//! future cancellation; engine death still needs operator reconciliation.
 //!
 //! The lane is best-effort and never a reason to fail a spawn:
 //! - `KRANZ_SGIAN_BIN` set to a path uses that `sgian` binary; set but empty
@@ -24,8 +24,8 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 /// Environment variable the worker reads (Sgian's own client convention).
 pub const TOKEN_ENV: &str = "SGIAN_CLIENT_TOKEN";
@@ -45,6 +45,15 @@ pub struct SgianCredential {
     pub holder: String,
     bin: PathBuf,
     workspace: PathBuf,
+}
+
+/// Revokes an issued worker credential even if its running future is dropped.
+pub(crate) struct RevocationGuard(pub SgianCredential);
+
+impl Drop for RevocationGuard {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
 }
 
 /// The holder name Sgian records for a run.
@@ -133,8 +142,8 @@ pub fn issue_with(
 }
 
 impl SgianCredential {
-    /// Revoke the credential. Failure is logged and otherwise ignored: the
-    /// daemon may have gone away, in which case nothing holds the token.
+    /// Attempt revocation. Failure is logged; daemon state must be reconciled
+    /// by the operator if cleanup could not be confirmed.
     pub fn revoke(&self) {
         self.revoke_with(DEADLINE);
     }
@@ -185,70 +194,25 @@ const BIN_NAME: &str = "sgian.exe";
 #[cfg(not(windows))]
 const BIN_NAME: &str = "sgian";
 
-/// Run `bin args…`, returning stdout on exit 0, within `deadline`. The child
-/// inherits the ambient environment (the daemon's socket lives under the
-/// operator's home) minus any client token of the engine's own, so the call
-/// is made as the workspace owner and not under a credential that may lack
-/// the `admin` scope.
+/// Run the operator helper with bounded pipes and process-tree cleanup. The
+/// discovery allowlist keeps HOME for daemon lookup, without forwarding provider
+/// credentials or a worker's client token. Never log the helper's reply bytes.
 fn run_ctl(bin: &Path, args: &[&str], deadline: Duration) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(args)
-        .env_remove(TOKEN_ENV)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("{} did not start: {error}", bin.display()))?;
-    let started = Instant::now();
-    // Drain the pipes on a helper thread so a chatty child cannot block on a
-    // full pipe while we poll for exit.
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut stderr = child.stderr.take().expect("stderr piped");
-    let drain = std::thread::spawn(move || {
-        use std::io::Read;
-        let err = std::thread::spawn(move || {
-            let mut err = Vec::new();
-            let _ = stderr.read_to_end(&mut err);
-            err
-        });
-        let mut out = Vec::new();
-        let _ = stdout.read_to_end(&mut out);
-        (out, err.join().unwrap_or_default())
-    });
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let (out, err) = drain.join().unwrap_or_default();
-                if status.success() {
-                    return Ok(out);
-                }
-                let message = String::from_utf8_lossy(&err).trim().to_string();
-                return Err(format!(
-                    "{} exited with {status}: {}",
-                    bin.display(),
-                    first_line(&message)
-                ));
-            }
-            Ok(None) if started.elapsed() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // Not joined: a grandchild of the wedged client may still
-                // hold the pipes open, and the caller must not wait on it.
-                // The drain thread ends on its own when the pipes close.
-                drop(drain);
-                return Err(format!(
-                    "{} did not answer within {deadline:?}",
-                    bin.display()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Err(format!("waiting for {}: {error}", bin.display())),
-        }
+        .env_clear()
+        .envs(crate::agent_env::probe_child_env(&[]));
+    let output = crate::git_ops::process::output(
+        command,
+        crate::git_ops::process::Limits::for_control(deadline),
+    )
+    .map_err(|error| format!("{} control call failed: {error}", bin.display()))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!("{} exited with {}", bin.display(), output.status))
     }
-}
-
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("")
 }
 
 /// Apply an issued credential to a session env; a convenience for callers
@@ -261,6 +225,7 @@ pub fn seed_env(env: &mut HashMap<String, String>, token: String) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     /// A fake `sgian` that appends its argv to `<dir>/calls`, then behaves
     /// per `body` (a shell snippet run with the args still in `$@`).
@@ -345,6 +310,56 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "the deadline must cut the wait short"
         );
+    }
+
+    #[test]
+    fn sgian_control_deadline_covers_pipes_after_leader_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-ran");
+        let bin = fake_sgian(
+            dir.path(),
+            &format!("(sleep 1; touch '{}') & exit 0", marker.display()),
+        );
+        // Prove the same descendant would act without cancellation.
+        assert!(run_ctl(&bin, &[], Duration::from_secs(3)).is_ok());
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let started = Instant::now();
+        assert!(run_ctl(&bin, &[], Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!marker.exists(), "timed-out descendants must not continue");
+    }
+
+    #[test]
+    fn sgian_control_refuses_oversize_output_and_does_not_log_reply_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for stream in ["", " >&2"] {
+            let bin = fake_sgian(dir.path(), &format!("head -c 65537 /dev/zero{stream}"));
+            assert!(run_ctl(&bin, &[], DEADLINE).is_err());
+        }
+        let bin = fake_sgian(dir.path(), "echo 'private-reply' >&2; exit 1");
+        let error = run_ctl(&bin, &[], DEADLINE).unwrap_err();
+        assert!(!error.contains("private-reply"));
+    }
+
+    #[test]
+    fn sgian_control_keeps_discovery_environment_without_ambient_secrets() {
+        let name =
+            "sgian::tests::sgian_control_keeps_discovery_environment_without_ambient_secrets";
+        if crate::agent_env::isolated_global_home_test(name) {
+            return;
+        }
+        std::env::set_var("KRANZ_SGIAN_PRIVATE_FIXTURE", "private-value");
+        std::env::set_var(TOKEN_ENV, "private-value");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_sgian(dir.path(), "env");
+        let output = run_ctl(&bin, &[], DEADLINE).unwrap();
+        let env = String::from_utf8(output).unwrap();
+        assert!(env.lines().any(|line| line.starts_with("HOME=")));
+        assert!(env.lines().any(|line| line.starts_with("PATH=")));
+        assert!(!env.contains("KRANZ_SGIAN_PRIVATE_FIXTURE="));
+        assert!(!env.contains("SGIAN_CLIENT_TOKEN="));
     }
 
     #[test]

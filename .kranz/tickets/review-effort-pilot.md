@@ -12,6 +12,10 @@ Run a small, reproducible review pilot after the evidence follow-ups land and
 publish an honest assessment of the human effort, missing evidence and defects
 observed. Use the results to decide which further product work is justified.
 
+The [protocol and case list](../../docs/scoping/review-effort-pilot.md) are
+prepared. Case execution and human measurements remain outstanding; fixture
+mechanism checks are preparation evidence, not pilot results.
+
 ## Context
 
 The operator authorized scheduling this pilot on 2026-09-16 following the

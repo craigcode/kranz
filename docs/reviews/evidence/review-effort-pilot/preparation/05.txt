@@ -1,0 +1,6 @@
+Running unittests src/lib.rs (target/debug/deps/kranz_engine-f0518376c4708a11)
+
+running 1 test
+test contract_controls::tests::pair_tests::baseline_pair_parity_and_broken_checker_do_not_change_policy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1318 filtered out; finished in 2.13s

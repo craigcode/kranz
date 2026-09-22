@@ -990,9 +990,7 @@ pub async fn run_worker_in(
     )?;
     let mut target = LogTarget::Live(log);
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    if let Some(credential) = sgian {
-        credential.revoke();
-    }
+    drop(sgian);
     outcome
 }
 
@@ -1106,9 +1104,7 @@ pub(crate) async fn run_worker_in_buffered_controlled(
         None => LogTarget::Buffer(Vec::new()),
     };
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    if let Some(credential) = sgian {
-        credential.revoke();
-    }
+    drop(sgian);
     if matches!(target, LogTarget::Controlled { .. }) {
         target
             .permission_notice(PermissionNotice::Finished, &run_id, session_cwd)
@@ -1250,7 +1246,7 @@ fn build_worker_spec(
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
-) -> Result<(SessionSpec, RunMeta, Option<crate::sgian::SgianCredential>)> {
+) -> Result<(SessionSpec, RunMeta, Option<crate::sgian::RevocationGuard>)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -1429,7 +1425,7 @@ fn build_worker_spec(
     // byte-identical session.
     let sgian = crate::sgian::issue(repo_root, &run_id).map(|(credential, token)| {
         crate::sgian::seed_env(&mut spec.env, token);
-        credential
+        crate::sgian::RevocationGuard(credential)
     });
 
     let run_meta = RunMeta {

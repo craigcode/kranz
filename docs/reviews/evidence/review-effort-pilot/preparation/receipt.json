@@ -1,0 +1,134 @@
+{
+  "kind": "fixture-mechanism-readiness-not-human-pilot",
+  "testedCommit": "3fb8a61815d97fa7542fe63a25480d4d642a2426",
+  "testedTree": "4e9e2d256625b5956c1302ca6e2d63d1e8b3c1fb",
+  "protocolSha256": "0b58d39091f669faf631f82e7911d644a3efae497673960c12b61fa114bb13f3",
+  "os": "Darwin",
+  "osVersion": "26.6.2",
+  "architecture": "arm64",
+  "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "startedAt": "2026-09-22T06:39:14.402132+00:00",
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "review_packet_invalidates_pass_after_dirty_edit_and_exposes_previous_review_binding",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "01.txt",
+      "sha256": "b322f578c01bfd093cbe0f06749565df375985febc45d32cf3914e82a39e87cb",
+      "bytes": 299,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "237ce6a2235bf5150b2bb43499bb45382ec26a3d0f65367e3d160d1529682e81"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "review_packet_missing_tampered_zero_assertions_error_and_expiry_never_pass",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "02.txt",
+      "sha256": "c548039292d4595891bec68db5b04a0975970a3a2e6afe19e3f7347bb247ed44",
+      "bytes": 290,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "c8e7372534eac87b1a81223a5fed12008e0f11dd877a86d1993b86dde1254d20"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "review_packet_old_logs_are_explicit_and_never_read_worker_transcripts",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "03.txt",
+      "sha256": "35b86f2b47f0a83b2ff95e4381ef4e182a1a904c6f6ba934b86c52ed2338122d",
+      "bytes": 285,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "f406461129c154e44c9a6672cbce3f4db7fcd42e995b303431ded13acdf2483f"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "contract_controls::tests::pair_tests::baseline_pair_actual_revisions_overlay_and_tamper_evidence",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "04.txt",
+      "sha256": "5018bb3a056c5fb1d86c994a7f9ad5e8d0fb488502e941b2ce675b0641d200d5",
+      "bytes": 302,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "e4aa4e0485c751c21d7f1c19fb1e344360a43a395668148892af279ace097ab8"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "contract_controls::tests::pair_tests::baseline_pair_parity_and_broken_checker_do_not_change_policy",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "05.txt",
+      "sha256": "3dedce5216ffd3bc3095c5d251c5e7f4047c9273d9113598f1efaf98e520b3f9",
+      "bytes": 304,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "447a1ee0d267e7ecc5ce7057de38acbb33e3c2138840ea040b7069d4462a47c6"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "contract_controls::tests::contract_readback_control_setup_zero_checks_and_timeout_are_inconclusive",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "testsPassed": 1,
+      "skipMarker": false,
+      "log": "06.txt",
+      "sha256": "75fc1e82fd6e87c1517bb72b3ffadd6b5f9ad66975a8da47ad000293faa8ca09",
+      "bytes": 304,
+      "transformation": "Retain the complete positive test-suite section; omit build and zero-selected-test sections. Exit code, exact total count and skip markers were checked against the complete output.",
+      "completeOutputSha256": "e234569b69ac501448f76635ec794aebce402041411f5d073081391634e47896"
+    }
+  ],
+  "finishedAt": "2026-09-22T06:39:33.528197+00:00",
+  "humanReviewedCases": null,
+  "activeHumanReviewSeconds": null,
+  "liveProviderCalls": 0,
+  "caseExecutionStatus": "not-started",
+  "workingTreeNote": "Only pilot documentation and ticket/roadmap bookkeeping were uncommitted during these checks; executable sources matched the recorded commit."
+}

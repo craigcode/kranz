@@ -53,6 +53,10 @@ verified_against:
 
 ## Human review evidence
 
+Rechecked 2026-09-22 for v0.4.0: Sgian's fixed client-credential shape is covered
+by the shared scrubber, including bare output and structured evidence strings.
+This remains defense in depth, not a complete secret-disclosure guarantee.
+
 `kranz review-packet` and the dashboard share a read-only projection. Tests cover
 dirty source edits, absent or changed artifacts, zero assertions, expiry,
 legacy logs and exact pending decisions. The contained evaluator fixture cannot

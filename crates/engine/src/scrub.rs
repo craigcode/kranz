@@ -181,6 +181,8 @@ fn rules() -> &'static [Rule] {
             ),
             // 3k. Slack tokens.
             rule("slack-token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}", REDACTED),
+            // Sgian client credentials contain 32 random bytes encoded as hex.
+            rule("sgian-client-token", r"\bsgc_[0-9a-fA-F]{64}\b", REDACTED),
             // 3l. JWTs (three base64url segments).
             rule(
                 "jwt",
