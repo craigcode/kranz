@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 #[path = "git_process.rs"]
-mod process;
+pub(crate) mod process;
 
 /// One commit in a [`GitRepo::commits_between`] listing.
 #[derive(Debug, Clone, PartialEq, Eq)]

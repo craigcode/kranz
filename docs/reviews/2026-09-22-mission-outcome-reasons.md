@@ -55,7 +55,8 @@ mission filtering, invalid windows, unique denominators, absent old fields,
 missing logs, shared exports and unchanged source/control files. UI tests cover
 escaped evidence, absent legacy reports and window selection.
 
-GitHub's complete checks passed on `c4052e9`; the ancestry update requires a
-fresh check run on `3fb8a61` before merge. No live-provider qualification, Keychain
+GitHub's complete checks passed on `c4052e9` and the ancestry update `3fb8a61`.
+PR #75 merged at `0ba7d11de52dc5fe9de5d3184e8ac106959ee136` on 2026-09-22.
+No live-provider qualification, Keychain
 access, release tag or version bump is part of this review. Human review effort
 and the three pilot cases remain unmeasured.

@@ -2794,6 +2794,34 @@ async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_worker_issues_and_revokes_a_sgian_credential() {
+    // This test changes process-wide binary selection. Keep every other
+    // worker fixture in the workspace outside that environment.
+    const MARKER: &str = "KRANZ_SGIAN_RUNNER_FIXTURE";
+    if std::env::var(MARKER).as_deref() != Ok("1") {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "run_worker_issues_and_revokes_a_sgian_credential",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed;"));
+        return;
+    }
+    verify_worker_sgian_revocation(false).await;
+    verify_worker_sgian_revocation(true).await;
+}
+
+#[cfg(unix)]
+async fn verify_worker_sgian_revocation(drop_running: bool) {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
@@ -2814,14 +2842,18 @@ async fn run_worker_issues_and_revokes_a_sgian_credential() {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var(kranz_engine::sgian::BIN_ENV, &fake);
 
-    let backend =
-        MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
-    let outcome = run_worker(
+    let backend = MockBackend::with_scripts(vec![if drop_running {
+        MockScript::streaming(vec![mock_init("mock-session"), mock_text("working...")])
+    } else {
+        MockScript::single_shot_json(&worker_report_json())
+    }]);
+    let f = feature();
+    let mut run = Box::pin(run_worker(
         &backend,
         &mut log,
         &p,
         &cfg,
-        &feature(),
+        &f,
         "ship the auth system",
         "Auth",
         None,
@@ -2834,12 +2866,34 @@ async fn run_worker_issues_and_revokes_a_sgian_credential() {
         &[],
         None,
         None,
-    )
-    .await
-    .unwrap();
+    ));
+    if drop_running {
+        timeout(HANG_PROOF, async {
+            tokio::select! {
+                _ = &mut run => panic!("streaming worker unexpectedly completed"),
+                _ = async {
+                    while backend.started_specs().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        drop(run);
+    } else {
+        run.await.unwrap();
+    }
     std::env::remove_var(kranz_engine::sgian::BIN_ENV);
 
-    let holder = kranz_engine::sgian::holder_for(&outcome.run_id);
+    let run_id = read_log(&p)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::WorkerSpawned { run_id, .. } => Some(run_id),
+            _ => None,
+        })
+        .unwrap();
+    let holder = kranz_engine::sgian::holder_for(&run_id);
     let specs = backend.started_specs();
     assert_eq!(
         specs[0]

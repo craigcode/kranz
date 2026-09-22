@@ -36,6 +36,12 @@ verified_against:
 
 ## The one invariant
 
+Rechecked 2026-09-22 for release preparation: Sgian worker credentials use an
+owned revocation guard, including dropped futures, and the existing bounded
+Git subprocess supervisor also bounds coordination-helper pipes. This does not
+change mission authority; failed revocation and engine death still require
+operator reconciliation. See [Sgian coordination](../../sgian-coordination.md).
+
 A sequential worker interrupted by Pause returns to the outer idle loop after
 recording its existing commits and closing live permissions. It must not enter
 checkpoint, judgment or respawn while paused. A later permission click cannot

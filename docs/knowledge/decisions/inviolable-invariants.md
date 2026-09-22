@@ -31,6 +31,12 @@ verified_against:
 
 ## What this is
 
+Rechecked 2026-09-22 for the Sgian release corrections: coordination helpers use
+bounded process-tree supervision and a cleared discovery environment. Worker
+credential guards cover dropped futures; the scrubber recognizes client tokens.
+These reinforce existing process and evidence boundaries without granting any
+new mission authority. Unconfirmed revocation still needs operator action.
+
 The load-bearing invariants a change in kranz must never break, each with WHY
 and where it is enforced. These are not style preferences; several have a scar
 behind them (named incidents, respawns, a shipped-broken push). Break one and

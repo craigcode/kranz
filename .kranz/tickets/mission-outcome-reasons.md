@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented and reviewed in PR #75; merged at 0ba7d11de52dc5fe9de5d3184e8ac106959ee136. Delivered through a PR, not a recorded Complete mission.
+state: done
 title: Mission outcomes — distinguish defective work, environment blocks and human boundaries
 priority: 2
 schedule: once

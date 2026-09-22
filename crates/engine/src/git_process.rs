@@ -1,4 +1,5 @@
-//! Bounded, exact Git output. Reuses the agent process-group / Job Object
+//! Bounded, exact child output for Git and operator coordination helpers.
+//! Reuses the agent process-group / Job Object
 //! primitives, without the gate runner's combined, lossy tail representation.
 
 use std::ffi::OsString;
@@ -8,13 +9,21 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Clone, Copy)]
-pub(super) struct Limits {
+pub(crate) struct Limits {
     timeout: Duration,
     stdout: usize,
     stderr: usize,
 }
 
 impl Limits {
+    pub(crate) fn for_control(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            stdout: 64 * 1024,
+            stderr: 4 * 1024,
+        }
+    }
+
     pub(super) fn for_command(args: &[OsString], network: bool) -> Self {
         let config = args.first().is_some_and(|arg| arg == "config");
         Self {
@@ -35,7 +44,7 @@ impl Limits {
     }
 }
 
-pub(super) fn output(command: Command, limits: Limits) -> io::Result<Output> {
+pub(crate) fn output(command: Command, limits: Limits) -> io::Result<Output> {
     let run = move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -49,7 +58,7 @@ pub(super) fn output(command: Command, limits: Limits) -> io::Result<Output> {
             scope
                 .spawn(run)
                 .join()
-                .unwrap_or_else(|_| Err(io::Error::other("Git process supervisor panicked")))
+                .unwrap_or_else(|_| Err(io::Error::other("process supervisor panicked")))
         })
     } else {
         run()
@@ -112,7 +121,7 @@ async fn capture(mut command: tokio::process::Command, limits: Limits) -> io::Re
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("Git exceeded its {}s deadline", limits.timeout.as_secs()),
+            format!("process exceeded its {:#?} deadline", limits.timeout),
         )),
     };
     if result.is_err() {

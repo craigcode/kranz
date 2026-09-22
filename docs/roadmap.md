@@ -248,7 +248,7 @@ acceptance); they are not additional release prerequisites. S5 and S7 are define
   current evidence and the human decision.
 - [x] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
   — comparable observations across actual revisions, extending existing controls.
-- [ ] [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) —
+- [x] [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) —
   explain recorded causes without changing mission states or authority.
 - [ ] [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) — a bounded
   assessment of evidence gaps and human work after the implementations land;

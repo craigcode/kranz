@@ -1,6 +1,6 @@
 [package]
 name = "kranz-dashboard"
-version = "0.3.0"
+version = "0.4.0"
 description = "Kranz Mission Control — Tauri desktop shell embedding the kranz server"
 authors = ["Kranz"]
 license = "MIT"
