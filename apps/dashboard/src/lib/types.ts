@@ -834,7 +834,48 @@ export interface EscalationRow {
 }
 
 /** `GET /api/missions/outcomes` — flight-surgeon outcomes fold. */
+export interface OutcomeReasonObservation {
+  seq: number;
+  ts: string;
+  eventType: string;
+  category: string;
+  detail: string;
+  state: string;
+  resolutionSeq: number | null;
+  milestoneId: string | null;
+  featureId: string | null;
+  runId: string | null;
+  attemptId: string | null;
+  permissionRequestId: string | null;
+  stage: string | null;
+  actor: { kind: string; id?: string } | null;
+  blockContext: { owner: string; cause: string } | null;
+  deadline: string | null;
+}
+
+export interface OutcomeReasonReport {
+  mappingVersion: number;
+  from: string | null;
+  through: string | null;
+  selection: string;
+  unavailableLogs: string[];
+  missions: {
+    missionId: string;
+    taskClass: string;
+    currentStatus: string | null;
+    observations: OutcomeReasonObservation[];
+  }[];
+  taskClasses: {
+    taskClass: string;
+    missions: number;
+    mixedMissions: number;
+    unresolvedMissions: number;
+    counts: { category: string; missions: number; observations: number; share: number | null }[];
+  }[];
+}
+
 export interface Outcomes {
+  outcomeReasons?: OutcomeReasonReport;
   autonomyRatio: AutonomyRatio;
   grantLatency: GrantLatency;
   escalations: EscalationRow[];

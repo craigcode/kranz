@@ -302,6 +302,11 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
     ));
     out.push_str(&format!("  closed missions: {}\n", ratio.closed_missions));
 
+    if let Some(reasons) = &outcomes.outcome_reasons {
+        out.push('\n');
+        out.push_str(&kranz_engine::outcomes::reasons::render_text(reasons));
+    }
+
     let has_history = ratio.closed_missions > 0
         || !outcomes.escalations.is_empty()
         || outcomes.grant_latency.total_decided > 0

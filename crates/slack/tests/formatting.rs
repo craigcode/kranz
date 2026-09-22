@@ -429,6 +429,7 @@ fn help_lists_the_steering_commands() {
 #[test]
 fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
     let outcomes = Outcomes {
+        outcome_reasons: None,
         autonomy_ratio: AutonomyRatio {
             closed_missions: 4,
             total_interventions: 6,
@@ -532,6 +533,7 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
 #[test]
 fn outcomes_slack_card_empty_history_renders_gracefully() {
     let outcomes = Outcomes {
+        outcome_reasons: None,
         autonomy_ratio: AutonomyRatio {
             closed_missions: 0,
             total_interventions: 0,

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Outcomes } from '../lib/types';
 
@@ -51,6 +51,16 @@ afterEach(() => {
 });
 
 describe('OutcomesPanel', () => {
+  it('requests the selected reason window without issuing a mission action', async () => {
+    vi.mocked(getOutcomes).mockResolvedValue(emptyOutcomes());
+    render(<OutcomesPanel />);
+    await screen.findByLabelText('Reason activity window');
+    expect(getOutcomes).toHaveBeenLastCalledWith(30);
+    fireEvent.change(screen.getByLabelText('Reason activity window'), { target: { value: '7' } });
+    await waitFor(() => expect(getOutcomes).toHaveBeenLastCalledWith(7));
+    await screen.findByLabelText('Reason activity window');
+  });
+
   it('renders the four latency buckets with their counts', async () => {
     const outcomes = emptyOutcomes();
     outcomes.grantLatency = {

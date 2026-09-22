@@ -99,15 +99,31 @@ pub(crate) async fn list_missions(
 /// `GET /api/missions/outcomes` — flight-surgeon outcomes fold (autonomy
 /// ratio, grant-latency distribution, escalation ledger), computed
 /// per-request from the event logs by [`kranz_engine::outcomes::compute_outcomes`].
-/// No caching, no second source of truth.
+/// Reuses the engine log memo; no second source of truth.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OutcomeQuery {
+    window_days: Option<u64>,
+}
+
 pub(crate) async fn mission_outcomes(
     Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
+    Query(query): Query<OutcomeQuery>,
 ) -> Result<Json<kranz_engine::outcomes::Outcomes>, ApiError> {
+    let days = query
+        .window_days
+        .unwrap_or(kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS);
+    if days > kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS {
+        return Err(ApiError::bad_request("outcome reason window is too large"));
+    }
     reads
         .run(move || {
-            let outcomes = kranz_engine::outcomes::compute_outcomes(&server.repo_root)
-                .map_err(|e| ApiError::internal(e.to_string()))?;
+            let mut options = kranz_engine::outcomes::OutcomesOptions::resolve(&server.repo_root);
+            options.reason_window = Some((days, chrono::Utc::now()));
+            let outcomes =
+                kranz_engine::outcomes::compute_outcomes_with_options(&server.repo_root, &options)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
             Ok(Json(outcomes))
         })
         .await
@@ -1932,6 +1948,73 @@ mod tests {
         assert_eq!(buckets.len(), 4);
         assert!(buckets.iter().all(|b| b["count"] == 0));
         assert_eq!(body["escalations"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn outcome_reasons_endpoint_uses_the_engine_fold_and_validates_window() {
+        let tmp = TempDir::new().unwrap();
+        let mut plan = sample_plan();
+        plan.milestones.push(PlanMilestone {
+            title: "unit".into(),
+            features: vec![],
+        });
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created("seeded"),
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: None,
+                },
+                EventKind::MilestoneBlocked {
+                    milestone_id: "ms-1".into(),
+                    reason: "Authentication unavailable".into(),
+                    block_context: Some(kranz_engine::types::BlockContext::engine(
+                        kranz_engine::types::BlockCause::Authentication,
+                    )),
+                },
+            ],
+        );
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        let recorded = std::fs::read(paths.events_file()).unwrap();
+        assert_eq!(std::fs::read_dir(paths.control_dir()).unwrap().count(), 0);
+        let app = crate::router(tmp.path().to_path_buf(), None);
+        let response = app
+            .clone()
+            .oneshot(get("/api/missions/outcomes?windowDays=7"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let report: kranz_engine::outcomes::reasons::Report =
+            serde_json::from_value(body["outcomeReasons"].clone()).unwrap();
+        assert_eq!(
+            report.through.unwrap() - report.from.unwrap(),
+            chrono::Duration::days(7)
+        );
+        let options = kranz_engine::outcomes::OutcomesOptions {
+            reason_window: Some((7, report.through.unwrap())),
+            ..Default::default()
+        };
+        let engine =
+            kranz_engine::outcomes::compute_outcomes_with_options(tmp.path(), &options).unwrap();
+        assert_eq!(Some(report), engine.outcome_reasons);
+        assert_eq!(body["outcomeReasons"]["taskClasses"][0]["missions"], 1);
+        assert_eq!(
+            body["outcomeReasons"]["missions"][0]["observations"][0]["category"],
+            "environment-prerequisite"
+        );
+        for value in ["-1", "nonsense", "36526", "18446744073709551615"] {
+            let response = app
+                .clone()
+                .oneshot(get(&format!("/api/missions/outcomes?windowDays={value}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{value}");
+        }
+        assert_eq!(std::fs::read(paths.events_file()).unwrap(), recorded);
+        assert_eq!(std::fs::read_dir(paths.control_dir()).unwrap().count(), 0);
     }
 
     #[tokio::test]

@@ -11,6 +11,12 @@
 //! `&[Event]` (the merged-change denominator adds the live ancestry probe at
 //! fold time — derived, never stored).
 
+pub mod reasons;
+
+#[cfg(test)]
+#[path = "outcomes/reasons_tests.rs"]
+mod reasons_tests;
+
 use crate::events::{Event, EventKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -109,6 +115,9 @@ pub struct DivergenceOutcomes {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcomes {
+    /// Versioned, read-only explanation of recorded causes. Absent in older reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_reasons: Option<reasons::Report>,
     pub autonomy_ratio: AutonomyRatio,
     pub grant_latency: GrantLatency,
     pub escalations: Vec<EscalationRow>,
@@ -279,6 +288,7 @@ pub struct CycleTime {
 /// the wire surface; this lives in the memo cache and the aggregator).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MissionOutcomes {
+    pub outcome_reasons: reasons::MissionReasons,
     pub interventions: u64,
     pub is_closed: bool,
     pub latencies_ms: Vec<u64>,
@@ -447,10 +457,20 @@ pub(crate) fn cached_mission_outcomes(
 /// in ascending `seq` order for the "earliest later" grant/unblock/revision
 /// matching to be correct.
 pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
-    let mission_events: Vec<&Event> = events
-        .iter()
-        .filter(|e| e.mission_id == mission_id)
-        .collect();
+    let filtered: std::borrow::Cow<'_, [Event]> =
+        if events.iter().all(|e| e.mission_id == mission_id) {
+            std::borrow::Cow::Borrowed(events)
+        } else {
+            std::borrow::Cow::Owned(
+                events
+                    .iter()
+                    .filter(|e| e.mission_id == mission_id)
+                    .cloned()
+                    .collect(),
+            )
+        };
+    let events = filtered.as_ref();
+    let mission_events: Vec<&Event> = events.iter().collect();
 
     let is_closed = mission_events.iter().any(|e| {
         matches!(
@@ -839,7 +859,14 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
             }),
     };
 
+    let outcome_reasons = reasons::mission(
+        mission_id,
+        &mission_events,
+        comparison.folded.as_ref().map(|s| s.status),
+        task_class.as_deref(),
+    );
     MissionOutcomes {
+        outcome_reasons,
         interventions,
         is_closed,
         latencies_ms,
@@ -883,6 +910,8 @@ struct ReuseAcc {
 /// the same options always yields byte-identical report data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutcomesOptions {
+    /// Activity-cohort window for outcome reasons only; None means all recorded history.
+    pub reason_window: Option<(u64, DateTime<Utc>)>,
     /// Grants APPROVED in under this many ms are flagged as rubber-stamp
     /// signals (strictly under; at/over is not flagged).
     pub rubber_stamp_threshold_ms: u64,
@@ -901,6 +930,7 @@ impl Default for OutcomesOptions {
         Self {
             rubber_stamp_threshold_ms: crate::types::DEFAULT_RUBBER_STAMP_THRESHOLD_MS,
             comparison_window: None,
+            reason_window: None,
         }
     }
 }
@@ -926,6 +956,7 @@ impl OutcomesOptions {
     /// merged-change fold publishes) ending at the request time.
     fn with_comparison_window(mut self) -> Self {
         self.comparison_window = Some((DEFAULT_MERGED_CHANGE_WINDOW_DAYS, Utc::now()));
+        self.reason_window = self.comparison_window;
         self
     }
 }
@@ -987,24 +1018,34 @@ pub fn compute_outcomes_with_options(
     // same pass so the comparison section never re-reads a log this loop
     // just folded (14th-pass review — the double scan).
     let mut comparison_inputs: Vec<(String, ComparisonInputs)> = Vec::new();
+    let mut reason_missions = Vec::new();
+    let mut unavailable_logs = Vec::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
         let events_path = paths.events_file();
         if !events_path.is_file() {
+            unavailable_logs.push(id);
             continue;
         }
         // Never fold a mission reached through a symlinked path component
         // (P1 mission-path-no-follow).
         if paths.require_no_follow().is_err() {
+            unavailable_logs.push(id);
             continue;
         }
         // Memoized fold (outcomes-fold-scaling): unchanged logs are not
         // re-parsed on repeated requests; new events grow the file and
         // invalidate deterministically.
         let Some(out) = cached_mission_outcomes(&id, &events_path) else {
+            unavailable_logs.push(id);
             continue;
         };
+        if out.outcome_reasons.latest_event_seq.is_some() {
+            reason_missions.push(out.outcome_reasons.clone());
+        } else {
+            unavailable_logs.push(id.clone());
+        }
         comparison_inputs.push((id.clone(), out.comparison.clone()));
         if out.is_closed {
             closed_missions += 1;
@@ -1183,6 +1224,11 @@ pub fn compute_outcomes_with_options(
         .transpose()?;
 
     Ok(Outcomes {
+        outcome_reasons: Some(reasons::report(
+            reason_missions,
+            unavailable_logs,
+            options.reason_window,
+        )?),
         autonomy_ratio: AutonomyRatio {
             closed_missions,
             total_interventions,
@@ -2073,14 +2119,17 @@ mod tests {
                     EventKind::MissionCompleted {},
                 ],
             );
-            let first = compute_outcomes(root).unwrap();
+            // A request-time window intentionally changes its report timestamps.
+            // Pin the same all-history options while checking the log memo.
+            let options = OutcomesOptions::default();
+            let first = compute_outcomes_with_options(root, &options).unwrap();
             assert_eq!(
                 cache_entry_stats(&events_path),
                 Some((1, 0)),
                 "first fold computes once, no hits"
             );
 
-            let second = compute_outcomes(root).unwrap();
+            let second = compute_outcomes_with_options(root, &options).unwrap();
             assert_eq!(
                 cache_entry_stats(&events_path),
                 Some((1, 1)),
@@ -2105,7 +2154,7 @@ mod tests {
                     },
                 ],
             );
-            let third = compute_outcomes(root).unwrap();
+            let third = compute_outcomes_with_options(root, &options).unwrap();
             assert_eq!(
                 cache_entry_stats(&events_path),
                 Some((2, 1)),
