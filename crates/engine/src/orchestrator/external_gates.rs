@@ -206,6 +206,13 @@ impl MissionEngine {
             .cloned()
             .collect();
         let prior_refs: Vec<_> = prior.iter().collect();
+        let diagnostics = crate::contract_controls::pair::diagnostics(
+            &paths.mission_dir(),
+            &events,
+            self.active_repo(),
+            &contract,
+            &self.state.config,
+        );
         let records = Box::pin(driver::evaluate_stage_async(
             driver::StageEvaluation {
                 paths: &paths,
@@ -222,7 +229,7 @@ impl MissionEngine {
                     required: &required,
                     observed: &observed,
                 },
-                diagnostics: &[],
+                diagnostics: &diagnostics,
                 prior_findings: &prior_refs,
                 consent: None,
             },

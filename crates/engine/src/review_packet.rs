@@ -32,6 +32,7 @@ pub struct ReviewPacket {
     pub committed_change: Option<CommittedChange>,
     pub decisions: Vec<Entry>,
     pub evaluations: Vec<Evaluation>,
+    pub baseline_candidates: Vec<crate::contract_controls::pair::Review>,
     pub history: Vec<Entry>,
     pub unknowns: Vec<String>,
 }
@@ -192,6 +193,7 @@ pub fn project(
         committed_change: None,
         decisions: vec![],
         evaluations: vec![],
+        baseline_candidates: vec![],
         history: vec![],
         unknowns: vec![],
     };
@@ -445,6 +447,16 @@ pub fn project(
         });
     }
     packet.evaluations.reverse();
+    packet.baseline_candidates = crate::contract_controls::pair::reviews_with_budget(
+        mission_dir,
+        events,
+        repo,
+        approved
+            .map(|(_, p)| p.validation_contract.as_slice())
+            .unwrap_or(&[]),
+        &state.config,
+        &mut budget,
+    );
     if records.is_empty() {
         packet.unknowns.push("No source-bound external check receipts recorded. Native gate outcomes below are recorded results, not proof of a current pass.".into());
     }
@@ -452,6 +464,9 @@ pub fn project(
     for event in events {
         let entry = match &event.kind {
             EventKind::GateResult { gate, surface, verdict, artefact_ref, artefact_detail, .. } => {
+                if packet.baseline_candidates.iter().any(|pair| pair.seq == event.seq) {
+                    continue;
+                }
                 let availability = match crate::gate_results::resolve_artefact(mission_dir, artefact_ref) {
                     crate::gate_results::ArtefactResolution::Resolved { .. } => "artifact present (legacy reference, no digest verification)",
                     crate::gate_results::ArtefactResolution::Inline => "inline evidence in this event",
@@ -856,6 +871,82 @@ pub fn render_markdown(packet: &ReviewPacket) -> String {
                 "- {} — unavailable · {}",
                 literal(&a.path),
                 a.digest.as_str()
+            );
+        }
+    }
+    if !packet.baseline_candidates.is_empty() {
+        out.push_str("\n### Baseline and candidate observations\n");
+        for pair in &packet.baseline_candidates {
+            let summary = &pair.summary;
+            let _ = writeln!(out, "\n#### {} — recorded {} (advisory)\n\n{}\n\n{}\n\nEnvironment: {}. Checker: {}. Baseline checker overlay: {}.\n",
+                literal(&summary.assertion_id), name(&summary.status), literal(&pair.detail), literal(&summary.detail),
+                literal(&summary.spec.environment_label), literal(&summary.checker_sha256),
+                literal(summary.checker_overlay_sha256.as_deref().unwrap_or("none")));
+            for (label, observation, expected) in [
+                (
+                    "Baseline",
+                    &summary.baseline,
+                    &summary.spec.expected_baseline,
+                ),
+                (
+                    "Candidate",
+                    &summary.candidate,
+                    &summary.spec.expected_candidate,
+                ),
+            ] {
+                let _ = writeln!(
+                    out,
+                    "- {label}: expected {}. {}",
+                    literal(&serde_json::to_string(expected).unwrap_or_default()),
+                    literal(
+                        &observation
+                            .as_ref()
+                            .map(|o| {
+                                let source = o
+                                    .binding
+                                    .as_ref()
+                                    .map(|b| b.source.head.as_str())
+                                    .unwrap_or("unavailable");
+                                let receipt = o
+                                    .receipt
+                                    .as_ref()
+                                    .map(|r| {
+                                        format!(
+                                            "{} checks, {}{}{}",
+                                            r.checks_run,
+                                            name(&r.outcome),
+                                            r.failure_id
+                                                .as_ref()
+                                                .map(|id| format!(" ({id})"))
+                                                .unwrap_or_default(),
+                                            r.diagnostic
+                                                .as_ref()
+                                                .map(|d| format!("; diagnostic: {d}"))
+                                                .unwrap_or_default()
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "receipt unavailable".into());
+                                format!(
+                                    "Commit {source}; exit {}; {receipt}.",
+                                    o.exit_code
+                                        .map(|c| c.to_string())
+                                        .unwrap_or_else(|| "unavailable".into())
+                                )
+                            })
+                            .unwrap_or_else(|| "Observation unavailable.".into())
+                    )
+                );
+            }
+            let _ = writeln!(
+                out,
+                "\nRetained evidence: {} · event #{} · {}.\n",
+                literal(&pair.reference),
+                pair.seq,
+                if pair.available {
+                    "digest verified"
+                } else {
+                    "unavailable"
+                }
             );
         }
     }

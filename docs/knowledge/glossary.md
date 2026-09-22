@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-21
+last_verified: 2026-09-22
 verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
@@ -38,6 +38,10 @@ Project vocabulary. Terms link to the note that explains them in depth.
   is a `Command` (a build/test/lint invocation), `AgentJudgement`
   (a validator/orchestrator verdict), or `PtyScript` (an interactive terminal check). See
   [gates](validation/gates.md).
+- **Baseline/candidate pair** — opt-in advisory observations at two actual
+  revisions, with approved expectations, separately identified checker overlay
+  and source/environment configuration bindings. A recorded pair is not a
+  current gate decision. See [critical assertion controls](../contract-controls.md).
 - **Orchestrator** — the planning-and-judging agent role: drafts plans, proposes
   revisions, and renders final-gate verdicts. Claude uses a streaming session;
   non-Claude backends use fresh single-shot turns. Execution turns receive the

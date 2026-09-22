@@ -463,3 +463,54 @@ fn gate_input_builder_retains_advisory_diagnostics_without_inventing_command_rec
     assert!(value.get("exitCode").is_none());
     assert_eq!(diagnostic.content.digest, Digest::of(bytes));
 }
+
+#[test]
+fn baseline_pair_dossier_is_selected_data_and_cannot_replace_required_receipts() {
+    use kranz_engine::gate::{ArtefactRef, GateKind, GateOutcome, GateReport};
+    let fixture = Fixture::new("judgment");
+    let descriptor = json!({
+        "digest": Digest::of(b"retained"), "bytes": 8,
+        "summary": {
+            "assertionId": "a-pair", "assertionSha256": "a".repeat(64),
+            "checkerSha256": "b".repeat(64), "controlSha256": "c".repeat(64),
+            "recordedAt": Utc::now().to_rfc3339(),
+            "spec": {"baselineRevision": "d".repeat(40), "expectedBaseline": {"outcome":"failed", "failureId":"bug"},
+                "expectedCandidate": {"outcome":"passed"}, "environmentLabel":"fixture", "overlayCheckerOnBaseline":true},
+            "status":"inconclusive", "detail":"fixture receipt missing", "baseline":null, "candidate":null,
+            "checkerOverlaySha256":"b".repeat(64)
+        }
+    });
+    let diagnostics = [GateReport {
+        name: "baseline-candidate:a-pair".into(),
+        kind: GateKind::Deterministic,
+        outcome: GateOutcome::pass(
+            ArtefactRef::new("file:runs/pair.json")
+                .with_detail(format!("baseline-candidate-v1:{descriptor}")),
+        ),
+    }];
+    let mut input = fixture.input();
+    input.diagnostics = &diagnostics;
+    let built = build(input).unwrap();
+    let (_, bytes) = built
+        .evidence
+        .inputs()
+        .find(|(a, _)| a.id.as_str() == "diagnostic-0")
+        .unwrap();
+    let diagnostic: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(diagnostic["baselineCandidate"]["assertionId"], "a-pair");
+    assert_eq!(diagnostic["baselineCandidate"]["status"], "inconclusive");
+    assert!(diagnostic.get("receipt").is_none());
+    assert!(!String::from_utf8_lossy(bytes).contains("PRIVATE-CANARY"));
+    let required = [RequiredCheck {
+        id: id("command-1"),
+        command: "cargo test".into(),
+        require_assertions: true,
+    }];
+    let mut input = fixture.input();
+    input.diagnostics = &diagnostics;
+    input.checks.required = &required;
+    assert!(build(input)
+        .err()
+        .unwrap()
+        .contains("nonvacuous mechanical evidence"));
+}

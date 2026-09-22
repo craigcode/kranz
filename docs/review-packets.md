@@ -49,6 +49,14 @@ worktrees are not recreated. Findings are never silently marked resolved, and
 recorded waivers remain explicit exceptions whose applicability must be
 rechecked. The view does not infer a waiver or a successful independent review.
 
+Opt-in [baseline/candidate observations](contract-controls.md#baseline-and-candidate-observations)
+have a separate section. It shows approved expectations, original source
+identities, any checker overlay, environment labels and actual receipts.
+Retained bytes must match their sealed digest. Source and environment
+configuration matching is reported separately from the recorded outcome;
+mutable toolchain, cache and service state remains unqualified. These advisory
+observations never become a current gate pass or authorize reuse.
+
 ## Human view and validator boundary
 
 `GET /api/missions/:id/review-packet` returns `{packet, markdown}`. It requires
@@ -72,7 +80,9 @@ the always-authenticated route and prove that reads do not mutate the report,
 log or control inbox.
 
 Artifact reads reject symlinks, non-regular files, hard links and digest/length
-mismatches. A packet reads at most 128 MiB of retained artifacts, newest first,
-and observes at most 32 distinct stage baselines. Evidence outside those bounds
+mismatches. A packet reads at most 128 MiB of retained artifacts, spending the
+budget on external evaluations first and revision pairs second, newest first
+within each group. It observes at most 32 distinct stage baselines and 32 pair
+baselines. Evidence outside those bounds
 stays unavailable; it never becomes a passing claim. Use `kranz provenance` and
 `kranz evidence-bundle` for the wider audit chain and retained bytes.

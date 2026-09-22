@@ -33,6 +33,19 @@ function NegativeControlReview({ assertionId, control }: { assertionId: string; 
       </p>
       <p>Expected failure: <code>{control.expectedFailure}</code></p>
       <p className="dim">Timeout: {control.timeoutSeconds ?? 60}s per fixture (maximum 180s).</p>
+      {control.baselinePair && (
+        <section aria-label={`Baseline and candidate expectations for ${assertionId}`}>
+          <strong>Baseline and candidate evidence (advisory)</strong>
+          <p>Baseline commit: <code>{control.baselinePair.baselineRevision}</code></p>
+          <p>Expected baseline: <code>{JSON.stringify(control.baselinePair.expectedBaseline)}</code></p>
+          <p>Expected candidate: <code>{JSON.stringify(control.baselinePair.expectedCandidate)}</code></p>
+          <p>Environment label: {control.baselinePair.environmentLabel}</p>
+          <p>{control.baselinePair.overlayCheckerOnBaseline
+            ? 'The exact checker files below may be overlaid onto the baseline snapshot. The candidate must deliver them.'
+            : 'Both revisions must already contain the exact checker files below.'}</p>
+          <p className="dim">The valid/defective control proof must succeed before the actual revision pair runs. All cases share a 300s budget. Environment configuration is recorded; host tools and external services remain unqualified.</p>
+        </section>
+      )}
       {groups.map(({ label, files }) => (
         <div className="contract-control-files" key={label}>
           <div>{label}</div>

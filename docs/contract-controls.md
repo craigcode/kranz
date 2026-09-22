@@ -109,6 +109,80 @@ those transitions. Replanning cannot replace an approved assertion's controls;
 new controls require a new assertion identity under the existing additive
 contract rules.
 
+## Baseline and candidate observations
+
+Selected fixes and behavior changes can add `baselinePair` to a negative
+control. It compares the actual pinned baseline with the actual candidate after
+the valid/defective control proof succeeds. This is optional: parity and
+characterization checks may expect both revisions to pass.
+
+```json
+{
+  "baselineRevision": "0123456789abcdef0123456789abcdef01234567",
+  "expectedBaseline": {"outcome": "failed", "failureId": "invalid-credential-authorized"},
+  "expectedCandidate": {"outcome": "passed"},
+  "environmentLabel": "native checks, local fixtures, no external services",
+  "overlayCheckerOnBaseline": true
+}
+```
+
+Replace the example commit with the full lowercase ID of the actual baseline
+commit. Approve the expected outcomes with the plan, before execution. Existing
+revision rules prevent a worker from redefining them after seeing a failure.
+The same command and exact `checkerFiles` run on both revisions. With explicit
+`overlayCheckerOnBaseline`, a new regression check can be placed into the
+disposable baseline checkout. The artifact separately records the original
+source identity and checker overlay identity. The candidate must deliver the
+approved checker bytes; neither implementation fixtures nor the baseline test
+overlay are applied to the actual candidate observation. Overlays pin file bytes,
+not executable modes; invoke scripts with an explicit interpreter such as `sh`.
+
+All four executions share the existing 300-second budget and containment.
+Approval may record an inconclusive pair when the future checker is not yet
+delivered. Final validation collects fresh observations. A broken checker that
+fails its valid control prevents the pair from running. A failed expectation
+needs a nonzero exit, positive checks and the exact approved failure ID. A
+missing dependency, authentication failure, zero selected tests, unrelated
+compiler error, malformed receipt or timeout cannot establish the intended
+failure. Checker adapters must only emit a behavioral receipt after recognizing
+the declared assertion; shell exit status alone is insufficient.
+
+A compile-time assertion uses an explicit diagnostic expectation:
+
+```json
+{"outcome":"diagnostic","failureId":"missing-answer","diagnostic":"E0425: cannot find value missing_answer in this scope"}
+```
+
+Its failed receipt must include the same `failureId` and exact `diagnostic`, with
+positive `checksRun`; the valid control must compile and pass. An ordinary
+`failed` expectation rejects a receipt carrying a compiler diagnostic. Review
+the adapter that recognizes the diagnostic, including how it distinguishes
+unrelated compilation and setup failures. An error code alone often names a
+whole class of failures; bind the expected symbol and message in the adapter.
+
+The retained version-2 control artifact contains both source identities,
+receipts, overlay identity and environment configuration digests. Environment
+comparison covers OS/architecture, effective sandbox policy and cleared child
+environment values. Scratch paths and separately bound revisions are normalized;
+environment values are hashed, not published. Tool binaries, caches and remote
+service state are **not attested**. The environment label should state the
+intended toolchain and service assumptions; identical configuration is not proof
+that an external environment stayed unchanged. Source identities use the existing
+S5 snapshot selection and exclusions, not a claim to cover private files or
+ignored runtime data.
+
+An advisory `baseline-candidate:<assertion>` gate result seals the retained
+artifact digest and length. [Review packets](review-packets.md) show the exact
+observations and whether selected source, approved check and environment
+configuration still match. A later source/check/configuration change makes the
+observation historical. Missing or modified retained evidence stays unavailable
+in review and unresolved in export. Approval and completion-stage external gates receive a narrow
+source/configuration-bound diagnostic containing identities and receipts, without
+worker transcripts or command output. The pair never substitutes for required
+command receipts, independent judgment, fresh gate consumption or human consent.
+A branch pair does not attest the eventual merge tree; merge keeps its existing
+integration checks.
+
 This implements the negative-controls portion of
 [`contract-readback-and-negative-controls`](../.kranz/tickets/contract-readback-and-negative-controls.md).
 Independent model read-back and a recorded operator comparison remain open in

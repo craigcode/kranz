@@ -140,7 +140,19 @@ export interface NegativeControl {
   expectedFailure: string;
   /** Seconds per fixture: defaults to 60; the engine rejects values over 180. */
   timeoutSeconds?: number;
+  baselinePair?: {
+    baselineRevision: string;
+    expectedBaseline: PairExpectation;
+    expectedCandidate: PairExpectation;
+    environmentLabel: string;
+    overlayCheckerOnBaseline: boolean;
+  };
 }
+
+export type PairExpectation =
+  | { outcome: 'passed' }
+  | { outcome: 'failed'; failureId: string }
+  | { outcome: 'diagnostic'; failureId: string; diagnostic: string };
 
 /** One scripted terminal session declared by a `pty-script` assertion. */
 export interface PtyScript {
