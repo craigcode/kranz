@@ -244,7 +244,7 @@ boundary. They follow the v0.3.0 ACP integration and S7 (governed mission
 acceptance); they are not additional release prerequisites. S5 and S7 are defined in the
 [ACP/gate implementation sequence](scoping/acp-worker-gate-contract.md#delivery-slices-and-effort).
 
-- [ ] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,
+- [x] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,
   current evidence and the human decision.
 - [ ] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
   — comparable observations across actual revisions, extending existing controls.
