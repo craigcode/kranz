@@ -1010,7 +1010,9 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
             .create(
                 &["create".into()],
                 if deadline {
-                    Duration::from_millis(250)
+                    // Allow process startup under the full workspace's load,
+                    // while still interrupting the fixture's six-second create.
+                    Duration::from_secs(3)
                 } else {
                     CREATE_TIMEOUT
                 },
