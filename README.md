@@ -124,6 +124,12 @@ authentication is passed only through each backend's sanctioned variable, not
 through the ambient environment. See [Agent backends](docs/agent-backends.md),
 then run `kranz ready` before the first mission.
 
+When the repository is also served by a [Sgian](https://github.com/craigcode/sgian)
+daemon, each worker run identifies itself there as `kranz:<run-id>` with a
+credential the engine issues before the session and revokes after it. The lane
+is silent when `sgian` or its daemon is absent. See
+[Sgian coordination](docs/sgian-coordination.md).
+
 ### Crates and API stability
 
 Most users install only `kranz`. Cargo fetches the other crates because they

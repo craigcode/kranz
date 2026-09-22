@@ -12,6 +12,13 @@ Notable user-visible changes are documented here. This project follows
   evidence remains visible. Human packets stay outside validator inputs and
   use the existing decision controls. See [review packets](docs/review-packets.md).
 
+- Worker runs in a repository served by a Sgian daemon now identify
+  themselves there as `kranz:<run-id>`: the engine issues a write-scoped
+  credential before the session, passes it as `SGIAN_CLIENT_TOKEN`, and
+  revokes it when the run ends. Silent when `sgian` or its daemon is absent;
+  `KRANZ_SGIAN_BIN` overrides or disables the lane. See
+  [Sgian coordination](docs/sgian-coordination.md).
+
 ## 0.3.0 - 2026-09-20
 
 - Added opt-in, qualified Claude and Codex ACP workers in pinned Linux ARM64

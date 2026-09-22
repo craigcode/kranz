@@ -969,7 +969,7 @@ pub async fn run_worker_in(
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
-    let (spec, run_meta) = build_worker_spec(
+    let (spec, run_meta, sgian) = build_worker_spec(
         cfg,
         &paths.repo_root,
         &paths.mission_id,
@@ -989,7 +989,11 @@ pub async fn run_worker_in(
         standards_pin,
     )?;
     let mut target = LogTarget::Live(log);
-    run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await
+    let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
+    if let Some(credential) = sgian {
+        credential.revoke();
+    }
+    outcome
 }
 
 /// [`run_worker_in`] that BUFFERS its event kinds instead of appending them to
@@ -1073,7 +1077,7 @@ pub(crate) async fn run_worker_in_buffered_controlled(
     relay: Option<PermissionRelay>,
     cancel: Option<Arc<Notify>>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
-    let (spec, run_meta) = build_worker_spec(
+    let (spec, run_meta, sgian) = build_worker_spec(
         cfg,
         &paths.repo_root,
         &paths.mission_id,
@@ -1102,6 +1106,9 @@ pub(crate) async fn run_worker_in_buffered_controlled(
         None => LogTarget::Buffer(Vec::new()),
     };
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
+    if let Some(credential) = sgian {
+        credential.revoke();
+    }
     if matches!(target, LogTarget::Controlled { .. }) {
         target
             .permission_notice(PermissionNotice::Finished, &run_id, session_cwd)
@@ -1243,7 +1250,7 @@ fn build_worker_spec(
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
-) -> Result<(SessionSpec, RunMeta)> {
+) -> Result<(SessionSpec, RunMeta, Option<crate::sgian::SgianCredential>)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -1415,6 +1422,16 @@ fn build_worker_spec(
         }
     }
 
+    // Sgian coordination lane: when a Sgian daemon serves the repository,
+    // the run identifies itself there as `kranz:<run-id>` through a
+    // credential the engine issues now and revokes when the run ends
+    // (`crate::sgian`). Absent daemon or binary is the common case and a
+    // byte-identical session.
+    let sgian = crate::sgian::issue(repo_root, &run_id).map(|(credential, token)| {
+        crate::sgian::seed_env(&mut spec.env, token);
+        credential
+    });
+
     let run_meta = RunMeta {
         backend: Some(cfg.backend_kind(role)),
         run_id,
@@ -1425,7 +1442,7 @@ fn build_worker_spec(
         prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
         executor_route,
     };
-    Ok((spec, run_meta))
+    Ok((spec, run_meta, sgian))
 }
 
 /// Run one validator session for a milestone (plan §4.4/§4.6).
