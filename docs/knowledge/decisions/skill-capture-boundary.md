@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-22
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -11,6 +11,11 @@ verified_against:
   - .kranz/tickets/m5-skill-capture-positioning-decision.md
   - .kranz/tickets/training-corpus-export.md
 ---
+
+Rechecked 2026-09-22 (UTC) after the gate review packet shipped and its
+roadmap checkbox was closed. The packet and baseline/candidate comparison
+remain read-only evidence surfaces; neither changes the execution or skill
+capture boundary.
 
 ## What this records
 
