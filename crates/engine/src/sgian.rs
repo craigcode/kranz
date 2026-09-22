@@ -232,7 +232,10 @@ fn run_ctl(bin: &Path, args: &[&str], deadline: Duration) -> Result<Vec<u8>, Str
             Ok(None) if started.elapsed() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = drain.join();
+                // Not joined: a grandchild of the wedged client may still
+                // hold the pipes open, and the caller must not wait on it.
+                // The drain thread ends on its own when the pipes close.
+                drop(drain);
                 return Err(format!(
                     "{} did not answer within {deadline:?}",
                     bin.display()
