@@ -13,6 +13,9 @@ verified_against:
 
 # Kranz knowledge vault
 
+Rechecked 2026-09-22 against the skill-capture decision after pilot preparation;
+manual evidence measurement adds no knowledge-capture or skill-generation path.
+
 The canonical, reviewed knowledge store for kranz: what the system is, how it is
 run, how it is gated, and the invariants that must never break. Both humans and
 agents read this. New here? Start with [CONVENTIONS.md](CONVENTIONS.md) for the

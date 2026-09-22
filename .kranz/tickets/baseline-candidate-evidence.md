@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented and reviewed in PR #74; merged at 0c29e9f29c0aa1e020dc104f1a5731c4c48f46ed. Delivered through a PR, not a recorded Complete mission.
+state: done
 title: Baseline and candidate evidence — prove the intended behavior changed
 priority: 2
 schedule: once

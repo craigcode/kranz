@@ -246,12 +246,13 @@ acceptance); they are not additional release prerequisites. S5 and S7 are define
 
 - [x] [Gate review packet](../.kranz/tickets/gate-review-packet.md) — scope,
   current evidence and the human decision.
-- [ ] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
+- [x] [Baseline/candidate evidence](../.kranz/tickets/baseline-candidate-evidence.md)
   — comparable observations across actual revisions, extending existing controls.
 - [ ] [Mission outcome reasons](../.kranz/tickets/mission-outcome-reasons.md) —
   explain recorded causes without changing mission states or authority.
 - [ ] [Review-effort pilot](../.kranz/tickets/review-effort-pilot.md) — a bounded
-  assessment of evidence gaps and human work after the implementations land.
+  assessment of evidence gaps and human work after the implementations land;
+  [protocol and case list](scoping/review-effort-pilot.md) prepared before execution.
 
 Ticket frontmatter owns priority, one-shot scheduling and admission dependencies.
 It ranks the review packet first after S7; the baseline and outcome extensions

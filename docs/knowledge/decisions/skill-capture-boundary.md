@@ -12,10 +12,10 @@ verified_against:
   - .kranz/tickets/training-corpus-export.md
 ---
 
-Rechecked 2026-09-22 (UTC) after the gate review packet shipped and its
-roadmap checkbox was closed. The packet and baseline/candidate comparison
-remain read-only evidence surfaces; neither changes the execution or skill
-capture boundary.
+Rechecked 2026-09-22 (UTC) against the evidence-stream roadmap and
+[review-effort pilot protocol](../../scoping/review-effort-pilot.md).
+The pilot measures evidence gaps and manual review; it does not create skills,
+optimize prompts or change the skill-capture boundary.
 
 ## What this records
 

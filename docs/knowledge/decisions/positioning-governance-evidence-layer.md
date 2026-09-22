@@ -13,10 +13,11 @@ verified_against:
   - crates/cli/src/ready.rs
 ---
 
-Rechecked 2026-09-22 (UTC) after the gate review packet shipped and its
-roadmap checkbox was closed. The packet and baseline/candidate comparison
-remain read-only evidence surfaces; neither changes the execution or skill
-capture boundary.
+Rechecked 2026-09-22 (UTC) against the evidence-stream roadmap and
+[review-effort pilot protocol](../../scoping/review-effort-pilot.md).
+Packets, baseline/candidate comparisons and outcome reasons remain read-only
+evidence surfaces. The pilot records manual review observations; it adds no
+execution or skill-capture mechanism.
 
 ## What this records
 
