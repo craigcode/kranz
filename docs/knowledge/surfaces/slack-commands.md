@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-22
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -149,7 +149,7 @@ the entities would show literally. That is why `/kranz ticket show`'s header
 (slug then title) is deliberately unescaped while its body is escaped.
 
 Approve buttons carry `<mission-id>:<plan-identity>` (the full sha256 of the
-plan's canonical JSON, shared with dashboard previews through
+plan's canonical JSON, including optional baseline/candidate expectations, shared with dashboard previews through
 `planning::plan_identity`). `approve_flow` commits through
 `PlanningHost::approve_pending_if`, which compares the clicked card's identity
 against the parked plan and commits while holding the engine and pending-plan

@@ -632,6 +632,15 @@ fn plan_schema() -> serde_json::Value {
             }
         }
     });
+    let pair_expectation = serde_json::json!({"oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["outcome"],
+         "properties": {"outcome": {"const": "passed"}}},
+        {"type": "object", "additionalProperties": false, "required": ["outcome", "failureId"],
+         "properties": {"outcome": {"const": "failed"}, "failureId": {"type": "string", "minLength": 1, "maxLength": 128}}},
+        {"type": "object", "additionalProperties": false, "required": ["outcome", "failureId", "diagnostic"],
+         "properties": {"outcome": {"const": "diagnostic"}, "failureId": {"type": "string", "minLength": 1, "maxLength": 128},
+            "diagnostic": {"type": "string", "minLength": 1, "maxLength": 1024}}}
+    ]});
     let negative_control = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -641,7 +650,17 @@ fn plan_schema() -> serde_json::Value {
             "validFiles": control_files.clone(),
             "defectiveFiles": control_files,
             "expectedFailure": { "type": "string" },
-            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 180, "default": 60 }
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 180, "default": 60 },
+            "baselinePair": {
+                "type": "object", "additionalProperties": false,
+                "required": ["baselineRevision", "expectedBaseline", "expectedCandidate", "environmentLabel", "overlayCheckerOnBaseline"],
+                "properties": {
+                    "baselineRevision": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+                    "expectedBaseline": pair_expectation.clone(), "expectedCandidate": pair_expectation,
+                    "environmentLabel": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "overlayCheckerOnBaseline": {"type": "boolean"}
+                }
+            }
         }
     });
     let validation_contract = serde_json::json!({

@@ -170,7 +170,14 @@ pub fn lint_env(
     base_sha: Option<&str>,
     passthrough: &[String],
 ) -> HashMap<String, String> {
-    let mut env = crate::agent_env::contract_command_env(scratch, base_sha, passthrough);
+    with_git_hooks_disabled(crate::agent_env::contract_command_env(
+        scratch,
+        base_sha,
+        passthrough,
+    ))
+}
+
+pub(crate) fn with_git_hooks_disabled(mut env: HashMap<String, String>) -> HashMap<String, String> {
     env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
     env.insert("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string());
     env.insert("GIT_CONFIG_VALUE_0".to_string(), "/dev/null".to_string());

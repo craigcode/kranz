@@ -619,6 +619,23 @@ pub fn assemble_evidence_bundle(
         push_reference(gate.artefact_ref.clone());
     }
     let mut gate_expected = std::collections::BTreeMap::new();
+    let mut paired = std::collections::BTreeMap::new();
+    for gate in &chain.gates {
+        if gate.gate.starts_with("baseline-candidate:") {
+            let descriptor =
+                crate::contract_controls::pair::descriptor(gate.artefact_detail.as_deref());
+            let expected = descriptor.as_ref().map(|d| (d.digest.clone(), d.bytes));
+            gate_expected
+                .entry(gate.artefact_ref.clone())
+                .and_modify(|prior: &mut Option<_>| {
+                    if *prior != expected {
+                        *prior = None;
+                    }
+                })
+                .or_insert(expected);
+            paired.insert(gate.artefact_ref.clone(), descriptor);
+        }
+    }
     for record in &chain.gate_evaluations {
         for artifact in record.requested.retained_inputs.iter().chain(
             record
@@ -649,7 +666,19 @@ pub fn assemble_evidence_bundle(
     let mut artefact_entries: Vec<ManifestEntry> = Vec::new();
     let mut artefact_files: Vec<BundleFile> = Vec::new();
     for reference in &references {
-        let (mut status, mut bytes) = read_artefact(&mission_dir, reference);
+        let (mut status, mut bytes) = if let Some(descriptor) = paired.get(reference) {
+            match descriptor.as_ref().and_then(|d| {
+                crate::contract_controls::pair::retained_bytes(&mission_dir, reference, d)
+            }) {
+                Some(bytes) => (
+                    ArtefactStatus::Resolved,
+                    Some(crate::scrub::scrub(&String::from_utf8_lossy(&bytes)).into_bytes()),
+                ),
+                None => (ArtefactStatus::Unresolved, None),
+            }
+        } else {
+            read_artefact(&mission_dir, reference)
+        };
         if let Some(expected) = gate_expected.get(reference) {
             let matches =
                 expected

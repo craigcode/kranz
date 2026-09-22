@@ -30,6 +30,9 @@ verified_against:
   - crates/engine/src/orchestrator/finalization.rs
   - crates/engine/src/command_exec.rs
   - crates/engine/src/contract_controls.rs
+  - crates/engine/src/contract_controls/pair.rs
+  - crates/engine/src/contract_controls_pair_tests.rs
+  - crates/engine/src/agent_env.rs
   - crates/engine/src/merge.rs
   - crates/engine/src/merge_gate.rs
   - crates/engine/src/scrub.rs
@@ -251,7 +254,12 @@ writable sandbox roots remain private scratch. The control-specific runner
 retains the leader PID until same-group descendants are killed on completion,
 error, cancellation, or timeout. Ordinary gate execution is unchanged.
 Controls never replace ordinary validation or the
-empty-deliverable gate. See [critical assertion controls](../../contract-controls.md).
+empty-deliverable gate. Optional baseline/candidate pairs then run actual
+revisions with the same checker and approved expectations. The retained pair
+seals source identities, checker overlay and receipts; review/export verify its
+digest. Current source and environment configuration can be compared without
+creating scratch files or seeding caches. Mutable tools/services remain
+unqualified, and pair diagnostics never replace required execution receipts. See [critical assertion controls](../../contract-controls.md).
 
 `final_gate()` in [finalization.rs](../../../crates/engine/src/orchestrator/finalization.rs)
 (feature f-2-2) counts `commits_between(base, "HEAD")` filtered by

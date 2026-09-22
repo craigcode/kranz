@@ -291,6 +291,7 @@ pub fn build(input: BuildInput<'_>) -> Result<BuiltInput, String> {
             &serde_json::json!({"name":report.name,"kind":report.kind,
                 "verdict":report.outcome.verdict,"reference":report.outcome.artefact.reference,
                 "detail":report.outcome.artefact.detail,"ruleIds":report.outcome.rule_ids,
+                "baselineCandidate": crate::contract_controls::pair::descriptor(report.outcome.artefact.detail.as_deref()).map(|d| d.summary),
                 "authority":"existing-stage-policy; diagnostic is not an execution receipt"}),
         )?;
     }

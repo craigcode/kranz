@@ -5,6 +5,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added opt-in baseline/candidate evidence using the existing contained control
+  runner. Approved expectations, source and checker identities, test overlays,
+  environment configuration and both receipts travel through advisory gate
+  inputs, human review packets and digest-verified exports. Missing evidence
+  stays unresolved; stale observations do not authorize reuse. See
+  [baseline/candidate observations](docs/contract-controls.md#baseline-and-candidate-observations).
+
 - Added a read-only human review packet in the CLI, dashboard and authenticated
   report view. It brings approved scope, candidate changes, check freshness,
   findings, explicit exceptions and pending decisions together, with references

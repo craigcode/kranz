@@ -92,12 +92,17 @@ pub(crate) fn extend_windows_process_env(env: &mut HashMap<String, String>) {
 /// requires the profile tuple to exist in an explicit environment block.
 #[cfg(windows)]
 pub(crate) fn redirect_windows_profile_env(env: &mut HashMap<String, String>, base_home: &Path) {
+    for path in ["tmp", "AppData/Roaming", "AppData/Local"] {
+        let _ = std::fs::create_dir_all(base_home.join(path));
+    }
+    windows_profile_env_values(env, base_home);
+}
+
+#[cfg(windows)]
+fn windows_profile_env_values(env: &mut HashMap<String, String>, base_home: &Path) {
     let tmp = base_home.join("tmp");
     let appdata_roaming = base_home.join("AppData").join("Roaming");
     let appdata_local = base_home.join("AppData").join("Local");
-    for path in [&tmp, &appdata_roaming, &appdata_local] {
-        let _ = std::fs::create_dir_all(path);
-    }
     env.insert("USERPROFILE".to_string(), base_home.display().to_string());
     env.insert("TMPDIR".to_string(), tmp.display().to_string());
     env.insert("TEMP".to_string(), tmp.display().to_string());
@@ -205,7 +210,7 @@ pub(crate) fn cache_only_cargo_home(base_home: &Path) -> PathBuf {
         return destination;
     }
 
-    let Some(source) = toolchain_var_value("CARGO_HOME", ".cargo").map(PathBuf::from) else {
+    let Some(source) = contract_cargo_cache_source() else {
         return destination;
     };
     for name in ["registry", "git"] {
@@ -217,6 +222,10 @@ pub(crate) fn cache_only_cargo_home(base_home: &Path) -> PathBuf {
         seed_cargo_cache(name, &from, &to);
     }
     destination
+}
+
+pub(crate) fn contract_cargo_cache_source() -> Option<PathBuf> {
+    toolchain_var_value("CARGO_HOME", ".cargo").map(PathBuf::from)
 }
 
 /// Seed one shared cache directory (`registry/` or `git/`) into the isolated
@@ -462,7 +471,21 @@ pub fn sanitized_child_env(
     extra: &[(String, String)],
 ) -> HashMap<String, String> {
     let _ = std::fs::create_dir_all(base_home.join("tmp"));
+    let cargo_home = cache_only_cargo_home(base_home);
+    #[cfg(windows)]
+    {
+        // Prepare the directories without overriding caller-supplied extras.
+        let mut profile = HashMap::new();
+        redirect_windows_profile_env(&mut profile, base_home);
+    }
+    child_env_values(base_home, &cargo_home, extra)
+}
 
+fn child_env_values(
+    base_home: &Path,
+    cargo_home: &Path,
+    extra: &[(String, String)],
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
     if let Some(path) = std::env::var_os("PATH") {
         env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
@@ -481,10 +504,7 @@ pub fn sanitized_child_env(
     // commands. CARGO_HOME is always replaced with an isolated cache-only
     // root; no prompt-injectable child receives operator Cargo config/tokens.
     extend_noncredential_toolchain_env(&mut env);
-    env.insert(
-        "CARGO_HOME".to_string(),
-        cache_only_cargo_home(base_home).display().to_string(),
-    );
+    env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
     #[cfg(windows)]
     {
         // Case-insensitive ambient lookup, canonical-cased emission: Windows
@@ -495,7 +515,7 @@ pub fn sanitized_child_env(
         // operator's real profile. `cmd` stages pipe temp files in %TEMP%
         // and PowerShell/CLR consult APPDATA/LOCALAPPDATA on startup —
         // leaving them unset hangs children in opaque ways (89f05a1 CI).
-        redirect_windows_profile_env(&mut env, base_home);
+        windows_profile_env_values(&mut env, base_home);
     }
     for (key, value) in extra {
         env.insert(key.clone(), value.clone());
@@ -631,6 +651,25 @@ pub fn contract_command_env(
     base_sha: Option<&str>,
     passthrough: &[String],
 ) -> HashMap<String, String> {
+    sanitized_child_env(mission_scratch, &contract_extra(base_sha, passthrough))
+}
+
+/// Reconstruct cleared environment values for evidence comparison without
+/// creating scratch directories or seeding toolchain caches. Never use this
+/// preview as a process environment: its cache path is only a placeholder.
+pub(crate) fn contract_command_env_preview(
+    mission_scratch: &Path,
+    base_sha: Option<&str>,
+    passthrough: &[String],
+) -> HashMap<String, String> {
+    child_env_values(
+        mission_scratch,
+        &mission_scratch.join(".cargo-cache-preview"),
+        &contract_extra(base_sha, passthrough),
+    )
+}
+
+fn contract_extra(base_sha: Option<&str>, passthrough: &[String]) -> Vec<(String, String)> {
     let mut extra: Vec<(String, String)> =
         crate::runner::contract_env(base_sha).into_iter().collect();
     for (var, default_subdir) in CONTRACT_TOOLCHAIN_VARS {
@@ -671,7 +710,7 @@ pub fn contract_command_env(
             }
         }
     }
-    sanitized_child_env(mission_scratch, &extra)
+    extra
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +815,21 @@ impl Drop for EnvTestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_pair_environment_preview_is_read_only_and_matches_prepared_values() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("not-created-by-preview");
+        let mut preview = contract_command_env_preview(&scratch, Some("pinned"), &[]);
+        assert!(!scratch.exists());
+        let mut prepared = contract_command_env(&scratch, Some("pinned"), &[]);
+        assert!(scratch.join("tmp").is_dir());
+        assert!(Path::new(prepared.get("CARGO_HOME").unwrap()).is_dir());
+        preview.remove("CARGO_HOME");
+        prepared.remove("CARGO_HOME");
+        assert_eq!(preview, prepared);
+    }
 
     fn extra(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "contract_controls_pair_tests.rs"]
+mod pair_tests;
+
 // Libtest runs unrelated evaluation fixtures concurrently. Wait only for the
 // explicitly tested admission refusal, never retry an execution/receipt error.
 fn evaluate_available(
@@ -105,6 +108,7 @@ fn assertion(checker: &str) -> Assertion {
             }],
             expected_failure: "invalid-credential-authorized".into(),
             timeout_seconds: 5,
+            baseline_pair: None,
         }),
     }
 }
@@ -273,10 +277,12 @@ fn contract_readback_control_receipts_require_behavioral_checks_and_matching_fai
             checks_run: checks,
             outcome,
             failure_id: failure.map(str::to_string),
+            diagnostic: None,
         }),
         output_tail: String::new(),
         elapsed_ms: 0,
         environment_names: Vec::new(),
+        binding: None,
     };
     let valid = case(Some(0), 3, CheckOutcome::Passed, None);
     let good = case(Some(1), 2, CheckOutcome::Failed, Some("bad-auth"));

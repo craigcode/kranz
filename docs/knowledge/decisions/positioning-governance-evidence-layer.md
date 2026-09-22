@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-20
+last_verified: 2026-09-22
 verified_against:
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
@@ -12,6 +12,11 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-09-22 (UTC) after the gate review packet shipped and its
+roadmap checkbox was closed. The packet and baseline/candidate comparison
+remain read-only evidence surfaces; neither changes the execution or skill
+capture boundary.
 
 ## What this records
 

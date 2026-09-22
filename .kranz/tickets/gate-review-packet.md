@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented and reviewed in PR #73; merged as cd7537ea076be60a63da9a27f4cb26c36d3f1b84 after all required checks passed.
+state: done
 title: Gate review packet — show scope, current evidence and the human decision
 priority: 1
 schedule: once

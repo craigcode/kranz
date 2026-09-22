@@ -57,6 +57,32 @@ beforeEach(() => {
 });
 
 describe('PlanReview', () => {
+  it('shows the exact baseline, expectations and overlay before approval', () => {
+    const reviewed = plan();
+    reviewed.validationContract = [{
+      id: 'pair', check: 'command', statement: 'preserve API shape', command: 'sh check.sh',
+      negativeControl: {
+        checkerFiles: [{ path: 'check.sh', content: 'check' }],
+        validFiles: [{ path: 'api.rs', content: 'valid' }],
+        defectiveFiles: [{ path: 'api.rs', content: 'defective' }],
+        expectedFailure: 'missing-api',
+        baselinePair: {
+          baselineRevision: 'a'.repeat(40), environmentLabel: 'fixture <script>text</script>',
+          expectedBaseline: { outcome: 'diagnostic', failureId: 'missing-api', diagnostic: 'E0425' },
+          expectedCandidate: { outcome: 'passed' }, overlayCheckerOnBaseline: true,
+        },
+      },
+    }];
+    useKranzStore.setState(s => ({ planning: { ...s.planning, review: { ...s.planning.review!, plan: reviewed } } }));
+    const { container } = render(<PlanReview />);
+    const panel = screen.getByLabelText('Baseline and candidate expectations for pair');
+    expect(within(panel).getByText('a'.repeat(40))).toBeTruthy();
+    expect(within(panel).getByText(/E0425/)).toBeTruthy();
+    expect(within(panel).getByText(/candidate must deliver them/)).toBeTruthy();
+    expect(within(panel).getByText(/host tools and external services remain unqualified/)).toBeTruthy();
+    expect(container.querySelector('script')).toBeNull();
+  });
+
   it('keeps legacy assertions free of negative-control UI', () => {
     const reviewed = plan();
     reviewed.validationContract = [{ id: 'a1', check: 'command', statement: 'tests pass', command: 'npm test' }];

@@ -1368,6 +1368,46 @@ mod negative_control_tests {
     }
 
     #[test]
+    fn baseline_pair_replay_pins_approved_expectations_and_preserves_old_logs() {
+        let legacy = plan();
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("baselinePair"));
+        let legacy: Plan = serde_json::from_slice(&bytes).unwrap();
+        approved(&legacy).unwrap();
+        let mut value = serde_json::to_value(legacy).unwrap();
+        value["validationContract"][0]["negativeControl"]["baselinePair"] = serde_json::json!({
+            "baselineRevision": "a".repeat(40), "environmentLabel": "native fixture", "overlayCheckerOnBaseline": true,
+            "expectedBaseline": {"outcome": "failed", "failureId": "wrong-value"}, "expectedCandidate": {"outcome": "passed"}
+        });
+        let plan: Plan = serde_json::from_value(value.clone()).unwrap();
+        let state = approved(&plan).unwrap();
+        dry_run_revised_plan(&state, &plan, 1).unwrap();
+        for (field, replacement) in [
+            ("baselineRevision", serde_json::json!("b".repeat(40))),
+            ("environmentLabel", serde_json::json!("other environment")),
+            ("overlayCheckerOnBaseline", serde_json::json!(false)),
+            ("expectedBaseline", serde_json::json!({"outcome":"passed"})),
+            (
+                "expectedCandidate",
+                serde_json::json!({"outcome":"failed", "failureId":"another"}),
+            ),
+        ] {
+            let mut changed = value.clone();
+            changed["validationContract"][0]["negativeControl"]["baselinePair"][field] =
+                replacement;
+            let changed: Plan = serde_json::from_value(changed).unwrap();
+            assert!(
+                crate::planning::validate_revised_plan_for_gate(&state.mission, &changed).is_err(),
+                "pre-emit {field}"
+            );
+            assert!(
+                dry_run_revised_plan(&state, &changed, 1).is_err(),
+                "replay {field}"
+            );
+        }
+    }
+
+    #[test]
     fn negative_control_replay_and_revision_validation_agree() {
         let plan = plan();
         let state = approved(&plan).unwrap();

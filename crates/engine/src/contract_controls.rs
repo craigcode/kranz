@@ -1,7 +1,8 @@
 //! Opt-in evidence that an approved command distinguishes a valid implementation
 //! from a particular defect. Controls are advisory; an execution failure is not
-//! evidence of rejection. The same command runs twice with a read-only checkout
-//! and writable scratch, and must report a nonzero number of behavioral checks.
+//! evidence of rejection. The same command runs on valid/defective controls and
+//! optional actual revision pairs, with read-only checkouts and writable scratch.
+//! Every conclusive case must report a nonzero number of declared checks.
 
 use crate::error::{EngineError, Result};
 use crate::gate::{ArtefactRef, GateKind, GateOutcome, GateReport};
@@ -16,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub mod pair;
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 512 * 1024;
@@ -66,6 +69,8 @@ pub struct ControlSpec {
     pub expected_failure: String,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_pair: Option<pair::PairSpec>,
 }
 
 fn default_timeout() -> u64 {
@@ -134,6 +139,9 @@ pub fn validate(assertions: &[Assertion]) -> Result<()> {
             ));
         }
         let checker = file_paths(&spec.checker_files)?;
+        if let Some(pair) = &spec.baseline_pair {
+            pair.validate()?;
+        }
         let valid = file_paths(&spec.valid_files)?;
         let defective = file_paths(&spec.defective_files)?;
         let exact_paths = |files: &[ControlFile]| {
@@ -201,6 +209,8 @@ pub struct CheckReceipt {
     pub outcome: CheckOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +220,7 @@ pub enum CheckOutcome {
     Failed,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaseEvidence {
     pub exit_code: Option<i32>,
@@ -218,6 +228,8 @@ pub struct CaseEvidence {
     pub output_tail: String,
     pub elapsed_ms: u128,
     pub environment_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<pair::CaseBinding>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,6 +249,8 @@ pub struct ControlEvidence {
     pub detail: String,
     pub valid: Option<CaseEvidence>,
     pub defective: Option<CaseEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_pair: Option<pair::PairEvidence>,
 }
 
 fn identity(value: &impl Serialize) -> String {
@@ -247,7 +261,10 @@ fn classify(valid: &CaseEvidence, defective: &CaseEvidence, expected: &str) -> C
     let passed = |case: &CaseEvidence| {
         case.exit_code == Some(0)
             && case.receipt.as_ref().is_some_and(|r| {
-                r.checks_run > 0 && r.outcome == CheckOutcome::Passed && r.failure_id.is_none()
+                r.checks_run > 0
+                    && r.outcome == CheckOutcome::Passed
+                    && r.failure_id.is_none()
+                    && r.diagnostic.is_none()
             })
     };
     if !passed(valid) {
@@ -347,6 +364,7 @@ fn run_case(
     revision: &str,
     assertion: &Assertion,
     files: &[ControlFile],
+    overlay_checker: bool,
     config: &MissionConfig,
     deadline: Instant,
     cancelled: &AtomicBool,
@@ -364,6 +382,22 @@ fn run_case(
     let root = ScratchRoot::create()?;
     let snapshot = root.0.join("checkout");
     let _worktree = crate::orchestrator::ApprovalLintWorktree::create(repo, &snapshot, revision)?;
+    let source = spec
+        .baseline_pair
+        .as_ref()
+        .map(|pair| {
+            let repo = GitRepo::open(&snapshot)?;
+            crate::gate_evaluation::snapshot::SourceSnapshot::capture(
+                &repo,
+                &pair.baseline_revision,
+            )
+            .map(|snapshot| snapshot.identity)
+            .map_err(invalid)
+        })
+        .transpose()?;
+    if overlay_checker {
+        apply_files(&snapshot, &spec.checker_files)?;
+    }
     check_inputs(&snapshot, &spec.checker_files)?;
     apply_files(&snapshot, files)?;
     let scratch = root.0.join("scratch");
@@ -389,22 +423,12 @@ fn run_case(
     if sandbox.enforce() == SandboxEnforce::Off {
         return Err(invalid("control containment unavailable"));
     }
-    let mut env =
-        crate::contract_lint::lint_env(&scratch, Some(revision), &config.contract_env_passthrough);
-    env.insert(
-        "CARGO_TARGET_DIR".into(),
-        scratch.join("target").display().to_string(),
-    );
-    env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
-    env.insert(
-        "KRANZ_CONTROL_SCRATCH".into(),
-        scratch.display().to_string(),
-    );
-    env.insert(
-        "KRANZ_CONTROL_RESULT".into(),
-        scratch.join("result.json").display().to_string(),
-    );
+    let env = pair::case_environment(config, &scratch, revision);
     let env = crate::command_exec::gate_env_for_sandbox(&env, &sandbox);
+    let binding = source.map(|source| pair::CaseBinding {
+        source,
+        environment: pair::environment_identity(config, &scratch, &env),
+    });
     let mut environment_names: Vec<_> = env.keys().cloned().collect();
     environment_names.sort();
     let timeout = deadline
@@ -437,10 +461,11 @@ fn run_case(
         output_tail: crate::scrub::scrub_and_truncate(&output, 4096),
         elapsed_ms: start.elapsed().as_millis(),
         environment_names,
+        binding,
     })
 }
 
-fn persist(paths: &MissionPaths, evidence: &ControlEvidence) -> Result<String> {
+fn persist(paths: &MissionPaths, evidence: &ControlEvidence) -> Result<(String, Vec<u8>)> {
     let mission = paths.open_mission_dir_nofollow(false)?;
     let runs = crate::paths::open_real_subdir(&mission, "runs", &paths.runs_dir(), true)?;
     let name = format!("control-{}.json", uuid::Uuid::new_v4());
@@ -450,11 +475,13 @@ fn persist(paths: &MissionPaths, evidence: &ControlEvidence) -> Result<String> {
         &name,
         cap_std::fs::OpenOptions::new().write(true).create_new(true),
     )?;
-    file.write_all(&serde_json::to_vec_pretty(&value)?)?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    file.write_all(&bytes)?;
     file.sync_all()?;
-    Ok(crate::gate_results::file_artefact_ref(&format!(
-        "runs/{name}"
-    )))
+    Ok((
+        crate::gate_results::file_artefact_ref(&format!("runs/{name}")),
+        bytes,
+    ))
 }
 
 /// Run selected controls afresh at this immutable revision. Receipt files are
@@ -497,7 +524,7 @@ pub(crate) fn evaluate_cancellable(
             continue;
         };
         let mut evidence = ControlEvidence {
-            version: 1,
+            version: if spec.baseline_pair.is_some() { 2 } else { 1 },
             assertion_id: assertion.id.clone(),
             assertion_sha256: identity(assertion),
             checker_sha256: identity(&spec.checker_files),
@@ -519,6 +546,7 @@ pub(crate) fn evaluate_cancellable(
             detail: String::new(),
             valid: None,
             defective: None,
+            baseline_pair: spec.baseline_pair.as_ref().map(pair::PairEvidence::pending),
         };
         let result = (|| -> Result<()> {
             if admission.is_none() {
@@ -526,6 +554,13 @@ pub(crate) fn evaluate_cancellable(
             }
             check_budget(deadline, cancelled)?;
             validate(assertions)?;
+            if spec.baseline_pair.is_some()
+                && repo.rev_parse(&format!("{revision}^{{commit}}"))? != revision
+            {
+                return Err(invalid(
+                    "paired observations require a full immutable candidate commit",
+                ));
+            }
             if !repo.is_clean_tracked_strict()? {
                 return Err(invalid("source has tracked changes or hidden index flags"));
             }
@@ -536,6 +571,7 @@ pub(crate) fn evaluate_cancellable(
                 revision,
                 assertion,
                 &spec.valid_files,
+                false,
                 config,
                 deadline,
                 cancelled,
@@ -547,6 +583,7 @@ pub(crate) fn evaluate_cancellable(
                 revision,
                 assertion,
                 &spec.defective_files,
+                false,
                 config,
                 deadline,
                 cancelled,
@@ -556,6 +593,21 @@ pub(crate) fn evaluate_cancellable(
                 evidence.defective.as_ref().unwrap(),
                 &spec.expected_failure,
             );
+            if evidence.status == ControlStatus::Verified && spec.baseline_pair.is_some() {
+                if let Err(error) = pair::evaluate_pair(
+                    repo,
+                    paths,
+                    revision,
+                    assertion,
+                    config,
+                    deadline,
+                    cancelled,
+                    &mut evidence,
+                ) {
+                    evidence.baseline_pair.as_mut().unwrap().detail =
+                        format!("INCONCLUSIVE: {error}");
+                }
+            }
             Ok(())
         })();
         evidence.detail = match result {
@@ -566,8 +618,20 @@ pub(crate) fn evaluate_cancellable(
                 ControlStatus::Inconclusive => "INCONCLUSIVE: execution did not establish both a valid pass and rejection of the intended defect; inspect case receipts and output".into(),
             },
         };
-        let artefact = match persist(paths, &evidence) {
-            Ok(reference) => {
+        if let Some(pair) = &mut evidence.baseline_pair {
+            if evidence.status != ControlStatus::Verified {
+                pair.detail = format!(
+                    "INCONCLUSIVE: controls did not establish a usable pair. {}",
+                    evidence.detail
+                );
+            }
+        }
+        let retained = persist(paths, &evidence);
+        if spec.baseline_pair.is_some() {
+            reports.push(pair::report(&evidence, &retained));
+        }
+        let artefact = match retained {
+            Ok((reference, _)) => {
                 ArtefactRef::new(reference).with_detail(format!("{} (advisory)", evidence.detail))
             }
             Err(error) => {
