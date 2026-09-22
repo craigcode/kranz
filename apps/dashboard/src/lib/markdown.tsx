@@ -10,7 +10,9 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
   // Consume escaped punctuation before looking for formatting. A complete
   // bold/code span can still contain escapes without losing its delimiters.
   const unescape = (value: string) => value.replace(/\\([\\`*_{}[\]<>()#+\-.!|])/g, '$1');
-  const parts = text.split(/(\\[\\`*_{}[\]<>()#+\-.!|]|`(?:\\.|[^`])+`|\*\*(?:\\.|[^*])+\*\*)/g);
+  // Escape and ordinary-character alternatives must be disjoint, so an
+  // unterminated span cannot backtrack through exponentially many parses.
+  const parts = text.split(/(\\[\\`*_{}[\]<>()#+\-.!|]|`(?:\\.|[^`\\])+`|\*\*(?:\\.|[^*\\])+\*\*)/g);
   return parts.map((part, i) => {
     if (/^\\[\\`*_{}[\]<>()#+\-.!|]$/.test(part)) return part.slice(1);
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {

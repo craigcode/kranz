@@ -14,3 +14,9 @@ it('keeps escaped punctuation inside a formatted review label', () => {
   const { container } = render(<>{renderMarkdown('**Gate attempt attempt\\-1** — event #7')}</>);
   expect(container.querySelector('strong')?.textContent).toBe('Gate attempt attempt-1');
 });
+
+it.each([['`', '_'], ['**', ')']])('renders a long unterminated %s span without backtracking', (prefix, punctuation) => {
+  const { container } = render(<>{renderMarkdown(prefix + (`\\${punctuation}`).repeat(2000))}</>);
+  expect(container.textContent).toBe(prefix + punctuation.repeat(2000));
+  expect(container.querySelector('strong, code')).toBeNull();
+});

@@ -2,8 +2,13 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-21
+last_verified: 2026-09-22
 verified_against:
+  - crates/engine/src/review_packet.rs
+  - crates/engine/tests/review_packet_test.rs
+  - crates/engine/tests/gate_input_builder_test.rs
+  - crates/engine/tests/gate_evaluator_test.rs
+  - crates/server/tests/server_test.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/acp_worker/tests.rs
   - crates/engine/src/gate_evaluation/subprocess.rs
@@ -42,6 +47,15 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+## Human review evidence
+
+`kranz review-packet` and the dashboard share a read-only projection. Tests cover
+dirty source edits, absent or changed artifacts, zero assertions, expiry,
+legacy logs and exact pending decisions. The contained evaluator fixture cannot
+read marked human audit files or reach the host listener. Human API reads require
+header authority and cannot mutate the report, event log or control inbox.
+Existing stage consumption remains authoritative. See [review packets](../../review-packets.md).
 
 ## Explicit external evaluator checks
 
