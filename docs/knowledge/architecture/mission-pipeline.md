@@ -72,6 +72,16 @@ automatic workspace recovery; only old events without it use the historical
 message fallback. Display wording cannot grant a new typed block an automatic
 lift.
 
+## Recorded outcome reasons
+
+`outcomes::reasons` adds a versioned read-only mapping of explicit event causes.
+Authentication blocks, reported checker findings and human/policy boundaries
+remain distinct; ambiguous diagnostics remain unknown. The activity cohort
+counts each mission once per task class and category, retains earlier attempts,
+and reports current reducer status separately. CLI, API, dashboard and the
+existing evidence bundle share the fold. It grants no authority and changes no
+mission state. See [recorded outcome reasons](../../outcome-reasons.md).
+
 ## Human review projection
 
 `review_packet::compute_review_packet` folds the sealed log and verifies retained

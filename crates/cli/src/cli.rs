@@ -151,8 +151,8 @@ pub enum Command {
         #[arg(long)]
         all: bool,
 
-        /// Window in days for the merged-change denominator (only with
-        /// --all; default 30, inclusive at both ends)
+        /// Inclusive activity window for outcome reasons, or the merged-change
+        /// denominator with --all (default 30); other existing metrics keep their scope.
         #[arg(long, default_value_t = kranz_engine::outcomes::DEFAULT_MERGED_CHANGE_WINDOW_DAYS)]
         window_days: u64,
     },

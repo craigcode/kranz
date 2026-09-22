@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added read-only recorded outcome reasons in the CLI, API, dashboard and
+  evidence export. Explicit authentication blocks, checker findings and human
+  boundaries remain distinct; ambiguous failures stay unknown. Activity-window
+  counts preserve repair history and label overlapping mission populations.
+  See [recorded outcome reasons](docs/outcome-reasons.md).
+
 - Added opt-in baseline/candidate evidence using the existing contained control
   runner. Approved expectations, source and checker identities, test overlays,
   environment configuration and both receipts travel through advisory gate

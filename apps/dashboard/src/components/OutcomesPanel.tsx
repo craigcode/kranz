@@ -5,6 +5,7 @@
 // source of truth.
 
 import { useEffect, useState } from 'react';
+import { OutcomeReasons } from './OutcomeReasons';
 import { getOutcomes } from '../lib/api';
 import type { Outcomes } from '../lib/types';
 
@@ -25,18 +26,19 @@ function formatDurationMs(ms: number): string {
 }
 
 export function OutcomesPanel() {
+  const [windowDays, setWindowDays] = useState(30);
   const [outcomes, setOutcomes] = useState<Outcomes | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    getOutcomes()
+    getOutcomes(windowDays)
       .then((o) => !cancelled && setOutcomes(o))
       .catch((err: unknown) => !cancelled && setError(err instanceof Error ? err.message : String(err)));
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [windowDays]);
 
   if (error !== null) {
     return (
@@ -63,6 +65,13 @@ export function OutcomesPanel() {
   return (
     <section className="panel outcomes-panel">
       <div className="section-label">Outcomes</div>
+
+      <label>Reason activity window <select aria-label="Reason activity window" value={windowDays} onChange={(event) => {
+        setWindowDays(Number(event.target.value)); setOutcomes(null); setError(null);
+      }}>
+        <option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option>
+      </select></label>
+      <OutcomeReasons report={outcomes.outcomeReasons} />
 
       <div className="outcomes-section outcomes-autonomy">
         <h3 className="outcomes-heading">Autonomy ratio</h3>

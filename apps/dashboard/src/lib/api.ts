@@ -194,8 +194,8 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 /** `GET /api/missions/outcomes` — flight-surgeon outcomes fold (autonomy
  *  ratio, grant-latency distribution, escalation ledger). */
-export function getOutcomes(): Promise<Outcomes> {
-  return getJson('/api/missions/outcomes');
+export function getOutcomes(windowDays = 30): Promise<Outcomes> {
+  return getJson(`/api/missions/outcomes?windowDays=${encodeURIComponent(windowDays)}`);
 }
 
 /** `GET /api/escalation-metrics` — the flight-surgeon console (autonomy split

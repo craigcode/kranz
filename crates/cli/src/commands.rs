@@ -162,7 +162,14 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                     print!("{}", crate::merged_costs::render_org(&report));
                 }
             } else {
-                let outcomes = kranz_engine::outcomes::compute_outcomes(&repo)?;
+                anyhow::ensure!(
+                    window_days <= kranz_engine::outcomes::MAX_MERGED_CHANGE_WINDOW_DAYS,
+                    "outcome reason window is too large"
+                );
+                let mut options = kranz_engine::outcomes::OutcomesOptions::resolve(&repo);
+                options.reason_window = Some((window_days, chrono::Utc::now()));
+                let outcomes =
+                    kranz_engine::outcomes::compute_outcomes_with_options(&repo, &options)?;
                 if json {
                     println!("{}", output::render_outcomes_json(&outcomes)?);
                 } else {

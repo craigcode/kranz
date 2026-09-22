@@ -180,6 +180,9 @@ pub struct EvidenceBundle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MissionCostSummary {
+    /// The same read-only reason fold as outcomes; never a new event store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_reasons: Option<crate::outcomes::reasons::MissionReasons>,
     /// Σ worker cost (recorded costUsd, token-priced fallback).
     pub total_cost_usd: f64,
     /// Commits on `feature.completed` whose subject is not an engine/meta
@@ -592,6 +595,7 @@ pub fn assemble_evidence_bundle(
     let chain = crate::provenance::provenance_chain(&mission_dir, mission_id, &events)?;
     let outcomes: MissionOutcomes = crate::outcomes::mission_outcomes(mission_id, &events);
     let cost = MissionCostSummary {
+        outcome_reasons: Some(outcomes.outcome_reasons.clone()),
         total_cost_usd: outcomes.cost_usd,
         non_meta_commits: outcomes.non_meta_commits,
         usd_per_commit: (outcomes.non_meta_commits > 0)
