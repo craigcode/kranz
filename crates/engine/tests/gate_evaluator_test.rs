@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 const IMAGE: &str =
     "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d";
 const CHECKER: &str = include_str!("fixtures/gate-evaluator/checker.py");
-fn manifest(mode: &str, root: &Path) -> String {
-    format!("[pack]\nname = 'synthetic-checker'\nschema = 5\n[[evaluator]]\nname = 'synthetic-checker'\nimage = '{IMAGE}'\nexecutable = '/usr/local/bin/python3'\nargs = ['-I','-S','/checker/checker.py','{mode}','{}','{}']\nfiles = ['checker.py']\nstages = ['plan-approval']\nevidence = ['source']\nkind = 'mechanical'\nenforcement = 'blocking'\n", root.join("serve.token").display(), root.join("candidate.txt").display())
+fn manifest(mode: &str, root: &Path, port: u16) -> String {
+    format!("[pack]\nname = 'synthetic-checker'\nschema = 5\n[[evaluator]]\nname = 'synthetic-checker'\nimage = '{IMAGE}'\nexecutable = '/usr/local/bin/python3'\nargs = ['-I','-S','/checker/checker.py','{mode}','{}','{}','{}','{}','{port}']\nfiles = ['checker.py']\nstages = ['plan-approval']\nevidence = ['source']\nkind = 'mechanical'\nenforcement = 'blocking'\n", root.join("serve.token").display(), root.join("candidate.txt").display(), root.join(".kranz/missions/mission-1/runs/worker.jsonl").display(), root.join(".kranz/missions/mission-1/review-packet.json").display())
 }
 fn git(root: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
@@ -44,6 +44,7 @@ struct Fixture {
     tmp: tempfile::TempDir,
     registration: PinnedRegistration,
     evidence: FrozenEvidence,
+    human_listener: std::net::TcpListener,
 }
 impl Fixture {
     fn new(mode: &str, shared: bool) -> Self {
@@ -57,10 +58,28 @@ impl Fixture {
             tempfile::tempdir().unwrap()
         };
         let root = tmp.path();
-        std::fs::write(root.join("pack.toml"), manifest(mode, root)).unwrap();
+        let human_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        human_listener.set_nonblocking(true).unwrap();
+        std::fs::write(
+            root.join("pack.toml"),
+            manifest(mode, root, human_listener.local_addr().unwrap().port()),
+        )
+        .unwrap();
         std::fs::write(root.join("checker.py"), CHECKER).unwrap();
         std::fs::write(root.join("serve.token"), "synthetic authority canary").unwrap();
         std::fs::write(root.join("candidate.txt"), "synthetic candidate canary").unwrap();
+        let mission = root.join(".kranz/missions/mission-1");
+        std::fs::create_dir_all(mission.join("runs")).unwrap();
+        std::fs::write(
+            mission.join("runs/worker.jsonl"),
+            "HUMAN-ONLY-WORKER-REASONING",
+        )
+        .unwrap();
+        std::fs::write(
+            mission.join("review-packet.json"),
+            r#"{"transcript":"runs/worker.jsonl","summary":"HUMAN-ONLY-WORKER-REASONING"}"#,
+        )
+        .unwrap();
         git(root, &["init", "-q"]);
         git(root, &["add", "pack.toml", "checker.py"]);
         git(root, &["commit", "-qm", "trusted checker"]);
@@ -72,6 +91,7 @@ impl Fixture {
             tmp,
             registration,
             evidence,
+            human_listener,
         }
     }
 }
@@ -137,7 +157,11 @@ fn gate_subprocess_v1_pins_script_bytes_at_approved_git_ref() {
 #[test]
 fn gate_subprocess_v1_pack_schema_and_mission_load_fail_closed() {
     let f = Fixture::new("pass", false);
-    let text = manifest("pass", f.tmp.path());
+    let text = manifest(
+        "pass",
+        f.tmp.path(),
+        f.human_listener.local_addr().unwrap().port(),
+    );
     let pack = Pack::load(f.tmp.path()).unwrap().unwrap();
     assert_eq!(pack.evaluators.len(), 1);
     let config = kranz_engine::types::MissionConfig {
@@ -332,6 +356,7 @@ mod container {
         };
         for mode in [
             "containment",
+            "human-view",
             "artifact",
             "finding",
             "fail",
@@ -351,6 +376,11 @@ mod container {
                 .unwrap_or_else(|e| panic!("{mode}: {e}; {}", outcome.directory.display()));
             assert!(accepted.container_removed);
             assert_eq!(accepted.exit_code, 0);
+            assert_eq!(
+                f.human_listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "evaluator reached the human API listener"
+            );
             if mode == "fail" {
                 assert_eq!(accepted.result.verdict, Some(Verdict::Fail));
             }

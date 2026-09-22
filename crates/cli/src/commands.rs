@@ -190,6 +190,16 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::ReviewPacket { mission_id, json } => {
+            let mission = select_mission(&repo, mission_id.as_deref().or(cli.mission.as_deref()))?;
+            let packet = kranz_engine::review_packet::compute_review_packet(&repo, &mission)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&packet)?);
+            } else {
+                print!("{}", kranz_engine::review_packet::render_markdown(&packet));
+            }
+            Ok(0)
+        }
         Command::GateScores { gate, json } => {
             let series = kranz_engine::gate_scores::compute_gate_score_series(&repo, &gate)?;
             if json {

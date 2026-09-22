@@ -3,6 +3,15 @@
 Notable user-visible changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Added a read-only human review packet in the CLI, dashboard and authenticated
+  report view. It brings approved scope, candidate changes, check freshness,
+  findings, explicit exceptions and pending decisions together, with references
+  to their recorded evidence. Dirty edits make prior checks historical; missing
+  evidence remains visible. Human packets stay outside validator inputs and
+  use the existing decision controls. See [review packets](docs/review-packets.md).
+
 ## 0.3.0 - 2026-09-20
 
 - Added opt-in, qualified Claude and Codex ACP workers in pinned Linux ARM64

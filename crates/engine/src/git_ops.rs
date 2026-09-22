@@ -1537,6 +1537,31 @@ impl GitRepo {
             .collect())
     }
 
+    /// Operator review inventory: pinned base to working-tree bytes, including
+    /// deletions, both sides of renames and non-ignored untracked paths.
+    pub(crate) fn review_changed_paths(&self, base: &str) -> Result<Vec<String>> {
+        let base = self.rev_parse(base)?;
+        let output = self.probe(&["diff", "--no-renames", "--name-only", "-z", &base, "--"])?;
+        if !output.status.success() || output.stdout.len() > 8 * 1024 * 1024 {
+            return Err(EngineError::Git("review path inventory unavailable".into()));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for path in output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            paths.insert(
+                std::str::from_utf8(path)
+                    .map_err(|_| EngineError::Git("non-UTF-8 review path".into()))?
+                    .to_string(),
+            );
+        }
+        for path in self.untracked_files()? {
+            paths.insert(
+                path.into_string()
+                    .map_err(|_| EngineError::Git("non-UTF-8 review path".into()))?,
+            );
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     /// Whether `from..to` touches anything under `apps/dashboard/` — the
     /// signal the gate suite uses to decide whether to run the dashboard
     /// gates (roadmap M6 gated merge).

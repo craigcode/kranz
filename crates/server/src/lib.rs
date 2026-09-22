@@ -505,6 +505,10 @@ fn protected_repo_api_routes() -> Router<Arc<ServerState>> {
         .route("/standards-metrics", get(rest::standards_metrics))
         .route("/cost-per-merged-change", get(rest::cost_per_merged_change))
         .route("/missions/{id}/state", get(rest::mission_state))
+        .route(
+            "/missions/{id}/review-packet",
+            get(rest::mission_review_packet),
+        )
         .route("/missions/{id}/standards", get(rest::mission_standards))
         .route(
             "/missions/{id}/standards/waiver",
@@ -934,8 +938,15 @@ async fn require_mutation_token(
     let path = request.uri().path();
     let is_health = path == "/api/health";
     let is_read = request.method() == Method::GET || request.method() == Method::HEAD;
-    let needs_auth =
-        !is_health && (request.method() == Method::POST || (gate.require_read_token && is_read));
+    // Human review must not be reachable by a sandboxed validator through
+    // otherwise anonymous loopback reads. Reuse the existing read capability.
+    let human_review = path.ends_with("/review-packet")
+        || (path.ends_with("/report.md")
+            && axum::extract::Query::<rest::ReportQuery>::try_from_uri(request.uri())
+                .map_or(true, |query| query.review));
+    let needs_auth = !is_health
+        && (request.method() == Method::POST
+            || ((gate.require_read_token || human_review) && is_read));
     if needs_auth {
         let read_ok = |presented: &str| is_read && token_matches(presented, &gate.read_authority);
         let header_ok = request
@@ -944,6 +955,7 @@ async fn require_mutation_token(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|presented| token_matches(presented, expected) || read_ok(presented));
         let query_ok = gate.require_read_token
+            && !human_review
             && is_read
             && request
                 .uri()

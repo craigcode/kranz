@@ -7,24 +7,20 @@
 import type { ReactNode } from 'react';
 
 function renderInline(text: string, keyBase: string): ReactNode[] {
-  // Split on `code` first, then **bold** inside the plain segments.
-  const out: ReactNode[] = [];
-  const codeParts = text.split(/(`[^`]+`)/g);
-  codeParts.forEach((part, i) => {
+  // Consume escaped punctuation before looking for formatting. A complete
+  // bold/code span can still contain escapes without losing its delimiters.
+  const unescape = (value: string) => value.replace(/\\([\\`*_{}[\]<>()#+\-.!|])/g, '$1');
+  const parts = text.split(/(\\[\\`*_{}[\]<>()#+\-.!|]|`(?:\\.|[^`])+`|\*\*(?:\\.|[^*])+\*\*)/g);
+  return parts.map((part, i) => {
+    if (/^\\[\\`*_{}[\]<>()#+\-.!|]$/.test(part)) return part.slice(1);
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
-      out.push(<code key={`${keyBase}-c${i}`}>{part.slice(1, -1)}</code>);
-      return;
+      return <code key={`${keyBase}-c${i}`}>{unescape(part.slice(1, -1))}</code>;
     }
-    const boldParts = part.split(/(\*\*[^*]+\*\*)/g);
-    boldParts.forEach((bp, j) => {
-      if (bp.startsWith('**') && bp.endsWith('**') && bp.length > 4) {
-        out.push(<strong key={`${keyBase}-b${i}-${j}`}>{bp.slice(2, -2)}</strong>);
-      } else if (bp !== '') {
-        out.push(bp);
-      }
-    });
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={`${keyBase}-b${i}`}>{unescape(part.slice(2, -2))}</strong>;
+    }
+    return part;
   });
-  return out;
 }
 
 export function renderMarkdown(text: string): ReactNode {

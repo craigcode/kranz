@@ -184,6 +184,16 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show the human review packet: approved scope, candidate, check freshness,
+    /// findings, exceptions and pending decisions (read-only, no provider call)
+    ReviewPacket {
+        /// The mission id (defaults to --mission / auto-selection)
+        mission_id: Option<String>,
+        /// Emit the shared dashboard projection as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the recorded evaluation series for one gate identity across all
     /// missions: every gate.result with that gate name, in log order —
     /// verdict, and the gate-supplied score + threshold where the gate

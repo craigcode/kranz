@@ -53,6 +53,29 @@ if mode == 'redaction':
     secret = 'ghp_' + 'A' * 36
     artifact('redacted.txt', secret.encode())
     result['rationale'] = secret
+if mode == 'human-view':
+    # The human view may contain the whole audit chain. Prove the actual
+    # evaluator process cannot follow its files or reach a listening host API.
+    for root in ('/gate/inputs', '/checker'):
+        for path in Path(root).rglob('*'):
+            if path.is_file():
+                assert (b'HUMAN-ONLY-' + b'WORKER-REASONING') not in path.read_bytes()
+    for path in sys.argv[4:6]:
+        try:
+            Path(path).read_bytes()
+        except OSError:
+            pass
+        else:
+            raise AssertionError('human-only file readable: ' + path)
+    for host in ('host.docker.internal', '192.168.5.2', '172.17.0.1', '127.0.0.1'):
+        try:
+            connection = socket.create_connection((host, int(sys.argv[6])), timeout=0.1)
+        except OSError:
+            pass
+        else:
+            connection.close()
+            raise AssertionError('human API reachable: ' + host)
+    artifact('human-view-denials.json', b'{"files":"denied","api":"denied","inputs":"no worker transcript"}')
 if mode == 'artifact':
     artifact('evidence.txt', b'A safe result.\n')
 if mode == 'finding' or mode == 'bad-line':

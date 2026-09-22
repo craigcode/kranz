@@ -76,6 +76,7 @@ pub mod queue;
 pub mod reducer;
 pub mod report_render;
 pub mod review_artifact;
+pub mod review_packet;
 pub mod reviewer_independence;
 pub mod routing;
 pub mod routing_rules;

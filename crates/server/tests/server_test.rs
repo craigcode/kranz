@@ -2063,6 +2063,100 @@ async fn read_auth_loopback_rejects_tokenless_get() {
 }
 
 #[tokio::test]
+async fn review_packet_uses_shared_projection_and_read_authority_without_mutation() {
+    let (tmp, app) = read_auth_app(true, false);
+    let uri = format!("/api/missions/{MISSION_ID}/review-packet");
+    let (status, _) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let read = exchange_read_token(&app, READ_AUTH_TOKEN).await;
+    let paths = MissionPaths::new(tmp.path(), MISSION_ID);
+    let before = std::fs::read(paths.events_file()).unwrap();
+    let response = app
+        .oneshot(
+            Request::get(uri)
+                .header(kranz_server::TOKEN_HEADER, read)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let expected =
+        kranz_engine::review_packet::compute_review_packet(tmp.path(), MISSION_ID).unwrap();
+    let mut expected = serde_json::to_value(expected).unwrap();
+    expected["observedAt"] = body["packet"]["observedAt"].clone();
+    assert_eq!(body["packet"], expected);
+    assert!(body["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Human review packet"));
+    assert_eq!(before, std::fs::read(paths.events_file()).unwrap());
+    assert!(control::drain(&paths).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn human_review_report_is_authenticated_ephemeral_and_cannot_be_written_by_get() {
+    let (tmp, app) = read_auth_app(true, false);
+    let paths = MissionPaths::new(tmp.path(), MISSION_ID);
+    std::fs::write(paths.report_file(), "# Original report\n").unwrap();
+    let uri = format!("/api/missions/{MISSION_ID}/report.md?review=true");
+    let (status, _) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let read = exchange_read_token(&app, READ_AUTH_TOKEN).await;
+    let response = app
+        .oneshot(
+            Request::get(uri)
+                .header(kranz_server::TOKEN_HEADER, read)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Human review packet"));
+    assert_eq!(
+        std::fs::read_to_string(paths.report_file()).unwrap(),
+        "# Original report\n"
+    );
+}
+
+#[tokio::test]
+async fn human_review_rejects_url_capabilities_even_when_other_reads_allow_them() {
+    for read_auth in [false, true] {
+        let (tmp, app) = read_auth_app(true, read_auth);
+        std::fs::write(
+            MissionPaths::new(tmp.path(), MISSION_ID).report_file(),
+            "# Original report\n",
+        )
+        .unwrap();
+        let read = exchange_read_token(&app, READ_AUTH_TOKEN).await;
+        for suffix in [
+            format!("review-packet?token={read}"),
+            format!("report.md?review=true&token={read}"),
+            format!("report.md?%72eview=true&token={read}"),
+        ] {
+            let (status, _) = get_json(&app, &format!("/api/missions/{MISSION_ID}/{suffix}")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        // The ordinary report retains its existing query-token behavior.
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/missions/{MISSION_ID}/report.md?review=false&token={read}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["markdown"], "# Original report\n");
+    }
+}
+
+#[tokio::test]
 async fn read_auth_health_exempt_without_token() {
     let (_tmp, app) = read_auth_app(true, true);
 
@@ -2546,6 +2640,37 @@ async fn live_permission_api_requires_mutation_authority_and_exact_binding() {
     let uri = format!("/api/missions/{MISSION_ID}/permission/answer");
     let body = json!({"requestId":request.proposal.id,"bindingDigest":request.binding_digest,"allow":true});
     let read_capability = exchange_read_token(&app, TEST_TOKEN).await;
+    let packet_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/missions/{MISSION_ID}/review-packet"))
+                .header(kranz_server::TOKEN_HEADER, &read_capability)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(packet_response.status(), StatusCode::OK);
+    let packet: Value = serde_json::from_slice(
+        &packet_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert!(packet["packet"]["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|decision| {
+            decision["title"] == format!("Permission {}", request.proposal.id)
+                && decision["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&request.binding_digest)
+        }));
     for token in [None, Some(read_capability.as_str())] {
         let mut req = Request::post(&uri).header("content-type", "application/json");
         if let Some(token) = token {

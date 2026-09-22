@@ -59,6 +59,8 @@ impl Fixture {
         std::fs::write(root.join("source.rs"), "after\n").unwrap();
         for path in [
             ".kranz/missions/m-1/runs/worker.jsonl",
+            ".kranz/missions/m-1/review-packet.json",
+            ".kranz/missions/m-1/report.md",
             ".codex/auth.json",
             ".kranz/serve.token",
         ] {
