@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Delivered in public v0.4.0; replay, reseed, cap increase/decrease and saturation verified. See docs/reviews/2026-09-22-post-v040-maintenance.md. Reconciled from released code; no Complete mission record fabricated.
+state: done
 title: Keep orchestrator repair-budget evidence current after config changes
 priority: 1
 schedule: once

@@ -103,6 +103,8 @@ reseed. Require the engine to allow the third requested repair and refuse a
 fourth; keep a failing non-waivable command assertion blocked. Existing static
 digest snapshot tests do not cover changing the cap.
 
-This task completes the investigation and prepares the correction. The fix
-ticket remains open, and release-candidate closure should retain it as an
-open issue until the correction and its workspace/platform checks pass.
+The original investigation kept the correction open pending implementation and
+workspace/platform checks. That correction is now shipped in v0.4.0; the ticket
+is reconciled in the [maintenance review](2026-09-22-post-v040-maintenance.md).
+The historical probe and observations above remain pinned to the defective
+source and are not current-source regression assertions.

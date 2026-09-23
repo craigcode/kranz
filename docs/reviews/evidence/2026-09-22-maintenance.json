@@ -1,0 +1,281 @@
+{
+  "base": "fccdef95334f82f4595005407e2ba7caeacc824c",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "kind": "local synthetic and build verification; assistant self-review",
+  "rustTests": {
+    "passed": 3110,
+    "failed": 0,
+    "ignored": 10
+  },
+  "explicitContainerProofs": [
+    "KRANZ_ACP_CONTAINER_TESTS=1",
+    "KRANZ_GATE_CONTAINER_TESTS=1",
+    "KRANZ_MOUNT_CONTAINER_TESTS=1"
+  ],
+  "gates": [
+    {
+      "step": "test",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-test.log",
+      "logSha256": "07f4804c4102897dc901f32debf2b17795babc390f98bbc8134f9857a21c18f7"
+    },
+    {
+      "step": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-clippy.log",
+      "logSha256": "a2b69b2caed09f95b978f5bedec11f6d2330dc6815e4b34b183a9867997869bb"
+    },
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-fmt.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "build",
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-build.log",
+      "logSha256": "6d69651d92d76737dbce48b83548226aa9896757e1336a0232c601b790f73f45"
+    },
+    {
+      "step": "docs",
+      "command": [
+        "cargo",
+        "doc",
+        "--workspace",
+        "--no-deps",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-docs.log",
+      "logSha256": "6c0e7b63b0b04d6dfbf59f04b28d1966c6f223a672d2a2d38534f8f6a1570d84"
+    },
+    {
+      "step": "deny",
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-deny.log",
+      "logSha256": "f1a0fca39d4280363937aabd77783990ea6480bd9ca257816de3b68fc8efa845"
+    },
+    {
+      "step": "domain",
+      "command": [
+        "target/debug/kranz",
+        "domain-lint"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-domain.log",
+      "logSha256": "04910e12b27267484927adae695c48cc7c939610fe0d3c2de5c11ea4c9fb6170"
+    },
+    {
+      "step": "public-tree",
+      "command": [
+        "scripts/audit-public-tree.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-public-tree.log",
+      "logSha256": "12b8b3d9862ae0b4942b7d5362f00334bc96bb45eea353dad245a42b038ce6eb"
+    },
+    {
+      "step": "notices",
+      "command": [
+        "scripts/check-rust-notices.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-notices.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "package-licenses",
+      "command": [
+        "scripts/check-package-licenses.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-package-licenses.log",
+      "logSha256": "e03287e0999a922c01a077e00865d42d2296a7ea7a8d78320f109fa68eb37c39"
+    },
+    {
+      "step": "packaging",
+      "command": [
+        "python3",
+        "scripts/test-package-release.py"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-packaging.log",
+      "logSha256": "ada8287c158c47db545f6c9e762701c9fdb3de124ea9dbacac45d9e31b016b77"
+    },
+    {
+      "stage": "install",
+      "command": [
+        "npm",
+        "ci"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-install.log",
+      "logSha256": "c6d49593ea0d58fc6bfa56bb02575d82b26816eeb78b2ab59b25dee6bd342cae"
+    },
+    {
+      "stage": "audit",
+      "command": [
+        "npm",
+        "audit",
+        "--audit-level=high"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-audit.log",
+      "logSha256": "6d8c5c8f3d7684adb070417bd608d01ae90aa3dc26a65af03ffda4955f38d9a3"
+    },
+    {
+      "stage": "types",
+      "command": [
+        "npx",
+        "tsc",
+        "-b"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-types.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "stage": "test",
+      "command": [
+        "npm",
+        "run",
+        "test"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-test.log",
+      "logSha256": "8362d85fcb9ef2a40a1ce20c397a2343cc2c6ca7fc4d632c24338fa850a546da"
+    },
+    {
+      "stage": "build",
+      "command": [
+        "npm",
+        "run",
+        "build"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-build.log",
+      "logSha256": "dbf1a119c08e64ddaa301e87660c3a18bfa70c73c85d737b332fc349ce395035"
+    },
+    {
+      "stage": "sync",
+      "command": [
+        "npm",
+        "run",
+        "sync-embedded"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-sync.log",
+      "logSha256": "19432da27799a3743a69a1721c6e9f588478331d57499d72efbde915ef240c79"
+    },
+    {
+      "stage": "embedded",
+      "command": [
+        "npm",
+        "run",
+        "check-embedded"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-embedded.log",
+      "logSha256": "53d8487d89adc791ca67d176c618994286a4e44e2067bae6b91859a05cf08912"
+    },
+    {
+      "stage": "lint",
+      "command": [
+        "npm",
+        "run",
+        "lint"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-dashboard-lint.log",
+      "logSha256": "93a0485f4acd7e820e78243b7d6550e0c06ff7b73317174671bf614a2ab04ad1"
+    },
+    {
+      "stage": "install",
+      "command": [
+        "npm",
+        "ci"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-even-g2-install.log",
+      "logSha256": "6370b3630d736204b865da93687feaca538a1ac99cb0084f3878f0b0986097b3"
+    },
+    {
+      "stage": "audit",
+      "command": [
+        "npm",
+        "audit",
+        "--audit-level=high"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-even-g2-audit.log",
+      "logSha256": "6d8c5c8f3d7684adb070417bd608d01ae90aa3dc26a65af03ffda4955f38d9a3"
+    },
+    {
+      "stage": "test",
+      "command": [
+        "npm",
+        "run",
+        "test"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-even-g2-test.log",
+      "logSha256": "95ff4efcd471d089937c99ae8909ab9174a163edf8fb48e69e3901e331a31d3e"
+    },
+    {
+      "stage": "pack",
+      "command": [
+        "npm",
+        "run",
+        "pack"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-even-g2-pack.log",
+      "logSha256": "f635797dbcf25dc3225bd4f89854bbf6c0711a7cd9e84ca4b510f998150f0ae9"
+    },
+    {
+      "stage": "lint",
+      "command": [
+        "npm",
+        "run",
+        "lint"
+      ],
+      "exitCode": 0,
+      "log": "kranz-maintenance-even-g2-lint.log",
+      "logSha256": "69cfc79bd4b159f9105f621a7ad37fad18e3ed1dde878c792e257ac3ed4dbace"
+    }
+  ]
+}
