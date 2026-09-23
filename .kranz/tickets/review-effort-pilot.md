@@ -13,8 +13,10 @@ publish an honest assessment of the human effort, missing evidence and defects
 observed. Use the results to decide which further product work is justified.
 
 The [protocol and case list](../../docs/scoping/review-effort-pilot.md) are
-prepared. Case execution and human measurements remain outstanding; fixture
-mechanism checks are preparation evidence, not pilot results.
+prepared. The three deterministic cases have now executed; see the
+[execution record](../../docs/reviews/2026-09-22-review-effort-pilot-execution.md).
+Human decisions, measurements and the final reviewed assessment remain pending.
+Scripted fixture responses are not human or independent model judgment.
 
 ## Context
 

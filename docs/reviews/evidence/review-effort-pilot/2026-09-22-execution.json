@@ -1,0 +1,679 @@
+{
+  "kind": "derived-pilot-execution-summary; original engine exports retained separately",
+  "protocol": "docs/scoping/review-effort-pilot.md",
+  "status": "awaiting-human-review",
+  "source": {
+    "engineBase": "fccdef95334f82f4595005407e2ba7caeacc824c",
+    "engineTree": "b915c1278c279196098b32dbda159d699b4e2d9f",
+    "runnerSha256": "5d5dec946c650c72aa1f228b55af8b5af727f9d5238b6b18768e9f4b248f2d54",
+    "sourceFiles": [
+      {
+        "path": "crates/engine/examples/review_effort_pilot.rs",
+        "sha256": "8a7cfe380ff1ff20c618479462567affe178f09346ffaa407d2aa71451a8e1ed"
+      },
+      {
+        "path": "scripts/review-effort-pilot.py",
+        "sha256": "3fd096ea67dc9844d2f7111aca71c0d32185c038a9f391cff634c0bd16af533b"
+      }
+    ],
+    "previousPreparations": [
+      "20260922-cases-01: D1 script-dispatch failure; retained",
+      "20260922-cases-02: three executed; reader policy not persisted and missing-dependency variant refused checker drift rather than running; retained"
+    ]
+  },
+  "sample": {
+    "selectedCases": 3,
+    "executedCases": 3,
+    "humanReviewedCases": 0,
+    "timedCases": 0,
+    "incompleteCases": 3,
+    "incompleteReason": "Initial human decisions and final reviewed assessment pending"
+  },
+  "providerInvocations": 0,
+  "humanReviewSeconds": null,
+  "seedDetection": null,
+  "efficiencyClaim": null,
+  "cases": [
+    {
+      "case": "D1",
+      "mission": "m-b6b99e",
+      "baseline": "5d6bcdc91112ca846a3cb557bdb66ec8f14dfde2",
+      "candidate": {
+        "head": "cb1f39e447b6fdab34ad59bfa827525d9692b83e",
+        "base": "5d6bcdc91112ca846a3cb557bdb66ec8f14dfde2",
+        "inventoryDigest": "sha256:bc5c4547a76c0f5a217382c10206e893a527e608d7e5fd7d730c9b6a900295c0",
+        "exclusionsDigest": "sha256:05a195e0c41fe87224eae8037f383215b519c306286185d559804e4a201ce2b0"
+      },
+      "workingTree": " M README.md\n",
+      "engineStatus": "Complete; scripted fixture",
+      "localMerge": false,
+      "release": false,
+      "humanDecision": null,
+      "reviewSeconds": null,
+      "baselineCandidateObservations": [],
+      "freshInputFileCount": 52,
+      "rawEqualsRetainedInputDigests": true,
+      "workerMarkerPresentInTranscriptAndAbsentFromGateInputs": true,
+      "artifacts": [
+        {
+          "path": "D1/prepared.json",
+          "bytes": 1973,
+          "sha256": "eabcf27e3d13ec2769d7a824476301d9e9a7ed1dfe64cf1d98dc245b5cdb26d1"
+        },
+        {
+          "path": "D1/configuration.json",
+          "bytes": 1779,
+          "sha256": "18577cabd522b4992b0c9b13c92ea0598d884411f76f89c25fc0818bb559aca7"
+        },
+        {
+          "path": "D1/review-packet.json",
+          "bytes": 24145,
+          "sha256": "59b99c56bf5057ab5375351bf62c6d5b2bb00acb7bd7b00547dd7d0e9f7be669"
+        },
+        {
+          "path": "D1/review-packet.md",
+          "bytes": 5599,
+          "sha256": "55bcb3beb3760b5e987b822f14a229757d57253de6c5c6bd058d731e103cddab"
+        },
+        {
+          "path": "D1/cli-review-packet.json",
+          "bytes": 24145,
+          "sha256": "fb3da72e871c8e226403772c3f1f6276b55c93269fd9ea185ef3cffb164c327e"
+        },
+        {
+          "path": "D1/cli-outcomes.json",
+          "bytes": 5090,
+          "sha256": "a6f7e339f25a4acd49498854d8f3d1e797117bd2f1dc220ad9b693f6abf7f074"
+        },
+        {
+          "path": "D1/source.diff",
+          "bytes": 291,
+          "sha256": "bf613aecf0eaa87d08d9ac80233c9a571877c7d04ecc5ad4752f198435cd3e60"
+        },
+        {
+          "path": "D1/export/manifest.json",
+          "bytes": 23873,
+          "sha256": "13502af01c6c7185243d688c6daaf335c8312e05c5df387fa1a00a9163f1b2e1"
+        },
+        {
+          "path": "D1/cli-export/manifest.json",
+          "bytes": 23873,
+          "sha256": "13502af01c6c7185243d688c6daaf335c8312e05c5df387fa1a00a9163f1b2e1"
+        },
+        {
+          "path": "D1/validator-input-verification.json",
+          "bytes": 16806,
+          "sha256": "e5e08fa642aa7d412952b9a233256f1c0eae197360f0d911f0ad0ba46347f360"
+        },
+        {
+          "path": "D1/mock-review-input-verification.json",
+          "bytes": 510,
+          "sha256": "484ae03227a7146ec31d928ea211eba1799c92eabaae2c2ab8960b56556ea9ce"
+        },
+        {
+          "path": "D1/record.json",
+          "bytes": 2582,
+          "sha256": "7b860bd15090137803cd9b811f1e75c7bc84b4253f5c0138562227005500965d"
+        }
+      ]
+    },
+    {
+      "case": "B1",
+      "mission": "m-f1b3bb",
+      "baseline": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+      "candidate": {
+        "head": "1b53997577eb080d9a2012c4434d10ecf82aaf5a",
+        "base": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+        "inventoryDigest": "sha256:982f14b7eabcac9d6e48f3d11e683f25329dcbea6f9553a0da4bf24cbdae83b9",
+        "exclusionsDigest": "sha256:ce65a16c4961f4ff78dc63c23d6da0ddaa76c018dc8ed1962505f105bf076482"
+      },
+      "workingTree": "",
+      "engineStatus": "Complete; scripted fixture",
+      "localMerge": false,
+      "release": false,
+      "humanDecision": null,
+      "reviewSeconds": null,
+      "baselineCandidateObservations": [
+        {
+          "seq": 12,
+          "sourceAndConfigMatch": false,
+          "summary": {
+            "assertionId": "a-1",
+            "assertionSha256": "53ef8b8cb61e045f71bd288514a727c0207ed6b864460df1802f2894c9beb02e",
+            "checkerSha256": "2b809bb26ac2c57fbd71e307c588dfa7f6fbff4f3609b60248c3058e12c42b9b",
+            "controlSha256": "7a11291cc578259c42c2836ce1e89171f691bd869b373d352692adbdf9e12aee",
+            "recordedAt": "2026-09-23T00:01:44.457478+00:00",
+            "spec": {
+              "baselineRevision": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+              "expectedBaseline": {
+                "outcome": "failed",
+                "failureId": "invalid-credential-authorized"
+              },
+              "expectedCandidate": {
+                "outcome": "passed"
+              },
+              "environmentLabel": "local-pilot-fs+net",
+              "overlayCheckerOnBaseline": true
+            },
+            "status": "inconclusive",
+            "detail": "INCONCLUSIVE: source identities, expectations or environment configuration differ; inspect the actual receipts. Setup errors, missing receipts and zero checks do not establish the intended behavior.",
+            "baseline": {
+              "binding": {
+                "source": {
+                  "head": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "base": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "inventoryDigest": "sha256:bf68bf568a0e940e832f78548cdff86f924c3bdc8a02ff9c5ab22eeacb680da4",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 1,
+              "receipt": {
+                "checksRun": 2,
+                "outcome": "failed",
+                "failureId": "invalid-credential-authorized"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "candidate": {
+              "binding": {
+                "source": {
+                  "head": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "base": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "inventoryDigest": "sha256:bf68bf568a0e940e832f78548cdff86f924c3bdc8a02ff9c5ab22eeacb680da4",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 1,
+              "receipt": {
+                "checksRun": 2,
+                "outcome": "failed",
+                "failureId": "invalid-credential-authorized"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "checkerOverlaySha256": "2b809bb26ac2c57fbd71e307c588dfa7f6fbff4f3609b60248c3058e12c42b9b"
+          }
+        },
+        {
+          "seq": 58,
+          "sourceAndConfigMatch": false,
+          "summary": {
+            "assertionId": "a-1",
+            "assertionSha256": "53ef8b8cb61e045f71bd288514a727c0207ed6b864460df1802f2894c9beb02e",
+            "checkerSha256": "2b809bb26ac2c57fbd71e307c588dfa7f6fbff4f3609b60248c3058e12c42b9b",
+            "controlSha256": "7a11291cc578259c42c2836ce1e89171f691bd869b373d352692adbdf9e12aee",
+            "recordedAt": "2026-09-23T00:01:51.639858+00:00",
+            "spec": {
+              "baselineRevision": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+              "expectedBaseline": {
+                "outcome": "failed",
+                "failureId": "invalid-credential-authorized"
+              },
+              "expectedCandidate": {
+                "outcome": "passed"
+              },
+              "environmentLabel": "local-pilot-fs+net",
+              "overlayCheckerOnBaseline": true
+            },
+            "status": "verified",
+            "detail": "VERIFIED: approved expectations matched at both revisions after valid/defective controls passed. Environment configuration matches; host toolchain, cache and service state are not attested. Advisory observation only.",
+            "baseline": {
+              "binding": {
+                "source": {
+                  "head": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "base": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "inventoryDigest": "sha256:bf68bf568a0e940e832f78548cdff86f924c3bdc8a02ff9c5ab22eeacb680da4",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 1,
+              "receipt": {
+                "checksRun": 2,
+                "outcome": "failed",
+                "failureId": "invalid-credential-authorized"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "candidate": {
+              "binding": {
+                "source": {
+                  "head": "0c974bf47c839b92c25e18cb01ddef3cdfcd76d7",
+                  "base": "76b4e9be1fe66aae98cf6b1d18e36991aad4c62a",
+                  "inventoryDigest": "sha256:982f14b7eabcac9d6e48f3d11e683f25329dcbea6f9553a0da4bf24cbdae83b9",
+                  "exclusionsDigest": "sha256:4202b9426b97a92c89c0fff8b7c6e1568fb7ee7949b1a3df6524bf044bdcc2dd"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 0,
+              "receipt": {
+                "checksRun": 3,
+                "outcome": "passed"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "checkerOverlaySha256": "2b809bb26ac2c57fbd71e307c588dfa7f6fbff4f3609b60248c3058e12c42b9b"
+          }
+        }
+      ],
+      "freshInputFileCount": 54,
+      "rawEqualsRetainedInputDigests": true,
+      "workerMarkerPresentInTranscriptAndAbsentFromGateInputs": true,
+      "artifacts": [
+        {
+          "path": "B1/prepared.json",
+          "bytes": 3465,
+          "sha256": "af73c7fdf589e331652183479aaf0c7cf5a52766357082b6a5776333e577dd4a"
+        },
+        {
+          "path": "B1/configuration.json",
+          "bytes": 1779,
+          "sha256": "18577cabd522b4992b0c9b13c92ea0598d884411f76f89c25fc0818bb559aca7"
+        },
+        {
+          "path": "B1/review-packet.json",
+          "bytes": 34760,
+          "sha256": "78ca07fe2ee3713c264fa4a64d182bdd2c62dd7ed0983ccff56a4232541b740e"
+        },
+        {
+          "path": "B1/review-packet.md",
+          "bytes": 8431,
+          "sha256": "c7a05d6c5bcb54dc54b51ae05368cb354457e605c7b34c7b97a39564b2bd8ffb"
+        },
+        {
+          "path": "B1/cli-review-packet.json",
+          "bytes": 34760,
+          "sha256": "240ded6a02364de55a1c5776af2da1c1275d17fc6ed0ac2a9049a80ed5732a7a"
+        },
+        {
+          "path": "B1/cli-outcomes.json",
+          "bytes": 5101,
+          "sha256": "6b9b5416e48a275915729a9f4a320ff4b02ebe95ad02519e740c658bb8a6b9ba"
+        },
+        {
+          "path": "B1/source.diff",
+          "bytes": 215,
+          "sha256": "d394431164dc4f89c29e94e761c3dd2a17dc979ab864897242b80650661eecf0"
+        },
+        {
+          "path": "B1/export/manifest.json",
+          "bytes": 25157,
+          "sha256": "a959de1109e6fc5ddd560f6929b51fba5b3324652511b8c85b915b17f0d51e74"
+        },
+        {
+          "path": "B1/cli-export/manifest.json",
+          "bytes": 25157,
+          "sha256": "a959de1109e6fc5ddd560f6929b51fba5b3324652511b8c85b915b17f0d51e74"
+        },
+        {
+          "path": "B1/validator-input-verification.json",
+          "bytes": 17422,
+          "sha256": "de3963db95bf5910f4052a1e4982fab987af393b0beb5956f7aec4bd9e52fbe2"
+        },
+        {
+          "path": "B1/mock-review-input-verification.json",
+          "bytes": 510,
+          "sha256": "a38b27bfad4554a1b43a91235eb2bf0fce68ecbbbed2c513d28511c30a97cdfd"
+        },
+        {
+          "path": "B1/record.json",
+          "bytes": 2586,
+          "sha256": "dbbb4e3de460c3c46d1fe60745cf14ffcb7f6e1a3843925471c3529beadf68f6"
+        }
+      ],
+      "checkerSetupVariant": {
+        "status": "inconclusive",
+        "validExitCode": 1,
+        "receipt": null,
+        "output": "\n--- stderr ---\ncheck.sh: line 1: ./missing-checker-dependency.sh: No such file or directory",
+        "evidenceSha256": "26c9fd4d5c44c85bd685959daa07097dc2003a1e3fd7b5cf1278d65cdbfdb390"
+      }
+    },
+    {
+      "case": "Y1",
+      "mission": "m-fcaa43",
+      "baseline": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+      "candidate": {
+        "head": "f08cda6976d5f6385c5ba19065e7638cf06e99be",
+        "base": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+        "inventoryDigest": "sha256:c0bf35e57a400d8acb5d819b263697b0dc9e0b40190dacfd94102188f1433c61",
+        "exclusionsDigest": "sha256:a57fa7735c6007dca3162107e14742800adf8243151b15901d551ee8e1422492"
+      },
+      "workingTree": "",
+      "engineStatus": "Complete; scripted fixture",
+      "localMerge": false,
+      "release": false,
+      "humanDecision": null,
+      "reviewSeconds": null,
+      "baselineCandidateObservations": [
+        {
+          "seq": 12,
+          "sourceAndConfigMatch": false,
+          "summary": {
+            "assertionId": "a-1",
+            "assertionSha256": "79edace2c86e9ca9ae3eee052a3d7880ba0abb89a5079cb5ba25d81ac3133cfb",
+            "checkerSha256": "99d1479f89539b93fc3597b9c27e1513fb9f798ed71bd5efe900b2a07c5d280c",
+            "controlSha256": "0110e876cf9292b3a222841fd2318a3b05b005ca42c8ca97049a652640b5b98d",
+            "recordedAt": "2026-09-23T00:01:57.663302+00:00",
+            "spec": {
+              "baselineRevision": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+              "expectedBaseline": {
+                "outcome": "passed"
+              },
+              "expectedCandidate": {
+                "outcome": "passed"
+              },
+              "environmentLabel": "local-pilot-fs+net",
+              "overlayCheckerOnBaseline": true
+            },
+            "status": "verified",
+            "detail": "VERIFIED: approved expectations matched at both revisions after valid/defective controls passed. Environment configuration matches; host toolchain, cache and service state are not attested. Advisory observation only.",
+            "baseline": {
+              "binding": {
+                "source": {
+                  "head": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "base": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "inventoryDigest": "sha256:4a31140cb57aaadf359b29e0754c747c7b48f4794e6ad2e406bde8255debc5c5",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 0,
+              "receipt": {
+                "checksRun": 5,
+                "outcome": "passed"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "candidate": {
+              "binding": {
+                "source": {
+                  "head": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "base": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "inventoryDigest": "sha256:4a31140cb57aaadf359b29e0754c747c7b48f4794e6ad2e406bde8255debc5c5",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 0,
+              "receipt": {
+                "checksRun": 5,
+                "outcome": "passed"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "checkerOverlaySha256": "99d1479f89539b93fc3597b9c27e1513fb9f798ed71bd5efe900b2a07c5d280c"
+          }
+        },
+        {
+          "seq": 58,
+          "sourceAndConfigMatch": false,
+          "summary": {
+            "assertionId": "a-1",
+            "assertionSha256": "79edace2c86e9ca9ae3eee052a3d7880ba0abb89a5079cb5ba25d81ac3133cfb",
+            "checkerSha256": "99d1479f89539b93fc3597b9c27e1513fb9f798ed71bd5efe900b2a07c5d280c",
+            "controlSha256": "0110e876cf9292b3a222841fd2318a3b05b005ca42c8ca97049a652640b5b98d",
+            "recordedAt": "2026-09-23T00:02:05.593778+00:00",
+            "spec": {
+              "baselineRevision": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+              "expectedBaseline": {
+                "outcome": "passed"
+              },
+              "expectedCandidate": {
+                "outcome": "passed"
+              },
+              "environmentLabel": "local-pilot-fs+net",
+              "overlayCheckerOnBaseline": true
+            },
+            "status": "verified",
+            "detail": "VERIFIED: approved expectations matched at both revisions after valid/defective controls passed. Environment configuration matches; host toolchain, cache and service state are not attested. Advisory observation only.",
+            "baseline": {
+              "binding": {
+                "source": {
+                  "head": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "base": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "inventoryDigest": "sha256:4a31140cb57aaadf359b29e0754c747c7b48f4794e6ad2e406bde8255debc5c5",
+                  "exclusionsDigest": "sha256:9d54f0d180de2a7dd1f8aef5ade77ccaf2779bef33f0dc5a65294994c2f75f10"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 0,
+              "receipt": {
+                "checksRun": 5,
+                "outcome": "passed"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "candidate": {
+              "binding": {
+                "source": {
+                  "head": "6d482f8f61a5cf50748868c4bec7fdb87a946ae2",
+                  "base": "2e09c40fb3726fef24374f5af05fe53d24ed10c9",
+                  "inventoryDigest": "sha256:c0bf35e57a400d8acb5d819b263697b0dc9e0b40190dacfd94102188f1433c61",
+                  "exclusionsDigest": "sha256:c080c185c0ffedd586aa216b762f75f3474f7aec688f6b087846ab6abeefefb4"
+                },
+                "environment": "sha256:f33ffa6e6a5320b31a63a111f241bce899a40996731c115a5896b0a69f1844bc"
+              },
+              "exitCode": 0,
+              "receipt": {
+                "checksRun": 5,
+                "outcome": "passed"
+              },
+              "environmentNames": [
+                "CARGO_HOME",
+                "CARGO_NET_OFFLINE",
+                "CARGO_TARGET_DIR",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "HOME",
+                "KRANZ_BASE_SHA",
+                "KRANZ_CONTROL_RESULT",
+                "KRANZ_CONTROL_SCRATCH",
+                "NPM_CONFIG_CACHE",
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "RUSTUP_HOME",
+                "TMPDIR"
+              ]
+            },
+            "checkerOverlaySha256": "99d1479f89539b93fc3597b9c27e1513fb9f798ed71bd5efe900b2a07c5d280c"
+          }
+        }
+      ],
+      "freshInputFileCount": 60,
+      "rawEqualsRetainedInputDigests": true,
+      "workerMarkerPresentInTranscriptAndAbsentFromGateInputs": true,
+      "artifacts": [
+        {
+          "path": "Y1/prepared.json",
+          "bytes": 5103,
+          "sha256": "44e4f0062846a2d9ceccc618b37bd42bc95ee990b97cb837bd405c029fe7a7f2"
+        },
+        {
+          "path": "Y1/configuration.json",
+          "bytes": 1779,
+          "sha256": "18577cabd522b4992b0c9b13c92ea0598d884411f76f89c25fc0818bb559aca7"
+        },
+        {
+          "path": "Y1/review-packet.json",
+          "bytes": 37939,
+          "sha256": "5bcd779a47cc09ebc6ff47200a4d1bf2d128a4e1f45fcda1c4e928f6ee78bf25"
+        },
+        {
+          "path": "Y1/review-packet.md",
+          "bytes": 8731,
+          "sha256": "329f57e45a985693a1a9fb4a7bbc31d2d40726c12e7b053f986b86a9684f912d"
+        },
+        {
+          "path": "Y1/cli-review-packet.json",
+          "bytes": 37939,
+          "sha256": "6f40681e95b253b69c48bb58a57a58b20f414a84a4f20e5b200e9cbded3a9427"
+        },
+        {
+          "path": "Y1/cli-outcomes.json",
+          "bytes": 5093,
+          "sha256": "e365744f2196c6f061238b1ded3caa4171b62c1a6e388e51d0508264586ce944"
+        },
+        {
+          "path": "Y1/source.diff",
+          "bytes": 407,
+          "sha256": "dcb83e5f84d332b366cef7dba356824a42cdce2d28fd3b1c041c7e3740320a69"
+        },
+        {
+          "path": "Y1/export/manifest.json",
+          "bytes": 27851,
+          "sha256": "9c966ff7039a80341dc857020d9151b6d2dacb7a39e8a92df3dc180529baf21b"
+        },
+        {
+          "path": "Y1/cli-export/manifest.json",
+          "bytes": 27851,
+          "sha256": "9c966ff7039a80341dc857020d9151b6d2dacb7a39e8a92df3dc180529baf21b"
+        },
+        {
+          "path": "Y1/validator-input-verification.json",
+          "bytes": 19601,
+          "sha256": "1b559a4d651645c6d10c74b17ab0f9712ef4e7d8b6244a88f0fc8cc5da1c6974"
+        },
+        {
+          "path": "Y1/mock-review-input-verification.json",
+          "bytes": 510,
+          "sha256": "2f04d705173f748c9a30b2d5fe7ed85b10252454677285cc373427e52b669f8e"
+        },
+        {
+          "path": "Y1/record.json",
+          "bytes": 2589,
+          "sha256": "4cdd951ade2ec271907ce463482ebfcd98de839dc97694909e90fd39e6388666"
+        }
+      ]
+    }
+  ],
+  "earlierPreparations": [
+    {
+      "id": "cases-01",
+      "D1": "incomplete: first worker received controller script; stopped, retained",
+      "B1": "not started",
+      "Y1": "not started"
+    },
+    {
+      "id": "cases-02",
+      "status": "executed, no human review; reader policy absent from fixture HOME and B1 variant stopped at checker drift; retained unchanged"
+    }
+  ],
+  "verification": "docs/reviews/evidence/review-effort-pilot/2026-09-22-verification.json",
+  "readOnlyCliSourceNote": "The original CLI export used the dependency-maintenance build (07608c203f7fea68cc4c892ae076c018ef7618b3), with unchanged review/outcome Rust sources. A clean rebuild from the engine base reproduces every packet/outcome field apart from observation and reporting-window timestamps; original artifacts are unmodified."
+}

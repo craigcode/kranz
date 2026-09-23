@@ -1,0 +1,273 @@
+{
+  "base": "fccdef95334f82f4595005407e2ba7caeacc824c",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "kind": "clean workspace rebuild and synthetic verification; human review remains pending",
+  "isolatedTarget": true,
+  "workspaceArtifactsCleanedBeforeRebuild": [
+    "kranz",
+    "kranz-engine",
+    "kranz-server",
+    "kranz-slack"
+  ],
+  "rustTests": {
+    "passed": 3110,
+    "failed": 0,
+    "ignored": 10
+  },
+  "explicitContainerProofs": [
+    "KRANZ_ACP_CONTAINER_TESTS=1",
+    "KRANZ_GATE_CONTAINER_TESTS=1",
+    "KRANZ_MOUNT_CONTAINER_TESTS=1"
+  ],
+  "sourceFiles": [
+    {
+      "path": "crates/engine/examples/review_effort_pilot.rs",
+      "sha256": "8a7cfe380ff1ff20c618479462567affe178f09346ffaa407d2aa71451a8e1ed"
+    },
+    {
+      "path": "scripts/review-effort-pilot.py",
+      "sha256": "3fd096ea67dc9844d2f7111aca71c0d32185c038a9f391cff634c0bd16af533b"
+    }
+  ],
+  "runnerComparison": {
+    "retainedSha256": "5d5dec946c650c72aa1f228b55af8b5af727f9d5238b6b18768e9f4b248f2d54",
+    "cleanRebuildSha256": "74678d6ed119cff053eeccbdcd14752a1277e610243f6f3cedaf63077506dfb8",
+    "byteIdentical": false,
+    "metadataRanges": [
+      [
+        2024,
+        2040,
+        "LC_UUID"
+      ],
+      [
+        18118848,
+        18260576,
+        "LC_CODE_SIGNATURE payload"
+      ]
+    ],
+    "differingBytes": 48,
+    "differingBytesOutsideUuidAndCodeSignature": 0,
+    "equalSize": true,
+    "sha256WithUuidAndSignatureZeroed": "ea1dc7bc115699eb488359367996ab2076848fb02bc4be92407c4330d372025e",
+    "originalBytesUnmodified": true
+  },
+  "readerComparison": {
+    "cliSha256": "71131cfd613e14b801f9bb13d61b520138d86a5604b0515ee9520960823032bf",
+    "sourceBase": "fccdef95334f82f4595005407e2ba7caeacc824c",
+    "comparisons": [
+      {
+        "case": "D1",
+        "projection": "review-packet",
+        "differentFields": [
+          "/observedAt"
+        ],
+        "exitCode": 0,
+        "sha256": "64ec555c0a7c36c7a271adfafe98217e24916db9e1a13ea446d0361491ccba0f"
+      },
+      {
+        "case": "D1",
+        "projection": "outcomes",
+        "differentFields": [
+          "/outcomeReasons/through",
+          "/outcomeReasons/from"
+        ],
+        "exitCode": 0,
+        "sha256": "e67e02db97e67647f7fa0bbdfa8a9c00636f6ccf7b7ac85d29e5e07fb0c6f4b4"
+      },
+      {
+        "case": "B1",
+        "projection": "review-packet",
+        "differentFields": [
+          "/observedAt"
+        ],
+        "exitCode": 0,
+        "sha256": "93430a7550921dd1c7b4552f40afa656dce4fd3d8c59f68e9b71b1948ddb4743"
+      },
+      {
+        "case": "B1",
+        "projection": "outcomes",
+        "differentFields": [
+          "/outcomeReasons/through",
+          "/outcomeReasons/from"
+        ],
+        "exitCode": 0,
+        "sha256": "07cb0a232baf891f277b2a14c64c478003cc90bfe92da561393dfcec76fa5ddf"
+      },
+      {
+        "case": "Y1",
+        "projection": "review-packet",
+        "differentFields": [
+          "/observedAt"
+        ],
+        "exitCode": 0,
+        "sha256": "48298d31d4e690eba474132422a1d1076da25113da4ac81388c20ed25ff7d0aa"
+      },
+      {
+        "case": "Y1",
+        "projection": "outcomes",
+        "differentFields": [
+          "/outcomeReasons/through",
+          "/outcomeReasons/from"
+        ],
+        "exitCode": 0,
+        "sha256": "199bb2a1b876a03f6efd6a6c296687d6e38e4829b2ebbe61c5fe5b6d1d7808f1"
+      }
+    ]
+  },
+  "retainedArtifactCountVerified": 887,
+  "rejectedSharedTargetAttempt": {
+    "status": "rejected",
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--locked"
+    ],
+    "reason": "Shared target reused ACP test binary with tests absent from the pilot source checkout. Outer gate driver stopped before further steps; current test process allowed to finish normal cleanup. No result from this run counts as pilot validation.",
+    "sourceBase": "fccdef95334f82f4595005407e2ba7caeacc824c",
+    "log": "rejected-shared-target-test.log",
+    "logSha256": "0de72f92486c3b5c6017a68fee2aaaa6037802a628b50b353c95a4a738c67517",
+    "replacement": "Isolated copy-on-write target; cargo clean for all four workspace packages before rebuild."
+  },
+  "gates": [
+    {
+      "step": "test",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-test.log",
+      "logSha256": "97f69ace32d171b17162d004373fd4999d2b24b076d77339611c2804612b127b"
+    },
+    {
+      "step": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-clippy.log",
+      "logSha256": "58ccad92c03ce8ad6b02ee09c1221606c677011e501152cbd0308b3910fe3313"
+    },
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-fmt.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "build",
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-build.log",
+      "logSha256": "46bfdfa5910eeaba811071568f156716e9cb16b16d0e38fb4e63583a43853381"
+    },
+    {
+      "step": "example",
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--example",
+        "review_effort_pilot",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-example.log",
+      "logSha256": "725716c9d0859a73a63f14d4d0a2ad3e42126c00feb69e99f0ea4e31a7e8f9d9"
+    },
+    {
+      "step": "docs",
+      "command": [
+        "cargo",
+        "doc",
+        "--workspace",
+        "--no-deps",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-docs.log",
+      "logSha256": "966f8b6cc4fe744db985354d960d0800d4413f32de26e9dcb3e40ee696e7c2a8"
+    },
+    {
+      "step": "deny",
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-deny.log",
+      "logSha256": "f1a0fca39d4280363937aabd77783990ea6480bd9ca257816de3b68fc8efa845"
+    },
+    {
+      "step": "domain",
+      "command": [
+        "/Users/craigmartin/Data/kranz-pilot-build/debug/kranz",
+        "domain-lint"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-domain.log",
+      "logSha256": "e36dee9afc7cca4ac533309d43f1816b154dd2c93491cb17ad3657d4f9a3c2b9"
+    },
+    {
+      "step": "public-tree",
+      "command": [
+        "scripts/audit-public-tree.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-public-tree.log",
+      "logSha256": "12b8b3d9862ae0b4942b7d5362f00334bc96bb45eea353dad245a42b038ce6eb"
+    },
+    {
+      "step": "notices",
+      "command": [
+        "scripts/check-rust-notices.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-notices.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "package-licenses",
+      "command": [
+        "scripts/check-package-licenses.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-package-licenses.log",
+      "logSha256": "e03287e0999a922c01a077e00865d42d2296a7ea7a8d78320f109fa68eb37c39"
+    },
+    {
+      "step": "packaging",
+      "command": [
+        "python3",
+        "scripts/test-package-release.py"
+      ],
+      "exitCode": 0,
+      "log": "kranz-review-pilot-isolated-packaging.log",
+      "logSha256": "b38122eb00786a1dde791468e577d2a36fbd71bde53d316bdbbeaf12a03db7c1"
+    }
+  ],
+  "providerInvocations": 0,
+  "humanReviewSeconds": null
+}
