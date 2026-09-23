@@ -479,6 +479,11 @@ fn git_config_protection_refuses_metadata_that_would_rebind_authority() {
 
 #[test]
 fn git_config_protection_seals_ancestor_gitlink_for_subdirectory_sessions() {
+    // Authority masks read HOME and CARGO_HOME while resolving shared Git
+    // metadata. Keep other fixtures' temporary paths stable for this reader.
+    let _env_lock = crate::agent_env::ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (_dir, mut inputs) = fixture();
     let main = inputs.session_cwd.clone();
     let worktree = main.join("linked");
