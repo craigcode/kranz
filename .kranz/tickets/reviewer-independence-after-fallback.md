@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Delivered in public v0.4.0; approved policy, actual model provenance, fallback and replay regressions verified. See docs/reviews/2026-09-22-post-v040-maintenance.md. Reconciled from released code; no Complete mission record fabricated.
 title: Preserve approved reviewer independence after backend fallback
 priority: 2
 schedule: once
@@ -14,9 +16,11 @@ alone is not evidence of independence. Unknown provenance fails closed.
 
 ## Scope and contractChangeRequest
 
-Approved by the operator on 2026-09-07. This is a governance gate within the
-positioning ADR, not a new routing or code-generation feature. Repository
-visibility remains private and release publication remains disabled.
+Approved by the operator on 2026-09-07 as a governance gate within the
+positioning ADR. At that approval, the repository was private and publication
+was disabled. Subsequent public releases supersede that historical posture;
+[the release procedure](../../docs/releasing.md) governs current publication.
+This remains a governance feature, not a routing or code-generation feature.
 
 Add optional reviewerIndependence fields to mission config, plan and mission,
 and optional resolved backend provenance to worker.spawned and WorkerRun.
