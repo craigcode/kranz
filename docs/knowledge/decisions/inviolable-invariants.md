@@ -2,8 +2,10 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-23
 verified_against:
+  - crates/engine/src/container_egress.rs
+  - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
   - crates/server/src/lib.rs
   - crates/engine/src/acp_worker.rs
@@ -240,6 +242,10 @@ untouched (AGENTS.md rules 1–3).
   requires an observed Docker-client exit status; expiration of its bounded
   wait fails closed, and killing that client cannot establish success. See
   [mount preflight ownership](../../acp-containment.md#mount-preflight-ownership).
+  Filtered egress requires a recognized stable Docker daemon >=25.0.5, a DNS
+  prerequisite rather than blanket qualification. Read-only caches are readable
+  and host-mutable, and default-bridge peers share relay access: the documented
+  boundary assumes a trusted host/daemon, not hostile Docker tenants.
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
   `tickets/`, `lessons/`, `hook-status/`), every SIBLING mission dir, the
@@ -270,6 +276,9 @@ the resolution before writing the protocol response; a sent receipt is not proof
 of the effect. Prohibited or incomplete actions cannot be approved, and only
 unique certified once-only options qualify. Expiry, action drift, a dead peer
 or a lost response channel closes the request without retrying the effect.
+A deadline belongs to its session, not sibling candidates. Mission-wide controls
+still stop and join the batch before they apply; only permission answers and
+noninterrupting messages are handled immediately.
 Local capability authority is recorded as such; only a verified Slack interaction
 supplies a Slack user identity. Permission callbacks alone remain cooperative;
 only the explicit qualified worker profiles add the separately proven container

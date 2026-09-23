@@ -216,5 +216,38 @@
       "log": "kranz-acp-followups-workflow.log",
       "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     }
+  ],
+  "documentationChecks": [
+    {
+      "step": "knowledge-refresh",
+      "command": [
+        "/private/tmp/kranz-acp-verified-cli",
+        "knowledge-refresh"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-refresh.log",
+      "logSha256": "b9a4a7e56f187a3a8e5906518ba3e6acc35f8f0a8c47a113d20d3b2fe73c6688"
+    },
+    {
+      "step": "knowledge-domain",
+      "command": [
+        "/private/tmp/kranz-acp-verified-cli",
+        "domain-lint"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-domain.log",
+      "logSha256": "4755ad2c586aa5b60baf1a61eca2da97aeb616b9e973720b149054e7e38d5703"
+    },
+    {
+      "step": "knowledge-diff",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-diff.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
   ]
 }

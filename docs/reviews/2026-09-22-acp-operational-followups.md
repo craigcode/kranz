@@ -87,3 +87,8 @@ requests that proof; the updated workflow passes actionlint.
 identify this local verification. Raw logs are retained in the operator
 verification archive. GitHub checks must still pass on the proposed commit
 before its protected merge.
+
+The first GitHub run flagged four source-linked knowledge notes as stale. Their
+ACP profile, consent, cache/relay and test descriptions have been reviewed and
+updated with current source citations. `knowledge-refresh` and the domain audit
+pass after that documentation correction; the tested runtime source is unchanged.

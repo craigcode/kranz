@@ -2,8 +2,10 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-23
 verified_against:
+  - crates/engine/src/container_egress.rs
+  - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
@@ -327,7 +329,12 @@ spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
 An operator-only `worker.acpProfile` admits the reviewed Claude/Codex container
 profiles to ordinary worktree missions. It fixes guest argv, image, explicit
 file credential, startup settings and configured egress; defaults remain
-unchanged. Generic enforced ACP, validators, session resume and dispatch-pool
+unchanged. Extra mission grants cannot widen that fixed egress set; the refusal
+names the boundary without printing destinations or reading credentials.
+Filtered Docker egress additionally requires a recognized stable daemon >=25.0.5
+as a conservative DNS prerequisite. Cache mounts remain readable and the relay
+shares its allowlist with default-bridge peers; the host/daemon is trusted, not
+a hostile multi-tenant boundary. Generic enforced ACP, validators, session resume and dispatch-pool
 profiles are refused. The profile supplies a private HOME with an unmounted
 private parent. Existing permission, checkpoint and event machinery remains
 in use; engine-run checks use the same image offline without the worker login.
@@ -348,8 +355,12 @@ before sending a response; `permission.response-recorded` says sent or uncertain
 not that a tool completed. `permission.closed` preserves why a request can no
 longer be answered. These events fold into `MissionState.permissions`.
 
-Replay recreates records, never response handles. Resume closes orphaned calls;
-pause and policy changes cancel live workers before changing their authority.
+Replay recreates records, never response handles. Resume closes orphaned calls.
+Expiry closes only the affected request; its backend deadline ends that session
+without cancelling sibling candidates. During an active batch only exact
+permission answers and noninterrupting messages apply immediately. All other
+controls cancel and join the batch before processing, even when a control later
+proves stale or ineffective. This preserves inbox order and mission authority.
 See [one-call consent](../../acp-live-permissions.md) and
 [the broker](../../../crates/engine/src/orchestrator/live_permissions.rs).
 

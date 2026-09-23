@@ -2,8 +2,10 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-23
 verified_against:
+  - crates/engine/src/container_egress.rs
+  - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
@@ -117,7 +119,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **ACP worker profile** — operator-selected `worker.acpProfile` fixing a
   qualified adapter/image, private file credential, startup policy and configured
   egress. It requires contained worktree workers; generic ACP enforcement remains
-  refused. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
+  refused. Mission egress grants cannot widen its fixed allowlist. Cache and
+  relay access assume a trusted host/daemon; a version prerequisite alone is
+  not profile qualification. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
 - **Mutation authority** — a validated, nonempty token required by the server's
   mutation-capable constructors. Convenience routers mint an undisclosed token,
   so reads work and unauthenticated mutations are refused.
@@ -132,5 +136,6 @@ Project vocabulary. Terms link to the note that explains them in depth.
 - **One-call permission** — a short-lived ACP request bound to one action, offered
   options, peer/session/run, workspace and approved plan/policy. Its durable
   resolution precedes the response; delivery and tool outcome remain separate.
+  Expiry ends the affected session without cancelling sibling candidates.
   It never becomes a mission-wide command grant. See
   [live consent](../acp-live-permissions.md).

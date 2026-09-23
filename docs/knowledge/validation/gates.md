@@ -2,8 +2,10 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-23
 verified_against:
+  - crates/engine/src/container_egress.rs
+  - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
   - crates/engine/tests/review_packet_test.rs
   - crates/engine/tests/gate_input_builder_test.rs
@@ -82,9 +84,12 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires all nine descendant/lifetime daemon proofs and the six ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime daemon proofs and the six ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
-tests do not substitute for those proofs. Synthetic control tests additionally
+tests do not substitute for those proofs. The same job explicitly runs the
+synthetic cache-read/denied-write proof and rejects its skip marker. Optional
+container tests use a bounded daemon probe; ACP/gate/mount proof flags still
+fail closed when an installed CLI cannot reach a daemon. Synthetic control tests additionally
 require confirmed absence after asynchronous deletion and failure when a
 namespace persists. The MCP descendant proof exchanges initialization and a
 tool call with a detached child, requires thirteen containment denials and a
@@ -414,7 +419,13 @@ and optional Slack submit the exact request/binding digest. Tests use local
 peers and disposable authority data; they do not need provider login or Keychain
 access. Fragmented stdout survives cancelled reads, and an answer waits until
 an already-started protocol frame is complete. Future messages from a cooperative
-peer cannot be predicted; this protocol check is not containment.
+peer cannot be predicted; this protocol check is not containment. A two-request
+broker regression closes an expired request while its sibling can still receive
+consent. Control regressions retain batch cancellation for all controls except
+exact permission answers and noninterrupting messages. The separate real egress
+proof records the default-bridge relay trust assumption and external-DNS denial
+on the tested internal-only network; older or unrecognized daemon versions fail
+the conservative admission floor.
 See [live consent](../../acp-live-permissions.md).
 
 The S5 stage drivers record evaluation, engine resolution and attempted
