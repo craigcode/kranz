@@ -5,6 +5,10 @@ below are a convenience sample for finding evidence gaps, not an efficiency
 benchmark. The [pilot ticket](../../.kranz/tickets/review-effort-pilot.md) stays
 open until the cases and final assessment are reviewed.
 
+The [execution record](../reviews/2026-09-22-review-effort-pilot-execution.md)
+now retains the three executed fixtures and preparation corrections. Human
+decisions and measurements are pending; execution alone does not close the pilot.
+
 Use the shipped [review packet](../review-packets.md),
 [baseline/candidate observations](../contract-controls.md#baseline-and-candidate-observations),
 [outcome reasons](../outcome-reasons.md), and existing evidence export. No new
