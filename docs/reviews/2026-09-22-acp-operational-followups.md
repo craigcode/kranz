@@ -92,3 +92,6 @@ The first GitHub run flagged four source-linked knowledge notes as stale. Their
 ACP profile, consent, cache/relay and test descriptions have been reviewed and
 updated with current source citations. `knowledge-refresh` and the domain audit
 pass after that documentation correction; the tested runtime source is unchanged.
+The dependent lessons index was refreshed after CI identified that additional
+link in the knowledge graph; the final committed notes are checked again before
+pushing. The earlier pre-commit check is retained as such.
