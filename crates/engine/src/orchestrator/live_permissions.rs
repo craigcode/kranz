@@ -221,9 +221,9 @@ impl MissionEngine {
                 reason: "deadline expired".into(),
             })?;
             self.permission_handles.remove(&request_id);
-            if let Some(cancel) = &self.permission_cancel {
-                cancel.notify_waiters();
-            }
+            // ACP enforces this request's live deadline in its own session.
+            // The shared notifier belongs to mission controls and durability
+            // failures; expiring one candidate must not abort its siblings.
         }
         Ok(())
     }
@@ -551,29 +551,40 @@ mod tests {
         assert_eq!(reducer::fold(&events).unwrap().permissions.len(), 2);
     }
     fn seed_request(engine: &mut MissionEngine) -> Request {
+        seed_request_for(engine, "fixture-run", "fixture-session", 300_000)
+    }
+
+    fn seed_request_for(
+        engine: &mut MissionEngine,
+        run_id: &str,
+        session_id: &str,
+        ttl_ms: i64,
+    ) -> Request {
         engine
             .emit(EventKind::WorkerSpawned {
                 backend: Some(BackendKind::Acp),
-                run_id: "fixture-run".into(),
+                run_id: run_id.into(),
                 role: Role::Worker,
                 feature_id: Some("f-1-1".into()),
                 milestone_id: None,
                 candidate: None,
                 executor_route: None,
-                sdk_session_id: "fixture-session".into(),
+                sdk_session_id: session_id.into(),
                 model: "fixture".into(),
                 quant: "n/a".into(),
                 weight_hash: None,
                 prompt_hash: "fixture".into(),
-                transcript_path: MissionPaths::transcript_rel("fixture-run"),
+                transcript_path: MissionPaths::transcript_rel(run_id),
             })
             .unwrap();
         let (plan_digest, policy_digest) = engine.permission_authority().unwrap();
+        let mut proposal = proposal(session_id);
+        proposal.deadline = proposal.observed_at + chrono::Duration::milliseconds(ttl_ms);
         let request = Request::new(
-            proposal("fixture-session"),
+            proposal,
             live_permission::Binding {
                 mission_id: engine.paths.mission_id.clone(),
-                run_id: "fixture-run".into(),
+                run_id: run_id.into(),
                 workspace: engine.paths.repo_root.display().to_string(),
                 plan_digest,
                 policy_digest,
@@ -586,6 +597,150 @@ mod tests {
             })
             .unwrap();
         request
+    }
+
+    #[tokio::test]
+    async fn live_permission_expiry_preserves_sibling_response_and_batch() {
+        let Some((_dir, mut engine)) = engine() else {
+            return;
+        };
+        let expired = seed_request_for(&mut engine, "run-expiring", "session-expiring", 1000);
+        let sibling = seed_request_for(&mut engine, "run-sibling", "session-sibling", 300_000);
+        let (expired_handle, mut expired_answers) = PermissionResponder::channel();
+        let (sibling_handle, mut sibling_answers) = PermissionResponder::channel();
+        engine
+            .permission_handles
+            .insert(expired.proposal.id.clone(), expired_handle);
+        engine
+            .permission_handles
+            .insert(sibling.proposal.id.clone(), sibling_handle);
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        engine.permission_cancel = Some(cancel.clone());
+        let batch_cancelled = cancel.notified();
+        tokio::pin!(batch_cancelled);
+        batch_cancelled.as_mut().enable();
+        tokio::time::sleep(
+            (expired.proposal.deadline - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default()
+                + Duration::from_millis(10),
+        )
+        .await;
+        engine.permission_tick().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), batch_cancelled)
+                .await
+                .is_err(),
+            "one request expiry must not cancel sibling candidate sessions"
+        );
+        assert_eq!(
+            engine.state.permissions[&expired.proposal.id]
+                .closed
+                .as_deref(),
+            Some("deadline expired")
+        );
+        assert!(expired_answers.recv().await.is_none());
+        assert!(engine.state.permissions[&sibling.proposal.id].pending(chrono::Utc::now()));
+        engine
+            .resolve_live_permission(Resolution {
+                request_id: sibling.proposal.id.clone(),
+                binding_digest: sibling.binding_digest,
+                allow: true,
+                actor: Actor::LocalRepositoryAuthority,
+                reason: "approve live sibling".into(),
+            })
+            .unwrap();
+        let answer = sibling_answers.try_recv().unwrap();
+        assert!(answer.allow);
+        assert_eq!(answer.proposal, sibling.proposal);
+        let replay =
+            reducer::fold(&EventLog::read_events(&engine.paths.events_file()).unwrap()).unwrap();
+        assert!(replay.permissions[&expired.proposal.id]
+            .resolution
+            .is_none());
+        assert!(
+            replay.permissions[&sibling.proposal.id]
+                .resolution
+                .as_ref()
+                .unwrap()
+                .allow
+        );
+    }
+
+    #[tokio::test]
+    async fn live_permission_control_boundary_defers_mission_changes_but_keeps_messages_live() {
+        let controls = [
+            ControlCommand::Pause,
+            ControlCommand::Resume,
+            ControlCommand::Msg {
+                text: "interrupt".into(),
+                interrupt: true,
+            },
+            ControlCommand::ConfigChange {
+                patch: json!({"maxRespawns":0}),
+            },
+            ControlCommand::RequestRevision {
+                instructions: "revise".into(),
+            },
+            ControlCommand::ApproveRevision { revision: 1 },
+            ControlCommand::RejectRevision { revision: 1 },
+            ControlCommand::ApproveGrant {
+                command: "fixture".into(),
+            },
+            ControlCommand::DenyGrant {
+                command: "fixture".into(),
+                reason: "declined".into(),
+            },
+            ControlCommand::AnswerQuestion {
+                question_id: "q-fixture".into(),
+                answer: "answer".into(),
+                option: None,
+            },
+        ];
+        for command in controls {
+            let Some((_dir, mut engine)) = engine() else {
+                return;
+            };
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            engine.permission_cancel = Some(cancel.clone());
+            let cancelled = cancel.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            control::enqueue(
+                &engine.paths,
+                &ControlCommand::Msg {
+                    text: "keep pumping".into(),
+                    interrupt: false,
+                },
+            )
+            .unwrap();
+            control::enqueue(&engine.paths, &command).unwrap();
+            let before = EventLog::read_events(&engine.paths.events_file())
+                .unwrap()
+                .len();
+            engine.drain_control().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), cancelled)
+                .await
+                .unwrap();
+            let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
+            assert_eq!(
+                events.len(),
+                before + 1,
+                "only the noninterrupting message applies before workers join: {command:?}"
+            );
+            assert!(matches!(
+                events.last().unwrap().kind,
+                EventKind::UserMessage {
+                    interrupt: false,
+                    ..
+                }
+            ));
+            assert_eq!(
+                control::drain(&engine.paths).unwrap().len(),
+                1,
+                "control must remain queued: {command:?}"
+            );
+        }
     }
 
     #[test]

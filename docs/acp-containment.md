@@ -62,7 +62,8 @@ the repository and worker-writable roots. Symlinks, duplicate JSON keys, unknown
 profiles, custom argv, boundary drift and unexpected caller environment variables
 fail before the adapter starts. The configured egress set is exact; the existing
 proxy's effective default Anthropic floor also applies. Extra egress grants do
-not widen a qualified worker. A missing configured image fails without a pull;
+not widen a qualified worker; the refusal names this fixed-allowlist boundary
+without printing the destination. A missing configured image fails without a pull;
 a rebuilt image with another ID needs its own qualification.
 
 On macOS, Docker must share the repository, mission worktrees, gate scratch and
@@ -107,6 +108,43 @@ records the integrated failure cases; the later [live-worker record](reviews/202
 retains the authorized provider attempts and their limits.
 
 ## Boundary
+
+### Host trust and DNS prerequisite
+
+Filtered container egress now requires a stable Docker daemon version of at
+least 25.0.5 before provisioning a relay. Unrecognized/vendor-suffixed versions,
+prereleases and older backports are unsupported by this admission check.
+This is a conservative prerequisite, not certification of every newer daemon.
+Docker fixed host-forwarded DNS leakage from internal-only networks in
+[25.0.5](https://docs.docker.com/engine/release-notes/25.0/#2505).
+The [Moby advisory](https://github.com/moby/moby/security/advisories/GHSA-mq39-4gv4-mvpx)
+also names patched older branches; being below Kranz's support floor does not
+mean every such build has that vulnerability. The live proof checks an external
+DNS lookup against bridge and internal-only networks on its recorded daemon;
+it does not recreate every host resolver configuration or test older daemons.
+
+The engine host and Docker daemon are trusted. The relay listens on its internal
+and default-bridge interfaces, so a peer on the default bridge can use the same
+destination allowlist. That peer does not receive the relay token, but the relay
+adds it to forwarded requests. This is not an isolation boundary between hostile
+Docker tenants. Use a dedicated trusted daemon; do not share it with unrelated
+untrusted containers. The upstream allowlist still applies to every connection.
+
+Read-only toolchain mounts protect integrity, not confidentiality. Workers can
+read the selected Rust toolchain, Cargo `bin`, `registry` and `git` caches, and
+the npm cache. The Cargo root, its configuration and its credential files are
+not mounted. Gate commands mount Cargo `bin` and use their separately seeded
+cache-only home. Private source or sensitive logs inside a mounted cache remain
+readable, and host-side cache changes are not frozen by a read-only guest bind.
+Select sanitized operator-owned cache directories for this trust model. A
+synthetic probe checks readable fixture sources, denied writes and inaccessible
+Cargo credentials without reading real operator cache contents.
+
+Isolating the relay listener and freezing per-project cache inputs would change
+the qualified boundary. That work is separately scoped in
+[the cache/relay qualification ticket](../.kranz/tickets/acp-cache-relay-isolation.md).
+
+### Worker namespace
 
 The caller supplies a resolved Docker sandbox and an absolute **guest** command.
 The installed Linux image must be immutable (`repository@sha256:…` or an image

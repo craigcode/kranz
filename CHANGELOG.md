@@ -5,6 +5,15 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Isolated expired ACP permission requests from sibling candidates, clarified
+  which operator controls stop the active batch, and made fixed-profile egress
+  refusals identify the grant mismatch without printing destinations.
+- Filtered Docker egress now requires a recognized stable daemon version of at
+  least 25.0.5 for the internal-network DNS prerequisite. Documented cache
+  readability and default-bridge relay trust assumptions. Optional container
+  tests distinguish an unavailable daemon from a missing CLI; explicitly
+  requested proofs still fail closed.
+
 ## 0.4.0 - 2026-09-22
 
 - Added read-only recorded outcome reasons in the CLI, API, dashboard and

@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Reproduced and resolved in the post-v0.4.0 operational follow-up; sibling expiry and diagnostics have regressions, daemon/DNS/cache/relay assumptions have retained proofs, and full workspace gates pass. See docs/reviews/2026-09-22-acp-operational-followups.md. Changed cache/relay profiles remain separately scoped.
+state: done
 title: ACP release follow-ups — cancellation scope and operational boundary diagnostics
 priority: 2
 schedule: once
