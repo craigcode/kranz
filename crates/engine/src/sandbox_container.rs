@@ -1010,6 +1010,191 @@ pub fn container_gate_run_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_runtime() -> Option<ContainerRuntime> {
+        let runtime = detect();
+        if let Some(runtime) = runtime {
+            let probe = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::command_exec::run_bounded_argv(
+                    &std::env::current_dir().unwrap(),
+                    Path::new(runtime.binary()),
+                    &["info".into()],
+                    std::time::Duration::from_secs(5),
+                    &runtime.client_env(),
+                ));
+            if probe.0 == Some(0) {
+                return Some(runtime);
+            }
+        }
+        for flag in [
+            "KRANZ_ACP_CONTAINER_TESTS",
+            "KRANZ_GATE_CONTAINER_TESTS",
+            "KRANZ_MOUNT_CONTAINER_TESTS",
+        ] {
+            assert!(
+                std::env::var(flag).as_deref() != Ok("1"),
+                "container daemon unavailable for explicitly requested proof: {flag}=1"
+            );
+        }
+        crate::test_capability::skip(
+            crate::test_capability::capability::CONTAINER,
+            "container CLI or daemon unavailable (bounded info probe failed)",
+        );
+        None
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn optional_container_daemon_probe_skips_but_requested_proofs_fail() {
+        const CASE: &str = "sandbox_container::tests::optional_container_daemon_probe_skips_but_requested_proofs_fail";
+        if std::env::var_os("KRANZ_DAEMON_PROBE_CHILD").is_some() {
+            assert!(detect().is_some(), "fixture CLI must be discoverable");
+            assert!(live_runtime().is_none());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("docker");
+        std::fs::write(&cli, "#!/bin/sh\n[ \"$1\" != info ]\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let flags = [
+            "KRANZ_ACP_CONTAINER_TESTS",
+            "KRANZ_GATE_CONTAINER_TESTS",
+            "KRANZ_MOUNT_CONTAINER_TESTS",
+        ];
+        for required in std::iter::once(None).chain(flags.iter().copied().map(Some)) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([CASE, "--exact", "--nocapture"])
+                .env("KRANZ_DAEMON_PROBE_CHILD", "1")
+                .env("PATH", dir.path())
+                .env("KRANZ_REQUIRED_CAPABILITIES", "");
+            for flag in flags {
+                child.env_remove(flag);
+            }
+            if let Some(flag) = required {
+                child.env(flag, "1");
+            }
+            let output = child.output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(flag) = required {
+                assert!(!output.status.success(), "{flag} must fail: {text}");
+                assert!(
+                    text.contains(&format!("explicitly requested proof: {flag}=1")),
+                    "{text}"
+                );
+            } else {
+                assert!(output.status.success(), "{text}");
+                assert!(
+                    text.contains(
+                        "KRANZ_TEST_SKIP: container: container CLI or daemon unavailable"
+                    ),
+                    "{text}"
+                );
+                assert!(text.contains("test result: ok. 1 passed"), "{text}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_cache_probe_documents_readable_sources_and_denied_writes() {
+        if std::env::var("KRANZ_ACP_CONTAINER_TESTS").as_deref() != Ok("1") {
+            eprintln!("SKIP-ACP-CACHE: set KRANZ_ACP_CONTAINER_TESTS=1 for synthetic cache proof");
+            return;
+        }
+        let (runtime, client_env) = {
+            let _guard = crate::agent_env::EnvTestGuard::engage(&[]);
+            let runtime = live_runtime().expect("explicit cache proof needs a daemon");
+            (runtime, runtime.client_env())
+        };
+        let root = live_fixture();
+        let operator = root.path().join("operator");
+        let session = root.path().join("session");
+        let scratch = root.path().join("scratch");
+        let mission = session.join(".kranz/missions/m-cache");
+        for directory in [&session, &scratch, &mission] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let cache_paths = [
+            ".rustup/toolchains/fixture",
+            ".cargo/bin/fixture",
+            ".cargo/registry/fixture",
+            ".cargo/git/fixture",
+            ".npm/fixture",
+        ];
+        for path in cache_paths {
+            let path = operator.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "synthetic-cache-source").unwrap();
+        }
+        std::fs::write(
+            operator.join(".cargo/credentials.toml"),
+            "synthetic-private-credential",
+        )
+        .unwrap();
+        let input = SandboxInputs {
+            enforce: SandboxEnforce::FsNet,
+            session_cwd: session,
+            mission_dir: mission,
+            tmpdir: scratch,
+            extra_write: vec![],
+            egress: vec![],
+            validator_read_deny_roots: vec![],
+        };
+        let args = {
+            let cargo = operator.join(".cargo");
+            let rustup = operator.join(".rustup");
+            let npm = operator.join(".npm");
+            let _env = crate::agent_env::EnvTestGuard::engage(&[
+                ("HOME", operator.to_str().unwrap()),
+                ("CARGO_HOME", cargo.to_str().unwrap()),
+                ("RUSTUP_HOME", rustup.to_str().unwrap()),
+                ("NPM_CONFIG_CACHE", npm.to_str().unwrap()),
+            ]);
+            let mut command = vec!["-c".into(),
+                "set -eu; credential=$1; shift; test ! -r \"$credential\"; for cache do test \"$(cat \"$cache\")\" = synthetic-cache-source; if printf tampered > \"$cache\" 2>/dev/null; then exit 9; fi; done; printf 'CACHE-TRUST: sources readable; writes and Cargo credentials denied\\n'".into(),
+                "probe".into(), cargo.join("credentials.toml").display().to_string()];
+            command.extend(
+                cache_paths
+                    .iter()
+                    .map(|p| operator.join(p).display().to_string()),
+            );
+            container_run_args(&input, &ContainerSpec {runtime, network:None, name:None,
+                image:"python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d".into()},
+                Path::new("/bin/sh"), &command, None)
+        };
+        let (code, output) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::command_exec::run_bounded_argv(
+                root.path(),
+                Path::new(runtime.binary()),
+                &args,
+                std::time::Duration::from_secs(30),
+                &client_env,
+            ));
+        assert_eq!(code, Some(0), "{output}");
+        assert!(
+            output.contains("CACHE-TRUST: sources readable; writes and Cargo credentials denied"),
+            "{output}"
+        );
+        println!("{output}");
+        for path in cache_paths {
+            assert_eq!(
+                std::fs::read_to_string(operator.join(path)).unwrap(),
+                "synthetic-cache-source"
+            );
+        }
+    }
     use crate::sandbox::SandboxInputs;
     use crate::types::SandboxEnforce;
     use std::path::PathBuf;
@@ -1091,11 +1276,7 @@ mod tests {
             );
             return;
         }
-        let Some(runtime) = detect() else {
-            crate::test_capability::skip(
-                crate::test_capability::capability::CONTAINER,
-                "no container runtime on PATH, so the bind-mount round trip cannot be proven",
-            );
+        let Some(runtime) = live_runtime() else {
             return;
         };
         // The checkout's parent, not a temp dir: a runtime can share one and
@@ -1794,11 +1975,7 @@ mod tests {
             );
             return;
         }
-        let Some(runtime) = detect() else {
-            crate::test_capability::skip(
-                crate::test_capability::capability::CONTAINER,
-                "no docker/podman/nerdctl/container on PATH",
-            );
+        let Some(runtime) = live_runtime() else {
             return;
         };
 
@@ -1906,8 +2083,7 @@ mod tests {
     fn container_authority_directory_hides_tokens_created_after_start() {
         if crate::agent_env::isolated_global_home_test("sandbox_container::tests::container_authority_directory_hides_tokens_created_after_start") { return; }
         use std::io::{BufRead as _, Write as _};
-        let Some(runtime) = detect() else {
-            eprintln!("no container runtime; skipping live authority test");
+        let Some(runtime) = live_runtime() else {
             return;
         };
         let dir = live_fixture();

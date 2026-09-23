@@ -138,12 +138,16 @@ impl AcpWorkerProfile {
             .container
             .as_ref()
             .ok_or_else(|| refusal("missing Docker image/runtime"))?;
+        if !same_egress(&sandbox.inputs.egress, definition.egress) {
+            return Err(refusal(
+                "resolved egress differs from the qualified profile; mission egress grants cannot widen its fixed allowlist",
+            ));
+        }
         if sandbox.backend != crate::sandbox::SandboxBackend::Container
             || container.runtime != crate::sandbox_container::ContainerRuntime::Docker
             || container.image != definition.image
             || sandbox.inputs.enforce != SandboxEnforce::FsNet
             || !sandbox.inputs.extra_write.is_empty()
-            || !same_egress(&sandbox.inputs.egress, definition.egress)
             || crate::sandbox::absolutize(&spec.cwd)
                 != crate::sandbox::absolutize(&sandbox.inputs.session_cwd)
             || !spec.writable

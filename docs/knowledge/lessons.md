@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-23
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -53,6 +53,9 @@ left to per-mission capture:
   container. Bound the guest lifetime, delete only owned full IDs, and require
   confirmed absence; retain recovery intent when creation or cleanup is uncertain.
   See mount preflight ownership in the invariants note.
+- **Name the actual isolation boundary.** Read-only cache mounts protect guest
+  writes, not cache confidentiality or host-side mutation. Default-bridge
+  relay access assumes trusted Docker peers; see the invariants note.
 - **Sandbox mount ordering.** Restoring a writable private workspace must
   preserve covered Git/cache write protections and later authority masks;
   see the authority-material rule in the invariants note.

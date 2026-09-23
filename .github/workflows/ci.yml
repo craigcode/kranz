@@ -483,6 +483,24 @@ jobs:
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
             exit 1
           fi
+      - name: Record cache readability and deny guest mutation
+        env:
+          KRANZ_ACP_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-acp-cache-proof.log"
+          set +e
+          cargo test --workspace --locked sandbox_container::tests::container_cache_probe_documents_readable_sources_and_denied_writes -- --exact --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          grep -qE 'test result: ok\. 1 passed' "$log"
+          grep -q 'CACHE-TRUST: sources readable; writes and Cargo credentials denied' "$log"
+          if grep -q 'SKIP-ACP-CACHE' "$log"; then
+            exit 1
+          fi
       - name: Prove mount helper ownership and interrupted cleanup
         env:
           KRANZ_MOUNT_CONTAINER_TESTS: '1'

@@ -1,0 +1,253 @@
+{
+  "base": "fccdef95334f82f4595005407e2ba7caeacc824c",
+  "kind": "local synthetic and build verification; assistant self-review",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "docker": "29.2.1 (Colima)",
+  "sourceFiles": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "09da4259f76c9fa951c5a39f53a0c83838c4fc603de9d4d59292ba27ed6287d6"
+    },
+    {
+      "path": "crates/engine/src/acp_worker.rs",
+      "sha256": "b9123278dcd3f6cab9ccf69b8fe6a89143f9a6e44a275befa465fb2b5e15d66d"
+    },
+    {
+      "path": "crates/engine/src/acp_worker/tests.rs",
+      "sha256": "45f093bcf56b820a6720f2747540fda829fb93145f414cc40682e7058d7aa149"
+    },
+    {
+      "path": "crates/engine/src/container_egress.rs",
+      "sha256": "86765bac2b7a31f3e9d0ea333e82b3e175ef3f024bc3221ebf2251d2e6ee1eb5"
+    },
+    {
+      "path": "crates/engine/src/orchestrator/live_permissions.rs",
+      "sha256": "2bf406e4cea7970dd26ba370e33f25ca64c4a1173377b38deafd2eced9b74a2f"
+    },
+    {
+      "path": "crates/engine/src/sandbox_container.rs",
+      "sha256": "eaa55851aa726fa0b3b5f8d12b3e81be737db7161309aca19a6e4357b114fce5"
+    }
+  ],
+  "rustTests": {
+    "passed": 3116,
+    "failed": 0,
+    "ignored": 10
+  },
+  "explicitContainerProofs": [
+    "KRANZ_ACP_CONTAINER_TESTS=1",
+    "KRANZ_GATE_CONTAINER_TESTS=1",
+    "KRANZ_MOUNT_CONTAINER_TESTS=1"
+  ],
+  "separateExactProofs": {
+    "egress": 1,
+    "cache": 1
+  },
+  "providerInvocations": 0,
+  "limits": [
+    "Tests do not qualify every newer Docker daemon or reproduce a vulnerable historical daemon.",
+    "Default-bridge peers share relay authority; mounted caches are readable and host-mutable.",
+    "Broker regression verifies sibling capabilities; existing backend deadline-to-cleanup path was inspected, not a five-minute provider trial."
+  ],
+  "gates": [
+    {
+      "step": "egress-proof",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked",
+        "container_egress::tests::container_per_host_egress_live_proof",
+        "--",
+        "--exact",
+        "--ignored",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-egress-proof.log",
+      "logSha256": "375d59d1cd376107cec1fa6da15ff3c9584a7c8f8bb533673b7393e4c8f0351a"
+    },
+    {
+      "step": "test",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-test.log",
+      "logSha256": "8c3592e303410dbaaa75ce2d68c216813b1308df1e7a31f9c1d2bea0781ea696"
+    },
+    {
+      "step": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-clippy.log",
+      "logSha256": "7d2520d7993574c33cee755ec9d6f138ca5558d2b5ca3f91e7aad29c26b9f10f"
+    },
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-fmt.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "build",
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-build.log",
+      "logSha256": "a566ec513380221e1cd0a9aa9ad56a29652d96a8a94044564c10dd6eb1bbb5d1"
+    },
+    {
+      "step": "docs",
+      "command": [
+        "cargo",
+        "doc",
+        "--workspace",
+        "--no-deps",
+        "--locked"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-docs.log",
+      "logSha256": "9be6a3f78a399cf04e4fcdc1287eab3f7d78d40e1dd31849a8c9e22fc0552114"
+    },
+    {
+      "step": "deny",
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-deny.log",
+      "logSha256": "f1a0fca39d4280363937aabd77783990ea6480bd9ca257816de3b68fc8efa845"
+    },
+    {
+      "step": "domain",
+      "command": [
+        "target/debug/kranz",
+        "domain-lint"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-domain.log",
+      "logSha256": "6929600ba100bd86dfb12a899ca208aa60da937aebb686f9bd64b92440ff40d9"
+    },
+    {
+      "step": "public-tree",
+      "command": [
+        "scripts/audit-public-tree.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-public-tree.log",
+      "logSha256": "12b8b3d9862ae0b4942b7d5362f00334bc96bb45eea353dad245a42b038ce6eb"
+    },
+    {
+      "step": "notices",
+      "command": [
+        "scripts/check-rust-notices.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-notices.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "step": "package-licenses",
+      "command": [
+        "scripts/check-package-licenses.sh"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-package-licenses.log",
+      "logSha256": "e03287e0999a922c01a077e00865d42d2296a7ea7a8d78320f109fa68eb37c39"
+    },
+    {
+      "step": "packaging",
+      "command": [
+        "python3",
+        "scripts/test-package-release.py"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-packaging.log",
+      "logSha256": "b38122eb00786a1dde791468e577d2a36fbd71bde53d316bdbbeaf12a03db7c1"
+    },
+    {
+      "step": "cache-proof",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--locked",
+        "sandbox_container::tests::container_cache_probe_documents_readable_sources_and_denied_writes",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-cache-proof.log",
+      "logSha256": "0eba463c64ecd169e4d1b0cccdefa1cece0ea08607403309d89d774c9a9aec8e"
+    },
+    {
+      "step": "workflow",
+      "command": [
+        "actionlint",
+        ".github/workflows/ci.yml"
+      ],
+      "exitCode": 0,
+      "log": "kranz-acp-followups-workflow.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "documentationChecks": [
+    {
+      "step": "knowledge-refresh",
+      "command": [
+        "/private/tmp/kranz-acp-verified-cli",
+        "knowledge-refresh"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-refresh.log",
+      "logSha256": "b9a4a7e56f187a3a8e5906518ba3e6acc35f8f0a8c47a113d20d3b2fe73c6688"
+    },
+    {
+      "step": "knowledge-domain",
+      "command": [
+        "/private/tmp/kranz-acp-verified-cli",
+        "domain-lint"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-domain.log",
+      "logSha256": "4755ad2c586aa5b60baf1a61eca2da97aeb616b9e973720b149054e7e38d5703"
+    },
+    {
+      "step": "knowledge-diff",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exitCode": 0,
+      "log": "knowledge-diff.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

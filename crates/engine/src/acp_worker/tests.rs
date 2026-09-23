@@ -370,6 +370,33 @@ fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
     }
 }
 
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn acp_profile_egress_grant_refusal_names_fixed_allowlist_without_reading_credentials() {
+    let f = Fixture::new();
+    let mut profile = f.profile.clone();
+    profile.credential_file = f._dir.path().join("absent");
+    let mut spec = f.spec();
+    spec.sandbox
+        .as_mut()
+        .unwrap()
+        .inputs
+        .egress
+        .push("sensitive-destination.invalid:443".into());
+    let error = profile
+        .prepare(&mut spec)
+        .err()
+        .expect("grant must not widen profile")
+        .to_string();
+    assert!(error.contains("mission egress grants"), "{error}");
+    assert!(error.contains("fixed allowlist"), "{error}");
+    assert!(!error.contains("sensitive-destination"), "{error}");
+    assert!(
+        !error.contains("credential source"),
+        "boundary must fail before credential read: {error}"
+    );
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn docker_enabled() -> bool {
     if std::env::var("KRANZ_ACP_CONTAINER_TESTS").as_deref() == Ok("1") {

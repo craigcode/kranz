@@ -99,8 +99,17 @@ limited to 64 KiB. An unavailable operator eventually causes a failed run,
 not an automatic allow.
 
 A changed invocation, ended peer, cancellation or expired deadline cannot use
-a queued approval. A pause or policy-changing control cancels active ACP work
-before applying that control. Later inbox files stay unacknowledged until the
+a queued approval. An expired request fails its own ACP session; sibling
+candidates retain their live requests. The backend owns the session deadline,
+while the engine closes the expired request's response capability.
+
+While ACP workers are active, only one-call permission answers and messages
+with `interrupt: false` apply immediately. Pause, resume, interrupting messages,
+configuration changes, revision controls, command-grant decisions and structured
+question answers cancel and join the active batch before they are processed.
+This conservative boundary also covers controls that later prove stale or
+have no effect; it preserves inbox order while authority can change or a new
+controller turn can start. Later inbox files stay unacknowledged until the
 workers stop. On restart, the writer closes outstanding requests; replay and
 state reads never recreate an in-memory response handle. A lost or uncertain
 response is not retried automatically.

@@ -160,6 +160,24 @@ impl ContainerEgressBoundary {
             )));
         }
 
+        // Older internal-network resolvers could forward DNS through the host
+        // despite the missing guest route (CVE-2024-29018). This conservative
+        // support floor does not qualify every newer runtime or older backport.
+        let version = docker_checked(
+            runtime,
+            &[
+                "version".into(),
+                "--format".into(),
+                "{{.Server.Version}}".into(),
+            ],
+            "verify internal-network DNS prerequisite",
+        )?;
+        if !supported_dns_version(&String::from_utf8_lossy(&version.stdout)) {
+            return Err(EngineError::Backend(
+                "container egress requires a stable Docker daemon version >= 25.0.5 for internal-network DNS isolation; older, prerelease and unrecognized versions are unsupported".into(),
+            ));
+        }
+
         recover_stale_boundaries(runtime)?;
         let owner_pid = std::process::id().to_string();
         let owner_identity = owner_identity_hash(std::process::id() as i32).ok_or_else(|| {
@@ -490,6 +508,19 @@ impl ContainerEgressBoundary {
             &self.credential_dir,
         )
     }
+}
+
+fn supported_dns_version(value: &str) -> bool {
+    let fields: Vec<_> = value.trim().split('.').collect();
+    if fields.len() != 3
+        || fields
+            .iter()
+            .any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    let parsed: Option<Vec<u32>> = fields.into_iter().map(|s| s.parse().ok()).collect();
+    parsed.is_some_and(|v| (v[0], v[1], v[2]) >= (25, 0, 5))
 }
 
 impl Drop for ContainerEgressBoundary {
@@ -831,6 +862,26 @@ fn remove_recovered_credential_dir(raw: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_egress_dns_floor_excludes_unqualified_daemons() {
+        for version in ["25.0.5", "25.0.6\n", "26.0.0", "29.7.1"] {
+            assert!(supported_dns_version(version), "{version}");
+        }
+        for version in [
+            "",
+            "24.0.9",
+            "25.0.4",
+            "23.0.11",
+            "26.0.0-rc1",
+            "29.1.0+vendor",
+            "29.1",
+            "29.1.0.1",
+            "999999999999999999.0.1",
+        ] {
+            assert!(!supported_dns_version(version), "{version}");
+        }
+    }
     use crate::backend::{PromptMode, SessionSpec};
     use crate::sandbox::{ResolvedSandbox, SandboxInputs};
     use std::collections::HashMap;
@@ -1065,12 +1116,14 @@ mod tests {
             .unwrap();
         let allowed_port = allowed.local_addr().unwrap().port();
         let allowed_task = tokio::spawn(async move {
-            let (mut stream, _) = allowed.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut request = [0_u8; 4];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request, b"ping");
-            stream.write_all(b"pong").await.unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = allowed.accept().await.unwrap();
+                let mut request = [0_u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+            }
         });
 
         let root = tempfile::tempdir().unwrap();
@@ -1116,7 +1169,63 @@ mod tests {
             "{allowed_text}"
         );
         assert!(allowed_text.contains("pong"), "{allowed_text}");
+        // The relay listens on both interfaces. Default-bridge peers share
+        // this allowlist authority; they are trusted host peers, not isolated
+        // tenants. Keep this limitation explicit until a separately qualified
+        // relay profile isolates the listener.
+        let relay_ip = docker_checked(
+            ContainerRuntime::Docker,
+            &[
+                "inspect".into(),
+                "--format".into(),
+                "{{.NetworkSettings.Networks.bridge.IPAddress}}".into(),
+                relay.clone(),
+            ],
+            "inspect relay bridge interface",
+        )
+        .unwrap();
+        let relay_ip = String::from_utf8(relay_ip.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let bridge_probe = docker_checked(ContainerRuntime::Docker,
+            &["run".into(), "--rm".into(), "--network".into(), "bridge".into(),
+                crate::sandbox_container::DEFAULT_IMAGE.into(), "sh".into(), "-c".into(),
+                format!("printf 'CONNECT 127.0.0.1:{allowed_port} HTTP/1.1\\r\\nHost: 127.0.0.1:{allowed_port}\\r\\n\\r\\nping' | nc -w 5 {relay_ip} {RELAY_PORT}")],
+            "record default-bridge relay trust assumption").unwrap();
+        let bridge_text = String::from_utf8_lossy(&bridge_probe.stdout);
+        assert!(
+            bridge_text.contains("200 Connection Established") && bridge_text.contains("pong"),
+            "{bridge_text}"
+        );
+        println!("RELAY-TRUST: default bridge peers can use the relay allowlist; hostile co-tenancy is unsupported");
         allowed_task.await.unwrap();
+
+        let dns_control = docker_checked(
+            ContainerRuntime::Docker,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "bridge".into(),
+                RELAY_IMAGE.into(),
+                "python".into(),
+                "-c".into(),
+                "import socket; socket.getaddrinfo('example.com',443); print('DNS-POSITIVE')"
+                    .into(),
+            ],
+            "prove external DNS works on the ordinary bridge",
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&dns_control.stdout).contains("DNS-POSITIVE"));
+        let dns_denial = docker_checked(ContainerRuntime::Docker,
+            &["run".into(), "--rm".into(), "--network".into(), network.clone(), RELAY_IMAGE.into(),
+                "python".into(), "-c".into(), "import socket\ntry:\n socket.getaddrinfo('example.com',443)\nexcept socket.gaierror:\n print('DNS-DENIED')\nelse:\n raise SystemExit('external DNS unexpectedly resolved')".into()],
+            "prove internal-network resolver refuses external DNS").unwrap();
+        assert!(String::from_utf8_lossy(&dns_denial.stdout).contains("DNS-DENIED"));
+        println!(
+            "DNS-BOUNDARY: external lookup succeeds on bridge and fails on internal-only network"
+        );
 
         let denied_output = docker_checked(
             ContainerRuntime::Docker,
