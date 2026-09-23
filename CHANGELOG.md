@@ -5,6 +5,8 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.4.1 - 2026-09-23
+
 - Isolated expired ACP permission requests from sibling candidates, clarified
   which operator controls stop the active batch, and made fixed-profile egress
   refusals identify the grant mismatch without printing destinations.
@@ -13,6 +15,9 @@ Notable user-visible changes are documented here. This project follows
   readability and default-bridge relay trust assumptions. Optional container
   tests distinguish an unavailable daemon from a missing CLI; explicitly
   requested proofs still fail closed.
+
+- Updated dashboard and experimental Even G2 dependencies, rebuilt the embedded
+  dashboard, and refreshed CodeQL action pins.
 
 ## 0.4.0 - 2026-09-22
 
