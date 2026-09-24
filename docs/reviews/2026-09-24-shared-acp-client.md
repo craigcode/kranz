@@ -81,3 +81,20 @@ locally. Existing Linux Docker and Windows/macOS CI lanes remain required. No
 live model/provider calls, credentials or Keychain access were used. The spike
 does not qualify Sgian lifecycle handling, a real adapter, terminal mediation,
 PTY support or visibility of commands an adapter executes internally.
+
+## Desktop CI correction
+
+The first PR head passed the Linux/macOS Rust suites and Linux container proofs,
+but both desktop compile jobs rejected the standalone Tauri lockfile under
+`--locked`: it lacked the extracted crate. The correction adds only `kranz-acp`
+and the engine dependency edge. A parsed before/after comparison confirms that
+all existing registry package versions, checksums and dependency edges remain
+unchanged. The root workspace and production Rust source are unchanged.
+
+The corrected macOS desktop `cargo check --locked` passed. Dashboard typecheck,
+259 tests, build, embedded sync/check and lint passed; the embedded bundle has
+no diff. Desktop `cargo audit --deny unsound` passed when run from its CI working
+directory using the existing advisory policy. An earlier root-directory audit
+invocation did not load that policy and its failed log is retained; no audit
+exception was added or weakened. The corrected head still needs its CI results
+and PR review before merge.
