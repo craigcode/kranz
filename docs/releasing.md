@@ -56,7 +56,7 @@ branches, tags, crates, formulas, or releases.
 Versions are workspace-inherited. Update:
 
 - `[workspace.package] version` in the root `Cargo.toml`;
-- `kranz-engine`, `kranz-server`, and `kranz-slack` version requirements under
+- `kranz-acp`, `kranz-engine`, `kranz-server`, and `kranz-slack` version requirements under
   root `[workspace.dependencies]`;
 - `apps/dashboard/src-tauri/tauri.conf.json`;
 - `apps/dashboard/src-tauri/Cargo.toml`;
@@ -132,6 +132,7 @@ options. See the [Cargo publish reference](https://doc.rust-lang.org/cargo/comma
 Before publication:
 
 ```sh
+cargo package --list -p kranz-acp
 cargo package --list -p kranz-engine
 cargo package --list -p kranz-server
 cargo package --list -p kranz-slack
@@ -211,6 +212,9 @@ Publishing is irreversible. Run each dry-run immediately before its publish,
 then wait until crates.io resolves that exact version before continuing:
 
 ```sh
+cargo publish --dry-run -p kranz-acp
+cargo publish -p kranz-acp
+
 cargo publish --dry-run -p kranz-engine
 cargo publish -p kranz-engine
 
@@ -224,6 +228,7 @@ cargo publish --dry-run -p kranz
 cargo publish -p kranz
 ```
 
+`kranz-acp` must resolve before publishing `kranz-engine`.
 `kranz-server` and `kranz-slack` are independent once `kranz-engine` is live;
 the CLI must be last because it depends on all three. Confirm ownership,
 package contents, repository URL, license, README rendering, and installability

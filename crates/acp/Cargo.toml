@@ -1,0 +1,27 @@
+[package]
+name = "kranz-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded ACP v1 protocol client without mission or process authority."
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+conformance = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Do not inherit the engine's full Tokio feature set. Consumers own the runtime.
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[[example]]
+name = "threaded_client"
+test = true
+required-features = ["conformance"]

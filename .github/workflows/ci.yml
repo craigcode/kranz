@@ -58,6 +58,8 @@ jobs:
         run: scripts/audit-public-history.sh
       - name: Verify package license notices
         run: scripts/check-package-licenses.sh
+      - name: Verify the shared ACP crate without engine feature unification
+        run: python3 scripts/check-acp-client.py
       - name: Build strict public API documentation
         env:
           RUSTDOCFLAGS: -D warnings

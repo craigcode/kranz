@@ -2,8 +2,10 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-23
+last_verified: 2026-09-24
 verified_against:
+  - crates/acp/src/lib.rs
+  - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/acp_worker.rs
@@ -21,6 +23,8 @@ verified_against:
 ---
 
 # Glossary
+
+- **Shared ACP client** — `kranz-acp` owns bounded framing and session protocol; the engine retains permission authority, event/cost normalization and process containment. Client terminal/filesystem services and resume remain disabled. See [the boundary](../scoping/shared-acp-client.md).
 
 Project vocabulary. Terms link to the note that explains them in depth.
 

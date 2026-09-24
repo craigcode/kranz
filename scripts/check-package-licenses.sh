@@ -5,6 +5,7 @@ set -euo pipefail
 # MIT notice byte-identical to the repository license and prove it is actually
 # present in the archive Cargo will upload.
 packages=(
+  'kranz-acp:crates/acp'
   'kranz-engine:crates/engine'
   'kranz-server:crates/server'
   'kranz-slack:crates/slack'
@@ -31,4 +32,4 @@ for entry in "${packages[@]}"; do
   fi
 done
 
-echo 'package license check: all four archives contain the canonical MIT notice'
+echo 'package license check: all workspace archives contain the canonical MIT notice'

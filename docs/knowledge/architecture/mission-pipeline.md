@@ -2,8 +2,10 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-23
+last_verified: 2026-09-24
 verified_against:
+  - crates/acp/src/lib.rs
+  - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
@@ -325,6 +327,12 @@ resets start a new segment; missing or zeroed crash results do not erase prior
 spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
 
 ## Qualified ACP workers
+
+Rechecked 2026-09-24: `kranz-acp` now owns protocol framing and session state.
+`backend_acp` still owns credential filtering, event mapping, live consent,
+deadlines and supervised cleanup; profile admission is unchanged. The threaded
+consumer is a synthetic runtime proof, not Sgian integration. See
+[shared ACP ownership](../../scoping/shared-acp-client.md).
 
 An operator-only `worker.acpProfile` admits the reviewed Claude/Codex container
 profiles to ordinary worktree missions. It fixes guest argv, image, explicit

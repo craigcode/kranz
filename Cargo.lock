@@ -1458,6 +1458,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kranz-acp"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kranz-engine"
 version = "0.4.1"
 dependencies = [
@@ -1468,6 +1477,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "globset",
+ "kranz-acp",
  "libc",
  "proptest",
  "regex",
