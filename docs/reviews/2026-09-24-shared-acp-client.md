@@ -70,9 +70,9 @@ strict docs, package licenses, dependency notices and cargo-deny passed.
 All five tickets were read with the real CLI parser: all 31 scoping/acceptance
 bullets survived, one-shot schedules parsed and the linear dependency chain
 matched the design. Domain lint and knowledge freshness passed. A post-commit
-freshness check identified two dependent standing notes (skill capture and
-lessons); both were re-reviewed against the changed roadmap/invariants and
-updated before the final check. These tickets
+freshness checks identified dependent standing notes (skill capture, lessons
+and the vault index); each was re-reviewed against the changed roadmap,
+invariants and citations before the final check. These tickets
 do not create a recorded Complete mission or admit dependent work automatically.
 
 Local execution is on macOS. Docker is stopped: daemon-dependent tests record
