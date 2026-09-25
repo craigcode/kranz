@@ -41,7 +41,8 @@
 //! an adapter can perform actions without asking. `allowed_tools` is not an
 //! enforced allowlist here, and read-only roles may still execute commands.
 //!
-//! Client fs/terminal services and same-feature resume remain unsupported.
+//! Client fs services and same-feature resume remain unsupported. Terminals
+//! remain disabled in released profiles; a contained fixture tests the seam.
 //! Unexpected client requests receive -32601. Released adapters may support
 //! load/resume methods; that does not imply Kranz negotiates or uses them.
 //! Configuration restricts ACP to opt-in worker use. Enforced missions require
@@ -80,6 +81,18 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod terminals;
+
+#[derive(Debug)]
+struct TerminalCompletion {
+    id: Value,
+    method: String,
+    result: std::result::Result<Value, kranz_acp::terminal::Error>,
+    receipt: Value,
+    permission_id: Option<String>,
+}
 
 /// Max characters kept in tool-use / tool-result summaries.
 const SUMMARY_MAX_CHARS: usize = 200;
@@ -130,6 +143,9 @@ enum Input {
     Peer(Frame),
     PermissionAnswer(crate::live_permission::Answer),
     PermissionExpired,
+    Terminal(TerminalCompletion),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    TerminalReceipt(Value),
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +425,8 @@ pub struct AcpBackend {
     program: PathBuf,
     args: Vec<String>,
     profile: Option<crate::acp_worker::AcpWorkerProfile>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    terminal_fixture_run: Option<String>,
 }
 
 impl AcpBackend {
@@ -419,6 +437,8 @@ impl AcpBackend {
             program: program.into(),
             args,
             profile: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            terminal_fixture_run: None,
         }
     }
 
@@ -436,6 +456,8 @@ impl AcpBackend {
                 program: definition.program.into(),
                 args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
                 profile: Some(profile.clone()),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                terminal_fixture_run: None,
             })
         } else {
             let command = cfg.acp_command.as_ref().ok_or_else(|| {
@@ -443,6 +465,12 @@ impl AcpBackend {
             })?;
             Ok(Self::new(command, cfg.acp_args.clone()))
         }
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn with_terminal_fixture(mut self, run_id: &str) -> Self {
+        self.terminal_fixture_run = Some(run_id.to_owned());
+        self
     }
 
     /// The program this backend spawns.
@@ -498,6 +526,12 @@ impl AgentBackend for AcpBackend {
                     .to_string(),
             ));
         }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.terminal_fixture_run.is_some() && (!container_requested || self.profile.is_some()) {
+            return Err(EngineError::Backend(
+                "terminal fixture requires its own contained profile".into(),
+            ));
+        }
         let profile_home = self
             .profile
             .as_ref()
@@ -516,6 +550,12 @@ impl AgentBackend for AcpBackend {
         };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let mut command = self.native_command(&spec);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let terminals = terminals::Broker::prepare(
+            self.terminal_fixture_run.clone(),
+            container.as_ref(),
+            &spec,
+        )?;
         command
             .current_dir(&spec.cwd)
             // ACP is bidirectional: stdin carries the client's requests.
@@ -585,7 +625,18 @@ impl AgentBackend for AcpBackend {
             crate::live_permission::PermissionResponder::channel();
         let mut session = AcpSession {
             session_id: spec.session_id.clone(),
-            protocol: Client::new(),
+            protocol: {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if terminals.admitted() {
+                    Client::with_terminal_support()
+                } else {
+                    Client::new()
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                Client::new()
+            },
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            terminals,
             model,
             spec,
             child,
@@ -668,9 +719,13 @@ impl AcpBackend {
 struct PendingPermission {
     proposal: crate::live_permission::Proposal,
     expires_at: tokio::time::Instant,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    terminal: Option<kranz_acp::terminal::Create>,
 }
 
 pub struct AcpSession {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    terminals: terminals::Broker,
     session_id: String,
     protocol: Client,
     model: String,
@@ -814,6 +869,8 @@ impl AcpSession {
             .accept_session(request.id, &new_result)
             .map_err(|e| EngineError::Backend(e.to_string()))?
             .to_owned();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.terminals.bind(&self.session_id, &acp_session_id);
         self.handshake_complete = true;
         let reported_model = peer_reported_model(&new_result).map(str::to_owned);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -934,6 +991,14 @@ impl AcpSession {
             }
             let can_answer = !self.lines.has_partial_line();
             let read = {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                let terminal = self.terminals.next();
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let terminal = async {
+                    std::future::pending::<Result<TerminalCompletion>>()
+                        .await
+                        .map(Input::Terminal)
+                };
                 let line = self.lines.next_line();
                 tokio::pin!(line);
                 let read = if let Some(deadline) = self.drain_deadline {
@@ -947,6 +1012,7 @@ impl AcpSession {
                 } else {
                     tokio::select! {
                         biased;
+                        completion = terminal => return completion.map(Some),
                         // Drain already-buffered action changes before applying
                         // a queued answer to the older invocation description.
                         read = &mut line => read,
@@ -1031,6 +1097,12 @@ impl AcpSession {
                     "live permission deadline expired".into(),
                 ));
             }
+            Input::Terminal(completion) => return self.complete_terminal(completion).await,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Input::TerminalReceipt(raw) => {
+                self.queue.push_back(AgentEvent::Other { raw });
+                return Ok(());
+            }
             Input::Peer(frame) => frame,
         };
         match frame {
@@ -1051,6 +1123,10 @@ impl AcpSession {
                 params,
                 raw,
             } => {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if method.starts_with("terminal/") && self.terminals.provider.is_some() {
+                    return self.handle_terminal(id, &method, params).await;
+                }
                 if method == method::REQUEST_PERMISSION {
                     self.handle_permission_request(id, &params, raw).await?;
                 } else {
@@ -1349,7 +1425,10 @@ impl AcpSession {
             }
         };
         let peer_id = serde_json::to_string(&id)?;
-        if self.pending_permissions.len() >= crate::live_permission::MAX_PENDING
+        let pending_count = self.pending_permissions.len();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let pending_count = pending_count + self.terminals.pending();
+        if pending_count >= crate::live_permission::MAX_PENDING
             || self.seen_permission_ids.len() >= 1024
             || !self.seen_permission_ids.insert(peer_id)
             || self
@@ -1400,6 +1479,8 @@ impl AcpSession {
             proposal.id.clone(),
             PendingPermission {
                 proposal: proposal.clone(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                terminal: None,
                 expires_at: tokio::time::Instant::now()
                     + std::time::Duration::from_secs(
                         crate::live_permission::REQUEST_TTL_SECS as u64,
@@ -1437,11 +1518,17 @@ impl AcpSession {
                 "stale or prohibited permission response".into(),
             ));
         }
-        let proposal = self
+        let pending = self
             .pending_permissions
             .remove(&answer.proposal.id)
-            .expect("checked above")
-            .proposal;
+            .expect("checked above");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(action) = pending.terminal {
+            return self
+                .answer_terminal(pending.proposal, action, answer.allow)
+                .await;
+        }
+        let proposal = pending.proposal;
         let decision = if answer.allow {
             PermissionDecision::Allow
         } else {
@@ -1462,6 +1549,34 @@ impl AcpSession {
             request_id: proposal.id.clone(),
             delivery: delivery.clone(),
             raw: json!({"permissionResponse":proposal.id,"delivery":delivery}),
+        });
+        sent
+    }
+
+    async fn complete_terminal(&mut self, completion: TerminalCompletion) -> Result<()> {
+        let response = match &completion.result {
+            Ok(result) => json!({"jsonrpc":"2.0", "id":completion.id, "result":result}),
+            Err(error) => json!({"jsonrpc":"2.0", "id":completion.id,
+                "error":{"code":-32000, "message":error.to_string()}}),
+        };
+        let sent = self.write_message(response).await;
+        if let Some(id) = completion.permission_id {
+            let delivery = if sent.is_ok() {
+                crate::live_permission::Delivery::Sent
+            } else {
+                crate::live_permission::Delivery::Uncertain
+            };
+            self.queue.push_back(AgentEvent::PermissionResponded {
+                request_id: id.clone(),
+                delivery: delivery.clone(),
+                raw: json!({"permissionResponse":id,"delivery":delivery}),
+            });
+        }
+        self.queue.push_back(AgentEvent::Other {
+            raw: json!({"terminalReceipt": {
+                "method":completion.method, "requestId":completion.id,
+                "succeeded":completion.result.is_ok(), "evidence":completion.receipt,
+            }}),
         });
         sent
     }
@@ -1551,6 +1666,8 @@ impl AcpSession {
     /// Kill only while the leader is still owned. Never signal a cached PID
     /// after reaping; the same-group cleanup precedes Child::wait.
     async fn kill_child(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.terminals.stop();
         self.stdin.take();
         if self.child_status.is_none() {
             kill_owned_peer(
@@ -1568,6 +1685,23 @@ impl AcpSession {
                 self.cleanup_failure
                     .get_or_insert("container removal failed");
                 tracing::error!(%error, "ACP cleanup requires recovery");
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(provider) = &self.terminals.provider {
+            if !self.terminals.cleanup_recorded {
+                self.terminals.cleanup_recorded = true;
+                if let Ok(receipts) = provider.drain_receipts() {
+                    for raw in receipts {
+                        self.queue.push_back(AgentEvent::Other { raw });
+                    }
+                }
+                self.queue.push_back(AgentEvent::Other {
+                    raw: json!({"terminalNamespaceCleanup": {
+                        "scope":provider.scope, "confirmed":self.cleanup_failure.is_none(),
+                        "cause":self.cleanup_failure,
+                    }}),
+                });
             }
         }
         if let Some(profile) = self.profile_home.as_mut() {
@@ -1602,6 +1736,12 @@ impl AcpSession {
     /// our owned process group. Contained peers terminate under the trusted
     /// supervisor; the Docker client's exit status must arrive before success.
     async fn finish_session(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Err(error) = self.close_terminals().await {
+            self.kill_child().await;
+            self.exit = Some(SessionExit::Failed(error.to_string()));
+            return;
+        }
         self.stdin.take();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let contained = self.container.is_some();
@@ -1692,18 +1832,24 @@ impl AgentSession for AcpSession {
             }
             if self.saw_result && matches!(self.spec.prompt, PromptMode::SingleShot(_)) {
                 self.finish_session().await;
-                return Ok(None);
+                continue;
             }
             let frame = match self.read_frame().await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     self.finish_session().await;
-                    return Ok(None);
+                    continue;
                 }
                 Err(e) => {
                     self.kill_child().await;
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    if self.terminals.provider.is_some() {
+                        self.queue.push_back(AgentEvent::Other {
+                            raw: json!({"terminalSessionFailure":e.to_string()}),
+                        });
+                    }
                     self.exit = Some(SessionExit::Failed(e.to_string()));
-                    return Ok(None);
+                    continue;
                 }
             };
             if let Err(e) = self.handle_frame(frame).await {

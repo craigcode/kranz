@@ -24,8 +24,8 @@ execution or skill-capture mechanism.
 ## What this records
 
 Rechecked 2026-09-25 against the [shared ACP scope](../../scoping/shared-acp-client.md).
-Extracting protocol transport preserves the shipped dispatch seam. The later
-terminal work must add observable contained execution beneath that seam; desk
+Extracting protocol transport preserves the shipped dispatch seam. The contained
+terminal fixture adds execution receipts beneath that seam; desk
 UI remains in Sgian, and no code-generation pool or prompt optimization is added.
 
 A strategic decision about what kranz is, made 2026-07-29. Work that

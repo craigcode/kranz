@@ -485,6 +485,25 @@ jobs:
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
             exit 1
           fi
+      - name: Prove contained ACP terminal authority and cleanup
+        env:
+          KRANZ_ACP_CONTAINER_TESTS: '1'
+        run: |
+          log="$RUNNER_TEMP/kranz-acp-terminal-proof.log"
+          set +e
+          cargo test --workspace --locked acp_terminal_v1 -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          for proof in consent_concurrency_bounds_and_descendants paths_and_environment_fail_before_consent peer_provider_death_and_drop_stop_namespace pending_consent_and_late_create_cannot_complete engine_death_expires_terminal_namespace default_capability_refuses_execution; do
+            grep -q "test acp_container::tests::terminals::acp_terminal_v1_${proof} ... ok" "$log"
+          done
+          if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
+            exit 1
+          fi
       - name: Record cache readability and deny guest mutation
         env:
           KRANZ_ACP_CONTAINER_TESTS: '1'

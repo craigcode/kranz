@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented the shared terminal contract and contained synthetic provider; six adversarial container proofs and exact consent/scoped authority tests. Production admission remains closed. See docs/reviews/2026-09-25-contained-acp-terminals.md; this is ticket reconciliation, not a recorded Complete mission.
+state: done
 title: ACP terminal provider contract and contained fake
 priority: 2
 schedule: once
@@ -14,9 +15,11 @@ Define and prove the five ACP terminal operations in a contained fake provider b
 
 The operator approved this staged stream on 2026-09-24 after v0.4.1. See
 [shared ACP scope and decisions D1–D4](../../docs/scoping/shared-acp-client.md).
-The next implementation is specified in the
-[terminal-provider contract](../../docs/scoping/acp-terminal-provider.md); its
-authority, concurrency and contained-fixture proofs remain outstanding.
+The [terminal-provider contract](../../docs/scoping/acp-terminal-provider.md)
+is implemented by a private contained fixture with exact consent, asynchronous
+routing, scoped handles and six live-container proofs. See the
+[implementation review](../../docs/reviews/2026-09-25-contained-acp-terminals.md).
+Production admission, Sgian and real-adapter qualification remain later work.
 The review-effort pilot is independent. Follow the dependency-admission rules
 linked by the scope; ticket completion alone is not a recorded Complete mission.
 
