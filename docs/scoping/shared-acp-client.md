@@ -6,6 +6,11 @@ capabilities. Terminal mediation and Sgian integration remain subsequent slices
 with their own containment and authority proofs. No provider trial is authorized
 by this scope. The human review-effort pilot has separate completion criteria.
 
+PR #82 merged the first two slices at `7943324a` after independent review and
+passing required checks. The next slice is specified in the
+[terminal-provider implementation contract](acp-terminal-provider.md); terminal
+support remains disabled while its implementation and contained proofs are open.
+
 The first implementation supplies `kranz-acp`, the engine adapter, shared
 synthetic fixtures and a provider-free threaded consumer example. This is a
 source dependency until a future release, not a newly published registry crate.

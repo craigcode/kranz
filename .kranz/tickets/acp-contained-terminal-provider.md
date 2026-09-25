@@ -14,6 +14,9 @@ Define and prove the five ACP terminal operations in a contained fake provider b
 
 The operator approved this staged stream on 2026-09-24 after v0.4.1. See
 [shared ACP scope and decisions D1–D4](../../docs/scoping/shared-acp-client.md).
+The next implementation is specified in the
+[terminal-provider contract](../../docs/scoping/acp-terminal-provider.md); its
+authority, concurrency and contained-fixture proofs remain outstanding.
 The review-effort pilot is independent. Follow the dependency-admission rules
 linked by the scope; ticket completion alone is not a recorded Complete mission.
 

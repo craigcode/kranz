@@ -287,8 +287,8 @@ extract without changing worker capabilities. The review-effort pilot continues
 independently. Terminal execution stays inside the admitted containment boundary;
 Sgian owns pane presentation, while Kranz owns mission authority and evidence.
 
-- [ ] [Boundary and consumer spike](../.kranz/tickets/shared-acp-boundary-spike.md).
-- [ ] [Client extraction](../.kranz/tickets/shared-acp-client-extraction.md).
+- [x] [Boundary and consumer spike](../.kranz/tickets/shared-acp-boundary-spike.md) — PR #82.
+- [x] [Client extraction](../.kranz/tickets/shared-acp-client-extraction.md) — PR #82.
 - [ ] [Contained terminal-provider contract](../.kranz/tickets/acp-contained-terminal-provider.md).
 - [ ] [Sgian integration qualification](../.kranz/tickets/acp-sgian-terminal-qualification.md).
 - [ ] [Pinned adapter qualification](../.kranz/tickets/acp-terminal-adapter-qualification.md).

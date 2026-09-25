@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-24
+last_verified: 2026-09-25
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -328,7 +328,7 @@ spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
 
 ## Qualified ACP workers
 
-Rechecked 2026-09-24: `kranz-acp` now owns protocol framing and session state.
+Rechecked 2026-09-25: `kranz-acp` now owns protocol framing and session state.
 `backend_acp` still owns credential filtering, event mapping, live consent,
 deadlines and supervised cleanup; profile admission is unchanged. The threaded
 consumer is a synthetic runtime proof, not Sgian integration. See

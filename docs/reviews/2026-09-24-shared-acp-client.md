@@ -96,5 +96,26 @@ The corrected macOS desktop `cargo check --locked` passed. Dashboard typecheck,
 no diff. Desktop `cargo audit --deny unsound` passed when run from its CI working
 directory using the existing advisory policy. An earlier root-directory audit
 invocation did not load that policy and its failed log is retained; no audit
-exception was added or weakened. The corrected head still needs its CI results
+exception was added or weakened. The corrected head then needed its CI results
 and PR review before merge.
+
+## Independent review and merge
+
+Three fresh reviewers examined exact head `d4106c5` against `4de9c56`: protocol
+and bounded I/O, engine permission/lifetime behavior, and packaging/dependency
+boundaries and scope. None found an actionable issue. The isolated packaged
+crate proof was repeated successfully. One reviewer's adapter test build ran
+out of local disk before any tests executed; after clearing an obsolete release
+build cache, the focused workspace adapter target passed all 27 tests.
+
+The corrected Linux CI job failed three required Docker availability probes.
+The same Rust source had passed the preceding Linux jobs. The failed job was
+rerun without weakening capability requirements and passed, including the full
+workspace suite. The original failure and the successful rerun are retained in
+the operator's evidence directory. All required checks were green before merge.
+
+[PR #82](https://github.com/craigcode/kranz/pull/82) merged at
+`7943324aa7accbf81661ae278cf7f42034f84be7` on 2026-09-25 UTC. The extraction is
+on main; the latest published release remains v0.4.1. The terminal-provider
+implementation, Sgian integration and adapter qualification remain separate,
+unfinished tickets.
