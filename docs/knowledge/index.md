@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-09-22
+last_verified: 2026-09-24
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -13,8 +13,9 @@ verified_against:
 
 # Kranz knowledge vault
 
-Rechecked 2026-09-22 against the skill-capture decision after pilot preparation;
-manual evidence measurement adds no knowledge-capture or skill-generation path.
+Rechecked 2026-09-24 against the skill-capture decision after shared ACP
+extraction. Protocol sharing extends dispatch; the knowledge, lesson and skill
+boundaries described by this map remain unchanged.
 
 The canonical, reviewed knowledge store for kranz: what the system is, how it is
 run, how it is gated, and the invariants that must never break. Both humans and

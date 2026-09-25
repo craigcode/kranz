@@ -2,8 +2,10 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-23
+last_verified: 2026-09-24
 verified_against:
+  - crates/acp/src/lib.rs
+  - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
@@ -118,6 +120,12 @@ governed missions. See
 [ACP containment](../../acp-containment.md).
 
 ## The full-workspace gate suite
+
+The shared ACP extraction adds an isolated packaged-crate check,
+`scripts/check-acp-client.py`, so engine feature unification cannot hide runtime
+or dependency coupling. Shared synthetic fixtures exercise both raw updates and
+Kranz event normalization; they do not replace the existing contained worker
+qualification or live-provider evidence.
 
 The contained ACP completion regressions delay an earned nonzero Docker exit
 past the native grace, require a missing status to fail at the contained

@@ -2,8 +2,10 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-23
+last_verified: 2026-09-24
 verified_against:
+  - crates/acp/src/lib.rs
+  - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
@@ -32,6 +34,12 @@ verified_against:
 ---
 
 ## What this is
+
+Rechecked 2026-09-24 for the shared ACP extraction: framing, bounded readers
+and unique-key decoding move to `kranz-acp`. Engine process supervision,
+credential filtering and durable permission authority retain their owners.
+Broker answers are a local input type and cannot be created by a wire frame.
+Filesystem, terminal and resume capabilities remain disabled.
 
 Rechecked 2026-09-22 for the Sgian release corrections: coordination helpers use
 bounded process-tree supervision and a cleared discovery environment. Worker

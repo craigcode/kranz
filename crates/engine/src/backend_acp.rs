@@ -72,6 +72,7 @@ use crate::backend_claude::win_job;
 use crate::error::{EngineError, Result};
 use crate::stream_bounds::{drain_to_tail, BoundedLines, STDERR_TAIL_CAP, STDOUT_LINE_CAP};
 use crate::types::TokenUsage;
+use kranz_acp::{classify_line, method, Client, Frame, RpcOutcome, UpdateKind};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -85,10 +86,6 @@ const SUMMARY_MAX_CHARS: usize = 200;
 /// Max characters of captured stderr included in failure messages.
 const STDERR_TAIL_CHARS: usize = 500;
 
-/// The only ACP protocol version this backend speaks (stable schema v1; see
-/// module docs). A peer negotiating anything else is refused at `initialize`.
-const ACP_PROTOCOL_VERSION: u64 = 1;
-
 /// Deadline for one handshake request (`initialize`, `session/new`). Both
 /// may involve adapter startup and authentication. The limit keeps
 /// `start()` from parking the run loop forever. The prompt turn itself is
@@ -100,16 +97,6 @@ const COMPLETION_GRACE: std::time::Duration = std::time::Duration::from_millis(2
 const CONTAINER_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const CANCEL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// JSON-RPC method names, stable schema v1 (`meta.json`).
-mod method {
-    pub(crate) const INITIALIZE: &str = "initialize";
-    pub(crate) const SESSION_NEW: &str = "session/new";
-    pub(crate) const SESSION_PROMPT: &str = "session/prompt";
-    pub(crate) const SESSION_CANCEL: &str = "session/cancel";
-    pub(crate) const SESSION_UPDATE: &str = "session/update";
-    pub(crate) const REQUEST_PERMISSION: &str = "session/request_permission";
-}
 
 /// Claude-style tool name → ACP `kind`s it matches, for interpreting
 /// `SessionSpec::disallowed_tools` patterns against ACP tool calls. ACP
@@ -137,106 +124,12 @@ const MUTATING_KINDS: &[&str] = &["edit", "delete", "move"];
 // JSON-RPC framing
 // ---------------------------------------------------------------------------
 
-/// One stdout line classified by JSON-RPC shape. The wire is symmetric
-/// (both sides issue requests), so a line is one of: a response to a client
-/// request, a peer request we must answer, or a notification.
+/// Local broker input cannot be constructed from peer JSON.
 #[derive(Debug)]
-enum Frame {
-    /// In-process broker messages; never constructible from peer JSON.
+enum Input {
+    Peer(Frame),
     PermissionAnswer(crate::live_permission::Answer),
     PermissionExpired,
-    /// `result`/`error` for a client-issued request id.
-    Response {
-        id: u64,
-        outcome: RpcOutcome,
-    },
-    /// Peer→client request (`session/request_permission`, or an unsupported
-    /// client method). The `id` is echoed back verbatim — it may be a string
-    /// or a number per JSON-RPC, so it is kept as a raw [`Value`].
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
-        raw: Value,
-    },
-    /// Peer→client notification (`session/update`, or anything else).
-    Notification {
-        method: String,
-        params: Value,
-        raw: Value,
-    },
-    /// Malformed protocol input: retained diagnostic, then session failure.
-    Unrecognized(Value),
-}
-
-/// The payload of a JSON-RPC response: peer ids are always numbers in our
-/// exchanges with the peer's client side, but the error path keeps the raw
-/// object for the transcript.
-#[derive(Debug)]
-enum RpcOutcome {
-    Result(Value),
-    Error(Value),
-}
-
-/// Classify one stdout line. Unparseable lines become
-/// [`Frame::Unrecognized`] with `raw = {"unparsed": <line>}` so nothing is
-/// ever dropped from transcripts (mirrors `backend_codex::parse_codex_line`).
-fn classify_line(line: &str) -> Frame {
-    let value = match crate::strict_json::parse(line.as_bytes()) {
-        Ok(value) => value,
-        Err(_) => return Frame::Unrecognized(json!({ "unparsed": line })),
-    };
-    classify_value(value)
-}
-
-fn classify_value(value: Value) -> Frame {
-    let obj = match value.as_object() {
-        Some(obj) => obj,
-        None => return Frame::Unrecognized(value),
-    };
-    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Frame::Unrecognized(value);
-    }
-    let has_id = obj.contains_key("id");
-    if obj.contains_key("method") && (obj.contains_key("result") || obj.contains_key("error")) {
-        return Frame::Unrecognized(value);
-    }
-    if has_id && !(obj["id"].is_string() || obj["id"].is_i64() || obj["id"].is_u64()) {
-        return Frame::Unrecognized(value);
-    }
-    let method = obj.get("method").and_then(Value::as_str);
-    match (method, has_id) {
-        // Request: method + id.
-        (Some(method), true) => Frame::Request {
-            id: obj.get("id").cloned().unwrap_or(Value::Null),
-            method: method.to_string(),
-            params: obj.get("params").cloned().unwrap_or(Value::Null),
-            raw: value,
-        },
-        // Notification: method, no id.
-        (Some(method), false) => Frame::Notification {
-            method: method.to_string(),
-            params: obj.get("params").cloned().unwrap_or(Value::Null),
-            raw: value,
-        },
-        // Response: no method, carries result or error. Our request ids are
-        // numbers; anything else is not a response to us.
-        (None, true) => {
-            let id = obj.get("id").and_then(Value::as_u64);
-            match (id, obj.get("result"), obj.get("error")) {
-                (Some(id), Some(result), None) => Frame::Response {
-                    id,
-                    outcome: RpcOutcome::Result(result.clone()),
-                },
-                (Some(id), None, Some(error)) => Frame::Response {
-                    id,
-                    outcome: RpcOutcome::Error(error.clone()),
-                },
-                _ => Frame::Unrecognized(value),
-            }
-        }
-        (None, false) => Frame::Unrecognized(value),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +585,7 @@ impl AgentBackend for AcpBackend {
             crate::live_permission::PermissionResponder::channel();
         let mut session = AcpSession {
             session_id: spec.session_id.clone(),
-            acp_session_id: None,
+            protocol: Client::new(),
             model,
             spec,
             child,
@@ -709,8 +602,6 @@ impl AgentBackend for AcpBackend {
             stderr_buf,
             stderr_task: Some(stderr_task),
             queue: VecDeque::new(),
-            next_request_id: 1,
-            prompt_request_id: None,
             tool_calls: HashMap::new(),
             permission_responder,
             permission_answers,
@@ -781,8 +672,7 @@ struct PendingPermission {
 
 pub struct AcpSession {
     session_id: String,
-    /// The peer-issued session id (`session/new` response).
-    acp_session_id: Option<String>,
+    protocol: Client,
     model: String,
     /// Kept for permission decisions (`disallowed_tools`, `writable`).
     spec: SessionSpec,
@@ -801,10 +691,6 @@ pub struct AcpSession {
     stderr_task: Option<JoinHandle<()>>,
     /// Converted events not yet surfaced; popped one per `next_event`.
     queue: VecDeque<AgentEvent>,
-    next_request_id: u64,
-    /// The in-flight `session/prompt` request id; its response synthesizes
-    /// the terminal `Result`. `None` outside a prompt turn.
-    prompt_request_id: Option<u64>,
     /// Tracked tool calls by `toolCallId` (kind/title/subject), so a
     /// `tool_call_update` or permission request resolves to what is known
     /// about the call.
@@ -874,14 +760,8 @@ impl AcpSession {
     /// transcripts diffable.
     async fn write_message(&mut self, message: Value) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let mut line = serde_json::to_string(&message)
-            .map_err(|e| EngineError::Backend(format!("failed to encode acp message: {e}")))?;
-        line.push('\n');
-        if line.len() > STDOUT_LINE_CAP {
-            return Err(EngineError::Backend(
-                "acp request exceeds the frame byte limit".into(),
-            ));
-        }
+        let line =
+            kranz_acp::encode_message(&message).map_err(|e| EngineError::Backend(e.to_string()))?;
         let stdin = self
             .stdin
             .as_mut()
@@ -896,22 +776,6 @@ impl AcpSession {
         Ok(())
     }
 
-    /// Send a client request and return its id (the caller either awaits the
-    /// response via [`AcpSession::pump_until_response`] or, for
-    /// `session/prompt`, leaves it to the `next_event` loop).
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        self.write_message(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await?;
-        Ok(id)
-    }
-
     /// `initialize` + `session/new`, then the first `session/prompt` (its
     /// response streams in through `next_event` like any later turn).
     async fn handshake(&mut self) -> Result<()> {
@@ -921,57 +785,35 @@ impl AcpSession {
                 .write_launch(self.stdin.as_mut().expect("startup stdin"))
                 .await?;
         }
-        let init_id = self
-            .send_request(
-                method::INITIALIZE,
-                json!({
-                    "protocolVersion": ACP_PROTOCOL_VERSION,
-                    "clientCapabilities": {
-                        // fs/terminal unsupported: a conformant peer never
-                        // calls fs/* or terminal/*; one that does is answered
-                        // with -32601 rather than silently served.
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false,
-                    },
-                    "clientInfo": {
-                        "name": "kranz",
-                        "title": "kranz mission engine",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                }),
-            )
+        let request = self
+            .protocol
+            .initialize(json!({
+                "name": "kranz",
+                "title": "kranz mission engine",
+                "version": env!("CARGO_PKG_VERSION"),
+            }))
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.write_message(request.message).await?;
+        let init_result = self
+            .pump_until_response(request.id, HANDSHAKE_TIMEOUT)
             .await?;
-        let init_result = self.pump_until_response(init_id, HANDSHAKE_TIMEOUT).await?;
-        let peer_version = init_result
-            .get("protocolVersion")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if peer_version != ACP_PROTOCOL_VERSION {
-            return Err(EngineError::Backend(format!(
-                "acp agent negotiated protocol version {peer_version}, but this backend speaks \
-                 only stable version {ACP_PROTOCOL_VERSION} (schema v1)"
-            )));
-        }
+        self.protocol
+            .accept_initialize(request.id, &init_result)
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
 
-        let new_id = self
-            .send_request(
-                method::SESSION_NEW,
-                json!({
-                    "cwd": self.spec.cwd.display().to_string(),
-                    "mcpServers": [],
-                }),
-            )
+        let request = self
+            .protocol
+            .new_session(&self.spec.cwd.display().to_string())
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.write_message(request.message).await?;
+        let new_result = self
+            .pump_until_response(request.id, HANDSHAKE_TIMEOUT)
             .await?;
-        let new_result = self.pump_until_response(new_id, HANDSHAKE_TIMEOUT).await?;
-        let acp_session_id = new_result
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.trim().is_empty() && id.len() <= 256)
-            .ok_or_else(|| {
-                EngineError::Backend("acp session/new response carried no sessionId".to_string())
-            })?
-            .to_string();
-        self.acp_session_id = Some(acp_session_id.clone());
+        let acp_session_id = self
+            .protocol
+            .accept_session(request.id, &new_result)
+            .map_err(|e| EngineError::Backend(e.to_string()))?
+            .to_owned();
         self.handshake_complete = true;
         let reported_model = peer_reported_model(&new_result).map(str::to_owned);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1004,20 +846,16 @@ impl AcpSession {
     /// Send one `session/prompt` request and mark its id as the turn whose
     /// response synthesizes the terminal `Result`.
     async fn send_prompt(&mut self, text: &str) -> Result<()> {
-        let acp_session_id = self
-            .acp_session_id
-            .clone()
-            .ok_or_else(|| EngineError::Backend("acp session not established yet".to_string()))?;
-        let id = self
-            .send_request(
-                method::SESSION_PROMPT,
-                json!({
-                    "sessionId": acp_session_id,
-                    "prompt": [ { "type": "text", "text": text } ],
-                }),
-            )
-            .await?;
-        self.prompt_request_id = Some(id);
+        let request = self
+            .protocol
+            .prompt(text)
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if let Err(error) = self.write_message(request.message).await {
+            // Preserve the adapter's existing state on a failed send: only a
+            // successfully written prompt becomes an outstanding turn.
+            self.protocol.complete_prompt(request.id);
+            return Err(error);
+        }
         // A new turn begins: the terminal Result stitches only this turn's
         // last message.
         self.message_text.clear();
@@ -1048,10 +886,10 @@ impl AcpSession {
                     }
                 };
                 match frame {
-                    Frame::Response {
+                    Input::Peer(Frame::Response {
                         id: response_id,
                         outcome,
-                    } if response_id == id => {
+                    }) if response_id == id => {
                         return match outcome {
                             RpcOutcome::Result(result) => Ok(result),
                             RpcOutcome::Error(error) => Err(EngineError::Backend(format!(
@@ -1075,7 +913,7 @@ impl AcpSession {
     /// Read and classify the next stdout line; `None` at EOF. Blank lines
     /// are skipped (NDJSON tolerates them; a peer's pretty-printing or
     /// keepalive must not fabricate events).
-    async fn read_frame(&mut self) -> Result<Option<Frame>> {
+    async fn read_frame(&mut self) -> Result<Option<Input>> {
         loop {
             let permission_wait = self
                 .pending_permissions
@@ -1092,7 +930,7 @@ impl AcpSession {
                 .min()
                 .unwrap_or(std::time::Duration::from_secs(86400));
             if permission_wait.is_zero() {
-                return Ok(Some(Frame::PermissionExpired));
+                return Ok(Some(Input::PermissionExpired));
             }
             let can_answer = !self.lines.has_partial_line();
             let read = {
@@ -1119,10 +957,10 @@ impl AcpSession {
                                 self.permission_answers.recv().await
                             }
                         }, if can_answer => {
-                            return Ok(answer.map(Frame::PermissionAnswer));
+                            return Ok(answer.map(Input::PermissionAnswer));
                         }
                         _ = tokio::time::sleep(permission_wait), if !self.pending_permissions.is_empty() => {
-                            return Ok(Some(Frame::PermissionExpired));
+                            return Ok(Some(Input::PermissionExpired));
                         }
                         exited = wait_for_peer_exit(&mut self.child) => {
                             exited.map_err(|e| EngineError::Backend(format!("acp process observation failed: {e}")))?;
@@ -1169,7 +1007,7 @@ impl AcpSession {
                             ));
                         }
                     }
-                    return Ok(Some(classify_line(&line)));
+                    return Ok(Some(Input::Peer(classify_line(&line))));
                 }
                 Ok(None) => return Ok(None),
                 Err(e) => {
@@ -1184,16 +1022,18 @@ impl AcpSession {
 
     /// Convert one frame into queued events and side effects (permission
     /// answers, tool tracking, usage capture, terminal-Result synthesis).
-    async fn handle_frame(&mut self, frame: Frame) -> Result<()> {
-        match frame {
-            Frame::PermissionAnswer(answer) => self.answer_permission(answer).await?,
-            Frame::PermissionExpired => {
-                // Do not manufacture or replay a denial resolution. Terminating
-                // the peer closes its requests without authorizing an effect.
+    async fn handle_frame(&mut self, input: Input) -> Result<()> {
+        let frame = match input {
+            Input::PermissionAnswer(answer) => return self.answer_permission(answer).await,
+            Input::PermissionExpired => {
+                // Closing the peer does not manufacture an authorization.
                 return Err(EngineError::Backend(
                     "live permission deadline expired".into(),
                 ));
             }
+            Input::Peer(frame) => frame,
+        };
+        match frame {
             Frame::Notification {
                 method,
                 params,
@@ -1230,8 +1070,7 @@ impl AcpSession {
                 }
             }
             Frame::Response { id, outcome } => {
-                if Some(id) == self.prompt_request_id {
-                    self.prompt_request_id = None;
+                if self.protocol.complete_prompt(id) {
                     self.synthesize_result(outcome, id);
                 } else {
                     // A response to nothing outstanding (a straggler from a
@@ -1286,17 +1125,17 @@ impl AcpSession {
 
     /// Map one `session/update` notification onto events (see module docs).
     fn handle_session_update(&mut self, params: &Value, raw: Value) -> Result<()> {
-        let Some(expected) = self.acp_session_id.as_deref() else {
+        let Some(session_update) = self
+            .protocol
+            .session_update(params)
+            .map_err(|e| EngineError::Backend(e.to_string()))?
+        else {
             // No prompt has been sent: pre-session notices are diagnostic only.
             self.queue.push_back(AgentEvent::Other { raw });
             return Ok(());
         };
-        if params.get("sessionId").and_then(Value::as_str) != Some(expected) {
-            return Err(EngineError::Backend(
-                "acp update has a foreign or missing sessionId".into(),
-            ));
-        }
-        let update = params.get("update").cloned().unwrap_or(Value::Null);
+        let kind = session_update.kind;
+        let update = session_update.update;
         if let Some(call_id) = update.get("toolCallId").and_then(Value::as_str) {
             if let Some(pending) = self
                 .pending_permissions
@@ -1324,8 +1163,8 @@ impl AcpSession {
                 }
             }
         }
-        match update.get("sessionUpdate").and_then(Value::as_str) {
-            Some("agent_message_chunk") => {
+        match kind {
+            UpdateKind::AgentMessageChunk => {
                 let text = update
                     .get("content")
                     .and_then(|c| c.get("text"))
@@ -1356,7 +1195,7 @@ impl AcpSession {
                     raw,
                 });
             }
-            Some("tool_call") => {
+            UpdateKind::ToolCall => {
                 let id = update
                     .get("toolCallId")
                     .and_then(Value::as_str)
@@ -1372,7 +1211,7 @@ impl AcpSession {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let subject = tool_call_subject(&kind, &title, &update);
+                let subject = tool_call_subject(&kind, &title, update);
                 self.track_tool_call(
                     id,
                     ToolCallInfo {
@@ -1387,7 +1226,7 @@ impl AcpSession {
                     raw,
                 });
             }
-            Some("tool_call_update") => {
+            UpdateKind::ToolCallUpdate => {
                 let id = update
                     .get("toolCallId")
                     .and_then(Value::as_str)
@@ -1409,7 +1248,7 @@ impl AcpSession {
                     || update.get("rawInput").is_some()
                     || update.get("locations").is_some()
                 {
-                    tracked.subject = tool_call_subject(&tracked.kind, &tracked.title, &update);
+                    tracked.subject = tool_call_subject(&tracked.kind, &tracked.title, update);
                 }
                 self.track_tool_call(id.clone(), tracked.clone())?;
                 match status.as_str() {
@@ -1423,14 +1262,14 @@ impl AcpSession {
                         self.queue.push_back(AgentEvent::ToolResult {
                             tool: Some(tracked.kind.clone()),
                             denied: false,
-                            summary: tool_result_summary(&update, &tracked, &status),
+                            summary: tool_result_summary(update, &tracked, &status),
                             raw,
                         });
                     }
                     _ => self.queue.push_back(AgentEvent::Other { raw }),
                 }
             }
-            Some("usage_update") => {
+            UpdateKind::UsageUpdate => {
                 // Remembered for the terminal Result's cost; the update
                 // itself is transcript-only (no AgentEvent kind for
                 // mid-stream usage, and `used`/`size` are context-window
@@ -1452,8 +1291,8 @@ impl AcpSession {
         params: &Value,
         raw: Value,
     ) -> Result<()> {
-        if self.acp_session_id.is_none()
-            || params.get("sessionId").and_then(Value::as_str) != self.acp_session_id.as_deref()
+        if self.protocol.session_id().is_none()
+            || params.get("sessionId").and_then(Value::as_str) != self.protocol.session_id()
         {
             self.write_message(json!({
                 "jsonrpc": "2.0", "id": id,
@@ -1535,7 +1374,11 @@ impl AcpSession {
         let mut proposal = crate::live_permission::Proposal {
             id: format!("permission-{}", uuid::Uuid::new_v4()),
             engine_session_id: self.session_id.clone(),
-            peer_session_id: self.acp_session_id.clone().expect("validated above"),
+            peer_session_id: self
+                .protocol
+                .session_id()
+                .expect("validated above")
+                .to_owned(),
             peer_request_id: id,
             tool_call_id: call_id,
             action_digest: crate::live_permission::digest(&action)?,
@@ -1880,12 +1723,12 @@ impl AgentSession for AcpSession {
                 "acp session is closed; cannot send further messages".to_string(),
             ));
         }
-        if self.acp_session_id.is_none() {
+        if self.protocol.session_id().is_none() {
             return Err(EngineError::Backend(
                 "acp session not established yet; cannot send a message".to_string(),
             ));
         }
-        if matches!(self.spec.prompt, PromptMode::SingleShot(_)) || self.prompt_request_id.is_some()
+        if matches!(self.spec.prompt, PromptMode::SingleShot(_)) || self.protocol.prompt_in_flight()
         {
             return Err(EngineError::Backend(
                 "acp session cannot accept an overlapping or single-shot follow-up".into(),
@@ -1902,16 +1745,8 @@ impl AgentSession for AcpSession {
         // cleanly and answer the prompt with stopReason "cancelled"), then
         // the house tree-kill regardless — abort must never depend on the
         // peer honoring the notification.
-        if let Some(acp_session_id) = self.acp_session_id.clone() {
-            let _ = tokio::time::timeout(
-                CANCEL_WRITE_TIMEOUT,
-                self.write_message(json!({
-                    "jsonrpc": "2.0",
-                    "method": method::SESSION_CANCEL,
-                    "params": { "sessionId": acp_session_id },
-                })),
-            )
-            .await;
+        if let Some(cancel) = self.protocol.cancel() {
+            let _ = tokio::time::timeout(CANCEL_WRITE_TIMEOUT, self.write_message(cancel)).await;
         }
         self.kill_child().await;
         #[cfg(any(target_os = "macos", target_os = "linux"))]

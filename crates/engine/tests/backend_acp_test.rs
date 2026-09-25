@@ -156,14 +156,11 @@ fn notification(update: &str) -> String {
 fn full_session_peer() -> String {
     let mut body = String::from(PEER_PREAMBLE);
     body.push_str("    *'\"method\":\"session/prompt\"'*)\n");
-    body.push_str(&notification("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Hello \"},\"messageId\":\"m1\"}"));
-    body.push_str(&notification("{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"world\"},\"messageId\":\"m1\"}"));
-    body.push_str(&notification("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"tc-1\",\"title\":\"cargo test --workspace\",\"kind\":\"execute\",\"status\":\"in_progress\",\"rawInput\":{\"command\":\"cargo test --workspace\"}}"));
-    body.push_str(&notification("{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"tc-1\",\"status\":\"completed\",\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"test result: ok. 5 passed\"}}]}"));
-    body.push_str(&notification("{\"sessionUpdate\":\"usage_update\",\"used\":12345,\"size\":200000,\"cost\":{\"amount\":0.042,\"currency\":\"USD\"}}"));
-    body.push_str(
-        "      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":'\"$id\"',\"result\":{\"stopReason\":\"end_turn\"}}'\n      exit 0\n      ;;\n",
-    );
+    // Both the threaded second consumer and the real backend consume this
+    // fixture. The original normalized-event assertions below stay unchanged.
+    body.push_str("      cat <<'ACP_TURN'\n");
+    body.push_str(kranz_acp::conformance::TURN);
+    body.push_str("ACP_TURN\n      exit 0\n      ;;\n");
     body.push_str(PEER_SUFFIX);
     body
 }

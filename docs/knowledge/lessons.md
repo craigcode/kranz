@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-23
+last_verified: 2026-09-24
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -11,6 +11,10 @@ verified_against:
 ---
 
 # Lessons
+
+Rechecked 2026-09-24 against the shared ACP invariants update. The isolated
+crate check supplements the full-workspace gate, and shared transport does not
+change process ownership, permission authority or the lesson-capture channel.
 
 `.kranz/lessons/` is the append-only, mission-capture memory: at most one
 reusable lesson per mission, injected tightly-capped into planning seeds. It

@@ -2,8 +2,10 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-22
+last_verified: 2026-09-24
 verified_against:
+  - crates/acp/src/lib.rs
+  - docs/scoping/shared-acp-client.md
   - docs/roadmap.md
   - docs/scoping/governance-evidence-layer.md
   - docs/scoping/flight-rules-engineering-standards.md
@@ -20,6 +22,11 @@ evidence surfaces. The pilot records manual review observations; it adds no
 execution or skill-capture mechanism.
 
 ## What this records
+
+Rechecked 2026-09-24 against the [shared ACP scope](../../scoping/shared-acp-client.md).
+Extracting protocol transport preserves the shipped dispatch seam. The later
+terminal work must add observable contained execution beneath that seam; desk
+UI remains in Sgian, and no code-generation pool or prompt optimization is added.
 
 A strategic decision about what kranz is, made 2026-07-29. Work that
 contradicts it should be flagged against this ADR, not reconciled quietly.

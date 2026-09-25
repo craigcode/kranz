@@ -279,6 +279,24 @@ Specialist prompts and code-generation workflows stay with external harnesses
 or consumer packs. A Sgian desk may present and act through Kranz's decisions;
 terminal/editor/factory UI and cloud orchestration remain outside these tickets.
 
+## Shared ACP client and Sgian terminal integration (2026-09-24)
+
+The operator approved the [staged design](scoping/shared-acp-client.md) after
+v0.4.1. Start with protocol ownership and a provider-free second consumer, then
+extract without changing worker capabilities. The review-effort pilot continues
+independently. Terminal execution stays inside the admitted containment boundary;
+Sgian owns pane presentation, while Kranz owns mission authority and evidence.
+
+- [ ] [Boundary and consumer spike](../.kranz/tickets/shared-acp-boundary-spike.md).
+- [ ] [Client extraction](../.kranz/tickets/shared-acp-client-extraction.md).
+- [ ] [Contained terminal-provider contract](../.kranz/tickets/acp-contained-terminal-provider.md).
+- [ ] [Sgian integration qualification](../.kranz/tickets/acp-sgian-terminal-qualification.md).
+- [ ] [Pinned adapter qualification](../.kranz/tickets/acp-terminal-adapter-qualification.md).
+
+Ticket frontmatter owns ordering and dependencies. No live-provider run, host
+execution fallback, prompt ownership transfer or release is authorized by this
+backlog. Each later integration must supply its own lifecycle and authority proof.
+
 ## M6 — Cloud missions ◑ (scoped push, Dockerfile, deploy docs, exec --push shipped; Railway live deploy operator-gated)
 
 Run missions on rented compute; the event-sourced core and the M2.5 HTTP

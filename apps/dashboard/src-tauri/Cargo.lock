@@ -1935,6 +1935,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kranz-acp"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kranz-dashboard"
 version = "0.4.1"
 dependencies = [
@@ -1961,6 +1970,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "globset",
+ "kranz-acp",
  "libc",
  "regex",
  "reqwest 0.12.28",

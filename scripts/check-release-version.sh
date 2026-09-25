@@ -53,7 +53,7 @@ if [ "$tauri_version" != "$workspace_version" ] || [ "$tauri_crate_version" != "
   exit 1
 fi
 
-for crate in kranz-engine kranz-server kranz-slack; do
+for crate in kranz-acp kranz-engine kranz-server kranz-slack; do
   if ! grep -Eq "^${crate} = \\{ version = \"${workspace_version//./\\.}\", path = " Cargo.toml; then
     echo "release check: workspace dependency $crate is not pinned to $workspace_version" >&2
     exit 1
@@ -76,7 +76,7 @@ version = sys.argv[1]
 readme = pathlib.Path("README.md").read_text()
 patterns = [
     r"cargo install kranz --version ([^\s]+)",
-    r"https://crates\.io/crates/(?:kranz|kranz-engine|kranz-server|kranz-slack)/([^/)\s]+)",
+    r"https://crates\.io/crates/(?:kranz|kranz-acp|kranz-engine|kranz-server|kranz-slack)/([^/)\s]+)",
     r"https://github\.com/craigcode/kranz/releases/tag/v([^/)\s]+)",
 ]
 for pattern in patterns:

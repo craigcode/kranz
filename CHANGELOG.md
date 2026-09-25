@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Extract bounded ACP v1 framing and session protocol into `kranz-acp`, with a
+  provider-free threaded consumer and shared conformance fixtures. Kranz retains
+  permission authority, event normalization, credentials and process containment;
+  filesystem, terminal and resume capabilities remain disabled.
+
+
 ## 0.4.1 - 2026-09-23
 
 - Isolated expired ACP permission requests from sibling candidates, clarified

@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+kranz-acp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -55,6 +56,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+kranz-acp = { workspace = true, features = ["conformance"] }
 proptest = "1"
 
 [[example]]
