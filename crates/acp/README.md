@@ -17,9 +17,13 @@ Treat protocol or write errors as terminal: discard the client and clean up its
 owned transport. Never retry a partially written frame. Filter credentials
 before persisting raw input. Cancellation is a notification, not a process kill.
 
-Filesystem, terminal and session-load capabilities remain disabled. This is the
-existing Kranz protocol subset, not an implementation of every optional ACP
-capability. Permission requests are handed to the consumer unchanged; no
+Filesystem and session-load capabilities remain disabled. Terminal capability
+also defaults to false. Consumers may use `Client::with_terminal_support()` only
+after admitting a provider. `terminal` contains the five asynchronous operations,
+typed requests/results, scoped handles and a bounded UTF-8 output tail. Its
+consumer-defined creation authority is not a wire permission or an execution
+implementation. Kranz's engine fixture exercises the contract inside an owned
+container; released worker profiles still advertise false. Permission requests are handed to the consumer unchanged; no
 permission decision or tool execution is built in.
 
 Run the provider-free thread/runtime spike:

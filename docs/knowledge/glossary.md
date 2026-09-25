@@ -24,7 +24,7 @@ verified_against:
 
 # Glossary
 
-- **Shared ACP client** — `kranz-acp` owns bounded framing and session protocol; the engine retains permission authority, event/cost normalization and process containment. Client terminal/filesystem services and resume remain disabled. See [the boundary](../scoping/shared-acp-client.md).
+- **Shared ACP client** — `kranz-acp` owns bounded framing and session protocol; the engine retains permission authority, event/cost normalization and process containment. Released profiles keep terminal/filesystem services and resume disabled; a private contained terminal fixture proves the five-operation contract. See [the boundary](../scoping/shared-acp-client.md).
 
 Project vocabulary. Terms link to the note that explains them in depth.
 

@@ -11,6 +11,8 @@ verified_against:
   - crates/engine/src/review_packet.rs
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/backend_acp.rs
+  - crates/engine/src/acp_terminal.rs
+  - crates/engine/src/backend_acp/terminals.rs
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
   - crates/engine/src/gate_evaluation/lifecycle.rs
@@ -331,7 +333,11 @@ spend. A resumed process starts a fresh ledger. Existing event logs stay intact.
 Rechecked 2026-09-25: `kranz-acp` now owns protocol framing and session state.
 `backend_acp` still owns credential filtering, event mapping, live consent,
 deadlines and supervised cleanup; profile admission is unchanged. The threaded
-consumer is a synthetic runtime proof, not Sgian integration. See
+consumer is a synthetic runtime proof, not Sgian integration. The terminal
+fixture uses a separate asynchronous operation queue, exact-action consent,
+scoped handles and a subreaper inside the owned namespace; only a private test
+constructor enables it. Started, exited and namespace-cleanup receipts are
+separate from the wire response and permission-delivery receipt. See
 [shared ACP ownership](../../scoping/shared-acp-client.md).
 
 An operator-only `worker.acpProfile` admits the reviewed Claude/Codex container

@@ -994,6 +994,8 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
         std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = create ]; then\n touch \"$0.created\"\n sleep 6\n printf '%064d\\n' 1\nfi\n").unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut owned = OwnedContainer {
+            id: None,
+            alive: std::sync::Arc::new(AtomicBool::new(true)),
             client: DockerEvaluator::new(&wrapper).unwrap(),
             name: "kranz-fixture".into(),
             owner: "fixture".into(),
@@ -1039,3 +1041,5 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
         }
     }
 }
+
+mod terminals;

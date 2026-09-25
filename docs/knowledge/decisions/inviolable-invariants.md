@@ -5,6 +5,9 @@ freshness: check-on-touch
 last_verified: 2026-09-25
 verified_against:
   - crates/acp/src/lib.rs
+  - crates/acp/src/terminal.rs
+  - crates/engine/src/acp_terminal.rs
+  - crates/engine/src/backend_acp/terminals.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
@@ -39,7 +42,11 @@ Rechecked 2026-09-25 for the shared ACP extraction: framing, bounded readers
 and unique-key decoding move to `kranz-acp`. Engine process supervision,
 credential filtering and durable permission authority retain their owners.
 Broker answers are a local input type and cannot be created by a wire frame.
-Filesystem, terminal and resume capabilities remain disabled.
+Released worker profiles keep filesystem, terminal and resume capabilities
+disabled. A private terminal fixture now requires exact-action consent and uses
+the owned namespace, scoped handles and confirmed descendant cleanup. It adds
+no host execution fallback or production configuration switch. See the
+[terminal contract](../../scoping/acp-terminal-provider.md).
 
 Rechecked 2026-09-22 for the Sgian release corrections: coordination helpers use
 bounded process-tree supervision and a cleared discovery environment. Worker

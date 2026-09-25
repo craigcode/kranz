@@ -11,7 +11,7 @@ use crate::sandbox::{SandboxBackend, SandboxInputs};
 use crate::sandbox_container::{ContainerRuntime, MountProof};
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -28,6 +28,8 @@ fn error(message: impl std::fmt::Display) -> EngineError {
 }
 
 pub(crate) struct OwnedContainer {
+    id: Option<String>,
+    alive: std::sync::Arc<AtomicBool>,
     client: DockerEvaluator,
     name: String,
     owner: String,
@@ -230,6 +232,8 @@ impl OwnedContainer {
             }))?,
         )?;
         let mut owned = Self {
+            id: None,
+            alive: std::sync::Arc::new(AtomicBool::new(true)),
             client,
             name: name.clone(),
             owner: owner.clone(),
@@ -319,7 +323,55 @@ impl OwnedContainer {
             return Err(error("could not create owned namespace"));
         }
         self.creation_finished = true;
+        self.id = Some(id.to_owned());
         Ok(())
+    }
+
+    /// Fixture-only admission for the terminal contract. No released adapter
+    /// profile may silently acquire this new execution path.
+    pub(crate) fn terminal_context(
+        &self,
+        spec: &SessionSpec,
+    ) -> Result<crate::acp_terminal::Context> {
+        let sandbox = spec
+            .sandbox
+            .as_ref()
+            .ok_or_else(|| error("terminal boundary missing"))?;
+        if self.removed
+            || !self.alive.load(std::sync::atomic::Ordering::Acquire)
+            || self.image != crate::acp_terminal::FIXTURE_IMAGE
+            || sandbox.inputs.enforce != crate::types::SandboxEnforce::FsNet
+            || !sandbox.inputs.egress.is_empty()
+            || !sandbox.inputs.extra_write.is_empty()
+            || !spec.writable
+        {
+            return Err(error("terminal provider profile is not qualified"));
+        }
+        let root = self
+            .root
+            .as_ref()
+            .ok_or_else(|| error("terminal lease missing"))?;
+        private_write(
+            &root.path().join("terminal.py"),
+            include_bytes!("acp_container/terminal.py"),
+        )?;
+        let scratch = crate::sandbox::absolutize(&sandbox.inputs.tmpdir)
+            .join(format!("terminal-home-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&scratch)
+            .map_err(error)?;
+        Ok(crate::acp_terminal::Context {
+            client: self.client.clone(),
+            container_id: self
+                .id
+                .clone()
+                .ok_or_else(|| error("terminal namespace unconfirmed"))?,
+            image: self.image.clone(),
+            workspace: crate::sandbox::absolutize(&spec.cwd),
+            scratch,
+            alive: self.alive.clone(),
+        })
     }
 
     pub(crate) async fn write_launch(
@@ -352,6 +404,8 @@ impl OwnedContainer {
     }
 
     fn stop_lease(&mut self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Release);
         if let Some(task) = self.heartbeat.take() {
             task.abort();
         }

@@ -3,7 +3,8 @@
 //! The caller owns I/O scheduling, deadlines, credentials, process supervision,
 //! permission decisions and event presentation. This crate never spawns a child
 //! or answers a permission request. A cancel notification is not a process kill.
-//! Filesystem, terminal and session loading are intentionally unsupported.
+//! Filesystem and session loading are unsupported. Terminals default to false;
+//! opt-in consumers must supply and supervise an admitted terminal provider.
 //!
 //! Use [`io::BoundedLines::new_strict`] before [`classify_line`]. Retain the reader
 //! across cancelled reads: an incomplete frame must not race a permission answer.
@@ -17,6 +18,7 @@ pub mod conformance {
 
 pub mod io;
 pub mod strict_json;
+pub mod terminal;
 mod wire;
 
 use serde_json::{json, Value};
@@ -78,6 +80,7 @@ enum Phase {
 /// the consumer must keep reading while its permission policy waits for input.
 #[derive(Debug)]
 pub struct Client {
+    terminal: bool,
     phase: Phase,
     next_request_id: u64,
     session_id: Option<String>,
@@ -93,10 +96,20 @@ impl Default for Client {
 impl Client {
     pub fn new() -> Self {
         Self {
+            terminal: false,
             phase: Phase::Fresh,
             next_request_id: 1,
             session_id: None,
             prompt_id: None,
+        }
+    }
+
+    /// The embedding consumer must admit and supervise its provider before
+    /// choosing this constructor. It enables wire capability only, not policy.
+    pub fn with_terminal_support() -> Self {
+        Self {
+            terminal: true,
+            ..Self::new()
         }
     }
 
@@ -123,7 +136,7 @@ impl Client {
                 "protocolVersion": PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false,
+                    "terminal": self.terminal,
                 },
                 "clientInfo": client_info,
             }),

@@ -114,6 +114,8 @@ pub mod workspace_remote;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod acp_container;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod acp_terminal;
 pub mod backend_acp;
 pub mod backend_claude;
 pub mod backend_codex;

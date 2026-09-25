@@ -1291,7 +1291,7 @@ pub(crate) fn run_control_command_sandboxed_blocking(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-struct ControlChild(tokio::process::Child);
+pub(crate) struct ControlChild(pub(crate) tokio::process::Child);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for ControlChild {
