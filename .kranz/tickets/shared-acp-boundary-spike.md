@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented and independently reviewed in PR #82; merged at 7943324aa7accbf81661ae278cf7f42034f84be7. Out-of-mission delivery; dependency admission still follows docs/tickets.md.
+state: done
 title: Shared ACP boundary and threaded consumer spike
 priority: 1
 schedule: once

@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-24
+last_verified: 2026-09-25
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -35,7 +35,7 @@ verified_against:
 
 ## What this is
 
-Rechecked 2026-09-24 for the shared ACP extraction: framing, bounded readers
+Rechecked 2026-09-25 for the shared ACP extraction: framing, bounded readers
 and unique-key decoding move to `kranz-acp`. Engine process supervision,
 credential filtering and durable permission authority retain their owners.
 Broker answers are a local input type and cannot be created by a wire frame.

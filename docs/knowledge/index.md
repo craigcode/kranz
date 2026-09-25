@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-09-24
+last_verified: 2026-09-25
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -13,7 +13,7 @@ verified_against:
 
 # Kranz knowledge vault
 
-Rechecked 2026-09-24 against the skill-capture decision after shared ACP
+Rechecked 2026-09-25 against the skill-capture decision after shared ACP
 extraction. Protocol sharing extends dispatch; the knowledge, lesson and skill
 boundaries described by this map remain unchanged.
 

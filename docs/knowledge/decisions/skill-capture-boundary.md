@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-24
+last_verified: 2026-09-25
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -17,7 +17,7 @@ Rechecked 2026-09-22 (UTC) against the evidence-stream roadmap and
 The pilot measures evidence gaps and manual review; it does not create skills,
 optimize prompts or change the skill-capture boundary.
 
-Rechecked 2026-09-24 against the shared ACP roadmap and positioning update.
+Rechecked 2026-09-25 against the shared ACP roadmap and positioning update.
 Protocol extraction and contained terminal evidence extend the dispatch adapter;
 they add no skill capture, prompt optimization or consumer skill installation.
 

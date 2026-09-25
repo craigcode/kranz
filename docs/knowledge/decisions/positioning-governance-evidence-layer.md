@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-24
+last_verified: 2026-09-25
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -23,7 +23,7 @@ execution or skill-capture mechanism.
 
 ## What this records
 
-Rechecked 2026-09-24 against the [shared ACP scope](../../scoping/shared-acp-client.md).
+Rechecked 2026-09-25 against the [shared ACP scope](../../scoping/shared-acp-client.md).
 Extracting protocol transport preserves the shipped dispatch seam. The later
 terminal work must add observable contained execution beneath that seam; desk
 UI remains in Sgian, and no code-generation pool or prompt optimization is added.
