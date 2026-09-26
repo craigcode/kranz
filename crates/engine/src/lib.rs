@@ -69,6 +69,7 @@ pub mod pack;
 pub mod planning;
 pub mod pr_handoff;
 pub mod preflight;
+pub mod presentation;
 pub mod prompts;
 pub mod provenance;
 pub mod pty_harness;

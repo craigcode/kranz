@@ -517,3 +517,13 @@ fn review_packet_native_block_names_the_exact_latest_decision_event() {
     assert_eq!(block.seq, event.seq);
     assert!(block.detail.contains("Required checker could not run"));
 }
+
+#[test]
+fn review_packet_never_emits_terminal_controls_or_invisible_unicode() {
+    let f = Fixture::new();
+    let mut packet = f.packet();
+    packet.mission_id = "m-\u{1b}c\r\u{009b}2J\u{202e}\u{200b}".into();
+    let markdown = review_packet::render_markdown(&packet);
+    assert!(!markdown.chars().any(kranz_engine::presentation::ambiguous));
+    assert!(markdown.contains("u001b") && markdown.contains("u202e"));
+}

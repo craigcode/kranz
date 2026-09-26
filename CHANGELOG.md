@@ -5,6 +5,25 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.4.2 - 2026-09-26
+
+- Made Sgian host-control credentials an explicit opt-in through an absolute
+  helper path outside the checkout. Enforced sessions never receive them;
+  bounded issuance and revocation now run off the async executor.
+- Refuse invisible/control characters in live approvals and render them visibly
+  in the CLI, Slack, dashboard and review packets. Deny rules now cover repeated
+  wildcard suffixes, argument arrays, every supplied path and lexical traversal.
+- Require external gate acceptance to cover changed source with clean tracked
+  candidate bytes and normal index flags. Changed private or detected-secret
+  files block acceptance; ordinary web framework and Unicode paths are supported.
+- Persist bounded ACP progress batches even without permission requests, retain
+  transport failures, and refuse completion with unanswered consent. Mount proofs
+  run freshly for the current image and container starts use the owned ID.
+- Check configured credentials across adjacent ACP text chunks; verify retained
+  evidence digests before export redaction. Added offline adapter-lock receipt
+  checks and refusal to run proof checkers under optimized Python.
+
+
 - Extract bounded ACP v1 framing and session protocol into `kranz-acp`, with a
   provider-free threaded consumer and shared conformance fixtures. Kranz retains
   permission authority, event normalization, credentials and process containment;

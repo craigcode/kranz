@@ -89,6 +89,9 @@ pub struct SourceSnapshot {
 impl SourceSnapshot {
     pub fn capture(repo: &GitRepo, base: &str) -> Result<Self, String> {
         let repo = repo.with_hooks_disabled().map_err(|e| e.to_string())?;
+        if !repo.has_normal_index_entries().map_err(|e| e.to_string())? {
+            return Err("gate source snapshot refuses hidden index flags".into());
+        }
         let base = repo.rev_parse(base).map_err(|e| e.to_string())?;
         let head = repo.head_sha().map_err(|e| e.to_string())?;
         let root = Dir::open_ambient_dir(repo.root(), cap_std::ambient_authority())
@@ -114,7 +117,9 @@ impl SourceSnapshot {
             if total > MAX_SOURCE_BYTES {
                 return Err("gate source snapshot exceeds byte limit".into());
             }
-            if contains_private_key(&bytes) {
+            if contains_private_key(&bytes)
+                || !crate::scrub::scan_text(&String::from_utf8_lossy(&bytes)).is_empty()
+            {
                 excluded_paths.push(path.as_str().to_string());
                 continue;
             }
@@ -143,6 +148,8 @@ impl SourceSnapshot {
             "prefixes": EXCLUDED_PREFIXES,
             "prefixMatching": "directory-bounded at any depth, ASCII case-insensitive",
             "privateKeys": "files containing a PEM private-key BEGIN line are excluded in full",
+            "detectedCredentials": "files matching the engine secret scanner are excluded in full; changed excluded source blocks acceptance",
+            "missionRecords": "only the current mission's enumerated record files and missions/index.md are metadata, supplied through approved scope and evidence rather than source coverage",
             "environmentFiles": ".env and .env.* at any depth, ASCII case-insensitive",
             "ignoredFiles": "Git standard excludes at capture; ignored caches are not evidence",
             "excludedPaths": excluded_paths,
@@ -160,6 +167,45 @@ impl SourceSnapshot {
             files,
             excluded_paths,
         })
+    }
+
+    /// Acceptance judges committed source, and must not omit a changed source
+    /// path to keep credentials private. Mission records are a separately
+    /// declared metadata class (approved plan/evidence), never source coverage.
+    pub fn verify_candidate(&self, repo: &GitRepo, mission_id: &str) -> Result<(), String> {
+        let repo = repo.with_hooks_disabled().map_err(|e| e.to_string())?;
+        if !repo.is_clean_tracked_strict().map_err(|e| e.to_string())? {
+            return Err(
+                "gate acceptance requires committed candidate bytes and normal index flags".into(),
+            );
+        }
+        for path in repo.untracked_files().map_err(|e| e.to_string())? {
+            let path = path
+                .to_str()
+                .ok_or("gate acceptance refuses a non-UTF-8 untracked path")?;
+            if !crate::contract_sweep::is_mission_record_path(mission_id, path) {
+                return Err(format!(
+                    "gate acceptance requires committed candidate source; untracked path: {}",
+                    crate::presentation::visible(path)
+                ));
+            }
+        }
+        let changed = repo
+            .review_changed_paths(&self.identity.base)
+            .map_err(|e| e.to_string())?;
+        let missing: Vec<_> = self
+            .excluded_paths
+            .iter()
+            .filter(|path| {
+                changed.contains(path)
+                    && !crate::contract_sweep::is_mission_record_path(mission_id, path)
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!("gate source coverage is incomplete; changed private/excluded paths require separate review: {}",
+                crate::presentation::visible(&missing.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", "))));
+        }
+        self.verify_current(&repo)
     }
 
     pub fn verify_current(&self, repo: &GitRepo) -> Result<(), String> {

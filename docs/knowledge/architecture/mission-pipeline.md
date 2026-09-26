@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-25
+last_verified: 2026-09-26
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,13 +40,19 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-09-26: the controlled worker relay now persists progress batches
+without waiting for consent. External acceptance refuses omitted changed source,
+hidden index flags and uncommitted candidate inputs. Approval controls refuse
+ambiguous text; Sgian issuance requires explicit opt-in and enforcement off.
+
 ## The one invariant
 
-Rechecked 2026-09-22 for release preparation: Sgian worker credentials use an
-owned revocation guard, including dropped futures, and the existing bounded
-Git subprocess supervisor also bounds coordination-helper pipes. This does not
-change mission authority; failed revocation and engine death still require
-operator reconciliation. See [Sgian coordination](../../sgian-coordination.md).
+Rechecked 2026-09-26 for review remediation: Sgian worker credentials require
+an explicit installed absolute helper and `sandbox.enforce: off`. PATH discovery
+is disabled; enforced workers never receive this host-control authority. Issuance
+and revocation use the blocking pool and bounded subprocess supervision, including
+best-effort cleanup for dropped futures. Failed revocation and engine death still
+require operator reconciliation. See [Sgian coordination](../../sgian-coordination.md).
 
 A sequential worker interrupted by Pause returns to the outer idle loop after
 recording its existing commits and closing live permissions. It must not enter

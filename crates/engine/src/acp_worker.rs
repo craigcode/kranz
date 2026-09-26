@@ -285,6 +285,7 @@ impl AcpWorkerProfile {
         Ok(PreparedProfile {
             home: Some(home),
             secrets,
+            stream_tails: Default::default(),
             receipt: json!({
                 "profile":self.id,"credentialSource":"operator-selected-file","startupPolicy":"v1",
                 "hostOs":std::env::consts::OS,"hostArch":std::env::consts::ARCH,
@@ -355,11 +356,12 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 pub(crate) struct PreparedProfile {
     home: Option<tempfile::TempDir>,
     secrets: Vec<String>,
+    stream_tails: std::collections::HashMap<String, String>,
     pub receipt: Value,
 }
 
 impl PreparedProfile {
-    pub fn contains_secret(&self, text: &str) -> bool {
+    pub fn contains_secret(&mut self, text: &str) -> bool {
         fn contains(value: &Value, secrets: &[String]) -> bool {
             match value {
                 Value::String(text) => secrets.iter().any(|s| text.contains(s)),
@@ -370,10 +372,46 @@ impl PreparedProfile {
                 _ => false,
             }
         }
-        self.secrets.iter().any(|s| text.contains(s))
-            || serde_json::from_str::<Value>(text)
-                .is_ok_and(|value| contains(&value, &self.secrets))
+        if self.secrets.iter().any(|s| text.contains(s)) {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        if contains(&value, &self.secrets) {
+            return true;
+        }
+        // NDJSON frames are not text boundaries. Keep a bounded suffix for
+        // each ACP text stream, across intervening protocol notifications.
+        let update = &value["params"]["update"];
+        let Some(kind @ ("agent_message_chunk" | "agent_thought_chunk")) =
+            update["sessionUpdate"].as_str()
+        else {
+            return false;
+        };
+        let Some(chunk) = update["content"]["text"].as_str() else {
+            return false;
+        };
+        let tail = self.stream_tails.entry(kind.into()).or_default();
+        tail.push_str(chunk);
+        if self.secrets.iter().any(|secret| tail.contains(secret)) {
+            return true;
+        }
+        let retain = self
+            .secrets
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let mut start = tail.len().saturating_sub(retain);
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+        false
     }
+
     pub fn scrub(&self, mut text: String) -> String {
         for secret in &self.secrets {
             text = text.replace(secret, "[REDACTED]");

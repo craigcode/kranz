@@ -4,13 +4,17 @@
 daemon supervises coding agents in a repository and records who did what: each
 client connects under a holder name, takes leases on agent panes, and leaves
 attributed records in the daemon's ledger. When a Kranz mission runs inside a
-repository that a Sgian daemon also serves, every worker session identifies
-itself to that daemon as its own principal instead of borrowing the
-operator's.
+repository that a Sgian daemon also serves, an operator may opt an uncontained
+worker into a separate run principal. This is host-control authority and is
+disabled by default. Enforced sandbox sessions never receive it.
 
 ## What happens
 
-Before a worker session starts, the engine asks the daemon for a credential:
+Set `KRANZ_SGIAN_BIN` to an absolute, trusted installed helper outside both the
+repository and the worker checkout, for example `/opt/homebrew/bin/sgian`.
+Symlinks are resolved before checking those boundaries; `PATH` is never searched.
+With `sandbox.enforce: off`, before a worker session starts the engine asks the
+daemon for a credential:
 
 ```sh
 sgian ctl --workspace <repo root> --json identity issue --holder kranz:<run-id> --scope write
@@ -29,7 +33,9 @@ sgian ctl --workspace <repo root> --json identity revoke <credential id>
 ```
 
 An owned guard attempts revocation when a running worker future is dropped as
-well as on normal return. Each control call has a five-second execution/output
+well as on normal return. Issuance and normal revocation run on the blocking
+pool; cancellation schedules a bounded best-effort revocation without blocking
+the async executor. Each control call has a five-second execution/output
 deadline and bounded reply buffers; it supervises descendants that hold pipes
 open after the leader exits. The helper receives the existing discovery
 environment allowlist (including HOME for daemon lookup), not ambient provider
@@ -42,19 +48,20 @@ leave a credential outstanding; a killed engine cannot run its cleanup guard.
 Inspect the daemon and revoke outstanding run identities explicitly after
 uncertain cleanup. A successful revocation ends the credential's subscriptions.
 The token is passed in the session environment, not as a command argument or
-intentional log field. This lane does not grant access through a sandbox or
-mount a host daemon socket into a contained worker.
+intentional log field. Sgian write authority can include host-side process
+execution. It is never issued to a worker with `sandbox.enforce` other than
+`off`, and a caller-supplied `SGIAN_CLIENT_TOKEN` is removed before worker spawn.
 
 ## When it is off
 
 The lane is best-effort and never a reason to fail a spawn:
 
-- `sgian` is not on `PATH`, or no daemon serves the repository root: the
-  session starts without the variable and the engine logs at `debug`.
+- The helper is not explicitly configured, the path is relative or inside a
+  worker-writable checkout, or sandbox enforcement is enabled: no credential
+  is issued. Missing binaries and absent daemons also leave the lane off.
 - A refused request, failed control call or deadline produces the same outcome,
   logged at `debug`. An unusable credential record is logged at `warn`.
-- `KRANZ_SGIAN_BIN` set to a path uses that binary instead of searching
-  `PATH`; set to an empty string it disables the lane entirely.
+- An unset or empty `KRANZ_SGIAN_BIN` disables the lane entirely.
 
 The engine calls `sgian ctl` with the discovery allowlist and without any
 `SGIAN_CLIENT_TOKEN`, so the request is made as the workspace owner, the only

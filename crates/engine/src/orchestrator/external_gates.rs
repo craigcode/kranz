@@ -64,6 +64,9 @@ impl MissionEngine {
         };
         let snapshot =
             SourceSnapshot::capture(self.active_repo(), base).map_err(driver::invalid)?;
+        snapshot
+            .verify_candidate(self.active_repo(), &self.state.mission.id)
+            .map_err(driver::invalid)?;
         let root = self.active_root().to_path_buf();
         let env = self.contract_command_env(Some(&authority.base))?;
         let mut sandbox = self.gate_sandbox(&root)?;
@@ -171,7 +174,7 @@ impl MissionEngine {
                 }
             }
             snapshot
-                .verify_current(self.active_repo())
+                .verify_candidate(self.active_repo(), &self.state.mission.id)
                 .map_err(driver::invalid)
         }
         .await;
@@ -238,7 +241,7 @@ impl MissionEngine {
         .await?;
         let current = self.external_authority()?.0;
         if let Err(error) = snapshot
-            .verify_current(self.active_repo())
+            .verify_candidate(self.active_repo(), &self.state.mission.id)
             .map_err(driver::invalid)
             .and_then(|()| authority.verify(&current))
         {
