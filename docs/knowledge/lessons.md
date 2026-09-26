@@ -2,13 +2,15 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-25
+last_verified: 2026-09-26
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-09-26 against the updated invariants. Explicit Sgian opt-in, visible approvals, committed-source coverage and fresh mount proofs refine safety rules without changing mission lesson capture.
 
 # Lessons
 

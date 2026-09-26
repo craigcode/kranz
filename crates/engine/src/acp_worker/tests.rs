@@ -1084,3 +1084,22 @@ async fn acp_containment_v1_profile_credential_echo_fails_and_cleans_home() {
         "base\n"
     );
 }
+
+#[test]
+fn acp_profile_refuses_a_credential_split_over_text_frames() {
+    let secret = "synthetic-login-no-authority-12345";
+    for kind in ["agent_message_chunk", "agent_thought_chunk"] {
+        let mut profile = PreparedProfile {
+            home: None,
+            secrets: vec![secret.into()],
+            stream_tails: Default::default(),
+            receipt: serde_json::json!({}),
+        };
+        let frame = |text: &str| {
+            serde_json::json!({"params":{"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}}).to_string()
+        };
+        assert!(!profile.contains_secret(&frame(&secret[..13])));
+        assert!(!profile.contains_secret(r#"{"params":{"update":{"sessionUpdate":"plan"}}}"#));
+        assert!(profile.contains_secret(&frame(&secret[13..])));
+    }
+}

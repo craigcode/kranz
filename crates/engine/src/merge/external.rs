@@ -160,7 +160,9 @@ impl Audit {
             .snapshot
             .take()
             .ok_or_else(|| driver::invalid("merge snapshot is absent"))?;
-        snapshot.verify_current(scratch).map_err(driver::invalid)?;
+        snapshot
+            .verify_candidate(scratch, &self.state.mission.id)
+            .map_err(driver::invalid)?;
         if !self.authority.applies(Stage::Merge) {
             return Ok(());
         }
@@ -218,7 +220,9 @@ impl Audit {
                 output_summary: Some(crate::scrub::scrub_and_truncate(&output, 8192)),
             });
         }
-        snapshot.verify_current(scratch).map_err(driver::invalid)?;
+        snapshot
+            .verify_candidate(scratch, &self.state.mission.id)
+            .map_err(driver::invalid)?;
         let events = EventLog::read_events(self.log.events_path())?;
         let authority = Authority::from_events(repo, &self.state, &events)?;
         self.authority.verify(&authority)?;
@@ -255,7 +259,10 @@ impl Audit {
             },
             |kind| self.emit(kind),
         )?;
-        if let Err(error) = snapshot.verify_current(scratch).map_err(driver::invalid) {
+        if let Err(error) = snapshot
+            .verify_candidate(scratch, &self.state.mission.id)
+            .map_err(driver::invalid)
+        {
             self.close("integration bytes changed while checks ran")?;
             return Err(error);
         }

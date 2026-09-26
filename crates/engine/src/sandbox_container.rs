@@ -60,9 +60,7 @@
 //! the gate's `CARGO_HOME` is a seeded cache-only home precisely because the
 //! real one is a credential directory).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use crate::sandbox::SandboxInputs;
 
@@ -316,36 +314,18 @@ fn unshared_path_reason(runtime: ContainerRuntime, host_dir: &Path, symptom: &st
     reason
 }
 
-/// One proof per (runtime, path) for the life of the process.
+/// Prove the current mount against the selected image and current daemon.
 ///
-/// The probe costs a container run. Session resolution happens per role and
-/// per feature, so proving every time would add that cost to every spawn,
-/// and the answer cannot change while a daemon keeps running.
-fn proof_cache() -> &'static Mutex<HashMap<(String, String), MountProof>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), MountProof>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// [`prove_bind_mount`] memoized per runtime and path.
+/// The historical name is retained for callers. A process-wide cache cannot
+/// prove freshness: an operator may switch Docker contexts, restart the daemon,
+/// change file sharing or replace an image between sessions in `kranz serve`.
+/// Failures must also be retryable without restarting the engine.
 pub fn cached_bind_mount_proof(
     runtime: ContainerRuntime,
     host_dir: &Path,
     image: &str,
 ) -> MountProof {
-    let key = (
-        runtime.binary().to_string(),
-        host_dir.to_string_lossy().into_owned(),
-    );
-    if let Ok(cache) = proof_cache().lock() {
-        if let Some(proof) = cache.get(&key) {
-            return proof.clone();
-        }
-    }
-    let proof = prove_bind_mount(runtime, host_dir, image);
-    if let Ok(mut cache) = proof_cache().lock() {
-        cache.insert(key, proof.clone());
-    }
-    proof
+    prove_bind_mount(runtime, host_dir, image)
 }
 
 /// Prove every distinct host root a run will mount.
@@ -358,8 +338,8 @@ pub fn cached_bind_mount_proof(
 /// ceremony, so every declared root is proven and the FIRST failure is
 /// returned, naming the path the operator has to fix.
 ///
-/// Roots are deduplicated by their proof cache key, so the common case of
-/// several mounts under one shared root costs one container run.
+/// Identical roots are deduplicated within this call. Each later call renews
+/// the proof against its current runtime and image.
 pub fn prove_mount_roots(runtime: ContainerRuntime, roots: &[PathBuf], image: &str) -> MountProof {
     let mut seen = Vec::new();
     for root in roots {

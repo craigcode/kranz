@@ -703,11 +703,14 @@ pub fn build_permission_ready(
     request: &kranz_engine::live_permission::Request,
     dashboard_url: Option<&str>,
 ) -> Vec<Value> {
-    let action = serde_json::to_string_pretty(&request.proposal.action).unwrap_or_default();
-    let workspace_complete = request.binding.workspace.chars().count() <= 1000;
+    let action = kranz_engine::presentation::visible(
+        &serde_json::to_string_pretty(&request.proposal.action).unwrap_or_default(),
+    );
+    let workspace_text = kranz_engine::presentation::visible(&request.binding.workspace);
+    let workspace_complete = workspace_text.chars().count() <= 1000;
     let complete = !action.is_empty() && action.chars().count() <= 2400 && workspace_complete;
     let workspace = if workspace_complete {
-        request.binding.workspace.as_str()
+        workspace_text.as_str()
     } else {
         "Open the dashboard to inspect the complete workspace."
     };
@@ -717,14 +720,17 @@ pub fn build_permission_ready(
             "Authorize this exact invocation once. Future calls require their own authorization.",
         ),
         json!({"type":"section","text":{"type":"plain_text","text":if complete { action } else { "Open the dashboard to inspect the complete action before allowing it.".into() }}}),
-        json!({"type":"context","elements":[{"type":"plain_text","text":format!("Mission {} · run {}\nWorkspace: {}\nExpires {}", request.binding.mission_id, request.binding.run_id, workspace, request.proposal.deadline)}]}),
+        json!({"type":"context","elements":[{"type":"plain_text","text":format!("Mission {} · run {}\nWorkspace: {}\nExpires {}", kranz_engine::presentation::visible(&request.binding.mission_id), kranz_engine::presentation::visible(&request.binding.run_id), workspace, request.proposal.deadline)}]}),
     ];
     let value = format!(
         "{}:{}:{}",
         request.binding.mission_id, request.proposal.id, request.binding_digest
     );
     let mut buttons = Vec::new();
-    if complete && request.proposal.prohibition.is_none() && request.proposal.option(true).is_some()
+    if complete
+        && !request.ambiguous_display()
+        && request.proposal.prohibition.is_none()
+        && request.proposal.option(true).is_some()
     {
         buttons.push(json!({"type":"button","text":{"type":"plain_text","text":"Allow once"},"action_id":ALLOW_PERMISSION_ACTION_ID,"value":value}));
     }

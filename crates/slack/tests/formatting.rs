@@ -590,3 +590,42 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
         "renders zero-escalation summary: {text}"
     );
 }
+
+#[test]
+fn permission_card_escapes_hidden_text_and_never_offers_allow() {
+    use kranz_engine::live_permission::{self, Binding, Proposal, Request};
+    use serde_json::json;
+    let now = chrono::Utc::now();
+    let action = json!({"rawInput":{"command":"npm \u{202e}\u{200b}test"}});
+    let options = vec![json!({"optionId":"allow","kind":"allow_once"})];
+    let request = Request::new(
+        Proposal {
+            id: "permission-1".into(),
+            engine_session_id: "engine-1".into(),
+            peer_session_id: "peer-1".into(),
+            peer_request_id: json!(1),
+            tool_call_id: "tool-1".into(),
+            action_digest: live_permission::digest(&action).unwrap(),
+            options_digest: live_permission::digest(&options).unwrap(),
+            action,
+            options,
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(60),
+            prohibition: None,
+        },
+        Binding {
+            mission_id: "m-1".into(),
+            run_id: "run-1".into(),
+            workspace: "/workspace".into(),
+            plan_digest: "a".repeat(64),
+            policy_digest: "b".repeat(64),
+        },
+    )
+    .unwrap();
+    let blocks = kranz_slack::format::build_permission_ready(&request, None);
+    let text = all_text(&blocks);
+    assert!(!text.chars().any(kranz_engine::presentation::ambiguous));
+    assert!(text.contains("\\u202e"));
+    assert!(!text.contains("Allow once"));
+    assert!(text.contains("Deny once"));
+}

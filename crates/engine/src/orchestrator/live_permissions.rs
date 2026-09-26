@@ -91,7 +91,11 @@ impl MissionEngine {
                         ));
                     }
                     let id = request.proposal.id.clone();
-                    let prohibition = request.proposal.prohibition.clone();
+                    let prohibition = request.proposal.prohibition.clone().or_else(|| {
+                        request.ambiguous_display().then(|| {
+                            "permission contains invisible or terminal control characters".into()
+                        })
+                    });
                     self.emit(EventKind::PermissionRequested {
                         request: request.clone(),
                     })?;
@@ -127,6 +131,7 @@ impl MissionEngine {
                     })?;
                     self.permission_handles.remove(&request_id);
                 }
+                PermissionNotice::Progress => {}
                 PermissionNotice::Finished => self.close_permissions(
                     Some(&binding.run_id),
                     "peer ended; no further permission response can be delivered",
@@ -167,6 +172,11 @@ impl MissionEngine {
                 "permission is stale, expired or already resolved".into(),
             ));
         }
+        record.validate_answer(
+            &resolution.binding_digest,
+            resolution.allow,
+            chrono::Utc::now(),
+        )?;
         let proposal = record.request.proposal.clone();
         // The reducer rejects policy prohibitions and uncertified allow options.
         self.emit(EventKind::PermissionResolved {
@@ -430,6 +440,156 @@ mod tests {
             } else {
                 SessionExit::Completed
             })
+        }
+    }
+
+    struct BurstPeer {
+        fail: bool,
+    }
+    struct BurstSession {
+        id: String,
+        index: usize,
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for BurstPeer {
+        async fn start(&self, spec: SessionSpec) -> Result<Box<dyn AgentSession>> {
+            Ok(Box::new(BurstSession {
+                id: spec.session_id,
+                index: 0,
+                fail: self.fail,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentSession for BurstSession {
+        fn session_id(&self) -> String {
+            self.id.clone()
+        }
+        async fn next_event(&mut self) -> Result<Option<AgentEvent>> {
+            if self.index == 4200 {
+                return if self.fail {
+                    Err(EngineError::Backend("fixture transport failure".into()))
+                } else {
+                    Ok(None)
+                };
+            }
+            let text = format!("message-{}", self.index);
+            self.index += 1;
+            Ok(Some(AgentEvent::Text {
+                raw: json!({"text":text}),
+                text,
+            }))
+        }
+        async fn send_user_message(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn abort(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn exit_status(&self) -> Option<SessionExit> {
+            Some(SessionExit::Completed)
+        }
+    }
+
+    #[tokio::test]
+    async fn live_permission_relay_persists_long_permissionless_runs_including_transport_failure() {
+        for fail in [false, true] {
+            let Some((_dir, mut engine)) = engine() else {
+                return;
+            };
+            let (relay, mut receiver) = engine.permission_channel().unwrap();
+            let paths = engine.paths.clone();
+            let cfg = engine.state.config.clone();
+            let feature = engine.state.mission.milestones[0].features[0].clone();
+            let peer = BurstPeer { fail };
+            let run = runner::run_worker_in_buffered_controlled(
+                &peer,
+                &paths,
+                &cfg,
+                &feature,
+                "goal",
+                "M1",
+                None,
+                &paths.repo_root,
+                None,
+                &[],
+                &[],
+                &[],
+                AuthVerdict::Inconclusive,
+                &[],
+                None,
+                None,
+                Some(relay),
+                None,
+            );
+            let outcome = engine.drive_permission_worker(run, &mut receiver).await;
+            assert_eq!(outcome.is_err(), fail);
+            if let Ok((buffer, _)) = outcome {
+                assert!(buffer.is_empty());
+            }
+            let events = EventLog::read_events(&paths.events_file()).unwrap();
+            let messages: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    EventKind::WorkerMessage { tag, content, .. } if tag == "text" => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(messages.len(), 4200);
+            assert_eq!(messages[0], "message-0");
+            assert_eq!(messages[4199], "message-4199");
+            let state = reducer::fold(&events).unwrap();
+            assert!(state.permissions.is_empty());
+            assert_eq!(state.runs.len(), 1);
+            assert!(state.runs.values().all(|run| run.ended_at.is_some()));
+            if fail {
+                assert!(events.iter().any(|e| matches!(
+                    e.kind,
+                    EventKind::WorkerCompleted {
+                        result: crate::types::RunResult::Fail,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn live_permission_ambiguous_values_cannot_be_allowed_but_old_requests_still_validate() {
+        for hidden in ["\u{202e}", "\u{200b}", "\u{1b}", "\r"] {
+            let mut proposal = proposal("s-1");
+            proposal.action = json!({"command":format!("npm {hidden}test")});
+            proposal.action_digest = live_permission::digest(&proposal.action).unwrap();
+            let request = Request::new(
+                proposal.clone(),
+                live_permission::Binding {
+                    mission_id: "m-1".into(),
+                    run_id: "run-1".into(),
+                    workspace: "/workspace".into(),
+                    plan_digest: "a".repeat(64),
+                    policy_digest: "b".repeat(64),
+                },
+            )
+            .unwrap();
+            request.validate().unwrap();
+            let record = live_permission::Record {
+                request,
+                resolution: None,
+                resolved_at: None,
+                delivery: None,
+                responded_at: None,
+                closed: None,
+            };
+            assert!(record
+                .validate_answer(&record.request.binding_digest, true, chrono::Utc::now())
+                .is_err());
+            record
+                .validate_answer(&record.request.binding_digest, false, chrono::Utc::now())
+                .unwrap();
+            let (responder, _answers) = PermissionResponder::channel();
+            assert!(responder.respond(&proposal, true).is_err());
+            responder.respond(&proposal, false).unwrap();
         }
     }
 

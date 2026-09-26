@@ -1,7 +1,7 @@
 //! Per-run Sgian client credential (optional coordination lane).
 //!
 //! When the operator runs a mission inside a repository that a Sgian daemon
-//! also serves, every worker session the engine spawns identifies itself to
+//! also serves, an explicitly opted-in, uncontained worker identifies itself to
 //! that daemon as its own principal: the engine asks the daemon for a
 //! credential held by `kranz:<run-id>` with the `write` scope, hands the
 //! token to the worker through `SGIAN_CLIENT_TOKEN`, and revokes the
@@ -11,8 +11,9 @@
 //! future cancellation; engine death still needs operator reconciliation.
 //!
 //! The lane is best-effort and never a reason to fail a spawn:
-//! - `KRANZ_SGIAN_BIN` set to a path uses that `sgian` binary; set but empty
-//!   disables the lane; unset searches `PATH` for `sgian`.
+//! - `KRANZ_SGIAN_BIN` must name an absolute helper outside the repository.
+//!   Unset, empty and relative values disable the lane; PATH is never searched.
+//! - Enforced sandbox sessions never receive this host-control capability.
 //! - No binary, no daemon serving the repository root, a refused request, a
 //!   malformed reply or a call that outlasts [`DEADLINE`] all degrade to a
 //!   session without the variable, logged at `debug` (absent daemon is the
@@ -48,12 +49,59 @@ pub struct SgianCredential {
 }
 
 /// Revokes an issued worker credential even if its running future is dropped.
-pub(crate) struct RevocationGuard(pub SgianCredential);
+pub(crate) struct RevocationGuard(Option<SgianCredential>);
+
+impl RevocationGuard {
+    pub(crate) async fn close(mut self) {
+        if let Some(credential) = self.0.take() {
+            if let Err(error) = tokio::task::spawn_blocking(move || credential.revoke()).await {
+                tracing::warn!(%error, "sgian revocation task failed; operator reconciliation required");
+            }
+        }
+    }
+}
 
 impl Drop for RevocationGuard {
     fn drop(&mut self) {
-        self.0.revoke();
+        if let Some(credential) = self.0.take() {
+            // Cancellation is best-effort but must not block an async executor.
+            // The helper itself retains its deadline and process-tree cleanup.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || credential.revoke());
+            } else if let Err(error) = std::thread::Builder::new()
+                .name("kranz-sgian-revoke".into())
+                .spawn(move || credential.revoke())
+            {
+                tracing::warn!(%error, "sgian revocation could not start; operator reconciliation required");
+            }
+        }
     }
+}
+
+/// Cancellation during issuance drops the returned guard on the blocking pool,
+/// so even a credential minted after the caller stops gets a revocation attempt.
+pub(crate) async fn issue_worker(
+    workspace: &Path,
+    session_cwd: &Path,
+    run_id: &str,
+    enforce: crate::types::SandboxEnforce,
+) -> Option<(RevocationGuard, String)> {
+    if enforce != crate::types::SandboxEnforce::Off {
+        return None;
+    }
+    let bin = trusted_bin(std::env::var_os(BIN_ENV), workspace)?;
+    if bin.starts_with(session_cwd.canonicalize().ok()?) {
+        return None;
+    }
+    let workspace = workspace.to_path_buf();
+    let run_id = run_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        issue_with(&bin, &workspace, &run_id, DEADLINE)
+            .map(|(credential, token)| (RevocationGuard(Some(credential)), token))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The holder name Sgian records for a run.
@@ -65,7 +113,7 @@ pub fn holder_for(run_id: &str) -> String {
 /// `workspace`, returning the credential and its one-time token, or `None`
 /// when the lane is disabled or unavailable.
 pub fn issue(workspace: &Path, run_id: &str) -> Option<(SgianCredential, String)> {
-    let bin = resolve_bin(std::env::var_os(BIN_ENV), std::env::var_os("PATH"))?;
+    let bin = trusted_bin(std::env::var_os(BIN_ENV), workspace)?;
     issue_with(&bin, workspace, run_id, DEADLINE)
 }
 
@@ -176,23 +224,20 @@ impl SgianCredential {
     }
 }
 
-/// Pick the `sgian` binary: the override wins, an empty override disables,
-/// otherwise the first `sgian` on `PATH`.
-pub fn resolve_bin(override_var: Option<OsString>, path_var: Option<OsString>) -> Option<PathBuf> {
-    match override_var {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => std::env::split_paths(&path_var?).find_map(|dir| {
-            let candidate = dir.join(BIN_NAME);
-            candidate.is_file().then_some(candidate)
-        }),
-    }
+/// Only an explicit absolute helper opts in. The legacy PATH argument is
+/// retained for API compatibility and is deliberately ignored.
+pub fn resolve_bin(override_var: Option<OsString>, _path_var: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(override_var?);
+    path.is_absolute().then_some(path)
 }
 
-#[cfg(windows)]
-const BIN_NAME: &str = "sgian.exe";
-#[cfg(not(windows))]
-const BIN_NAME: &str = "sgian";
+fn trusted_bin(override_var: Option<OsString>, workspace: &Path) -> Option<PathBuf> {
+    let bin = resolve_bin(override_var, None)?.canonicalize().ok()?;
+    let workspace = workspace.canonicalize().ok()?;
+    // Resolve symlinks before checking ownership: a repository-provided helper
+    // must never run with the operator's host authority.
+    (bin.is_file() && !bin.starts_with(workspace)).then_some(bin)
+}
 
 /// Run the operator helper with bounded pipes and process-tree cleanup. The
 /// discovery allowlist keeps HOME for daemon lookup, without forwarding provider
@@ -369,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bin_honours_the_override_and_searches_path() {
+    fn resolve_bin_requires_explicit_absolute_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_sgian(dir.path(), "true");
         assert_eq!(
@@ -382,7 +427,14 @@ mod tests {
         );
         let path =
             std::env::join_paths([dir.path().join("nowhere"), dir.path().to_path_buf()]).unwrap();
-        assert_eq!(resolve_bin(None, Some(path)), Some(bin));
+        assert_eq!(resolve_bin(None, Some(path)), None);
+        assert_eq!(resolve_bin(Some(OsString::from("./sgian")), None), None);
+        assert_eq!(trusted_bin(Some(bin.clone().into()), dir.path()), None);
+        let workspace = tempfile::tempdir().unwrap();
+        assert_eq!(
+            trusted_bin(Some(bin.clone().into()), workspace.path()),
+            Some(bin.canonicalize().unwrap())
+        );
         assert_eq!(
             resolve_bin(None, Some(OsString::from(dir.path().join("nowhere")))),
             None

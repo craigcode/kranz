@@ -13,6 +13,8 @@ starts at `05778ae`. The linked reports were retained in that public snapshot.
 | [September 11 remediation](reviews/2026-09-11-audit-remediation.md) | Six findings covering review bypass, Git configuration, approval identity, imports, ticket writes, and artifact reads; local macOS regression runs. | Finding-to-change-to-test table, full gate results, and limitations including Git preflight races and accepted Tauri advisories. Platform claims are scoped to recorded runs. |
 | [v0.2.1 response and v0.2.2 release](reviews/2026-09-13-server-security-patch.md) | Response to a supplied static review of public `05778ae`; that reviewer did not build or deeply audit orchestration, sandbox, or Windows AppContainer. | Streamed POST media types, route-local hook authentication, and end-to-end read-token exchange. Tests first reproduced the old behavior. Records the v0.2.1 release-runner failure and v0.2.2 correction. |
 
+| [September 26 ACP and gate remediation](reviews/2026-09-26-acp-gate-remediation.md) | Response to supplied review of public `a5442c55`; source tracing, synthetic regressions and five-axis self-review. | Explicit worker authority, safe consent, source coverage, audit durability, fresh mount proofs and item-by-item residual dispositions. |
+
 Follow individual reports for exact test names, evidence, and disposition.
 Reviewer identity or independence is not inferred where a report does not
 record it. Report new vulnerabilities through [SECURITY.md](../SECURITY.md).

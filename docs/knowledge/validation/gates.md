@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-25
+last_verified: 2026-09-26
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -447,3 +447,11 @@ or escalated checks; a retry collects fresh evidence and never overrides a
 nonwaivable failure. External command-permission executables and Windows mission
 evaluators remain refused; S4's separate live permission consent path is unchanged.
 [Stage integration review](../../reviews/2026-09-18-gate-stage-integration.md).
+
+The 2026-09-26 remediation makes external acceptance refuse hidden index flags,
+uncommitted tracked changes, untracked source and changed private/excluded source
+outside the exact mission-record metadata class. Unicode and ordinary framework
+path labels retain control/traversal checks. Permission previews escape controls
+and the engine refuses ambiguous allow decisions, including old pending records.
+The controlled worker relay persists progress without waiting for a permission
+request. See [review dispositions](../../reviews/2026-09-26-acp-gate-remediation.md).

@@ -83,9 +83,11 @@ impl TryFrom<String> for WirePath {
                     && component != "."
                     && component != ".."
                     && !component.starts_with(' ')
-                    && component
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b" _.-".contains(&b))
+                    && component.chars().all(|c| {
+                        !c.is_control()
+                            && !crate::presentation::ambiguous(c)
+                            && !"\\:<>\"|?*".contains(c)
+                    })
                     && !component.ends_with(['.', ' ']),
                 "invalid wire path component",
             )?;
@@ -95,7 +97,8 @@ impl TryFrom<String> for WirePath {
                 .unwrap_or("")
                 .to_ascii_uppercase();
             require(
-                !["CON", "PRN", "AUX", "NUL"].contains(&base.as_str())
+                !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str())
+                    && !["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"].contains(&base.as_str())
                     && !(base.len() == 4
                         && (base.starts_with("COM") || base.starts_with("LPT"))
                         && matches!(base.as_bytes()[3], b'1'..=b'9')),
@@ -119,7 +122,7 @@ pub(crate) fn validate_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Re
     let mut leaves = BTreeSet::new();
     for path in &paths {
         require(
-            leaves.insert(path.to_ascii_lowercase()),
+            leaves.insert(path.to_lowercase()),
             "duplicate filesystem path",
         )?;
         let mut prefix = String::new();
@@ -128,7 +131,7 @@ pub(crate) fn validate_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Re
                 prefix.push('/');
             }
             prefix.push_str(part);
-            if let Some(prior) = spelling.insert(prefix.to_ascii_lowercase(), prefix.clone()) {
+            if let Some(prior) = spelling.insert(prefix.to_lowercase(), prefix.clone()) {
                 require(prior == prefix, "case-ambiguous filesystem component")?;
             }
         }
@@ -136,7 +139,7 @@ pub(crate) fn validate_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Re
     for path in paths {
         for (index, _) in path.match_indices('/') {
             require(
-                !leaves.contains(&path[..index].to_ascii_lowercase()),
+                !leaves.contains(&path[..index].to_lowercase()),
                 "file/directory path conflict",
             )?;
         }
@@ -505,7 +508,7 @@ impl Manifest {
             artifact.content.validate(true)?;
             require(
                 ids.insert(&artifact.id)
-                    && paths.insert(artifact.content.path.as_str().to_ascii_lowercase()),
+                    && paths.insert(artifact.content.path.as_str().to_lowercase()),
                 "duplicate artifact ID or case-ambiguous path",
             )?;
         }
@@ -610,7 +613,7 @@ impl EvaluationResult {
         for artifact in &self.artifacts {
             artifact.validate(false)?;
             require(
-                paths.insert(artifact.path.as_str().to_ascii_lowercase()),
+                paths.insert(artifact.path.as_str().to_lowercase()),
                 "duplicate output artifact path",
             )?;
         }

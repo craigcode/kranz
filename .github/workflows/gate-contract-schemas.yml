@@ -24,3 +24,5 @@ jobs:
             --only-binary=:all: --require-hashes -r scripts/requirements-gate-schemas.txt
       - name: Validate gate contract schemas and synthetic fixtures
         run: '"$RUNNER_TEMP/kranz-gate-schema-venv/bin/python" scripts/check-gate-contract.py'
+      - name: Verify retained ACP adapter locks and proof checks
+        run: python3 scripts/check-acp-receipts.py

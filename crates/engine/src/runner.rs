@@ -111,6 +111,7 @@ pub enum PermissionNotice {
         crate::live_permission::PermissionResponder,
     ),
     Responded(String, crate::live_permission::Delivery),
+    Progress,
     Finished,
 }
 
@@ -135,6 +136,14 @@ impl LogTarget<'_> {
         Ok(())
     }
 
+    async fn flush_progress(&mut self, run_id: &str, cwd: &std::path::Path) -> Result<()> {
+        if matches!(self, LogTarget::Controlled { events, .. } if !events.is_empty()) {
+            self.permission_notice(PermissionNotice::Progress, run_id, cwd)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn permission_notice(
         &mut self,
         notice: PermissionNotice,
@@ -151,10 +160,6 @@ impl LogTarget<'_> {
                 "live consent requires an engine-owned permission relay".into(),
             ));
         };
-        if matches!(notice, PermissionNotice::Finished) && !*relayed {
-            return Ok(());
-        }
-        *relayed = true;
         let (persisted, acknowledged) = tokio::sync::oneshot::channel();
         let packet = PermissionPacket {
             events: std::mem::take(events),
@@ -182,6 +187,7 @@ impl LogTarget<'_> {
         })
         .await
         .map_err(|_| EngineError::Backend("permission persistence timed out".into()))??;
+        *relayed = true;
         Ok(())
     }
 }
@@ -407,6 +413,8 @@ pub async fn run_session_to(
         transcript_path: MissionPaths::transcript_rel(&run_meta.run_id),
     })?;
 
+    log.flush_progress(&run_meta.run_id, &spec.cwd).await?;
+
     // Egress proxy (3.3a): an fs+net session whose sandbox routes through the
     // filtering proxy gets its env pointed at the proxy BEFORE spawn. A proxy
     // that cannot start fails the run closed here — the session never
@@ -443,6 +451,14 @@ pub async fn run_session_to(
             transcript: &mut transcript,
         };
         loop {
+            // Bound memory and apply backpressure through the sole event writer,
+            // including turns that never ask for a permission.
+            if matches!(sink.log, LogTarget::Controlled { events, .. } if events.len() >= 32) {
+                sink.log
+                    .flush_progress(&run_meta.run_id, &permission_cwd)
+                    .await?;
+                sink.transcript.flush()?;
+            }
             let step = match &cancel {
                 Some(notify) if !cancelled => tokio::select! {
                     biased;
@@ -605,6 +621,10 @@ pub async fn run_session_to(
     // remains the authoritative layer (hook_gates module docs).
     for kind in crate::hook_gates::records_to_events(&hook_gate_session_id, &run_meta.run_id) {
         log.record(kind)?;
+        if matches!(log, LogTarget::Controlled { events, .. } if events.len() >= 32) {
+            log.flush_progress(&run_meta.run_id, &permission_cwd)
+                .await?;
+        }
     }
 
     // Runtime-evidence projection (ticket validator-runtime-evidence-
@@ -987,10 +1007,13 @@ pub async fn run_worker_in(
         touch_set,
         executor_route,
         standards_pin,
-    )?;
+    )
+    .await?;
     let mut target = LogTarget::Live(log);
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    drop(sgian);
+    if let Some(guard) = sgian {
+        guard.close().await;
+    }
     outcome
 }
 
@@ -1093,7 +1116,8 @@ pub(crate) async fn run_worker_in_buffered_controlled(
         touch_set,
         executor_route,
         standards_pin,
-    )?;
+    )
+    .await?;
     let run_id = run_meta.run_id.clone();
     let mut target = match relay {
         Some(relay) => LogTarget::Controlled {
@@ -1104,8 +1128,28 @@ pub(crate) async fn run_worker_in_buffered_controlled(
         None => LogTarget::Buffer(Vec::new()),
     };
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    drop(sgian);
+    if let Some(guard) = sgian {
+        guard.close().await;
+    }
     if matches!(target, LogTarget::Controlled { .. }) {
+        if let Err(error) = &outcome {
+            if matches!(target, LogTarget::Controlled { relayed: true, .. }) {
+                // A transport failure still leaves a durable, failed run and all
+                // events captured before it. It must not disappear with the buffer.
+                target.record(EventKind::WorkerMessage {
+                    run_id: run_id.clone(),
+                    tag: "error".into(),
+                    content: scrub::scrub_and_truncate(&error.to_string(), MESSAGE_CONTENT_MAX),
+                })?;
+                target.record(EventKind::WorkerCompleted {
+                    run_id: run_id.clone(),
+                    result: RunResult::Fail,
+                    tokens: TokenUsage::default(),
+                    cost_usd: None,
+                    report: None,
+                })?;
+            }
+        }
         target
             .permission_notice(PermissionNotice::Finished, &run_id, session_cwd)
             .await?;
@@ -1228,7 +1272,7 @@ fn seed_worker_env(
 /// exactly as before; an empty set projects nothing (the sweep's
 /// advisory-off posture).
 #[allow(clippy::too_many_arguments)]
-fn build_worker_spec(
+async fn build_worker_spec(
     cfg: &MissionConfig,
     repo_root: &std::path::Path,
     mission_id: &str,
@@ -1418,15 +1462,15 @@ fn build_worker_spec(
         }
     }
 
-    // Sgian coordination lane: when a Sgian daemon serves the repository,
-    // the run identifies itself there as `kranz:<run-id>` through a
-    // credential the engine issues now and revokes when the run ends
-    // (`crate::sgian`). Absent daemon or binary is the common case and a
-    // byte-identical session.
-    let sgian = crate::sgian::issue(repo_root, &run_id).map(|(credential, token)| {
-        crate::sgian::seed_env(&mut spec.env, token);
-        crate::sgian::RevocationGuard(credential)
-    });
+    // Host coordination authority is opt-in and incompatible with containment.
+    spec.env.remove(crate::sgian::TOKEN_ENV);
+    let sgian =
+        crate::sgian::issue_worker(repo_root, session_cwd, &run_id, role_cfg.sandbox.enforce)
+            .await
+            .map(|(guard, token)| {
+                crate::sgian::seed_env(&mut spec.env, token);
+                guard
+            });
 
     let run_meta = RunMeta {
         backend: Some(cfg.backend_kind(role)),

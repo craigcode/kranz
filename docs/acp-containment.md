@@ -44,8 +44,9 @@ is not qualified. Only that file is copied into a new private HOME, alongside
 engine-authored `config.toml` selecting file-only auth and disabling `plugins`
 and `remote_plugin`. It starts with `NO_BROWSER=1` and
 `INITIAL_AGENT_MODE=read-only`. No other provider configuration is copied. Session refreshes are not written
-back to the selected source file; an expired or superseded login needs operator
-renewal. The engine does not repair it through an interactive fallback.
+back to the selected source file; refresh-token rotation can therefore leave
+the source login superseded, requiring operator renewal. Never copy a worker-
+writable auth file back into the operator home as a repair. The engine does not repair it through an interactive fallback.
 
 For Claude, use profile `claude-acp-0.77.0-arm64-v1`, the same image, and exactly
 `["api.anthropic.com:443", "claude.ai:443"]` as the configured egress list.
@@ -205,6 +206,17 @@ it does not become a successful run. The ledger includes image, supervisor hash,
 owner identity and container name, without recording session environment values
 or host control credentials. This does not make the separate provider credential
 home safe to retain indefinitely after an engine crash.
+
+Containers start by their recorded full ID. A crash between successful create
+and start can leave a never-started container: its guest watchdog has not run.
+The private ownership ledger is recovery evidence, not an automatic reaper.
+Reconcile using the original daemon endpoint, owner label and inspected full ID;
+confirm an empty owned inventory. Never use broad prune or remove by name.
+
+Mount proofs are renewed for each admission against its selected image and current
+Docker context. The engine no longer caches success or failure for the lifetime
+of `kranz serve`; daemon or sharing changes and repaired failures require a fresh
+proof. This adds a container probe to repeated admissions.
 
 Engine `SIGKILL` cannot run a Rust destructor. Lease expiry stops the worker in
 that case, while the private ledger remains as recovery evidence. This does not

@@ -37,7 +37,7 @@
 //!   A log carrying `secret.redacted` audits yields a bundle with
 //!   fingerprints only (test-pinned). Artefact bytes are the one half that
 //!   did NOT cross a write boundary the engine controls — they are ordinary
-//!   files in a worker-writable tree — so [`read_artefact`] scrubs them here,
+//!   files in a worker-writable tree — so bundle assembly scrubs them here,
 //!   as text, and the manifest digests the redacted form (audit H5).
 //! - **Missing evidence is named, never omitted and never an error.** A
 //!   `file:` reference whose bytes are gone (a cleaned `runs/`, a pruned
@@ -260,21 +260,9 @@ fn artefact_bundle_path(reference: &str) -> Option<String> {
 /// open (a racing prune), yields `(Unresolved, None)` — the bundle names
 /// the gap instead of failing.
 ///
-/// The bytes cross [`crate::scrub`] on the way in (audit H5). `events.jsonl`
-/// was redacted at append time; artefacts are ordinary files in a tree a
-/// worker can write, so the bundle applies the boundary itself rather than
-/// inheriting a guarantee only the engine's own writers keep. Without this,
-/// planting a secret in a finished transcript put it in the package the
-/// module contract promises is scrubbed.
-///
-/// Artefacts are handled as TEXT: bytes are decoded lossily
-/// (`from_utf8_lossy`), scrubbed, and the scrubbed text is what ships and
-/// what the manifest digests. A binary artefact therefore travels with
-/// U+FFFD in place of its invalid bytes. That is deliberate: the alternative
-/// — passing non-UTF-8 through verbatim — makes one stray byte an opt-out of
-/// redaction, and every artefact the engine produces (JSONL transcripts,
-/// plan/report markdown, JSON) is text.
-fn read_artefact(mission_dir: &Path, reference: &str) -> (ArtefactStatus, Option<Vec<u8>>) {
+/// Read retained bytes without following links. Internal only: callers verify
+/// any recorded digest before converting to scrubbed text for export.
+fn read_raw_artefact(mission_dir: &Path, reference: &str) -> (ArtefactStatus, Option<Vec<u8>>) {
     let ArtefactResolution::Resolved { path } = resolve_artefact(mission_dir, reference) else {
         return (ArtefactStatus::Unresolved, None);
     };
@@ -284,10 +272,7 @@ fn read_artefact(mission_dir: &Path, reference: &str) -> (ArtefactStatus, Option
         Ok(bytes)
     });
     match read {
-        Ok(bytes) => {
-            let scrubbed = crate::scrub::scrub(&String::from_utf8_lossy(&bytes));
-            (ArtefactStatus::Resolved, Some(scrubbed.into_bytes()))
-        }
+        Ok(bytes) => (ArtefactStatus::Resolved, Some(bytes)),
         Err(_) => (ArtefactStatus::Unresolved, None),
     }
 }
@@ -674,14 +659,11 @@ pub fn assemble_evidence_bundle(
             match descriptor.as_ref().and_then(|d| {
                 crate::contract_controls::pair::retained_bytes(&mission_dir, reference, d)
             }) {
-                Some(bytes) => (
-                    ArtefactStatus::Resolved,
-                    Some(crate::scrub::scrub(&String::from_utf8_lossy(&bytes)).into_bytes()),
-                ),
+                Some(bytes) => (ArtefactStatus::Resolved, Some(bytes)),
                 None => (ArtefactStatus::Unresolved, None),
             }
         } else {
-            read_artefact(&mission_dir, reference)
+            read_raw_artefact(&mission_dir, reference)
         };
         if let Some(expected) = gate_expected.get(reference) {
             let matches =
@@ -697,6 +679,10 @@ pub fn assemble_evidence_bundle(
                 bytes = None;
             }
         }
+        // Export still redacts every artefact, including binary data. The
+        // manifest identifies these exported bytes, not the original input.
+        let bytes =
+            bytes.map(|bytes| crate::scrub::scrub(&String::from_utf8_lossy(&bytes)).into_bytes());
         match artefact_bundle_path(reference).zip(bytes) {
             Some((path, bytes)) => {
                 artefact_entries.push(ManifestEntry {

@@ -60,6 +60,14 @@ impl Proposal {
         Ok(())
     }
 
+    /// Check source values, including JSON keys and adapter option labels.
+    /// Kept out of historical validation so old event logs still replay.
+    pub fn ambiguous_display(&self) -> bool {
+        serde_json::to_value(self)
+            .map(|value| crate::presentation::has_ambiguous_json(&value))
+            .unwrap_or(true)
+    }
+
     /// IDs are opaque. Only a unique, offered, one-time kind supplies semantics.
     pub fn option(&self, allow: bool) -> Option<String> {
         let mut ids = std::collections::BTreeSet::new();
@@ -132,6 +140,13 @@ impl Request {
         })
     }
 
+    pub fn ambiguous_display(&self) -> bool {
+        self.proposal.ambiguous_display()
+            || serde_json::to_value(&self.binding)
+                .map(|value| crate::presentation::has_ambiguous_json(&value))
+                .unwrap_or(true)
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.proposal.validate()?;
         self.binding.validate()?;
@@ -199,7 +214,8 @@ impl Record {
         if !self.pending(now)
             || self.request.binding_digest != binding_digest
             || (allow
-                && (self.request.proposal.prohibition.is_some()
+                && (self.request.ambiguous_display()
+                    || self.request.proposal.prohibition.is_some()
                     || self.request.proposal.option(true).is_none()))
         {
             return Err(EngineError::InvalidState(
@@ -308,6 +324,11 @@ impl PermissionResponder {
     /// The caller must durably record the matching resolution before queuing.
     /// Queued is not sent: the session emits a separate delivery receipt.
     pub fn respond(&self, proposal: &Proposal, allow: bool) -> Result<()> {
+        if allow && (proposal.ambiguous_display() || proposal.prohibition.is_some()) {
+            return Err(EngineError::InvalidState(
+                "ambiguous or prohibited permission cannot be allowed".into(),
+            ));
+        }
         self.0
             .try_send(Answer {
                 proposal: proposal.clone(),

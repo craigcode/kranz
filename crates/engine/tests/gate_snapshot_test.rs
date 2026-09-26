@@ -232,6 +232,9 @@ fn gate_snapshot_portable_dotfiles_and_spaces_keep_traversal_and_alias_denials()
         "inputs/../escape",
         "inputs/./file",
         "inputs/CON.txt",
+        "inputs/COM¹.txt",
+        "inputs/CONIN$",
+        "inputs/a\u{202e}b",
         "inputs/file.",
         "inputs/file ",
         "inputs/ file",
@@ -291,4 +294,101 @@ fn gate_snapshot_excludes_nested_credentials_and_private_pem_but_keeps_public_ce
     // Becoming private changes the selection binding, even if HEAD stays fixed.
     std::fs::write(dir.path().join("tls/public.pem"), key("EC PRIVATE KEY")).unwrap();
     assert!(snapshot.verify_current(&repo).is_err());
+}
+
+#[test]
+fn gate_snapshot_acceptance_refuses_hidden_flags_dirty_bytes_and_excluded_changes() {
+    let (dir, repo) = repo();
+    let base = repo.head_sha().unwrap();
+    std::fs::write(dir.path().join("tracked.rs"), "uncommitted replacement").unwrap();
+    let snapshot = SourceSnapshot::capture(&repo, &base).unwrap();
+    assert!(snapshot
+        .verify_candidate(&repo, "m-fixture")
+        .unwrap_err()
+        .contains("committed candidate"));
+    git(
+        dir.path(),
+        &["update-index", "--skip-worktree", "tracked.rs"],
+    );
+    assert!(SourceSnapshot::capture(&repo, &base)
+        .unwrap_err()
+        .contains("hidden index"));
+    git(
+        dir.path(),
+        &["update-index", "--no-skip-worktree", "tracked.rs"],
+    );
+    git(dir.path(), &["checkout", "--", "tracked.rs"]);
+    std::fs::write(dir.path().join("untracked.rs"), "uncommitted dependency").unwrap();
+    let snapshot = SourceSnapshot::capture(&repo, &base).unwrap();
+    assert!(snapshot
+        .verify_candidate(&repo, "m-fixture")
+        .unwrap_err()
+        .contains("untracked path"));
+    std::fs::remove_file(dir.path().join("untracked.rs")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/.config")).unwrap();
+    std::fs::write(dir.path().join("src/.config/payload.rs"), "hidden source").unwrap();
+    std::fs::write(
+        dir.path().join("tracked.rs"),
+        format!("// source\n-----BEGIN {}-----\n", "PRIVATE KEY"),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "candidate"]);
+    let snapshot = SourceSnapshot::capture(&repo, &base).unwrap();
+    let error = snapshot.verify_candidate(&repo, "m-fixture").unwrap_err();
+    assert!(
+        error.contains("src/.config/payload.rs") && error.contains("tracked.rs"),
+        "{error}"
+    );
+    assert!(!snapshot
+        .files
+        .values()
+        .any(|b| b.windows(13).any(|v| v == b"hidden source")));
+}
+
+#[test]
+fn gate_snapshot_acceptance_supports_web_and_unicode_paths() {
+    let (dir, repo) = repo();
+    let base = repo.head_sha().unwrap();
+    for name in [
+        "src/[id].tsx",
+        "src/+page.svelte",
+        "@types/index.ts",
+        "café.rs",
+        "日本語.rs",
+    ] {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "source").unwrap();
+    }
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "ordinary filenames"]);
+    SourceSnapshot::capture(&repo, &base)
+        .unwrap()
+        .verify_candidate(&repo, "m-fixture")
+        .unwrap();
+}
+
+#[test]
+fn gate_snapshot_detected_json_credentials_do_not_become_source_evidence() {
+    let (dir, repo) = repo();
+    let base = repo.head_sha().unwrap();
+    let credential = format!("ghp_{}", "Ab7Cd9Ef2".repeat(5));
+    assert!(!kranz_engine::scrub::scan_text(&credential).is_empty());
+    let bytes = serde_json::to_vec(&serde_json::json!({"credential":credential})).unwrap();
+    std::fs::write(dir.path().join("credentials.json"), &bytes).unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "credential fixture"]);
+    let snapshot = SourceSnapshot::capture(&repo, &base).unwrap();
+    assert!(snapshot
+        .excluded_paths
+        .contains(&"credentials.json".to_string()));
+    assert!(snapshot
+        .verify_candidate(&repo, "m-fixture")
+        .unwrap_err()
+        .contains("credentials.json"));
+    assert!(snapshot
+        .files
+        .values()
+        .all(|v| !String::from_utf8_lossy(v).contains(&credential)));
 }

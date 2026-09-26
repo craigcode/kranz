@@ -985,6 +985,12 @@ impl GitRepo {
         if !self.is_clean_tracked()? {
             return Ok(false);
         }
+        self.has_normal_index_entries()
+    }
+
+    /// Read index flags without invoking repository hooks or refreshing away
+    /// evidence of hidden working-tree changes.
+    pub(crate) fn has_normal_index_entries(&self) -> Result<bool> {
         Ok(self
             .run_seeing_fsmonitor(&["ls-files", "-v", "-f"])?
             .lines()

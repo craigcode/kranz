@@ -3,7 +3,7 @@ state: open
 title: Qualify Sgian panes over the contained terminal provider
 priority: 3
 schedule: once
-blocked-by: [acp-contained-terminal-provider]
+blocked-by: [acp-resource-budget-qualification, acp-contained-terminal-provider]
 ---
 
 ## Goal
