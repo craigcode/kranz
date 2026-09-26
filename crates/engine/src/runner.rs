@@ -33,10 +33,10 @@
 //! separate files, not the single-writer log, so they are written live in both
 //! modes.
 //!
-//! ACP uses `LogTarget::Controlled`: a permission notice relays the run's
-//! preceding buffer to the engine and awaits only its durability acknowledgement.
+//! ACP uses `LogTarget::Controlled`: bounded progress and permission notices
+//! relay preceding events to the engine and await its durability acknowledgement.
 //! The engine remains the sole writer while sessions continue pumping output
-//! during human waits. Runs without permission notices retain deferred replay.
+//! during human waits. Only `LogTarget::Buffer` retains deferred replay.
 
 use crate::auth_verify::AuthVerdict;
 use crate::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
