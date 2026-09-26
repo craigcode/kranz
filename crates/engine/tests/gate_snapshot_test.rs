@@ -375,7 +375,7 @@ fn gate_snapshot_detected_json_credentials_do_not_become_source_evidence() {
     let base = repo.head_sha().unwrap();
     let credential = format!("ghp_{}", "Ab7Cd9Ef2".repeat(5));
     assert!(!kranz_engine::scrub::scan_text(&credential).is_empty());
-    let bytes = serde_json::to_vec(&serde_json::json!({"credential":credential})).unwrap();
+    let bytes = serde_json::to_vec(&serde_json::json!({"value":credential})).unwrap();
     std::fs::write(dir.path().join("credentials.json"), &bytes).unwrap();
     git(dir.path(), &["add", "."]);
     git(dir.path(), &["commit", "-qm", "credential fixture"]);
