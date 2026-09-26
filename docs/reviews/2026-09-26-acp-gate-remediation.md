@@ -83,3 +83,11 @@ guest execution; its expected nonzero result is inconclusive as isolation
 evidence. [Container denial receipts](../../.kranz/tickets/container-denial-proof-receipts.md)
 tracks making that distinction mandatory. The changed ACP containment proofs
 have separate positive execution and owned-cleanup checks.
+
+The corrected Windows fixtures passed, but the server lifecycle test binary
+then overflowed a Tokio worker stack. The hosted lifecycle also reproduced the
+overflow locally on a 1 MiB worker stack. Heap-pinning the feature-execution
+future at the mission-loop boundary made that same local probe pass. The REST
+lifecycle regression now explicitly uses a 1 MiB runtime stack (2 MiB on
+Windows, its native default); production thread limits are unchanged. Full
+workspace and cross-platform checks must pass again before release.

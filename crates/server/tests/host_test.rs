@@ -1320,8 +1320,22 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
 // Hosted lifecycle: goal → conversation → plan → approve → start → COMPLETE
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn hosted_lifecycle_reaches_complete_without_a_terminal() {
+#[test]
+fn hosted_lifecycle_reaches_complete_without_a_terminal() {
+    // Windows debug frames overflowed the default 2 MiB worker stack. Use
+    // that budget there and 1 MiB elsewhere to reproduce the same regression
+    // on macOS without changing the compiler or other tests' thread stacks.
+    let stack_bytes = if cfg!(windows) { 2 << 20 } else { 1 << 20 };
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(stack_bytes)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(hosted_lifecycle());
+}
+
+async fn hosted_lifecycle() {
     if !setup() {
         return;
     }

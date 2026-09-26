@@ -2898,7 +2898,9 @@ impl MissionEngine {
             }
 
             match next_feature(&self.state.mission.milestones[mi]) {
-                Some(fi) => self.run_feature(mi, fi).await?,
+                // Keep the worker/permission state machine off the enclosing
+                // mission future's stack, including on Windows runtime threads.
+                Some(fi) => Box::pin(self.run_feature(mi, fi)).await?,
                 None => self.validation_round(mi).await?,
             }
         }

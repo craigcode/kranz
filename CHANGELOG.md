@@ -22,6 +22,8 @@ Notable user-visible changes are documented here. This project follows
 - Check configured credentials across adjacent ACP text chunks; verify retained
   evidence digests before export redaction. Added offline adapter-lock receipt
   checks and refusal to run proof checkers under optimized Python.
+- Keep feature-execution futures on the heap to avoid exhausting hosted mission
+  runtime stacks; the full REST lifecycle has a bounded-stack regression check.
 
 
 - Extract bounded ACP v1 framing and session protocol into `kranz-acp`, with a
