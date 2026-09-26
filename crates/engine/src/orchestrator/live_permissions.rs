@@ -557,6 +557,7 @@ mod tests {
 
     #[test]
     fn live_permission_ambiguous_values_cannot_be_allowed_but_old_requests_still_validate() {
+        let workspace = tempfile::tempdir().unwrap();
         for hidden in ["\u{202e}", "\u{200b}", "\u{1b}", "\r"] {
             let mut proposal = proposal("s-1");
             proposal.action = json!({"command":format!("npm {hidden}test")});
@@ -566,7 +567,7 @@ mod tests {
                 live_permission::Binding {
                     mission_id: "m-1".into(),
                     run_id: "run-1".into(),
-                    workspace: "/workspace".into(),
+                    workspace: workspace.path().display().to_string(),
                     plan_digest: "a".repeat(64),
                     policy_digest: "b".repeat(64),
                 },

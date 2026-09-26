@@ -596,6 +596,7 @@ fn permission_card_escapes_hidden_text_and_never_offers_allow() {
     use kranz_engine::live_permission::{self, Binding, Proposal, Request};
     use serde_json::json;
     let now = chrono::Utc::now();
+    let workspace = tempfile::tempdir().unwrap();
     let action = json!({"rawInput":{"command":"npm \u{202e}\u{200b}test"}});
     let options = vec![json!({"optionId":"allow","kind":"allow_once"})];
     let request = Request::new(
@@ -616,7 +617,7 @@ fn permission_card_escapes_hidden_text_and_never_offers_allow() {
         Binding {
             mission_id: "m-1".into(),
             run_id: "run-1".into(),
-            workspace: "/workspace".into(),
+            workspace: workspace.path().display().to_string(),
             plan_digest: "a".repeat(64),
             policy_digest: "b".repeat(64),
         },

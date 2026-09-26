@@ -70,5 +70,16 @@ corrected without relaxing production checks. Colima refused macOS's unshared
 default temporary root; explicit proofs use dedicated shared home directories.
 One unchanged native-Claude subprocess fixture timed out at 30 seconds, then
 passed alone and with its complete 40-test group (one ignored live smoke).
-The cause of that single timeout is unconfirmed; a full rerun uses eight test
-threads, and CI retains its normal platform configuration.
+The cause of that single timeout is unconfirmed. An eight-thread workspace run
+then encountered a Docker mount-proof control timeout; the same synthetic ACP
+proof passed in the serial rerun. CI retains its normal platform configuration.
+Windows CI identified two Unix-only authority fixture paths and a checkout
+fixture inheriting global CRLF conversion that the hardened reader deliberately
+ignores. Temporary absolute paths and an explicit local line-ending setting fix
+those fixtures without relaxing production refusal checks.
+
+One unchanged local legacy container denial subprobe timed out before proving
+guest execution; its expected nonzero result is inconclusive as isolation
+evidence. [Container denial receipts](../../.kranz/tickets/container-denial-proof-receipts.md)
+tracks making that distinction mandatory. The changed ACP containment proofs
+have separate positive execution and owned-cleanup checks.

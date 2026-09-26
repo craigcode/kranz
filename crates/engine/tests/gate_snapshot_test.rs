@@ -25,6 +25,9 @@ fn git(root: &Path, args: &[&str]) {
 fn repo() -> (tempfile::TempDir, GitRepo) {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-b", "main"]);
+    // The hardened reader ignores global config; fixture checkout must use
+    // the same byte-preserving behavior even on Windows hosts with autocrlf.
+    git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.name", "Fixture"]);
     git(
         dir.path(),
@@ -320,10 +323,8 @@ fn gate_snapshot_acceptance_refuses_hidden_flags_dirty_bytes_and_excluded_change
     git(dir.path(), &["checkout", "--", "tracked.rs"]);
     std::fs::write(dir.path().join("untracked.rs"), "uncommitted dependency").unwrap();
     let snapshot = SourceSnapshot::capture(&repo, &base).unwrap();
-    assert!(snapshot
-        .verify_candidate(&repo, "m-fixture")
-        .unwrap_err()
-        .contains("untracked path"));
+    let error = snapshot.verify_candidate(&repo, "m-fixture").unwrap_err();
+    assert!(error.contains("untracked path"), "{error}");
     std::fs::remove_file(dir.path().join("untracked.rs")).unwrap();
     std::fs::create_dir_all(dir.path().join("src/.config")).unwrap();
     std::fs::write(dir.path().join("src/.config/payload.rs"), "hidden source").unwrap();

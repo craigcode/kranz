@@ -292,6 +292,7 @@ Sgian owns pane presentation, while Kranz owns mission authority and evidence.
 - [x] [Contained terminal-provider contract](../.kranz/tickets/acp-contained-terminal-provider.md) — [synthetic proof and review](reviews/2026-09-25-contained-acp-terminals.md); production admission remains closed.
 - [ ] [ACP recovery and credential lifecycle](../.kranz/tickets/acp-recovery-and-credential-lifecycle.md).
 - [ ] [ACP resource-budget qualification](../.kranz/tickets/acp-resource-budget-qualification.md), before Sgian terminal rollout.
+- [ ] [Conclusive container denial proof receipts](../.kranz/tickets/container-denial-proof-receipts.md).
 - [ ] [Sgian integration qualification](../.kranz/tickets/acp-sgian-terminal-qualification.md).
 - [ ] [Pinned adapter qualification](../.kranz/tickets/acp-terminal-adapter-qualification.md).
 
