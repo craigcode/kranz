@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-25
+last_verified: 2026-09-26
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -39,6 +39,11 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-09-26: the controlled worker relay now persists progress batches
+without waiting for consent. External acceptance refuses omitted changed source,
+hidden index flags and uncommitted candidate inputs. Approval controls refuse
+ambiguous text; Sgian issuance requires explicit opt-in and enforcement off.
 
 ## The one invariant
 
