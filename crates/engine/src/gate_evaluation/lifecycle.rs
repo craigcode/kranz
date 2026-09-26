@@ -326,7 +326,7 @@ fn validate_artifacts(artifacts: &[RetainedArtifact]) -> Result<(), String> {
     for artifact in artifacts {
         if artifact.retained_bytes > 64 * 1024 * 1024
             || !artifact.path.as_str().starts_with("runs/gates/")
-            || !names.insert(artifact.path.as_str().to_ascii_lowercase())
+            || !names.insert(artifact.path.as_str().to_lowercase())
         {
             return Err("invalid retained gate artifact".into());
         }

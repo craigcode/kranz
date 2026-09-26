@@ -2816,19 +2816,24 @@ async fn run_worker_issues_and_revokes_a_sgian_credential() {
         assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed;"));
         return;
     }
-    verify_worker_sgian_revocation(false).await;
-    verify_worker_sgian_revocation(true).await;
+    verify_worker_sgian_revocation(false, false).await;
+    verify_worker_sgian_revocation(true, false).await;
+    verify_worker_sgian_revocation(false, true).await;
 }
 
 #[cfg(unix)]
-async fn verify_worker_sgian_revocation(drop_running: bool) {
+async fn verify_worker_sgian_revocation(drop_running: bool, enforced: bool) {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
-    let cfg = MissionConfig::default();
+    let mut cfg = MissionConfig::default();
+    if enforced {
+        cfg.worker.sandbox.enforce = kranz_engine::types::SandboxEnforce::Fs;
+    }
     let calls = dir.path().join("sgian-calls");
-    let fake = dir.path().join("sgian");
+    let installed = tempfile::tempdir().unwrap();
+    let fake = installed.path().join("sgian");
     std::fs::write(
         &fake,
         format!(
@@ -2882,9 +2887,34 @@ async fn verify_worker_sgian_revocation(drop_running: bool) {
         .unwrap();
         drop(run);
     } else {
-        run.await.unwrap();
+        let result = run.await;
+        if !enforced {
+            result.unwrap();
+        }
     }
     std::env::remove_var(kranz_engine::sgian::BIN_ENV);
+
+    if enforced {
+        assert!(
+            !calls.exists(),
+            "an enforced worker must not issue a host credential"
+        );
+        assert!(backend
+            .started_specs()
+            .iter()
+            .all(|spec| !spec.env.contains_key(kranz_engine::sgian::TOKEN_ENV)));
+        return;
+    }
+    timeout(HANG_PROOF, async {
+        while !std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .contains("identity revoke")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 
     let run_id = read_log(&p)
         .into_iter()

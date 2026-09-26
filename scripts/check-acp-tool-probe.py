@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Real-container, synthetic-peer qualification of shell-once. Never uses a vendor."""
+if not __debug__:
+    raise SystemExit("ACP proof checks require assertions; disable PYTHONOPTIMIZE and -O")
+
 import json
 import os
 from pathlib import Path

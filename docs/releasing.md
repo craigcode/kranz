@@ -22,7 +22,9 @@ Complete `docs/public-readiness.md`. In particular:
 - the old v0.1.0 release remains only in the private archive, or is withdrawn
   or visibly marked unsupported on an approved in-place route;
 - the repository is public and an anonymous clone has been verified;
-- all four reserved crates.io names are controlled by the expected owners;
+- existing crates.io names are controlled by the expected owners, and any new
+  name is available for the operator-approved first publication (currently
+  `kranz-acp`);
 - the `release` GitHub environment requires owner approval;
 - the repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`;
   and

@@ -153,6 +153,13 @@ class GateV1Contract(unittest.TestCase):
                     count += 1
         self.assertEqual(count, 15)
 
+    def test_gate_contract_v1_web_and_unicode_paths_keep_traversal_denials(self):
+        path = Draft202012Validator(schemas['urn:kranz:gate:common:1']['$defs']['path'])
+        for name in ['src/[id].tsx', 'src/+page.svelte', '@types/index.ts', 'café.rs', '日本語.rs']:
+            self.assertTrue(path.is_valid(name), name)
+        for name in ['../bad', '/absolute', 'a/./b', 'a//b', 'C:/drive', 'a\\b', 'a\nb', 'a\u202eb', 'a ', 'a.']:
+            self.assertFalse(path.is_valid(name), repr(name))
+
     def test_gate_contract_v1_stage_subject_mismatch_is_invalid(self):
         request, _, _ = self.example()
         for stage in ['plan-approval','command-permission','final-gate','merge']:

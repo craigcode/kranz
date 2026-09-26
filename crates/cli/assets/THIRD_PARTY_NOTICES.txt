@@ -6878,11 +6878,11 @@ SOFTWARE.
 ================================================================================
 MIT License (MIT)
 Used by:
-- kranz-acp 0.4.1 <https://github.com/craigcode/kranz>
-- kranz 0.4.1 <https://github.com/craigcode/kranz>
-- kranz-engine 0.4.1 <https://github.com/craigcode/kranz>
-- kranz-server 0.4.1 <https://github.com/craigcode/kranz>
-- kranz-slack 0.4.1 <https://github.com/craigcode/kranz>
+- kranz-acp 0.4.2 <https://github.com/craigcode/kranz>
+- kranz 0.4.2 <https://github.com/craigcode/kranz>
+- kranz-engine 0.4.2 <https://github.com/craigcode/kranz>
+- kranz-server 0.4.2 <https://github.com/craigcode/kranz>
+- kranz-slack 0.4.2 <https://github.com/craigcode/kranz>
 
 MIT License
 

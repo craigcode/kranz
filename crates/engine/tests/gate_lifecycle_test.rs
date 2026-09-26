@@ -278,7 +278,7 @@ fn gate_lifecycle_bundle_names_missing_and_changed_retained_bytes() {
     let paths = MissionPaths::new(dir.path(), "m-lifecycle");
     let folder = paths.runs_dir().join("gates/attempt-1");
     std::fs::create_dir_all(&folder).unwrap();
-    let retained = b"checked output [REDACTED]\n";
+    let retained = b"checked output [REDACTED]\n\xff";
     std::fs::write(folder.join("present.txt"), retained).unwrap();
     let mut request = requested("plan-approval");
     request.retained_inputs = ["present.txt", "missing.txt"]
@@ -341,7 +341,7 @@ fn gate_lifecycle_bundle_names_missing_and_changed_retained_bytes() {
                 .find(|file| Some(&file.path) == entry.path.as_ref())
                 .unwrap()
                 .bytes;
-            assert_eq!(bytes, retained);
+            assert_eq!(bytes, String::from_utf8_lossy(retained).as_bytes());
             assert_eq!(
                 format!("sha256:{}", entry.sha256.as_ref().unwrap()),
                 Digest::of(bytes).as_str()

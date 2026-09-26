@@ -354,7 +354,12 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                         .values()
                         .filter(|r| r.pending(now))
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&requests)?);
+                    println!(
+                        "{}",
+                        kranz_engine::presentation::visible(&serde_json::to_string_pretty(
+                            &requests
+                        )?)
+                    );
                 }
                 PermissionCommand::Allow {
                     id,

@@ -43,7 +43,7 @@ in configuration. Other backends have role and sandbox restrictions; run
 `kranz ready` before the first mission.
 
 ```sh
-cargo install kranz --version 0.4.1 --locked
+cargo install kranz --version 0.4.2 --locked
 cd /path/to/your/repo             # must be a git repo
 
 # 0. Onboard the repo. This detects common Rust/Node/Python gates, adds the
@@ -84,17 +84,17 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 ## Install
 
 **With Cargo.** Install the published
-[v0.4.1 release](https://crates.io/crates/kranz/0.4.1), including the embedded
+[v0.4.2 release](https://crates.io/crates/kranz/0.4.2), including the embedded
 web dashboard:
 
 ```sh
-cargo install kranz --version 0.4.1 --locked
+cargo install kranz --version 0.4.2 --locked
 ```
 
-Most users install only `kranz`; Cargo builds its three library dependencies
+Most users install only `kranz`; Cargo builds its library dependencies
 automatically.
 
-**Prebuilt binaries.** [Download v0.4.1 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.4.1)
+**Prebuilt binaries.** [Download v0.4.2 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.4.2)
 for Linux x86_64, macOS Apple Silicon or Intel, and Windows ARM64 or x86_64.
 Extract the archive and put `kranz` (`kranz.exe` on Windows) on your `PATH`.
 The release includes checksums, build provenance attestations, an SBOM, and
@@ -125,9 +125,10 @@ through the ambient environment. See [Agent backends](docs/agent-backends.md),
 then run `kranz ready` before the first mission.
 
 When the repository is also served by a [Sgian](https://github.com/craigcode/sgian)
-daemon, each worker run identifies itself there as `kranz:<run-id>` with a
-credential the engine issues before the session and revokes after it. The lane
-is silent when `sgian` or its daemon is absent. See
+daemon, uncontained worker runs can opt into a `kranz:<run-id>` credential.
+Set `KRANZ_SGIAN_BIN` to a trusted absolute helper path outside the checkout.
+The lane is off by default and disabled whenever sandbox enforcement is on;
+the engine revokes issued credentials after the session. See
 [Sgian coordination](docs/sgian-coordination.md).
 
 ### Crates and API stability
@@ -137,12 +138,13 @@ are reusable components of the product:
 
 | Crate | Provides |
 |---|---|
-| [`kranz`](https://crates.io/crates/kranz/0.4.1) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
-| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.4.1) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
-| [`kranz-server`](https://crates.io/crates/kranz-server/0.4.1) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
-| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.4.1) | The Slack Socket Mode bridge for operating and observing missions. |
+| [`kranz`](https://crates.io/crates/kranz/0.4.2) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
+| [`kranz-acp`](https://crates.io/crates/kranz-acp/0.4.2) | Bounded ACP v1 framing and session protocol for independent clients. |
+| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.4.2) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
+| [`kranz-server`](https://crates.io/crates/kranz-server/0.4.2) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
+| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.4.2) | The Slack Socket Mode bridge for operating and observing missions. |
 
-The three library crates are public for reuse, but their Rust APIs are early
+The four library crates are public for reuse, but their Rust APIs are early
 and evolving in the v0.4 line. Pin exact versions if embedding them; semantic
 compatibility is not yet promised beyond Cargo's normal pre-1.0 rules.
 

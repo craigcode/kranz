@@ -304,7 +304,10 @@ impl OwnedContainer {
             "start".into(),
             "--attach".into(),
             "--interactive".into(),
-            name,
+            owned
+                .id
+                .clone()
+                .ok_or_else(|| error("created namespace ID missing"))?,
         ]);
         Ok((owned, command))
     }

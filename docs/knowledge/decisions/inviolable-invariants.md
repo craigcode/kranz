@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-25
+last_verified: 2026-09-26
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -37,6 +37,12 @@ verified_against:
 ---
 
 ## What this is
+
+Rechecked 2026-09-26: Sgian write credentials now require explicit operator
+opt-in to an absolute helper outside the checkout and are never issued to
+enforced workers. Approval controls render and refuse ambiguous characters;
+external acceptance requires committed, covered source. Progress batches use
+the existing single writer, and mount admissions re-prove the current image.
 
 Rechecked 2026-09-25 for the shared ACP extraction: framing, bounded readers
 and unique-key decoding move to `kranz-acp`. Engine process supervision,

@@ -1427,3 +1427,32 @@ async fn live_permission_cancel_with_an_unanswered_request_does_not_deadlock() {
     assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
     assert!(!outcome.exists());
 }
+
+#[tokio::test]
+async fn live_permission_unanswered_cannot_complete_without_a_terminal_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        r#"{PEER_PREAMBLE}
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{{"sessionId":"acp-mock-session-1","toolCall":{{"toolCallId":"tc-1","kind":"execute","rawInput":{{"command":"npm test"}}}},"options":[{{"optionId":"allow","kind":"allow_once"}}]}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+      exit 0
+      ;;
+{PEER_SUFFIX}"#
+    );
+    let peer = write_peer(dir.path(), "unanswered.sh", &body);
+    let mut session = AcpBackend::new(peer, vec![])
+        .start(spec(dir.path(), "unanswered", true, &[]))
+        .await
+        .unwrap();
+    let mut requests = 0;
+    while let Some(event) = session.next_event().await.unwrap() {
+        if matches!(event, AgentEvent::PermissionRequested { .. }) {
+            requests += 1;
+        }
+    }
+    assert_eq!(requests, 1);
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Failed(reason)) if reason.contains("unanswered"))
+    );
+}

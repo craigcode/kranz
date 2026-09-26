@@ -170,66 +170,104 @@ struct ToolCallInfo {
     title: String,
     /// Command (`execute`) or path (file kinds) extracted from
     /// `rawInput`/`locations`; the subject glob patterns match against.
-    subject: String,
+    subject: Vec<String>,
 }
 
-/// Extract the matchable subject from a tool-call-shaped value
-/// (`rawInput.command`/`cmd` for execute, `locations[0].path` or
-/// `rawInput.path` for file kinds). Explicit raw input invalidates display
-/// fallback; execute never trusts a title as its command.
-fn tool_call_subject(kind: &str, title: &str, call: &Value) -> String {
-    let raw_input = call.get("rawInput").cloned().unwrap_or(Value::Null);
-    let str_at = |value: &Value, keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| value.get(*k).and_then(Value::as_str).map(str::to_string))
+/// Extract every policy subject. Unsupported or incomplete shapes yield no
+/// subjects, which fails closed whenever a deny rule covers the call kind.
+fn tool_call_subject(kind: &str, title: &str, call: &Value) -> Vec<String> {
+    let raw = call.get("rawInput");
+    let parse = || -> Option<Vec<String>> {
+        let mut subjects = Vec::new();
+        if kind == "execute" {
+            let raw = raw?.as_object()?;
+            for key in ["command", "cmd"] {
+                if let Some(command) = raw.get(key) {
+                    let command = command.as_str()?;
+                    if command.trim().is_empty() {
+                        return None;
+                    }
+                    let mut full = command.to_string();
+                    if let Some(args) = raw.get("args") {
+                        for arg in args.as_array()? {
+                            full.push(' ');
+                            full.push_str(arg.as_str()?);
+                        }
+                    }
+                    subjects.push(full);
+                }
+            }
+        } else {
+            if let Some(locations) = call.get("locations") {
+                for location in locations.as_array()? {
+                    subjects.push(location.get("path")?.as_str()?.to_string());
+                }
+            }
+            if let Some(raw) = raw {
+                let raw = raw.as_object()?;
+                for key in ["path", "filePath", "file_path"] {
+                    if let Some(path) = raw.get(key) {
+                        subjects.push(path.as_str()?.to_string());
+                    }
+                }
+            } else if call.get("locations").is_none() {
+                subjects.push(title.to_string());
+            }
+        }
+        if subjects.iter().any(|s| s.trim().is_empty()) {
+            return None;
+        }
+        Some(subjects)
     };
-    if kind == "execute" {
-        // Display titles and file locations are not executable arguments.
-        return str_at(&raw_input, &["command", "cmd"]).unwrap_or_default();
+    parse().unwrap_or_default()
+}
+
+/// Lexical normalization only; policy never follows a worker-controlled symlink.
+fn normalized_policy_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            ".." if path.starts_with('/') => {}
+            _ => parts.push(part),
+        }
     }
-    if let Some(path) = call
-        .get("locations")
-        .and_then(Value::as_array)
-        .and_then(|locs| locs.first())
-        .and_then(|loc| loc.get("path"))
-        .and_then(Value::as_str)
-    {
-        return path.to_string();
-    }
-    if let Some(path) = str_at(&raw_input, &["path", "filePath", "file_path"]) {
-        return path;
-    }
-    if call.get("rawInput").is_some() || call.get("locations").is_some() {
-        return String::new();
-    }
-    title.to_string()
+    format!(
+        "{}{}",
+        if path.starts_with('/') { "/" } else { "" },
+        parts.join("/")
+    )
 }
 
 /// `*`-wildcard match (a bare `*` spans any text including empty; every
 /// other character matches literally, case-sensitively — shell commands and
 /// paths are case-sensitive on the platforms this guards).
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let parts = pattern.split('*');
-    let anchored_start = !pattern.starts_with('*');
-    let anchored_end = !pattern.ends_with('*');
-    let mut rest = text;
-    let mut first = true;
-    for part in parts {
-        if part.is_empty() {
-            first = false;
-            continue;
-        }
-        match rest.find(part) {
-            Some(idx) if !first || !anchored_start || idx == 0 => {
-                rest = &rest[idx + part.len()..];
-            }
-            _ => return false,
-        }
-        first = false;
+    // Match the final literal from the end before consuming interior pieces.
+    // Taking its first occurrence loses matches such as *--force on a command
+    // containing that suffix more than once.
+    let mut parts: Vec<_> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
     }
-    // After the last literal, a pattern not ending in `*` must end exactly
-    // there (nothing left over).
-    !anchored_end || rest.is_empty()
+    let Some(mut rest) = text.strip_prefix(parts.remove(0)) else {
+        return false;
+    };
+    let Some(prefix) = rest.strip_suffix(parts.pop().unwrap_or_default()) else {
+        return false;
+    };
+    rest = prefix;
+    for part in parts {
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    true
 }
 
 /// Split one claude-shaped permission pattern (`Bash(git push*)`, `Write`,
@@ -296,21 +334,38 @@ fn decide_permission(spec: &SessionSpec, call: &ToolCallInfo) -> PermissionDecis
     {
         return PermissionDecision::Deny("tool call carries an unknown or missing ACP kind".into());
     }
-    if call.subject.trim().is_empty() {
+    if call.subject.is_empty() || call.subject.iter().any(|s| s.trim().is_empty()) {
         if let Some(pattern) = spec
             .disallowed_tools
             .iter()
             .find(|pattern| pattern_covers_kind(pattern, &call.kind))
         {
             return PermissionDecision::Deny(format!(
-                "tool call carries no subject (no rawInput command or path, no locations[0].path, \
-                 no title), so deny pattern {pattern:?} for ACP kind {:?} cannot be evaluated",
+                "tool call carries no complete policy subject, so deny pattern {pattern:?} \
+                 for ACP kind {:?} cannot be evaluated",
                 call.kind
             ));
         }
     }
     for pattern in &spec.disallowed_tools {
-        if pattern_matches(pattern, &call.kind, &call.subject) {
+        let matches = call.subject.iter().any(|subject| {
+            if pattern_matches(pattern, &call.kind, subject) {
+                return true;
+            }
+            if call.kind == "execute" {
+                return false;
+            }
+            let normalized = normalized_policy_path(subject);
+            let absolute = normalized_policy_path(&spec.cwd.join(&normalized).to_string_lossy());
+            let cwd = normalized_policy_path(&spec.cwd.to_string_lossy());
+            let relative = absolute
+                .strip_prefix(&format!("{cwd}/"))
+                .unwrap_or(&normalized);
+            pattern_matches(pattern, &call.kind, &normalized)
+                || pattern_matches(pattern, &call.kind, &absolute)
+                || pattern_matches(pattern, &call.kind, relative)
+        });
+        if matches {
             return PermissionDecision::Deny(format!(
                 "matches SessionSpec.disallowed_tools pattern {pattern:?}"
             ));
@@ -1058,7 +1113,7 @@ impl AcpSession {
                     }
                     if self
                         .profile_home
-                        .as_ref()
+                        .as_mut()
                         .is_some_and(|p| p.contains_secret(&line))
                     {
                         return Err(EngineError::Backend(
@@ -1415,7 +1470,7 @@ impl AcpSession {
             match decide_permission(&self.spec, &info) {
                 PermissionDecision::Allow
                     if !call_update.get("rawInput").is_some_and(Value::is_object)
-                        || info.subject.trim().is_empty() =>
+                        || info.subject.is_empty() =>
                 {
                     PermissionDecision::Deny(
                         "the complete action is unavailable for one-call consent".into(),
@@ -1471,6 +1526,10 @@ impl AcpSession {
                 PermissionDecision::Allow => None,
             },
         };
+        if proposal.ambiguous_display() {
+            proposal.prohibition =
+                Some("permission contains invisible or terminal control characters".into());
+        }
         if proposal.option(true).is_none() && proposal.prohibition.is_none() {
             proposal.prohibition = Some("no unique certified allow_once option was offered".into());
         }
@@ -1736,6 +1795,13 @@ impl AcpSession {
     /// our owned process group. Contained peers terminate under the trusted
     /// supervisor; the Docker client's exit status must arrive before success.
     async fn finish_session(&mut self) {
+        if !self.pending_permissions.is_empty() {
+            self.kill_child().await;
+            self.exit = Some(SessionExit::Failed(
+                "ACP prompt completed with unanswered permission requests".into(),
+            ));
+            return;
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Err(error) = self.close_terminals().await {
             self.kill_child().await;
@@ -1981,6 +2047,57 @@ mod tests {
     }
 
     #[test]
+    fn backend_acp_policy_covers_repeated_suffix_arguments_and_every_normalized_path() {
+        for (pattern, text) in [
+            ("*--force", "git push --force && echo --force"),
+            ("a*a", "aaa"),
+            ("a**b*c", "aabbbc"),
+            ("*é", "é café"),
+        ] {
+            assert!(wildcard_match(pattern, text), "{pattern} {text}");
+        }
+        assert!(!wildcard_match("ab*bc", "abc"));
+        let mut spec = spec_with(true, &["Bash(git push*)", "Write(.env*)"]);
+        spec.cwd = "/repo".into();
+        for (kind, action) in [
+            (
+                "execute",
+                json!({"rawInput":{"command":"git","args":["push","origin"]}}),
+            ),
+            (
+                "execute",
+                json!({"rawInput":{"command":"git","args":"push"}}),
+            ),
+            (
+                "edit",
+                json!({"locations":[{"path":"safe.rs"},{"path":"./x/../.env"}]}),
+            ),
+            (
+                "edit",
+                json!({"locations":[{"path":"safe.rs"}],"rawInput":{"path":"/repo/x/../.env"}}),
+            ),
+            ("edit", json!({"locations":[{"path":"safe.rs"},{}]})),
+        ] {
+            let call = ToolCallInfo {
+                kind: kind.into(),
+                title: "safe".into(),
+                subject: tool_call_subject(kind, "safe", &action),
+            };
+            assert!(
+                matches!(decide_permission(&spec, &call), PermissionDecision::Deny(_)),
+                "{action}"
+            );
+        }
+        let action = json!({"rawInput":{"command":"cargo","args":["test","--workspace"]}});
+        let call = ToolCallInfo {
+            kind: "execute".into(),
+            title: "test".into(),
+            subject: tool_call_subject("execute", "test", &action),
+        };
+        assert_eq!(decide_permission(&spec, &call), PermissionDecision::Allow);
+    }
+
+    #[test]
     fn backend_acp_pattern_matches_maps_claude_names_to_acp_kinds() {
         assert!(pattern_matches(
             "Bash(git push*)",
@@ -2031,7 +2148,7 @@ mod tests {
         let push = ToolCallInfo {
             kind: "execute".to_string(),
             title: "git push origin main".to_string(),
-            subject: "git push origin main".to_string(),
+            subject: vec!["git push origin main".to_string()],
         };
         assert!(matches!(
             decide_permission(&spec, &push),
@@ -2040,7 +2157,7 @@ mod tests {
         let test = ToolCallInfo {
             kind: "execute".to_string(),
             title: "cargo test".to_string(),
-            subject: "cargo test".to_string(),
+            subject: vec!["cargo test".to_string()],
         };
         assert_eq!(decide_permission(&spec, &test), PermissionDecision::Allow);
 
@@ -2049,7 +2166,7 @@ mod tests {
         let edit = ToolCallInfo {
             kind: "edit".to_string(),
             title: "write src/main.rs".to_string(),
-            subject: "/repo/src/main.rs".to_string(),
+            subject: vec!["/repo/src/main.rs".to_string()],
         };
         assert!(matches!(
             decide_permission(&ro, &edit),
@@ -2059,7 +2176,7 @@ mod tests {
         let read = ToolCallInfo {
             kind: "read".to_string(),
             title: "read src/main.rs".to_string(),
-            subject: "/repo/src/main.rs".to_string(),
+            subject: vec!["/repo/src/main.rs".to_string()],
         };
         assert_eq!(decide_permission(&ro, &read), PermissionDecision::Allow);
     }
@@ -2074,13 +2191,13 @@ mod tests {
         let no_subject = ToolCallInfo {
             kind: "execute".to_string(),
             title: String::new(),
-            subject: String::new(),
+            subject: Vec::new(),
         };
         assert!(
             matches!(
                 decide_permission(&spec, &no_subject),
                 PermissionDecision::Deny(ref reason)
-                    if reason.contains("no subject") && reason.contains("Bash(git push*)")
+                    if reason.contains("no complete policy subject") && reason.contains("Bash(git push*)")
             ),
             "got {:?}",
             decide_permission(&spec, &no_subject)
@@ -2088,7 +2205,7 @@ mod tests {
 
         // Whitespace is no subject either.
         let blank_subject = ToolCallInfo {
-            subject: "   ".to_string(),
+            subject: vec!["   ".to_string()],
             ..no_subject.clone()
         };
         assert!(matches!(
@@ -2118,7 +2235,7 @@ mod tests {
             let call = ToolCallInfo {
                 kind: kind.to_string(),
                 title: "do something".to_string(),
-                subject: "/repo/src/main.rs".to_string(),
+                subject: vec!["/repo/src/main.rs".to_string()],
             };
             assert!(
                 matches!(
@@ -2134,7 +2251,7 @@ mod tests {
         let other = ToolCallInfo {
             kind: "other".to_string(),
             title: "think".to_string(),
-            subject: "think".to_string(),
+            subject: vec!["think".to_string()],
         };
         assert!(matches!(
             decide_permission(&writable, &other),

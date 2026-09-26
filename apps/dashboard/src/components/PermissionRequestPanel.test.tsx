@@ -58,6 +58,19 @@ describe('PermissionRequestPanel', () => {
     await waitFor(() => expect(api.answerPermission).toHaveBeenCalledWith('m-1', 'permission-1', 'exact-binding', false));
   });
 
+  it.each(['\u202e', '\u200b', '\u061c', '\r', '\u001b'])('makes unsafe approval text visible and refuses allow (%j)', async (control) => {
+    const record = pending();
+    record.request.proposal.action = { rawInput: { command: `npm ${control}test` } };
+    record.request.binding.workspace += control;
+    show(record);
+    expect(screen.getByText(/invisible or control characters/)).toBeTruthy();
+    expect(document.body.textContent).not.toContain(control);
+    fireEvent.click(screen.getByRole('button', { name: 'Allow once' }));
+    expect(api.answerPermission).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Deny once' }));
+    await waitFor(() => expect(api.answerPermission).toHaveBeenCalledWith('m-1', 'permission-1', 'exact-binding', false));
+  });
+
   it.each(['expired', 'resolved', 'closed'])('hides a %s request', (kind) => {
     const record = pending();
     if (kind === 'expired') record.request.proposal.deadline = new Date(Date.now() - 1).toISOString();

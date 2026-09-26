@@ -746,7 +746,7 @@ fn pending_decisions(
 /// it cannot introduce links to the human API or active markup in a renderer.
 pub fn render_markdown(packet: &ReviewPacket) -> String {
     fn literal(text: &str) -> String {
-        crate::scrub::scrub(text)
+        crate::presentation::visible(&crate::scrub::scrub(text))
             .chars()
             .flat_map(|c| {
                 if "\\`*_{}[]<>()#+-.!|".contains(c) {

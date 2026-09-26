@@ -53,14 +53,14 @@ impl FrozenEvidence {
             return Err("input bytes exceed host limit".into());
         }
         let mut paths = BTreeSet::new();
-        paths.insert(request.params.evidence.path.as_str().to_ascii_lowercase());
+        paths.insert(request.params.evidence.path.as_str().to_lowercase());
         for artifact in &manifest.artifacts {
             let bytes = inputs
                 .get(&artifact.id)
                 .ok_or("manifest input is missing")?;
             if bytes.len() as u64 != artifact.content.bytes
                 || Digest::of(bytes) != artifact.content.digest
-                || !paths.insert(artifact.content.path.as_str().to_ascii_lowercase())
+                || !paths.insert(artifact.content.path.as_str().to_lowercase())
             {
                 return Err("input digest, length or path collision".into());
             }
@@ -207,7 +207,7 @@ impl FrozenEvidence {
             let path = match entry {
                 SnapshotEntry::File { path, .. } | SnapshotEntry::Deleted { path } => path,
             };
-            if !paths.insert(path.as_str().to_ascii_lowercase()) {
+            if !paths.insert(path.as_str().to_lowercase()) {
                 return Err("duplicate snapshot path".into());
             }
             if let SnapshotEntry::File {

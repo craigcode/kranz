@@ -166,7 +166,9 @@ checker/runtime content is separately read-only. S3 must prove these mappings
 and access restrictions before declaring a platform supported.
 
 Wire paths use normalized relative POSIX components under an assigned input or
-output root. Reject empty/dot/dot-dot components, absolute paths, drive/UNC forms,
+output root. Ordinary Unicode names and web-framework names such as `[id].tsx`,
+`+page.svelte` and `@types/index.ts` are supported. Control and invisible direction
+characters are refused. Reject empty/dot/dot-dot components, absolute paths, drive/UNC forms,
 backslashes, NUL, ambiguous case collisions and alternate data streams. The host
 also rejects trailing dots and reserved device components (such as `CON` or
 `NUL.txt`) before mapping these labels to a filesystem. Runtime mapping is
@@ -394,3 +396,21 @@ bindings. Escalation requires investigation and a fresh stage attempt after the
 cause is addressed; these views do not offer an override for blocking failures.
 See the [stage review](reviews/2026-09-18-gate-stage-integration.md) for validation
 and remaining acceptance work.
+
+## Candidate source coverage
+
+External milestone, final and merge acceptance requires a clean tracked candidate
+with normal Git index flags and no untracked source. The exact mission-record
+metadata exception below also applies to untracked records. The source snapshot
+may still represent dirty bytes
+for diagnostic uses, but those bytes cannot stand in for accepted commits.
+Skip-worktree, assume-unchanged and fsmonitor-valid flags refuse capture.
+
+Private path exclusions, PEM markers and engine secret-scanner matches keep
+credentials out of evaluator inputs. A changed excluded source path blocks
+acceptance and names the coverage gap; it does not become a silent exemption or
+send private bytes to the reviewer. The current mission's enumerated plan,
+research and report records and the mission catalog remain metadata represented
+by approved scope and audit evidence, as in the existing deliverable path policy.
+Other files beneath `.kranz/missions` are not exempt. This scanner is defense in
+depth, not detection of every possible secret representation.

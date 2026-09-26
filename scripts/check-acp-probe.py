@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the bounded ACP probe with a deterministic local peer, never a vendor."""
+if not __debug__:
+    raise SystemExit("ACP proof checks require assertions; disable PYTHONOPTIMIZE and -O")
+
 import json, os, pathlib, subprocess, tempfile, sys
 root=pathlib.Path(tempfile.mkdtemp(prefix='kranz-acp-probe-proof-'))
 (root/'peer.py').write_text('''import json,os,sys
