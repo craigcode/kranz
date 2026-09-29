@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-09-29
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,8 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-09-29 (UTC) against the roadmap and scoping cleanup; engineering ownership, the execution freeze and retained evidence features are unchanged.
 
 Rechecked 2026-09-26 against the remediation roadmap. Approval integrity, evidence coverage, container recovery and resource qualification strengthen the existing boundary; they add no prompt optimization or code-generation machinery.
 

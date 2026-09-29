@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-09-29
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -35,6 +35,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-09-29 (UTC) against the public-documentation addition to AGENTS.md; consent, containment, Git and event-log invariants are unchanged.
 
 ## What this is
 
