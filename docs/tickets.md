@@ -4,6 +4,16 @@ How to capture work as tickets, turn them into drafted plans, and execute
 them on demand. This is the usage companion to the design doc
 (docs/backlog-and-slack.md §tickets); commands verified against the CLI.
 
+## Public ticket content
+
+In a public repository, tracked tickets and their discussion sidecars are
+public too, including in source downloads and existing Git history. Write
+self-contained implementation goals, constraints and acceptance criteria.
+Technical source attribution and interoperability requirements belong here;
+competitive strategy and private business analysis belong in a separate,
+access-controlled notes store outside the checkout. Removing a passage in a
+later commit does not remove it from earlier commits or release tags.
+
 ## Where tickets live
 
 One ticket = one plain markdown file in the repo at `.kranz/tickets/<slug>.md`:

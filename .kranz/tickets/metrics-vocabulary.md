@@ -8,12 +8,8 @@ schedule: once
 
 # Publish the trust-metric vocabulary
 
-Source: the competitive analysis (2026-08-02). GitHub Agent HQ brands itself
-Mission Control; the labs ship usage/spend governance; Waydev ships
-cost-per-PR. Everything measures usage, access, spend, and attribution —
-nothing measures whether trust was correctly granted. The counter is
-vocabulary: a platform can copy a dashboard in a quarter, but if the TERMS
-are ours, the copy validates us.
+These metrics describe mission authorization and outcomes. Publish their
+definitions alongside reproducible examples from the event log.
 
 ## Problem
 
@@ -39,8 +35,8 @@ They are not a published, citable vocabulary with worked examples.
    and what the operator decided; also the fine-tune corpus
    (training-corpus-export).
 5. A worked example of each computed from this repo's own event log (the
-   receipts), plus the one-paragraph positioning line: everyone's building
-   the viewing gallery; nobody audits the go/no-go calls.
+   receipts), plus a paragraph explaining how the metrics help an operator
+   inspect authorization decisions and their outcomes.
 
 ## Test gate
 

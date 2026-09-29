@@ -13,10 +13,8 @@ checks — becomes a set of named, deterministic gates at approve and merge
 time, each failing with the class named.
 
 ## Context
-From docs/scoping/governance-evidence-layer.md (KRZ-327) — the wedge: an
-evidenced differentiator (the positioning ADR names it) absent from
-competing maturity framings. The escapes are documented in-repo: the
-m-66aff8 a3 vacuous-filter incident (AGENTS.md anti-vacuity rule), the
+From docs/scoping/governance-evidence-layer.md (KRZ-327). The contract
+defects are documented in-repo: the m-66aff8 a3 vacuous-filter incident (AGENTS.md anti-vacuity rule), the
 SUSPECT classes contract_lint.rs already detects at approval, and
 contract_health.rs tracking. Related tickets:
 contract-smoke-test-at-approval, escalate-contract-authoring-bugs. This

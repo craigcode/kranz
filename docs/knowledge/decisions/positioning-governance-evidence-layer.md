@@ -55,25 +55,18 @@ It does not write code.**
 
 ## Reasoning
 
-- **Execution is commoditising.** Headless agent CLIs (Claude Code first
-  among them) ship deterministic lifecycle hooks, isolated subagents, skills
-  and plugins, and gain capability weekly with zero effort from this
-  project. Competing on orchestration-for-better-codegen is a race kranz
-  loses on velocity — Factory, Anthropic, Cursor, and Amp all staff that
-  surface (see the roadmap's external-scan pattern notes and
-  docs/reviews/ampcode.md).
-- **Model hosting and fine-tuning are backends, not competitors.** Hosted
-  frontier, hosted fine-tune, and a local tier all sit behind one routing
-  seam (KRZ-331).
-- **What is not commoditised is the layer above**, and kranz already has
-  most of it: an append-only event-sourced log, cost per event, a
-  grant/consent model with escalation, secret-scan-at-write, and outcome
-  folds that can answer *why did this change pass, and who or what decided
-  it* months after the fact. That answer — provenance — is the single most
-  defensible thing kranz does.
-- **The wedge is contract-style validation** (KRZ-327): a real, evidenced
-  defect class (vacuous/miswired contract assertions) that competing
-  framings do not address. Push it while it is uncontested.
+- **Execution stays behind the backend seam.** External agent CLIs own
+  code generation, their model integrations and session internals. Kranz
+  translates their lifecycle and permission events into mission controls.
+- **Model hosting and fine-tuning are backend concerns.** Hosted frontier,
+  hosted fine-tune and local tiers use the routing seam (KRZ-331).
+- **Authorization and evidence need durable records.** The append-only log,
+  cost records, consent and escalation events, secret-scan decisions and
+  outcome folds let an operator reconstruct why a change passed and who
+  or what authorized it.
+- **Contract validation addresses observed failures** (KRZ-327). Vacuous
+  filters and miswired assertions need deterministic checks with executable
+  counterexamples, independent of the coding backend.
 
 ## Ownership by layer
 

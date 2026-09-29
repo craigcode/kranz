@@ -11,24 +11,21 @@ Extend `kranz ready` from a scorecard into a two-axis readiness view whose
 source of truth stays kranz-native: (1) an AMM-compatible projection —
 level L1–L5 plus missing signals — derived from the native signals, with
 Factory's 5/19/36/60/100 thresholds living in ONE mapping table as ordinal
-labels (never gospel; the paper will revise them); (2) a second axis the
-whitepaper cannot see — contract/consent health: contract-lint pass rate at
+labels (version the mapping so later revisions are explicit); (2) a
+separate contract/consent-health axis: contract-lint pass rate at
 approval, secret-scan FP friction (waivers per mission), blocked-cause
 histogram (grant vs contract-bug vs scan vs gate); (3) the org metric across
 the M8 catalog: "N of M repos at L3+", computed by running the same probe
 per catalog repo (CLI view first; REST surface only if cheap).
 
 ## Context
-factory-autonomy-maturity-model-whitepaper.pdf (~/downloads) + the
-meta-review quibbles this ticket encodes: map to AMM, do NOT adopt it (their
-thresholds are marketing numbers); the moat is not on their map — the last
-three bites came from the contract/consent axis the paper doesn't measure;
-and the dogfood score is already done: this repo is L3− (P6 file size,
-test/validation speed, and remote exec are the named gaps). ready.rs already
-probes most foundation signals (merge gates, gitignore hygiene, backend
-lanes, test runner detection); the AMM Eight Pillars map closely onto its
-dimensions. Event logs carry the contract-health data (grant.requested,
-milestone.blocked, validation.finding, waiver events).
+The projection is informed by Factory's Autonomy Maturity Model whitepaper.
+Keep its versioned ordinal mapping separate from Kranz's native readiness
+signals and contract/consent-health measurements. The recorded planning
+baseline was L3−, with file size, test/validation speed and remote execution
+as the named gaps. `ready.rs` already probes merge gates, gitignore hygiene,
+backend lanes and test runners. Event logs carry contract-health evidence
+through grant, milestone, finding and waiver events.
 
 ## Acceptance hints
 - `kranz ready --json` emits: native signals (unchanged), `amm` projection

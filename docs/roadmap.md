@@ -456,60 +456,23 @@ repos operate from one Slack workspace with unambiguous routing; and a
 brand-new repo's first mission runs with no hand-editing beyond
 `kranz init` answers.
 
-## Product pattern notes from Warp/Oz/Factory (2026-07-08), Cursor (2026-07-09), Monaco (2026-07-10), Mission Control (2026-07-13), Amp (2026-07-27), and the Warp Agent CLI re-scan (2026-08-04)
+## Implementation patterns from external tools
 
-External scan: Warp Agent/Oz and Factory's Droid/AutoWiki surfaces are useful
-as UX/product benchmarks, not architecture targets. Cursor is now a stronger
-direct overlap on unattended agent work (Agents Window, cloud agents,
-worktrees, automations, hooks, Agent Review, and Grok 4.5 in its first-party
-model pool), so "agent orchestrator" is no longer a useful differentiator.
-The broad "agentic IDE" lane (terminal replacement, built-in editor/LSP,
-voice, general local coding environment) still belongs to the sgian side
-product, not kranz. The kranz-compatible lessons are narrower and should
-reinforce the mission/audit/gate model:
+The July–August 2026 research on Warp/Oz, Factory, Cursor, Monaco,
+AgentSystemLabs Mission Control and Amp informed the implementation notes
+below. These are Kranz requirements and historical design references, not
+claims about those products' current capabilities. Related technical notes:
+[Amp](reviews/ampcode.md) and [Atomic](reviews/atomic.md).
 
-Amp (ampcode.com, reviewed 2026-07-27 — full verdicts in
-docs/reviews/ampcode.md) sharpens the boundary from the frontier side.
-Post-Sourcegraph spin-out it sells hosted unsupervised agents ("orbs"),
-event-driven wake-ups, agent-to-agent spawning, and a Slack surface — with
-default-allow tools, direct-to-main shipping, and no plan gate, all by
-stated policy. It contests the autonomous-platform lane alongside Cursor
-and Factory while vacating the consent/audit/validation lane kranz holds;
-its own walk-backs (public thread sharing killed over leak-review risk,
-passkey step-up added against compromised accounts driving agents) confirm
-that lane is real. The borrow list is small and concrete: cross-provider
-scrutiny defaults, repo-owned `.kranz/checks/` review checks, a
-runaway-rate calibration metric, OIDC workload identity + authenticated
-previews for M6 remote workspaces, and passkey step-up on hosted spend
-verbs. Its orb lifecycle validates the accepted workspace-contract D-A…D-H
-nearly field-for-field.
+Kranz owns plans, consent, validation and audit records. Terminal and editor
+interfaces remain outside its scope. Retained follow-ups include cross-provider
+scrutiny, repo-owned review checks, runaway-cost classification, workload
+identity, authenticated previews and step-up authentication for hosted spend.
+The configuration audit, routing rules and PTY validation tickets carry the
+corresponding engineering work. New backends require headless protocol,
+permission and containment evidence before admission.
 
-Warp re-scan (2026-08-04, the day its standalone Agent CLI launched;
-supersedes the 2026-07-08 "UX benchmark" note): Warp open-sourced its
-terminal client (Apr 2026, AGPL), launched Oz as its closed cloud
-orchestration/monetization layer (Feb 2026), and shipped the Agent CLI —
-a TUI-only agent on a pty mux (drives full-screen apps and SSH sessions)
-with NO headless/JSON mode, no lifecycle hooks, no local sandboxing, and
-no local transcripts (cloud-synced; even self-hosted enterprise routes
-transcripts/inference through Warp's backend). Verdict unchanged in kind,
-sharpened in degree: Warp contests execution and orchestration —
-cross-harness delegation (Claude Code/Codex as cloud children under a
-Warp orchestrator) is the one novel mechanism — and vacates the
-consent/audit/validation lane. Not a backend candidate until a
-headless/JSON mode exists (revisit trigger). Contrast worth remembering:
-`--auto-approve` bypasses its command denylist BY DEFAULT and a custom
-denylist replaces rather than extends the built-in — the fail-open
-composition kranz's config-fail-open-audit ticket exists to prevent.
-Borrowed: config-fail-open-audit, routing-rules-config (KRZ-331 slice),
-pty-functional-validation, plus reference mechanics recorded on
-heterogeneous-dispatch-pool. The terminal/agentic-IDE surface remains
-sgian's lane — now with an open-source incumbent substrate and a
-demonstrated local-first gap (the OpenWarp fork demand signal).
-
-AgentSystemLabs Mission Control reinforces the same boundary from the other
-side: it is a polished desktop PTY/session manager, not a mission-validation
-engine. Borrow sensing and operator ergonomics, not the IDE shell. The
-follow-up backlog (rewritten after adversarial review) is sequenced as:
+The session-visibility and operator-ergonomics backlog is sequenced as:
 
 - **Near-term P2 slices shipped:** `repo-knowledge-ranked-brief-injection`,
   `post-complete-pr-handoff-no-push`, `backend-readiness-quota-preflight`,
@@ -520,8 +483,7 @@ follow-up backlog (rewritten after adversarial review) is sequenced as:
   backend lane), `multi-repo-project-picker` (blocked on multi-root host
   design).
 
-- **A worktree is not a workspace.** Monaco's failed local-worktree phase
-  exposed the shared runtime problems source isolation does not solve: port
+- **A worktree is not a workspace.** Source isolation does not solve port
   collisions, Docker contention, dependency setup, disk pruning, and awkward
   human handoff. Keep worktrees as the local source-isolation provider, but
   make a complete runnable application environment the unit M6 provisions.
@@ -567,18 +529,13 @@ useful, keep product APIs distinct.
   Composer under the existing kranz mission contract. The backend must prove
   terminal report text parsing, model/cost capture, worktree cwd discipline,
   permission mapping, and the no-push/no-main-write invariants before it is a
-  default option. The Amp CLI (headless `-x` execute mode, newline-JSON
-  streaming with usage fields incl. cache tokens) is a second candidate
-  behind the same proof bar, with two extra cautions recorded in
-  docs/reviews/ampcode.md §5: a trust-by-default permission surface that
-  maps thinly onto kranz policy, and a weekly feature-deletion policy that
-  makes any integration seam unstable.
-- **Positioning correction.** Cursor now credibly owns much of the polished
-  agentic development-platform story. Kranz should describe itself as the
-  git-native mission recorder, consent gate, and validation harness around
-  headless agents, not as a generalized agentic IDE or model router.
-- **Automation triggers without losing the gate.** Cursor's automations make
-  event-triggered background agents feel normal. Add kranz-side triggers only
+  default option. Amp is another candidate behind the same proof bar;
+  recheck the headless interface, permission mapping and version compatibility
+  against the selected release before integration (docs/reviews/ampcode.md §5).
+- **Product boundary.** Kranz records missions, enforces consent and validates
+  changes made by headless agents. General-purpose editor and IDE features
+  remain outside the architecture boundary.
+- **Automation triggers without losing the gate.** Add kranz-side triggers only
   where they preserve explicit mission semantics: GitHub/Slack/Linear/webhook
   events should create or draft tickets, queue approved plans, or request
   human approval, never silently merge or push.

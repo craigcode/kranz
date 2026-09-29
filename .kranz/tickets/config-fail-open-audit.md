@@ -14,13 +14,11 @@ extending them, (b) any flag that silently bypasses a deny/blocklist, and
 (c) allow/deny precedence that is not deny-wins.
 
 ## Context
-Source: the Warp Agent CLI launch scan (2026-08-04, roadmap pattern
-notes), which shipped two live counterexamples: `--auto-approve` bypasses
-the command denylist by default, and a user-supplied denylist replaces the
-built-in one rather than extending it. Kranz's stated rules are the
-opposite — deny precedence (permissions.rs), fail-closed sandbox, missing/
-invalid merge-gates fail closed — but the invariant is only as strong as
-its least-audited surface. Surfaces to sweep: role permission profiles and
+The 2026-08-04 Warp CLI documentation review prompted checks for two
+composition hazards: an auto-approval path bypassing a denylist and a custom
+list replacing safer defaults. Audit Kranz's own stated rules: deny precedence
+(`permissions.rs`), fail-closed sandboxing, and missing/invalid merge-gates
+refusal. Surfaces to inspect include role permission profiles and
 worker deny-rule grants, sandbox enforce/extraWrite/egress plus egress
 grants, secret-allowlist waivers, merge-gates and workspace-contract
 validation, `--allow-unvalidated` and every `--dangerously-*` flag, the

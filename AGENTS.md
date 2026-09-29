@@ -159,6 +159,15 @@ resolve via `Ticket::read_state`; lifecycle writes go through
 frontmatter, skipping git-dirty tickets by name
 (`crates/engine/src/migrate_state.rs`).
 
+## Public documentation boundary
+
+Tickets, discussion sidecars, roadmap entries and design notes in this repo
+are public source artifacts. Keep implementation scope, constraints, acceptance
+criteria and necessary technical attribution here. Keep competitive strategy,
+market comparisons and private business analysis in an access-controlled notes
+store outside the checkout. Public tickets must remain self-contained; do not
+make a private note a prerequisite for implementing or reviewing them.
+
 ## Change discipline
 
 Small, focused changes with tests. Every change gets reviewed against the

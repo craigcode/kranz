@@ -17,10 +17,10 @@ fixture as parser ground truth. Validator-first (cross-vendor scrutiny
 diversity), worker-capable behind the same role config.
 
 ## Context
-kranz's defensible layer is the mission/audit/consent harness; importing
-headless coding CLIs as backends turns vendor pressure into model/runtime
-leverage (roadmap-options "Now" lane; precedents shipped for codex and droid,
-probe completed for cursor). Official docs confirm the interface:
+Headless coding CLIs connect through the existing backend seam and retain
+Kranz's mission, audit and consent controls. Codex and Droid provide the
+implementation precedents, with the Cursor probe documenting the evidence
+required before adding an adapter. The recorded CLI interface is:
 `kimi -p` is non-interactive with auto permission policy (static deny rules
 remain), `--output-format stream-json` emits one JSON object per line
 (Assistant messages, tool_calls → Tool messages, thinking/progress on

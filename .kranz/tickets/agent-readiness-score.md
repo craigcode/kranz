@@ -38,13 +38,12 @@ ticket).
 
 ## Reference: Factory.ai agent-readiness taxonomy (2026-07-07)
 
-Factory's readiness report on this repo (Level 2, 40%) is a proven
-reference for `kranz ready`'s structure — mirror the category taxonomy,
-tiering, and N/A handling, but ADD the kranz-specific dimension Factory
-(a static scanner) cannot see.
+The category taxonomy, tiering and N/A handling below were informed by
+Factory.ai's agent-readiness taxonomy. Use them as a design reference;
+Kranz also needs checks for runnable mission validation contracts.
 
-Their 9 categories, each criterion tiered BASIC / INTERMEDIATE / ADVANCED,
-inapplicable ones scored N/A (not counted):
+The reference has nine categories, each criterion tiered BASIC /
+INTERMEDIATE / ADVANCED, with inapplicable criteria scored N/A (not counted):
 - Style & Validation (lint, type-check, formatter, strict typing, dead
   code, naming, pre-commit hooks, complexity, duplication, tech-debt)
 - Build System (build-cmd doc, deps pinned, single-command setup, monorepo
@@ -66,12 +65,9 @@ Design notes for kranz's version:
   templates, product analytics, deployment frequency, feature flags) are
   team/OSS/SaaS process, irrelevant to a solo private repo — score them but
   clearly bucket them as "going-public prep", not "code health", so the
-  headline number is not dragged by inapplicable process. Factory's 40% was
-  mostly this drag.
+  headline number is not reduced by inapplicable process criteria.
 - AGENTS.md presence is a HEAVILY-weighted, unlocking signal — check it
   first (matches the took `ready` design already noted).
-- ADD the dimension Factory can't measure: does the repo expose runnable
-  validation commands a mission's contract can BIND to (cargo test
-  --workspace, npm test, a lint/build gate)? That is kranz-specific
-  agent-readiness — the difference between "ready for humans/CI" and "ready
-  for kranz's own autonomous workers." Score it prominently.
+- Score whether the repo exposes runnable validation commands a mission's
+  contract can bind to (`cargo test --workspace`, `npm test`, a lint/build
+  gate). Make this mission-contract readiness dimension prominent.
