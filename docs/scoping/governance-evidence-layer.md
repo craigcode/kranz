@@ -12,13 +12,11 @@ the on-disk backlog is slug tickets in `.kranz/tickets/`.
 
 Kranz dispatches, gates, records and proves. It does not write code.
 
-Execution is commoditising (headless agent CLIs improve weekly with zero
-effort from this project); model hosting and fine-tuning are backends, not
-competitors. What is not commoditised — and what kranz already has most of —
-is the layer above: event-sourced state, cost per event, grants/consent with
-escalation, secret-scan-at-write, and a ledger that can answer *why did this
-change pass, and who or what decided it* months later. Full reasoning and the
-frozen/retained boundary: the ADR.
+External agent CLIs own code generation. Kranz owns the mission controls
+and evidence: event-sourced state, cost per event, grants and escalation,
+secret-scan decisions, and a ledger that can answer why a change passed and
+who or what authorized it. Model hosting and fine-tuning remain behind the
+backend seam. The ADR defines the frozen and retained implementation boundary.
 
 ## Series map
 
@@ -143,17 +141,13 @@ map and was reassigned. Reconciliations:
 
 ## Addendum 2026-08-04 — Warp Agent CLI scan
 
-Source: the Warp Agent CLI launch review (roadmap pattern notes,
-2026-08-04). Three tickets added outside the KRZ numbering:
-`config-fail-open-audit` (governance hardening — Warp shipped
-auto-approve-bypasses-denylist and replace-not-extend denylists as live
-counterexamples), `routing-rules-config` (the KRZ-331 config-surface
-slice; Warp's complexity-tier and ordered-rule router forms are the
-reference), and `pty-functional-validation` (extends M5 functional QA to
-terminal-interactive targets; validation-side only). Reference mechanics
-recorded on `heterogeneous-dispatch-pool` (harness-agnostic addressing,
-unified lifecycle vocabulary) and `backend-routing-abstraction`. Warp is
-not a backend candidate until a headless/JSON mode exists.
+Source: the 2026-08-04 Warp Agent CLI documentation review. Three tickets
+were added outside the KRZ numbering: `config-fail-open-audit` for denylist
+precedence and list composition, `routing-rules-config` for the KRZ-331
+configuration surface, and `pty-functional-validation` for terminal-interactive
+validation targets. Reference mechanics were recorded on
+`heterogeneous-dispatch-pool` and `backend-routing-abstraction`. Any new
+backend requires a demonstrated headless protocol and permission mapping.
 
 ## Addendum 2026-08-07 — Cloudflare engineering standards enforcement
 

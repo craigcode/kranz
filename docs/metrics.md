@@ -115,9 +115,9 @@ by default and the ones that told it to stop and rework.
 
 ## The one-line version
 
-Everyone in the field is building the viewing gallery — dashboards for
-watching agents work. Nobody else audits the go/no-go calls. These four
-numbers are the audit.
+The autonomy ratio, grant timing, false-green linkage and escalation ledger
+help an operator inspect mission authorization and its outcomes. Each measure
+links back to recorded events.
 
 ## Addendum: the consumption numbers (KRZ-321/329)
 

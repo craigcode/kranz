@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-09-29
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -11,6 +11,8 @@ verified_against:
   - .kranz/tickets/m5-skill-capture-positioning-decision.md
   - .kranz/tickets/training-corpus-export.md
 ---
+
+Rechecked 2026-09-29 (UTC) against the roadmap and architecture rationale cleanup; no skill creation, installation or prompt optimization is introduced.
 
 Rechecked 2026-09-26: the remediation and container recovery/resource tickets add no skill creation, installation or prompt optimization. This decision remains unchanged.
 

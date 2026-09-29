@@ -20,8 +20,7 @@ and scope), `specs/` (requirements as SHALL-style scenarios), `design.md`
 through explore, propose, apply, archive. Its README states plainly that it
 avoids rigid phase gates and does not enforce a workflow.
 
-That non-goal is exactly kranz's goal, which is why the two compose instead
-of competing. OpenSpec produces intent. Kranz makes intent binding: approval
+OpenSpec supplies authored intent. Kranz applies the mission contract: approval
 pins the base SHA, a worker implements against it with no memory of the
 conversation, and a separate validator session re-runs the named commands.
 `docs/tickets.md` already carries `task-class: spec-review` with
@@ -58,9 +57,9 @@ doing that thinking.
 acceptance hints to be concrete and testable with a passed-count guard,
 because a bare test-name filter exits 0 on zero matches. "The app SHALL
 default to the system preference" cannot fail. Copying scenarios into hints
-would ship vacuous assertions on every imported mission, which is the defect
-class the positioning ADR calls the wedge. Carry them as intent, and let the
-orchestrator propose executable commands or return NEEDS-CONTEXT.
+would ship vacuous assertions on every imported mission. Carry scenarios as
+intent, and let the orchestrator propose executable commands or return
+NEEDS-CONTEXT.
 
 One direction only. `openspec/changes/` explains why the work exists; the
 approved plan is what the validator judges. Syncing back would create two

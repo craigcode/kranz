@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-09-29
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -21,6 +21,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-09-29 (UTC) against the public-documentation rule in AGENTS.md; runtime types, ticket lifecycle and role terminology are unchanged.
 
 Rechecked 2026-09-26 against the approval and evidence remediation. One-call consent still binds the original action; ambiguous display controls now forbid an allow decision. No vocabulary or role boundary changed.
 
