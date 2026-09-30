@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-09-30
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -54,6 +54,11 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-09-30 against the container-denial fixture changes: production
+sandbox policy and deadlines are unchanged. File-access denial probes now
+require guest execution, the expected access failure and confirmed cleanup;
+local synthetic checks do not substitute for the live Linux receipt.
 
 Rechecked 2026-09-29 (UTC) against the AGENTS.md and ticket publication guidance; gate commands, acceptance requirements and consent behavior are unchanged.
 

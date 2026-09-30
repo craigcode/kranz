@@ -1,0 +1,217 @@
+//! Test-only receipts: a runtime failure is never an access-denial proof.
+
+use super::ContainerRuntime;
+use crate::command_exec::run_bounded_argv;
+use std::{collections::HashMap, path::Path, time::Duration};
+
+pub(crate) struct DenialProbe {
+    witness: std::path::PathBuf,
+    nonce: String,
+    receipt: String,
+}
+
+impl DenialProbe {
+    pub(crate) fn new(scratch: &Path, name: &str) -> Self {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            witness: scratch.join(format!("denial-{nonce}.started")),
+            receipt: format!("KRANZ_DENIAL:{nonce}:{name}"),
+            nonce,
+        }
+    }
+
+    /// The shell exits successfully only after observing the expected failure.
+    /// Diagnostic matching excludes missing tools, syntax errors and unrelated
+    /// command failures. The host checks a separate, unique start witness.
+    pub(crate) fn command(&self, operation: &str, status: i32, diagnostic: &str) -> String {
+        let errors = self.witness.with_extension("stderr");
+        format!(
+            "set -eu; export LC_ALL=C; command -v cat >/dev/null; \
+             printf '%s\\n' {nonce} > {witness}; \
+             if ( set +e; {operation} ) >/dev/null 2>{errors}; then exit 40; else result=$?; fi; \
+             test \"$result\" -eq {status} || exit 41; \
+             case \"$(cat {errors})\" in *{diagnostic}*) ;; *) cat {errors}; exit 42;; esac; \
+             printf '%s\\n' {receipt}",
+            nonce = quote(&self.nonce),
+            witness = quote(&self.witness.display().to_string()),
+            errors = quote(&errors.display().to_string()),
+            diagnostic = quote(diagnostic),
+            receipt = quote(&self.receipt),
+        )
+    }
+
+    pub(crate) fn proved(&self, code: Option<i32>, output: &str, cleaned: bool) -> bool {
+        code == Some(0)
+            && cleaned
+            && std::fs::read_to_string(&self.witness).ok().as_deref()
+                == Some(&format!("{}\n", self.nonce))
+            && output.lines().any(|line| line == self.receipt)
+    }
+}
+
+pub(crate) fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Run the real production argv with an observation-only label. Confirm an
+/// empty, successful inventory after --rm; on failure remove only inspected,
+/// full IDs bearing this fixture's random label. Never remove by name or prune.
+/// Forced cleanup cannot turn a failed probe into a passing receipt.
+pub(crate) async fn run_observed(
+    cwd: &Path,
+    runtime: ContainerRuntime,
+    mut args: Vec<String>,
+    timeout: Duration,
+) -> (Option<i32>, String, bool) {
+    assert_eq!(args.first().map(String::as_str), Some("run"));
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let label = format!("io.kranz.denial-test={owner}");
+    args.splice(1..1, ["--label".into(), label.clone()]);
+    // Capture the client endpoint settings once for execution and cleanup.
+    let env = runtime.client_env();
+    let (code, mut output) =
+        run_bounded_argv(cwd, Path::new(runtime.binary()), &args, timeout, &env).await;
+    let before = inventory(cwd, runtime, &env, &label).await;
+    let cleaned = matches!(&before, Ok(ids) if ids.is_empty());
+    if let Ok(ids) = before {
+        for id in ids {
+            let (status, inspection) = run_bounded_argv(
+                cwd,
+                Path::new(runtime.binary()),
+                &["inspect".into(), id.clone()],
+                Duration::from_secs(5),
+                &env,
+            )
+            .await;
+            let inspected = serde_json::from_str::<serde_json::Value>(&inspection).ok();
+            let owned = status == Some(0)
+                && inspected.as_ref().is_some_and(|v| {
+                    v[0]["Id"].as_str() == Some(id.as_str())
+                        && v[0]["Config"]["Labels"]["io.kranz.denial-test"].as_str()
+                            == Some(owner.as_str())
+                });
+            if owned {
+                let _ = run_bounded_argv(
+                    cwd,
+                    Path::new(runtime.binary()),
+                    &["rm".into(), "-f".into(), id],
+                    Duration::from_secs(5),
+                    &env,
+                )
+                .await;
+            }
+        }
+    }
+    if !cleaned {
+        let after = inventory(cwd, runtime, &env, &label).await;
+        output.push_str(&format!(
+            "\nprobe cleanup was not confirmed on normal exit; label={label}; recovery={after:?}"
+        ));
+    }
+    (code, output, cleaned)
+}
+
+async fn inventory(
+    cwd: &Path,
+    runtime: ContainerRuntime,
+    env: &HashMap<String, String>,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    let (code, output) = run_bounded_argv(
+        cwd,
+        Path::new(runtime.binary()),
+        &[
+            "ps".into(),
+            "--all".into(),
+            "--quiet".into(),
+            "--no-trunc".into(),
+            "--filter".into(),
+            format!("label={label}"),
+        ],
+        Duration::from_secs(5),
+        env,
+    )
+    .await;
+    if code != Some(0) {
+        return Err(format!("inventory failed: {code:?}: {output}"));
+    }
+    output
+        .lines()
+        .map(|id| {
+            if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Ok(id.to_owned())
+            } else {
+                Err("inventory did not return full container IDs".into())
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn denial_receipt_rejects_startup_timeout_and_incomplete_evidence() {
+    use crate::command_exec::{run_shell_command_sandboxed_with_code, GateSandbox};
+    let dir = tempfile::tempdir().unwrap();
+    let probe = DenialProbe::new(dir.path(), "synthetic-hidden-read");
+    let missing = dir.path().join("absent");
+    let command = probe.command(
+        &format!("cat {}", quote(&missing.display().to_string())),
+        1,
+        "No such file or directory",
+    );
+    let env = crate::agent_env::contract_command_env(dir.path(), None, &[]);
+    let run = |command: String, timeout| {
+        let env = env.clone();
+        let cwd = dir.path().to_path_buf();
+        async move {
+            run_shell_command_sandboxed_with_code(
+                &cwd,
+                &command,
+                timeout,
+                &env,
+                &GateSandbox::Disabled,
+            )
+            .await
+        }
+    };
+    let (code, output) = run(command.clone(), Duration::from_secs(5)).await;
+    assert!(probe.proved(code, &output, true));
+    assert!(!probe.proved(code, &output, false), "cleanup is mandatory");
+    assert!(
+        !probe.proved(None, &output, true),
+        "even a receipt cannot excuse supervision failure"
+    );
+    std::fs::remove_file(&probe.witness).unwrap();
+    assert!(
+        !probe.proved(code, &output, true),
+        "output alone is insufficient"
+    );
+
+    let (code, output) = run("exit 125".into(), Duration::from_secs(5)).await;
+    assert_eq!(code, Some(125));
+    assert!(!probe.proved(code, &output, true));
+    // Emit a valid receipt before hanging: a timeout must still fail closed.
+    let (code, output) = run(format!("{command}; sleep 30"), Duration::from_millis(100)).await;
+    assert_eq!(code, None);
+    assert!(!probe.proved(code, &output, true));
+    // Missing executable and unexpected success must not produce a denial.
+    for operation in [
+        "/kranz-no-such-command".to_string(),
+        "true".to_string(),
+        "false".to_string(),
+    ] {
+        let command = probe.command(&operation, 1, "No such file or directory");
+        let (code, output) = run(command, Duration::from_secs(5)).await;
+        assert!(
+            !probe.proved(code, &output, true),
+            "operation={operation}; code={code:?}; output={output}"
+        );
+    }
+    std::fs::write(&missing, "allowed").unwrap();
+    let (code, output) = run(command, Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(40),
+        "an allowed read must reject the denial: {output}"
+    );
+    assert!(!probe.proved(code, &output, true));
+}

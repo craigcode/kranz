@@ -23,3 +23,7 @@ During September 26 release verification, the unchanged container_gate_wrap_runs
 
 - Synthetic launch failure and supervision timeout cases cannot satisfy an access-denial assertion.
 - A real denied read has an independently observed guest execution marker, the expected denial result and confirmed owned cleanup; allowed reads still prove the positive control.
+
+## Implementation review
+
+The first slice tightens the legacy worker and command-gate file-access probes and adds startup/timeout/receipt negative controls. It remains pending live Linux proof and review. The audit also identified the direct-socket bypass assertion in `container_per_host_egress_live_proof`; that networking probe still needs a conclusive execution receipt before this ticket can close. See [fixture review](../../docs/reviews/2026-09-30-container-denial-receipts.md).

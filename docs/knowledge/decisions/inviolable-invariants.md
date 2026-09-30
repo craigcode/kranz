@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-09-30
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -35,6 +35,11 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-09-30 against the container-denial fixture changes: production
+sandbox policy and deadlines are unchanged. File-access denial probes now
+require guest execution, the expected access failure and confirmed cleanup;
+local synthetic checks do not substitute for the live Linux receipt.
 
 Rechecked 2026-09-29 (UTC) against the public-documentation addition to AGENTS.md; consent, containment, Git and event-log invariants are unchanged.
 
