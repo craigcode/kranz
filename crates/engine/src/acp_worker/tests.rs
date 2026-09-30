@@ -7,6 +7,7 @@ fn profile(id: &str) -> AcpWorkerProfile {
     AcpWorkerProfile {
         id: id.into(),
         credential_file: std::env::temp_dir().join("operator-auth.json"),
+        resources: None,
     }
 }
 fn config(profile: AcpWorkerProfile) -> MissionConfig {
@@ -16,7 +17,7 @@ fn config(profile: AcpWorkerProfile) -> MissionConfig {
         ..Default::default()
     };
     cfg.worker.backend = Some("acp".into());
-    cfg.worker.acp_profile = Some(profile);
+    cfg.worker.acp_profile = Some(Box::new(profile));
     cfg.worker.sandbox = SandboxConfig {
         provider: SandboxProvider::Container,
         enforce: SandboxEnforce::FsNet,
@@ -189,6 +190,7 @@ impl Fixture {
             profile: AcpWorkerProfile {
                 id: "fixture-acp-worker-v1".into(),
                 credential_file: auth,
+                resources: None,
             },
         }
     }
@@ -1093,6 +1095,7 @@ fn acp_profile_refuses_a_credential_split_over_text_frames() {
             home: None,
             secrets: vec![fixture_value.into()],
             stream_tails: Default::default(),
+            resources: None,
             receipt: serde_json::json!({}),
         };
         let frame = |text: &str| {
@@ -1102,4 +1105,97 @@ fn acp_profile_refuses_a_credential_split_over_text_frames() {
         assert!(!profile.contains_secret(r#"{"params":{"update":{"sessionUpdate":"plan"}}}"#));
         assert!(profile.contains_secret(&frame(&fixture_value[13..])));
     }
+}
+
+#[test]
+fn acp_profile_resource_ceilings_are_revision_scoped_and_bounded() {
+    let with = |id: &str, overrides: Option<ResourceOverrides>| AcpWorkerProfile {
+        resources: overrides,
+        ..profile(id)
+    };
+    // Revisions qualified before ceilings keep no limits and refuse overrides.
+    for id in [CLAUDE, CODEX, "fixture-acp-worker-v1"] {
+        assert_eq!(with(id, None).effective_resources().unwrap(), None);
+        let refused = with(id, Some(ResourceOverrides::default()))
+            .validate_target("linux", "aarch64")
+            .unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("declares no resource ceilings"));
+    }
+    let defaults = with("fixture-acp-worker-v2", None)
+        .effective_resources()
+        .unwrap()
+        .unwrap();
+    assert_eq!((defaults.memory_mib, defaults.pids), (256, 64));
+    let raised = with(
+        "fixture-acp-worker-v2",
+        Some(ResourceOverrides {
+            memory_mib: Some(1_024),
+            cpu_millis: Some(500),
+            ..Default::default()
+        }),
+    )
+    .effective_resources()
+    .unwrap()
+    .unwrap();
+    assert_eq!((raised.memory_mib, raised.cpu_millis), (1_024, 500));
+    assert_eq!(raised.nofile, defaults.nofile);
+    // Zero would read as unlimited to Docker; above the maximum needs a new revision.
+    for overrides in [
+        ResourceOverrides {
+            memory_mib: Some(0),
+            ..Default::default()
+        },
+        ResourceOverrides {
+            memory_mib: Some(1_025),
+            ..Default::default()
+        },
+        ResourceOverrides {
+            pids: Some(257),
+            ..Default::default()
+        },
+        ResourceOverrides {
+            fsize_mib: Some(0),
+            ..Default::default()
+        },
+    ] {
+        let refused = with("fixture-acp-worker-v2", Some(overrides))
+            .validate_target("linux", "aarch64")
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("revision maximum"),
+            "{refused}"
+        );
+    }
+    // The override is additive configuration: absent stays absent on disk.
+    let plain = serde_json::to_value(with("fixture-acp-worker-v2", None)).unwrap();
+    assert!(plain.get("resources").is_none());
+    let parsed: AcpWorkerProfile = serde_json::from_value(json!({
+        "id":"fixture-acp-worker-v2","credentialFile":"/auth","resources":{"memoryMib":512}
+    }))
+    .unwrap();
+    assert_eq!(parsed.resources.unwrap().memory_mib, Some(512));
+    assert!(serde_json::from_value::<AcpWorkerProfile>(json!({
+        "id":"fixture-acp-worker-v2","credentialFile":"/auth","resources":{"swapMib":512}
+    }))
+    .is_err());
+    // Evidence names the code-resident revision, not only its id.
+    let v1 = profile("fixture-acp-worker-v1")
+        .definition()
+        .unwrap()
+        .sha256();
+    let v2 = profile("fixture-acp-worker-v2")
+        .definition()
+        .unwrap()
+        .sha256();
+    assert_eq!(v1.len(), 64);
+    assert_ne!(v1, v2);
+    assert_eq!(
+        v2,
+        profile("fixture-acp-worker-v2")
+            .definition()
+            .unwrap()
+            .sha256()
+    );
 }

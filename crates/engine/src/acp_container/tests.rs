@@ -377,6 +377,7 @@ fn acp_containment_v1_owner_process() {
                     &spec(root, &name, "complete"),
                     Path::new("/usr/local/bin/python3"),
                     &[root.join("workspace/peer.py").display().to_string()],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -501,6 +502,7 @@ async fn acp_containment_v1_cleanup_failure_retains_recovery_evidence() {
         &session_spec,
         Path::new("/usr/local/bin/python3"),
         &[root.path().join("workspace/peer.py").display().to_string()],
+        None,
     )
     .await
     .unwrap();
@@ -615,7 +617,8 @@ async fn acp_containment_v1_name_collision_never_removes_an_unowned_container() 
         .unwrap()
         .trim()
         .to_string();
-    let result = OwnedContainer::prepare(&spec, Path::new("/usr/local/bin/python3"), &[]).await;
+    let result =
+        OwnedContainer::prepare(&spec, Path::new("/usr/local/bin/python3"), &[], None).await;
     tokio::time::sleep(Duration::from_millis(300)).await; // Let error-path Drop attempt cleanup.
     let inspection = client
         .control(&["container".into(), "inspect".into(), id.clone()])
@@ -814,7 +817,7 @@ async fn acp_containment_v1_unqualified_inputs_are_refused_before_creation() {
             _ => unreachable!(),
         }
         assert!(
-            OwnedContainer::prepare(&spec, Path::new("/usr/local/bin/python3"), &[])
+            OwnedContainer::prepare(&spec, Path::new("/usr/local/bin/python3"), &[], None)
                 .await
                 .is_err()
         );
@@ -937,6 +940,7 @@ async fn acp_containment_v1_launch_prelude_rejects_overflow_eof_and_expired_owne
             &spec(root.path(), &name, "complete"),
             Path::new("/usr/local/bin/python3"),
             &[root.path().join("workspace/peer.py").display().to_string()],
+            None,
         )
         .await
         .unwrap();
@@ -985,6 +989,119 @@ async fn acp_containment_v1_launch_prelude_rejects_overflow_eof_and_expired_owne
     }
 }
 
+fn fixture_resources() -> crate::acp_worker::Resources {
+    crate::acp_worker::Resources {
+        memory_mib: 256,
+        cpu_millis: 1_500,
+        pids: 64,
+        nofile: 256,
+        fsize_mib: 64,
+    }
+}
+
+#[test]
+fn acp_resource_argv_replaces_pids_once_and_leaves_unbounded_revisions_untouched() {
+    let reviewed: Vec<String> = [
+        "create",
+        "--rm",
+        "-i",
+        "--pids-limit",
+        "512",
+        "--network",
+        "none",
+        "IMAGE",
+        "-I",
+        "-S",
+        "-u",
+        "supervisor.py",
+        "/kranz-owned-session",
+    ]
+    .map(String::from)
+    .to_vec();
+    let image_index = reviewed.len() - 6;
+    let mut unbounded = reviewed.clone();
+    apply_resources(&mut unbounded, image_index, None);
+    assert_eq!(unbounded, reviewed);
+
+    let mut bounded = reviewed.clone();
+    apply_resources(&mut bounded, image_index, Some(fixture_resources()));
+    assert_eq!(bounded.iter().filter(|a| *a == "--pids-limit").count(), 1);
+    let pids = bounded.iter().position(|a| a == "--pids-limit").unwrap();
+    assert_eq!(bounded[pids + 1], "64");
+    let image = bounded.iter().position(|a| a == "IMAGE").unwrap();
+    assert_eq!(bounded[image..], reviewed[image_index..]);
+    for flag in [
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--cpus=1.500",
+        "nofile=256:256",
+        "fsize=67108864:67108864",
+    ] {
+        let at = bounded.iter().position(|a| a == flag).unwrap();
+        assert!(at < image, "{flag} must precede the image");
+    }
+
+    // A prologue without a pids flag still gets exactly one, before the image.
+    let mut without: Vec<String> = reviewed
+        .iter()
+        .filter(|a| *a != "--pids-limit" && *a != "512")
+        .cloned()
+        .collect();
+    let image_index = without.len() - 6;
+    apply_resources(&mut without, image_index, Some(fixture_resources()));
+    let pids = without.iter().position(|a| a == "--pids-limit").unwrap();
+    assert_eq!(without[pids + 1], "64");
+    assert!(pids < without.iter().position(|a| a == "IMAGE").unwrap());
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_ceilings_reach_the_namespace() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let (mut owned, _) = OwnedContainer::prepare(
+        &spec(root.path(), &name, "idle"),
+        Path::new("/usr/local/bin/python3"),
+        &[root.path().join("workspace/peer.py").display().to_string()],
+        Some(fixture_resources()),
+    )
+    .await
+    .unwrap();
+    let inspected = owned
+        .client
+        .control(&["inspect".into(), owned.id.clone().unwrap()])
+        .await
+        .unwrap();
+    owned.remove().await.unwrap();
+    absent(root.path(), &name).await;
+    let metadata: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let host = &metadata[0]["HostConfig"];
+    assert_eq!(host["Memory"], 256 * 1024 * 1024);
+    assert_eq!(host["MemorySwap"], 256 * 1024 * 1024);
+    assert_eq!(host["NanoCpus"], 1_500_000_000_u64);
+    assert_eq!(host["PidsLimit"], 64);
+    let ulimit = |name: &str| {
+        host["Ulimits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["Name"] == name)
+            .map(|u| (u["Soft"].clone(), u["Hard"].clone()))
+            .unwrap()
+    };
+    assert_eq!(
+        ulimit("nofile"),
+        (serde_json::json!(256), serde_json::json!(256))
+    );
+    assert_eq!(
+        ulimit("fsize"),
+        (serde_json::json!(67108864), serde_json::json!(67108864))
+    );
+    assert_eq!(owned.receipt()["resources"]["memoryMib"], 256);
+}
+
 #[tokio::test]
 async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_state() {
     use std::os::unix::fs::PermissionsExt;
@@ -1006,6 +1123,7 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
             creation_started: false,
             creation_finished: false,
             removed: false,
+            resources: None,
         };
         let started = std::time::Instant::now();
         let result = owned
