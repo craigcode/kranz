@@ -108,9 +108,36 @@ headroom. Record the measurement receipt next to the profile definition.
 
 The guest terminal driver raises `oom_score_adj` for its children (an
 unprivileged process may raise its own score). Under memory pressure the kernel
-then kills a terminal command before the adapter. The agent sees a normal
-`wait_for_exit` result with `SIGKILL` and can react. Pair this with the OOM
-classification below so the receipt says "memory ceiling", not "exit 137".
+then usually kills a terminal command before the adapter. The agent sees a
+normal `wait_for_exit` result with `SIGKILL` and can react. Pair this with the
+OOM classification below so the receipt says "memory ceiling", not "exit 137".
+
+This ordering is best-effort, not a boundary. Without `CAP_SYS_RESOURCE` a
+process cannot go below its inherited `oom_score_adj_min`, but it can lower its
+own score back to that minimum, which is the adapter's level. A hostile command
+can therefore undo the hint, and the kernel then kills the largest process. The
+memory ceiling is the guarantee. The worst case is a dead adapter and a failed
+run with a classified memory receipt, never an escape. Per-terminal cgroups
+would need a writable cgroup filesystem inside the container, and sibling
+containers would break the admitted-namespace decision (D2 in the
+[shared ACP client scope](shared-acp-client.md)). Neither is worth that cost.
+
+### Session wall clock
+
+ACP sessions have no bound today. Claude-backend workers stop at the role's
+turn cap (`maxTurns: 50` for workers, `types.rs:1780`), but the ACP backend
+passes `max_turns: None` (`backend_acp.rs:2137`). The wall clock is the only
+limit on a runaway ACP worker, so size it to catch runaways, not to budget
+work.
+
+The operator's local mission logs hold 287 worker sessions (Claude backend,
+July to September 2026): p50 3.2 min, p90 6.6 min, p99 10.7 min, max 11.2 min.
+The tail sits near the turn cap. Default the ceiling to **60 minutes**, about
+five times the observed maximum, with room for a 30-minute terminal build. The
+operator may raise it to a **4-hour hard maximum** under D-R2. Re-check the
+default against the R3 measurements, because ACP sessions that run terminal
+builds may take longer than these samples. A turn cap for ACP depends on how
+each adapter reports turns and stays a separate decision.
 
 ### Failure classification
 
@@ -168,8 +195,8 @@ it on for a real adapter remains the separate
 | D-R1: How do limits reach existing profiles? | New `-v2` profile ids; `-v1` argv unchanged | No silent contract change; operators opt in by changing one config value |
 | D-R2: Who can change a ceiling? | Operator only, in `~/.kranz/config.json`, within a hard maximum the profile declares; never repo config, plan or worker (`PatchClass::Never`) | Overrides land in the policy digest through config; the receipt records the effective value |
 | D-R3: How are defaults set? | Measured peak plus documented headroom from a qualification fixture, recorded as a receipt | Numbers are defensible; re-measure when an adapter or image changes |
-| D-R4: Shared memory pool | Keep one container cgroup; raise terminal children's `oom_score_adj` so builds die before the adapter | No per-terminal cgroup machinery; the agent sees a killed command instead of a dead session |
-| D-R5: Session wall clock | Add a profile-declared ceiling (proposed 4 h) for ACP sessions only | Bounds a spinning worker under a CPU cap; other backends unchanged |
+| D-R4: Shared memory pool | Keep one container cgroup; raise terminal children's `oom_score_adj` as best-effort ordering; the ceiling is the guarantee | No per-terminal cgroup machinery; usually a killed command instead of a dead session; a hostile command can undo the hint but not escape the ceiling |
+| D-R5: Session wall clock | Profile-declared ceiling for ACP sessions only: default 60 min, operator may raise to a 4 h hard maximum; re-check after R3 | Bounds a runaway worker that has no turn cap; other backends unchanged |
 | D-R6: Terminal counters | Separate consent and control classes as above | Polling cannot fail a run; consent limits stay as reviewed |
 | D-R7: Failure record | Additive classified field on the worker completion event | No new event type; old logs still parse |
 
