@@ -81,7 +81,9 @@ blocks on an unpolled terminal and host memory stays at the byte limit. Keep it.
 
 Add resource fields to `Definition` and ship new profile ids
 (`claude-acp-0.77.0-arm64-v2`, `codex-acp-1.11.0-arm64-v2`) that carry them.
-The `-v1` ids keep their current argv byte-for-byte and stay selectable until
+The v2 ids arrive with R2 carrying provisional ceilings labeled `provisional`
+in the receipt, so the first limit hit is already classified. R3 replaces those
+values with measured ones. The `-v1` ids keep their current argv byte-for-byte and stay selectable until
 the operator retires them. Non-ACP container workers and gates are out of scope
 and keep the shared prologue unchanged.
 
@@ -206,14 +208,15 @@ Estimates are engineering days for one contributor including tests and review.
 
 | Slice | Depends on | Deliverable | Days |
 |---|---|---|---:|
-| R1 Profile contract | D-R1, D-R2 | `Definition` resource fields, v2 ids, create-path flags, config validation, receipts with `definitionSha256` | 3–4 |
-| R2 Classification | R1 | OOM/pids/wall inspection, additive event field, operator message | 2–3 |
+| R1 Profile contract | D-R1, D-R2 | `Definition` resource fields, create-path flags, operator override validation, receipts with `definitionSha256`, proven on a test-only fixture revision | 3–4 |
+| R2 Classification | R1 | OOM/pids/wall inspection, additive event field, operator message, provisional claude/codex v2 ids | 2–3 |
 | R3 Container qualification | R1, R2 | Measurement fixture and adversarial fixtures: memory balloon, fork bomb, CPU spin, fd and file-size exhaustion; each ends inside the namespace with a classified receipt and the namespace removed | 3–5 |
 | R4 Terminal budgets | R1 | Lifetime/retention/wait split, counter classes, pre-consent capacity checks, `oom_score_adj` | 4–6 |
 | R5 Terminal qualification | R4 | Fixtures for a multi-minute build, delayed wait, unpolled output flood, each cap reached, cooperative cancel with a live terminal, cleanup after exhaustion | 3–4 |
 
-Total: **15–22 engineering days**. R1 and R2 are useful on their own because
-they bound today's released workers without touching terminals. R4 can start in
+Total: **15–22 engineering days**. R1 and R2 together bound today's released
+workers without touching terminals: R1 adds the mechanism, and R2 adds the
+selectable v2 revisions once limit failures are classified. R4 can start in
 parallel once R1's field shape is settled.
 
 The measurement in R3 needs a live adapter session. That is a bounded,
