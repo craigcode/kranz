@@ -40,6 +40,35 @@ pub(crate) struct OwnedContainer {
     creation_started: bool,
     creation_finished: bool,
     removed: bool,
+    resources: Option<crate::acp_worker::Resources>,
+}
+
+/// Apply a profile revision's ceilings to the create argv. The shared
+/// prologue's `--pids-limit` is replaced in place so it appears once (or
+/// added if a future prologue drops it); `None` leaves the reviewed argv
+/// byte-identical.
+pub(crate) fn apply_resources(
+    create: &mut Vec<String>,
+    image_index: usize,
+    resources: Option<crate::acp_worker::Resources>,
+) {
+    let Some(r) = resources else { return };
+    let mut flags = Vec::new();
+    match create.iter().position(|arg| arg == "--pids-limit") {
+        Some(at) if at + 1 < image_index => create[at + 1] = r.pids.to_string(),
+        _ => flags.extend(["--pids-limit".into(), r.pids.to_string()]),
+    }
+    let fsize = u64::from(r.fsize_mib) * 1024 * 1024;
+    flags.extend([
+        format!("--memory={}m", r.memory_mib),
+        format!("--memory-swap={}m", r.memory_mib),
+        format!("--cpus={}.{:03}", r.cpu_millis / 1000, r.cpu_millis % 1000),
+        "--ulimit".into(),
+        format!("nofile={0}:{0}", r.nofile),
+        "--ulimit".into(),
+        format!("fsize={fsize}:{fsize}"),
+    ]);
+    create.splice(image_index..image_index, flags);
 }
 
 impl OwnedContainer {
@@ -47,6 +76,7 @@ impl OwnedContainer {
         spec: &SessionSpec,
         program: &Path,
         args: &[String],
+        resources: Option<crate::acp_worker::Resources>,
     ) -> Result<(Self, tokio::process::Command)> {
         let resolved = spec
             .sandbox
@@ -244,6 +274,7 @@ impl OwnedContainer {
             creation_started: false,
             creation_finished: false,
             removed: false,
+            resources,
         };
         let mut container = container.clone();
         container.name = Some(name.clone());
@@ -280,6 +311,8 @@ impl OwnedContainer {
                 format!("com.kranz.acp-owner={owner}"),
             ],
         );
+        let image_index = create.len() - 6;
+        apply_resources(&mut create, image_index, resources);
         owned.create(&create, CREATE_TIMEOUT).await?;
         let mut lease = std::fs::OpenOptions::new()
             .write(true)
@@ -401,7 +434,8 @@ impl OwnedContainer {
         serde_json::json!({
             "backend":"docker", "image":self.image, "owner":self.owner,
             "supervisorSha256":crate::standards_waiver::sha256_hex(SUPERVISOR.as_bytes()),
-            "leaseSeconds":5, "credentialSource":"caller-supplied-session-environment-and-scratch",
+            "leaseSeconds":5, "resources":self.resources,
+            "credentialSource":"caller-supplied-session-environment-and-scratch",
             "providerCompatibilityCertified":false,
         })
     }

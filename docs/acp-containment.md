@@ -67,6 +67,17 @@ not widen a qualified worker; the refusal names this fixed-allowlist boundary
 without printing the destination. A missing configured image fails without a pull;
 a rebuilt image with another ID needs its own qualification.
 
+A profile revision may declare container ceilings: memory (with no swap), CPU,
+process count, open files and maximum file size. The `-v1` profiles declare
+none, so their container argv is unchanged and an `acpProfile.resources`
+override on them is refused. On a revision that declares ceilings, the operator
+may set any of `memoryMib`, `cpuMillis`, `pids`, `nofile` and `fsizeMib` in
+`acpProfile.resources`, from 1 up to the revision's hard maximum. Absent fields
+keep the revision default. The profile and container receipts record the
+effective values and a `definitionSha256` of the code-resident revision. See
+[ACP resource budgets](scoping/acp-resource-budgets.md); no released revision
+declares ceilings yet.
+
 On macOS, Docker must share the repository, mission worktrees, gate scratch and
 private worker home. `TMPDIR` controls ordinary worktree/gate temporary paths;
 `KRANZ_SCRATCH_ROOT` controls the ACP scratch base. Point both at existing private,

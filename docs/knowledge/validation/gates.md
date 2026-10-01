@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-10-01
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -55,6 +55,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the Linux ACP containment job now also requires the resource-ceiling proof by name.
+
 Rechecked 2026-09-29 (UTC) against the AGENTS.md and ticket publication guidance; gate commands, acceptance requirements and consent behavior are unchanged.
 
 ## Human review evidence
@@ -88,7 +90,7 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime daemon proofs and the six ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and resource-ceiling daemon proofs and the six ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. The same job explicitly runs the
 synthetic cache-read/denied-write proof and rejects its skip marker. Optional

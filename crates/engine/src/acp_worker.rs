@@ -25,16 +25,76 @@ const CREDENTIAL_LIMIT: u64 = 48_000;
 pub struct AcpWorkerProfile {
     pub id: String,
     pub credential_file: PathBuf,
+    /// Operator lowering or raising of the revision's declared ceilings,
+    /// within its hard maximum (docs/scoping/acp-resource-budgets.md D-R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceOverrides>,
 }
 
-#[derive(Clone, Copy)]
+/// Per-field operator overrides; absent fields keep the revision default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsize_mib: Option<u32>,
+}
+
+/// Effective container ceilings. Memory has no swap; `fsize` bounds any one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Resources {
+    pub memory_mib: u32,
+    pub cpu_millis: u32,
+    pub pids: u32,
+    pub nofile: u32,
+    pub fsize_mib: u32,
+}
+
+/// What a profile revision declares: defaults and the operator's hard maximum.
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct Ceilings {
+    pub defaults: Resources,
+    pub max: Resources,
+}
+
+#[derive(Clone, Copy, Serialize)]
 pub(crate) struct Definition {
     pub program: &'static str,
     pub args: &'static [&'static str],
     pub image: &'static str,
     pub egress: &'static [&'static str],
     pub claude: bool,
+    /// `None` for revisions qualified before ceilings existed; their
+    /// container argv stays exactly as reviewed.
+    pub resources: Option<Ceilings>,
 }
+
+impl Definition {
+    /// Digest of the code-resident contract behind a profile id, so evidence
+    /// shows which revision ran even though approval binds only the id.
+    pub(crate) fn sha256(&self) -> String {
+        let canonical = serde_json::to_vec(self).expect("definition serializes");
+        crate::standards_waiver::sha256_hex(&canonical)
+    }
+}
+
+#[cfg(test)]
+const FIXTURE: Definition = Definition {
+    program: "/usr/local/bin/python3",
+    args: &["-c", include_str!("acp_worker/peer.py")],
+    image: "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+    egress: &["provider.invalid:443"],
+    claude: false,
+    resources: None,
+};
 
 fn refusal(reason: &str) -> EngineError {
     EngineError::Config(format!("ACP worker profile refused: {reason}"))
@@ -51,6 +111,7 @@ impl AcpWorkerProfile {
                 image: IMAGE,
                 egress: &["api.anthropic.com:443", "claude.ai:443"],
                 claude: true,
+                resources: None,
             }),
             CODEX => Ok(Definition {
                 program: "/opt/acp/node_modules/.bin/codex-acp",
@@ -62,15 +123,29 @@ impl AcpWorkerProfile {
                     "api.openai.com:443",
                 ],
                 claude: false,
+                resources: None,
             }),
             #[cfg(test)]
-            "fixture-acp-worker-v1" => Ok(Definition {
-                program: "/usr/local/bin/python3",
-                args: &["-c", include_str!("acp_worker/peer.py")],
-                image:
-                    "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
-                egress: &["provider.invalid:443"],
-                claude: false,
+            "fixture-acp-worker-v1" => Ok(FIXTURE),
+            #[cfg(test)]
+            "fixture-acp-worker-v2" => Ok(Definition {
+                resources: Some(Ceilings {
+                    defaults: Resources {
+                        memory_mib: 256,
+                        cpu_millis: 1_000,
+                        pids: 64,
+                        nofile: 256,
+                        fsize_mib: 64,
+                    },
+                    max: Resources {
+                        memory_mib: 1_024,
+                        cpu_millis: 2_000,
+                        pids: 256,
+                        nofile: 1_024,
+                        fsize_mib: 256,
+                    },
+                }),
+                ..FIXTURE
             }),
             _ => Err(refusal("unknown or unqualified profile id")),
         }
@@ -80,8 +155,8 @@ impl AcpWorkerProfile {
         self.definition()?;
         let supported = matches!(os, "macos" | "linux") && arch == "aarch64";
         #[cfg(test)]
-        let supported =
-            supported || (self.id == "fixture-acp-worker-v1" && matches!(os, "macos" | "linux"));
+        let supported = supported
+            || (self.id.starts_with("fixture-acp-worker-") && matches!(os, "macos" | "linux"));
         if !supported {
             return Err(refusal(
                 "only the reviewed macOS/Linux ARM64 hosts are admitted",
@@ -92,7 +167,47 @@ impl AcpWorkerProfile {
                 "credentialFile must be an explicit absolute operator-owned file",
             ));
         }
+        self.effective_resources()?;
         Ok(())
+    }
+
+    /// The ceilings this session runs under: revision defaults with operator
+    /// overrides applied. Zero is refused because Docker reads it as unlimited.
+    pub(crate) fn effective_resources(&self) -> Result<Option<Resources>> {
+        let Some(ceilings) = self.definition()?.resources else {
+            return match self.resources {
+                Some(_) => Err(refusal(
+                    "this profile revision declares no resource ceilings to override",
+                )),
+                None => Ok(None),
+            };
+        };
+        let overrides = self.resources.clone().unwrap_or_default();
+        let pick = |name: &str, value: Option<u32>, default: u32, max: u32| match value {
+            None => Ok(default),
+            Some(v) if (1..=max).contains(&v) => Ok(v),
+            Some(_) => Err(refusal(&format!(
+                "resources.{name} must be between 1 and the revision maximum {max}"
+            ))),
+        };
+        let (d, m) = (ceilings.defaults, ceilings.max);
+        Ok(Some(Resources {
+            memory_mib: pick(
+                "memoryMib",
+                overrides.memory_mib,
+                d.memory_mib,
+                m.memory_mib,
+            )?,
+            cpu_millis: pick(
+                "cpuMillis",
+                overrides.cpu_millis,
+                d.cpu_millis,
+                m.cpu_millis,
+            )?,
+            pids: pick("pids", overrides.pids, d.pids, m.pids)?,
+            nofile: pick("nofile", overrides.nofile, d.nofile, m.nofile)?,
+            fsize_mib: pick("fsizeMib", overrides.fsize_mib, d.fsize_mib, m.fsize_mib)?,
+        }))
     }
 
     pub(crate) fn validate_config(
@@ -282,12 +397,15 @@ impl AcpWorkerProfile {
             .expect("checked sandbox")
             .inputs
             .tmpdir = home_path;
+        let resources = self.effective_resources()?;
         Ok(PreparedProfile {
             home: Some(home),
             secrets,
             stream_tails: Default::default(),
+            resources,
             receipt: json!({
-                "profile":self.id,"credentialSource":"operator-selected-file","startupPolicy":"v1",
+                "profile":self.id,"definitionSha256":definition.sha256(),"resources":resources,
+                "credentialSource":"operator-selected-file","startupPolicy":"v1",
                 "hostOs":std::env::consts::OS,"hostArch":std::env::consts::ARCH,
                 "proofs":["native-tool-proof-v2.json","linux-native-tool-proof-v1.json"],
                 "fullMissionAcceptanceProven":false,
@@ -357,6 +475,9 @@ pub(crate) struct PreparedProfile {
     home: Option<tempfile::TempDir>,
     secrets: Vec<String>,
     stream_tails: std::collections::HashMap<String, String>,
+    // Read only by the macOS/Linux container create path.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub resources: Option<Resources>,
     pub receipt: Value,
 }
 

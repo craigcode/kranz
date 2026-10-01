@@ -1152,8 +1152,10 @@ pub struct RoleConfig {
     pub sandbox: SandboxConfig,
     /// Explicit operator-owned ACP worker qualification and credential source.
     /// Absent on old persisted configurations; never implies generic ACP support.
+    /// Boxed (serialization-identical): hosted mission futures hold several
+    /// configs, and the REST lifecycle test bounds them to a 1 MiB stack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acp_profile: Option<crate::acp_worker::AcpWorkerProfile>,
+    pub acp_profile: Option<Box<crate::acp_worker::AcpWorkerProfile>>,
 }
 
 /// OS sandbox enforcement level for a role's sessions.
