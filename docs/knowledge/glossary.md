@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-10-01
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -21,6 +21,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the ACP worker profile entry now notes revision ceilings and bounded overrides.
 
 Rechecked 2026-09-29 (UTC) against the public-documentation rule in AGENTS.md; runtime types, ticket lifecycle and role terminology are unchanged.
 
@@ -129,7 +131,8 @@ Project vocabulary. Terms link to the note that explains them in depth.
   egress. It requires contained worktree workers; generic ACP enforcement remains
   refused. Mission egress grants cannot widen its fixed allowlist. Cache and
   relay access assume a trusted host/daemon; a version prerequisite alone is
-  not profile qualification. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
+  not profile qualification. A revision may declare resource ceilings;
+  `acpProfile.resources` overrides stay within them. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
 - **Mutation authority** — a validated, nonempty token required by the server's
   mutation-capable constructors. Convenience routers mint an undisclosed token,
   so reads work and unauthenticated mutations are refused.

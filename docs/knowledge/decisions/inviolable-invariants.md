@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-10-01
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -35,6 +35,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the sandbox container tier still carries `--pids-limit`, and ACP ceilings only tighten a qualified profile's container. No invariant changed.
 
 Rechecked 2026-09-29 (UTC) against the public-documentation addition to AGENTS.md; consent, containment, Git and event-log invariants are unchanged.
 

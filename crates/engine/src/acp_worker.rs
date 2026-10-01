@@ -475,6 +475,8 @@ pub(crate) struct PreparedProfile {
     home: Option<tempfile::TempDir>,
     secrets: Vec<String>,
     stream_tails: std::collections::HashMap<String, String>,
+    // Read only by the macOS/Linux container create path.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub resources: Option<Resources>,
     pub receipt: Value,
 }
