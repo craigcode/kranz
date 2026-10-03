@@ -1952,6 +1952,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         if !host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
@@ -1986,7 +1987,7 @@ mod tests {
         };
         let ok_file = session.path().join("ok.txt");
         {
-            use super::denial_test::{quote, run_observed, DenialProbe};
+            use super::denial_test::{quote, run_observed, AccessProbe};
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2010,7 +2011,7 @@ mod tests {
                     "Read-only file system",
                 ),
             ] {
-                let probe = DenialProbe::new(scratch.path(), name);
+                let probe = AccessProbe::new(scratch.path(), name);
                 let command = format!(
                     "set -e; printf ok > {}; {}",
                     quote(&ok_file.display().to_string()),

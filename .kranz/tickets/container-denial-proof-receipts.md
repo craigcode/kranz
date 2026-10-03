@@ -26,4 +26,4 @@ During September 26 release verification, the unchanged container_gate_wrap_runs
 
 ## Implementation review
 
-The first slice tightens the legacy worker and command-gate file-access probes and adds startup/timeout/receipt negative controls. It remains pending live Linux proof and review. The audit also identified the direct-socket bypass assertion in `container_per_host_egress_live_proof`; that networking probe still needs a conclusive execution receipt before this ticket can close. See [fixture review](../../docs/reviews/2026-09-30-container-denial-receipts.md).
+The legacy worker and command-gate file-access probes and the direct-socket bypass fixture now require conclusive guest receipts and confirmed cleanup. Synthetic controls cover launch failure, supervision timeout, unrelated socket errors, unexpected access, missing witnesses, unowned IDs and unavailable or persistent inventory. Live Linux proof and review remain required before this ticket closes. See [fixture review](../../docs/reviews/2026-09-30-container-denial-receipts.md).

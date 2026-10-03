@@ -4573,7 +4573,7 @@ esac
             "writes inside the mount set and the forwarded env must work: {output}"
         );
 
-        use crate::sandbox_container::denial_test::{quote, run_observed, DenialProbe};
+        use crate::sandbox_container::denial_test::{quote, run_observed, AccessProbe};
         let outside_file = outside.path().join("container_gate_wrap_marker");
         let mut probes = vec![
             (
@@ -4607,7 +4607,7 @@ esac
             ));
         }
         for (name, operation, status, diagnostic) in probes {
-            let probe = DenialProbe::new(scratch.path(), name);
+            let probe = AccessProbe::new(scratch.path(), name);
             let wrapped = sandbox
                 .wrap_shell(&probe.command(&operation, status, diagnostic), &env)
                 .unwrap();
