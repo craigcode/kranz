@@ -114,7 +114,12 @@ pub(crate) async fn remove_owned(
         let (code, output) = run_bounded_argv(
             cwd,
             Path::new(runtime.binary()),
-            &["inspect".into(), id.clone()],
+            &[
+                "inspect".into(),
+                "--format".into(),
+                r#"{"Id":{{json .Id}},"Owner":{{json (index .Config.Labels "io.kranz.denial-test")}}}"#.into(),
+                id.clone(),
+            ],
             Duration::from_secs(5),
             env,
         )
@@ -122,8 +127,7 @@ pub(crate) async fn remove_owned(
         let inspected = serde_json::from_str::<serde_json::Value>(&output).ok();
         if code != Some(0)
             || !inspected.as_ref().is_some_and(|v| {
-                v[0]["Id"].as_str() == Some(id.as_str())
-                    && v[0]["Config"]["Labels"]["io.kranz.denial-test"].as_str() == Some(owner)
+                v["Id"].as_str() == Some(id.as_str()) && v["Owner"].as_str() == Some(owner)
             })
         {
             return Err(format!("cannot confirm ownership of {id}: {output}"));
@@ -299,11 +303,10 @@ async fn denial_cleanup_requires_owned_full_ids_and_confirmed_absence() {
         let removed = root.path().join("removed");
         let id = "a".repeat(64);
         let owner = "fixture-owner";
-        let inspection = serde_json::json!([{
-            "Id": id, "Config": {"Labels": {"io.kranz.denial-test":
-                if case == "unowned" { "somebody-else" } else { owner }
-            }}
-        }]);
+        let inspection = serde_json::json!({
+            "Id": id,
+            "Owner": if case == "unowned" { "somebody-else" } else { owner }
+        });
         std::fs::write(
             &cli,
             format!(
@@ -311,7 +314,8 @@ async fn denial_cleanup_requires_owned_full_ids_and_confirmed_absence() {
              ps)\n [ {case} != unavailable ] || exit 125\n\
              if [ {case} = malformed ]; then printf 'short-id\\n'; exit 0; fi\n\
              if [ {case} = persists ] || [ ! -e {removed} ]; then printf '%s\\n' {id}; fi;;\n\
-             inspect) printf '%s\\n' {inspection};;\n\
+             inspect)\n [ \"$2\" = --format ] && [ \"$4\" = {id} ] || exit 127\n\
+             printf '%s\\n' {inspection};;\n\
              rm) printf '%s\\n' \"$@\" > {removed};;\n\
              *) exit 126;;\nesac\n",
                 removed = quote(&removed.display().to_string()),

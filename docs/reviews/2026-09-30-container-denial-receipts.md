@@ -29,7 +29,9 @@ The fixture wrapper uses production-generated container argv and the existing
 bounded runner, adding only an observation label. If normal removal is not
 confirmed, the proof fails. Recovery inspects each full ID and its owner label
 before removing that ID, then rechecks inventory. It never removes by name or
-prunes unrelated resources. This is fixture cleanup, not a new production
+prunes unrelated resources. Inspection requests only the ID and ownership
+label: the full Docker metadata can exceed the bounded runner's output tail.
+This is fixture cleanup, not a new production
 recovery contract; interrupted or delayed creation still cannot count as a
 passing denial.
 
@@ -83,5 +85,8 @@ The final October 2 implementation passed 3,148 workspace tests (zero failed,
 strict Rust documentation, Cargo deny, domain lint and Gitleaks. Synthetic
 fixture validation needs no provider credentials or model calls. A deliberate
 negative control that accepted connection refusal as denial failed as expected.
-Docker is unavailable locally; no live container result is claimed until the
-required Linux CI jobs supply it.
+Docker is unavailable locally. The first Linux attempt completed the positive,
+denied and positive socket sequence, then correctly failed because its full
+Docker ownership inspection was truncated by the bounded output tail. The
+fixture now requests only the two ownership fields, and its synthetic runtime
+requires a formatted inspection. A passing live result remains pending.
