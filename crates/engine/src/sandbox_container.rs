@@ -2006,8 +2006,8 @@ mod tests {
                 ),
                 (
                     "read-only-root-write",
-                    "printf nope > /etc/kranz-denial-probe".to_string(),
-                    2,
+                    "printf nope | tee /etc/kranz-denial-probe".to_string(),
+                    1,
                     "Read-only file system",
                 ),
             ] {

@@ -29,7 +29,7 @@ impl AccessProbe {
             "set -eu; export LC_ALL=C; command -v cat >/dev/null; \
              printf '%s\\n' {nonce} > {witness}; \
              if ( set +e; {operation} ) >/dev/null 2>{errors}; then exit 40; else result=$?; fi; \
-             test \"$result\" -eq {status} || exit 41; \
+             if [ \"$result\" -ne {status} ]; then printf 'expected status {status}; got %s\\n' \"$result\"; cat {errors}; exit 41; fi; \
              case \"$(cat {errors})\" in *{diagnostic}*) ;; *) cat {errors}; exit 42;; esac; \
              printf '%s\\n' {receipt}",
             nonce = quote(&self.nonce),
@@ -271,6 +271,30 @@ async fn denial_receipt_rejects_startup_timeout_and_incomplete_evidence() {
         "an allowed read must reject the denial: {output}"
     );
     assert!(!probe.proved(code, &output, true));
+
+    // Use the write utility's status, not a shell redirection status (which
+    // differs between the host shell and the container's BusyBox shell).
+    let absent_parent = dir.path().join("absent-parent/file");
+    let write_operation = format!(
+        "printf content | tee {}",
+        quote(&absent_parent.display().to_string())
+    );
+    let write_probe = AccessProbe::new(dir.path(), "synthetic-missing-parent-write");
+    let write_command = write_probe.command(&write_operation, 1, "No such file or directory");
+    let (code, output) = run(write_command.clone(), Duration::from_secs(5)).await;
+    assert!(
+        write_probe.proved(code, &output, true),
+        "{code:?}: {output}"
+    );
+    std::fs::create_dir(absent_parent.parent().unwrap()).unwrap();
+    let (code, output) = run(write_command, Duration::from_secs(5)).await;
+    assert_eq!(
+        code,
+        Some(40),
+        "an allowed write must reject denial: {output}"
+    );
+    assert!(!write_probe.proved(code, &output, true));
+    assert_eq!(std::fs::read_to_string(absent_parent).unwrap(), "content");
 }
 
 #[tokio::test]

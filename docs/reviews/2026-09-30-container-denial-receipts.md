@@ -19,8 +19,9 @@ Each access probe now needs all four pieces of evidence:
 3. An exact receipt and a successful overall probe exit.
 4. A successful, empty runtime inventory for the probe's random owner label.
 
-Hidden-file reads require the missing-path error from `cat`; read-only writes
-require the read-only-filesystem error. A successful read or write, missing
+Hidden-file reads require the missing-path error from `cat`; writes use `tee`
+and require its exit 1 plus the expected missing-path or read-only-filesystem
+error. This avoids shell-specific redirection exit codes. A successful read or write, missing
 tool, unexpected error, startup failure or supervision timeout fails the proof.
 Explicit `set +e` around the operation preserves its actual status even on
 shells that otherwise collapse a subshell's error to exit 1 under `set -e`.
@@ -89,4 +90,7 @@ Docker is unavailable locally. The first Linux attempt completed the positive,
 denied and positive socket sequence, then correctly failed because its full
 Docker ownership inspection was truncated by the bounded output tail. The
 fixture now requests only the two ownership fields, and its synthetic runtime
-requires a formatted inspection. A passing live result remains pending.
+requires a formatted inspection. The corrected [network job](https://github.com/craigcode/kranz/actions/runs/37104755574/job/111150989958) passed with its final receipt.
+The Linux file probes exposed shell-specific redirection statuses; those probes
+now use the write utility's status and diagnostic, with a synthetic failed-write
+and allowed-write control. Renewed local and live file checks remain pending.

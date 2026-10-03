@@ -4578,23 +4578,26 @@ esac
         let mut probes = vec![
             (
                 "root-write",
-                "printf nope > /etc/container_gate_wrap_nope".to_string(),
-                2,
+                "printf nope | tee /etc/container_gate_wrap_nope".to_string(),
+                1,
                 "Read-only file system",
             ),
             (
                 "unmounted-write",
-                format!("printf x > {}", quote(&outside_file.display().to_string())),
-                2,
+                format!(
+                    "printf x | tee {}",
+                    quote(&outside_file.display().to_string())
+                ),
+                1,
                 "No such file or directory",
             ),
             (
                 "audit-log-write",
                 format!(
-                    "printf tampered >> {}",
+                    "printf tampered | tee -a {}",
                     quote(&mission.join("events.jsonl").display().to_string())
                 ),
-                2,
+                1,
                 "Read-only file system",
             ),
         ];
