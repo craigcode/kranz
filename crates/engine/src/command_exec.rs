@@ -4471,9 +4471,11 @@ esac
     /// read-only rootfs, and a sibling host temp dir the container never
     /// mounts), the mission metadata mount is read-only (the events.jsonl
     /// append fails and the host bytes are untouched), and the host's
-    /// `.kranz/serve.token` is unreachable (its /dev/null mask reads back
-    /// empty, so `test -s` fails). The off arm (GateSandbox::Disabled on the
-    /// host) proves the probes are valid — the SAME probes succeed there, so
+    /// `.kranz/serve.token` is absent from the private directory view. Every
+    /// denial needs a guest start witness, a specific access-error receipt,
+    /// successful probe completion and confirmed container removal. The off
+    /// arm (GateSandbox::Disabled on the host) proves the unmounted write and
+    /// authority read are valid — those probes succeed there, so
     /// the container is what denies them.
     ///
     /// Skips outside the live-proven Linux host path or without a runtime;
@@ -4493,13 +4495,28 @@ esac
             );
             return;
         }
-        if crate::sandbox_container::detect().is_none() {
-            eprintln!(
-                "no container runtime (docker/podman/nerdctl/container) on PATH; skipping \
-                 container gate wrap fixture"
+        let runtime = crate::sandbox_container::detect();
+        let ready = if let Some(runtime) = runtime {
+            run_bounded_argv(
+                &std::env::current_dir().unwrap(),
+                std::path::Path::new(runtime.binary()),
+                &["info".into()],
+                Duration::from_secs(5),
+                &runtime.client_env(),
+            )
+            .await
+            .0 == Some(0)
+        } else {
+            false
+        };
+        if !ready {
+            crate::test_capability::skip(
+                crate::test_capability::capability::CONTAINER,
+                "container CLI or daemon unavailable for denial proof",
             );
             return;
         }
+        let runtime = runtime.unwrap();
 
         // Only live container fixtures need a VM-shared path. Native gate
         // fixtures stay outside the checkout so Git cannot discover its config.
@@ -4556,60 +4573,63 @@ esac
             "writes inside the mount set and the forwarded env must work: {output}"
         );
 
-        // Writes OUTSIDE the mount set fail: /etc (read-only rootfs) and a
-        // sibling host temp dir the container never mounts.
+        use crate::sandbox_container::denial_test::{quote, run_observed, AccessProbe};
         let outside_file = outside.path().join("container_gate_wrap_marker");
-        for probe in [
-            "echo nope > /etc/container_gate_wrap_nope".to_string(),
-            format!("echo x > '{}'", outside_file.display()),
-        ] {
-            let (ok, output) =
-                run_shell_command_sandboxed(repo.path(), &probe, &env, &sandbox).await;
+        let mut probes = vec![
+            (
+                "root-write",
+                "printf nope | tee /etc/container_gate_wrap_nope".to_string(),
+                1,
+                "Read-only file system",
+            ),
+            (
+                "unmounted-write",
+                format!(
+                    "printf x | tee {}",
+                    quote(&outside_file.display().to_string())
+                ),
+                1,
+                "No such file or directory",
+            ),
+            (
+                "audit-log-write",
+                format!(
+                    "printf tampered | tee -a {}",
+                    quote(&mission.join("events.jsonl").display().to_string())
+                ),
+                1,
+                "Read-only file system",
+            ),
+        ];
+        for name in ["serve.token", "serve.read.token", "config.json"] {
+            probes.push((
+                name,
+                format!("cat {}", quote(&kranz_dir.join(name).display().to_string())),
+                1,
+                "No such file or directory",
+            ));
+        }
+        for (name, operation, status, diagnostic) in probes {
+            let probe = AccessProbe::new(scratch.path(), name);
+            let wrapped = sandbox
+                .wrap_shell(&probe.command(&operation, status, diagnostic), &env)
+                .unwrap();
+            let (code, output, cleaned) =
+                run_observed(repo.path(), runtime, wrapped.args, COMMAND_TIMEOUT).await;
             assert!(
-                !ok,
-                "write outside the mount set must fail inside the container: {probe}\n{output}"
+                probe.proved(code, &output, cleaned),
+                "{name} needs guest execution, a specific denial and cleanup: {code:?}: {output}"
             );
         }
         assert!(
             !outside_file.exists(),
             "the denied write must not create the host file"
         );
-
-        // Mission metadata is read-only: the append fails and the audit log
-        // keeps its host bytes.
-        let (ok, _) = run_shell_command_sandboxed(
-            repo.path(),
-            &format!(
-                "echo tampered >> '{}'",
-                mission.join("events.jsonl").display()
-            ),
-            &env,
-            &sandbox,
-        )
-        .await;
-        assert!(!ok, "the events.jsonl append must fail on the ro mount");
         assert_eq!(
             std::fs::read_to_string(mission.join("events.jsonl")).unwrap(),
             "{\"seq\":1}\n",
             "the audit log must be untouched by the container gate"
         );
-
-        // The host's authority material is unreachable: the /dev/null mask
-        // reads back EMPTY (test -s fails) while an ordinary repo file still
-        // reads fine.
-        for name in ["serve.token", "serve.read.token", "config.json"] {
-            let (ok, output) = run_shell_command_sandboxed(
-                repo.path(),
-                &format!("test -s '{}'", kranz_dir.join(name).display()),
-                &env,
-                &sandbox,
-            )
-            .await;
-            assert!(
-                !ok,
-                ".kranz/{name} must be /dev/null-masked inside the container: {output}"
-            );
-        }
         let (ok, output) = run_shell_command_sandboxed(
             repo.path(),
             &format!("test -s '{}'", repo.path().join("public.txt").display()),

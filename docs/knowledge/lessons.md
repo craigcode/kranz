@@ -2,13 +2,21 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-10-03
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
+File and network access probes require guest receipts and confirmed cleanup;
+production routing, process ownership and mission contracts are unchanged.
+
+Rechecked 2026-09-30 against the container-denial invariants note. The test
+receipts strengthen the existing anti-vacuity rule; lesson capture, provenance
+and production cleanup requirements are unchanged.
 
 Rechecked 2026-09-29 (UTC) against the public-documentation rule and invariants note; append-only lesson capture and its provenance rules are unchanged.
 

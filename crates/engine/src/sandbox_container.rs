@@ -987,6 +987,9 @@ pub fn container_gate_run_args(
     out
 }
 
+#[cfg(all(test, unix))]
+pub(crate) mod denial_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1943,11 +1946,13 @@ mod tests {
     /// Smoke: a trivial worker inside the provider lands a write inside the
     /// mounted session dir on the host, a write outside the declared policy
     /// (`/etc`, read-only root fs) is denied, and authority material under the
-    /// session root (`.kranz/serve.token`) is masked by its /dev/null bind.
+    /// session root (`.kranz/serve.token`) is absent from its private view.
     /// Skips outside the live-proven Linux host path or without a runtime;
     /// CI ubuntu-latest has Docker.
+    #[cfg(unix)]
     #[test]
     fn container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary() {
+        let _env = crate::agent_env::EnvTestGuard::engage(&[]);
         if !host_supports_container_contract() {
             crate::test_capability::skip(
                 crate::test_capability::capability::CONTAINER,
@@ -1981,40 +1986,58 @@ mod tests {
             name: None,
         };
         let ok_file = session.path().join("ok.txt");
-        let args = container_run_args(
-            &inputs,
-            &spec,
-            Path::new("sh"),
-            &[
-                "-c".to_string(),
-                format!(
-                    "echo ok > {} && ! cat {} && echo nope > /etc/nope.txt",
-                    ok_file.display(),
-                    kranz_dir.join("serve.token").display()
+        {
+            use super::denial_test::{quote, run_observed, AccessProbe};
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // Separate probes: failure reading a hidden token must not prevent
+            // the read-only root write from ever executing.
+            for (name, operation, status, diagnostic) in [
+                (
+                    "hidden-authority-read",
+                    format!(
+                        "cat {}",
+                        quote(&kranz_dir.join("serve.token").display().to_string())
+                    ),
+                    1,
+                    "No such file or directory",
                 ),
-            ],
-            None,
-        );
-        let output = std::process::Command::new(runtime.binary())
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("failed to spawn container runtime");
-
-        assert!(
-            ok_file.exists(),
-            "write inside the mounted session_cwd must land on the host: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !output.status.success(),
-            "write outside the declared policy (/etc) must be denied, failing the worker: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !String::from_utf8_lossy(&output.stdout).contains("secret"),
-            "the /dev/null mask must hide serve.token content inside the container"
-        );
+                (
+                    "read-only-root-write",
+                    "printf nope | tee /etc/kranz-denial-probe".to_string(),
+                    1,
+                    "Read-only file system",
+                ),
+            ] {
+                let probe = AccessProbe::new(scratch.path(), name);
+                let command = format!(
+                    "set -e; printf ok > {}; {}",
+                    quote(&ok_file.display().to_string()),
+                    probe.command(&operation, status, diagnostic),
+                );
+                let args = container_run_args(
+                    &inputs,
+                    &spec,
+                    Path::new("sh"),
+                    &["-c".into(), command],
+                    None,
+                );
+                let (code, output, cleaned) = executor.block_on(run_observed(
+                    session.path(),
+                    runtime,
+                    args,
+                    std::time::Duration::from_secs(600),
+                ));
+                assert!(
+                    probe.proved(code, &output, cleaned),
+                    "{name} needs guest execution, a specific denial and cleanup: {code:?}: {output}"
+                );
+                assert_eq!(std::fs::read_to_string(&ok_file).unwrap(), "ok");
+                assert!(!output.contains("secret"));
+            }
+        }
     }
 
     #[test]
