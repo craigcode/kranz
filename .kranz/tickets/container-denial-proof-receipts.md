@@ -1,5 +1,6 @@
 ---
-state: open
+state-note: Implemented and reviewed in PR #101; local workspace gates and live Linux file/network denial proofs passed. Production containment and deadlines are unchanged.
+state: done
 title: Require conclusive execution receipts for container denial tests
 priority: 2
 schedule: once
@@ -26,4 +27,4 @@ During September 26 release verification, the unchanged container_gate_wrap_runs
 
 ## Implementation review
 
-The legacy worker and command-gate file-access probes and the direct-socket bypass fixture now require conclusive guest receipts and confirmed cleanup. Synthetic controls cover launch failure, supervision timeout, unrelated socket errors, unexpected access, missing witnesses, unowned IDs and unavailable or persistent inventory. Live Linux proof and review remain required before this ticket closes. See [fixture review](../../docs/reviews/2026-09-30-container-denial-receipts.md).
+The legacy worker and command-gate file-access probes and the direct-socket bypass fixture now require conclusive guest receipts and confirmed cleanup. Synthetic controls cover launch failure, supervision timeout, unrelated socket errors, unexpected access, missing witnesses, unowned IDs and unavailable or persistent inventory. The local workspace gates, live Linux file and network proofs, and five-axis self-review passed; PR #101 records the implementation and required merge checks. See [fixture review](../../docs/reviews/2026-09-30-container-denial-receipts.md).

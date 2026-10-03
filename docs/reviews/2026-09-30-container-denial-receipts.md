@@ -1,9 +1,9 @@
 # Container denial receipts: file and network fixtures
 
-Base: public `a37c9981`. Updated 2026-10-02. This is the test-only implementation of
+Base: public `a37c9981`. Updated 2026-10-03. This is the test-only implementation of
 [container-denial-proof-receipts](../../.kranz/tickets/container-denial-proof-receipts.md).
-The ticket remains open. Production profiles, resource limits, supervision
-and cleanup behavior are unchanged.
+The ticket is complete on PR #101. Production profiles, resource limits,
+supervision and cleanup behavior are unchanged.
 
 ## Findings and change
 
@@ -81,16 +81,23 @@ Self-review, not an independent review:
 
 ## Validation status
 
-The final October 2 implementation passed 3,148 workspace tests (zero failed,
+Implementation `de923179` passed 3,148 local workspace tests (zero failed,
 10 ignored), formatting, Clippy with warnings denied, the workspace build,
-strict Rust documentation, Cargo deny, domain lint and Gitleaks. Synthetic
-fixture validation needs no provider credentials or model calls. A deliberate
+strict Rust documentation, Cargo deny, domain lint and Gitleaks. A deliberate
 negative control that accepted connection refusal as denial failed as expected.
-Docker is unavailable locally. The first Linux attempt completed the positive,
-denied and positive socket sequence, then correctly failed because its full
-Docker ownership inspection was truncated by the bounded output tail. The
-fixture now requests only the two ownership fields, and its synthetic runtime
-requires a formatted inspection. The corrected [network job](https://github.com/craigcode/kranz/actions/runs/37104755574/job/111150989958) passed with its final receipt.
-The Linux file probes exposed shell-specific redirection statuses; those probes
-now use the write utility's status and diagnostic, with a synthetic failed-write
-and allowed-write control. Renewed local and live file checks remain pending.
+These checks used synthetic fixtures and no provider credentials or model calls.
+
+The [Linux workspace and five explicit receipt checks](https://github.com/craigcode/kranz/actions/runs/37105518733/job/111153134402)
+passed on that implementation. Both real file fixtures executed, and the CI
+step required successful nonzero test counts without capability skips.
+The [live network proof](https://github.com/craigcode/kranz/actions/runs/37105518733/job/111153134357)
+also passed with the positive/denied/positive sequence and the final receipt
+confirming owned cleanup. The live external-evaluator and native macOS suites
+passed in the same run. Docker was unavailable locally; those live receipts
+come from Linux CI.
+
+The initial CI attempts failed closed on truncated Docker inspection output
+and shell-specific redirection statuses. Compact ownership inspection and
+explicit write-utility errors resolved those fixture assumptions; synthetic
+controls cover both corrections. Later ticket and review bookkeeping does not
+change the tested implementation. Required PR checks still govern merge.
