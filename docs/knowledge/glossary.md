@@ -22,7 +22,7 @@ verified_against:
   - AGENTS.md
 ---
 
-Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the ACP worker profile entry now notes revision ceilings and bounded overrides.
+Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the ACP worker profile entry now notes revision ceilings and bounded overrides.
 
 Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
 File and network access probes require guest receipts and confirmed cleanup;

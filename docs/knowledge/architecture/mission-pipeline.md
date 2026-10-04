@@ -40,7 +40,7 @@ verified_against:
   - docs/design.md
 ---
 
-Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1): a profile revision may declare container ceilings, receipts record the effective values and a `definitionSha256`, and `RoleConfig.acp_profile` is boxed without a serialization change. The pipeline stages are unchanged.
+Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1): a profile revision may declare container ceilings, receipts record the effective values and a `definitionSha256`, and `RoleConfig.acp_profile` is boxed without a serialization change. The pipeline stages are unchanged.
 
 Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
 File and network access probes require guest receipts and confirmed cleanup;

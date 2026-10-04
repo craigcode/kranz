@@ -172,7 +172,7 @@ impl AcpWorkerProfile {
     }
 
     /// The ceilings this session runs under: revision defaults with operator
-    /// overrides applied. Zero is refused because Docker reads it as unlimited.
+    /// overrides applied. Reject unusable values and Docker's unlimited sentinels.
     pub(crate) fn effective_resources(&self) -> Result<Option<Resources>> {
         let Some(ceilings) = self.definition()?.resources else {
             return match self.resources {
@@ -183,11 +183,11 @@ impl AcpWorkerProfile {
             };
         };
         let overrides = self.resources.clone().unwrap_or_default();
-        let pick = |name: &str, value: Option<u32>, default: u32, max: u32| match value {
+        let pick = |name: &str, value: Option<u32>, default: u32, min: u32, max: u32| match value {
             None => Ok(default),
-            Some(v) if (1..=max).contains(&v) => Ok(v),
+            Some(v) if (min..=max).contains(&v) => Ok(v),
             Some(_) => Err(refusal(&format!(
-                "resources.{name} must be between 1 and the revision maximum {max}"
+                "resources.{name} must be between {min} and the revision maximum {max}"
             ))),
         };
         let (d, m) = (ceilings.defaults, ceilings.max);
@@ -196,17 +196,19 @@ impl AcpWorkerProfile {
                 "memoryMib",
                 overrides.memory_mib,
                 d.memory_mib,
+                6, // Docker's minimum memory limit is 6 MiB.
                 m.memory_mib,
             )?,
             cpu_millis: pick(
                 "cpuMillis",
                 overrides.cpu_millis,
                 d.cpu_millis,
+                10, // Linux's 1 ms quota floor at Docker's default 100 ms period.
                 m.cpu_millis,
             )?,
-            pids: pick("pids", overrides.pids, d.pids, m.pids)?,
-            nofile: pick("nofile", overrides.nofile, d.nofile, m.nofile)?,
-            fsize_mib: pick("fsizeMib", overrides.fsize_mib, d.fsize_mib, m.fsize_mib)?,
+            pids: pick("pids", overrides.pids, d.pids, 1, m.pids)?,
+            nofile: pick("nofile", overrides.nofile, d.nofile, 1, m.nofile)?,
+            fsize_mib: pick("fsizeMib", overrides.fsize_mib, d.fsize_mib, 1, m.fsize_mib)?,
         }))
     }
 

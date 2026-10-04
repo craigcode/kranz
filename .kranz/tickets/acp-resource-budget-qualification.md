@@ -13,6 +13,7 @@ Define and prove resource limits for released ACP workers and future terminal-pr
 
 Current containers have no explicit memory or CPU ceilings. The contained terminal provider remains a synthetic fixture with bounded operation/request limits, not a released general-purpose session. See [September 26 review](../../docs/reviews/2026-09-26-acp-gate-remediation.md).
 Scope, gaps and proposed D-R1…D-R7 decisions: [ACP resource budgets](../../docs/scoping/acp-resource-budgets.md).
+R1 provides the fixture-only profile contract; [R1 review](../../docs/reviews/2026-10-04-acp-resource-contract.md). This ticket stays open for classification, production qualification and terminal budgets.
 
 ## Scoping answers
 

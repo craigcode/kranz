@@ -36,7 +36,7 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
-Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the sandbox container tier still carries `--pids-limit`, and ACP ceilings only tighten a qualified profile's container. No invariant changed.
+Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the sandbox container tier still carries `--pids-limit`, and ACP ceilings apply only to revisions that declare them; currently that is a test fixture. Overrides have runtime floors and revision maxima, and production v1 profiles remain unchanged. No invariant changed.
 
 Rechecked 2026-10-04 (UTC): the container fixture helper now matches its
 Unix-only test callers. Production containment, authority and deadlines are unchanged.

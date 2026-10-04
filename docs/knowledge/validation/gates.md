@@ -55,7 +55,7 @@ verified_against:
   - docs/tickets.md
 ---
 
-Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the Linux ACP containment job now also requires the resource-ceiling proof by name.
+Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the Linux ACP containment job now requires both resource-limit create metadata and a complete fixture mission with guest readback and profile/container receipts by name. Production v2 profiles remain unavailable pending qualification.
 
 Rechecked 2026-10-04 (UTC): the container fixture helper now matches its
 Unix-only test callers. Production containment, authority and deadlines are unchanged.
