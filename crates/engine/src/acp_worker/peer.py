@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import resource
 import subprocess
 import sys
 
@@ -40,6 +41,18 @@ for line in sys.stdin:
     elif method == "session/new":
         reply(request, {"sessionId": "profile-fixture-session"})
     elif method == "session/prompt":
+        resources_checked = False
+        if "fixture-check-resources" in str(request):
+            # This synthetic qualification lane uses Docker's cgroup v2 namespace.
+            cgroup = Path("/sys/fs/cgroup")
+            assert int((cgroup / "memory.max").read_text()) == 512 * 1024 * 1024
+            assert int((cgroup / "memory.swap.max").read_text()) == 0
+            assert int((cgroup / "pids.max").read_text()) == 80
+            quota, period = map(int, (cgroup / "cpu.max").read_text().split())
+            assert quota * 2 == period * 3
+            assert resource.getrlimit(resource.RLIMIT_NOFILE) == (128, 128)
+            assert resource.getrlimit(resource.RLIMIT_FSIZE) == (32 * 1024 * 1024,) * 2
+            resources_checked = True
         if "fixture-expose-login" in str(request):
             Path("source.txt").write_text(str(home))
             print("failure: " + login_value, file=sys.stderr, flush=True)
@@ -56,6 +69,7 @@ for line in sys.stdin:
         granted = answer["result"]["outcome"].get("optionId") == "once"
         if granted:
             subprocess.run(["/bin/sh", "-c", command], check=True)
-        report = {"result": "pass" if granted else "fail", "summary": "synthetic profile worker", "filesTouched": ["source.txt"] if granted else [], "testEvidence": str(home), "commandsRun": [command] if granted else [], "commits": []}
+        summary = "synthetic profile worker; resource limits read back" if resources_checked else "synthetic profile worker"
+        report = {"result": "pass" if granted else "fail", "summary": summary, "filesTouched": ["source.txt"] if granted else [], "testEvidence": str(home), "commandsRun": [command] if granted else [], "commits": []}
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "profile-fixture-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": json.dumps(report)}}}})
         reply(request, {"stopReason": "end_turn"})

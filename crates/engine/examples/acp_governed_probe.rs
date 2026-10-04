@@ -77,10 +77,11 @@ fn configuration(provider: &str, credential_file: PathBuf) -> Result<MissionConf
     cfg.worker.backend = Some("acp".into());
     cfg.worker.max_budget_usd = None;
     cfg.worker.max_turns = Some(4);
-    cfg.worker.acp_profile = Some(AcpWorkerProfile {
+    cfg.worker.acp_profile = Some(Box::new(AcpWorkerProfile {
         id: id.into(),
         credential_file,
-    });
+        resources: None,
+    }));
     cfg.worker.sandbox = SandboxConfig {
         provider: SandboxProvider::Container,
         enforce: SandboxEnforce::FsNet,

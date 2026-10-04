@@ -7,6 +7,7 @@ fn profile(id: &str) -> AcpWorkerProfile {
     AcpWorkerProfile {
         id: id.into(),
         credential_file: std::env::temp_dir().join("operator-auth.json"),
+        resources: None,
     }
 }
 fn config(profile: AcpWorkerProfile) -> MissionConfig {
@@ -16,7 +17,7 @@ fn config(profile: AcpWorkerProfile) -> MissionConfig {
         ..Default::default()
     };
     cfg.worker.backend = Some("acp".into());
-    cfg.worker.acp_profile = Some(profile);
+    cfg.worker.acp_profile = Some(Box::new(profile));
     cfg.worker.sandbox = SandboxConfig {
         provider: SandboxProvider::Container,
         enforce: SandboxEnforce::FsNet,
@@ -189,6 +190,7 @@ impl Fixture {
             profile: AcpWorkerProfile {
                 id: "fixture-acp-worker-v1".into(),
                 credential_file: auth,
+                resources: None,
             },
         }
     }
@@ -417,6 +419,12 @@ async fn acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_cons
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_containment_v1_profile_resources_survive_dispatch_and_leave_receipts() {
+    profile_mission(ProfileScenario::Resources).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn acp_containment_v1_profile_defect_requires_repair_and_fresh_consent() {
     profile_mission(ProfileScenario::Repair).await;
 }
@@ -443,6 +451,7 @@ async fn acp_containment_v1_profile_checker_failure_blocks_completed_worker() {
 #[derive(Clone, Copy, PartialEq)]
 enum ProfileScenario {
     Clean,
+    Resources,
     Repair,
     Interrupt,
     PolicyDrift,
@@ -463,7 +472,17 @@ async fn profile_mission(scenario: ProfileScenario) {
     }
     // Keep PATH and Docker context stable while other tests poison the environment.
     let _env = crate::agent_env::EnvTestGuard::engage(&[]);
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    if scenario == ProfileScenario::Resources {
+        f.profile.id = "fixture-acp-worker-v2".into();
+        f.profile.resources = Some(ResourceOverrides {
+            memory_mib: Some(512),
+            cpu_millis: Some(1_500),
+            pids: Some(80),
+            nofile: Some(128),
+            fsize_mib: Some(32),
+        });
+    }
     let complete = r#"{"decision":"complete","guidance":"","summary":"accepted fixture"}"#;
     let checkpoint = r#"{"action":"commit-as-is","note":"host checkpoint"}"#;
     let repair = scenario == ProfileScenario::Repair;
@@ -524,6 +543,8 @@ async fn profile_mission(scenario: ProfileScenario) {
     .unwrap();
     let spec = if repair {
         "fixture-seeded-defect: write changed newline to source.txt"
+    } else if scenario == ProfileScenario::Resources {
+        "fixture-check-resources: write changed newline to source.txt"
     } else {
         "write changed newline to source.txt"
     };
@@ -729,9 +750,30 @@ async fn profile_mission(scenario: ProfileScenario) {
         assert!(!text.contains("synthetic-login-no-authority-12345"));
         if text.contains("workerProfile") {
             profile_receipts += 1;
+            if scenario == ProfileScenario::Resources {
+                let receipt = text
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|value| value.get("workerProfile").is_some())
+                    .expect("profile receipt");
+                let expected =
+                    serde_json::to_value(f.profile.effective_resources().unwrap()).unwrap();
+                assert_eq!(receipt["workerProfile"]["resources"], expected);
+                assert_eq!(receipt["containment"]["resources"], expected);
+                assert_eq!(
+                    receipt["workerProfile"]["definitionSha256"],
+                    f.profile.definition().unwrap().sha256()
+                );
+            }
             // The fixture's parsed report records only its disposable HOME path.
             for run in state.runs.values().filter(|r| r.role == Role::Worker) {
                 let report = run.report.as_ref().expect("parsed profile worker report");
+                if scenario == ProfileScenario::Resources {
+                    assert_eq!(
+                        report.summary, "synthetic profile worker; resource limits read back",
+                        "guest must witness completion of every resource readback"
+                    );
+                }
                 let home = Path::new(&report.test_evidence);
                 assert!(
                     home.is_absolute()
@@ -1093,6 +1135,7 @@ fn acp_profile_refuses_a_credential_split_over_text_frames() {
             home: None,
             secrets: vec![fixture_value.into()],
             stream_tails: Default::default(),
+            resources: None,
             receipt: serde_json::json!({}),
         };
         let frame = |text: &str| {
@@ -1101,5 +1144,123 @@ fn acp_profile_refuses_a_credential_split_over_text_frames() {
         assert!(!profile.contains_secret(&frame(&fixture_value[..13])));
         assert!(!profile.contains_secret(r#"{"params":{"update":{"sessionUpdate":"plan"}}}"#));
         assert!(profile.contains_secret(&frame(&fixture_value[13..])));
+    }
+}
+
+#[test]
+fn acp_profile_resource_ceilings_are_revision_scoped_and_bounded() {
+    let with = |id: &str, overrides: Option<ResourceOverrides>| AcpWorkerProfile {
+        resources: overrides,
+        ..profile(id)
+    };
+    // Revisions qualified before ceilings keep no limits and refuse overrides.
+    for id in [CLAUDE, CODEX, "fixture-acp-worker-v1"] {
+        assert_eq!(with(id, None).effective_resources().unwrap(), None);
+        let refused = with(id, Some(ResourceOverrides::default()))
+            .validate_target("linux", "aarch64")
+            .unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("declares no resource ceilings"));
+    }
+    let defaults = with("fixture-acp-worker-v2", None)
+        .effective_resources()
+        .unwrap()
+        .unwrap();
+    assert_eq!((defaults.memory_mib, defaults.pids), (256, 64));
+    let raised = with(
+        "fixture-acp-worker-v2",
+        Some(ResourceOverrides {
+            memory_mib: Some(1_024),
+            cpu_millis: Some(500),
+            ..Default::default()
+        }),
+    )
+    .effective_resources()
+    .unwrap()
+    .unwrap();
+    assert_eq!((raised.memory_mib, raised.cpu_millis), (1_024, 500));
+    assert_eq!(raised.nofile, defaults.nofile);
+    // Exercise every boundary, including Docker's memory and CPU floors.
+    for (field, min, max) in [
+        ("memoryMib", 6_u32, 1_024_u32),
+        ("cpuMillis", 10, 2_000),
+        ("pids", 1, 256),
+        ("nofile", 1, 1_024),
+        ("fsizeMib", 1, 256),
+    ] {
+        for value in [0, min - 1, min, max, max + 1] {
+            let overrides = serde_json::from_value(json!({field: value})).unwrap();
+            let result =
+                with("fixture-acp-worker-v2", Some(overrides)).validate_target("linux", "aarch64");
+            if (min..=max).contains(&value) {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&format!("resources.{field}")), "{error}");
+                assert!(error.contains(&format!("between {min}")), "{error}");
+            }
+        }
+        for invalid in [json!(-1), json!(u64::from(u32::MAX) + 1), json!(1.5)] {
+            assert!(serde_json::from_value::<ResourceOverrides>(json!({field: invalid})).is_err());
+        }
+    }
+    // The override is additive configuration: absent stays absent on disk.
+    let plain = serde_json::to_value(with("fixture-acp-worker-v2", None)).unwrap();
+    assert!(plain.get("resources").is_none());
+    let parsed: AcpWorkerProfile = serde_json::from_value(json!({
+        "id":"fixture-acp-worker-v2","credentialFile":"/auth","resources":{"memoryMib":512}
+    }))
+    .unwrap();
+    assert_eq!(parsed.resources.unwrap().memory_mib, Some(512));
+    assert!(serde_json::from_value::<AcpWorkerProfile>(json!({
+        "id":"fixture-acp-worker-v2","credentialFile":"/auth","resources":{"swapMib":512}
+    }))
+    .is_err());
+    // Evidence names the code-resident revision, not only its id.
+    let v1 = profile("fixture-acp-worker-v1")
+        .definition()
+        .unwrap()
+        .sha256();
+    let v2 = profile("fixture-acp-worker-v2")
+        .definition()
+        .unwrap()
+        .sha256();
+    assert_eq!(v1.len(), 64);
+    assert_ne!(v1, v2);
+    assert_eq!(
+        v2,
+        profile("fixture-acp-worker-v2")
+            .definition()
+            .unwrap()
+            .sha256()
+    );
+}
+
+#[test]
+fn acp_profile_resource_overrides_preserve_config_authority_and_wire_shape() {
+    use crate::config::{check_project_layer_keys, check_runtime_patch, PatchSource};
+    let old_profile = json!({"id": CODEX, "credentialFile": "/auth"});
+    let mut old_role = serde_json::to_value(MissionConfig::default().worker).unwrap();
+    old_role["acpProfile"] = old_profile;
+    let role: RoleConfig = serde_json::from_value(old_role.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&role).unwrap(), old_role);
+    let base = serde_json::to_value(config(profile("fixture-acp-worker-v2"))).unwrap();
+    for field in ["memoryMib", "cpuMillis", "pids", "nofile", "fsizeMib"] {
+        for resources in [json!({field: 128}), Value::Null] {
+            let patch = json!({"worker": {"acpProfile": {"resources": resources}}});
+            assert!(
+                check_project_layer_keys(&patch, &base, Path::new(".kranz/config.json")).is_err()
+            );
+            for source in [PatchSource::Operator, PatchSource::Inbox] {
+                assert!(check_runtime_patch(&patch, &base, source).is_err());
+            }
+        }
+    }
+    for id in ["claude-acp-0.77.0-arm64-v2", "codex-acp-1.11.0-arm64-v2"] {
+        assert!(
+            profile(id).definition().is_err(),
+            "unqualified production revision: {id}"
+        );
     }
 }

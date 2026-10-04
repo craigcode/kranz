@@ -55,6 +55,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the Linux ACP containment job now requires both resource-limit create metadata and a complete fixture mission with guest readback and profile/container receipts by name. Production v2 profiles remain unavailable pending qualification.
+
 Rechecked 2026-10-04 (UTC): the container fixture helper now matches its
 Unix-only test callers. Production containment, authority and deadlines are unchanged.
 
@@ -100,7 +102,7 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime daemon proofs and the six ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and resource-ceiling daemon proofs and the six ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. The same job explicitly runs the
 synthetic cache-read/denied-write proof and rejects its skip marker. Optional

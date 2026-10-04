@@ -876,10 +876,11 @@ mod tests {
     fn acp_profile_readiness_never_reads_or_probes_a_login() {
         let mut cfg = MissionConfig::default();
         cfg.worker.backend = Some("acp".into());
-        cfg.worker.acp_profile = Some(crate::acp_worker::AcpWorkerProfile {
+        cfg.worker.acp_profile = Some(Box::new(crate::acp_worker::AcpWorkerProfile {
             id: crate::acp_worker::CODEX.into(),
             credential_file: std::env::temp_dir().join("missing-profile-auth.json"),
-        });
+            resources: None,
+        }));
         let role = probe_role(Role::Worker, &cfg);
         assert_eq!(role.status, ReadinessStatus::Unknown);
         assert!(role.detail.contains("authentication not probed"));

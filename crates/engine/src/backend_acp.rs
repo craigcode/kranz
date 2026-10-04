@@ -510,7 +510,7 @@ impl AcpBackend {
             Ok(Self {
                 program: definition.program.into(),
                 args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
-                profile: Some(profile.clone()),
+                profile: Some((**profile).clone()),
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 terminal_fixture_run: None,
             })
@@ -596,9 +596,13 @@ impl AgentBackend for AcpBackend {
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let (container, mut command) = if container_requested {
-            let (container, command) =
-                crate::acp_container::OwnedContainer::prepare(&spec, &self.program, &self.args)
-                    .await?;
+            let (container, command) = crate::acp_container::OwnedContainer::prepare(
+                &spec,
+                &self.program,
+                &self.args,
+                profile_home.as_ref().and_then(|p| p.resources),
+            )
+            .await?;
             (Some(container), command)
         } else {
             (None, self.native_command(&spec))
