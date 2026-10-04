@@ -28,7 +28,9 @@ mission through a v2 fixture profile with nondefault overrides. The guest reads
 memory, swap, CPU and process limits from its cgroup v2 namespace and checks
 descriptor/file-size limits through `getrlimit`. The host requires delivery,
 permission evidence, unchanged primary source, disposed private home, and
-matching profile/container receipts. Linux CI requires both named tests and
+matching profile/container receipts. A required guest witness is emitted only
+after all readbacks pass, so losing the fixture trigger cannot silently skip
+the assertions. Linux CI requires both named tests and
 rejects capability skips. This checks propagation and useful synthetic work;
 it does not qualify real adapters or resource-exhaustion behavior.
 

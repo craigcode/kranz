@@ -768,6 +768,12 @@ async fn profile_mission(scenario: ProfileScenario) {
             // The fixture's parsed report records only its disposable HOME path.
             for run in state.runs.values().filter(|r| r.role == Role::Worker) {
                 let report = run.report.as_ref().expect("parsed profile worker report");
+                if scenario == ProfileScenario::Resources {
+                    assert_eq!(
+                        report.summary, "synthetic profile worker; resource limits read back",
+                        "guest must witness completion of every resource readback"
+                    );
+                }
                 let home = Path::new(&report.test_evidence);
                 assert!(
                     home.is_absolute()
