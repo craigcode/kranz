@@ -1045,6 +1045,121 @@ mod tests {
         .is_ok_and(|output| output.status.success())
     }
 
+    #[cfg(unix)]
+    async fn prove_direct_socket_denial(
+        cwd: &Path,
+        network: &str,
+    ) -> std::result::Result<(), String> {
+        use crate::command_exec::run_bounded_argv;
+        use crate::sandbox_container::denial_test::{remove_owned, run_observed, AccessProbe};
+        let runtime = ContainerRuntime::Docker;
+        let env = runtime.client_env();
+        let owner = uuid::Uuid::new_v4().simple().to_string();
+        let label = format!("io.kranz.denial-test={owner}");
+        println!("KRANZ_SOCKET_TARGET_OWNER={label}");
+        let proof = async {
+            let (code, output) = run_bounded_argv(
+                cwd,
+                Path::new(runtime.binary()),
+                &[
+                    "run".into(),
+                    "--detach".into(),
+                    "--rm".into(),
+                    "--label".into(),
+                    label.clone(),
+                    "--network".into(),
+                    "bridge".into(),
+                    RELAY_IMAGE.into(),
+                    "python".into(),
+                    "-u".into(),
+                    "-c".into(),
+                    include_str!("sandbox_container/socket_probe.py").into(),
+                    "serve".into(),
+                ],
+                COMMAND_TIMEOUT,
+                &env,
+            )
+            .await;
+            let target_id = output.trim();
+            if code != Some(0)
+                || target_id.len() != 64
+                || !target_id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "target did not start with a full ID: {code:?}: {output}"
+                ));
+            }
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                let (code, logs) = run_bounded_argv(
+                    cwd,
+                    Path::new(runtime.binary()),
+                    &["logs".into(), target_id.into()],
+                    Duration::from_secs(5),
+                    &env,
+                )
+                .await;
+                if code == Some(0) && logs.lines().any(|line| line == "SOCKET-TARGET-READY") {
+                    break;
+                }
+                if code != Some(0) || Instant::now() >= deadline {
+                    return Err(format!("target never became ready: {code:?}: {logs}"));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let (code, address) = run_bounded_argv(
+                cwd,
+                Path::new(runtime.binary()),
+                &[
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.NetworkSettings.Networks.bridge.IPAddress}}".into(),
+                    target_id.into(),
+                ],
+                COMMAND_TIMEOUT,
+                &env,
+            )
+            .await;
+            if code != Some(0) || address.parse::<std::net::Ipv4Addr>().is_err() {
+                return Err(format!("target address was not established: {address}"));
+            }
+            // The same pinned interpreter and socket operation bracket the
+            // denied attempt with successful reads from the exact same target.
+            for (name, mode, net) in [
+                ("socket-before", "allowed", "bridge"),
+                ("socket-bypass", "denied", network),
+                ("socket-after", "allowed", "bridge"),
+            ] {
+                let probe = AccessProbe::new(cwd, name);
+                let mut args = vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--network".into(),
+                    net.into(),
+                    "--volume".into(),
+                    format!("{}:{}", cwd.display(), cwd.display()),
+                    RELAY_IMAGE.into(),
+                ];
+                args.extend(probe.socket_args(mode, &address));
+                let (code, output, cleaned) =
+                    run_observed(cwd, runtime, args, COMMAND_TIMEOUT).await;
+                if !probe.proved(code, &output, cleaned) {
+                    return Err(format!("{name} proof failed: {code:?}: {output}"));
+                }
+                println!("{output}");
+            }
+            Ok(())
+        }
+        .await;
+        // Cleanup runs before the caller asserts, including launch/inspection
+        // failures. Only full IDs with this owner label may be removed.
+        let cleanup = remove_owned(cwd, runtime, &env, &owner).await;
+        cleanup?;
+        proof?;
+        println!("KRANZ_SOCKET_DENIAL_PROVEN: guest started; route denied; target live before and after; owned cleanup confirmed");
+        Ok(())
+    }
+
     /// Linux live proof for the ticket contract: the allowed CONNECT tunnels,
     /// a denied CONNECT yields this run's structured record, removing proxy
     /// variables cannot recover a direct route, and explicit + Drop teardown
@@ -1250,79 +1365,10 @@ mod tests {
             String::from_utf8_lossy(&denied_output.stdout)
         );
 
-        // A peer on the external bridge is reachable from an ordinary
-        // control container but not from the worker's internal-only network.
-        let target = format!("kranz-egress-target-{}", uuid::Uuid::new_v4().simple());
-        docker_checked(
-            ContainerRuntime::Docker,
-            &[
-                "run".to_string(),
-                "-d".to_string(),
-                "--rm".to_string(),
-                "--name".to_string(),
-                target.clone(),
-                crate::sandbox_container::DEFAULT_IMAGE.to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                "while true; do echo external | nc -l -p 18080; done".to_string(),
-            ],
-            "start external direct-socket target",
-        )
-        .unwrap();
-        let target_ip = docker_checked(
-            ContainerRuntime::Docker,
-            &[
-                "inspect".to_string(),
-                "--format".to_string(),
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}".to_string(),
-                target.clone(),
-            ],
-            "inspect direct-socket target",
-        )
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap();
-        let control = docker_checked(
-            ContainerRuntime::Docker,
-            &[
-                "run".to_string(),
-                "--rm".to_string(),
-                crate::sandbox_container::DEFAULT_IMAGE.to_string(),
-                "nc".to_string(),
-                "-w".to_string(),
-                "3".to_string(),
-                target_ip.clone(),
-                "18080".to_string(),
-            ],
-            "prove external target is live from the ordinary bridge",
-        )
-        .unwrap();
-        assert!(String::from_utf8_lossy(&control.stdout).contains("external"));
-        let bypass = docker_output(
-            ContainerRuntime::Docker,
-            &[
-                "run".to_string(),
-                "--rm".to_string(),
-                "--network".to_string(),
-                network.clone(),
-                crate::sandbox_container::DEFAULT_IMAGE.to_string(),
-                "nc".to_string(),
-                "-w".to_string(),
-                "3".to_string(),
-                target_ip,
-                "18080".to_string(),
-            ],
-        )
-        .unwrap();
-        assert!(
-            !bypass.status.success(),
-            "internal-only worker bypassed relay: {}",
-            String::from_utf8_lossy(&bypass.stdout)
-        );
-        docker_remove_if_present(
-            ContainerRuntime::Docker,
-            &["rm".to_string(), "-f".to_string(), target],
-        )
-        .unwrap();
+        #[cfg(unix)]
+        prove_direct_socket_denial(root.path(), &network)
+            .await
+            .unwrap();
 
         let denials = boundary.shutdown().await.unwrap();
         assert_eq!(

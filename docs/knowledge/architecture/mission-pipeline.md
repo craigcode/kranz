@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-10-03
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -39,6 +39,10 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
+File and network access probes require guest receipts and confirmed cleanup;
+production routing, process ownership and mission contracts are unchanged.
 
 Rechecked 2026-09-26: the controlled worker relay now persists progress batches
 without waiting for consent. External acceptance refuses omitted changed source,
