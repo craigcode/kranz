@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-01
+last_verified: 2026-10-04
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -41,6 +41,10 @@ verified_against:
 ---
 
 Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1): a profile revision may declare container ceilings, receipts record the effective values and a `definitionSha256`, and `RoleConfig.acp_profile` is boxed without a serialization change. The pipeline stages are unchanged.
+
+Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
+File and network access probes require guest receipts and confirmed cleanup;
+production routing, process ownership and mission contracts are unchanged.
 
 Rechecked 2026-09-26: the controlled worker relay now persists progress batches
 without waiting for consent. External acceptance refuses omitted changed source,

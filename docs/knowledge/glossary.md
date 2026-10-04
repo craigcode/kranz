@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-01
+last_verified: 2026-10-04
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -23,6 +23,10 @@ verified_against:
 ---
 
 Rechecked 2026-10-01 (UTC) against ACP profile resource ceilings (R1); the ACP worker profile entry now notes revision ceilings and bounded overrides.
+
+Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
+File and network access probes require guest receipts and confirmed cleanup;
+production routing, process ownership and mission contracts are unchanged.
 
 Rechecked 2026-09-29 (UTC) against the public-documentation rule in AGENTS.md; runtime types, ticket lifecycle and role terminology are unchanged.
 
