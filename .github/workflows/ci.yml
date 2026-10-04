@@ -307,6 +307,30 @@ jobs:
                 && 'git,bwrap,container,grep'
                 || 'git' }}
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+      - name: Require conclusive container access-denial receipts
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: container
+        shell: bash
+        run: |
+          for name in \
+            sandbox_container::denial_test::denial_receipt_rejects_startup_timeout_and_incomplete_evidence \
+            sandbox_container::denial_test::socket_denial_receipt_rejects_arbitrary_errors_and_unexpected_success \
+            sandbox_container::denial_test::denial_cleanup_requires_owned_full_ids_and_confirmed_absence \
+            sandbox_container::tests::container_provider_runs_a_trivial_worker_and_enforces_the_write_boundary \
+            command_exec::tests::container_gate_wrap_runs_contract_command_inside_the_container; do
+            log="$RUNNER_TEMP/kranz-denial-${name//::/-}.log"
+            set +e
+            cargo test --workspace --locked "$name" -- --exact --nocapture >"$log" 2>&1
+            status=$?
+            set -e
+            cat "$log"
+            test "$status" -eq 0
+            grep -qE 'test result: ok\. 1 passed' "$log"
+            if grep -q 'KRANZ_TEST_SKIP' "$log"; then
+              exit 1
+            fi
+          done
       - name: Check bounded ACP probe with a synthetic peer
         if: runner.os != 'Windows'
         shell: bash
@@ -421,6 +445,7 @@ jobs:
             exit "$status"
           fi
           grep -qE 'test result: ok\. 1 passed' "$log"
+          grep -q 'KRANZ_SOCKET_DENIAL_PROVEN:' "$log"
 
   # S3/S5/S6: real Docker containment and approval proof. No provider/model calls.
   rust-linux-external-evaluator:
