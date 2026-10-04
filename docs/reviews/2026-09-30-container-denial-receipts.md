@@ -1,6 +1,6 @@
 # Container denial receipts: file and network fixtures
 
-Base: public `a37c9981`. Updated 2026-10-03. This is the test-only implementation of
+Base: public `a37c9981`. Updated 2026-10-04. This is the test-only implementation of
 [container-denial-proof-receipts](../../.kranz/tickets/container-denial-proof-receipts.md).
 The ticket is complete on PR #101. Production profiles, resource limits,
 supervision and cleanup behavior are unchanged.
@@ -99,5 +99,8 @@ come from Linux CI.
 The initial CI attempts failed closed on truncated Docker inspection output
 and shell-specific redirection statuses. Compact ownership inspection and
 explicit write-utility errors resolved those fixture assumptions; synthetic
-controls cover both corrections. Later ticket and review bookkeeping does not
-change the tested implementation. Required PR checks still govern merge.
+controls cover both corrections. The Windows compile check subsequently caught
+an unused helper after its last cross-platform caller became Unix-only; the
+helper now has the same Unix guard as all of its callers. The evaluator job also
+failed closed when its Docker readiness check timed out; it must pass again.
+Required PR checks still govern merge.

@@ -1318,6 +1318,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn live_fixture() -> tempfile::TempDir {
         // Desktop VMs share the checkout but often not macOS /var/folders.
         // A host-only temp path can otherwise create a different empty VM

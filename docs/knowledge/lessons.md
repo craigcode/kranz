@@ -2,13 +2,16 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-03
+last_verified: 2026-10-04
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-10-04 (UTC) against the fixture-platform invariants update.
+Lesson capture, provenance and the anti-vacuity rule are unchanged.
 
 Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
 File and network access probes require guest receipts and confirmed cleanup;

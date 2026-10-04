@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-03
+last_verified: 2026-10-04
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -54,6 +54,9 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-10-04 (UTC): the container fixture helper now matches its
+Unix-only test callers. Production containment, authority and deadlines are unchanged.
 
 Rechecked 2026-10-03 (UTC) for the completed container-denial fixture scope.
 File and network access probes require guest receipts and confirmed cleanup;
