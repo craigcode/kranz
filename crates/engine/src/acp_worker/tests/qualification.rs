@@ -484,12 +484,12 @@ async fn live(root: &Path, p: &Preparation, authorized: &str) -> anyhow::Result<
 #[ignore = "prepare a concrete live measurement; reads no credential"]
 fn acp_resource_qualification_prepare_live() -> anyhow::Result<()> {
     let root = PathBuf::from(std::env::var("KRANZ_RESOURCE_PREPARATION")?);
-    let credential = PathBuf::from(std::env::var("KRANZ_RESOURCE_CREDENTIAL_FILE")?);
+    let source_path = PathBuf::from(std::env::var("KRANZ_RESOURCE_CREDENTIAL_FILE")?);
     ensure!(
-        root.is_absolute() && !credential.starts_with(&root),
+        root.is_absolute() && !source_path.starts_with(&root),
         "absolute, separate preparation/credential paths required"
     );
-    let p = preparation(&std::env::var("KRANZ_RESOURCE_PROVIDER")?, &credential)?;
+    let p = preparation(&std::env::var("KRANZ_RESOURCE_PROVIDER")?, &source_path)?;
     std::fs::create_dir(&root)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
@@ -534,8 +534,8 @@ async fn acp_resource_qualification_authorized_live() -> anyhow::Result<()> {
 #[test]
 fn acp_resource_qualification_refuses_changed_or_replayed_allowances() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
-    let credential = root.path().join("absent-credential.json");
-    let p = preparation("codex", &credential)?;
+    let source_path = root.path().join("absent-credential.json");
+    let p = preparation("codex", &source_path)?;
     write_new(&root.path().join("preparation.json"), &p)?;
     let bytes = bounded_bytes(&root.path().join("preparation.json"))?;
     assert!(consume(root.path(), "wrong-digest").is_err());
@@ -543,7 +543,7 @@ fn acp_resource_qualification_refuses_changed_or_replayed_allowances() -> anyhow
     consume(root.path(), &sha(&bytes))?;
     assert!(consume(root.path(), &sha(&bytes)).is_err());
     assert!(
-        !credential.exists(),
+        !source_path.exists(),
         "preparation/consumption must not access credentials"
     );
     let other = tempfile::tempdir()?;
