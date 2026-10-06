@@ -22,6 +22,7 @@ fn deliver_feature(engine: &mut MissionEngine, backend: BackendKind, model: &str
         .unwrap();
     engine
         .emit(EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: "worker-1".into(),
             result: RunResult::Pass,
             tokens: TokenUsage::default(),
@@ -819,6 +820,7 @@ async fn reviewer_independence_pending_only_revision_preserves_completed_prefix_
         .unwrap();
     engine
         .emit(EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: "worker-2".into(),
             result: RunResult::Pass,
             tokens: TokenUsage::default(),

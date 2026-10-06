@@ -71,16 +71,21 @@ A profile revision may declare container ceilings: memory (with no swap), CPU,
 process count, open files and maximum file size. The `-v1` profiles declare
 none, so their container argv is unchanged and an `acpProfile.resources`
 override on them is refused. On a revision that declares ceilings, the operator
-may set any of `memoryMib`, `cpuMillis`, `pids`, `nofile` and `fsizeMib` in
+may set `memoryMib`, `cpuMillis`, `pids`, `nofile`, `fsizeMib`, `tmpfsMib`
+and `sessionSeconds` in
 `acpProfile.resources`, up to the revision's hard maximum. Minimums are 6 MiB
-for memory, 10 millicores for CPU and 1 for the remaining fields. These runtime
+for memory, 10 millicores for CPU, 64 MiB for tmpfs and 1 for the remaining fields. These runtime
 floors do not guarantee an adapter can work at the minimum. Absent fields keep
 the revision default. Profile and container receipts record the configured
 effective values; the profile receipt also carries a `definitionSha256` of the
-code-resident revision. Neither receipt alone proves resource enforcement. See
+code-resident revision. Neither receipt alone proves resource enforcement. The test-only R2 revision
+also declares `tmpfsMib` and `sessionSeconds`, retains namespace-bound
+`resourceEvidence` on worker completion, and classifies only observed exhaustion.
+Its supervisor enforces the session deadline and preserves observations before
+container removal. The original v1 supervisor remains unchanged. See
 [ACP resource budgets](scoping/acp-resource-budgets.md); no released revision
 declares ceilings yet. Production revisions remain unavailable until useful-work
-and adversarial qualification passes; R1 supplies only a test fixture revision.
+and adversarial qualification passes; R1/R2 supply only a test fixture revision.
 
 On macOS, Docker must share the repository, mission worktrees, gate scratch and
 private worker home. `TMPDIR` controls ordinary worktree/gate temporary paths;

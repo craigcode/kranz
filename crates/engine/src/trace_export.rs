@@ -292,6 +292,7 @@ mod tests {
         summary: &str,
     ) -> crate::events::EventKind {
         crate::events::EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: run_id.to_string(),
             result,
             tokens: TokenUsage::default(),

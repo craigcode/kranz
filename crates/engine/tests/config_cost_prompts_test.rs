@@ -361,6 +361,7 @@ fn spawned(
 
 fn completed(run_id: &str, cost_usd: Option<f64>, tokens: TokenUsage) -> EventKind {
     EventKind::WorkerCompleted {
+        resource_evidence: None,
         run_id: run_id.to_string(),
         result: RunResult::Pass,
         tokens,

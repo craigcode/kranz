@@ -96,6 +96,7 @@ fn spawn(run_id: &str, feature_id: Option<&str>, milestone_id: Option<&str>) -> 
 
 fn completed(run_id: &str, tokens: TokenUsage, cost: Option<f64>) -> EventKind {
     EventKind::WorkerCompleted {
+        resource_evidence: None,
         run_id: run_id.to_string(),
         result: RunResult::Pass,
         tokens,
@@ -2104,6 +2105,7 @@ fn event_wire_format_matches_plan() {
         ts,
         mission_id: "m-01".to_string(),
         kind: EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: "r-1".to_string(),
             result: RunResult::Pass,
             tokens: TokenUsage {

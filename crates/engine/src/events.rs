@@ -273,6 +273,12 @@ pub enum EventKind {
 
     #[serde(rename = "worker.completed")]
     WorkerCompleted {
+        #[serde(
+            default,
+            rename = "resourceEvidence",
+            skip_serializing_if = "Option::is_none"
+        )]
+        resource_evidence: Option<Box<crate::acp_resources::ResourceEvidence>>,
         #[serde(rename = "runId")]
         run_id: String,
         result: RunResult,

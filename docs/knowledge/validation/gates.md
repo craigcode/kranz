@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-04
+last_verified: 2026-10-06
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,7 @@ verified_against:
   - crates/engine/tests/gate_evaluator_test.rs
   - crates/server/tests/server_test.rs
   - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_resources.rs
   - crates/engine/src/acp_worker/tests.rs
   - crates/engine/src/gate_evaluation/subprocess.rs
   - crates/engine/src/backend_acp.rs
@@ -23,6 +24,8 @@ verified_against:
   - scripts/check-acp-probe.py
   - crates/engine/src/acp_container.rs
   - crates/engine/src/acp_container/tests.rs
+  - crates/engine/src/acp_container/supervisor_resources.py
+  - crates/engine/src/acp_container/resource_peer.py
   - crates/engine/src/acp_container/peer.py
   - crates/engine/src/orchestrator/external_gates.rs
   - crates/engine/src/gate_evaluation/driver.rs
@@ -54,6 +57,13 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The Linux ACP
+lane requires six named resource proofs, including trusted failure attribution,
+forged-record rejection, honest success under throttling, completion replay and
+abort/owner-death cleanup. Missing observations remain explicit; an exit code
+alone is not a resource receipt. Local Docker proofs use synthetic peers; native
+Linux CI and later production qualification retain separate obligations.
 
 Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the Linux ACP containment job now requires both resource-limit create metadata and a complete fixture mission with guest readback and profile/container receipts by name. Production v2 profiles remain unavailable pending qualification.
 
@@ -102,7 +112,7 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and resource-ceiling daemon proofs and the six ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and six resource-observation daemon proofs and the six ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. The same job explicitly runs the
 synthetic cache-read/denied-write proof and rejects its skip marker. Optional

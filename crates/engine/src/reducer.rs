@@ -292,6 +292,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             state.runs.insert(
                 run_id.clone(),
                 WorkerRun {
+                    resource_evidence: None,
                     backend: *backend,
                     id: run_id.clone(),
                     role: *role,
@@ -331,17 +332,20 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
         }
 
         EventKind::WorkerCompleted {
+            resource_evidence,
             run_id,
             result,
             tokens,
             cost_usd,
             report,
+            ..
         } => {
             let run = run_mut(state, run_id)?;
             run.result = Some(*result);
             run.tokens = tokens.clone();
             run.cost_usd = *cost_usd;
             run.report = report.clone();
+            run.resource_evidence = resource_evidence.clone();
             run.ended_at = Some(event.ts);
             state.totals.add(tokens);
             state.total_cost_usd += cost_usd.unwrap_or(0.0);

@@ -1615,6 +1615,7 @@ mod tests {
                         transcript_path: "t".into(),
                     },
                     EventKind::WorkerCompleted {
+                        resource_evidence: None,
                         run_id: "r-1".into(),
                         result: kranz_engine::types::RunResult::Pass,
                         tokens: kranz_engine::types::TokenUsage {

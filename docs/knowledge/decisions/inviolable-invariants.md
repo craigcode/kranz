@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-04
+last_verified: 2026-10-06
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -14,6 +14,7 @@ verified_against:
   - crates/engine/src/review_packet.rs
   - crates/server/src/lib.rs
   - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_resources.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/sandbox_container.rs
@@ -35,6 +36,14 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The test-only
+resource revision adds bounded tmpfs and session-time limits plus protected
+supervisor observations. Classification requires observed evidence, not a worker
+exit code or configured ceiling alone. The optional completion/state fields are
+additive. Namespace removal is recorded separately from private-home cleanup;
+engine death can leave a stopped namespace and ledger for explicit recovery.
+Production v1 supervision and the existing authority boundaries are unchanged.
 
 Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the sandbox container tier still carries `--pids-limit`, and ACP ceilings apply only to revisions that declare them; currently that is a test fixture. Overrides have runtime floors and revision maxima, and production v1 profiles remain unchanged. No invariant changed.
 

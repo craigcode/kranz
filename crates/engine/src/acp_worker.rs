@@ -45,17 +45,23 @@ pub struct ResourceOverrides {
     pub nofile: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fsize_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmpfs_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_seconds: Option<u32>,
 }
 
 /// Effective container ceilings. Memory has no swap; `fsize` bounds any one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Resources {
+pub struct Resources {
     pub memory_mib: u32,
     pub cpu_millis: u32,
     pub pids: u32,
     pub nofile: u32,
     pub fsize_mib: u32,
+    pub tmpfs_mib: u32,
+    pub session_seconds: u32,
 }
 
 /// What a profile revision declares: defaults and the operator's hard maximum.
@@ -136,6 +142,8 @@ impl AcpWorkerProfile {
                         pids: 64,
                         nofile: 256,
                         fsize_mib: 64,
+                        tmpfs_mib: 64,
+                        session_seconds: 3_600,
                     },
                     max: Resources {
                         memory_mib: 1_024,
@@ -143,6 +151,8 @@ impl AcpWorkerProfile {
                         pids: 256,
                         nofile: 1_024,
                         fsize_mib: 256,
+                        tmpfs_mib: 256,
+                        session_seconds: 14_400,
                     },
                 }),
                 ..FIXTURE
@@ -209,6 +219,22 @@ impl AcpWorkerProfile {
             pids: pick("pids", overrides.pids, d.pids, 1, m.pids)?,
             nofile: pick("nofile", overrides.nofile, d.nofile, 1, m.nofile)?,
             fsize_mib: pick("fsizeMib", overrides.fsize_mib, d.fsize_mib, 1, m.fsize_mib)?,
+            // Docker's managed /dev tmpfs is 64 MiB. The configurable /dev/shm
+            // and explicit writable tmpfs mounts may not exceed this ceiling.
+            tmpfs_mib: pick(
+                "tmpfsMib",
+                overrides.tmpfs_mib,
+                d.tmpfs_mib,
+                64,
+                m.tmpfs_mib,
+            )?,
+            session_seconds: pick(
+                "sessionSeconds",
+                overrides.session_seconds,
+                d.session_seconds,
+                1,
+                m.session_seconds,
+            )?,
         }))
     }
 

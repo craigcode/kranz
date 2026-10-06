@@ -1987,6 +1987,7 @@ mod tests {
                         4,
                         100,
                         EventKind::WorkerCompleted {
+                            resource_evidence: None,
                             run_id: "r-1".into(),
                             result: RunResult::Pass,
                             tokens: TokenUsage {
@@ -2083,6 +2084,7 @@ mod tests {
                         3,
                         20,
                         EventKind::WorkerCompleted {
+                            resource_evidence: None,
                             run_id: "r-1".into(),
                             result: RunResult::Pass,
                             tokens,
@@ -2588,6 +2590,7 @@ mod tests {
 
         fn worker_completed(run_id: &str, tokens: TokenUsage, cost_usd: f64) -> EventKind {
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: run_id.into(),
                 result: RunResult::Pass,
                 tokens,

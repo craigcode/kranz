@@ -656,7 +656,19 @@ pub async fn run_session_to(
         })?;
     }
 
+    let mut resource_evidence = session.resource_evidence();
+    if let Some(evidence) = &mut resource_evidence {
+        evidence.classify(result == RunResult::Fail);
+        if let Some(message) = evidence.failure_message() {
+            log.record(EventKind::WorkerMessage {
+                run_id: run_meta.run_id.clone(),
+                tag: "error".into(),
+                content: message,
+            })?;
+        }
+    }
     log.record(EventKind::WorkerCompleted {
+        resource_evidence: resource_evidence.map(Box::new),
         run_id: run_meta.run_id.clone(),
         result,
         tokens: usage.clone(),
@@ -1142,6 +1154,7 @@ pub(crate) async fn run_worker_in_buffered_controlled(
                     content: scrub::scrub_and_truncate(&error.to_string(), MESSAGE_CONTENT_MAX),
                 })?;
                 target.record(EventKind::WorkerCompleted {
+                    resource_evidence: None,
                     run_id: run_id.clone(),
                     result: RunResult::Fail,
                     tokens: TokenUsage::default(),

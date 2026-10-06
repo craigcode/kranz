@@ -397,13 +397,16 @@ fn acp_containment_v1_owner_process() {
             }
             let mut spec = spec(root, &name, "blocked-stdin");
             spec.prompt = PromptMode::SingleShot("blocked".repeat(1_000_000));
-            let _session = AcpBackend::new(
+            let backend = AcpBackend::new(
                 "/usr/local/bin/python3",
                 vec![root.join("workspace/peer.py").display().to_string()],
-            )
-            .start(spec)
-            .await
-            .unwrap();
+            );
+            let backend = if std::env::var("KRANZ_ACP_OWNER_MODE").as_deref() == Ok("resources") {
+                backend.with_resource_fixture(fixture_resources())
+            } else {
+                backend
+            };
+            let _session = backend.start(spec).await.unwrap();
             std::future::pending::<()>().await;
         });
 }
@@ -996,6 +999,8 @@ fn fixture_resources() -> crate::acp_worker::Resources {
         pids: 64,
         nofile: 256,
         fsize_mib: 64,
+        tmpfs_mib: 64,
+        session_seconds: 3_600,
     }
 }
 
@@ -1124,6 +1129,9 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
             creation_finished: false,
             removed: false,
             resources: None,
+            observation_file: None,
+            observation_started_at: chrono::Utc::now(),
+            resource_evidence: None,
         };
         let started = std::time::Instant::now();
         let result = owned
@@ -1161,3 +1169,322 @@ async fn acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_s
 }
 
 mod terminals;
+
+#[test]
+fn acp_resource_observation_rejects_spoofed_namespaces_and_replaced_paths() {
+    use sha2::{Digest, Sha256};
+    let id = "a".repeat(64);
+    let mut state = serde_json::json!([{"Id":id,"Config":{"Labels":{"com.kranz.acp-owner":"owner"}},"State":{"Running":false,"OOMKilled":true,"ExitCode":137}}]);
+    assert!(inspected_state(&state, &id, "owner").unwrap().oom_killed);
+    assert!(inspected_state(&state, &"b".repeat(64), "owner").is_none());
+    assert!(inspected_state(&state, &id, "other").is_none());
+    state[0]["State"]["OOMKilled"] = serde_json::Value::Null;
+    assert!(inspected_state(&state, &id, "owner").is_none());
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sample");
+    let mut original = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let sample = serde_json::json!({"owner":"owner", "elapsedMs":10,"complete":true,"wallClockExpired":false,
+        "baseline":{"oomKill":0,"pidsMax":0,"throttledUsec":0},"current":{"oomKill":0,"pidsMax":0,"throttledUsec":12}});
+    let bytes = serde_json::to_vec(&sample).unwrap();
+    original.write_all(&Sha256::digest(&bytes)).unwrap();
+    original.write_all(&bytes).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"forged replacement").unwrap();
+    assert_eq!(
+        read_resource_sample(&original, "owner")
+            .unwrap()
+            .current
+            .oom_kill,
+        Some(0)
+    );
+    assert!(read_resource_sample(&original, "wrong-owner").is_none());
+    original.set_len(4129).unwrap();
+    assert!(read_resource_sample(&original, "owner").is_none());
+}
+
+async fn resource_case(
+    mode: &str,
+) -> (
+    tempfile::TempDir,
+    crate::acp_resources::ResourceEvidence,
+    SessionExit,
+) {
+    let root = fixture();
+    let name = name();
+    let peer = root.path().join("workspace/resource-peer.py");
+    std::fs::write(&peer, include_str!("resource_peer.py")).unwrap();
+    let mut limits = fixture_resources();
+    limits.session_seconds = if matches!(mode, "wall" | "startup-wall") {
+        2
+    } else {
+        30
+    };
+    if mode == "cpu" {
+        limits.cpu_millis = 100;
+    }
+    let backend = AcpBackend::new("/usr/local/bin/python3", vec![peer.display().to_string()])
+        .with_resource_fixture(limits);
+    let mut session = backend.start(spec(root.path(), &name, mode)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while session.next_event().await.unwrap().is_some() {}
+    })
+    .await
+    .expect("resource fixture deadline");
+    let exit = session.exit_status().unwrap();
+    let mut evidence = session.resource_evidence().expect("resource receipt");
+    evidence.classify(matches!(exit, SessionExit::Failed(_)));
+    assert!(evidence.namespace_cleanup_confirmed);
+    assert!(evidence.unavailable.is_empty(), "{evidence:?}");
+    assert_eq!(evidence.container_id.len(), 64);
+    assert_eq!(evidence.sample.as_ref().unwrap().owner, evidence.owner);
+    assert!(evidence.observation_finished_at >= evidence.observation_started_at);
+    assert!(!evidence.state.as_ref().unwrap().running);
+    absent(root.path(), &name).await;
+    (root, evidence, exit)
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_failures_bind_memory_pids_and_wall_observations() {
+    if !enabled() {
+        return;
+    }
+    use crate::acp_resources::FailureClass;
+    for (mode, class, key) in [
+        ("memory", FailureClass::Memory, "memoryMib"),
+        ("pids", FailureClass::Pids, "pids"),
+        ("wall", FailureClass::WallClock, "sessionSeconds"),
+        ("startup-wall", FailureClass::WallClock, "sessionSeconds"),
+    ] {
+        let (root, evidence, exit) = resource_case(mode).await;
+        assert!(matches!(exit, SessionExit::Failed(_)), "{mode}: {exit:?}");
+        assert_eq!(evidence.failure, Some(class), "{mode}: {evidence:?}");
+        assert!(evidence.failure_message().unwrap().contains(key));
+        assert!(!root.path().join("workspace/delivered.txt").exists());
+    }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_exit_codes_and_forged_observations_stay_unattributed() {
+    if !enabled() {
+        return;
+    }
+    for mode in ["exit137", "forged-observation"] {
+        let (_, evidence, exit) = resource_case(mode).await;
+        assert!(matches!(exit, SessionExit::Failed(_)));
+        assert_eq!(
+            evidence.failure,
+            Some(crate::acp_resources::FailureClass::Other),
+            "{mode}: {evidence:?}"
+        );
+        assert!(!evidence.sample.as_ref().unwrap().wall_clock_expired);
+        assert_eq!(evidence.sample.as_ref().unwrap().current.oom_kill, Some(0));
+    }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_throttling_and_tmpfs_caps_preserve_honest_success() {
+    if !enabled() {
+        return;
+    }
+    for mode in ["cpu", "tmpfs"] {
+        let (root, evidence, exit) = resource_case(mode).await;
+        assert_eq!(exit, SessionExit::Completed, "{mode}: {evidence:?}");
+        assert_eq!(evidence.failure, None);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("workspace/delivered.txt")).unwrap(),
+            "resource fixture delivery"
+        );
+        if mode == "cpu" {
+            let sample = evidence.sample.unwrap();
+            assert!(
+                sample.current.throttled_usec.unwrap() > sample.baseline.throttled_usec.unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_failures_survive_runner_completion_and_replay() {
+    if !enabled() {
+        return;
+    }
+    use crate::events::{Event, EventKind};
+    use crate::runner::{LogTarget, RunMeta};
+    use crate::types::{BackendKind, MissionConfig, Role, RunResult};
+    let root = fixture();
+    let name = name();
+    let peer = root.path().join("workspace/resource-peer.py");
+    std::fs::write(&peer, include_str!("resource_peer.py")).unwrap();
+    let backend = AcpBackend::new("/usr/local/bin/python3", vec![peer.display().to_string()])
+        .with_resource_fixture(crate::acp_worker::Resources {
+            session_seconds: 2,
+            ..fixture_resources()
+        });
+    let session_spec = spec(root.path(), &name, "wall");
+    let paths = crate::paths::MissionPaths::new(&session_spec.cwd, "m-fixture");
+    let mut log = LogTarget::Buffer(vec![EventKind::MissionCreated {
+        goal: "synthetic resource failure".into(),
+        base_branch: "main".into(),
+        mission_branch: "kranz/resource-fixture".into(),
+        config: MissionConfig::default(),
+    }]);
+    let outcome = crate::runner::run_session_to(
+        &backend,
+        session_spec,
+        &mut log,
+        &paths,
+        RunMeta {
+            run_id: "resource-run".into(),
+            role: Role::Worker,
+            feature_id: None,
+            milestone_id: None,
+            model: "synthetic".into(),
+            backend: Some(BackendKind::Acp),
+            prompt_hash: "fixture".into(),
+            executor_route: None,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.result, RunResult::Fail);
+    let LogTarget::Buffer(kinds) = log else {
+        unreachable!()
+    };
+    assert!(kinds.iter().any(|kind| matches!(kind, EventKind::WorkerMessage { content, .. } if content.contains("resources.sessionSeconds"))));
+    let events: Vec<Event> = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| Event {
+            seq: i as u64 + 1,
+            ts: chrono::Utc::now(),
+            mission_id: "m-fixture".into(),
+            kind,
+        })
+        .collect();
+    let retained: Vec<Event> =
+        serde_json::from_slice(&serde_json::to_vec(&events).unwrap()).unwrap();
+    let state = crate::reducer::fold(&retained).unwrap();
+    let run = &state.runs["resource-run"];
+    assert_eq!(run.result, Some(RunResult::Fail));
+    let evidence = run.resource_evidence.as_ref().unwrap();
+    assert_eq!(
+        evidence.failure,
+        Some(crate::acp_resources::FailureClass::WallClock)
+    );
+    assert!(evidence.namespace_cleanup_confirmed);
+    assert!(evidence.sample.as_ref().unwrap().wall_clock_expired);
+    assert!(!root.path().join("workspace/delivered.txt").exists());
+    absent(root.path(), &name).await;
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_abort_drop_and_owner_death_keep_cleanup_honest() {
+    if !enabled() {
+        return;
+    }
+    for dropped in [false, true] {
+        let root = fixture();
+        let name = name();
+        let mut session = AcpBackend::new(
+            "/usr/local/bin/python3",
+            vec![root.path().join("workspace/peer.py").display().to_string()],
+        )
+        .with_resource_fixture(fixture_resources())
+        .start(spec(root.path(), &name, "idle"))
+        .await
+        .unwrap();
+        ready(root.path()).await;
+        if dropped {
+            drop(session);
+        } else {
+            session.abort().await.unwrap();
+            assert_eq!(session.exit_status(), Some(SessionExit::Aborted));
+            assert!(
+                session
+                    .resource_evidence()
+                    .unwrap()
+                    .namespace_cleanup_confirmed
+            );
+        }
+        absent(root.path(), &name).await;
+    }
+
+    let root = fixture();
+    let name = name();
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "acp_container::tests::acp_containment_v1_owner_process",
+            "--exact",
+            "--nocapture",
+        ])
+        .env_clear()
+        .envs(ContainerRuntime::Docker.client_env())
+        .env(
+            crate::backend_claude::SCRATCH_ROOT_ENV,
+            crate::backend_claude::scratch_root_base(),
+        )
+        .env("KRANZ_ACP_OWNER_ROOT", root.path())
+        .env("KRANZ_ACP_OWNER_NAME", &name)
+        .env("KRANZ_ACP_OWNER_MODE", "resources")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    let mut owner_process = command.spawn().unwrap();
+    ready(root.path()).await;
+    owner_process.kill().await.unwrap();
+    let client = DockerEvaluator::new(
+        &trusted_docker(&spec(root.path(), &name, "idle").sandbox.unwrap().inputs).unwrap(),
+    )
+    .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let inspected = client
+                .control(&["inspect".into(), name.clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                inspected.code,
+                Some(0),
+                "resource namespace must remain inspectable after owner death"
+            );
+            let metadata: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+            if metadata[0]["State"]["Running"] == false {
+                break metadata;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("owner death did not expire the guest lease");
+    let heartbeat = std::fs::read(root.path().join("workspace/child-heartbeat")).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        heartbeat,
+        std::fs::read(root.path().join("workspace/child-heartbeat")).unwrap()
+    );
+    let owner = stopped[0]["Config"]["Labels"]["com.kranz.acp-owner"]
+        .as_str()
+        .unwrap();
+    let ledger = stopped[0]["Mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["Destination"] == GUEST_CONTROL)
+        .unwrap()["Source"]
+        .as_str()
+        .unwrap();
+    assert!(Path::new(ledger).join("container.json").is_file());
+    assert!(!Path::new(ledger).join("launch.json").exists());
+    remove(&client, owner, true, true).await.unwrap();
+    absent(root.path(), &name).await;
+    std::fs::remove_dir_all(ledger).unwrap();
+}

@@ -1,0 +1,269 @@
+"""Test-only resource revision of the trusted PID 1 supervisor.
+
+The released v1 supervisor stays byte-unchanged in supervisor.py.
+Trusted PID 1. The host lease, not agent cooperation, owns this namespace.
+
+Run only as /usr/local/bin/python3 -I -S -u with an engine-owned read-only
+control directory. No model output, workspace module or shell is evaluated here.
+"""
+import ctypes
+import hashlib
+import json
+import os
+import select
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+LEASE_SECONDS = 5.0
+POLL_SECONDS = 0.1
+COMPLETION_SECONDS = 1.0
+MAX_LAUNCH_BYTES = 1024 * 1024
+stage = "initialization"
+observer = None
+
+
+class ResourceObserver:
+    """The host keeps the original inode open. Unlink it before spawning the
+    peer, so neither a replacement pathname nor /proc/1/fd (PR_SET_DUMPABLE=0)
+    gives that peer a way to forge observations. No descriptor is inherited.
+    """
+    def __init__(self, contract):
+        self.owner = contract["owner"]
+        self.seconds = contract["sessionSeconds"]
+        self.started = time.monotonic()
+        self.wall_expired = False
+        path = "/kranz-resource-observation/sample"
+        self.fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        metadata = os.fstat(self.fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("invalid resource observation inode")
+        os.unlink(path)
+        self.baseline = self.counters()
+        self.write(False)
+
+    @staticmethod
+    def counters():
+        def counter(file, key):
+            try:
+                # The namespace is explicitly private; unsupported cgroup v1
+                # leaves counters unavailable rather than inventing zeroes.
+                with open("/proc/self/cgroup") as source:
+                    if source.read(4096).strip() != "0::/":
+                        return None
+                with open("/sys/fs/cgroup/" + file) as source:
+                    rows = dict(line.split() for line in source.read(4096).splitlines())
+                value = int(rows[key])
+                return value if 0 <= value <= 2**64 - 1 else None
+            except (OSError, KeyError, ValueError):
+                return None
+        return {"oomKill": counter("memory.events", "oom_kill"),
+                "pidsMax": counter("pids.events", "max"),
+                "throttledUsec": counter("cpu.stat", "throttled_usec")}
+
+    def write(self, complete):
+        payload = json.dumps({"owner": self.owner,
+            "elapsedMs": int((time.monotonic() - self.started) * 1000),
+            "complete": complete, "wallClockExpired": self.wall_expired,
+            "baseline": self.baseline, "current": self.counters()},
+            separators=(",", ":")).encode("ascii")
+        if len(payload) > 4096:
+            raise RuntimeError("resource observation overflow")
+        # A process killed in the middle of a shared-filesystem write must
+        # leave unavailable evidence, never a parseable mixture of samples.
+        payload = hashlib.sha256(payload).digest() + payload
+        if os.pwrite(self.fd, payload, 0) != len(payload):
+            raise OSError("resource observation short write")
+        os.ftruncate(self.fd, len(payload))
+
+    def tick(self):
+        self.wall_expired = time.monotonic() - self.started >= self.seconds
+        self.write(False)
+        if self.wall_expired:
+            stop(124)
+
+
+def stop(code):
+    # Exiting PID 1 kills every namespace descendant, including setsid children.
+    # _exit also prevents blocked daemon I/O threads from delaying termination.
+    if observer is not None:
+        try:
+            observer.write(True)
+        except BaseException:
+            pass  # Missing/torn evidence remains unavailable at the host.
+    os._exit(code)
+
+
+def reap_children(peer):
+    # PID 1 also adopts exited background tools. Bound each sweep so even a
+    # continuously forking peer cannot starve lease checks. This is the sole
+    # waiter; preserve the peer status instead of racing Popen.poll().
+    for _ in range(64):
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid == 0:
+            break
+        if pid == peer.pid:
+            peer.returncode = os.waitstatus_to_exitcode(status)
+    return peer.returncode
+
+
+def main():
+    global stage, observer
+    if os.getpid() != 1:
+        raise RuntimeError("supervisor requires a private PID namespace")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    libc.prctl.restype = ctypes.c_int
+    # The peer has the same uid. Deny ptrace and /proc/1/{mem,fd,root} access
+    # before spawning it; Docker also drops every capability. Do not exec
+    # after setting this flag (exec can reset dumpability).
+    if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        raise OSError(ctypes.get_errno(), "cannot protect supervisor")
+    root = sys.argv[1]
+    stage = "first-lease"
+
+    def read_lease():
+        try:
+            with open(root + "/lease", "rb") as source:
+                value = source.read(9)
+            return value if len(value) == 8 else None
+        except OSError:
+            return None  # Unreadable evidence never renews the deadline.
+
+    # A delayed daemon start must not execute a payload under a dead owner.
+    # Require a renewal observed *after* this supervisor started.
+    previous = read_lease()
+    changed_at = time.monotonic()
+    stage = "initial-renewal"
+    while True:
+        current = read_lease()
+        if current is not None and current != previous:
+            break
+        if time.monotonic() - changed_at >= LEASE_SECONDS:
+            stop(124)
+        time.sleep(POLL_SECONDS)
+    previous = current
+    changed_at = time.monotonic()
+    stage = "launch-input"
+
+    def read_launch_bytes(count):
+        nonlocal previous, changed_at
+        chunks = bytearray()
+        while len(chunks) < count:
+            current = read_lease()
+            now = time.monotonic()
+            if current is not None and current != previous:
+                previous, changed_at = current, now
+            if now - changed_at >= LEASE_SECONDS:
+                stop(124)
+            if select.select([0], [], [], POLL_SECONDS)[0]:
+                # Read exactly the prelude, leaving ACP bytes for the peer.
+                chunk = os.read(0, count - len(chunks))
+                if not chunk:
+                    raise EOFError("incomplete launch")
+                chunks.extend(chunk)
+        return chunks
+
+    length = int.from_bytes(read_launch_bytes(4), "big")
+    if not 0 < length <= MAX_LAUNCH_BYTES:
+        raise ValueError("launch size")
+    launch = json.loads(read_launch_bytes(length))
+    stage = "resource-observer"
+    observer = ResourceObserver(launch["resourceContract"])
+    stage = "peer-spawn"
+    peer = subprocess.Popen(
+        launch["argv"], cwd=launch["cwd"], env=launch["env"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        close_fds=True, start_new_session=True, bufsize=0,
+    )
+    failed = threading.Event()
+    input_eof = threading.Event()
+    stage = "supervision"
+
+    def forward(source, target, close_target=False):
+        reached_eof = False
+        try:
+            while True:
+                chunk = os.read(source, 65536)
+                if not chunk:
+                    reached_eof = True
+                    break
+                while chunk:
+                    written = os.write(target, chunk)
+                    if written <= 0:
+                        raise OSError("short pipe write")
+                    chunk = chunk[written:]
+        except (BrokenPipeError, OSError):
+            # Agent-stdin closure is normal after a single-shot response.
+            # Lost output cannot be presented as a successful run.
+            if not close_target:
+                failed.set()
+        finally:
+            if close_target:
+                os.close(target)
+                if reached_eof:
+                    input_eof.set()
+
+    input_thread = threading.Thread(
+        target=forward, args=(0, peer.stdin.fileno(), True), daemon=True,
+    )
+    outputs = [
+        threading.Thread(target=forward, args=(peer.stdout.fileno(), 1), daemon=True),
+        threading.Thread(target=forward, args=(peer.stderr.fileno(), 2), daemon=True),
+    ]
+    input_thread.start()
+    for thread in outputs:
+        thread.start()
+    ended_at = None
+    eof_at = None
+    code = None
+    while True:
+        observer.tick()
+        current = read_lease()
+        now = time.monotonic()
+        if current is not None and current != previous:
+            previous, changed_at = current, now
+        if now - changed_at >= LEASE_SECONDS:
+            stop(124)
+        if failed.is_set():
+            stop(125)
+        observed = reap_children(peer)
+        if code is None:
+            code = observed
+            if code is not None:
+                ended_at = now
+        if ended_at is not None:
+            if all(not thread.is_alive() for thread in outputs):
+                stop(code if 0 <= code <= 255 else 125)
+            # A detached child holding output open must not outlive the peer.
+            if now - ended_at >= 1.0:
+                stop(125)
+        elif input_eof.is_set():
+            if eof_at is None:
+                eof_at = now
+            if now - eof_at >= COMPLETION_SECONDS:
+                # Host stdin EOF ends a completed single-shot session. The
+                # trusted supervisor owns intentional shutdown, so the host
+                # never mistakes a killed Docker client for successful work.
+                # Check the peer directly before stopping: an orphan backlog
+                # must not hide an already-earned nonzero peer exit.
+                pid, status = os.waitpid(peer.pid, os.WNOHANG)
+                if pid == peer.pid:
+                    peer.returncode = os.waitstatus_to_exitcode(status)
+                    code, ended_at = peer.returncode, now
+                else:
+                    stop(0)
+        time.sleep(POLL_SECONDS)
+
+
+try:
+    main()
+except BaseException as failure:
+    # No credential-bearing launch data or exception text crosses stderr.
+    os.write(2, ("ACP supervisor refused at " + stage + ": " + type(failure).__name__ + "\n").encode("ascii"))
+    stop(125)

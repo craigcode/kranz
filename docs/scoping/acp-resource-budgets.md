@@ -1,8 +1,10 @@
 # ACP resource budgets: qualification scope
 
 Status: scoped 2026-09-30, reviewed 2026-10-04 against public `a07467c2`. The D-R
-recommendations below are proposed operator decisions, not accepted contracts.
-This review made no runtime changes and ran no paid agent sessions.
+recommendations below were proposed operator decisions. The operator approved
+R2 implementation on 2026-10-06; production values/admission still require R3.
+The initial scoping review made no runtime changes. R1/R2 implementation is
+restricted to test-only revisions; neither ran paid agent sessions.
 
 Ticket: [acp-resource-budget-qualification](../../.kranz/tickets/acp-resource-budget-qualification.md).
 It blocks [acp-sgian-terminal-qualification](../../.kranz/tickets/acp-sgian-terminal-qualification.md).
@@ -10,7 +12,7 @@ Prior contracts: [ACP containment](../acp-containment.md),
 [terminal provider](acp-terminal-provider.md),
 [September 26 review](../reviews/2026-09-26-acp-gate-remediation.md).
 
-## What exists
+## Scoping baseline (before R1)
 
 Qualified ACP workers run in an engine-owned Docker container. The argv comes
 from the shared `sandbox_container::container_run_args` builder, which
@@ -103,9 +105,9 @@ values in `OwnedContainer::receipt` and adds a `definitionSha256` over the
 canonical `Definition` to the profile receipt, so evidence shows exactly which
 contract ran.
 
-R1 covers memory, CPU, process count, open files and file size. Tmpfs caps and
-the session ceiling are later work, required before enabling a production v2
-revision. Override ranges have a minimum as well as a maximum: Docker requires
+R1 covers memory, CPU, process count, open files and file size. R2 adds a
+per-tmpfs ceiling and a supervisor-enforced session deadline to the test-only
+revision. Production v2 remains unavailable pending R3. Override ranges have a minimum as well as a maximum: Docker requires
 at least 6 MiB of memory; the default 100 ms CPU period and Linux's 1 ms minimum
 quota require at least 10 millicores. Runtime-valid values are not necessarily
 large enough for an adapter. Qualification must verify the effective limits
@@ -146,7 +148,7 @@ each adapter reports turns and stays a separate decision.
 
 ### Failure classification
 
-Before removing an ACP container, inspect `State.OOMKilled`, the exit status
+Before removing a resource-bounded ACP container, inspect `State.OOMKilled`, the exit status
 and available resource observations, using `DockerEvaluator` as a starting
 point. Classify a failure as `memory`, `pids`, `wallClock`, `terminalBudget`
 or `other` only when a named observation supports it. Bind that evidence to the
@@ -155,10 +157,11 @@ the resource: CPU limits throttle rather than necessarily terminate, and a
 child may handle process, descriptor or file-size exhaustion without exiting.
 Retain `other` when attribution is uncertain; never turn a tool's narrative
 into a confirmed limit hit. A configured ceiling and an observed exhaustion
-are separate receipt fields. Carry the class, observation and
-ceiling value in an additive, `#[serde(default)]` field on the existing
-worker completion event rather than adding a new event type (contract files
-stay additive-only). The operator-facing failure message names the limit, the
+are separate receipt fields. Carry the class, observations and configured ceilings in the additive,
+`#[serde(default)]` `resourceEvidence` field on the existing worker completion
+event and folded worker run. No new event type is added. Successful runs can
+also carry observations; a handled process-limit hit or CPU throttling does not
+turn a successful attempt into a failure. The operator-facing failure message names the limit, the
 value, and the config key that can change it.
 
 A resource failure fails the feature attempt honestly. Retry policy is
@@ -200,6 +203,56 @@ cleanup is uncertain, as today.
 Terminal capability stays off for released profiles after this ticket. Turning
 it on for a real adapter remains the separate
 [adapter qualification](../../.kranz/tickets/acp-terminal-adapter-qualification.md).
+
+## R2 implementation and contractChangeRequest
+
+The approved R2 change adds optional `worker.completed.payload.resourceEvidence`
+and `WorkerRun.resourceEvidence`; absent fields deserialize as `None` and are
+omitted on serialization. Old logs and snapshots retain their existing shape.
+The record binds the immutable container ID/image, supervisor hash, random
+engine owner, configured ceilings, host observation interval, Docker state,
+supervisor counter interval and classification. `namespaceCleanupConfirmed`
+refers only to namespace removal; private-home cleanup has its existing separate
+failure path. The runner uses a trusted backend method;
+agent messages cannot supply this field. A failure before the ACP handshake
+finishes still returns a closed session so the runner can retain its evidence.
+
+Only the test revision selects the new supervisor. The released v1 supervisor
+bytes, definitions and create arguments remain unchanged. The resource revision
+uses a private cgroup namespace and disables automatic container removal so the
+engine can inspect stopped state before explicit removal. Normal completion,
+abort and Drop keep bounded cleanup. Engine death can leave an **exited**
+container and its private recovery ledger; the existing five-second guest lease
+still ends live execution. R3 must include this recovery posture in qualification.
+
+The supervisor opens and unlinks an observation file before spawning the worker.
+The host retains the original descriptor; the supervisor is non-dumpable and
+passes no observation descriptor to its children. Recreating the pathname or
+writing JSON to stderr cannot forge that inode. Samples are capped and carry a
+checksum so a torn write is unavailable evidence. Cgroup v2 counters record
+baseline/current OOM kills, process-limit events and CPU throttling. Unsupported
+or unreadable counters remain null. A partial sample proves only its recorded
+interval; it is not proof that nothing happened afterward. Docker inspection
+must match the created ID and owner label. An OOM observation establishes memory
+exhaustion; it does not by itself distinguish the configured ceiling from host
+memory pressure. Concurrent resource hits remain `other` rather than inventing
+one causal explanation. Descriptor/file-size and tmpfs errors are not inferred
+from worker text or exit codes; uncertain failed attempts remain `other`.
+
+`tmpfsMib` bounds `/dev/shm` and every explicit tmpfs mount. Its minimum is 64 MiB
+because Docker manages `/dev` with a fixed 64 MiB tmpfs; the fixture verifies that
+mount also stays within the ceiling. Host bind mounts are not tmpfs and this is
+not an aggregate disk quota. `sessionSeconds` starts after the trusted supervisor
+receives the launch contract, before peer spawn, and includes handshake and
+permission waits. On expiry the supervisor records the deadline hit and exits
+PID 1, killing all namespace descendants. Lease loss, normal EOF shutdown and
+ordinary exit 124 are not classified as session expiry. Fixture defaults remain
+provisional: 64 MiB tmpfs and 3,600 seconds, maxima 256 MiB and 14,400 seconds.
+
+This is governance/evidence through the existing backend and completion seams.
+It adds no terminal admission, provider session, retry policy, prompt routing or
+production profile. R4 owns terminal-budget observations; R2 does not emit the
+reserved `terminalBudget` classification.
 
 ## D-R: proposed decisions
 

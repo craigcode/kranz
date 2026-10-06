@@ -134,6 +134,7 @@ fn seed_mission(repo_root: &Path) -> MissionPaths {
     })
     .unwrap();
     log.append(EventKind::WorkerCompleted {
+        resource_evidence: None,
         run_id: "run-1".into(),
         result: RunResult::Pass,
         tokens: TokenUsage {

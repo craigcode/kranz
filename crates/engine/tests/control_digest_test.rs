@@ -482,6 +482,7 @@ fn digest_events() -> Vec<Event> {
         ev(
             6,
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "r-1".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage {

@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-04
+last_verified: 2026-10-06
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -10,6 +10,7 @@ verified_against:
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/review_packet.rs
   - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_resources.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/acp_terminal.rs
   - crates/engine/src/backend_acp/terminals.rs
@@ -39,6 +40,13 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). Optional
+`resourceEvidence` on worker completion folds into `WorkerRun`; absent evidence
+keeps the old serialized shape. The backend supplies namespace-bound observations
+through a separate trusted channel, never from peer messages. Memory exhaustion
+or the supervisor's session deadline prevents a successful attempt; ambiguous
+failures remain `other`. Pipeline stages and permission authority are unchanged.
 
 Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1): a profile revision may declare container ceilings, receipts record the effective values and a `definitionSha256`, and `RoleConfig.acp_profile` is boxed without a serialization change. The pipeline stages are unchanged.
 

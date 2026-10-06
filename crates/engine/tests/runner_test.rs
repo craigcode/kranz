@@ -503,6 +503,7 @@ async fn run_session_happy_path_pass_report_events_and_transcript() {
             tokens,
             cost_usd,
             report,
+            ..
         } => {
             assert_eq!(run_id, "run-1");
             assert_eq!(*result, RunResult::Pass);
