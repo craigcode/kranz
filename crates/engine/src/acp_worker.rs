@@ -13,6 +13,21 @@ use std::path::{Path, PathBuf};
 pub const IMAGE: &str = "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743";
 pub const CLAUDE: &str = "claude-acp-0.77.0-arm64-v1";
 pub const CODEX: &str = "codex-acp-1.11.0-arm64-v1";
+// Exploration ceilings only. The live measurement and final qualification must
+// precede any production defaults; these IDs do not exist in release builds.
+#[cfg(test)]
+pub(crate) const RESOURCE_CANDIDATE_IMAGE: &str =
+    "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c";
+#[cfg(test)]
+pub(crate) const RESOURCE_CANDIDATE_LIMITS: Resources = Resources {
+    memory_mib: 2048,
+    cpu_millis: 2000,
+    pids: 256,
+    nofile: 1024,
+    fsize_mib: 128,
+    tmpfs_mib: 128,
+    session_seconds: 600,
+};
 const CODEX_CONFIG: &str =
     "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n";
 #[cfg(unix)]
@@ -109,6 +124,28 @@ fn refusal(reason: &str) -> EngineError {
 impl AcpWorkerProfile {
     pub(crate) fn definition(&self) -> Result<Definition> {
         match self.id.as_str() {
+            #[cfg(test)]
+            "qualification-claude-resource-r3" | "qualification-codex-resource-r3" => {
+                let base = Self {
+                    id: if self.id == "qualification-claude-resource-r3" {
+                        CLAUDE
+                    } else {
+                        CODEX
+                    }
+                    .into(),
+                    credential_file: self.credential_file.clone(),
+                    resources: None,
+                }
+                .definition()?;
+                Ok(Definition {
+                    image: RESOURCE_CANDIDATE_IMAGE,
+                    resources: Some(Ceilings {
+                        defaults: RESOURCE_CANDIDATE_LIMITS,
+                        max: RESOURCE_CANDIDATE_LIMITS,
+                    }),
+                    ..base
+                })
+            }
             CLAUDE => Ok(Definition {
                 program: "/usr/local/bin/node",
                 args: &[
