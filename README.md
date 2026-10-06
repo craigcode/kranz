@@ -1,10 +1,14 @@
 # Kranz
 
-**Git-native mission control for headless coding agents.** Kranz is a local
-governance and evidence harness—named for Gene Kranz, the Apollo flight
-director. An orchestrator plans, fresh-context workers implement one feature
-at a time, independent validators judge each milestone, and a human steers as
-project manager. The harness never touches the spacecraft; it runs the room.
+**Kranz is mission control for coding agents: a harness whose orchestrator
+plans the work, hands each feature to a fresh worker, has independent
+validators judge it, and keeps a record of what you approved.**
+
+Named for Gene Kranz, the Apollo flight director, it is a Git-native
+governance and evidence harness for headless coding agents. An orchestrator
+plans, fresh-context workers implement one feature at a time, independent
+validators judge each milestone, and a human steers as project manager. The
+harness never touches the spacecraft; it runs the room.
 
 The product is the few seconds between an agent wanting to act and a human
 trusting it. The consent surface — plan approval, command grants, the merge
