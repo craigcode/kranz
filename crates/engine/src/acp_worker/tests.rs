@@ -481,6 +481,8 @@ async fn profile_mission(scenario: ProfileScenario) {
             pids: Some(80),
             nofile: Some(128),
             fsize_mib: Some(32),
+            tmpfs_mib: Some(128),
+            session_seconds: Some(120),
         });
     }
     let complete = r#"{"decision":"complete","guidance":"","summary":"accepted fixture"}"#;
@@ -1188,6 +1190,8 @@ fn acp_profile_resource_ceilings_are_revision_scoped_and_bounded() {
         ("pids", 1, 256),
         ("nofile", 1, 1_024),
         ("fsizeMib", 1, 256),
+        ("tmpfsMib", 64, 256),
+        ("sessionSeconds", 1, 14_400),
     ] {
         for value in [0, min - 1, min, max, max + 1] {
             let overrides = serde_json::from_value(json!({field: value})).unwrap();
@@ -1246,7 +1250,15 @@ fn acp_profile_resource_overrides_preserve_config_authority_and_wire_shape() {
     let role: RoleConfig = serde_json::from_value(old_role.clone()).unwrap();
     assert_eq!(serde_json::to_value(&role).unwrap(), old_role);
     let base = serde_json::to_value(config(profile("fixture-acp-worker-v2"))).unwrap();
-    for field in ["memoryMib", "cpuMillis", "pids", "nofile", "fsizeMib"] {
+    for field in [
+        "memoryMib",
+        "cpuMillis",
+        "pids",
+        "nofile",
+        "fsizeMib",
+        "tmpfsMib",
+        "sessionSeconds",
+    ] {
         for resources in [json!({field: 128}), Value::Null] {
             let patch = json!({"worker": {"acpProfile": {"resources": resources}}});
             assert!(

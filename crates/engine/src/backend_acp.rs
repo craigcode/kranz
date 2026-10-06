@@ -480,6 +480,8 @@ pub struct AcpBackend {
     program: PathBuf,
     args: Vec<String>,
     profile: Option<crate::acp_worker::AcpWorkerProfile>,
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    resource_fixture: Option<crate::acp_worker::Resources>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     terminal_fixture_run: Option<String>,
 }
@@ -492,6 +494,8 @@ impl AcpBackend {
             program: program.into(),
             args,
             profile: None,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            resource_fixture: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             terminal_fixture_run: None,
         }
@@ -511,6 +515,8 @@ impl AcpBackend {
                 program: definition.program.into(),
                 args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
                 profile: Some((**profile).clone()),
+                #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+                resource_fixture: None,
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 terminal_fixture_run: None,
             })
@@ -525,6 +531,12 @@ impl AcpBackend {
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn with_terminal_fixture(mut self, run_id: &str) -> Self {
         self.terminal_fixture_run = Some(run_id.to_owned());
+        self
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn with_resource_fixture(mut self, resources: crate::acp_worker::Resources) -> Self {
+        self.resource_fixture = Some(resources);
         self
     }
 
@@ -596,11 +608,14 @@ impl AgentBackend for AcpBackend {
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let (container, mut command) = if container_requested {
+            let resources = profile_home.as_ref().and_then(|p| p.resources);
+            #[cfg(test)]
+            let resources = resources.or(self.resource_fixture);
             let (container, command) = crate::acp_container::OwnedContainer::prepare(
                 &spec,
                 &self.program,
                 &self.args,
-                profile_home.as_ref().and_then(|p| p.resources),
+                resources,
             )
             .await?;
             (Some(container), command)
@@ -733,6 +748,13 @@ impl AgentBackend for AcpBackend {
         // kills the child before the error crosses back.
         if let Err(e) = session.handshake().await {
             session.kill_child().await;
+            // A bounded profile can fail before initialization (for example
+            // OOM or its session deadline). Return the already-closed session
+            // so the runner retains its completion evidence.
+            if session.resource_evidence().is_some() {
+                session.exit = Some(SessionExit::Failed(e.to_string()));
+                return Ok(Box::new(session));
+            }
             let message = match e {
                 EngineError::Backend(message) => message,
                 other => other.to_string(),
@@ -1983,7 +2005,31 @@ impl AgentSession for AcpSession {
     }
 
     fn exit_status(&self) -> Option<SessionExit> {
-        self.exit.clone()
+        let exit = self.exit.clone();
+        if exit.is_some() {
+            if let Some(mut evidence) = self.resource_evidence() {
+                if evidence.requires_failure() {
+                    evidence.classify(true);
+                    let mut message = evidence.failure_message().expect("classified failure");
+                    if let Some(SessionExit::Failed(cause)) = &exit {
+                        message.push_str(&format!(" Session failure: {cause}"));
+                    }
+                    return Some(SessionExit::Failed(message));
+                }
+            }
+        }
+        exit
+    }
+
+    fn resource_evidence(&self) -> Option<crate::acp_resources::ResourceEvidence> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.container.as_ref().and_then(|c| c.resource_evidence())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
     }
 }
 

@@ -1336,6 +1336,7 @@ fn fractional_costs_keep_their_bits_and_integrity_across_reopen() {
     }
     for &cost in &costs {
         log.append(EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: "r-cost".into(),
             result: kranz_engine::types::RunResult::Pass,
             tokens: kranz_engine::types::TokenUsage::default(),
@@ -1390,6 +1391,7 @@ fn legacy_float_seals_still_read_and_accept_versioned_appends() {
     let mut lines = Vec::new();
     for (index, kind) in [
         EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: "r-legacy".into(),
             result: kranz_engine::types::RunResult::Pass,
             tokens: kranz_engine::types::TokenUsage::default(),
@@ -1467,6 +1469,7 @@ fn versioned_seals_refuse_numeric_downgrades_and_unknown_versions() {
     let p = paths(tmp.path());
     let mut log = EventLog::acquire(&p, MISSION, NEVER, LockForce::No).unwrap();
     log.append(EventKind::WorkerCompleted {
+        resource_evidence: None,
         run_id: "r-version".into(),
         result: kranz_engine::types::RunResult::Pass,
         tokens: kranz_engine::types::TokenUsage::default(),

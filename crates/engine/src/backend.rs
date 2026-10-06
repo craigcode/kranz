@@ -215,6 +215,12 @@ pub trait AgentSession: Send {
 
     /// Available after the stream has closed.
     fn exit_status(&self) -> Option<SessionExit>;
+
+    /// Trusted backend observations, collected before namespace removal.
+    /// Peer events and narrative reports cannot populate this channel.
+    fn resource_evidence(&self) -> Option<crate::acp_resources::ResourceEvidence> {
+        None
+    }
 }
 
 /// Factory for agent sessions — the mockable seam.

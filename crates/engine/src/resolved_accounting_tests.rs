@@ -65,6 +65,7 @@ fn run(
     append(
         events,
         EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: id,
             result: RunResult::Pass,
             tokens: tokens.clone(),

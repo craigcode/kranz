@@ -1190,6 +1190,7 @@ mod tests {
                 ),
                 worker_spawned("r-1", Role::Worker, "gpt-5"),
                 EventKind::WorkerCompleted {
+                    resource_evidence: None,
                     run_id: "r-1".into(),
                     result: RunResult::Pass,
                     tokens: TokenUsage {

@@ -584,6 +584,7 @@ mod tests {
 
     fn completed(run_id: &str, result: RunResult, summary: &str) -> EventKind {
         EventKind::WorkerCompleted {
+            resource_evidence: None,
             run_id: run_id.to_string(),
             result,
             tokens: TokenUsage::default(),

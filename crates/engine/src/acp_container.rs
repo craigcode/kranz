@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 
 const SUPERVISOR: &str = include_str!("acp_container/supervisor.py");
+const RESOURCE_SUPERVISOR: &str = include_str!("acp_container/supervisor_resources.py");
 const GUEST_CONTROL: &str = "/kranz-owned-session";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LAUNCH_BYTES: usize = 1024 * 1024;
@@ -41,6 +42,9 @@ pub(crate) struct OwnedContainer {
     creation_finished: bool,
     removed: bool,
     resources: Option<crate::acp_worker::Resources>,
+    observation_file: Option<std::fs::File>,
+    observation_started_at: chrono::DateTime<chrono::Utc>,
+    resource_evidence: Option<crate::acp_resources::ResourceEvidence>,
 }
 
 /// Apply a profile revision's ceilings to the create argv. The shared
@@ -63,12 +67,25 @@ pub(crate) fn apply_resources(
         format!("--memory={}m", r.memory_mib),
         format!("--memory-swap={}m", r.memory_mib),
         format!("--cpus={}.{:03}", r.cpu_millis / 1000, r.cpu_millis % 1000),
+        format!("--shm-size={}m", r.tmpfs_mib),
+        "--cgroupns=private".into(),
         "--ulimit".into(),
         format!("nofile={0}:{0}", r.nofile),
         "--ulimit".into(),
         format!("fsize={fsize}:{fsize}"),
     ]);
-    create.splice(image_index..image_index, flags);
+    let guest_argv = create.split_off(image_index);
+    create.extend(flags);
+    // Keep the stopped namespace until its host-observed state is captured.
+    // Drop/explicit cleanup still remove it; owner death retains an exited
+    // namespace and the private recovery ledger, never a live unleased worker.
+    create.retain(|arg| arg != "--rm");
+    for i in 1..create.len() {
+        if create[i - 1] == "--tmpfs" {
+            create[i].push_str(&format!(",size={}m", r.tmpfs_mib));
+        }
+    }
+    create.extend(guest_argv);
 }
 
 impl OwnedContainer {
@@ -242,12 +259,36 @@ impl OwnedContainer {
         env.insert("TMPDIR".into(), scratch);
         let mut argv = vec![program.display().to_string()];
         argv.extend_from_slice(args);
-        private_write(&canonical.join("supervisor.py"), SUPERVISOR.as_bytes())?;
+        let supervisor = if resources.is_some() {
+            RESOURCE_SUPERVISOR
+        } else {
+            SUPERVISOR
+        };
+        private_write(&canonical.join("supervisor.py"), supervisor.as_bytes())?;
+        let observation_file = if resources.is_some() {
+            std::fs::create_dir(canonical.join("observations")).map_err(error)?;
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(canonical.join("observations/sample"))
+                    .map_err(error)?,
+            )
+        } else {
+            None
+        };
         // Credentials cross only the attached stdin, never Docker arguments or
         // the recovery directory, which must survive unconfirmed cleanup.
-        let launch = serde_json::to_vec(&serde_json::json!({
+        let mut launch = serde_json::json!({
             "argv":argv, "cwd":crate::sandbox::absolutize(&spec.cwd), "env":env,
-        }))?;
+        });
+        if let Some(resources) = resources {
+            launch["resourceContract"] =
+                serde_json::json!({"owner":owner, "sessionSeconds":resources.session_seconds});
+        }
+        let launch = serde_json::to_vec(&launch)?;
         if launch.len() > MAX_LAUNCH_BYTES {
             return Err(error("launch data exceeds byte limit"));
         }
@@ -256,7 +297,7 @@ impl OwnedContainer {
             &canonical.join("container.json"),
             &serde_json::to_vec(&serde_json::json!({
                 "version":1, "name":name, "owner":owner, "image":container.image, "docker":docker,
-                "ownerPid":std::process::id(), "supervisorSha256":crate::standards_waiver::sha256_hex(SUPERVISOR.as_bytes()),
+                "ownerPid":std::process::id(), "supervisorSha256":crate::standards_waiver::sha256_hex(supervisor.as_bytes()),
                 "ownerIdentity":crate::event_log::process_identity_token(std::process::id() as i32),
                 "cleanupConfirmed":false,
             }))?,
@@ -275,6 +316,9 @@ impl OwnedContainer {
             creation_finished: false,
             removed: false,
             resources,
+            observation_file,
+            observation_started_at: chrono::Utc::now(),
+            resource_evidence: None,
         };
         let mut container = container.clone();
         container.name = Some(name.clone());
@@ -311,6 +355,19 @@ impl OwnedContainer {
                 format!("com.kranz.acp-owner={owner}"),
             ],
         );
+        let image_index = create.len() - 6;
+        if resources.is_some() {
+            create.splice(
+                image_index..image_index,
+                [
+                    "--mount".into(),
+                    format!(
+                        "type=bind,src={},dst=/kranz-resource-observation",
+                        mount_path(&canonical.join("observations"))?
+                    ),
+                ],
+            );
+        }
         let image_index = create.len() - 6;
         apply_resources(&mut create, image_index, resources);
         owned.create(&create, CREATE_TIMEOUT).await?;
@@ -433,7 +490,7 @@ impl OwnedContainer {
     pub(crate) fn receipt(&self) -> serde_json::Value {
         serde_json::json!({
             "backend":"docker", "image":self.image, "owner":self.owner,
-            "supervisorSha256":crate::standards_waiver::sha256_hex(SUPERVISOR.as_bytes()),
+            "supervisorSha256":crate::standards_waiver::sha256_hex(if self.resources.is_some() { RESOURCE_SUPERVISOR } else { SUPERVISOR }.as_bytes()),
             "leaseSeconds":5, "resources":self.resources,
             "credentialSource":"caller-supplied-session-environment-and-scratch",
             "providerCompatibilityCertified":false,
@@ -456,6 +513,7 @@ impl OwnedContainer {
         if self.removed {
             return Ok(());
         }
+        self.observe_resources().await;
         let result = remove(
             &self.client,
             &self.owner,
@@ -465,6 +523,9 @@ impl OwnedContainer {
         .await;
         if result.is_ok() {
             self.removed = true;
+            if let Some(evidence) = &mut self.resource_evidence {
+                evidence.namespace_cleanup_confirmed = true;
+            }
             if let Some(root) = self.root.take() {
                 root.close().map_err(error)?;
             }
@@ -479,6 +540,90 @@ impl OwnedContainer {
             ))
         })
     }
+
+    pub(crate) fn resource_evidence(&self) -> Option<crate::acp_resources::ResourceEvidence> {
+        self.resource_evidence.clone()
+    }
+
+    async fn observe_resources(&mut self) {
+        let (Some(limits), Some(id)) = (self.resources, self.id.as_ref()) else {
+            return;
+        };
+        if self.resource_evidence.is_some() {
+            return;
+        }
+        // Stop an unfinished namespace before sampling its final Docker state.
+        // The id came from our create response, never from the peer.
+        let _ = self.client.control(&["kill".into(), id.clone()]).await;
+        let inspected = self.client.control(&["inspect".into(), id.clone()]).await;
+        let mut unavailable = Vec::new();
+        let state = match inspected {
+            Ok(output) if output.code == Some(0) => {
+                let parsed = crate::strict_json::parse(&output.stdout).ok();
+                parsed
+                    .as_ref()
+                    .and_then(|v| inspected_state(v, id, &self.owner))
+            }
+            _ => None,
+        };
+        if state.is_none() {
+            unavailable.push("owned-container inspection unavailable or invalid".into());
+        }
+        let sample = self
+            .observation_file
+            .as_ref()
+            .and_then(|file| read_resource_sample(file, &self.owner));
+        if sample.is_none() {
+            unavailable.push("protected supervisor observation unavailable or invalid".into());
+        }
+        self.resource_evidence = Some(crate::acp_resources::ResourceEvidence {
+            container_id: id.clone(),
+            image: self.image.clone(),
+            supervisor_sha256: crate::standards_waiver::sha256_hex(RESOURCE_SUPERVISOR.as_bytes()),
+            owner: self.owner.clone(),
+            limits,
+            observation_started_at: self.observation_started_at,
+            observation_finished_at: chrono::Utc::now(),
+            state,
+            sample,
+            unavailable,
+            namespace_cleanup_confirmed: false,
+            failure: None,
+        });
+    }
+}
+
+fn inspected_state(
+    value: &serde_json::Value,
+    id: &str,
+    owner: &str,
+) -> Option<crate::acp_resources::ContainerState> {
+    let entries = value.as_array()?;
+    if entries.len() != 1 {
+        return None;
+    }
+    let v = &entries[0];
+    if v["Id"].as_str()? != id || v["Config"]["Labels"]["com.kranz.acp-owner"].as_str()? != owner {
+        return None;
+    }
+    Some(crate::acp_resources::ContainerState {
+        running: v["State"]["Running"].as_bool()?,
+        oom_killed: v["State"]["OOMKilled"].as_bool()?,
+        exit_code: v["State"]["ExitCode"].as_i64()?,
+    })
+}
+
+fn read_resource_sample(file: &std::fs::File, owner: &str) -> Option<crate::acp_resources::Sample> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+    let mut bytes = [0_u8; 4129];
+    let count = file.read_at(&mut bytes, 0).ok()?;
+    if !(33..=4128).contains(&count) || Sha256::digest(&bytes[32..count])[..] != bytes[..32] {
+        return None;
+    }
+    let sample: crate::acp_resources::Sample =
+        serde_json::from_value(crate::strict_json::parse(&bytes[32..count]).ok()?).ok()?;
+    (sample.owner == owner).then_some(sample)
 }
 
 impl Drop for OwnedContainer {

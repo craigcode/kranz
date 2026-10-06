@@ -7305,6 +7305,7 @@ impl MissionEngine {
                     // worker.completed carrying that turn's usage — totals
                     // accumulate in the reducer.
                     self.emit(EventKind::WorkerCompleted {
+                        resource_evidence: None,
                         run_id: run_id.clone(),
                         result: if is_error {
                             RunResult::Fail
@@ -9763,6 +9764,7 @@ pub(crate) mod tests {
             questions: None,
         };
         let run = WorkerRun {
+            resource_evidence: None,
             backend: None,
             id: "run-1".to_string(),
             role: Role::Worker,
@@ -10434,6 +10436,7 @@ pub(crate) mod tests {
             .unwrap();
         engine
             .emit(EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "run-worker".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage::default(),

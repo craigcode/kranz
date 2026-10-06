@@ -542,6 +542,8 @@ fn is_zero(value: &u32) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_evidence: Option<Box<crate::acp_resources::ResourceEvidence>>,
     pub id: String,
     pub role: Role,
     /// Feature this run worked on (workers) — validators have milestone_id instead.

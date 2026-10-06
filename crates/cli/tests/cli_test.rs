@@ -681,6 +681,7 @@ fn status_renders_tree_icons_totals_messages_and_decisions() {
                 transcript_path: "runs/w-1.jsonl".to_string(),
             },
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "w-1".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage {
@@ -785,6 +786,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 transcript_path: "runs/w-pass.jsonl".to_string(),
             },
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "w-pass".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage::default(),
@@ -826,6 +828,7 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
                 transcript_path: "runs/w-fail.jsonl".to_string(),
             },
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "w-fail".to_string(),
                 result: RunResult::Fail,
                 tokens: TokenUsage::default(),
@@ -930,6 +933,7 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
                 transcript_path: "runs/w-a-pass.jsonl".to_string(),
             },
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "w-a-pass".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage::default(),
@@ -1011,6 +1015,7 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
                 transcript_path: "runs/w-pass.jsonl".to_string(),
             },
             EventKind::WorkerCompleted {
+                resource_evidence: None,
                 run_id: "w-pass".to_string(),
                 result: RunResult::Pass,
                 tokens: TokenUsage::default(),
