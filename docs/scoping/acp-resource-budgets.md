@@ -3,7 +3,8 @@
 Status: scoped 2026-09-30, reviewed 2026-10-04 against public `a07467c2`. The D-R
 recommendations below were proposed operator decisions. The operator approved
 R2 implementation on 2026-10-06; production values/admission still require R3.
-This review made no runtime changes and ran no paid agent sessions.
+The initial scoping review made no runtime changes. R1/R2 implementation is
+restricted to test-only revisions; neither ran paid agent sessions.
 
 Ticket: [acp-resource-budget-qualification](../../.kranz/tickets/acp-resource-budget-qualification.md).
 It blocks [acp-sgian-terminal-qualification](../../.kranz/tickets/acp-sgian-terminal-qualification.md).

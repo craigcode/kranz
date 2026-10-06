@@ -69,6 +69,11 @@ abort, Drop and owner death. Portable tests cover classification, counter resets
 namespace mismatch, inode replacement, old logs, override ranges and authority.
 
 Local execution uses the existing pinned Python image in the Docker VM, with
-synthetic peers and no provider credentials or paid agent session. Final local
-check logs and PR checks are the validation receipts; the review does not qualify
-production adapter values or promise native Linux proof before CI completes.
+synthetic peers and no provider credentials or paid agent session. The local full-workspace suite passed 3,162 tests (10 ignored), with formatting,
+Clippy, build, strict docs and policy checks passing. All 34 local containment
+tests passed without a skip marker. The native Linux
+[containment job](https://github.com/craigcode/kranz/actions/runs/37442653411/job/112199883810)
+also passed all six required resource proofs on implementation commit `8dbfa8e5`.
+Later knowledge/scope edits do not change those source bytes. Final PR checks
+remain the integration receipts; these synthetic proofs do not qualify production
+adapter values.
