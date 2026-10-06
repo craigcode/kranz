@@ -2,13 +2,14 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-04
+last_verified: 2026-10-06
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
   - crates/engine/src/orchestrator/live_permissions.rs
   - crates/engine/src/acp_worker.rs
+  - crates/engine/src/acp_resources.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/src/reviewer_independence.rs
   - crates/engine/src/types.rs
@@ -21,6 +22,11 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The glossary
+now distinguishes configured resource ceilings from observed failure evidence.
+Production profile availability, role ownership and permission authority remain
+unchanged.
 
 Rechecked 2026-10-04 (UTC) against ACP profile resource ceilings (R1); the ACP worker profile entry now notes revision ceilings and bounded overrides.
 
@@ -136,7 +142,13 @@ Project vocabulary. Terms link to the note that explains them in depth.
   refused. Mission egress grants cannot widen its fixed allowlist. Cache and
   relay access assume a trusted host/daemon; a version prerequisite alone is
   not profile qualification. A revision may declare resource ceilings;
-  `acpProfile.resources` overrides stay within them. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
+  `acpProfile.resources` overrides stay within them. The resource fixture also
+  bounds each tmpfs and total session time; production v2 remains unavailable. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
+- **Resource evidence** — optional `resourceEvidence` on worker completion and
+  folded runs: namespace identity, effective ceilings, observation interval,
+  protected supervisor counters, matched Docker state and cleanup confirmation.
+  A configured ceiling or worker exit code alone is not proof of its cause.
+  See [resource scope](../scoping/acp-resource-budgets.md).
 - **Mutation authority** — a validated, nonempty token required by the server's
   mutation-capable constructors. Convenience routers mint an undisclosed token,
   so reads work and unauthenticated mutations are refused.

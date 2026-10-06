@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-10-03
+last_verified: 2026-10-06
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,11 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The existing
+backend seam supplies trusted resource observations to completion events and
+folded evidence. Test-only resource limits bound external execution; they add no
+scheduler, retry policy, prompt optimization or code-generation machinery.
 
 Rechecked 2026-10-03 (UTC): the roadmap completes the container-denial test
 ticket. Execution, prompt-optimization and skill-capture boundaries are unchanged.
