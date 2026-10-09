@@ -27,6 +27,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # uuid 1.27 needs rustc 1.89; the workspace rust-version is 1.88.
+      # Drop this when rust-version moves.
+      - dependency-name: uuid
+        versions: [">=1.27.0"]
     groups:
       cargo-minor-patch:
         update-types:
@@ -41,6 +46,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Same uuid floor as the root workspace (rust-version 1.88).
+      - dependency-name: uuid
+        versions: [">=1.27.0"]
     groups:
       cargo-minor-patch:
         update-types:
