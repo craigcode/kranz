@@ -4,6 +4,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import resource
+import shutil
+import subprocess
 import sys
 import time
 
@@ -74,6 +77,63 @@ for line in sys.stdin:
             until = time.monotonic() + 3
             while time.monotonic() < until:
                 pass
+        elif mode == "nofile":
+            assert resource.getrlimit(resource.RLIMIT_NOFILE) == (32, 32)
+            opened = []
+            try:
+                for _ in range(64):
+                    opened.append(os.open("/dev/null", os.O_RDONLY))
+            except OSError as error:
+                assert error.errno == errno.EMFILE
+            else:
+                raise AssertionError("descriptor ceiling did not refuse open")
+            finally:
+                for fd in opened:
+                    os.close(fd)
+            assert 0 < len(opened) < 32
+        elif mode == "fsize":
+            assert resource.getrlimit(resource.RLIMIT_FSIZE) == (1024 * 1024,) * 2
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            fd = os.open("bounded-file", os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                assert os.write(fd, b"x" * 1024 * 1024) == 1024 * 1024
+                try:
+                    os.write(fd, b"x")
+                except OSError as error:
+                    assert error.errno == errno.EFBIG
+                else:
+                    raise AssertionError("file size ceiling did not refuse write")
+            finally:
+                os.close(fd)
+            assert Path("bounded-file").stat().st_size == 1024 * 1024
+        elif mode == "usage":
+            block = bytearray(24 * 1024 * 1024)
+            for index in range(0, len(block), 4096):
+                block[index] = 1
+            children = [subprocess.Popen([sys.executable, "-I", "-S", "-c",
+                        "import time; time.sleep(0.5)"]) for _ in range(3)]
+            until = time.monotonic() + 0.6
+            while time.monotonic() < until:
+                sum(block[::4096])
+            for child in children:
+                assert child.wait(timeout=5) == 0
+        elif mode == "toolchains":
+            versions = {}
+            for tool in ["rustc", "cargo", "node", "npm"]:
+                path = shutil.which(tool)
+                if path:
+                    result = subprocess.run([path, "--version"], capture_output=True,
+                                            text=True, timeout=10)
+                    versions[tool] = {"path": path, "exitCode": result.returncode,
+                                      "version": result.stdout.strip()[:512]}
+                else:
+                    versions[tool] = None
+            Path("toolchains.json").write_text(json.dumps(versions))
+        elif mode == "workload":
+            completed = subprocess.run([sys.executable, "-I", "-S",
+                "/kranz-owned-session/qualification.py"], capture_output=True, timeout=240)
+            assert completed.returncode == 0, completed.stderr.decode()[-2000:]
+            assert completed.stdout.strip() == b"kranz-resource-workload-passed"
         elif mode == "tmpfs":
             shm = os.statvfs("/dev/shm")
             dev = os.statvfs("/dev")
