@@ -37,6 +37,8 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
+Rechecked 2026-10-06 (UTC): R3 measurement profiles exist only in test builds. Production v2 remains refused; live measurements require a separately approved, one-attempt manifest. Kernel accounting remains on the protected supervisor channel.
+
 Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The test-only
 resource revision adds bounded tmpfs and session-time limits plus protected
 supervisor observations. Classification requires observed evidence, not a worker

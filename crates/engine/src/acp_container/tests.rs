@@ -1228,12 +1228,22 @@ async fn resource_case(
     if mode == "cpu" {
         limits.cpu_millis = 100;
     }
+    if mode == "nofile" {
+        limits.nofile = 32;
+    }
+    if mode == "fsize" {
+        limits.fsize_mib = 1;
+    }
+    if mode == "workload" {
+        limits = crate::acp_worker::RESOURCE_CANDIDATE_LIMITS;
+    }
     let backend = AcpBackend::new("/usr/local/bin/python3", vec![peer.display().to_string()])
         .with_resource_fixture(limits);
     let mut session = backend.start(spec(root.path(), &name, mode)).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(45), async {
-        while session.next_event().await.unwrap().is_some() {}
-    })
+    tokio::time::timeout(
+        Duration::from_secs(if mode == "workload" { 300 } else { 45 }),
+        async { while session.next_event().await.unwrap().is_some() {} },
+    )
     .await
     .expect("resource fixture deadline");
     let exit = session.exit_status().unwrap();
@@ -1307,6 +1317,100 @@ async fn acp_containment_v1_resource_throttling_and_tmpfs_caps_preserve_honest_s
             );
         }
     }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_descriptor_and_file_limits_are_enforced() {
+    if !enabled() {
+        return;
+    }
+    for mode in ["nofile", "fsize"] {
+        let (root, evidence, exit) = resource_case(mode).await;
+        assert_eq!(exit, SessionExit::Completed, "{mode}: {evidence:?}");
+        assert_eq!(evidence.failure, None, "handled exhaustion is not failure");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("workspace/delivered.txt")).unwrap(),
+            "resource fixture delivery"
+        );
+        let observed = &evidence.sample.unwrap().usage.unwrap().limits;
+        assert_eq!(observed.nofile, Some([evidence.limits.nofile as u64; 2]));
+        assert_eq!(
+            observed.fsize_bytes,
+            Some([evidence.limits.fsize_mib as u64 * 1024 * 1024; 2])
+        );
+    }
+}
+
+#[tokio::test]
+async fn acp_containment_v1_resource_usage_and_kernel_limits_are_retained() {
+    if !enabled() {
+        return;
+    }
+    let (_, evidence, exit) = resource_case("usage").await;
+    assert_eq!(exit, SessionExit::Completed);
+    let sample = evidence.sample.unwrap();
+    assert!(sample.complete);
+    let usage = sample.usage.unwrap();
+    assert!(usage.memory_peak_bytes.unwrap() >= 24 * 1024 * 1024);
+    assert!(usage.pids_peak.unwrap() >= 5);
+    assert!(usage.cpu_usage_usec.unwrap() > usage.cpu_usage_at_start_usec.unwrap());
+    let limits = usage.limits;
+    assert_eq!(limits.memory_max_bytes, Some(256 * 1024 * 1024));
+    assert_eq!(limits.swap_max_bytes, Some(0));
+    assert_eq!(limits.pids_max, Some(64));
+    assert_eq!(
+        limits.cpu_quota_usec.unwrap() * 1000 / limits.cpu_period_usec.unwrap(),
+        1500
+    );
+    assert_eq!(limits.nofile, Some([256; 2]));
+    assert_eq!(limits.fsize_bytes, Some([64 * 1024 * 1024; 2]));
+}
+
+#[tokio::test]
+#[ignore = "operator-selected installed image, no credentials or provider call"]
+async fn acp_resource_qualification_toolchain_preflight() {
+    assert!(enabled(), "explicit container opt-in required");
+    let (root, evidence, exit) = resource_case("toolchains").await;
+    assert_eq!(exit, SessionExit::Completed);
+    let bytes = std::fs::read(root.path().join("workspace/toolchains.json")).unwrap();
+    let versions: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    println!(
+        "{}",
+        serde_json::json!({"toolchains":versions,"resourceEvidence":evidence})
+    );
+    for tool in ["rustc", "cargo", "node", "npm"] {
+        assert_eq!(
+            versions[tool]["exitCode"], 0,
+            "required toolchain {tool} unavailable"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "installed R3 candidate image; no credentials or provider call"]
+async fn acp_resource_qualification_offline_workload() {
+    assert!(enabled(), "explicit container opt-in required");
+    assert_eq!(
+        std::env::var("KRANZ_ACP_PROOF_IMAGE").unwrap(),
+        crate::acp_worker::RESOURCE_CANDIDATE_IMAGE
+    );
+    let (root, evidence, exit) = resource_case("workload").await;
+    assert_eq!(exit, SessionExit::Completed);
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            root.path()
+                .join("workspace/qualification-output/receipt.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["passed"], true);
+    assert_eq!(receipt["rustTests"], 2);
+    assert_eq!(receipt["nodeTests"], 2);
+    println!(
+        "{}",
+        serde_json::json!({"workload":receipt,"resourceEvidence":evidence})
+    );
 }
 
 #[tokio::test]

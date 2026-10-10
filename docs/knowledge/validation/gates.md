@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-06
+last_verified: 2026-10-10
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -16,6 +16,8 @@ verified_against:
   - crates/engine/src/acp_worker.rs
   - crates/engine/src/acp_resources.rs
   - crates/engine/src/acp_worker/tests.rs
+  - crates/engine/src/acp_worker/tests/qualification.rs
+  - crates/engine/src/acp_container/qualification_workload.py
   - crates/engine/src/gate_evaluation/subprocess.rs
   - crates/engine/src/backend_acp.rs
   - crates/engine/examples/acp_compat_probe.rs
@@ -58,8 +60,10 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-10-06 (UTC): R3 preparation adds required descriptor/file-size and kernel-accounting proofs to the Linux lane (eight resource-observation proofs total). Live qualification is ignored by default and requires an approved digest; synthetic and offline-workload passes cannot admit production v2.
+
 Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The Linux ACP
-lane requires six named resource proofs, including trusted failure attribution,
+lane gained six named resource proofs, including trusted failure attribution,
 forged-record rejection, honest success under throttling, completion replay and
 abort/owner-death cleanup. Missing observations remain explicit; an exit code
 alone is not a resource receipt. Local Docker proofs use synthetic peers; native
@@ -112,7 +116,7 @@ success. See [external evaluators](../../external-evaluators.md) for API boundar
 retention and recovery limits.
 
 The same Linux job also runs `acp_containment_v1` with
-`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and six resource-observation daemon proofs and the six ordinary-profile
+`KRANZ_ACP_CONTAINER_TESTS=1`. It requires the named descendant/lifetime and eight resource-observation daemon proofs and the seven ordinary-profile
 mission/credential-echo proofs by name and rejects `SKIP-ACP-CONTAINMENT`; the owner helper and pure admission
 tests do not substitute for those proofs. The same job explicitly runs the
 synthetic cache-read/denied-write proof and rejects its skip marker. Optional
@@ -183,7 +187,12 @@ POSIX coreutils present, and so cannot observe either failure class. The
 Ubuntu lane enables unprivileged user namespaces on its ephemeral runner and
 executes the real bubblewrap hostile-boundary and warm-overhead receipt. The
 MSRV lane runs
-`cargo check --workspace --locked` on Rust 1.88. Dedicated jobs cover the
+`cargo check --workspace --locked` on Rust 1.88. Jobs that pull container
+images (the image build, container egress, the external evaluator and the
+Ubuntu rust lane) first point the runner's Docker daemon at a registry mirror,
+because GitHub-hosted runners share Docker Hub's anonymous pull budget; the
+supply-chain lane installs cargo-deny from its checksummed release tarball for
+the same reason. Dedicated jobs cover the
 full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,

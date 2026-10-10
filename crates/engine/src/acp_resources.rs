@@ -32,6 +32,33 @@ pub struct Sample {
     pub wall_clock_expired: bool,
     pub baseline: Counters,
     pub current: Counters,
+    /// Kernel accounting, not worker-reported usage. Older observations omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    /// Total cgroup charge high-water mark, including cache/kernel memory; not RSS.
+    pub memory_peak_bytes: Option<u64>,
+    /// Kernel task (including thread) high-water mark; no sampled fallback.
+    pub pids_peak: Option<u64>,
+    pub cpu_usage_usec: Option<u64>,
+    pub cpu_usage_at_start_usec: Option<u64>,
+    pub limits: ObservedLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedLimits {
+    pub memory_max_bytes: Option<u64>,
+    pub swap_max_bytes: Option<u64>,
+    pub pids_max: Option<u64>,
+    pub cpu_quota_usec: Option<u64>,
+    pub cpu_period_usec: Option<u64>,
+    pub nofile: Option<[u64; 2]>,
+    pub fsize_bytes: Option<[u64; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +170,7 @@ mod tests {
                 exit_code: 137,
             }),
             sample: Some(Sample {
+                usage: None,
                 owner: "owned-fixture".into(),
                 elapsed_ms: 200,
                 complete: true,
@@ -234,5 +262,22 @@ mod tests {
         assert!(
             matches!(decoded, EventKind::WorkerCompleted { resource_evidence: Some(actual), .. } if *actual == e)
         );
+    }
+
+    #[test]
+    fn acp_resource_usage_is_additive_and_unavailable_is_not_zero() {
+        let old = serde_json::to_value(evidence().sample.unwrap()).unwrap();
+        assert!(old.get("usage").is_none());
+        let decoded: Sample = serde_json::from_value(old.clone()).unwrap();
+        assert!(decoded.usage.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+        let mut new = old;
+        new["usage"] = serde_json::json!({"memoryPeakBytes":null,"pidsPeak":null,
+            "cpuUsageUsec":null,"cpuUsageAtStartUsec":null,"limits":{
+            "memoryMaxBytes":null,"swapMaxBytes":null,"pidsMax":null,
+            "cpuQuotaUsec":null,"cpuPeriodUsec":null,"nofile":null,"fsizeBytes":null}});
+        let decoded: Sample = serde_json::from_value(new.clone()).unwrap();
+        assert!(decoded.usage.as_ref().unwrap().memory_peak_bytes.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), new);
     }
 }

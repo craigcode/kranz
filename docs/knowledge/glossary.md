@@ -23,6 +23,8 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-10-06 (UTC): R3 preparation adds optional kernel usage to resource evidence: memory charge high-water mark (not RSS), task high-water mark (including threads), CPU interval and effective limits. Missing values are not zero.
+
 Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The glossary
 now distinguishes configured resource ceilings from observed failure evidence.
 Production profile availability, role ownership and permission authority remain
