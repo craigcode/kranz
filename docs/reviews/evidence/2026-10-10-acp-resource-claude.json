@@ -1,0 +1,86 @@
+{
+  "hardDollarCap": null,
+  "keychain": false,
+  "measurementOnly": true,
+  "model": "default",
+  "passed": true,
+  "permissionDeliveries": 1,
+  "primaryUnchanged": true,
+  "productionQualified": false,
+  "provider": "claude",
+  "resourceEvidence": {
+    "containerId": "8238681e880f6ceafc83473fe934d514c60aab5c2f9be001ead060ad08a35c3f",
+    "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+    "limits": {
+      "cpuMillis": 2000,
+      "fsizeMib": 128,
+      "memoryMib": 2048,
+      "nofile": 1024,
+      "pids": 256,
+      "sessionSeconds": 600,
+      "tmpfsMib": 128
+    },
+    "namespaceCleanupConfirmed": true,
+    "observationFinishedAt": "2026-10-08T22:28:43.014978Z",
+    "observationStartedAt": "2026-10-08T22:28:31.128495Z",
+    "owner": "d6b2b7724c7e42a4a90612e310dfdecc",
+    "sample": {
+      "baseline": {
+        "oomKill": 0,
+        "pidsMax": 0,
+        "throttledUsec": 0
+      },
+      "complete": true,
+      "current": {
+        "oomKill": 0,
+        "pidsMax": 0,
+        "throttledUsec": 0
+      },
+      "elapsedMs": 11255,
+      "owner": "d6b2b7724c7e42a4a90612e310dfdecc",
+      "usage": {
+        "cpuUsageAtStartUsec": 57403,
+        "cpuUsageUsec": 2045364,
+        "limits": {
+          "cpuPeriodUsec": 100000,
+          "cpuQuotaUsec": 200000,
+          "fsizeBytes": [
+            134217728,
+            134217728
+          ],
+          "memoryMaxBytes": 2147483648,
+          "nofile": [
+            1024,
+            1024
+          ],
+          "pidsMax": 256,
+          "swapMaxBytes": 0
+        },
+        "memoryPeakBytes": 685223936,
+        "pidsPeak": 39
+      },
+      "wallClockExpired": false
+    },
+    "state": {
+      "exitCode": 0,
+      "oomKilled": false,
+      "running": false
+    },
+    "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+    "unavailable": []
+  },
+  "workerSessions": 1,
+  "workload": {
+    "dependencyDownloads": 0,
+    "nodeTests": 2,
+    "passed": true,
+    "rustTests": 2,
+    "schema": 1,
+    "versions": {
+      "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+      "node": "v22.23.1",
+      "npm": "10.9.8",
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"
+    }
+  }
+}

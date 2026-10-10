@@ -309,10 +309,15 @@ No Keychain or alternate credential discovery is used. Timeout/failure consumes
 the attempt and requires an explicit cleanup inventory before another allowance.
 Adapter-internal request retries are not claimed to be disabled.
 
-Preparation and synthetic proof alone do not close R3. The remaining gates are
-separately authorized live measurements for each adapter, review of headroom and
-supported host/daemon tuples, and proof at the selected production limits.
-Only then may a reviewed change admit v2. R4/R5 terminal budgets and production
+Preparation and synthetic proof alone do not close R3. Both separately authorized
+live measurements subsequently passed (Codex on October 6, Claude on October 8).
+The [selected-limit review](../reviews/2026-10-10-acp-selected-resource-limits.md)
+records their original receipts, headroom decision, narrow host/workload scope
+and exact-limit proof. The initial candidate retains 2 GiB/2 CPUs/256 tasks,
+1,024 descriptors, 128 MiB per file/tmpfs and 600 seconds; broader overrides and
+the provisional 60-minute/four-hour session bounds are not qualified by it.
+A reviewed admission must still enforce the supported host tuple and selected
+override range before making v2 selectable. R4/R5 terminal budgets and production
 terminal qualification remain separate. One small fixture is not evidence that
 a large application build fits the same ceilings.
 

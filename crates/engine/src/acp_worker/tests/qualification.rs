@@ -707,3 +707,62 @@ fn acp_resource_qualification_requires_observed_limits_and_complete_accounting()
         "two missing counters are not a clean interval"
     );
 }
+
+#[test]
+fn acp_resource_qualification_recorded_measurements_bind_selected_limits() {
+    for (provider, bytes, expected_sha) in [
+        (
+            "codex",
+            include_bytes!(
+                "../../../../../docs/reviews/evidence/2026-10-10-acp-resource-codex.json"
+            )
+            .as_slice(),
+            "34737668eb6685e3f90e50ad778d33bcb3bfde49b89a7a115482bbb91c4a83ad",
+        ),
+        (
+            "claude",
+            include_bytes!(
+                "../../../../../docs/reviews/evidence/2026-10-10-acp-resource-claude.json"
+            )
+            .as_slice(),
+            "8be38783b876f800f87fb9ba655453976834746d4268da2460a9a0a81835deed",
+        ),
+    ] {
+        assert_eq!(sha(bytes), expected_sha);
+        let result: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(result["provider"], provider);
+        for key in ["passed", "primaryUnchanged", "measurementOnly"] {
+            assert_eq!(result[key], true, "{key}");
+        }
+        assert_eq!(result["productionQualified"], false);
+        assert_eq!(result["workerSessions"], 1);
+        assert_eq!(result["permissionDeliveries"], 1);
+        assert_eq!(result["workload"]["passed"], true);
+        assert_eq!(result["workload"]["rustTests"], 2);
+        assert_eq!(result["workload"]["nodeTests"], 2);
+        assert_eq!(result["workload"]["dependencyDownloads"], 0);
+        let evidence: crate::acp_resources::ResourceEvidence =
+            serde_json::from_value(result["resourceEvidence"].clone()).unwrap();
+        verify_measurement(&evidence).unwrap();
+        assert_eq!(
+            evidence.supervisor_sha256,
+            sha(include_bytes!(
+                "../../acp_container/supervisor_resources.py"
+            ))
+        );
+        assert_eq!(
+            sha(include_bytes!(
+                "../../acp_container/qualification_workload.py"
+            )),
+            "67f2a9ab59ed6d3648040d3087cb81234f7d504023a101a538dd35205d4f0d7a"
+        );
+        let usage = evidence.sample.unwrap().usage.unwrap();
+        // These are headroom checks for the recorded fixture, not a prediction
+        // that arbitrary repository builds will fit the same resource budget.
+        assert!(
+            usage.memory_peak_bytes.unwrap() * 3
+                <= u64::from(RESOURCE_CANDIDATE_LIMITS.memory_mib) * 1024 * 1024
+        );
+        assert!(usage.pids_peak.unwrap() * 3 <= u64::from(RESOURCE_CANDIDATE_LIMITS.pids));
+    }
+}
