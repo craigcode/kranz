@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-10-06 (UTC): R3 preparation adds optional `sample.usage` inside resource evidence. Old records omit it; kernel high-water marks and effective limits remain separate from configured ceilings. No pipeline stage or released profile changes.
+
 Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). Optional
 `resourceEvidence` on worker completion folds into `WorkerRun`; absent evidence
 keeps the old serialized shape. The backend supplies namespace-bound observations

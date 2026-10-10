@@ -3,6 +3,9 @@ use super::*;
 use crate::backend::{PromptMode, SessionSpec};
 use crate::types::{BackendKind, MissionConfig, SandboxConfig};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod qualification;
+
 fn profile(id: &str) -> AcpWorkerProfile {
     AcpWorkerProfile {
         id: id.into(),
