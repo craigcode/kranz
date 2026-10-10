@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-06
+last_verified: 2026-10-10
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -187,7 +187,12 @@ POSIX coreutils present, and so cannot observe either failure class. The
 Ubuntu lane enables unprivileged user namespaces on its ephemeral runner and
 executes the real bubblewrap hostile-boundary and warm-overhead receipt. The
 MSRV lane runs
-`cargo check --workspace --locked` on Rust 1.88. Dedicated jobs cover the
+`cargo check --workspace --locked` on Rust 1.88. Jobs that pull container
+images (the image build, container egress, the external evaluator and the
+Ubuntu rust lane) first point the runner's Docker daemon at a registry mirror,
+because GitHub-hosted runners share Docker Hub's anonymous pull budget; the
+supply-chain lane installs cargo-deny from its checksummed release tarball for
+the same reason. Dedicated jobs cover the
 full-history knowledge refresh, supply chain/public-tree checks, Gas City pack,
 dashboard, Tauri on macOS/Windows, and Docker. The dashboard lane runs
 `npm ci`, high-severity audit, `npx tsc -b`, build, embedded-bundle freshness,
