@@ -15,6 +15,8 @@ verified_against:
   - crates/cli/src/ready.rs
 ---
 
+Rechecked 2026-10-06 (UTC): R3 preparation measures external adapter/toolchain resource use and checks enforcement. Its fixed offline workload is a qualification fixture, not new prompt, routing or code-generation machinery.
+
 Rechecked 2026-10-06 (UTC) against ACP resource failures (R2). The existing
 backend seam supplies trusted resource observations to completion events and
 folded evidence. Test-only resource limits bound external execution; they add no
