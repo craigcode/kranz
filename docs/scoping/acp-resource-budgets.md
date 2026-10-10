@@ -116,8 +116,8 @@ create arguments as enforcement evidence. See [Docker resource constraints](http
 and [Linux CPU bandwidth control](https://www.kernel.org/doc/html/latest/scheduler/sched-bwc.html).
 
 Starting values come from measurement, not guesswork. The qualification
-fixture records peak RSS, CPU time and process count for each adapter doing a
-synthetic feature that builds and tests a small Rust and Node project with the
+fixture records the cgroup memory charge high-water mark, CPU time and task
+count for each adapter doing a synthetic feature that builds and tests a small Rust and Node project with the
 declared toolchains. Set each ceiling at measured peak plus documented
 headroom. Record the measurement receipt next to the profile definition.
 
@@ -253,6 +253,68 @@ This is governance/evidence through the existing backend and completion seams.
 It adds no terminal admission, provider session, retry policy, prompt routing or
 production profile. R4 owns terminal-budget observations; R2 does not emit the
 reserved `terminalBudget` classification.
+
+## R3 preparation and additive contractChangeRequest
+
+The operator approved R3 implementation on 2026-10-06. Preparation adds optional
+`resourceEvidence.sample.usage` to the R2 contract. Its absence preserves old
+records; unavailable kernel values are null. It carries `memory.peak`,
+`pids.peak`, baseline/final `cpu.stat usage_usec`, and effective memory/swap,
+CPU, process and inherited hard/soft descriptor/file-size limits. The memory
+value is the cgroup charge, including cache and kernel memory, **not peak RSS**.
+The process controller counts tasks, including threads. There is no sampled
+fallback for a missing high-water counter. See the [kernel cgroup v2
+contract](https://www.kernel.org/doc/html/v6.14/admin-guide/cgroup-v2.html).
+The same protected supervisor inode supplies these values; worker output cannot
+populate them. This does not change the existing failure-classification rules.
+
+The test-only `qualification-{claude,codex}-resource-r3` profiles use a separate
+ARM64 image combining the pinned adapters with a complete installed Rust
+build toolchain. The [offline recipe](../../scripts/fixtures/acp-resource-qualification/Dockerfile)
+uses only already-installed immutable source images. It is not a published
+image or a production profile. `acp_worker.rs` pins the resulting candidate ID;
+a different result requires re-pinning and repeating proof. Rust 1.94.1,
+Node 22.23.1 and npm 10.9.8 are exercised without dependency downloads.
+
+Exploration ceilings are 2 GiB memory with no swap, 2 CPUs, 256 tasks, 1,024
+open descriptors, 128 MiB per file and per writable tmpfs, and a 600-second
+session. These are **measurement allowances, not measured production defaults**.
+The inherited container lifetime/enforcement proofs must pass on the candidate
+image; ordinary-profile fixtures retain their own pinned synthetic image. Separate
+adversarial cases exhaust memory, processes, descriptors, file size and tmpfs,
+observe CPU throttling, and expire the session. Handled resource errors do not
+manufacture a failed attempt. Named Linux CI checks cover descriptors/file size
+and effective kernel accounting in addition to R2's six resource proofs.
+
+The fixed read-only workload creates and tests small dependency-free Rust and
+Node projects (two tests each). It measures toolchain plus adapter overhead,
+not agent-authored feature quality or production build capacity. It uses the
+adapter's native shell permission seam; released ACP terminal capability stays
+off. Before live execution, an offline synthetic peer runs the exact workload.
+The live harness checks permission delivery, a single tool identity, command
+completion, the workload receipt, positive accounting, effective ceilings,
+namespace removal and an unchanged primary checkout. The workload receipt is
+an artifact; kernel measurements come through the separate protected channel.
+
+The ignored preparation test reads no credential and writes a private manifest
+binding provider, explicit credential path, image/profile, compiled test runner,
+supervisor/workload hashes, exact prompt/command and limits. Execution requires
+an operator-approved manifest digest. Exclusive `attempt.json` creation consumes
+that allowance before reading a credential or starting an adapter. Changed
+inputs, replay, extra commands/options or uncertain delivery fail closed. There
+is one prompt, at most one exact one-time permission, no harness retry, a
+780-second overall deadline and **no hard dollar cap**. Model selection remains
+the adapter default; initialization records its reported identity if available.
+No Keychain or alternate credential discovery is used. Timeout/failure consumes
+the attempt and requires an explicit cleanup inventory before another allowance.
+Adapter-internal request retries are not claimed to be disabled.
+
+Preparation and synthetic proof alone do not close R3. The remaining gates are
+separately authorized live measurements for each adapter, review of headroom and
+supported host/daemon tuples, and proof at the selected production limits.
+Only then may a reviewed change admit v2. R4/R5 terminal budgets and production
+terminal qualification remain separate. One small fixture is not evidence that
+a large application build fits the same ceilings.
 
 ## D-R: proposed decisions
 

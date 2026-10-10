@@ -10,6 +10,7 @@ import ctypes
 import hashlib
 import json
 import os
+import resource
 import select
 import stat
 import subprocess
@@ -42,32 +43,73 @@ class ResourceObserver:
             raise RuntimeError("invalid resource observation inode")
         os.unlink(path)
         self.baseline = self.counters()
+        self.cpu_started = self.counter("cpu.stat", "usage_usec")
+        self.limits = self.read_limits()
         self.write(False)
 
     @staticmethod
-    def counters():
-        def counter(file, key):
+    def cgroup(file):
+        try:
+            with open("/proc/self/cgroup") as source:
+                if source.read(4096).strip() != "0::/":
+                    return None
+            with open("/sys/fs/cgroup/" + file) as source:
+                return source.read(4096)
+        except OSError:
+            return None
+
+    @staticmethod
+    def integer(value):
+        try:
+            number = int(value)
+            return number if 0 <= number <= 2**64 - 1 else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def counter(cls, file, key):
+        try:
+            rows = dict(line.split() for line in cls.cgroup(file).splitlines())
+            return cls.integer(rows[key])
+        except (AttributeError, KeyError, ValueError):
+            return None
+
+    @classmethod
+    def counters(cls):
+        return {"oomKill": cls.counter("memory.events", "oom_kill"),
+                "pidsMax": cls.counter("pids.events", "max"),
+                "throttledUsec": cls.counter("cpu.stat", "throttled_usec")}
+
+    @classmethod
+    def read_limits(cls):
+        def rlimit(kind):
             try:
-                # The namespace is explicitly private; unsupported cgroup v1
-                # leaves counters unavailable rather than inventing zeroes.
-                with open("/proc/self/cgroup") as source:
-                    if source.read(4096).strip() != "0::/":
-                        return None
-                with open("/sys/fs/cgroup/" + file) as source:
-                    rows = dict(line.split() for line in source.read(4096).splitlines())
-                value = int(rows[key])
-                return value if 0 <= value <= 2**64 - 1 else None
-            except (OSError, KeyError, ValueError):
+                values = list(resource.getrlimit(kind))
+                return values if all(cls.integer(v) is not None for v in values) else None
+            except (OSError, ValueError):
                 return None
-        return {"oomKill": counter("memory.events", "oom_kill"),
-                "pidsMax": counter("pids.events", "max"),
-                "throttledUsec": counter("cpu.stat", "throttled_usec")}
+        cpu = (cls.cgroup("cpu.max") or "").split()
+        return {"memoryMaxBytes": cls.integer(cls.cgroup("memory.max")),
+                "swapMaxBytes": cls.integer(cls.cgroup("memory.swap.max")),
+                "pidsMax": cls.integer(cls.cgroup("pids.max")),
+                "cpuQuotaUsec": cls.integer(cpu[0]) if len(cpu) == 2 else None,
+                "cpuPeriodUsec": cls.integer(cpu[1]) if len(cpu) == 2 else None,
+                "nofile": rlimit(resource.RLIMIT_NOFILE),
+                "fsizeBytes": rlimit(resource.RLIMIT_FSIZE)}
+
+    def usage(self):
+        return {"memoryPeakBytes": self.integer(self.cgroup("memory.peak")),
+                "pidsPeak": self.integer(self.cgroup("pids.peak")),
+                "cpuUsageUsec": self.counter("cpu.stat", "usage_usec"),
+                "cpuUsageAtStartUsec": self.cpu_started,
+                "limits": self.limits}
 
     def write(self, complete):
         payload = json.dumps({"owner": self.owner,
             "elapsedMs": int((time.monotonic() - self.started) * 1000),
             "complete": complete, "wallClockExpired": self.wall_expired,
-            "baseline": self.baseline, "current": self.counters()},
+            "baseline": self.baseline, "current": self.counters(),
+            "usage": self.usage()},
             separators=(",", ":")).encode("ascii")
         if len(payload) > 4096:
             raise RuntimeError("resource observation overflow")

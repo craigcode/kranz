@@ -202,6 +202,14 @@ impl OwnedContainer {
             .tempdir_in(crate::backend_claude::scratch_root_base())
             .map_err(error)?;
         let canonical = root.path().canonicalize().map_err(error)?;
+        #[cfg(test)]
+        if resources.is_some() {
+            std::fs::write(
+                canonical.join("qualification.py"),
+                include_str!("acp_container/qualification_workload.py"),
+            )
+            .map_err(error)?;
+        }
         for writable in std::iter::once(&resolved.inputs.session_cwd)
             .chain(std::iter::once(&resolved.inputs.tmpdir))
             .chain(&resolved.inputs.extra_write)
