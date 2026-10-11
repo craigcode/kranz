@@ -89,11 +89,22 @@ pub(crate) fn apply_resources(
 }
 
 impl OwnedContainer {
+    #[cfg(test)]
     pub(crate) async fn prepare(
         spec: &SessionSpec,
         program: &Path,
         args: &[String],
         resources: Option<crate::acp_worker::Resources>,
+    ) -> Result<(Self, tokio::process::Command)> {
+        Self::prepare_with_host(spec, program, args, resources, None).await
+    }
+
+    pub(crate) async fn prepare_with_host(
+        spec: &SessionSpec,
+        program: &Path,
+        args: &[String],
+        resources: Option<crate::acp_worker::Resources>,
+        admitted_host: Option<&crate::acp_worker::admission::AdmittedHost>,
     ) -> Result<(Self, tokio::process::Command)> {
         let resolved = spec
             .sandbox
@@ -139,8 +150,14 @@ impl OwnedContainer {
             ));
         }
         crate::sandbox::validate_git_config_protection(&resolved.inputs, true)?;
-        let docker = trusted_docker(&resolved.inputs)?;
-        let client = DockerEvaluator::new(&docker).map_err(error)?;
+        let (docker, client) = match admitted_host {
+            Some(host) => (host.docker.clone(), host.client.clone()),
+            None => {
+                let docker = trusted_docker(&resolved.inputs)?;
+                let client = DockerEvaluator::new(&docker).map_err(error)?;
+                (docker, client)
+            }
+        };
         if filtered_network {
             let network = client
                 .control(&[
@@ -229,10 +246,16 @@ impl OwnedContainer {
         let runtime = container.runtime;
         let pin = container.image.clone();
         let proof_root = canonical.clone();
+        let admitted_client = admitted_host.map(|_| client.clone());
         let proof = tokio::task::spawn_blocking(move || {
             let mut roots = roots;
             roots.push(proof_root);
-            crate::sandbox_container::prove_mount_roots(runtime, &roots, &pin)
+            match admitted_client {
+                Some(client) => {
+                    crate::sandbox_container::prove_mount_roots_with_client(&client, &roots, &pin)
+                }
+                None => crate::sandbox_container::prove_mount_roots(runtime, &roots, &pin),
+            }
         })
         .await
         .map_err(error)?;
@@ -760,10 +783,19 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn trusted_docker(inputs: &SandboxInputs) -> Result<PathBuf> {
+    trusted_control_program(inputs, "docker")
+}
+
+pub(crate) fn trusted_control_program(inputs: &SandboxInputs, program: &str) -> Result<PathBuf> {
+    let label = if program == "docker" {
+        "Docker"
+    } else {
+        "Colima"
+    };
     for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .filter(|p| p.is_absolute())
     {
-        if let Ok(candidate) = root.join("docker").canonicalize() {
+        if let Ok(candidate) = root.join(program).canonicalize() {
             if !candidate.is_file() {
                 continue;
             }
@@ -772,12 +804,14 @@ fn trusted_docker(inputs: &SandboxInputs) -> Result<PathBuf> {
                 .chain(&inputs.extra_write)
                 .any(|root| candidate.starts_with(crate::sandbox::absolutize(root)))
             {
-                return Err(error("Docker control executable is worker-writable"));
+                return Err(error(format!(
+                    "{label} control executable is worker-writable"
+                )));
             }
             return Ok(candidate);
         }
     }
-    Err(error("trusted Docker executable unavailable"))
+    Err(error(format!("trusted {label} executable unavailable")))
 }
 
 #[cfg(test)]

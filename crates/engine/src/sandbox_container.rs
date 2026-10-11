@@ -355,6 +355,28 @@ pub fn prove_mount_roots(runtime: ContainerRuntime, roots: &[PathBuf], image: &s
     MountProof::Proven
 }
 
+/// Admission already selected this daemon. Do not resolve the ambient context
+/// again: another endpoint cannot qualify the admitted worker's mounts.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn prove_mount_roots_with_client(
+    client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+    roots: &[PathBuf],
+    image: &str,
+) -> MountProof {
+    let mut seen = Vec::new();
+    for root in roots {
+        if root.as_os_str().is_empty() || seen.iter().any(|prior| prior == root) {
+            continue;
+        }
+        seen.push(root.clone());
+        match mount_proof::prove_with_client(root, image, Some(client.clone())) {
+            MountProof::Proven => {}
+            failed => return failed,
+        }
+    }
+    MountProof::Proven
+}
+
 /// The roots a session or gate actually mounts, in the order the operator
 /// would want them reported.
 ///

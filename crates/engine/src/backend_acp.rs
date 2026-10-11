@@ -599,11 +599,10 @@ impl AgentBackend for AcpBackend {
                 "terminal fixture requires its own contained profile".into(),
             ));
         }
-        let profile_home = self
-            .profile
-            .as_ref()
-            .map(|profile| profile.prepare(&mut spec))
-            .transpose()?;
+        let profile_home = match &self.profile {
+            Some(profile) => Some(profile.prepare(&mut spec).await?),
+            None => None,
+        };
         let model = spec.model.clone();
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -611,11 +610,12 @@ impl AgentBackend for AcpBackend {
             let resources = profile_home.as_ref().and_then(|p| p.resources);
             #[cfg(test)]
             let resources = resources.or(self.resource_fixture);
-            let (container, command) = crate::acp_container::OwnedContainer::prepare(
+            let (container, command) = crate::acp_container::OwnedContainer::prepare_with_host(
                 &spec,
                 &self.program,
                 &self.args,
                 resources,
+                profile_home.as_ref().and_then(|p| p.admitted_host.as_ref()),
             )
             .await?;
             (Some(container), command)

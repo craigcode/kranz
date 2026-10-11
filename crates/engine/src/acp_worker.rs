@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 pub const IMAGE: &str = "sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743";
 pub const CLAUDE: &str = "claude-acp-0.77.0-arm64-v1";
 pub const CODEX: &str = "codex-acp-1.11.0-arm64-v1";
-// Exploration ceilings only. The live measurement and final qualification must
-// precede any production defaults; these IDs do not exist in release builds.
-#[cfg(test)]
-pub(crate) const RESOURCE_CANDIDATE_IMAGE: &str =
+pub const CLAUDE_V2: &str = "claude-acp-0.77.0-arm64-v2";
+pub const CODEX_V2: &str = "codex-acp-1.11.0-arm64-v2";
+pub(crate) mod admission;
+// Qualified for the fixed Rust/Node workload and admission::POLICY host tuple.
+pub const RESOURCE_IMAGE: &str =
     "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c";
-#[cfg(test)]
-pub(crate) const RESOURCE_CANDIDATE_LIMITS: Resources = Resources {
+pub const RESOURCE_LIMITS: Resources = Resources {
     memory_mib: 2048,
     cpu_millis: 2000,
     pids: 256,
@@ -28,6 +28,10 @@ pub(crate) const RESOURCE_CANDIDATE_LIMITS: Resources = Resources {
     tmpfs_mib: 128,
     session_seconds: 600,
 };
+#[cfg(test)]
+pub(crate) const RESOURCE_CANDIDATE_IMAGE: &str = RESOURCE_IMAGE;
+#[cfg(test)]
+pub(crate) const RESOURCE_CANDIDATE_LIMITS: Resources = RESOURCE_LIMITS;
 const CODEX_CONFIG: &str =
     "cli_auth_credentials_store = \"file\"\n\n[features]\nplugins = false\nremote_plugin = false\n";
 #[cfg(unix)]
@@ -41,7 +45,7 @@ pub struct AcpWorkerProfile {
     pub id: String,
     pub credential_file: PathBuf,
     /// Operator lowering or raising of the revision's declared ceilings,
-    /// within its hard maximum (docs/scoping/acp-resource-budgets.md D-R2).
+    /// within its qualified range (docs/scoping/acp-resource-budgets.md D-R2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceOverrides>,
 }
@@ -79,11 +83,13 @@ pub struct Resources {
     pub session_seconds: u32,
 }
 
-/// What a profile revision declares: defaults and the operator's hard maximum.
+/// Defaults and the qualified override range; older fixtures use runtime floors.
 #[derive(Clone, Copy, Serialize)]
 pub(crate) struct Ceilings {
     pub defaults: Resources,
     pub max: Resources,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<Resources>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -96,6 +102,8 @@ pub(crate) struct Definition {
     /// `None` for revisions qualified before ceilings existed; their
     /// container argv stays exactly as reviewed.
     pub resources: Option<Ceilings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<admission::Policy>,
 }
 
 impl Definition {
@@ -115,6 +123,7 @@ const FIXTURE: Definition = Definition {
     egress: &["provider.invalid:443"],
     claude: false,
     resources: None,
+    qualification: None,
 };
 
 fn refusal(reason: &str) -> EngineError {
@@ -124,6 +133,24 @@ fn refusal(reason: &str) -> EngineError {
 impl AcpWorkerProfile {
     pub(crate) fn definition(&self) -> Result<Definition> {
         match self.id.as_str() {
+            CLAUDE_V2 | CODEX_V2 => {
+                let base = Self {
+                    id: if self.id == CLAUDE_V2 { CLAUDE } else { CODEX }.into(),
+                    credential_file: self.credential_file.clone(),
+                    resources: None,
+                }
+                .definition()?;
+                Ok(Definition {
+                    image: RESOURCE_IMAGE,
+                    resources: Some(Ceilings {
+                        defaults: RESOURCE_LIMITS,
+                        max: RESOURCE_LIMITS,
+                        min: Some(RESOURCE_LIMITS),
+                    }),
+                    qualification: Some(admission::POLICY),
+                    ..base
+                })
+            }
             #[cfg(test)]
             "qualification-claude-resource-r3" | "qualification-codex-resource-r3" => {
                 let base = Self {
@@ -142,6 +169,7 @@ impl AcpWorkerProfile {
                     resources: Some(Ceilings {
                         defaults: RESOURCE_CANDIDATE_LIMITS,
                         max: RESOURCE_CANDIDATE_LIMITS,
+                        min: None,
                     }),
                     ..base
                 })
@@ -155,6 +183,7 @@ impl AcpWorkerProfile {
                 egress: &["api.anthropic.com:443", "claude.ai:443"],
                 claude: true,
                 resources: None,
+                qualification: None,
             }),
             CODEX => Ok(Definition {
                 program: "/opt/acp/node_modules/.bin/codex-acp",
@@ -167,12 +196,14 @@ impl AcpWorkerProfile {
                 ],
                 claude: false,
                 resources: None,
+                qualification: None,
             }),
             #[cfg(test)]
             "fixture-acp-worker-v1" => Ok(FIXTURE),
             #[cfg(test)]
             "fixture-acp-worker-v2" => Ok(Definition {
                 resources: Some(Ceilings {
+                    min: None,
                     defaults: Resources {
                         memory_mib: 256,
                         cpu_millis: 1_000,
@@ -199,15 +230,21 @@ impl AcpWorkerProfile {
     }
 
     pub(crate) fn validate_target(&self, os: &str, arch: &str) -> Result<()> {
-        self.definition()?;
-        let supported = matches!(os, "macos" | "linux") && arch == "aarch64";
+        let definition = self.definition()?;
+        let supported = if definition.qualification.is_some() {
+            os == "macos" && arch == "aarch64"
+        } else {
+            matches!(os, "macos" | "linux") && arch == "aarch64"
+        };
         #[cfg(test)]
         let supported = supported
             || (self.id.starts_with("fixture-acp-worker-") && matches!(os, "macos" | "linux"));
         if !supported {
-            return Err(refusal(
-                "only the reviewed macOS/Linux ARM64 hosts are admitted",
-            ));
+            return Err(refusal(if definition.qualification.is_some() {
+                "v2 requires the qualified macOS ARM64 Colima host; see docs/acp-containment.md"
+            } else {
+                "only the reviewed macOS/Linux ARM64 hosts are admitted"
+            }));
         }
         if !self.credential_file.is_absolute() {
             return Err(refusal(
@@ -238,38 +275,53 @@ impl AcpWorkerProfile {
             ))),
         };
         let (d, m) = (ceilings.defaults, ceilings.max);
+        let min = ceilings.min.unwrap_or(Resources {
+            memory_mib: 6,
+            cpu_millis: 10,
+            pids: 1,
+            nofile: 1,
+            fsize_mib: 1,
+            tmpfs_mib: 64,
+            session_seconds: 1,
+        });
         Ok(Some(Resources {
             memory_mib: pick(
                 "memoryMib",
                 overrides.memory_mib,
                 d.memory_mib,
-                6, // Docker's minimum memory limit is 6 MiB.
+                min.memory_mib,
                 m.memory_mib,
             )?,
             cpu_millis: pick(
                 "cpuMillis",
                 overrides.cpu_millis,
                 d.cpu_millis,
-                10, // Linux's 1 ms quota floor at Docker's default 100 ms period.
+                min.cpu_millis,
                 m.cpu_millis,
             )?,
-            pids: pick("pids", overrides.pids, d.pids, 1, m.pids)?,
-            nofile: pick("nofile", overrides.nofile, d.nofile, 1, m.nofile)?,
-            fsize_mib: pick("fsizeMib", overrides.fsize_mib, d.fsize_mib, 1, m.fsize_mib)?,
+            pids: pick("pids", overrides.pids, d.pids, min.pids, m.pids)?,
+            nofile: pick("nofile", overrides.nofile, d.nofile, min.nofile, m.nofile)?,
+            fsize_mib: pick(
+                "fsizeMib",
+                overrides.fsize_mib,
+                d.fsize_mib,
+                min.fsize_mib,
+                m.fsize_mib,
+            )?,
             // Docker's managed /dev tmpfs is 64 MiB. The configurable /dev/shm
             // and explicit writable tmpfs mounts may not exceed this ceiling.
             tmpfs_mib: pick(
                 "tmpfsMib",
                 overrides.tmpfs_mib,
                 d.tmpfs_mib,
-                64,
+                min.tmpfs_mib,
                 m.tmpfs_mib,
             )?,
             session_seconds: pick(
                 "sessionSeconds",
                 overrides.session_seconds,
                 d.session_seconds,
-                1,
+                min.session_seconds,
                 m.session_seconds,
             )?,
         }))
@@ -307,7 +359,7 @@ impl AcpWorkerProfile {
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, spec: &mut SessionSpec) -> Result<PreparedProfile> {
+    pub(crate) async fn prepare(&self, spec: &mut SessionSpec) -> Result<PreparedProfile> {
         self.validate_target(std::env::consts::OS, std::env::consts::ARCH)?;
         let definition = self.definition()?;
         let sandbox = spec
@@ -368,6 +420,11 @@ impl AcpWorkerProfile {
         if crate::sandbox::absolutize(primary) == crate::sandbox::absolutize(&spec.cwd) {
             return Err(refusal("worker cwd must differ from the primary checkout"));
         }
+        // Admission precedes even opening the provider credential source.
+        let admitted_host = match definition.qualification {
+            Some(policy) => Some(admission::probe(&sandbox.inputs, policy).await?),
+            None => None,
+        };
         let source = self
             .credential_file
             .canonicalize()
@@ -463,18 +520,25 @@ impl AcpWorkerProfile {
             .inputs
             .tmpdir = home_path;
         let resources = self.effective_resources()?;
+        let mut receipt = json!({
+            "profile":self.id,"definitionSha256":definition.sha256(),"resources":resources,
+            "credentialSource":"operator-selected-file","startupPolicy":"v1",
+            "hostOs":std::env::consts::OS,"hostArch":std::env::consts::ARCH,
+            "proofs":["native-tool-proof-v2.json","linux-native-tool-proof-v1.json"],
+            "fullMissionAcceptanceProven":false,
+        });
+        if let Some(host) = &admitted_host {
+            receipt["hostAdmission"] = host.receipt.clone();
+            receipt["proofs"] = serde_json::to_value(definition.qualification.unwrap().evidence)
+                .expect("qualification serializes");
+        }
         Ok(PreparedProfile {
             home: Some(home),
             secrets,
             stream_tails: Default::default(),
             resources,
-            receipt: json!({
-                "profile":self.id,"definitionSha256":definition.sha256(),"resources":resources,
-                "credentialSource":"operator-selected-file","startupPolicy":"v1",
-                "hostOs":std::env::consts::OS,"hostArch":std::env::consts::ARCH,
-                "proofs":["native-tool-proof-v2.json","linux-native-tool-proof-v1.json"],
-                "fullMissionAcceptanceProven":false,
-            }),
+            receipt,
+            admitted_host,
         })
     }
 }
@@ -537,6 +601,8 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) struct PreparedProfile {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub admitted_host: Option<admission::AdmittedHost>,
     home: Option<tempfile::TempDir>,
     secrets: Vec<String>,
     stream_tails: std::collections::HashMap<String, String>,

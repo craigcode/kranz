@@ -71,6 +71,27 @@ impl DockerEvaluator {
             env: crate::sandbox_container::ContainerRuntime::Docker.client_env(),
         })
     }
+    /// Freeze a reviewed local daemon selection; later Docker context changes
+    /// must not retarget a credential-bearing worker or its cleanup commands.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn pin_local_endpoint(&mut self, endpoint: &str) {
+        for key in [
+            "DOCKER_CONTEXT",
+            "DOCKER_TLS",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+            "DOCKER_API_VERSION",
+        ] {
+            self.env.remove(key);
+        }
+        self.env.insert("DOCKER_HOST".into(), endpoint.into());
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn environment(&self) -> &HashMap<String, String> {
+        &self.env
+    }
+
     async fn command(
         &self,
         args: &[String],
@@ -611,4 +632,41 @@ fn accept(
         exit_code: 0,
         container_removed: true,
     })
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn acp_v2_admission_pins_context_for_attached_and_control_commands() {
+        let mut client = DockerEvaluator {
+            program: PathBuf::from("/trusted/docker"),
+            env: HashMap::from([
+                ("DOCKER_CONTEXT".into(), "colima".into()),
+                ("DOCKER_HOST".into(), "ssh://remote".into()),
+                ("DOCKER_TLS".into(), "1".into()),
+                ("DOCKER_TLS_VERIFY".into(), "1".into()),
+                ("DOCKER_CERT_PATH".into(), "/other".into()),
+                ("DOCKER_API_VERSION".into(), "old".into()),
+            ]),
+        };
+        client.pin_local_endpoint("unix:///operator/.colima/default/docker.sock");
+        assert_eq!(client.env.len(), 1);
+        assert_eq!(
+            client.env["DOCKER_HOST"],
+            "unix:///operator/.colima/default/docker.sock"
+        );
+        let command = client.attached_command(&["start".into()]);
+        let environment: Vec<_> = command.as_std().get_envs().collect();
+        assert_eq!(
+            environment,
+            vec![(
+                std::ffi::OsStr::new("DOCKER_HOST"),
+                Some(std::ffi::OsStr::new(
+                    "unix:///operator/.colima/default/docker.sock"
+                ))
+            )]
+        );
+    }
 }
