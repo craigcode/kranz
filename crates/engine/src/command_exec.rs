@@ -1558,7 +1558,9 @@ where
 {
     let max_bytes = COMMAND_OUTPUT_TAIL * 4;
     let mut tail = Vec::with_capacity(max_bytes);
-    let mut chunk = [0u8; 8192];
+    // Heap-allocated: an inline array would sit in every command future's
+    // state across the await (stdout + stderr), bloating the hosted stack.
+    let mut chunk = vec![0u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {

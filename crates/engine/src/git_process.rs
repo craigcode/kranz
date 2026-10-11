@@ -193,7 +193,8 @@ async fn read_exact_bounded<R: AsyncRead + Unpin>(
     stream: &str,
 ) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
-    let mut chunk = [0u8; 8192];
+    // Heap-allocated so the buffer is not held in the future across await.
+    let mut chunk = vec![0u8; 8192];
     loop {
         let count = reader.read(&mut chunk).await?;
         if count == 0 {

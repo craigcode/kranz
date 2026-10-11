@@ -100,7 +100,8 @@ pub(crate) async fn run(
 
 async fn read_capped(mut reader: impl AsyncRead + Unpin, cap: usize) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
+    // Heap-allocated so the buffer is not held in the future across await.
+    let mut buffer = vec![0u8; 8192];
     loop {
         let n = reader
             .read(&mut buffer)
