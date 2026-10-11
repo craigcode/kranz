@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Done: async stream read buffers moved to the heap; run_loop boxes drain_control, final_gate, try_parallel_batch and validation_round; drive_permission_worker boxes the worker and its tick. Hosted lifecycle passes at 709 KiB (overflows at 694); a synthetic 512-byte MissionConfig field still passes at 1 MiB (~818 KiB). Per-byte config cost follows up in mission-state-by-reference."
 title: Restore stack headroom in hosted mission futures
 priority: 2
 schedule: once
