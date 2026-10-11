@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-06
+last_verified: 2026-10-11
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 
 Rechecked 2026-10-06 (UTC): R3 preparation adds optional kernel usage to resource evidence: memory charge high-water mark (not RSS), task high-water mark (including threads), CPU interval and effective limits. Missing values are not zero.
 
