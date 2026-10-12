@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-10
+last_verified: 2026-10-11
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -59,6 +59,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 
 Rechecked 2026-10-06 (UTC): R3 preparation adds required descriptor/file-size and kernel-accounting proofs to the Linux lane (eight resource-observation proofs total). Live qualification is ignored by default and requires an approved digest; synthetic and offline-workload passes cannot admit production v2.
 

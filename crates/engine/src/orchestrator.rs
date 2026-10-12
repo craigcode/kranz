@@ -2803,7 +2803,7 @@ impl MissionEngine {
 
         loop {
             // (a) drain the control inbox.
-            self.drain_control().await?;
+            Box::pin(self.drain_control()).await?;
 
             match self.state.mission.status {
                 MissionStatus::Complete => return Ok(MissionStatus::Complete),
@@ -2853,7 +2853,7 @@ impl MissionEngine {
 
             // (d) first incomplete milestone; none → final gate (h).
             let Some(mi) = first_incomplete(&self.state) else {
-                match self.final_gate().await? {
+                match Box::pin(self.final_gate()).await? {
                     Some(status) => return Ok(status),
                     None => continue,
                 }
@@ -2893,15 +2893,17 @@ impl MissionEngine {
             // With max_parallel_workers == 1 this guard short-circuits before
             // any parallel code runs, so the sequential behaviour below is
             // exactly what it was pre-M3.
-            if self.state.config.max_parallel_workers > 1 && self.try_parallel_batch(mi).await? {
+            if self.state.config.max_parallel_workers > 1
+                && Box::pin(self.try_parallel_batch(mi)).await?
+            {
                 continue;
             }
 
             match next_feature(&self.state.mission.milestones[mi]) {
-                // Keep the worker/permission state machine off the enclosing
-                // mission future's stack, including on Windows runtime threads.
+                // Keep each stage's state machine off the enclosing mission
+                // future's stack, including on Windows runtime threads.
                 Some(fi) => Box::pin(self.run_feature(mi, fi)).await?,
-                None => self.validation_round(mi).await?,
+                None => Box::pin(self.validation_round(mi)).await?,
             }
         }
     }

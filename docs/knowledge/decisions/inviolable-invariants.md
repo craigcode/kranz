@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-06
+last_verified: 2026-10-11
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 
 Rechecked 2026-10-06 (UTC): R3 measurement profiles exist only in test builds. Production v2 remains refused; live measurements require a separately approved, one-attempt manifest. Kernel accounting remains on the protected supervisor channel.
 
