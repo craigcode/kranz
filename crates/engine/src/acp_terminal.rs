@@ -3,7 +3,8 @@
 use crate::gate_evaluation::subprocess::DockerEvaluator;
 use crate::live_permission::{digest, Proposal};
 use kranz_acp::terminal::{
-    CleanupReceipt, Create, Error, ExitStatus, OutputSnapshot, OutputTail, Scope, TerminalProvider,
+    Budget, CleanupReceipt, Create, Error, ExitStatus, OutputSnapshot, OutputTail, Scope,
+    TerminalProvider,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12,7 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Notify};
 
@@ -21,6 +22,37 @@ pub(crate) const FIXTURE_IMAGE: &str =
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_TERMINALS: usize = 8;
 const MAX_CREATIONS: usize = 32;
+const MAX_OUTPUT_PER_SECOND: usize = 10;
+
+/// Code-owned fixture policy, never deserialized from peer or repository input.
+/// The selected resource profile still has a 600-second session ceiling.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Budgets {
+    command_ms: u64,
+    retention_ms: u64,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self {
+            command_ms: 600_000,
+            retention_ms: 300_000,
+        }
+    }
+}
+
+impl Budgets {
+    #[cfg(test)]
+    pub(crate) fn fixture(command_ms: u64, retention_ms: u64) -> Self {
+        assert!((1..=600_000).contains(&command_ms));
+        assert!((1..=300_000).contains(&retention_ms));
+        Self {
+            command_ms,
+            retention_ms,
+        }
+    }
+}
 
 pub(crate) struct Context {
     pub(crate) client: DockerEvaluator,
@@ -47,9 +79,14 @@ struct State {
     releasing: bool,
     driver_ok: bool,
     failed: bool,
+    budget: Option<Budget>,
+    retention_expired: bool,
+    output_window: Instant,
+    output_count: usize,
 }
 
 struct Entry {
+    deadline: tokio::time::Instant,
     state: Mutex<State>,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     changed: watch::Sender<()>,
@@ -60,6 +97,8 @@ struct Entry {
 struct Registry {
     entries: HashMap<String, Arc<Entry>>,
     authorities: HashSet<String>,
+    reservations: HashSet<String>,
+    retired: HashMap<String, (ExitStatus, bool)>,
     creations: usize,
 }
 
@@ -72,7 +111,7 @@ struct Receipts {
 impl Receipts {
     fn record(&self, value: Value) -> Result<(), Error> {
         let mut queue = self.queue.lock().map_err(|_| Error::Unavailable)?;
-        if queue.len() >= 2 * MAX_CREATIONS {
+        if queue.len() >= 3 * MAX_CREATIONS {
             return Err(Error::Unavailable);
         }
         queue.push_back(value);
@@ -84,7 +123,9 @@ impl Receipts {
 pub(crate) struct Provider {
     context: Context,
     pub(crate) scope: Scope,
-    registry: Mutex<Registry>,
+    registry: Arc<Mutex<Registry>>,
+    budgets: Budgets,
+    session_deadline: Instant,
     failed: Arc<AtomicBool>,
     failure: Arc<Notify>,
     receipts: Receipts,
@@ -96,6 +137,7 @@ impl Provider {
         run: String,
         engine_session: String,
         peer_session: String,
+        budgets: Budgets,
     ) -> Self {
         Self {
             context,
@@ -105,7 +147,9 @@ impl Provider {
                 peer_session_id: peer_session,
                 generation: uuid::Uuid::new_v4().to_string(),
             },
-            registry: Mutex::new(Registry::default()),
+            registry: Arc::new(Mutex::new(Registry::default())),
+            budgets,
+            session_deadline: Instant::now() + Duration::from_secs(600),
             failed: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(Notify::new()),
             receipts: Receipts::default(),
@@ -164,8 +208,48 @@ impl Provider {
         Ok(
             json!({"kind":"execute", "rawInput": request, "effectiveEnvironment":environment,
             "terminalScope":self.scope, "namespaceImage":self.context.image,
-            "namespaceId":self.context.container_id}),
+            "namespaceId":self.context.container_id,"terminalBudgets":self.budgets,
+            "sessionCeilingMs":600_000,"oomScoreAdjRequested":500}),
         )
+    }
+
+    /// Reserve before human consent. Reservations and issued authorities both
+    /// occupy capacity until denial or the atomic transition to a live entry.
+    pub(crate) fn reserve(&self, proposal: &str) -> Result<(), Error> {
+        self.check_scope(&self.scope)?;
+        if Instant::now() >= self.session_deadline {
+            return Err(Error::BudgetExceeded(Budget::SessionLifetime));
+        }
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        let reserved = registry.reservations.len() + registry.authorities.len();
+        if registry.creations + reserved >= MAX_CREATIONS {
+            return Err(Error::BudgetExceeded(Budget::Creations));
+        }
+        if registry.entries.len() + reserved >= MAX_TERMINALS {
+            return Err(Error::BudgetExceeded(Budget::Capacity));
+        }
+        if !registry.reservations.insert(proposal.to_owned()) {
+            return Err(Error::NotAuthorized);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_reservation(&self, proposal: &str) -> Result<(), Error> {
+        self.registry
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .reservations
+            .remove(proposal);
+        Ok(())
+    }
+
+    pub(crate) fn exit_status(&self, id: &str) -> Option<ExitStatus> {
+        let registry = self.registry.lock().ok()?;
+        if let Some((exit, _)) = registry.retired.get(id) {
+            return Some(exit.clone());
+        }
+        let exit = registry.entries.get(id)?.state.lock().ok()?.exit.clone();
+        exit
     }
 
     /// Called only after the backend validates the engine's durable response.
@@ -187,8 +271,8 @@ impl Provider {
             return Err(Error::NotAuthorized);
         }
         let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
-        if registry.authorities.len() >= crate::live_permission::MAX_PENDING {
-            return Err(Error::Unavailable);
+        if !registry.reservations.remove(&proposal.id) {
+            return Err(Error::NotAuthorized);
         }
         let nonce = uuid::Uuid::new_v4().to_string();
         registry.authorities.insert(nonce.clone());
@@ -203,10 +287,15 @@ impl Provider {
 
     fn entry(&self, scope: &Scope, id: &str) -> Result<Arc<Entry>, Error> {
         self.check_scope(scope)?;
-        let entry = self
-            .registry
-            .lock()
-            .map_err(|_| Error::Unavailable)?
+        let registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        if registry
+            .retired
+            .get(id)
+            .is_some_and(|(_, expired)| *expired)
+        {
+            return Err(Error::BudgetExceeded(Budget::Retention));
+        }
+        let entry = registry
             .entries
             .get(id)
             .cloned()
@@ -285,7 +374,11 @@ impl Provider {
         // At most eight handles. Each release is bounded; the outer session
         // applies a shared close deadline and tears down the namespace on error.
         for id in ids {
-            receipts.push(self.release(self.scope.clone(), id).await?);
+            match self.release(self.scope.clone(), id).await {
+                Ok(receipt) => receipts.push(receipt),
+                Err(Error::BudgetExceeded(Budget::Retention)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(receipts)
     }
@@ -337,50 +430,60 @@ impl TerminalProvider for Provider {
         action: Create,
         authority: Authority,
     ) -> Result<String, Error> {
-        // Consume even when subsequent validation refuses. No retry can reuse
-        // the one-use capability after a changed or stale attempt.
-        let known = self
-            .registry
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .authorities
-            .remove(&authority.nonce);
-        self.check_scope(&scope)?;
-        if !known {
-            return Err(Error::NotAuthorized);
-        }
-        let action = self.normalize(action)?;
-        let id = format!("terminal-{}", uuid::Uuid::new_v4());
-        let limit = action.validate()?;
-        let (changed, _) = watch::channel(());
-        let entry = Arc::new(Entry {
-            state: Mutex::new(State {
-                tail: OutputTail::new(limit)?,
-                started: false,
-                exit: None,
-                released: false,
-                releasing: false,
-                driver_ok: false,
-                failed: false,
-            }),
-            stdin: tokio::sync::Mutex::new(None),
-            changed,
-            abort: Mutex::new(None),
-        });
-        {
+        let (action, id, entry, session_ms) = {
             let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+            // Burn authority even on invalid input, without releasing capacity
+            // between consuming it and inserting the live entry.
+            let known = registry.authorities.remove(&authority.nonce);
+            self.check_scope(&scope)?;
+            if !known {
+                return Err(Error::NotAuthorized);
+            }
+            let action = self.normalize(action)?;
             if chrono::Utc::now() >= authority.deadline
                 || authority.scope != scope
                 || authority.digest != digest(&action).map_err(|_| Error::InvalidRequest)?
             {
                 return Err(Error::NotAuthorized);
             }
-            if registry.entries.len() >= MAX_TERMINALS || registry.creations >= MAX_CREATIONS {
-                return Err(Error::Unavailable);
+            let session_ms = self
+                .session_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if session_ms == 0 {
+                return Err(Error::BudgetExceeded(Budget::SessionLifetime));
             }
+            let id = format!("terminal-{}", uuid::Uuid::new_v4());
+            let (changed, _) = watch::channel(());
+            // Includes launch, guest cleanup/drain and Docker control reaping.
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_millis(
+                    session_ms.min(self.budgets.command_ms + self.budgets.retention_ms),
+                )
+                + 3 * OPERATION_TIMEOUT;
+            let entry = Arc::new(Entry {
+                deadline,
+                state: Mutex::new(State {
+                    tail: OutputTail::new(action.validate()?)?,
+                    started: false,
+                    exit: None,
+                    released: false,
+                    releasing: false,
+                    driver_ok: false,
+                    failed: false,
+                    budget: None,
+                    retention_expired: false,
+                    output_window: Instant::now(),
+                    output_count: 0,
+                }),
+                stdin: tokio::sync::Mutex::new(None),
+                changed,
+                abort: Mutex::new(None),
+            });
             registry.creations += 1;
             registry.entries.insert(id.clone(), entry.clone());
-        }
+            (action, id, entry, session_ms)
+        };
         let started = async {
             let mut command = self.context.client.attached_command(&[
                 "exec".into(),
@@ -404,7 +507,8 @@ impl TerminalProvider for Provider {
             let mut stdin = child.0.stdin.take().ok_or(Error::Unavailable)?;
             let stdout = child.0.stdout.take().ok_or(Error::Unavailable)?;
             let launch = serde_json::to_vec(&json!({"workspace":self.context.workspace,
-                "scratch":self.context.scratch, "action":action}))
+                "scratch":self.context.scratch, "action":action, "budgets":self.budgets,
+                "sessionRemainingMs":session_ms}))
             .map_err(|_| Error::InvalidRequest)?;
             if launch.len() > kranz_acp::terminal::MAX_REQUEST_BYTES {
                 return Err(Error::InvalidRequest);
@@ -423,11 +527,13 @@ impl TerminalProvider for Provider {
             let failed = self.failed.clone();
             let failure = self.failure.clone();
             let receipts = self.receipts.clone();
-            let binding =
-                json!({"terminalId":id,"scope":scope,"actionDigest":authority.action_digest});
+            let binding = json!({"terminalId":id,"scope":scope,"actionDigest":authority.action_digest,
+                "terminalBudgets":self.budgets,"sessionRemainingMs":session_ms});
+            let registry = self.registry.clone();
+            let handle = id.clone();
             let task = tokio::spawn(async move {
-                let outcome = tokio::time::timeout(
-                    Duration::from_secs(40),
+                let outcome = tokio::time::timeout_at(
+                    capture.deadline,
                     capture_driver(&capture, &mut child, stdout, receipts, binding),
                 )
                 .await;
@@ -437,6 +543,20 @@ impl TerminalProvider for Provider {
                     }
                     failed.store(true, Ordering::Release);
                     failure.notify_one();
+                }
+                // Expiry only frees capacity after driver exit and confirmed
+                // descendant cleanup. Tombstones are bounded by total creations.
+                if matches!(outcome, Ok(Ok(()))) {
+                    if let Ok(mut registry) = registry.lock() {
+                        if let Ok(state) = capture.state.lock() {
+                            if state.retention_expired {
+                                if let Some(exit) = &state.exit {
+                                    registry.entries.remove(&handle);
+                                    registry.retired.insert(handle, (exit.clone(), true));
+                                }
+                            }
+                        }
+                    }
                 }
                 capture.changed.send_replace(());
             });
@@ -457,30 +577,48 @@ impl TerminalProvider for Provider {
 
     async fn output(&self, scope: Scope, id: String) -> Result<OutputSnapshot, Error> {
         let entry = self.entry(&scope, &id)?;
-        let state = entry.state.lock().map_err(|_| Error::Unavailable)?;
+        let mut state = entry.state.lock().map_err(|_| Error::Unavailable)?;
         if state.failed {
             return Err(Error::CleanupUnconfirmed);
         }
+        if state.retention_expired {
+            return Err(Error::BudgetExceeded(Budget::Retention));
+        }
+        if state.output_window.elapsed() >= Duration::from_secs(1) {
+            state.output_window = Instant::now();
+            state.output_count = 0;
+        }
+        if state.output_count >= MAX_OUTPUT_PER_SECOND {
+            return Err(Error::BudgetExceeded(Budget::OutputRate));
+        }
+        state.output_count += 1;
         Ok(state.tail.snapshot(state.exit.clone()))
     }
 
     async fn wait_for_exit(&self, scope: Scope, id: String) -> Result<ExitStatus, Error> {
         let entry = self.entry(&scope, &id)?;
-        tokio::time::timeout(
-            Duration::from_secs(35),
-            wait_state(&entry, |s| s.exit.clone()),
+        tokio::time::timeout_at(
+            entry.deadline,
+            wait_state(&entry, |s| {
+                s.exit.clone().map(|exit| {
+                    s.budget
+                        .map_or(Ok(exit), |budget| Err(Error::BudgetExceeded(budget)))
+                })
+            }),
         )
         .await
         .map_err(|_| {
             self.fail();
             Error::CleanupUnconfirmed
-        })?
+        })??
     }
 
     async fn kill(&self, scope: Scope, id: String) -> Result<CleanupReceipt, Error> {
         let entry = self.entry(&scope, &id)?;
         let result = tokio::time::timeout(OPERATION_TIMEOUT, async {
-            control(&entry, "kill").await?;
+            // A natural exit or retention expiry can race the control write.
+            // The receipt, not pipe writability, decides whether cleanup worked.
+            let _ = control(&entry, "kill").await;
             let exit_status = wait_state(&entry, |s| s.exit.clone()).await?;
             Ok(CleanupReceipt {
                 exit_status,
@@ -505,6 +643,13 @@ impl TerminalProvider for Provider {
         self.check_scope(&scope)?;
         let entry = {
             let registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+            if registry
+                .retired
+                .get(&id)
+                .is_some_and(|(_, expired)| *expired)
+            {
+                return Err(Error::BudgetExceeded(Budget::Retention));
+            }
             let entry = registry
                 .entries
                 .get(&id)
@@ -520,7 +665,7 @@ impl TerminalProvider for Provider {
             entry
         };
         let result = tokio::time::timeout(OPERATION_TIMEOUT, async {
-            control(&entry, "release").await?;
+            let _ = control(&entry, "release").await;
             let exit_status = wait_state(&entry, |s| {
                 (s.released && s.driver_ok)
                     .then(|| s.exit.clone())
@@ -538,12 +683,13 @@ impl TerminalProvider for Provider {
         .await
         .map_err(|_| Error::CleanupUnconfirmed)
         .and_then(|v| v);
-        if result.is_ok() {
-            self.registry
-                .lock()
-                .map_err(|_| Error::Unavailable)?
-                .entries
-                .remove(&id);
+        if let Ok(receipt) = &result {
+            let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+            registry.entries.remove(&id);
+            registry
+                .retired
+                .entry(id)
+                .or_insert((receipt.exit_status.clone(), false));
         } else {
             self.fail();
             if let Some(abort) = entry.abort.lock().map_err(|_| Error::Unavailable)?.take() {
@@ -572,7 +718,18 @@ async fn capture_driver(
             let mut state = entry.state.lock().map_err(|_| Error::Unavailable)?;
             match value.get("event").and_then(Value::as_str) {
                 Some("started") if !state.started => {
-                    receipts.record(json!({"terminalStarted":binding}))?;
+                    let hint = &value["oomScoreAdj"];
+                    if hint["requested"] != 500
+                        || !(hint["observed"].is_null()
+                            || hint["observed"]
+                                .as_i64()
+                                .is_some_and(|n| (-1000..=1000).contains(&n)))
+                    {
+                        return Err(Error::InvalidRequest);
+                    }
+                    let mut started = binding.clone();
+                    started["oomScoreAdj"] = hint.clone();
+                    receipts.record(json!({"terminalStarted":started}))?;
                     state.started = true;
                 }
                 Some("output") if state.started && state.exit.is_none() => state
@@ -589,12 +746,21 @@ async fn capture_driver(
                     if status.exit_code.is_some() == status.signal.is_some() {
                         return Err(Error::InvalidRequest);
                     }
+                    state.budget = match value["budget"].as_str() {
+                        None if value["budget"].is_null() => None,
+                        Some("commandLifetime") => Some(Budget::CommandLifetime),
+                        Some("sessionLifetime") => Some(Budget::SessionLifetime),
+                        _ => return Err(Error::InvalidRequest),
+                    };
                     receipts.record(json!({"terminalExited": {
-                        "binding":binding,"exitStatus":status,"descendantsReaped":true,"outputDrained":true,
+                        "binding":binding,"exitStatus":status,"descendantsReaped":true,"outputDrained":true,"budget":state.budget,
                     }}))?;
                     state.exit = Some(status);
                 }
                 Some("released") if state.exit.is_some() && !state.released => {
+                    state.retention_expired = value["retentionExpired"]
+                        .as_bool()
+                        .ok_or(Error::InvalidRequest)?;
                     state.released = true
                 }
                 _ => return Err(Error::CleanupUnconfirmed),
@@ -611,6 +777,10 @@ async fn capture_driver(
     if !status.success() || !state.released {
         return Err(Error::CleanupUnconfirmed);
     }
+    receipts.record(
+        json!({"terminalReleased":{"binding":binding,"confirmed":true,
+        "retentionExpired":state.retention_expired,"exitStatus":state.exit}}),
+    )?;
     state.driver_ok = true;
     Ok(())
 }
@@ -634,6 +804,7 @@ mod tests {
             "run".into(),
             "engine".into(),
             "peer".into(),
+            Budgets::default(),
         );
         let action: Create = serde_json::from_value(json!({"sessionId":"peer","command":"/bin/sh",
             "args":["-c","echo harmless"]}))
@@ -662,6 +833,7 @@ mod tests {
     async fn terminal_authority_is_exact_expiring_and_consumed_on_failed_attempt() {
         let (provider, action, proposal) = fixture();
         for mutation in ["argv", "cwd", "env", "output"] {
+            provider.reserve(&proposal.id).unwrap();
             let authority = provider.authorize(&action, &proposal).unwrap();
             let replay = Authority {
                 nonce: authority.nonce.clone(),
@@ -699,6 +871,7 @@ mod tests {
         changed.action["rawInput"]["args"] = json!(["different"]);
         changed.action_digest = digest(&changed.action).unwrap();
         assert!(provider.authorize(&action, &changed).is_err());
+        provider.reserve(&proposal.id).unwrap();
         let mut authority = provider.authorize(&action, &proposal).unwrap();
         authority.deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
         assert_eq!(
@@ -707,6 +880,41 @@ mod tests {
                 .await,
             Err(Error::NotAuthorized)
         );
+    }
+
+    #[test]
+    fn terminal_reservations_precede_consent_and_count_issued_authorities() {
+        let (provider, action, proposal) = fixture();
+        provider.reserve(&proposal.id).unwrap();
+        let _authority = provider.authorize(&action, &proposal).unwrap();
+        for i in 1..MAX_TERMINALS {
+            provider.reserve(&i.to_string()).unwrap();
+        }
+        assert_eq!(
+            provider.reserve("excess"),
+            Err(Error::BudgetExceeded(Budget::Capacity))
+        );
+        provider.cancel_reservation("1").unwrap();
+        provider.reserve("replacement").unwrap();
+        assert_eq!(provider.registry.lock().unwrap().creations, 0);
+        let (provider, _, _) = fixture();
+        provider.registry.lock().unwrap().creations = MAX_CREATIONS - 1;
+        provider.reserve("last").unwrap();
+        assert_eq!(
+            provider.reserve("excess"),
+            Err(Error::BudgetExceeded(Budget::Creations))
+        );
+        provider.cancel_reservation("last").unwrap();
+        provider.reserve("replacement").unwrap();
+    }
+
+    #[test]
+    fn terminal_receipts_bound_three_events_for_each_creation() {
+        let receipts = Receipts::default();
+        for _ in 0..3 * MAX_CREATIONS {
+            receipts.record(json!({})).unwrap();
+        }
+        assert_eq!(receipts.record(json!({})), Err(Error::Unavailable));
     }
 
     fn terminal_env(name: &str, value: &str) -> kranz_acp::terminal::EnvironmentVariable {
@@ -743,6 +951,7 @@ mod tests {
                 provider.release(scope.clone(), "forged".into()).await,
                 Err(Error::InvalidHandle)
             );
+            provider.reserve(&proposal.id).unwrap();
             let authority = provider.authorize(&action, &proposal).unwrap();
             assert_eq!(
                 provider.create(scope, action.clone(), authority).await,

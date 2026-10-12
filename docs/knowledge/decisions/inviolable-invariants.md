@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-11
+last_verified: 2026-10-12
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-10-12 (UTC): R4 keeps exact one-use terminal authority and owned-namespace execution. Capacity is reserved before consent; controls have separate bounded accounting. Command/retention expiry is recoverable only with confirmed cleanup. Production terminal capability and the qualified 600-second v2 session ceiling stay unchanged.
 
 Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 

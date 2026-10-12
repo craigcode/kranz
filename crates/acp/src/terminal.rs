@@ -153,8 +153,23 @@ pub struct CleanupReceipt {
     pub exit_status: ExitStatus,
 }
 
+/// Recoverable terminal limits, distinct from uncertain containment cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Budget {
+    Capacity,
+    Creations,
+    PendingConsent,
+    PendingControl,
+    OutputRate,
+    CommandLifetime,
+    Retention,
+    SessionLifetime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
+    BudgetExceeded(Budget),
     InvalidRequest,
     InvalidHandle,
     NotAuthorized,
@@ -165,6 +180,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::BudgetExceeded(_) => "terminal budget exceeded",
             Self::InvalidRequest => "terminal request refused by bounds or policy",
             Self::InvalidHandle => "terminal handle is foreign, stale or released",
             Self::NotAuthorized => "terminal action lacks exact one-use authority",

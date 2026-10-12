@@ -566,7 +566,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in consent_concurrency_bounds_and_descendants paths_and_environment_fail_before_consent peer_provider_death_and_drop_stop_namespace pending_consent_and_late_create_cannot_complete engine_death_expires_terminal_namespace default_capability_refuses_execution; do
+          for proof in consent_concurrency_bounds_and_descendants paths_and_environment_fail_before_consent peer_provider_death_and_drop_stop_namespace pending_consent_and_late_create_cannot_complete engine_death_expires_terminal_namespace default_capability_refuses_execution budget_expiry_retention_and_oom_hint capacity_reserved_before_consent control_polling_and_pending_limits_recover; do
             grep -q "test acp_container::tests::terminals::acp_terminal_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then

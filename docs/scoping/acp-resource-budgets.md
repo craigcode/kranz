@@ -4,7 +4,9 @@ Status: scoped 2026-09-30, reviewed 2026-10-04 against public `a07467c2`. The D-
 recommendations below were proposed operator decisions. The operator approved
 R2 implementation on 2026-10-06 and v2 admission on 2026-10-11. R3 now admits
 only the exact selected limits and macOS/Colima tuple in the
-[v2 review](../reviews/2026-10-11-acp-v2-admission.md); R4/R5 remain open.
+[v2 review](../reviews/2026-10-11-acp-v2-admission.md). R4 was approved on
+2026-10-12; its fixture-only implementation is recorded in the
+[terminal-budget review](../reviews/2026-10-12-acp-terminal-budgets.md). R5 remains open.
 The initial scoping review made no runtime changes. R1/R2 implementation is
 restricted to test-only revisions; neither ran paid agent sessions.
 
@@ -326,6 +328,44 @@ unchanged. This closes R3 within the declared narrow envelope. R4/R5 terminal
 budgets and production terminal qualification remain separate. One small fixture is not evidence that
 a large application build fits the same ceilings.
 
+## R4 implementation
+
+The approved fixture uses a 600-second maximum command lifetime and separate
+300-second retention after exit, narrowed by the remaining terminal session
+window. These are code-owned limits; shorter durations are available only to
+synthetic tests. They do not admit the earlier proposed 30-minute command or
+60-minute/four-hour session. The qualified v2 session ceiling stays 600 seconds,
+and neither released profile advertises terminal capability.
+
+A command deadline kills and reaps the owned tree, drains output, and returns a
+`terminalBudget` error with `budget: commandLifetime` (or `sessionLifetime`) and
+the observed exit status. Normal exit stays a normal result. Retention expiry
+releases the driver, frees capacity after confirmed cleanup, and leaves a bounded
+status tombstone. A retained handle returns `budget: retention` after expiry.
+`wait_for_exit` and host capture use the command/retention envelope plus bounded
+cleanup supervision; create/kill/release still have eight-second RPC bounds.
+The guest's separate three-second reap and drain limits remain unchanged.
+
+Eight live handles, pending consent reservations and issued authorities share
+one capacity accounting transaction. The 32-creation limit also counts reserved
+future creations. Denial releases a reservation; approval transfers it to a
+one-use authority; create consumes it atomically into a live entry. Exhaustion
+is refused before proposing consent. Consent retains its 16 pending and 1,024
+lifetime identity limits. Controls have 32 in-flight slots, duplicate protection
+only while in flight, and ten output reads per terminal per one-second window.
+Recoverable limit errors carry typed data in the RPC error and audit receipt;
+uncertain cleanup still fails the namespace. Output tails keep their existing
+byte bounds and continuous drain. At most three asynchronous receipts per each
+of 32 creations fit the 96-entry queue.
+
+The trusted single-threaded guest supervisor requests `oom_score_adj=500` in
+the child before exec. A private pipe reports readback before untrusted code
+runs; unavailable readback is null. The synthetic proof checks child/descendant
+inheritance and an unchanged adapter hint. This preference is not proof of an
+OOM event or a guarantee that a terminal will be selected as victim. No new
+cgroup, sibling container, credential channel, resource profile, persisted event
+schema or production terminal admission is introduced.
+
 ## D-R: proposed decisions
 
 | Decision | Recommendation | Consequence |
@@ -352,8 +392,9 @@ Estimates are engineering days for one contributor including tests and review.
 
 Total: **15–22 engineering days**, a planning estimate to revisit after R1.
 R1 and R2 add mechanisms on test-only revisions; R3 now supplies narrow
-production admission. R4 is the next implementation slice; R5 qualifies it
-before terminal capability can be enabled.
+production admission. R4 now implements the terminal budget mechanisms on the
+synthetic fixture. R5 must qualify long builds, remaining caps and cancellation;
+real-adapter terminal enablement still needs its separate qualification.
 
 The measurement in R3 needs a live adapter session. That is a bounded,
 operator-authorized run with its own credential and budget approval. Every

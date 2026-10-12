@@ -15,6 +15,10 @@ async fn terminal_session(root: &Path, name: &str, mode: &str) -> Box<dyn AgentS
     );
     let backend = if mode == "disabled" {
         backend
+    } else if mode == "budget-expiry" {
+        backend.with_terminal_budget_fixture(1500, 1200)
+    } else if mode == "budget-controls" {
+        backend.with_terminal_budget_fixture(15000, 5000)
     } else {
         backend.with_terminal_fixture("fixture-run")
     };
@@ -303,5 +307,148 @@ async fn acp_terminal_v1_default_capability_refuses_execution() {
         session.exit_status()
     );
     assert!(!root.path().join("workspace/unapproved").exists());
+    absent(root.path(), &name).await;
+}
+
+#[tokio::test]
+async fn acp_terminal_v1_budget_expiry_retention_and_oom_hint() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let mut session = terminal_session(root.path(), &name, "budget-expiry").await;
+    let responder = session.permission_responder().unwrap();
+    let mut hints = 0;
+    let mut expired = false;
+    let mut retained = false;
+    let mut cleanup = false;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = session.next_event().await.unwrap() {
+            match event {
+                AgentEvent::PermissionRequested { proposal, .. } => {
+                    assert_eq!(proposal.action["terminalBudgets"]["commandMs"], 1500);
+                    responder.respond(&proposal, true).unwrap();
+                }
+                AgentEvent::Other { raw } => {
+                    if raw["terminalStarted"].is_object() {
+                        assert_eq!(raw["terminalStarted"]["oomScoreAdj"]["requested"], 500);
+                        assert_eq!(raw["terminalStarted"]["oomScoreAdj"]["observed"], 500);
+                        hints += 1;
+                    }
+                    if raw["terminalExited"]["budget"] == "commandLifetime" {
+                        assert_eq!(raw["terminalExited"]["exitStatus"]["signal"], "SIGKILL");
+                        assert_eq!(raw["terminalExited"]["descendantsReaped"], true);
+                        expired = true;
+                    }
+                    retained |= raw["terminalReleased"]["retentionExpired"] == true;
+                    cleanup |= raw["terminalSessionCleanup"]["confirmed"] == true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(hints, 2);
+    assert!(expired && retained && cleanup);
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Completed)),
+        "{:?}",
+        session.exit_status()
+    );
+    absent(root.path(), &name).await;
+}
+
+#[tokio::test]
+async fn acp_terminal_v1_capacity_reserved_before_consent() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let mut session = terminal_session(root.path(), &name, "budget-capacity").await;
+    let responder = session.permission_responder().unwrap();
+    let mut pending = Vec::new();
+    let mut refused = false;
+    let mut resumed = false;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = session.next_event().await.unwrap() {
+            match event {
+                AgentEvent::PermissionRequested { proposal, .. } => {
+                    if proposal.peer_request_id == 200 {
+                        assert!(refused);
+                        responder.respond(&proposal, true).unwrap();
+                        resumed = true;
+                    } else {
+                        assert!((100..108).contains(&proposal.peer_request_id.as_u64().unwrap()));
+                        pending.push(proposal);
+                    }
+                }
+                AgentEvent::Other { raw } if raw["terminalReceipt"]["requestId"] == 108 => {
+                    assert_eq!(raw["terminalReceipt"]["evidence"]["budget"], "capacity");
+                    assert_eq!(
+                        raw["terminalReceipt"]["evidence"]["refusedBeforeConsent"],
+                        true
+                    );
+                    assert_eq!(pending.len(), 8);
+                    for proposal in pending.drain(..) {
+                        responder.respond(&proposal, false).unwrap();
+                    }
+                    refused = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(refused && resumed);
+    assert!(!root.path().join("workspace/unapproved").exists());
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Completed)),
+        "{:?}",
+        session.exit_status()
+    );
+    absent(root.path(), &name).await;
+}
+
+#[tokio::test]
+async fn acp_terminal_v1_control_polling_and_pending_limits_recover() {
+    if !enabled() {
+        return;
+    }
+    let root = fixture();
+    let name = name();
+    let mut session = terminal_session(root.path(), &name, "budget-controls").await;
+    let responder = session.permission_responder().unwrap();
+    let mut approvals = 0;
+    let mut output_rate = false;
+    let mut pending_control = false;
+    tokio::time::timeout(Duration::from_secs(45), async {
+        while let Some(event) = session.next_event().await.unwrap() {
+            match event {
+                AgentEvent::PermissionRequested { proposal, .. } => {
+                    approvals += 1;
+                    responder.respond(&proposal, true).unwrap();
+                }
+                AgentEvent::Other { raw } => {
+                    output_rate |= raw["terminalReceipt"]["evidence"]["budget"] == "outputRate";
+                    pending_control |=
+                        raw["terminalReceipt"]["evidence"]["budget"] == "pendingControl";
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(approvals, 2);
+    assert!(output_rate && pending_control);
+    assert!(
+        matches!(session.exit_status(), Some(SessionExit::Completed)),
+        "{:?}",
+        session.exit_status()
+    );
     absent(root.path(), &name).await;
 }

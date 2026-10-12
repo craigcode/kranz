@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "slice": "R4",
+  "scope": "Synthetic terminal verdicts and source/log hashes; not real-adapter admission or retained per-command transcripts.",
+  "reviewDate": "2026-10-12",
+  "fixtureImage": "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d",
+  "productionTerminalEnabled": false,
+  "qualifiedSessionSeconds": 600,
+  "host": {
+    "macOS": "26.6.2",
+    "architecture": "arm64",
+    "docker": "29.2.1"
+  },
+  "checks": {
+    "workspaceTests": {
+      "command": "cargo test --workspace --locked --offline",
+      "exitCode": 0,
+      "logSha256": "ddbcc308568ebce2938a5789341e9b83ce2177744057bd8fe26712ca8247a027",
+      "passed": 3182,
+      "failed": 0,
+      "ignored": 16
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets --locked --offline -- -D warnings",
+      "exitCode": 0,
+      "logSha256": "03656ee33d810988d34cb9b14cba8300d830f7ecc32c508405204e0c6511d6f9"
+    },
+    "format": {
+      "command": "cargo fmt --all --check",
+      "exitCode": 0,
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "build": {
+      "command": "cargo build --workspace --locked --offline",
+      "exitCode": 0,
+      "logSha256": "665745d4c72213b3264afd52aa5c0de393dad5ea3787b74f15e04423f3f7d0fe"
+    },
+    "actualTerminalProof": {
+      "command": "KRANZ_ACP_CONTAINER_TESTS=1 cargo test --workspace --lib --locked --offline acp_terminal_v1 -- --nocapture",
+      "exitCode": 0,
+      "logSha256": "f5a53d7c8b4b836577d8fe4527f2364d889c1f4fec3f43b2e38bfe7bd116c1c3",
+      "passed": 9,
+      "failed": 0,
+      "skipped": 0,
+      "requiredNames": [
+        "acp_terminal_v1_consent_concurrency_bounds_and_descendants",
+        "acp_terminal_v1_paths_and_environment_fail_before_consent",
+        "acp_terminal_v1_peer_provider_death_and_drop_stop_namespace",
+        "acp_terminal_v1_pending_consent_and_late_create_cannot_complete",
+        "acp_terminal_v1_engine_death_expires_terminal_namespace",
+        "acp_terminal_v1_default_capability_refuses_execution",
+        "acp_terminal_v1_budget_expiry_retention_and_oom_hint",
+        "acp_terminal_v1_capacity_reserved_before_consent",
+        "acp_terminal_v1_control_polling_and_pending_limits_recover"
+      ]
+    },
+    "knowledgeRefresh": {
+      "command": "kranz knowledge-refresh",
+      "exitCode": 0,
+      "logSha256": "1a1358f577c05814259911051445e109432d8e5626bc524b7c5a4e0c46428af0"
+    }
+  },
+  "sourceSha256": {
+    "crates/acp/src/terminal.rs": "2832c2ac971725f282a35ad8a651bc35d040ea5895ff4e89b71ac5be1b466f39",
+    "crates/engine/src/acp_terminal.rs": "133eb508c366835abe7c2dbc44faed86dc91078775167cf75e223f5417bcc63e",
+    "crates/engine/src/backend_acp.rs": "ed92051589816fde6e80a7467d64ea87df9fd03f6aeb146cd11d4263615be7cf",
+    "crates/engine/src/backend_acp/terminals.rs": "acc62ceadfb1724b6b29f8d1989458cb3f5e57ca79e602c19b3bd4b4bafc60b5",
+    "crates/engine/src/acp_container/terminal.py": "dc1d361a6bbe976618533eb65fe16b6d7a06818b65dcb6561b0b6f8cec6e0bfb",
+    "crates/engine/src/acp_container/terminal_peer.py": "823278dcb569b00d880cf98787b347229d4962ea9e9d45c8470c9a00d0847833",
+    "crates/engine/src/acp_container/tests/terminals.rs": "c29307b39381fed9c9defe3b9cf3ae7b4ba351fed1896a2a88947628bba465b6"
+  },
+  "cleanup": {
+    "remainingContainers": 0,
+    "remainingOwnedNetworks": 0,
+    "colimaRestoredStopped": true
+  }
+}
