@@ -2,13 +2,15 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-06
+last_verified: 2026-10-11
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-10-11 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 
 Rechecked 2026-10-06 (UTC) against the R2 invariants note. Resource failures
 require observed evidence and explicit cleanup state; lesson capture and its

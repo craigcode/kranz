@@ -1325,11 +1325,20 @@ fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     // Windows debug frames overflowed the default 2 MiB worker stack. The
     // equivalent arm64 macOS regression reproduces at 1 MiB; other platforms
     // retain the normal 2 MiB budget rather than inheriting that test constraint.
+    //
+    // Headroom (arm64 macOS debug, 2026-10-11): passes at 709 KiB, overflows
+    // at 694 KiB. A synthetic 512-byte MissionConfig field raises the floor to
+    // about 818 KiB, so config bytes cost roughly 200x on this stack. Re-measure
+    // after growing MissionConfig/MissionState with KRANZ_HOSTED_STACK_KIB.
     let stack_bytes = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         1 << 20
     } else {
         2 << 20
     };
+    let stack_bytes = std::env::var("KRANZ_HOSTED_STACK_KIB")
+        .ok()
+        .and_then(|kib| kib.parse::<usize>().ok())
+        .map_or(stack_bytes, |kib| kib << 10);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(stack_bytes)

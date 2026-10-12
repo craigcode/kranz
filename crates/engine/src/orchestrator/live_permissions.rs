@@ -246,7 +246,9 @@ impl MissionEngine {
     where
         F: std::future::Future<Output = Result<T>>,
     {
-        tokio::pin!(future);
+        // Heap-pin the worker and the tick: both held inline made this the
+        // largest future on the hosted mission stack.
+        let mut future = Box::pin(future);
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut failure = None;
         loop {
@@ -256,7 +258,7 @@ impl MissionEngine {
                     if failure.is_none() { failure = self.handle_permission_packet(packet).err(); }
                 }
                 _ = tick.tick() => {
-                    if failure.is_none() { failure = self.permission_tick().await.err(); }
+                    if failure.is_none() { failure = Box::pin(self.permission_tick()).await.err(); }
                 }
             }
             if failure.is_some() {

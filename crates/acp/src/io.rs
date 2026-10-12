@@ -135,7 +135,8 @@ where
     R: AsyncRead + Unpin,
 {
     let mut window = TailWindow::new(cap);
-    let mut chunk = [0u8; 8192];
+    // Heap-allocated so the buffer is not held in the future across await.
+    let mut chunk = vec![0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
             // A read error ends capture exactly like the old
