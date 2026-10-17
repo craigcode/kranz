@@ -17,12 +17,14 @@ Mission event logs are per mission (`Event.mission_id` is required), so signals 
 
 ## Scoping answers
 
-- Ledger at `.kranz/signals/ledger.jsonl`, raw bodies under `.kranz/signals/raw/<sha256>`; both gitignored runtime (add to `paths.rs` and `init.rs` ignores).
+- Ledger at `.kranz/signals/ledger.jsonl` (serialised with single-file atomic append under `.kranz/signals/ledger.lock`), raw bodies under `.kranz/signals/raw/<sha256>`; both gitignored runtime (add to `paths.rs` and `init.rs` ignores). Enforce directory mode `0700` on `.kranz/signals` and `.kranz/signals/raw`, file mode `0600` on `ledger.jsonl` and raw files, and add `.kranz/signals/` to `sandbox::authority_read_deny_paths` so sandboxed workers, validators, and gates cannot read raw signal payloads.
+- Apply `scrub::scrub_text` (and strip sensitive headers/cookies/DSNs) before persisting raw payloads to `.kranz/signals/raw/<sha256>`, enforce a 256 KiB per-payload cap before buffering, and enforce a per-source rate limit and bounded retention / total disk quota (e.g. max 1,000 raw files or 64 MiB, oldest-evicted or rejected when full).
 - Record kinds at minimum: received, dropped (unverified, no body), triaged, proposed, consented, linked, written-back.
 - Raw bodies are written once and never parsed by the store.
 
 ## Acceptance hints
 
-- A signal recorded by hand appears in the ledger and, after a restart, reads back with the same hash.
+- A signal recorded by hand appears in the ledger and, after a restart, reads back with the same hash; `.kranz/signals/` is mode `0700`, files are mode `0600`, and `.kranz/signals/` is present in `sandbox::authority_read_deny_paths`.
+- Oversized payloads (> 256 KiB) and quota overflows are rejected cleanly, and secrets in raw payloads are scrubbed before hitting disk (test).
 - Tampering with a ledger line or a raw body is detected on read (test).
-- Two concurrent writers serialise through the lock (test).
+- Two concurrent writers serialise through `.kranz/signals/ledger.lock` (test).

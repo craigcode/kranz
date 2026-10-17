@@ -18,12 +18,12 @@ The GitHub trigger already verifies (`verify_signature`), normalises (`parse_tri
 
 ## Scoping answers
 
-- Unverified requests are dropped with a one-line decision log that has neither secret nor body; an unconfigured secret refuses everything, as today.
-- The normalised shape carries source, fingerprint, project, severity, environment, evidence links and bounded excerpts, with excerpts marked untrusted.
+- Unverified or replayed requests are dropped with a one-line decision log that has neither secret nor body; an unconfigured secret refuses everything, as today. Verification enforces a 256 KiB HTTP body limit before buffering, checks the timestamp header against a 5-minute skew window, and consults a bounded replay cache of `(source, delivery_id_or_sig_hash, timestamp)`.
+- Every non-fenced normalised field is validated against strict character-class allowlists and length caps: `source` (`[a-z0-9_-]{1,32}`), `fingerprint` (`[a-zA-Z0-9._:-]{1,128}`), `severity` (`critical | high | medium | low | info`), `project` (`[a-zA-Z0-9._/-]{1,128}`, no `..`), `environment` (`[a-zA-Z0-9._-]{1,64}`), and `evidence_links` (parsed `https://` URLs only, host matching the configured vendor host allowlist, no whitespace/control chars/markdown syntax `[`, `]`, `(`, `)`, max 4 links × 512 chars). Any field failing validation is rejected or moved into the fenced untrusted block.
 - Write back is part of the trait but may be a no-op for GitHub in this slice.
 
 ## Acceptance hints
 
 - The existing GitHub webhook tests pass unchanged through the new contract.
-- A stub adapter passes the conformance suite: bad signature rejected, missing secret refuses, oversized body refused, normalised fields bounded.
+- A stub adapter passes the conformance suite: bad signature rejected, stale timestamp or replayed delivery rejected, missing secret refuses, oversized body (> 256 KiB) refused before buffering, and normalised fields failing character-class allowlists or URL host rules are rejected or demoted into the untrusted fence.
 - Verified GitHub receipts now also land in the ledger.

@@ -18,12 +18,12 @@ The GitHub trigger drafts on receipt because an allow-listed user's labelled com
 
 ## Scoping answers
 
-- A new `signal` frontmatter key (additive, in `KNOWN_FRONTMATTER_KEYS`) carries the ledger reference.
-- Title and goal are composed from source, fingerprint, severity and links; free text appears only inside the fence.
+- Signal proposal tickets always carry `schedule: once`, a `signal` frontmatter key with the ledger reference, and an explicit `signal-proposal: unconsented` marker (additive, in `KNOWN_FRONTMATTER_KEYS`) that causes `kranz work`, `kranz ticket queue`, and `Scheduler::find_due_tickets` to refuse queueing or running until an explicit human consent command (`kranz signal consent <id>` or `kranz draft --consent-signal` / authenticated operator UI action) records the `consented` ledger event and clears the unconsented marker.
+- Title and goal are composed solely from strictly validated normalised fields (`source`, `fingerprint`, `severity`, `project`, `environment`, and host-allowlisted `https://` `evidence_links`); any field failing validation or free text appears only inside the nonced `<<<BEGIN KRANZ UNTRUSTED SIGNAL EVIDENCE [<nonce>]>>>` fence, and `Ticket::parse_sections` ignores `## ` headings inside the fence.
 - Pre-consent labels and `queue` shortcuts never apply to signal tickets. Consent is recorded in the ledger with the actor.
 
 ## Acceptance hints
 
-- No path from a received signal to a draft, queue or run without a recorded human actor, asserted by a test that walks every entry point (REST, CLI, Slack, scheduler).
-- Drafting a signal ticket through the existing Draft action works and records consent.
-- A signal whose free text contains instructions yields a ticket whose title and goal do not contain them.
+- No path from a received signal to a draft, queue or run without a recorded human consent event: `kranz work`, `kranz ticket queue`, and `Scheduler::find_due_tickets` all refuse unconsented signal proposals, asserted by a test that walks every entry point (REST, CLI, Slack, scheduler).
+- Consenting and drafting a signal ticket through the explicit operator consent action works and records `consented` in the ledger.
+- A signal whose free text or malformed fields contain instructions or `## Goal` / `## Review artifact` headings yields a ticket whose title, parsed `Goal`, and parsed sections do not contain them.

@@ -64,34 +64,69 @@ deterministic; no model reads signal content before a human has consented.
 ## Invariants
 
 1. **No signal drafts, queues or runs anything without a recorded human
-   consent.** A signal produces a proposal: an undrafted ticket. A test
-   asserts there is no other path. Pre-consent labels never apply to signals.
-2. **Signal content is data.** It reaches a drafter or worker only inside an
-   untrusted-data fence. The goal and title of a proposal are composed by
-   triage from normalised fields (source, fingerprint, severity, links), never
-   copied from free text.
-3. **Raw payloads are kept verbatim** with source, receipt time and SHA-256,
-   and are not interpreted where they are stored.
-4. **Unverified payloads are dropped** after a one-line decision log that
-   carries neither secret nor body. Authenticity is checked first.
+   consent.** A signal produces a proposal: an undrafted ticket with
+   `schedule: once` and an unconsented `signal` marker (`signal-proposal: unconsented`)
+   that `kranz work`, `kranz ticket queue`, and `Scheduler::find_due_tickets`
+   refuse to queue or run until an explicit human consent action (`kranz signal consent <id>`
+   or `kranz draft --consent-signal` / authenticated operator UI action)
+   records the `consented` ledger event. A test asserts there is no other path.
+   Pre-consent labels never apply to signals.
+2. **Signal content is data.** It reaches a drafter or worker only inside a
+   per-instance nonced untrusted-data fence
+   (`<<<BEGIN KRANZ UNTRUSTED SIGNAL EVIDENCE [<nonce>]>>>` ...
+   `<<<END KRANZ UNTRUSTED SIGNAL EVIDENCE [<nonce>]>>>`, with a fresh 128-bit
+   CSPRNG hex nonce per envelope and any literal `<<<BEGIN KRANZ UNTRUSTED` or
+   `<<<END KRANZ UNTRUSTED` substrings stripped from the body before wrapping).
+   `Ticket::parse_sections` ignores `## ` headings inside untrusted fences so
+   excerpts cannot inject `## Goal`, `## Review artifact`, or other sections.
+   The goal and title of a proposal are composed by triage only from strictly
+   validated normalised fields (`source` matching `[a-z0-9_-]{1,32}`,
+   `fingerprint` matching `[a-zA-Z0-9._:-]{1,128}`, `severity` in
+   `critical|high|medium|low|info`, `project` matching `[a-zA-Z0-9._/-]{1,128}`
+   with no `..`, `environment` matching `[a-zA-Z0-9._-]{1,64}`, and
+   `evidence_links` parsed as `https://` URLs whose host matches the configured
+   vendor host allowlist, with no whitespace, control chars, or markdown syntax
+   `[`, `]`, `(`, `)`, max 4 links × 512 chars); any field failing validation
+   is rejected or demoted into the fenced untrusted block, never interpolated
+   into title, goal, or frontmatter.
+3. **Raw payloads are bounded, scrubbed, and isolated** with source, receipt
+   time and SHA-256: HTTP bodies are capped (e.g. 256 KiB) before buffering,
+   sensitive headers/cookies/DSNs and secret tokens are scrubbed via
+   `scrub::scrub_text` before persistence, `.kranz/signals/` is created mode
+   `0700` with raw files mode `0600` under a bounded retention/disk quota
+   (e.g. max 1,000 raw files or 64 MiB), and `.kranz/signals/` is listed in
+   `sandbox::authority_read_deny_paths` so sandboxed workers, validators, and
+   gates cannot read raw signal payloads.
+4. **Unverified or replayed payloads are dropped** after a one-line decision
+   log that carries neither secret nor body. Authenticity and replay bounds
+   (timestamp header within a 5-minute skew window plus a bounded replay cache
+   of `(source, delivery_id_or_sig_hash, timestamp)`) are checked first.
 5. **Every intake decision is durable and replayable** in the signal ledger
    (D-A): received, triaged, proposed, consented, linked, written back.
-6. **Write-back is idempotent.** A crash and resume never double-posts.
+6. **Write-back is idempotent and egress-pinned.** A crash and resume never
+   double-posts, and outbound requests never follow payload-supplied URLs or
+   redirects.
 
 ## Flow
 
-1. **Receive.** A source adapter verifies the request, then the raw bytes go
-   to the ledger.
-2. **Normalise.** Source, fingerprint, project, severity, environment,
-   evidence links, and fenced excerpts.
+1. **Receive.** A source adapter enforces the 256 KiB body cap, verifies the
+   request signature and replay window/cache, and writes the scrubbed raw
+   bytes to the mode-`0600` raw store and ledger under `.kranz/signals/ledger.lock`.
+2. **Normalise.** Validate `source`, `fingerprint`, `project`, `severity`,
+   `environment`, and `evidence_links` against strict character-class
+   allowlists and length caps; wrap excerpts in a nonced untrusted fence after
+   stripping any literal `<<<BEGIN KRANZ UNTRUSTED` / `<<<END KRANZ UNTRUSTED`
+   markers.
 3. **Triage**, deterministic: dedupe by fingerprint within a window, map the
    project to a repo through config, classify by declared rules, and list
    recent merged missions whose paths overlap the signal's frames.
-4. **Propose.** An undrafted ticket with `signal:` provenance, a composed
-   goal, fenced evidence, and suggested `traced-from-mission` candidates.
-5. **Consent.** A human drafts it through the existing Draft action in the
-   dashboard, CLI or Slack. From there the normal plan approval and queue
-   apply.
+4. **Propose.** An undrafted ticket with `signal:` provenance, `schedule: once`,
+   `signal-proposal: unconsented`, a composed goal, nonced fenced evidence, and
+   suggested `traced-from-mission` candidates.
+5. **Consent.** A human consents and drafts it through an explicit consent
+   action (`kranz signal consent <id>` or `kranz draft --consent-signal` /
+   authenticated operator UI action). From there the normal plan approval and
+   queue apply.
 6. **Close.** When the linked mission completes, merges or fails, the result
    is written back to the source once.
 
@@ -102,7 +137,11 @@ infrastructure-only signal; recorded, no ticket).
 ## D-A. Where signal records live (PROPOSED)
 
 A repo-level, append-only signal ledger at `.kranz/signals/ledger.jsonl`
-(gitignored runtime), with raw bodies stored beside it by hash. Records are
+(gitignored runtime, directory mode `0700`, file mode `0600`, serialised via
+`.kranz/signals/ledger.lock`), with scrubbed raw bodies stored beside it by
+hash under `.kranz/signals/raw/<sha256>` (mode `0600`, capped at 256 KiB per
+payload and a bounded total quota such as 1,000 files / 64 MiB) and
+`.kranz/signals/` added to `sandbox::authority_read_deny_paths`. Records are
 hash-chained and MACed with the same authority key and primitives as the
 mission event log, but the ledger is its own record type, so `events.rs` stays
 untouched. Missions created from a signal carry the link in ticket
@@ -115,11 +154,13 @@ Alternative: a repo-level `EventKind` stream. Rejected for now: it needs
 
 An in-process Rust trait in engine core (`SignalSource`: verify, normalise,
 write back), beside the webhook code, not under the gate-evaluation
-subprocess contract. Verification needs the configured secret and must run
-before any untrusted byte goes anywhere else, which rules out handing raw
-requests to a pack subprocess. Vendor adapters are domain-free (a vendor's
-public webhook format), so they pass the clean-room test. The GitHub trigger
-is ported onto the trait as its first implementation, with no behavior change.
+subprocess contract. Verification needs the configured secret, enforces the
+timestamp skew window and bounded `(source, delivery_id_or_sig_hash, timestamp)`
+replay cache, and must run before any untrusted byte goes anywhere else, which
+rules out handing raw requests to a pack subprocess. Vendor adapters are
+domain-free (a vendor's public webhook format), so they pass the clean-room
+test. The GitHub trigger is ported onto the trait as its first implementation,
+with no behavior change.
 
 ## D-C. First source (OPERATOR DECISION)
 
@@ -153,9 +194,13 @@ exists to feed. Signal receipt to consent latency joins the outcomes report.
 ## D-G. What is written back (PROPOSED)
 
 Status and links only: proposal created, mission completed, merged, failed or
-declined, with the dashboard or branch reference. No diffs, reports or
-transcript text leave the host. A failure or decline never resolves the
-source issue.
+declined, with the dashboard or branch reference. Write-back URLs are
+constructed strictly from the operator-configured vendor base URL plus a
+validated `[a-zA-Z0-9_-]` external issue ID (never following a raw URL from the
+incoming payload), using `reqwest::redirect::Policy::none()` and `.no_proxy()`,
+with the destination host validated against the configured vendor host. No
+diffs, reports or transcript text leave the host. A failure or decline never
+resolves the source issue.
 
 ## Build slicing (one mission brief each)
 
