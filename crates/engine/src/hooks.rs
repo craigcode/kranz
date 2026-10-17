@@ -479,7 +479,13 @@ pub fn draft_trigger_ticket(repo_root: &Path, trigger: &Trigger) -> Result<Trigg
     let slug = trigger_slug(trigger.kind, &trigger.dedup_id);
     Ticket::ensure_valid_slug(&slug)?;
     let path = Ticket::md_path(repo_root, &slug);
-    if path.exists() {
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err(EngineError::InvalidState(format!(
+                "refusing trigger ticket path that is a symlink: {}",
+                path.display()
+            )));
+        }
         return Ok(TriggerDraft::Duplicate { slug });
     }
     let body = trigger_ticket_template(trigger);
@@ -490,9 +496,13 @@ pub fn draft_trigger_ticket(repo_root: &Path, trigger: &Trigger) -> Result<Trigg
             "internal error: trigger ticket template does not parse: {e}"
         ))
     })?;
-    std::fs::create_dir_all(Ticket::tickets_dir(repo_root))?;
-    std::fs::write(&path, body)?;
-    Ok(TriggerDraft::Drafted { slug })
+    match Ticket::create_markdown(repo_root, &slug, &body) {
+        Ok(_) => Ok(TriggerDraft::Drafted { slug }),
+        Err(EngineError::InvalidState(msg)) if msg.contains("already exists") => {
+            Ok(TriggerDraft::Duplicate { slug })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The trigger ticket's markdown: the standard four sections plus the

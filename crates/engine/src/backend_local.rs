@@ -155,13 +155,18 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     pub fn new(base_url: String, temperature: Option<f64>, context_budget: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         LocalBackend {
             base_url,
             temperature,
             context_budget,
             request_timeout: REQUEST_TIMEOUT,
             body_cap: RESPONSE_BODY_CAP,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }

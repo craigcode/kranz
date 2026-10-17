@@ -392,4 +392,19 @@ fn gate_snapshot_detected_json_credentials_do_not_become_source_evidence() {
         .files
         .values()
         .all(|v| !String::from_utf8_lossy(v).contains(&credential)));
+
+    // Pre-existing unchanged base files (e.g. scrubber unit tests with synthetic
+    // token fixtures) remain in `/workspace/source` when a mission modifies
+    // unrelated files.
+    let base_with_fixture = repo.head_sha().unwrap();
+    std::fs::write(dir.path().join("tracked.rs"), "updated source\n").unwrap();
+    git(dir.path(), &["add", "tracked.rs"]);
+    git(dir.path(), &["commit", "-qm", "unrelated change"]);
+    let snapshot_unchanged = SourceSnapshot::capture(&repo, &base_with_fixture).unwrap();
+    assert!(!snapshot_unchanged
+        .excluded_paths
+        .contains(&"credentials.json".to_string()));
+    snapshot_unchanged
+        .verify_candidate(&repo, "m-fixture")
+        .unwrap();
 }

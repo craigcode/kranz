@@ -437,7 +437,8 @@ impl MissionEngine {
                 .with_rule_ids(rule_ids),
             });
         }
-        prepared_standard_reports.extend(self.judge_standards_rules(&contextual_rules).await?);
+        prepared_standard_reports
+            .extend(Box::pin(self.judge_standards_rules(&contextual_rules)).await?);
 
         let control_reports = if contract.iter().any(|a| a.negative_control.is_some()) {
             let repo = self.active_repo().clone();
@@ -726,7 +727,7 @@ impl MissionEngine {
             .filter(|a| a.check == AssertionCheck::AgentJudgement)
             .collect();
         if !judgement.is_empty() {
-            findings.extend(self.judge_contract_assertions(&judgement).await?);
+            findings.extend(Box::pin(self.judge_contract_assertions(&judgement)).await?);
         }
 
         if !self.check_final_review_checkout(reviewed_checkout.as_ref())? {
@@ -734,8 +735,7 @@ impl MissionEngine {
         }
 
         if findings.is_empty() {
-            return self
-                .complete_mission(reviewed_checkout.as_ref())
+            return Box::pin(self.complete_mission(reviewed_checkout.as_ref()))
                 .await
                 .map(Some);
         }
@@ -797,10 +797,7 @@ impl MissionEngine {
             .map(|f| f.subject.clone())
             .collect();
         let all_findings = findings;
-        match self
-            .convert_findings(&last_milestone_id, &all_findings)
-            .await?
-        {
+        match Box::pin(self.convert_findings(&last_milestone_id, &all_findings)).await? {
             FindingsConversion::Escalate { escalations, text } => {
                 let subjects = escalations
                     .iter()
@@ -846,7 +843,7 @@ impl MissionEngine {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
                 // the replayed history) and BEFORE mission.completed.
-                self.complete_mission(reviewed_checkout.as_ref())
+                Box::pin(self.complete_mission(reviewed_checkout.as_ref()))
                     .await
                     .map(Some)
             }

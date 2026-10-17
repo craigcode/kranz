@@ -148,30 +148,68 @@ const COMMAND_OUTPUT_TAIL: usize = 1500;
 /// Hard cap on one contract `command` assertion at the final gate.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Maximum bytes retained per stream in [`run_with_timeout`]; any additional
+/// output is drained to `std::io::sink()` so a chatty child never blocks on a
+/// full OS pipe buffer.
+const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        let _ = pipe
+            .by_ref()
+            .take((MAX_CAPTURE_BYTES + 1) as u64)
+            .read_to_end(&mut buf);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        buf
+    })
+}
+
 /// Run `program args` to completion, polling with a bounded wall-clock
 /// (`timeout`) rather than blocking forever — the container provider's
 /// runtime probes (`workspace_container::spawn_bounded`) must never hang a
 /// readiness check. Returns `None` on spawn failure or on timeout (the child
 /// is killed). Synchronous and runtime-free so it is callable from inside the
-/// ambient tokio runtime; short-lived runtime probes only — anything that can
-/// spawn a tree of children or emit large output belongs on
-/// [`run_command_bounded`] (concurrent pipe drain + process-tree kill).
+/// ambient tokio runtime; stdout and stderr are drained concurrently on reader
+/// threads so output exceeding the OS pipe buffer never deadlocks `try_wait`.
 pub(crate) fn run_with_timeout(
     program: &std::path::Path,
     args: &[String],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut child = std::process::Command::new(program)
-        .args(args)
+    run_with_timeout_env(program, args, &[], timeout)
+}
+
+pub(crate) fn run_with_timeout_env(
+    program: &std::path::Path,
+    args: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let stdout_reader = spawn_pipe_reader(child.stdout.take()?);
+    let stderr_reader = spawn_pipe_reader(child.stderr.take()?);
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
@@ -180,7 +218,11 @@ pub(crate) fn run_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
 }
@@ -1469,19 +1511,36 @@ fn configure_bounded_child(
 /// `TerminateJobObject` takes the whole tree down — not just the wrapper.
 /// That path compiles and is validated only on windows-latest CI, never on
 /// the dev host.
+struct ArmedChildGroup(tokio::process::Child);
+
+impl Drop for ArmedChildGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        crate::backend_claude::kill_unreaped_group(&self.0);
+    }
+}
+
 async fn run_command_bounded(
     cmd: tokio::process::Command,
     timeout: Duration,
 ) -> (Option<i32>, String) {
     let mut cmd = cmd;
     let mut child = match cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => ArmedChildGroup(child),
         Err(e) => return (None, format!("failed to spawn shell: {e}")),
     };
-    let stdout = child.stdout.take().expect("stdout was configured as piped");
-    let stderr = child.stderr.take().expect("stderr was configured as piped");
-    #[cfg(unix)]
-    let group_pid = child.id();
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .expect("stdout was configured as piped");
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .expect("stderr was configured as piped");
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let leader_pid = child.0.id();
 
     // Windows: assign the spawned child to a kill-on-close Job Object so the
     // timeout path can kill the whole command tree. Held across the await; on
@@ -1490,7 +1549,7 @@ async fn run_command_bounded(
     // command still runs, timeout just falls back to killing the child only.
     // Compiled and validated only on windows-latest CI.
     #[cfg(windows)]
-    let job = match child.raw_handle() {
+    let job = match child.0.raw_handle() {
         Some(handle) => crate::backend_claude::win_job::JobHandle::create_and_assign(handle)
             .map_err(|e| {
                 tracing::warn!(error = %e, "failed to create Job Object for shell command; \
@@ -1501,13 +1560,14 @@ async fn run_command_bounded(
     };
 
     let execution = async {
-        let (status, stdout, stderr) = tokio::join!(
-            child.wait(),
-            read_stream_tail(stdout),
-            read_stream_tail(stderr)
-        );
+        let (stdout, stderr) = tokio::join!(read_stream_tail(stdout), read_stream_tail(stderr));
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(pid) = leader_pid {
+            control_leader_exited(pid)
+                .await
+                .map_err(|e| format!("failed waiting for shell: {e}"))?;
+        }
         Ok::<_, String>((
-            status.map_err(|e| format!("failed waiting for shell: {e}"))?,
             stdout.map_err(|e| format!("failed reading shell stdout: {e}"))?,
             stderr.map_err(|e| format!("failed reading shell stderr: {e}"))?,
         ))
@@ -1515,15 +1575,10 @@ async fn run_command_bounded(
     match tokio::time::timeout(timeout, execution).await {
         Err(_elapsed) => {
             // The read futures were dropped with `execution`; SIGKILL the
-            // whole group so descendants die too (a still-live member keeps
-            // the pgid valid, and the leader zombie pins it until reaped).
+            // whole group while the leader remains unreaped (`Child::id()` is
+            // still `Some(pid)`), so PID reuse can never be targeted.
             #[cfg(unix)]
-            if let Some(pid) = group_pid {
-                // Negative pid targets every process in the group.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
+            crate::backend_claude::kill_unreaped_group(&child.0);
             // Windows: TerminateJobObject kills the whole tree now (dropping
             // `job` at scope end would also do it via KILL_ON_JOB_CLOSE, but
             // the explicit kill is deterministic).
@@ -1531,12 +1586,28 @@ async fn run_command_bounded(
             if let Some(job) = &job {
                 job.kill();
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.0.start_kill();
+            let _ = child.0.wait().await;
             (None, format!("timed out after {}s", timeout.as_secs()))
         }
-        Ok(Err(error)) => (None, error),
-        Ok(Ok((status, stdout, stderr))) => {
+        Ok(Err(error)) => {
+            #[cfg(unix)]
+            crate::backend_claude::kill_unreaped_group(&child.0);
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.kill();
+            }
+            let _ = child.0.start_kill();
+            let _ = child.0.wait().await;
+            (None, error)
+        }
+        Ok(Ok((stdout, stderr))) => {
+            #[cfg(unix)]
+            crate::backend_claude::kill_unreaped_group(&child.0);
+            let status = match child.0.wait().await {
+                Ok(status) => status,
+                Err(e) => return (None, format!("failed waiting for shell: {e}")),
+            };
             let mut combined = stdout;
             if !stderr.trim().is_empty() {
                 combined.push_str("\n--- stderr ---\n");
@@ -4964,5 +5035,22 @@ esac
             (gate_wrapped.as_secs_f64() / gate_unwrapped.as_secs_f64() - 1.0) * 100.0,
             payload
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_does_not_deadlock_on_256_kib_stdout() {
+        let args = vec![
+            "-c".to_string(),
+            "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'x'".to_string(),
+        ];
+        let output = run_with_timeout(
+            std::path::Path::new("/bin/sh"),
+            &args,
+            Duration::from_secs(5),
+        )
+        .expect("256 KiB stdout child must complete without timing out");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES + 1);
     }
 }

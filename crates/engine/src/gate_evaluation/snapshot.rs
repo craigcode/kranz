@@ -97,6 +97,11 @@ impl SourceSnapshot {
         let root = Dir::open_ambient_dir(repo.root(), cap_std::ambient_authority())
             .map_err(|e| e.to_string())?;
         let paths = repo.gate_snapshot_paths(&base).map_err(|e| e.to_string())?;
+        let changed: std::collections::BTreeSet<String> = repo
+            .review_changed_paths(&base)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
         let mut entries = Vec::new();
         let mut files = BTreeMap::new();
         let mut total = 0usize;
@@ -118,7 +123,8 @@ impl SourceSnapshot {
                 return Err("gate source snapshot exceeds byte limit".into());
             }
             if contains_private_key(&bytes)
-                || !crate::scrub::scan_text(&String::from_utf8_lossy(&bytes)).is_empty()
+                || (changed.contains(path.as_str())
+                    && !crate::scrub::scan_text(&String::from_utf8_lossy(&bytes)).is_empty())
             {
                 excluded_paths.push(path.as_str().to_string());
                 continue;
@@ -148,7 +154,7 @@ impl SourceSnapshot {
             "prefixes": EXCLUDED_PREFIXES,
             "prefixMatching": "directory-bounded at any depth, ASCII case-insensitive",
             "privateKeys": "files containing a PEM private-key BEGIN line are excluded in full",
-            "detectedCredentials": "files matching the engine secret scanner are excluded in full; changed excluded source blocks acceptance",
+            "detectedCredentials": "changed files matching the engine secret scanner are excluded in full; changed excluded source blocks acceptance",
             "missionRecords": "only the current mission's enumerated record files and missions/index.md are metadata, supplied through approved scope and evidence rather than source coverage",
             "environmentFiles": ".env and .env.* at any depth, ASCII case-insensitive",
             "ignoredFiles": "Git standard excludes at capture; ignored caches are not evidence",

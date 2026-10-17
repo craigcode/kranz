@@ -596,7 +596,8 @@ fn entry_lines(entry: &TranscriptEntry, width: usize, out: &mut Vec<Line<'static
         TranscriptEntry::Orch(text) => {
             let prefix = "orch> ";
             let body_width = width.saturating_sub(prefix.len()).max(1);
-            for (i, line) in wrap_text(text, body_width).into_iter().enumerate() {
+            let sanitized = crate::output::sanitize_untrusted(text);
+            for (i, line) in wrap_text(&sanitized, body_width).into_iter().enumerate() {
                 let lead = if i == 0 {
                     prefix.to_string()
                 } else {
@@ -606,7 +607,8 @@ fn entry_lines(entry: &TranscriptEntry, width: usize, out: &mut Vec<Line<'static
             }
         }
         TranscriptEntry::Activity(text) => {
-            for (i, line) in wrap_text(text, width.saturating_sub(2).max(1))
+            let sanitized = crate::output::sanitize_untrusted(text);
+            for (i, line) in wrap_text(&sanitized, width.saturating_sub(2).max(1))
                 .into_iter()
                 .enumerate()
             {

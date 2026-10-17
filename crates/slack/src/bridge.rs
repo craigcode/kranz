@@ -1300,7 +1300,7 @@ fn hook_status_lines(repo_root: &Path, mission_id: &str) -> String {
             "\n:zap: hook signal _(non-authoritative)_: *{word}* — run `{short_run}…`"
         ));
         if let Some(detail) = &record.detail {
-            lines.push_str(&format!(" · {}", crate::format::escape_mrkdwn(detail)));
+            lines.push_str(&format!(" · {detail}"));
         }
     }
     lines
@@ -2831,7 +2831,8 @@ pub(crate) fn slugify(title: &str) -> String {
             prev_dash = true;
         }
     }
-    let trimmed = out.trim_end_matches('-').to_string();
+    let truncated: String = out.chars().take(64).collect();
+    let trimmed = truncated.trim_end_matches('-').to_string();
     if trimmed.is_empty() {
         "ticket".to_string()
     } else {

@@ -85,6 +85,12 @@ impl Proposal {
         let selected = candidates.next()?.get("optionId")?.as_str()?;
         candidates.next().is_none().then(|| selected.to_owned())
     }
+
+    /// True when the proposal offers both a unique `allow_once` and a unique
+    /// `reject_once` option with valid non-duplicate option IDs.
+    pub fn valid_options(&self) -> bool {
+        self.option(true).is_some() && self.option(false).is_some()
+    }
 }
 
 /// Engine-authored identity of the exact policy and workspace that spawned a run.

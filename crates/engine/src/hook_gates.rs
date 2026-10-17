@@ -376,26 +376,17 @@ pub fn evaluate(spec: &HookGateSpec, tool_name: &str, file_path: Option<&str>) -
 /// resolves, retain the lexical path so the guard keeps its fail-closed
 /// `strip_prefix` posture.
 fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let lexical = normalize_lexical(path);
-    let mut probe = lexical.as_path();
-    let mut suffix = Vec::new();
-
-    loop {
+    let components: Vec<std::path::Component<'_>> = path.components().collect();
+    for idx in (1..=components.len()).rev() {
+        let probe: PathBuf = components[..idx].iter().collect();
         if let Ok(mut resolved) = probe.canonicalize() {
-            for component in suffix.iter().rev() {
-                resolved.push(component);
+            for component in &components[idx..] {
+                resolved.push(component.as_os_str());
             }
             return normalize_lexical(&resolved);
         }
-        let Some(name) = probe.file_name() else {
-            return lexical;
-        };
-        suffix.push(name.to_os_string());
-        let Some(parent) = probe.parent() else {
-            return lexical;
-        };
-        probe = parent;
     }
+    normalize_lexical(path)
 }
 
 /// Lexical normalization used after filesystem aliases have been resolved:
@@ -944,5 +935,33 @@ mod tests {
     fn hook_gate_projection_shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote(Path::new("/a/b")), "'/a/b'");
         assert_eq!(shell_quote(Path::new("/a/o'brien")), r"'/a/o'\''brien'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_gate_blocks_symlink_dotdot_escape_outside_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        let outside = root.path().join("outside").join("nested");
+        std::fs::create_dir_all(worktree.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let link = worktree.join("sub").join("link_out");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let spec = spec_fixture(&worktree, &["**"]);
+        let escape_target = link.join("..").join("escape.txt");
+        let verdict = evaluate(&spec, "Write", Some(escape_target.to_str().unwrap()));
+        match verdict {
+            GuardVerdict::Block { reason, .. } => {
+                assert!(
+                    reason.contains("outside the mission checkout"),
+                    "expected outside checkout block reason, got: {reason}"
+                );
+            }
+            GuardVerdict::Allow => {
+                panic!("symlink + ../escape.txt must be blocked as outside the mission checkout")
+            }
+        }
     }
 }

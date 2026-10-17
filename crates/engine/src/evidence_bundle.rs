@@ -291,13 +291,20 @@ fn wire_name<T: Serialize>(value: &T) -> String {
 /// Collapse all whitespace runs to single spaces (goal text, decision
 /// summaries) so one logical line of the summary stays one physical line.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::presentation::visible(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Escape a markdown table cell: pipes would break the column structure,
-/// newlines the row structure.
+/// newlines the row structure, and backticks/brackets inline code/links.
 fn md_cell(text: &str) -> String {
-    one_line(text).replace('|', "\\|")
+    one_line(text)
+        .replace('|', "\\|")
+        .replace('`', "\\`")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 /// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") — the

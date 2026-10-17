@@ -81,6 +81,42 @@ impl MissionEngine {
                         ));
                     }
                     let request = Request::new(*proposal, binding)?;
+                    if request.proposal.prohibition.is_none() && !request.proposal.valid_options() {
+                        return Err(EngineError::InvalidState(
+                            "permission request must offer unique allow_once and reject_once options"
+                                .into(),
+                        ));
+                    }
+                    let run = self
+                        .state
+                        .runs
+                        .get(&request.binding.run_id)
+                        .ok_or_else(|| {
+                            EngineError::InvalidState(
+                                "permission request has no active worker run".into(),
+                            )
+                        })?;
+                    let now = chrono::Utc::now();
+                    if request.binding.mission_id != self.state.mission.id
+                        || request.proposal.engine_session_id != run.sdk_session_id
+                        || run.role != Role::Worker
+                        || run.ended_at.is_some()
+                        || now < request.proposal.observed_at
+                        || now >= request.proposal.deadline
+                        || self.state.permissions.contains_key(&request.proposal.id)
+                        || self.state.permissions.len() >= live_permission::MAX_MISSION_REQUESTS
+                        || self
+                            .state
+                            .permissions
+                            .values()
+                            .filter(|r| r.closed.is_none() && r.delivery.is_none())
+                            .count()
+                            >= live_permission::MAX_PENDING
+                    {
+                        return Err(EngineError::InvalidState(
+                            "invalid or stale one-call permission transition".into(),
+                        ));
+                    }
                     // Never make a redacted preview look like the complete action
                     // an operator authorized. An uninspectable request stops the run.
                     let mut retained = serde_json::to_value(&request)?;
@@ -839,9 +875,6 @@ mod tests {
                 text: "interrupt".into(),
                 interrupt: true,
             },
-            ControlCommand::ConfigChange {
-                patch: json!({"maxRespawns":0}),
-            },
             ControlCommand::RequestRevision {
                 instructions: "revise".into(),
             },
@@ -853,11 +886,6 @@ mod tests {
             ControlCommand::DenyGrant {
                 command: "fixture".into(),
                 reason: "declined".into(),
-            },
-            ControlCommand::AnswerQuestion {
-                question_id: "q-fixture".into(),
-                answer: "answer".into(),
-                option: None,
             },
         ];
         for command in controls {
@@ -877,6 +905,22 @@ mod tests {
                 },
             )
             .unwrap();
+            control::enqueue(
+                &engine.paths,
+                &ControlCommand::ConfigChange {
+                    patch: json!({"maxRespawns":0}),
+                },
+            )
+            .unwrap();
+            control::enqueue(
+                &engine.paths,
+                &ControlCommand::AnswerQuestion {
+                    question_id: "q-fixture".into(),
+                    answer: "answer".into(),
+                    option: None,
+                },
+            )
+            .unwrap();
             control::enqueue(&engine.paths, &command).unwrap();
             let before = EventLog::read_events(&engine.paths.events_file())
                 .unwrap()
@@ -888,20 +932,17 @@ mod tests {
             let events = EventLog::read_events(&engine.paths.events_file()).unwrap();
             assert_eq!(
                 events.len(),
-                before + 1,
-                "only the noninterrupting message applies before workers join: {command:?}"
+                before + 2,
+                "noninterrupting message and config change apply live before workers join: {command:?}"
             );
             assert!(matches!(
                 events.last().unwrap().kind,
-                EventKind::UserMessage {
-                    interrupt: false,
-                    ..
-                }
+                EventKind::ConfigChanged { .. }
             ));
             assert_eq!(
                 control::drain(&engine.paths).unwrap().len(),
                 1,
-                "control must remain queued: {command:?}"
+                "deferred control must remain queued: {command:?}"
             );
         }
     }

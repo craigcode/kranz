@@ -133,6 +133,11 @@ pub fn parse_from_goal(goal: &str) -> Result<Option<ReviewArtifactContract>> {
         };
     };
     if !review_class {
+        if goal[..index].contains("\n## Context\n")
+            || goal[..index].contains("<<<BEGIN KRANZ UNTRUSTED ")
+        {
+            return Ok(None);
+        }
         return Err(EngineError::Config(
             "a Review artifact appendix requires task-class: spec-review or incident-review"
                 .to_string(),

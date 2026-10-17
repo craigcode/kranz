@@ -286,9 +286,14 @@ fn looks_like_secret_charset(s: &str) -> bool {
 fn is_allowlisted(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
 
-    // Placeholder / dummy substrings.
-    const PLACEHOLDERS: &[&str] = &[
-        "xxxx",
+    if lower.contains("xxxx") {
+        return true;
+    }
+
+    // Placeholder / dummy words must appear as a delimited segment (or a
+    // short placeholder token <= 36 chars), not as a random 4-char substring
+    // inside a 60-char base64/alphanumeric credential.
+    const SEGMENT_PLACEHOLDERS: &[&str] = &[
         "replace",
         "example",
         "changeme",
@@ -299,7 +304,21 @@ fn is_allowlisted(value: &str) -> bool {
         "none",
         "redacted",
     ];
-    if PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
+    if lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|seg| SEGMENT_PLACEHOLDERS.contains(&seg))
+    {
+        return true;
+    }
+    const LONG_PLACEHOLDERS: &[&str] = &[
+        "replace",
+        "example",
+        "changeme",
+        "dummy",
+        "placeholder",
+        "redacted",
+    ];
+    if lower.len() <= 36 && LONG_PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
         return true;
     }
 
@@ -363,8 +382,9 @@ fn push_finding(
     location: &str,
     range: Range<usize>,
     value: &str,
+    check_allowlist: bool,
 ) {
-    if is_allowlisted(value) {
+    if check_allowlist && is_allowlisted(value) {
         return;
     }
     if occupied
@@ -396,6 +416,10 @@ fn scan_text_with_assignments(
     let mut out = Vec::new();
     let mut occupied: Vec<Range<usize>> = Vec::new();
     for rule in rules() {
+        let check_allowlist = matches!(
+            rule.id,
+            "bearer-token" | "basic-auth" | "connection-string-password"
+        );
         for caps in rule.re.captures_iter(text) {
             let m = rule
                 .secret_group
@@ -409,6 +433,7 @@ fn scan_text_with_assignments(
                     location,
                     m.start()..m.end(),
                     m.as_str(),
+                    check_allowlist,
                 );
             }
         }
@@ -423,6 +448,7 @@ fn scan_text_with_assignments(
                 location,
                 value.start()..value.end(),
                 value.as_str(),
+                true,
             );
         }
     }
@@ -437,6 +463,7 @@ fn scan_text_with_assignments(
                     location,
                     value.start()..value.end(),
                     value.as_str(),
+                    true,
                 );
             }
         }
@@ -611,6 +638,9 @@ fn scrub_json_assignment(mut value: String, key: Option<&str>) -> String {
                     !is_allowlisted(candidate.as_str())
                 }
             {
+                if value.trim().len() >= 8 {
+                    return REDACTED.to_string();
+                }
                 value.replace_range(..candidate.len(), REDACTED);
                 break;
             }
@@ -1118,5 +1148,29 @@ mod tests {
         );
         let garbage = read_allowlist_text("# reviewed\nnot-a-fingerprint\n");
         assert_eq!(filter_allowed(findings.clone(), &garbage), findings);
+    }
+
+    #[test]
+    fn h11_short_placeholder_substrings_do_not_suppress_high_entropy_or_prefixed_secrets() {
+        // A high-entropy credential or vendor token that happens to contain
+        // "none", "your", or "todo" as a 4-char substring inside an
+        // alphanumeric run must still be detected and redacted.
+        let token = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYznone1234567890";
+        let findings = scan_text(token);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule_id, "anthropic-api-key");
+
+        let entropy_secret = "access_token = aB3xQ9zK7mP2wR5tY8uV1nJ4kyour6dF0sGhWqZ7xC";
+        let findings = scan_text(entropy_secret);
+        assert!(!findings.is_empty(), "must flag high-entropy secret");
+        let scrubbed = scrub(entropy_secret);
+        assert!(scrubbed.contains(REDACTED), "{scrubbed}");
+    }
+
+    #[test]
+    fn h12_json_secret_value_with_spaces_or_quotes_redacts_entire_value() {
+        let raw = r#"{"password": "s3cr3t_first_part and the rest of the passphrase"}"#;
+        let out = scrub(raw);
+        assert_eq!(out, r#"{"password": "[REDACTED]"}"#);
     }
 }
