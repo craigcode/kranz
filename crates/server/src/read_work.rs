@@ -5,11 +5,10 @@
 
 use crate::ApiError;
 use axum::http::StatusCode;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 const MAX_READ_WORK: usize = 8;
-static READ_WORK: OnceLock<ReadWork> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct ReadWork {
@@ -50,17 +49,6 @@ impl Default for ReadWork {
     fn default() -> Self {
         Self::new(MAX_READ_WORK)
     }
-}
-
-pub(crate) async fn run<T, F>(work: F) -> Result<T, ApiError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
-{
-    READ_WORK
-        .get_or_init(|| ReadWork::new(MAX_READ_WORK))
-        .run(work)
-        .await
 }
 
 #[cfg(test)]

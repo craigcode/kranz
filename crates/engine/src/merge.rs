@@ -671,14 +671,30 @@ where
     }
 
     repo.checkout(base_branch)?;
-    strip_identical_untracked_twins(repo, base_sha, &mission_tip_sha)?;
-    match repo.fast_forward_to(&tested_commit)? {
-        MergeOutcome::Clean => Ok(MergeReport::Merged {
+    if let Err(err) = strip_identical_untracked_twins(repo, base_sha, &mission_tip_sha) {
+        if primary_branch_before_gates != base_branch {
+            let _ = repo.checkout(&primary_branch_before_gates);
+        }
+        return Err(err);
+    }
+    match repo.fast_forward_to(&tested_commit) {
+        Ok(MergeOutcome::Clean) => Ok(MergeReport::Merged {
             commit: tested_commit,
             stale_base,
         }),
-        MergeOutcome::RefusedPreMerge { detail } => Ok(MergeReport::RefusedPreMerge { detail }),
-        MergeOutcome::Conflict { .. } => unreachable!("--ff-only cannot create conflicts"),
+        Ok(MergeOutcome::RefusedPreMerge { detail }) => {
+            if primary_branch_before_gates != base_branch {
+                let _ = repo.checkout(&primary_branch_before_gates);
+            }
+            Ok(MergeReport::RefusedPreMerge { detail })
+        }
+        Ok(MergeOutcome::Conflict { .. }) => unreachable!("--ff-only cannot create conflicts"),
+        Err(err) => {
+            if primary_branch_before_gates != base_branch {
+                let _ = repo.checkout(&primary_branch_before_gates);
+            }
+            Err(err)
+        }
     }
 }
 
@@ -780,6 +796,12 @@ fn strip_identical_untracked_twins(
             None => continue,
         };
         let full_path = repo.root().join(&path);
+        let Ok(meta) = std::fs::symlink_metadata(&full_path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
         let current = match std::fs::read(&full_path) {
             Ok(bytes) => bytes,
             Err(_) => continue,

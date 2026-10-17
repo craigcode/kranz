@@ -233,7 +233,13 @@ pub fn create_pull_request(repo_root: &Path, handoff: &PrHandoff) -> Result<Stri
             stderr.trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(EngineError::Backend(format!(
+            "gh pr create returned unexpected non-HTTP URL: {url:?}"
+        )));
+    }
+    Ok(url)
 }
 
 fn looks_like_github_remote(url: &str) -> bool {

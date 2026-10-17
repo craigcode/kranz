@@ -508,10 +508,10 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         out.push_str(&format!(
             "  {}  {}  {}  {}  {}  {}{}\n",
             row.ts.to_rfc3339(),
-            row.mission_id,
+            sanitize_untrusted(&row.mission_id),
             row.kind.as_str(),
-            row.summary,
-            row.decision,
+            sanitize_untrusted(&row.summary),
+            sanitize_untrusted(&row.decision),
             latency,
             flag
         ));
@@ -679,7 +679,8 @@ pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
     for defect in &greens.traced_defects {
         out.push_str(&format!(
             "  traced: {} → {}\n",
-            defect.ticket, defect.mission_id
+            sanitize_untrusted(&defect.ticket),
+            sanitize_untrusted(&defect.mission_id)
         ));
     }
 
@@ -694,11 +695,11 @@ pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
         out.push_str(&format!(
             "  {}  {}  {}  {}  {}  {}  {}\n",
             row.ts.to_rfc3339(),
-            row.mission_id,
+            sanitize_untrusted(&row.mission_id),
             row.kind.as_str(),
-            milestone,
-            row.ask,
-            row.decision,
+            sanitize_untrusted(milestone),
+            sanitize_untrusted(&row.ask),
+            sanitize_untrusted(&row.decision),
             latency
         ));
     }

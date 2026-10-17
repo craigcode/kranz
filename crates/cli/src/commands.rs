@@ -1280,7 +1280,8 @@ fn print_orchestrator_reply(text: &str, tty: bool) {
     } else {
         "orchestrator> ".to_string()
     };
-    for line in text.lines() {
+    let sanitized = output::sanitize_untrusted(text);
+    for line in sanitized.lines() {
         println!("{prefix}{line}");
     }
 }
@@ -1562,13 +1563,16 @@ pub fn cmd_list_questions(repo: &Path, mission_id: &str) -> Result<String> {
             "{} ({}): {}\n",
             q.question_id,
             q.feature_id.as_deref().unwrap_or("mission"),
-            q.text
+            output::sanitize_untrusted(&q.text)
         ));
         if q.options.is_empty() {
             out.push_str("  free-text answer expected\n");
         } else {
             for (index, option) in q.options.iter().enumerate() {
-                out.push_str(&format!("  [{index}] {option}\n"));
+                out.push_str(&format!(
+                    "  [{index}] {}\n",
+                    output::sanitize_untrusted(option)
+                ));
             }
         }
     }
@@ -2053,7 +2057,9 @@ fn cmd_standards_waive(
     println!("  statement: {}", pinned.statement);
     println!(
         "finding: {} (run {})\n  evidence: {}",
-        outcome.finding_subject, outcome.run_id, outcome.finding_evidence
+        output::sanitize_untrusted(&outcome.finding_subject),
+        outcome.run_id,
+        output::sanitize_untrusted(&outcome.finding_evidence)
     );
     println!("  fingerprint: sha256:{}", outcome.finding_fingerprint);
     if pinned.when_paths.is_empty() {
@@ -2180,7 +2186,7 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
             Ok(state) => out.push_str(&format!(
                 "{id}  {:<10}  {}{ticket}\n",
                 output::mission_status_label(state.mission.status),
-                state.mission.goal
+                output::sanitize_untrusted(&state.mission.goal)
             )),
             Err(e) => out.push_str(&format!("{id}  {:<10}  (unreadable: {e:#})\n", "FAILED")),
         }
@@ -2263,7 +2269,12 @@ pub fn render_clean_listing(entries: &[CleanEntry]) -> String {
     }
     let mut out = String::new();
     for e in entries {
-        out.push_str(&format!("{:<10}  {}  {}\n", e.status_label, e.id, e.goal));
+        out.push_str(&format!(
+            "{:<10}  {}  {}\n",
+            e.status_label,
+            e.id,
+            output::sanitize_untrusted(&e.goal)
+        ));
     }
     out
 }

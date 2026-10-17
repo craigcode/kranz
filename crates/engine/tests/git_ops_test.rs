@@ -1996,3 +1996,45 @@ fn ordinary_repository_includes_are_refused_after_open_on_local_and_network_path
         );
     }
 }
+
+#[test]
+fn flag_shaped_arguments_are_refused_by_branch_checkout_diff_commits_and_tag() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _) = seeded_repo();
+    assert!(repo.create_branch("-D", None).is_err());
+    assert!(repo.create_branch("ok-branch", Some("--force")).is_err());
+    assert!(repo.checkout("--detach").is_err());
+    assert!(repo.commits_between("--all", "HEAD").is_err());
+    assert!(repo.commits_between("HEAD", "--all").is_err());
+    assert!(repo.diff_stat("--cached", "HEAD").is_err());
+    assert!(repo.diff_full("--cached", "HEAD").is_err());
+    assert!(repo.tag("-d", "msg").is_err());
+}
+
+#[test]
+fn remote_helper_double_colon_urls_are_refused_before_network_transport() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    raw_git(
+        dir.path(),
+        &["remote", "add", "origin", "sh::/bin/sh -c 'exit 1'"],
+    );
+    let ls_err = repo
+        .remote_has_branch("origin", "kranz/m-test")
+        .unwrap_err();
+    assert!(
+        ls_err.to_string().contains("::"),
+        "expected :: refusal in remote_has_branch, got: {ls_err}"
+    );
+    let push_err = repo
+        .push_mission_branch("origin", "kranz/m-test")
+        .unwrap_err();
+    assert!(
+        push_err.to_string().contains("::"),
+        "expected :: refusal in push_mission_branch, got: {push_err}"
+    );
+}
