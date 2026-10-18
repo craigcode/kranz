@@ -5,6 +5,35 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.4.3 - 2026-10-18
+
+- Hardened Git execution and network boundaries: disabled tag signing and GPG
+  helper programs during engine-created tags, rejected leading-dash ref/tag
+  names across Git operations, blocked `include.*`/`includeIf.*` and URL-scoped
+  `http.<url>.*`/`remote.<name>.*` overrides before network calls, and refused
+  remote-helper `::` URLs.
+- Hardened sandbox, container, and validator containment: refused symlinked or
+  hardlinked `target/` trees during validator snapshot warm-copy, created and
+  masked absent `.git/hooks`, `.git/info`, and `.git/modules` directories under
+  mount-based sandboxes, mounted common `.git` directories read-only for Docker
+  worktrees, and resolved DNS targets in the egress proxy to reject loopback,
+  unspecified, and link-local addresses unless explicitly allowlisted.
+- Tightened URL, credential, and scrubber validation: enforced strict loopback
+  URL parsing without backslashes or userinfo on `baseUrl` and hook-status
+  endpoints, required `0700`/`0600` modes on isolated credential homes and
+  hook-status specs, redacted full JSON secret values containing spaces, and
+  prevented short placeholder words inside long alphanumeric tokens from
+  suppressing secret detection.
+- Hardened validator verdict parsing, live permissions, event-log high-water
+  checks, `MissionHost::ask` tool/context isolation, and terminal/Markdown
+  output sanitization across the CLI, server, and Slack bridge.
+- Added ACP profile resource ceilings (R1), observed resource failure
+  classification and session budgets (R2), and test-only qualification
+  measurement scaffolding (R3), plus container socket/file denial guest receipts
+  and hosted mission stack-headroom boxing.
+- Updated OpenTelemetry to 0.33, `rustls` to 0.23.46, `quinn-proto` to 0.11.19,
+  and dashboard/Even G2 dependencies; refreshed third-party license notices.
+
 ## 0.4.2 - 2026-09-26
 
 - Made Sgian host-control credentials an explicit opt-in through an absolute
