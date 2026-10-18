@@ -850,10 +850,10 @@ pub fn build_question_ready(q: &QuestionReady, dashboard_url: Option<&str>) -> V
                 json!({
                     "type": "button",
                     "style": "primary",
-                    // Button text is capped (Slack 75 chars) and escaped like
-                    // the options list above (model-authored label); the full
-                    // label rides in the list.
-                    "text": { "type": "plain_text", "text": clip_to(&format!("{i}: {}", escape_mrkdwn(o.trim())), 75) },
+                    // Button text is capped (Slack 75 chars) and control-sanitized
+                    // for a `plain_text` object (which renders HTML entities literally);
+                    // the full mrkdwn-escaped label rides in the list above.
+                    "text": { "type": "plain_text", "text": clip_to(&format!("{i}: {}", kranz_engine::presentation::visible(o.trim())), 75) },
                     "action_id": ANSWER_QUESTION_ACTION_ID,
                     "value": format!("{}:{}:{i}", q.mission_id, q.question_id),
                 })
@@ -2213,7 +2213,9 @@ mod tests {
     }
 
     /// Model-authored asks must never inject Slack control sequences into
-    /// the card (the grant card's defensive-escape discipline).
+    /// mrkdwn blocks (the grant card's defensive-escape discipline), while
+    /// `plain_text` button labels stay literal (where HTML entities would
+    /// render verbatim).
     #[test]
     fn question_events_card_escapes_mrkdwn() {
         let blocks = build_question_ready(
@@ -2227,12 +2229,20 @@ mod tests {
             },
             None,
         );
-        let text = all_text(&blocks);
+        let non_action_blocks: Vec<Value> = blocks
+            .iter()
+            .filter(|b| b["type"].as_str() != Some("actions"))
+            .cloned()
+            .collect();
+        let text = all_text(&non_action_blocks);
         assert!(
             !text.contains("<!channel>"),
             "broadcast ping escaped: {text}"
         );
         assert!(!text.contains("<@U123>"), "user ping escaped: {text}");
+        let buttons = all_buttons(&blocks);
+        assert_eq!(buttons[0]["text"]["type"].as_str(), Some("plain_text"));
+        assert_eq!(buttons[0]["text"]["text"].as_str(), Some("0: yes <@U123>"));
     }
 
     /// M1: every agent-authored field posted as mrkdwn. `<!channel>` is a

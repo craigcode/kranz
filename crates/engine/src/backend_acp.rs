@@ -1260,13 +1260,14 @@ impl AcpSession {
                 "acp tool update has no valid toolCallId".into(),
             ));
         }
-        let bytes = info.kind.len() + info.title.len() + info.subject.len();
+        let subject_bytes = |subjects: &[String]| subjects.iter().map(String::len).sum::<usize>();
+        let bytes = info.kind.len() + info.title.len() + subject_bytes(&info.subject);
         let retained = self
             .tool_calls
             .iter()
             .filter(|(key, _)| *key != &id)
             .map(|(key, value)| {
-                key.len() + value.kind.len() + value.title.len() + value.subject.len()
+                key.len() + value.kind.len() + value.title.len() + subject_bytes(&value.subject)
             })
             .sum::<usize>();
         if self.tool_calls.len() >= 1024
@@ -1278,6 +1279,53 @@ impl AcpSession {
         }
         self.tool_calls.insert(id, info);
         Ok(())
+    }
+
+    fn merge_tool_call_update(info: &mut ToolCallInfo, update: &Value, default_kind: bool) {
+        let prev_title = info.title.clone();
+        let prev_subjects = std::mem::take(&mut info.subject);
+        let prev_was_title_fallback =
+            !prev_title.is_empty() && prev_subjects.len() == 1 && prev_subjects[0] == prev_title;
+        let kind_changed = update.get("kind").and_then(Value::as_str).is_some_and(|k| {
+            let changed = !info.kind.is_empty() && info.kind != k;
+            info.kind = k.to_string();
+            changed
+        });
+        if default_kind && info.kind.is_empty() {
+            info.kind = "other".to_string();
+        }
+        if let Some(title) = update.get("title").and_then(Value::as_str) {
+            info.title = title.to_string();
+        }
+        let has_explicit_subject_fields =
+            update.get("rawInput").is_some() || update.get("locations").is_some();
+        if has_explicit_subject_fields {
+            let new_subjects = tool_call_subject(&info.kind, &info.title, update);
+            if new_subjects.is_empty() {
+                info.subject = Vec::new();
+            } else {
+                let mut merged: Vec<String> = if prev_was_title_fallback || kind_changed {
+                    Vec::new()
+                } else {
+                    prev_subjects
+                };
+                for s in new_subjects {
+                    if !merged.contains(&s) {
+                        merged.push(s);
+                    }
+                }
+                info.subject = merged;
+            }
+        } else if prev_subjects.is_empty() || kind_changed || prev_was_title_fallback {
+            let recomputed = tool_call_subject(&info.kind, &info.title, update);
+            info.subject = if recomputed.is_empty() && !kind_changed {
+                prev_subjects
+            } else {
+                recomputed
+            };
+        } else {
+            info.subject = prev_subjects;
+        }
     }
 
     /// Map one `session/update` notification onto events (see module docs).
@@ -1395,18 +1443,7 @@ impl AcpSession {
                     .unwrap_or("")
                     .to_string();
                 let mut tracked = self.tool_calls.get(&id).cloned().unwrap_or_default();
-                if let Some(kind) = update.get("kind").and_then(Value::as_str) {
-                    tracked.kind = kind.to_string();
-                }
-                if let Some(title) = update.get("title").and_then(Value::as_str) {
-                    tracked.title = title.to_string();
-                }
-                if update.get("kind").is_some()
-                    || update.get("rawInput").is_some()
-                    || update.get("locations").is_some()
-                {
-                    tracked.subject = tool_call_subject(&tracked.kind, &tracked.title, update);
-                }
+                Self::merge_tool_call_update(&mut tracked, update, false);
                 self.track_tool_call(id.clone(), tracked.clone())?;
                 match status.as_str() {
                     // Terminal statuses surface as first-class ToolResult
@@ -1470,22 +1507,7 @@ impl AcpSession {
         // Merge what the request carries with what the tool_call/update
         // stream already told us about this call.
         let mut info = self.tool_calls.get(&call_id).cloned().unwrap_or_default();
-        if let Some(kind) = call_update.get("kind").and_then(Value::as_str) {
-            info.kind = kind.to_string();
-        }
-        if info.kind.is_empty() {
-            info.kind = "other".to_string();
-        }
-        if let Some(title) = call_update.get("title").and_then(Value::as_str) {
-            info.title = title.to_string();
-        }
-        if info.subject.is_empty()
-            || call_update.get("kind").is_some()
-            || call_update.get("rawInput").is_some()
-            || call_update.get("locations").is_some()
-        {
-            info.subject = tool_call_subject(&info.kind, &info.title, &call_update);
-        }
+        Self::merge_tool_call_update(&mut info, &call_update, true);
         if !missing_id {
             self.track_tool_call(call_id.clone(), info.clone())?;
         }
@@ -2339,5 +2361,35 @@ mod tests {
                 "cancelled"
             );
         }
+    }
+
+    #[test]
+    fn h14_merge_tool_call_update_preserves_and_accumulates_subjects() {
+        let mut info = ToolCallInfo {
+            kind: "read".to_string(),
+            title: "Read file".to_string(),
+            subject: vec!["/repo/serve.token".to_string()],
+        };
+        // A partial update with `kind` only must not clobber the existing subject.
+        AcpSession::merge_tool_call_update(
+            &mut info,
+            &json!({"toolCallId": "c1", "kind": "read", "status": "in_progress"}),
+            false,
+        );
+        assert_eq!(info.subject, vec!["/repo/serve.token".to_string()]);
+
+        // An update adding a benign path must retain the earlier denied path.
+        AcpSession::merge_tool_call_update(
+            &mut info,
+            &json!({"toolCallId": "c1", "kind": "read", "rawInput": {"path": "/repo/README.md"}}),
+            false,
+        );
+        assert_eq!(
+            info.subject,
+            vec![
+                "/repo/serve.token".to_string(),
+                "/repo/README.md".to_string()
+            ]
+        );
     }
 }

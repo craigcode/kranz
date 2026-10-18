@@ -345,6 +345,7 @@ enum ProjectPolicy {
     OperatorOnly,
     SandboxFloor,
     ReviewerFloor,
+    ConsideredAlternativesFloor,
 }
 
 #[derive(Clone, Copy)]
@@ -402,6 +403,22 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
         "allowBelowDefaultWorkerModel",
         PatchClass::Runtime,
         "it lifts the worker model floor the operator set",
+    ),
+    ConfigTrustRule {
+        key: "consideredAlternativesFeatureThreshold",
+        project: ProjectPolicy::ConsideredAlternativesFloor,
+        runtime: PatchClass::Consent,
+        reason: "it weakens or disables the considered-alternatives plan gate",
+    },
+    ConfigTrustRule::operator_only(
+        "consideredAlternativesTouchSetThreshold",
+        PatchClass::Consent,
+        "it weakens or disables the considered-alternatives plan gate",
+    ),
+    ConfigTrustRule::operator_only(
+        "consideredAlternativesHighUsdThreshold",
+        PatchClass::Consent,
+        "it weakens or disables the considered-alternatives plan gate",
     ),
     ConfigTrustRule::operator_only(
         "workerIsolation",
@@ -650,6 +667,13 @@ fn walk_project_layer(
                 ProjectPolicy::ReviewerFloor if normalized == rule.key => {
                     check_project_reviewer_floor(value, base_value, file, &dotted, rule.reason)?;
                 }
+                ProjectPolicy::ConsideredAlternativesFloor => {
+                    let valid = normalized == rule.key
+                        && value.as_u64().is_some_and(|v| (1..=8).contains(&v));
+                    if !valid {
+                        return Err(project_layer_refusal(file, &dotted, rule.reason));
+                    }
+                }
                 _ => {}
             }
         }
@@ -843,9 +867,6 @@ const RUNTIME_PATCHABLE: &[&str] = &[
     "eventStreamThrottleMs",
     "planningIdleReleaseMinutes",
     "autoWork",
-    "consideredAlternativesFeatureThreshold",
-    "consideredAlternativesTouchSetThreshold",
-    "consideredAlternativesHighUsdThreshold",
     "rubberStampThresholdMs",
     "<role>.model",
     "<role>.backend",
@@ -975,28 +996,42 @@ pub fn apply_validated_patch_from(
     Ok(merged)
 }
 
-/// The host of an `http(s)://` URL, or `""` when the string is not one.
-/// Userinfo is stripped (`http://user@host/` is `host`) and a bracketed IPv6
-/// literal keeps its own colons (`http://[::1]:8080` is `::1`).
-fn base_url_host(url: &str) -> &str {
+/// The host of an `http(s)://` URL, or `""` when the string is not a clean
+/// authority-only/path HTTP(S) URL. Backslashes, userinfo (`@`), query strings
+/// and fragments are rejected so WHATWG `reqwest::Url` parsing and validation
+/// agree on the exact target host.
+fn base_url_host(url: &str) -> String {
+    if url.contains('\\') {
+        return String::new();
+    }
     let Some(rest) = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
     else {
-        return "";
+        return String::new();
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let after_userinfo = match authority.rfind('@') {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    };
-    if let Some(bracketed) = after_userinfo.strip_prefix('[') {
-        return match bracketed.split_once(']') {
-            Some((host, _)) => host,
-            None => "",
-        };
+    if authority.is_empty() || authority.contains('@') {
+        return String::new();
     }
-    after_userinfo.split(':').next().unwrap_or(after_userinfo)
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return String::new();
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return String::new();
+    }
+    let Some(host) = parsed.host_str() else {
+        return String::new();
+    };
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string()
 }
 
 /// `localhost` or any address in a loopback range (127.0.0.0/8, ::1).
@@ -1257,7 +1292,8 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
             }
             match role_cfg.base_url.as_deref() {
                 Some(url) if !url.trim().is_empty() => {
-                    if base_url_host(url).is_empty() {
+                    let host = base_url_host(url);
+                    if host.is_empty() {
                         return Err(EngineError::Config(format!(
                             "{name}.baseUrl {url:?} is not a valid http/https URL"
                         )));
@@ -1272,12 +1308,11 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                     // exfiltration plus a config-driven internal-network
                     // oracle. Operators who really do run a shared endpoint
                     // name its host in the global-layer allowlist.
-                    let host = base_url_host(url);
-                    if !host_is_loopback(host)
+                    if !host_is_loopback(&host)
                         && !cfg
                             .local_backend_allowed_hosts
                             .iter()
-                            .any(|allowed| allowed.trim().eq_ignore_ascii_case(host))
+                            .any(|allowed| allowed.trim().eq_ignore_ascii_case(&host))
                     {
                         return Err(EngineError::Config(format!(
                             "{name}.baseUrl host {host:?} is not loopback: the engine POSTs \
@@ -2866,6 +2901,59 @@ mod tests {
         let applied = apply_executor_routing(&mut cfg, ExecutorTier::Local, Some(&endpoint));
         assert_eq!(applied, ExecutorTier::Frontier);
         assert!(cfg.worker.backend.is_none());
+    }
+
+    #[test]
+    fn base_url_host_rejects_backslash_userinfo_query_and_fragment_bypasses() {
+        for bad in [
+            "http://attacker.com\\@127.0.0.1:8080",
+            concat!("http://127.0.0.1", ":8080@attacker.com"),
+            "http://user@127.0.0.1:8080",
+            "http://127.0.0.1:8080?x=1",
+            "http://127.0.0.1:8080#frag",
+        ] {
+            let mut cfg = local_worker_cfg();
+            cfg.worker.base_url = Some(bad.to_string());
+            assert!(
+                validate(&cfg).is_err(),
+                "ambiguous baseUrl {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn m14_floor_and_threshold_keys_refused_from_inbox_and_project_weakening() {
+        let cfg = MissionConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &project,
+            serde_json::json!({ "allowBelowDefaultWorkerModel": true }).to_string(),
+        )
+        .unwrap();
+        assert!(
+            load_layers_with_roles(&[(project.clone(), Layer::Project)]).is_err(),
+            "project layer must refuse allowBelowDefaultWorkerModel"
+        );
+        for patch in [
+            serde_json::json!({ "consideredAlternativesFeatureThreshold": 0 }),
+            serde_json::json!({ "consideredAlternativesTouchSetThreshold": 999 }),
+            serde_json::json!({ "consideredAlternativesHighUsdThreshold": 999999.0 }),
+        ] {
+            assert!(
+                apply_validated_patch_from(&cfg, &patch, PatchSource::Inbox).is_err(),
+                "inbox must refuse {patch}"
+            );
+            assert!(
+                apply_validated_patch_from(&cfg, &patch, PatchSource::Operator).is_ok(),
+                "operator may still set {patch}"
+            );
+            std::fs::write(&project, patch.to_string()).unwrap();
+            assert!(
+                load_layers_with_roles(&[(project.clone(), Layer::Project)]).is_err(),
+                "project layer must refuse weakening {patch}"
+            );
+        }
     }
 
     trait RoleConfigTestExt {

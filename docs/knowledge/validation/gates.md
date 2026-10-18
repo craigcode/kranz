@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-11
+last_verified: 2026-10-18
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -59,6 +59,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: validator report parsing requires a schema-matching JSON object, bounded gate process-group cleanup holds the leader until group signaling, and merge twin cleanup refuses symlinks. Gate contracts are unchanged.
 
 Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 

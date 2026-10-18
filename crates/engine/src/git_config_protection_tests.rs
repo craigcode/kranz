@@ -555,3 +555,80 @@ fn git_config_protection_checks_neutral_config_even_for_non_git_sessions() {
         .to_string()
         .contains("neutral Git configuration"));
 }
+
+#[test]
+fn git_tag_disables_tag_gpg_sign_and_format_specific_gpg_programs() {
+    let (_dir, inputs) = fixture();
+    let root = &inputs.session_cwd;
+    std::fs::write(root.join("README.md"), "hello\n").unwrap();
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-m", "initial"]);
+
+    let marker = root.join("gpg-ssh-fired");
+    let helper = root.join("evil-gpg-ssh.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\necho fired > '{}'\nexit 1\n",
+            marker.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    git(root, &["config", "tag.gpgSign", "true"]);
+    git(root, &["config", "tag.forceSignAnnotated", "true"]);
+    git(root, &["config", "gpg.format", "ssh"]);
+    git(
+        root,
+        &["config", "gpg.ssh.program", helper.to_str().unwrap()],
+    );
+
+    let repo = crate::git_ops::GitRepo::open(root).unwrap();
+    repo.tag("kranz/m-test/v1", "annotated test tag").unwrap();
+    assert!(
+        !marker.exists(),
+        "gpg.ssh.program must not execute during repo.tag"
+    );
+}
+
+#[test]
+fn armed_local_network_config_refuses_url_scoped_http_extraheader_remote_vcs_and_include_shapes() {
+    for (key, value, expected_substr) in [
+        (
+            "http.https://github.com.proxy",
+            "http://127.0.0.1:8080",
+            "http.https://github.com.proxy",
+        ),
+        (
+            "http.extraheader",
+            "Authorization: Bearer secret",
+            "http.extraheader",
+        ),
+        ("remote.origin.vcs", "sh", "remote.origin.vcs"),
+        (
+            "includeif.path",
+            "evil.cfg",
+            "conditional repository config includes",
+        ),
+        (
+            "include.sub.path",
+            "evil.cfg",
+            "ordinary repository config includes",
+        ),
+    ] {
+        let (_dir, inputs) = fixture();
+        let root = &inputs.session_cwd;
+        let repo = crate::git_ops::GitRepo::open(root).unwrap();
+        git(root, &["config", key, value]);
+        let err = repo.refuse_network_on_armed_local_config().unwrap_err();
+        assert!(
+            err.to_string().contains(expected_substr),
+            "expected {expected_substr:?} in error for {key}, got: {err}"
+        );
+    }
+}

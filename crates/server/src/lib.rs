@@ -794,17 +794,31 @@ fn origin_host_is_ip(origin: &str) -> bool {
 ///
 /// Path-only in-process requests used by `tower::ServiceExt::oneshot` carry no
 /// Host header and are allowed; real network HTTP/1.1 requests present Host.
+fn is_github_webhook_post(request: &Request) -> bool {
+    if request.method() != Method::POST {
+        return false;
+    }
+    let path = request.uri().path();
+    path == "/api/hooks/github"
+        || path
+            .strip_prefix("/api/repos/")
+            .and_then(|rest| rest.strip_suffix("/hooks/github"))
+            .is_some_and(|repo_id| !repo_id.is_empty() && !repo_id.contains('/'))
+}
+
 async fn require_host(State(gate): State<HostGate>, request: Request, next: Next) -> Response {
-    if let Some(host) = request.headers().get(header::HOST) {
-        if !host
-            .to_str()
-            .is_ok_and(|h| host_allowed(h, gate.bind_is_loopback))
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "invalid host" })),
-            )
-                .into_response();
+    if !is_github_webhook_post(&request) {
+        if let Some(host) = request.headers().get(header::HOST) {
+            if !host
+                .to_str()
+                .is_ok_and(|h| host_allowed(h, gate.bind_is_loopback))
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "invalid host" })),
+                )
+                    .into_response();
+            }
         }
     }
     next.run(request).await

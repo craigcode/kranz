@@ -371,15 +371,20 @@ fn copy_untracked(
 /// `fresh`, the detail naming the cost.
 fn warm_target(session_root: &Path, snapshot_root: &Path) -> (TargetCopyTier, Option<String>) {
     let src = session_root.join("target");
-    if !src.is_dir() {
+    let Ok(meta) = std::fs::symlink_metadata(&src) else {
+        return (TargetCopyTier::Absent, None);
+    };
+    if !meta.file_type().is_dir() {
         return (TargetCopyTier::Absent, None);
     }
     let dst = snapshot_root.join("target");
-    if copy_dir_clonefile(&src, &dst) {
-        return (TargetCopyTier::Clonefile, None);
-    }
-    if copy_dir_reflink(&src, &dst) {
-        return (TargetCopyTier::Reflink, None);
+    if target_tree_safe_for_fast_clone(&src) {
+        if copy_dir_clonefile(&src, &dst) {
+            return (TargetCopyTier::Clonefile, None);
+        }
+        if copy_dir_reflink(&src, &dst) {
+            return (TargetCopyTier::Reflink, None);
+        }
     }
     let bytes = dir_size_bytes(&src);
     match pick_plain_or_fresh(bytes) {
@@ -408,7 +413,75 @@ fn warm_target(session_root: &Path, snapshot_root: &Path) -> (TargetCopyTier, Op
     }
 }
 
-/// `cp -c -R src dst` (APFS clonefile). `false` on any failure — non-macOS
+/// Pre-walk `src` using `cap_std` (`open_dir_nofollow` / `FollowSymlinks::No`)
+/// before handing the tree to `cp -c` / `cp --reflink=always`. Returns `false`
+/// if any entry is a symlink, a non-regular file (FIFO/socket/device), or (on
+/// Unix) a regular file with `nlink > 1`, so fast CoW clones never preserve a
+/// worker-planted symlink or hardlink into the validator snapshot.
+fn target_tree_safe_for_fast_clone(src: &Path) -> bool {
+    use cap_fs_ext::DirExt as _;
+    let Ok((src_parent, src_name)) = crate::paths::open_parent_nofollow(src) else {
+        return false;
+    };
+    let Ok(source) = src_parent.open_dir_nofollow(src_name) else {
+        return false;
+    };
+    dir_safe_for_fast_clone(&source)
+}
+
+fn dir_safe_for_fast_clone(dir: &cap_std::fs::Dir) -> bool {
+    use cap_fs_ext::{DirExt as _, OpenOptionsFollowExt as _};
+    use cap_primitives::fs::FollowSymlinks;
+    let Ok(entries) = dir.entries() else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        let name = entry.file_name();
+        if kind.is_dir() {
+            let Ok(child) = dir.open_dir_nofollow(&name) else {
+                return false;
+            };
+            if !dir_safe_for_fast_clone(&child) {
+                return false;
+            }
+        } else if kind.is_file() {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let Ok(file) = dir.open_with(&name, &options) else {
+                return false;
+            };
+            let Ok(metadata) = file.into_std().metadata() else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.nlink() > 1 {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// `cp -c -R -P src dst` (APFS clonefile). `false` on any failure — non-macOS
 /// `cp` has no `-c`, and a non-APFS volume makes clonefile itself fail — so
 /// the caller falls through to the next tier. A partial copy is swept
 /// before returning `false`. Never shares or links the source: the clone is
@@ -416,14 +489,14 @@ fn warm_target(session_root: &Path, snapshot_root: &Path) -> (TargetCopyTier, Op
 /// cache seeding ([`crate::agent_env`]), which seeds per-env copies of the
 /// operator's registry/git caches through the same tier order.
 pub(crate) fn copy_dir_clonefile(src: &Path, dst: &Path) -> bool {
-    run_cp(&["-c", "-R"], src, dst)
+    run_cp(&["-c", "-R", "-P"], src, dst)
 }
 
-/// `cp --reflink=always -R src dst` (GNU coreutils). `always` (not `auto`)
+/// `cp --reflink=always -R -P src dst` (GNU coreutils). `always` (not `auto`)
 /// so a non-reflink filesystem FAILS LOUDLY here and the caller falls
 /// through to the size-capped plain copy instead of silently paying one.
 pub(crate) fn copy_dir_reflink(src: &Path, dst: &Path) -> bool {
-    run_cp(&["--reflink=always", "-R"], src, dst)
+    run_cp(&["--reflink=always", "-R", "-P"], src, dst)
 }
 
 fn run_cp(extra_flags: &[&str], src: &Path, dst: &Path) -> bool {
@@ -948,5 +1021,55 @@ mod tests {
                 "a fast tier won on this clone-capable host: the copy exists"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_target_refuses_symlinked_top_level_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let snap = dir.path().join("snap");
+        let outside = dir.path().join("outside-target");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "host-secret").unwrap();
+        std::os::unix::fs::symlink(&outside, session.join("target")).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+
+        let (tier, detail) = warm_target(&session, &snap);
+        assert_eq!(tier, TargetCopyTier::Absent, "got {tier:?} ({detail:?})");
+        assert!(
+            std::fs::symlink_metadata(snap.join("target")).is_err(),
+            "symlinked top-level target must not be copied into snapshot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_target_refuses_fast_clone_and_plain_copy_when_nested_symlink_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let snap = dir.path().join("snap");
+        let outside_file = dir.path().join("outside-target.txt");
+        std::fs::write(&outside_file, "outside-bytes").unwrap();
+        std::fs::create_dir_all(session.join("target/sub")).unwrap();
+        std::fs::write(session.join("target/sub/ok.rlib"), "ok-bytes").unwrap();
+        std::os::unix::fs::symlink(&outside_file, session.join("target/sub/exfil")).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+
+        assert!(
+            !target_tree_safe_for_fast_clone(&session.join("target")),
+            "pre-walk must reject a target tree containing a nested symlink"
+        );
+        let (tier, detail) = warm_target(&session, &snap);
+        assert_eq!(
+            tier,
+            TargetCopyTier::Fresh,
+            "nested symlink inside target must refuse warm copy and fall back to Fresh, got {tier:?} ({detail:?})"
+        );
+        assert!(
+            std::fs::symlink_metadata(snap.join("target")).is_err(),
+            "failed warm_target must leave no target/ in snapshot"
+        );
     }
 }

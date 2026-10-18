@@ -366,11 +366,16 @@ fn drain_lines<W: std::io::Write>(
     sink: &mut W,
     buffer: &mut Vec<BufferedLine>,
 ) -> std::io::Result<()> {
-    while !buffer.is_empty() {
-        sink.write_all(buffer[0].line.as_bytes())?;
-        buffer.remove(0);
-    }
-    Ok(())
+    let mut written = 0;
+    let res = (|| {
+        for item in buffer.iter() {
+            sink.write_all(item.line.as_bytes())?;
+            written += 1;
+        }
+        Ok(())
+    })();
+    buffer.drain(..written);
+    res
 }
 
 fn ensure_absent_or_regular_at(dir: &Dir, name: &str, display: &Path) -> Result<()> {
@@ -694,7 +699,6 @@ impl EventLog {
         // Seal AFTER scrubbing, so the chain covers the bytes that actually
         // land on disk rather than the pre-redaction event.
         let (mut line, hash) = seal_line(&event, &self.prev_hash, self.authority_key.as_deref())?;
-        self.prev_hash = hash;
         line.push('\n');
 
         if event.kind.is_stream_delta() {
@@ -720,6 +724,7 @@ impl EventLog {
             }
         }
 
+        self.prev_hash = hash;
         self.next_seq += 1;
         Ok((event, findings))
     }
@@ -790,6 +795,9 @@ impl EventLog {
         let mut bytes = Vec::new();
         crate::paths::open_read_nofollow(path)?.read_to_end(&mut bytes)?;
         let parsed = Self::parse_log_bytes(&bytes, path)?;
+        if let Some((root, mission)) = log_identity(path) {
+            check_no_rollback(&MissionPaths::new(root, mission), &parsed.events)?;
+        }
         bytes.truncate(parsed.valid_len as usize);
         Ok((parsed.events, bytes))
     }
@@ -845,6 +853,8 @@ impl EventLog {
         let seal_floor = identity
             .and_then(|(root, mission)| crate::paths::read_seal_floor(root, mission))
             .unwrap_or(u64::MAX);
+        let high_water =
+            identity.and_then(|(root, mission)| crate::paths::read_high_water(root, mission));
         let mut events = Vec::new();
         let mut valid_len: usize = 0;
         let mut terminated = true;
@@ -861,11 +871,13 @@ impl EventLog {
                 None => (rest.len(), rest.len()),
             };
             let is_final = offset + step == bytes.len();
+            let expected = events.len() as u64 + 1;
+            let can_drop_torn_final = is_final && high_water.is_none_or(|hw_seq| expected > hw_seq);
             let line = String::from_utf8_lossy(&rest[..line_end]);
             let mut value: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(err) => {
-                    if is_final {
+                    if can_drop_torn_final {
                         tracing::warn!(
                             path = %path.display(),
                             line = line_no,
@@ -913,7 +925,7 @@ impl EventLog {
             let event: Event = match serde_json::from_value(value) {
                 Ok(e) => e,
                 Err(err) => {
-                    if is_final {
+                    if can_drop_torn_final {
                         tracing::warn!(
                             path = %path.display(),
                             line = line_no,
@@ -929,7 +941,6 @@ impl EventLog {
                     )));
                 }
             };
-            let expected = events.len() as u64 + 1;
             if event.seq != expected {
                 return Err(EngineError::LogCorruption(format!(
                     "seq discontinuity at {}:{}: expected {expected}, found {}",

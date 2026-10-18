@@ -133,6 +133,13 @@ fn seed_kimi_scratch_home(
     let home = scratch_root.join("home");
     let kimi_dir = home.join(".kimi-code");
     std::fs::create_dir_all(&kimi_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [scratch_root, home.as_path(), kimi_dir.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
     if let Some(real_home) = real_home {
         let source = real_home.join(".kimi-code");
         for entry in KIMI_SEED_ENTRIES {
@@ -140,6 +147,11 @@ fn seed_kimi_scratch_home(
             let dst = kimi_dir.join(entry);
             if src.is_file() {
                 std::fs::copy(&src, &dst)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+                }
             } else if src.is_dir() {
                 copy_dir_recursive(&src, &dst)?;
             }
@@ -152,6 +164,11 @@ fn seed_kimi_scratch_home(
 /// are skipped rather than followed).
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))?;
+    }
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -160,6 +177,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if file_type.is_file() {
             std::fs::copy(entry.path(), &target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+            }
         }
     }
     Ok(())

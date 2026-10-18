@@ -2933,6 +2933,8 @@ impl MissionEngine {
                             interrupt: false,
                             ..
                         }
+                        | ControlCommand::ConfigChange { .. }
+                        | ControlCommand::AnswerQuestion { .. }
                 ) {
                     // Finish owned workers before a control can revise policy or
                     // start another model turn. Leave this and later inbox files
@@ -5673,7 +5675,7 @@ impl MissionEngine {
             // Flight Rules (KRZ-345): the approved standards pin projects the
             // validation-stage rules into the validator prompt.
             let standards_pin = self.state.mission.standards_manifest.clone();
-            let outcome = runner::run_validator_in(
+            let outcome = Box::pin(runner::run_validator_in(
                 backend.as_ref(),
                 &mut self.log,
                 &self.paths,
@@ -5693,7 +5695,7 @@ impl MissionEngine {
                 runtime_evidence.as_deref(),
                 validator_sandbox,
                 standards_pin.as_ref(),
-            )
+            ))
             .await;
             let caught = self.catch_up();
             let mut outcome = outcome?;
@@ -5806,7 +5808,7 @@ impl MissionEngine {
                 // rules the primary session resolved.
                 let retry_validator_sandbox =
                     self.validator_containment(role, retry_kind, &retry_cfg, &retry_session_cwd)?;
-                let retry_outcome = runner::run_validator_in(
+                let retry_outcome = Box::pin(runner::run_validator_in(
                     retry_backend.as_ref(),
                     &mut self.log,
                     &self.paths,
@@ -5826,7 +5828,7 @@ impl MissionEngine {
                     runtime_evidence.as_deref(),
                     retry_validator_sandbox,
                     standards_pin.as_ref(),
-                )
+                ))
                 .await;
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
@@ -5925,24 +5927,23 @@ impl MissionEngine {
                     // command-assertion PASS.
                     || (!has_command_assertions && report.findings.is_empty());
                 if needs_confirm {
-                    match self
-                        .confirm_local_functional_pass(
-                            &milestone_id,
-                            role,
-                            &milestone,
-                            &contract,
-                            &start_sha,
-                            base_sha.as_deref(),
-                            &grants,
-                            &egress_grants,
-                            &worker_commands,
-                            contract_results.as_deref(),
-                            runtime_evidence.as_deref(),
-                            &outcome.run_id,
-                            &report,
-                            &passed_command_ids,
-                        )
-                        .await?
+                    match Box::pin(self.confirm_local_functional_pass(
+                        &milestone_id,
+                        role,
+                        &milestone,
+                        &contract,
+                        &start_sha,
+                        base_sha.as_deref(),
+                        &grants,
+                        &egress_grants,
+                        &worker_commands,
+                        contract_results.as_deref(),
+                        runtime_evidence.as_deref(),
+                        &outcome.run_id,
+                        &report,
+                        &passed_command_ids,
+                    ))
+                    .await?
                     {
                         Some(disagreements) => findings.extend(disagreements),
                         // The round blocked honestly (an untrusted
@@ -6008,7 +6009,7 @@ impl MissionEngine {
         // findings — an all-waived answer completes the milestone where the
         // old flow would have blocked on trivia.
         let findings: Vec<Finding> = findings.into_iter().map(|(_, f)| f).collect();
-        match self.convert_findings(&milestone_id, &findings).await? {
+        match Box::pin(self.convert_findings(&milestone_id, &findings)).await? {
             // validation_round findings never carry class=="command-assertion",
             // so convert_findings' escape-hatch guard makes this practically
             // unreachable here; handle it defensively rather than panic.

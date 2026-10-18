@@ -275,6 +275,50 @@ impl HookStatusSpec {
         serde_json::from_str(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// Write the spec file with owner-only permissions (`0o700` on the
+    /// parent directory, `0o600` + `O_NOFOLLOW` on the spec file on Unix)
+    /// so the per-run capability token is not world-readable in `/tmp`.
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                if let Some(root) = dir.parent() {
+                    if root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("kranz-session-"))
+                    {
+                        let _ =
+                            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+                    }
+                }
+            }
+        }
+        let spec_text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(spec_text.as_bytes())?;
+            file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, spec_text)
+        }
+    }
 }
 
 /// The runner-side seed carried on the session spec: what the backend
@@ -352,11 +396,7 @@ pub fn install_cursor_hook_status(
         run_id: seed.run_id.clone(),
     };
     let spec_path = spec_file(session_id);
-    if let Some(parent) = spec_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let spec_text = serde_json::to_string_pretty(&spec).map_err(std::io::Error::other)?;
-    std::fs::write(&spec_path, spec_text)?;
+    spec.write(&spec_path)?;
 
     let exe = std::env::current_exe()?;
     let command = format!(
@@ -366,6 +406,11 @@ pub fn install_cursor_hook_status(
     );
     let cursor_dir = session_home.join(".cursor");
     std::fs::create_dir_all(&cursor_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&cursor_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let hooks_text = serde_json::to_string_pretty(&cursor_hooks_json(&command))
         .map_err(std::io::Error::other)?;
     std::fs::write(cursor_dir.join("hooks.json"), hooks_text)
@@ -629,23 +674,38 @@ pub fn signal_post_for(spec: &HookStatusSpec, payload: &Value) -> Option<SignalP
 /// hook-status`) verbatim — no path munging here; config validation owns
 /// its shape.
 pub fn endpoint_is_loopback_http(endpoint: &str) -> bool {
+    if endpoint.contains('\\') {
+        return false;
+    }
     let Some(rest) = endpoint
         .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
     else {
         return false;
     };
-    let authority = rest.split('/').next().unwrap_or("");
-    // Bracketed v6 literals carry their own ':'s — split them off first.
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        match bracketed.split_once(']') {
-            Some((host, _)) => host,
-            None => return false,
-        }
-    } else {
-        authority.split(':').next().unwrap_or("")
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(endpoint) else {
+        return false;
     };
-    host == "localhost"
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
@@ -1011,12 +1071,38 @@ mod tests {
         for bad in [
             "http://example.com/api/hook-status",
             "http://192.168.1.5/api/hook-status",
+            concat!("http://127.0.0.1", ":4560@attacker.com/api/hook-status"),
+            "http://attacker.com\\@127.0.0.1:4560/api/hook-status",
+            "http://user@127.0.0.1:4560/api/hook-status",
+            "http://127.0.0.1:4560/api/hook-status?x=1",
+            "http://127.0.0.1:4560/api/hook-status#frag",
             "ftp://127.0.0.1/x",
             "127.0.0.1:4560/api/hook-status",
             "",
         ] {
             assert!(!endpoint_is_loopback_http(bad), "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_status_spec_write_enforces_0700_dir_and_0600_file_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("hook-status");
+        let spec_path = sub.join("spec.json");
+        let spec = HookStatusSpec {
+            version: SPEC_VERSION,
+            endpoint: "http://127.0.0.1:4560/api/hook-status".to_string(),
+            token: "example-placeholder".to_string(),
+            mission_id: "m-1".to_string(),
+            run_id: "r-1".to_string(),
+        };
+        spec.write(&spec_path).unwrap();
+        let dir_mode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&spec_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     /// The config resolution: disabled or endpoint-less means NO lane.
