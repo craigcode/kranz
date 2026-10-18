@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-acp"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-dashboard"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "kranz-engine",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-engine"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-server"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "axum",
