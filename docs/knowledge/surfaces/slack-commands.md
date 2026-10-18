@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-10-18
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: plain-text button labels use control-character escaping, slug lengths are bounded, and ask sessions run with read/write tools disabled. Command routing and allowlists are unchanged.
 
 Rechecked 2026-09-26: permission cards render control characters visibly and omit Allow for ambiguous requests. Existing authenticated routing and exact binding checks remain in force.
 
