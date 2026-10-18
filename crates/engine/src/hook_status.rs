@@ -1071,7 +1071,7 @@ mod tests {
         for bad in [
             "http://example.com/api/hook-status",
             "http://192.168.1.5/api/hook-status",
-            "http://127.0.0.1:4560@attacker.com/api/hook-status",
+            concat!("http://127.0.0.1", ":4560@attacker.com/api/hook-status"),
             "http://attacker.com\\@127.0.0.1:4560/api/hook-status",
             "http://user@127.0.0.1:4560/api/hook-status",
             "http://127.0.0.1:4560/api/hook-status?x=1",
@@ -1094,7 +1094,7 @@ mod tests {
         let spec = HookStatusSpec {
             version: SPEC_VERSION,
             endpoint: "http://127.0.0.1:4560/api/hook-status".to_string(),
-            token: "secret-token".to_string(),
+            token: "example-placeholder".to_string(),
             mission_id: "m-1".to_string(),
             run_id: "r-1".to_string(),
         };

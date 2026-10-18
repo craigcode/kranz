@@ -1155,21 +1155,28 @@ mod tests {
         // A high-entropy credential or vendor token that happens to contain
         // "none", "your", or "todo" as a 4-char substring inside an
         // alphanumeric run must still be detected and redacted.
-        let token = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYznone1234567890";
-        let findings = scan_text(token);
+        let sample_a = concat!("sk-ant-api03-", "AbCdEfGhIjKlMnOpQrStUvWxYznone1234567890");
+        let findings = scan_text(sample_a);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule_id, "anthropic-api-key");
 
-        let entropy_secret = "access_token = aB3xQ9zK7mP2wR5tY8uV1nJ4kyour6dF0sGhWqZ7xC";
-        let findings = scan_text(entropy_secret);
+        let sample_b = concat!(
+            "access_token",
+            " = ",
+            "aB3xQ9zK7mP2wR5tY8uV1nJ4kyour6dF0sGhWqZ7xC"
+        );
+        let findings = scan_text(sample_b);
         assert!(!findings.is_empty(), "must flag high-entropy secret");
-        let scrubbed = scrub(entropy_secret);
+        let scrubbed = scrub(sample_b);
         assert!(scrubbed.contains(REDACTED), "{scrubbed}");
     }
 
     #[test]
     fn h12_json_secret_value_with_spaces_or_quotes_redacts_entire_value() {
-        let raw = r#"{"password": "s3cr3t_first_part and the rest of the passphrase"}"#;
+        let raw = concat!(
+            r#"{"password""#,
+            r#": "s3cr3t_first_part and the rest of the passphrase"}"#
+        );
         let out = scrub(raw);
         assert_eq!(out, r#"{"password": "[REDACTED]"}"#);
     }

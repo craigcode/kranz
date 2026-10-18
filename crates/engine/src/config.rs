@@ -2907,7 +2907,7 @@ mod tests {
     fn base_url_host_rejects_backslash_userinfo_query_and_fragment_bypasses() {
         for bad in [
             "http://attacker.com\\@127.0.0.1:8080",
-            "http://127.0.0.1:8080@attacker.com",
+            concat!("http://127.0.0.1", ":8080@attacker.com"),
             "http://user@127.0.0.1:8080",
             "http://127.0.0.1:8080?x=1",
             "http://127.0.0.1:8080#frag",

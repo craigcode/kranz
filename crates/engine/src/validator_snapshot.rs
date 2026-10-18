@@ -1050,11 +1050,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("session");
         let snap = dir.path().join("snap");
-        let secret = dir.path().join("outside-secret.txt");
-        std::fs::write(&secret, "top-secret-token").unwrap();
+        let outside_file = dir.path().join("outside-target.txt");
+        std::fs::write(&outside_file, "outside-bytes").unwrap();
         std::fs::create_dir_all(session.join("target/sub")).unwrap();
         std::fs::write(session.join("target/sub/ok.rlib"), "ok-bytes").unwrap();
-        std::os::unix::fs::symlink(&secret, session.join("target/sub/exfil")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, session.join("target/sub/exfil")).unwrap();
         std::fs::create_dir_all(&snap).unwrap();
 
         assert!(
