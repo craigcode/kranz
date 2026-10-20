@@ -322,9 +322,10 @@ jobs:
       # bugs for the life of this lane. `test_capability::skip` panics instead
       # of skipping when the missing capability is listed here.
       #
-      # Windows deliberately omits `container`: the provider is supported only
-      # on Linux and session and gate resolution fail closed elsewhere. It also
-      # omits `bwrap` (Linux-only) and `sandbox-exec` (macOS-only).
+      # Windows deliberately omits `container`: the provider fails closed on
+      # Windows because the POSIX guest-path and `/dev/null` authority-mask
+      # contract does not hold there. It also omits `bwrap` (Linux-only) and
+      # `sandbox-exec` (macOS-only).
       - run: cargo test --workspace --no-fail-fast
         env:
           KRANZ_REQUIRED_CAPABILITIES: >-
@@ -419,13 +420,14 @@ jobs:
         run: |
           git config --global user.name kranz-ci
           git config --global user.email ci@kranz.local
-      # The supported macOS boundary is native Seatbelt. GitHub-hosted macOS
+      # The CI-proven macOS boundary is native Seatbelt. GitHub-hosted macOS
       # runners do not expose the virtualization needed by VM-backed container
-      # runtimes, so container support is live-proven and required on Linux
-      # only; macOS container configuration fails closed in the engine.
+      # runtimes, so `container` is omitted from KRANZ_REQUIRED_CAPABILITIES on
+      # hosted macOS while the engine proves declared bind-mount roots at run
+      # time on operator macOS hosts (`sandbox_container::mount_proof`).
       - run: cargo test --workspace --no-fail-fast
         env:
-          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec
+          KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec,keychain
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
       - name: Check bounded ACP probe with a synthetic peer
         if: runner.os != 'Windows'

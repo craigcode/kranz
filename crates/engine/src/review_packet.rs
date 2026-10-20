@@ -33,6 +33,7 @@ pub struct ReviewPacket {
     pub decisions: Vec<Entry>,
     pub evaluations: Vec<Evaluation>,
     pub baseline_candidates: Vec<crate::contract_controls::pair::Review>,
+    pub contract_readbacks: Vec<crate::contract_controls::readback::Review>,
     pub history: Vec<Entry>,
     pub unknowns: Vec<String>,
 }
@@ -194,6 +195,7 @@ pub fn project(
         decisions: vec![],
         evaluations: vec![],
         baseline_candidates: vec![],
+        contract_readbacks: vec![],
         history: vec![],
         unknowns: vec![],
     };
@@ -457,6 +459,15 @@ pub fn project(
         &state.config,
         &mut budget,
     );
+    packet.contract_readbacks = crate::contract_controls::readback::reviews_with_budget(
+        mission_dir,
+        events,
+        repo,
+        approved
+            .map(|(_, p)| p.validation_contract.as_slice())
+            .unwrap_or(&[]),
+        &mut budget,
+    );
     if records.is_empty() {
         packet.unknowns.push("No source-bound external check receipts recorded. Native gate outcomes below are recorded results, not proof of a current pass.".into());
     }
@@ -464,7 +475,9 @@ pub fn project(
     for event in events {
         let entry = match &event.kind {
             EventKind::GateResult { gate, surface, verdict, artefact_ref, artefact_detail, .. } => {
-                if packet.baseline_candidates.iter().any(|pair| pair.seq == event.seq) {
+                if packet.baseline_candidates.iter().any(|pair| pair.seq == event.seq)
+                    || packet.contract_readbacks.iter().any(|rb| rb.seq == event.seq)
+                {
                     continue;
                 }
                 let availability = match crate::gate_results::resolve_artefact(mission_dir, artefact_ref) {
@@ -947,6 +960,45 @@ pub fn render_markdown(packet: &ReviewPacket) -> String {
                 } else {
                     "unavailable"
                 }
+            );
+        }
+    }
+    if !packet.contract_readbacks.is_empty() {
+        out.push_str("\n### Contract read-back and operator comparison\n");
+        for rb in &packet.contract_readbacks {
+            let s = &rb.summary;
+            let _ = writeln!(
+                out,
+                "\n#### {} — read-back {} · disposition {} (advisory)\n\n{}\n\n- Original claim: {}\n- Executable check: {}\n- Read-back summary: {}\n- Exercised: {}\n- Asserted: {}\n- Assumptions: {}\n- Omissions: {}\n- Input isolation: input {} · prompt {} · goal_excluded={} · statement_excluded={}\n- Control outcome: {}\n\nRetained evidence: {} · event #{} · {} · {}.\n",
+                literal(&s.assertion_id),
+                name(&s.translation.status),
+                name(&rb.effective_disposition),
+                literal(&rb.detail),
+                literal(&s.original_claim),
+                literal(&s.command),
+                literal(&s.translation.summary),
+                literal(&s.translation.exercised.join("; ")),
+                literal(&s.translation.asserted.join("; ")),
+                literal(&s.translation.assumptions.join("; ")),
+                literal(&s.translation.omissions.join("; ")),
+                literal(&s.input_isolation.input_sha256),
+                literal(&s.input_isolation.prompt_sha256),
+                s.input_isolation.goal_excluded,
+                s.input_isolation.statement_excluded,
+                literal(
+                    &s.control_outcome
+                        .as_ref()
+                        .map(|c| format!("{} (expected failure: {})", name(&c.status), c.expected_failure))
+                        .unwrap_or_else(|| "none".into())
+                ),
+                literal(&rb.reference),
+                rb.seq,
+                if rb.available {
+                    "digest verified"
+                } else {
+                    "unavailable"
+                },
+                if rb.fresh { "fresh" } else { "stale" }
             );
         }
     }

@@ -26,9 +26,12 @@
 //!
 //! CI declares per-platform expectations rather than asserting a skip list
 //! after the fact: ubuntu requires `git,bwrap,container,grep`, macOS requires
-//! `git,sandbox-exec`, and Windows requires `git`. macOS and Windows omit
-//! `container` — the provider is supported only on Linux and session and gate
-//! resolution fail closed elsewhere.
+//! `git,sandbox-exec,keychain`, and Windows requires `git`. Hosted macOS omits
+//! `container` because GitHub-hosted macOS runners do not expose nested
+//! virtualization for VM-backed container runtimes (the engine instead proves
+//! declared bind-mount roots at run time on non-Linux POSIX hosts via
+//! `sandbox_container::mount_proof`), and Windows omits `container` because the
+//! provider fails closed on Windows.
 
 /// Environment variable naming the capabilities that MUST be present.
 /// Comma-separated; matching is exact and case-insensitive.
@@ -63,10 +66,11 @@ pub mod capability {
     /// POSIX `grep`, for the assertions that are ABOUT its exit-status
     /// semantics and cannot be rewritten portably.
     pub const GREP: &str = "grep";
-    /// macOS `security` able to CREATE a login keychain under a relocated
-    /// HOME. The GitHub macOS runner image 20260831.0337.3 broke this
-    /// (image 20260728.0273.1 did not); the cursor keychain tests probe it
-    /// and skip rather than report a runner regression as a code failure.
+    /// macOS `security` able to create and unlock a session login keychain
+    /// under a relocated HOME (`kranz-session.keychain-db` with
+    /// `login.keychain-db` symlinked to it). Required in the un-wrapped
+    /// `rust-macos` CI lane; skips cleanly inside Seatbelt-wrapped runs where
+    /// `securityd` refuses unlock operations.
     pub const KEYCHAIN: &str = "keychain";
 }
 
