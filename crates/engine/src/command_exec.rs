@@ -195,7 +195,21 @@ pub(crate) fn run_with_timeout_env(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().ok()?;
+    let mut attempts = 0u32;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e)
+                if attempts < 10
+                    && (e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        || e.raw_os_error() == Some(26)) =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    };
     let stdout_reader = spawn_pipe_reader(child.stdout.take()?);
     let stderr_reader = spawn_pipe_reader(child.stderr.take()?);
     let start = std::time::Instant::now();
