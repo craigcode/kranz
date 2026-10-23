@@ -1746,13 +1746,13 @@ mod tests {
     /// against a db the seed JUST reported unlocked.
     /// Whether this host's `security` can seed a login keychain under a
     /// relocated HOME at all, probed by running the seed itself against a
-    /// throwaway HOME. On a host where it cannot (the GitHub macOS runner
-    /// image 20260831.0337.3 refuses it; 20260728.0273.1 did not; a
-    /// sandboxed developer shell refuses the unlock), the keychain tests
-    /// skip with the capability marker instead of reporting a runner
-    /// regression as a defect in the seed. `KRANZ_REQUIRED_CAPABILITIES`
-    /// can still demand it, in which case the skip is a panic that names
-    /// the missing capability.
+    /// throwaway HOME. `ensure_session_login_keychain` creates
+    /// `kranz-session.keychain-db` and symlinks `login.keychain-db` to it so
+    /// `securityd` on GitHub's `macos-26-arm64` (`20260831.0337.3`+) runner
+    /// image succeeds (`rust-macos` requires `keychain` via
+    /// `KRANZ_REQUIRED_CAPABILITIES`). Inside a Seatbelt-wrapped shell (such
+    /// as `rust-macos-wrapped-suite`), `securityd` refuses the unlock and the
+    /// keychain tests skip with the capability marker.
     #[cfg(target_os = "macos")]
     fn keychain_can_be_created() -> bool {
         let home = tempfile::tempdir().unwrap();

@@ -674,6 +674,7 @@ impl EventLog {
 
     /// Append one event after scanning/redacting string payloads. Returns the
     /// sanitized event plus secret findings (fingerprints only, never values).
+    #[inline(never)]
     pub fn append_redacting(&mut self, kind: EventKind) -> Result<(Event, Vec<SecretFinding>)> {
         // Fail closed if another process stole the lock out from under us —
         // otherwise two engines dual-write one log (seq gaps / corruption).
@@ -687,7 +688,7 @@ impl EventLog {
             )));
         }
 
-        let event = Event {
+        let mut event = Event {
             seq: self.next_seq,
             ts: Utc::now(),
             mission_id: self.mission_id.clone(),
@@ -695,7 +696,9 @@ impl EventLog {
         };
         let mut value = serde_json::to_value(&event)?;
         let findings = crate::scrub::scrub_json_value(&mut value, "event");
-        let event: Event = serde_json::from_value(value)?;
+        if !findings.is_empty() {
+            event = serde_json::from_value(value)?;
+        }
         // Seal AFTER scrubbing, so the chain covers the bytes that actually
         // land on disk rather than the pre-redaction event.
         let (mut line, hash) = seal_line(&event, &self.prev_hash, self.authority_key.as_deref())?;

@@ -226,8 +226,18 @@ pub enum PlanRequest {
 struct SelectedBackend {
     backend: Arc<dyn AgentBackend>,
     kind: BackendKind,
-    cfg: MissionConfig,
+    cfg: Arc<MissionConfig>,
     fallback_reason: Option<String>,
+}
+
+/// Construct and heap-pin a stage future inside a non-inline synchronous
+/// frame so unoptimized (`opt-level = 0`) callers do not reserve an `alloca`
+/// for the unboxed `Future` temporary across the entire parent `poll()` frame.
+#[inline(never)]
+pub(crate) fn box_future<'a, T: 'a, F: std::future::Future<Output = T> + Send + 'a>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>> {
+    Box::pin(make())
 }
 
 /// The parallelization decision for one milestone (roadmap M3): which of the
@@ -788,15 +798,21 @@ impl MissionEngine {
     /// secret-shaped substrings inside string payloads, which no
     /// fold-validity rule keys on — a payload id literally shaped like an API
     /// key is the pathological exception, accepted and documented.
-    pub(crate) fn emit(&mut self, kind: EventKind) -> Result<Event> {
+    #[inline(never)]
+    pub(crate) fn emit(&mut self, kind: EventKind) -> Result<()> {
+        self.emit_event(kind).map(|_| ())
+    }
+
+    #[inline(never)]
+    pub(crate) fn emit_event(&mut self, kind: EventKind) -> Result<Event> {
         if !kind.is_stream_delta() {
-            let mut probe = self.state.clone();
-            let probe_event = Event {
+            let mut probe = Box::new(self.state.clone());
+            let probe_event = Box::new(Event {
                 seq: self.state.last_seq + 1,
                 ts: chrono::Utc::now(),
                 mission_id: self.paths.mission_id.clone(),
                 kind: kind.clone(),
-            };
+            });
             reducer::apply(&mut probe, &probe_event)?;
         }
         let (event, audits) = self.log.append_with_redaction_audits(kind)?;
@@ -865,7 +881,7 @@ impl MissionEngine {
                 SelectedBackend {
                     backend: Arc::clone(&self.backend),
                     kind: BackendKind::Claude,
-                    cfg,
+                    cfg: Arc::new(cfg),
                     fallback_reason: None,
                 }
             }
@@ -880,7 +896,7 @@ impl MissionEngine {
                 SelectedBackend {
                     backend,
                     kind: requested,
-                    cfg,
+                    cfg: Arc::new(cfg),
                     fallback_reason: None,
                 }
             }
@@ -891,7 +907,7 @@ impl MissionEngine {
                         SelectedBackend {
                             backend,
                             kind: requested,
-                            cfg,
+                            cfg: Arc::new(cfg),
                             fallback_reason: None,
                         }
                     }
@@ -906,7 +922,7 @@ impl MissionEngine {
                         SelectedBackend {
                             backend: Arc::clone(&self.backend),
                             kind: BackendKind::Claude,
-                            cfg,
+                            cfg: Arc::new(cfg),
                             fallback_reason: Some(format!(
                                 "{} backend requested for the {role_name} but not available \
                                  ({err}); falling back to the claude {role_name}",
@@ -1034,7 +1050,7 @@ impl MissionEngine {
         Ok(SelectedBackend {
             backend,
             kind,
-            cfg,
+            cfg: Arc::new(cfg),
             fallback_reason: None,
         })
     }
@@ -1572,7 +1588,7 @@ impl MissionEngine {
             version: workspace_pin.version,
         })?;
 
-        let approved_event = self.emit(EventKind::PlanApproved {
+        let approved_event = self.emit_event(EventKind::PlanApproved {
             plan,
             base_sha: Some(base_sha),
         })?;
@@ -2712,7 +2728,7 @@ impl MissionEngine {
             }
         }
 
-        let result = self.run_loop(&*provider).await;
+        let result = box_future(|| self.run_loop(&*provider)).await;
 
         // Provider teardown seam (design D-E, ticket
         // workspace-idle-hibernate): a TERMINAL run (Complete/Failed/
@@ -2797,13 +2813,13 @@ impl MissionEngine {
         // (idempotent-by-contract, see workspace_provider docs). No contract
         // ⇒ byte-identical behavior plus the additive workspace.provisioned
         // lifecycle event.
-        if let Some(status) = self.provision_workspace(provider).await? {
+        if let Some(status) = box_future(|| self.provision_workspace(provider)).await? {
             return Ok(status);
         }
 
         loop {
             // (a) drain the control inbox.
-            Box::pin(self.drain_control()).await?;
+            box_future(|| self.drain_control()).await?;
 
             match self.state.mission.status {
                 MissionStatus::Complete => return Ok(MissionStatus::Complete),
@@ -2853,7 +2869,7 @@ impl MissionEngine {
 
             // (d) first incomplete milestone; none → final gate (h).
             let Some(mi) = first_incomplete(&self.state) else {
-                match Box::pin(self.final_gate()).await? {
+                match box_future(|| self.final_gate()).await? {
                     Some(status) => return Ok(status),
                     None => continue,
                 }
@@ -2861,7 +2877,7 @@ impl MissionEngine {
 
             // (e) blocked milestone: only a queued user message can move it.
             if self.state.mission.milestones[mi].status == MilestoneStatus::Blocked {
-                match self.handle_blocked(mi).await? {
+                match box_future(|| self.handle_blocked(mi)).await? {
                     Some(status) => return Ok(status),
                     None => continue,
                 }
@@ -2869,7 +2885,7 @@ impl MissionEngine {
 
             // (c) queued user messages → consult the orchestrator.
             if !self.state.pending_user_messages.is_empty() {
-                self.consult_user_messages().await?;
+                box_future(|| self.consult_user_messages()).await?;
                 continue; // re-evaluate: the decision may precede config changes etc.
             }
 
@@ -2894,7 +2910,7 @@ impl MissionEngine {
             // any parallel code runs, so the sequential behaviour below is
             // exactly what it was pre-M3.
             if self.state.config.max_parallel_workers > 1
-                && Box::pin(self.try_parallel_batch(mi)).await?
+                && box_future(|| self.try_parallel_batch(mi)).await?
             {
                 continue;
             }
@@ -2902,8 +2918,8 @@ impl MissionEngine {
             match next_feature(&self.state.mission.milestones[mi]) {
                 // Keep each stage's state machine off the enclosing mission
                 // future's stack, including on Windows runtime threads.
-                Some(fi) => Box::pin(self.run_feature(mi, fi)).await?,
-                None => Box::pin(self.validation_round(mi)).await?,
+                Some(fi) => box_future(|| self.run_feature(mi, fi)).await?,
+                None => box_future(|| self.validation_round(mi)).await?,
             }
         }
     }
@@ -3414,7 +3430,7 @@ impl MissionEngine {
         // pool (or the validated-away 1-entry list) keeps the byte-for-byte
         // sequential path below.
         if self.state.config.worker_candidates.len() >= 2 {
-            return self.run_feature_dispatch_pool(mi, fi).await;
+            return box_future(|| self.run_feature_dispatch_pool(mi, fi)).await;
         }
         if self.state.mission.milestones[mi].features[fi].status == FeatureStatus::Pending {
             let feature_id = self.state.mission.milestones[mi].features[fi].id.clone();
@@ -3462,7 +3478,7 @@ impl MissionEngine {
             // per worker spawn. It is Claude-specific; non-Claude workers do
             // not need a Claude auth probe before launch.
             let auth_verdict = if selected_kind == BackendKind::Claude {
-                self.worker_auth_verdict().await
+                box_future(|| self.worker_auth_verdict()).await
             } else {
                 AuthVerdict::Inconclusive
             };
@@ -3480,27 +3496,30 @@ impl MissionEngine {
                 let paths = self.paths.clone();
                 let (relay, mut receiver) = self.permission_channel()?;
                 self.permission_cancel = Some(cancel.clone());
-                let future = runner::run_worker_in_buffered_controlled(
-                    backend.as_ref(),
-                    &paths,
-                    &cfg,
-                    &feature,
-                    &goal,
-                    &milestone_title,
-                    guidance.as_deref(),
-                    &session_cwd,
-                    base_sha.as_deref(),
-                    &grants,
-                    &egress_grants,
-                    &deny_exceptions,
-                    auth_verdict,
-                    &touch_set,
-                    executor_route.clone(),
-                    standards_pin.as_ref(),
-                    Some(relay),
-                    Some(cancel),
-                );
-                let result = self.drive_permission_worker(future, &mut receiver).await;
+                let future = box_future(|| {
+                    runner::run_worker_in_buffered_controlled(
+                        backend.as_ref(),
+                        &paths,
+                        &cfg,
+                        &feature,
+                        &goal,
+                        &milestone_title,
+                        guidance.as_deref(),
+                        &session_cwd,
+                        base_sha.as_deref(),
+                        &grants,
+                        &egress_grants,
+                        &deny_exceptions,
+                        auth_verdict,
+                        &touch_set,
+                        executor_route.clone(),
+                        standards_pin.as_ref(),
+                        Some(relay),
+                        Some(cancel),
+                    )
+                });
+                let result =
+                    box_future(|| self.drive_permission_worker(future, &mut receiver)).await;
                 self.permission_cancel = None;
                 self.close_permissions(None, "worker stopped; no response will be replayed")?;
                 match result {
@@ -3514,47 +3533,51 @@ impl MissionEngine {
                 }
             } else if self.state.config.isolation() == WorkerIsolation::Worktree {
                 let session_cwd = self.active_root().to_path_buf();
-                runner::run_worker_in(
-                    backend.as_ref(),
-                    &mut self.log,
-                    &self.paths,
-                    &cfg,
-                    &feature,
-                    &goal,
-                    &milestone_title,
-                    guidance.as_deref(),
-                    Some(cancel),
-                    &session_cwd,
-                    base_sha.as_deref(),
-                    &grants,
-                    &egress_grants,
-                    &deny_exceptions,
-                    auth_verdict,
-                    &touch_set,
-                    executor_route.clone(),
-                    standards_pin.as_ref(),
-                )
+                box_future(|| {
+                    runner::run_worker_in(
+                        backend.as_ref(),
+                        &mut self.log,
+                        &self.paths,
+                        &cfg,
+                        &feature,
+                        &goal,
+                        &milestone_title,
+                        guidance.as_deref(),
+                        Some(cancel),
+                        &session_cwd,
+                        base_sha.as_deref(),
+                        &grants,
+                        &egress_grants,
+                        &deny_exceptions,
+                        auth_verdict,
+                        &touch_set,
+                        executor_route.clone(),
+                        standards_pin.as_ref(),
+                    )
+                })
                 .await
             } else {
-                runner::run_worker(
-                    backend.as_ref(),
-                    &mut self.log,
-                    &self.paths,
-                    &cfg,
-                    &feature,
-                    &goal,
-                    &milestone_title,
-                    guidance.as_deref(),
-                    Some(cancel),
-                    base_sha.as_deref(),
-                    &grants,
-                    &egress_grants,
-                    &deny_exceptions,
-                    auth_verdict,
-                    &touch_set,
-                    executor_route.clone(),
-                    standards_pin.as_ref(),
-                )
+                box_future(|| {
+                    runner::run_worker(
+                        backend.as_ref(),
+                        &mut self.log,
+                        &self.paths,
+                        &cfg,
+                        &feature,
+                        &goal,
+                        &milestone_title,
+                        guidance.as_deref(),
+                        Some(cancel),
+                        base_sha.as_deref(),
+                        &grants,
+                        &egress_grants,
+                        &deny_exceptions,
+                        auth_verdict,
+                        &touch_set,
+                        executor_route.clone(),
+                        standards_pin.as_ref(),
+                    )
+                })
                 .await
             };
             watcher.abort();
@@ -3578,7 +3601,7 @@ impl MissionEngine {
 
             // Interrupt (or any queued command) → events now, so the
             // judgement digest reflects them.
-            self.drain_control().await?;
+            box_future(|| self.drain_control()).await?;
 
             // A permission-time pause has already stopped the owned worker.
             // Return to the run loop's idle park before any checkpoint, model
@@ -3618,7 +3641,9 @@ impl MissionEngine {
             }
 
             // §4.4 dirty-tree discipline (applies to interrupted runs too).
-            if !self.active_repo().is_clean()? && !self.resolve_dirty_tree(mi, &feature.id).await? {
+            if !self.active_repo().is_clean()?
+                && !box_future(|| self.resolve_dirty_tree(mi, &feature.id)).await?
+            {
                 return Ok(()); // orchestrator chose fail-feature
             }
             let commits = self.record_feature_progress(mi, fi, &feature_base_sha)?;
@@ -3677,8 +3702,7 @@ impl MissionEngine {
             let milestone_id = self.state.mission.milestones[mi].id.clone();
             self.emit_worker_questions(&milestone_id, &feature.id, &outcome)?;
 
-            match self
-                .judge_worker_run(&feature.id, &outcome, &commits, &diff_stat)
+            match box_future(|| self.judge_worker_run(&feature.id, &outcome, &commits, &diff_stat))
                 .await?
             {
                 JudgementOutcome::Complete => {
@@ -5675,27 +5699,29 @@ impl MissionEngine {
             // Flight Rules (KRZ-345): the approved standards pin projects the
             // validation-stage rules into the validator prompt.
             let standards_pin = self.state.mission.standards_manifest.clone();
-            let outcome = Box::pin(runner::run_validator_in(
-                backend.as_ref(),
-                &mut self.log,
-                &self.paths,
-                &cfg,
-                role,
-                &milestone,
-                &contract,
-                &start_sha,
-                None,
-                &session_cwd,
-                base_sha.as_deref(),
-                &grants,
-                &egress_grants,
-                &worker_commands,
-                milestone.validator_guidance.as_deref(),
-                contract_results.as_deref(),
-                runtime_evidence.as_deref(),
-                validator_sandbox,
-                standards_pin.as_ref(),
-            ))
+            let outcome = box_future(|| {
+                runner::run_validator_in(
+                    backend.as_ref(),
+                    &mut self.log,
+                    &self.paths,
+                    &cfg,
+                    role,
+                    &milestone,
+                    &contract,
+                    &start_sha,
+                    None,
+                    &session_cwd,
+                    base_sha.as_deref(),
+                    &grants,
+                    &egress_grants,
+                    &worker_commands,
+                    milestone.validator_guidance.as_deref(),
+                    contract_results.as_deref(),
+                    runtime_evidence.as_deref(),
+                    validator_sandbox,
+                    standards_pin.as_ref(),
+                )
+            })
             .await;
             let caught = self.catch_up();
             let mut outcome = outcome?;
@@ -5784,7 +5810,7 @@ impl MissionEngine {
                 )?;
                 let (retry_cfg, retry_backend) = if matches!(retry_kind, BackendKind::Claude) {
                     (
-                        self.claude_fallback_cfg_for_role(role),
+                        Arc::new(self.claude_fallback_cfg_for_role(role)),
                         Arc::clone(&self.backend),
                     )
                 } else {
@@ -5808,27 +5834,29 @@ impl MissionEngine {
                 // rules the primary session resolved.
                 let retry_validator_sandbox =
                     self.validator_containment(role, retry_kind, &retry_cfg, &retry_session_cwd)?;
-                let retry_outcome = Box::pin(runner::run_validator_in(
-                    retry_backend.as_ref(),
-                    &mut self.log,
-                    &self.paths,
-                    &retry_cfg,
-                    role,
-                    &milestone,
-                    &contract,
-                    &start_sha,
-                    None,
-                    &retry_session_cwd,
-                    base_sha.as_deref(),
-                    &grants,
-                    &egress_grants,
-                    &worker_commands,
-                    milestone.validator_guidance.as_deref(),
-                    contract_results.as_deref(),
-                    runtime_evidence.as_deref(),
-                    retry_validator_sandbox,
-                    standards_pin.as_ref(),
-                ))
+                let retry_outcome = box_future(|| {
+                    runner::run_validator_in(
+                        retry_backend.as_ref(),
+                        &mut self.log,
+                        &self.paths,
+                        &retry_cfg,
+                        role,
+                        &milestone,
+                        &contract,
+                        &start_sha,
+                        None,
+                        &retry_session_cwd,
+                        base_sha.as_deref(),
+                        &grants,
+                        &egress_grants,
+                        &worker_commands,
+                        milestone.validator_guidance.as_deref(),
+                        contract_results.as_deref(),
+                        runtime_evidence.as_deref(),
+                        retry_validator_sandbox,
+                        standards_pin.as_ref(),
+                    )
+                })
                 .await;
                 let caught = self.catch_up();
                 outcome = retry_outcome?;
@@ -5927,22 +5955,24 @@ impl MissionEngine {
                     // command-assertion PASS.
                     || (!has_command_assertions && report.findings.is_empty());
                 if needs_confirm {
-                    match Box::pin(self.confirm_local_functional_pass(
-                        &milestone_id,
-                        role,
-                        &milestone,
-                        &contract,
-                        &start_sha,
-                        base_sha.as_deref(),
-                        &grants,
-                        &egress_grants,
-                        &worker_commands,
-                        contract_results.as_deref(),
-                        runtime_evidence.as_deref(),
-                        &outcome.run_id,
-                        &report,
-                        &passed_command_ids,
-                    ))
+                    match box_future(|| {
+                        self.confirm_local_functional_pass(
+                            &milestone_id,
+                            role,
+                            &milestone,
+                            &contract,
+                            &start_sha,
+                            base_sha.as_deref(),
+                            &grants,
+                            &egress_grants,
+                            &worker_commands,
+                            contract_results.as_deref(),
+                            runtime_evidence.as_deref(),
+                            &outcome.run_id,
+                            &report,
+                            &passed_command_ids,
+                        )
+                    })
                     .await?
                     {
                         Some(disagreements) => findings.extend(disagreements),
@@ -5989,7 +6019,7 @@ impl MissionEngine {
             if !self.check_completion_review(Some(&milestone_id))? {
                 return Ok(());
             }
-            if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+            if !box_future(|| self.external_completion_checks(Some(mi))).await? {
                 return Ok(());
             }
             let tag = self.tag_milestone(&milestone_id);
@@ -6009,7 +6039,7 @@ impl MissionEngine {
         // findings — an all-waived answer completes the milestone where the
         // old flow would have blocked on trivia.
         let findings: Vec<Finding> = findings.into_iter().map(|(_, f)| f).collect();
-        match Box::pin(self.convert_findings(&milestone_id, &findings)).await? {
+        match box_future(|| self.convert_findings(&milestone_id, &findings)).await? {
             // validation_round findings never carry class=="command-assertion",
             // so convert_findings' escape-hatch guard makes this practically
             // unreachable here; handle it defensively rather than panic.
@@ -6034,7 +6064,7 @@ impl MissionEngine {
                 if !self.check_completion_review(Some(&milestone_id))? {
                     return Ok(());
                 }
-                if !Box::pin(self.external_completion_checks(Some(mi))).await? {
+                if !box_future(|| self.external_completion_checks(Some(mi))).await? {
                     return Ok(());
                 }
                 let tag = self.tag_milestone(&milestone_id);
@@ -6918,12 +6948,12 @@ impl MissionEngine {
     /// failures → [`EngineError::Backend`].
     pub(crate) async fn orch_turn(&mut self, message: &str) -> Result<String> {
         if self.state.config.backend_kind(Role::Orchestrator) != BackendKind::Claude {
-            return self.orch_single_shot_turn(message).await;
+            return box_future(|| self.orch_single_shot_turn(message)).await;
         }
 
         let mut last_err: Option<EngineError> = None;
         for attempt in 0..2u8 {
-            self.ensure_orchestrator().await?;
+            box_future(|| self.ensure_orchestrator()).await?;
             // Digest rendered fresh per attempt — state may have moved.
             let full = format!("{}\n\n{}", digest::render(&self.state), message);
             let turn = async {
@@ -6935,7 +6965,7 @@ impl MissionEngine {
             let result = match turn {
                 Ok(()) => {
                     self.transcribe_injected(&full)?;
-                    self.pump_turn().await
+                    box_future(|| self.pump_turn()).await
                 }
                 Err(e) => Err(e),
             };
@@ -7099,7 +7129,7 @@ impl MissionEngine {
         };
         let reseeded = resume.is_none() && !planning;
 
-        match self.start_orchestrator(seed, resume.clone()).await {
+        match box_future(|| self.start_orchestrator(seed, resume.clone())).await {
             Ok(()) => {}
             Err(e) if resume.is_some() => {
                 // Resume failed (spawn error or dead seed turn): fresh
@@ -7122,7 +7152,7 @@ impl MissionEngine {
                 } else {
                     digest::render_reseed(&self.state, &self.plan_json()?)
                 };
-                self.start_orchestrator(seed, None).await?;
+                box_future(|| self.start_orchestrator(seed, None)).await?;
                 self.emit(EventKind::OrchestratorDecision {
                     summary: "orchestrator session re-seeded".to_string(),
                     detail: None,
@@ -7143,46 +7173,48 @@ impl MissionEngine {
     /// Start one streaming orchestrator session, emit its `worker.spawned`,
     /// open its transcript, and pump the seed turn to its `Result`.
     async fn start_orchestrator(&mut self, seed: String, resume: Option<String>) -> Result<()> {
-        let cfg = self.state.config.clone();
-        let role_cfg = cfg.role(Role::Orchestrator).clone();
-
-        // The orchestrator prompt sizes features by the WORKER turn budget.
-        let mut vars: HashMap<&str, String> = HashMap::new();
-        vars.insert(
-            "turnBudget",
-            cfg.worker
-                .max_turns
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "a reasonable number of".to_string()),
-        );
-        let system_prompt = prompts::render(prompts::text(Role::Orchestrator), &vars);
-
+        let role_cfg = self.state.config.role(Role::Orchestrator).clone();
         let session_id = uuid::Uuid::new_v4().to_string();
-        let mut spec = SessionSpec {
-            cwd: self.paths.repo_root.clone(),
-            prompt: PromptMode::Streaming(seed),
-            append_system_prompt: Some(system_prompt),
-            model: role_cfg.model.clone(),
-            effort: role_cfg.reasoning_effort.clone(),
-            session_id: session_id.clone(),
-            resume: resume.clone(),
-            permission_mode: None,
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
-            tools: cfg.role(Role::Orchestrator).tools.clone(),
-            writable: false,
-            settings_json: None,
-            json_schema: None,
-            max_budget_usd: role_cfg.max_budget_usd,
-            max_turns: role_cfg.max_turns,
-            env: HashMap::new(),
-            sandbox: None,
-            hook_status: None,
+        let spec = {
+            let cfg = &self.state.config;
+            // The orchestrator prompt sizes features by the WORKER turn budget.
+            let mut vars: HashMap<&str, String> = HashMap::new();
+            vars.insert(
+                "turnBudget",
+                cfg.worker
+                    .max_turns
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "a reasonable number of".to_string()),
+            );
+            let system_prompt = prompts::render(prompts::text(Role::Orchestrator), &vars);
+
+            let mut spec = SessionSpec {
+                cwd: self.paths.repo_root.clone(),
+                prompt: PromptMode::Streaming(seed),
+                append_system_prompt: Some(system_prompt),
+                model: role_cfg.model.clone(),
+                effort: role_cfg.reasoning_effort.clone(),
+                session_id: session_id.clone(),
+                resume: resume.clone(),
+                permission_mode: None,
+                allowed_tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                tools: cfg.role(Role::Orchestrator).tools.clone(),
+                writable: false,
+                settings_json: None,
+                json_schema: None,
+                max_budget_usd: role_cfg.max_budget_usd,
+                max_turns: role_cfg.max_turns,
+                env: HashMap::new(),
+                sandbox: None,
+                hook_status: None,
+            };
+            permissions::apply(
+                permissions::for_role(Role::Orchestrator, cfg, &[], &[], &[]),
+                &mut spec,
+            );
+            spec
         };
-        permissions::apply(
-            permissions::for_role(Role::Orchestrator, &cfg, &[], &[], &[]),
-            &mut spec,
-        );
 
         let session = self.backend.start(spec).await?;
 
@@ -7229,7 +7261,7 @@ impl MissionEngine {
         // later send/pump pair stays aligned. The reply is captured (already
         // scrubbed by pump_turn) rather than discarded: the planning seed's
         // answer routinely ends with questions the user must see.
-        match self.pump_turn().await {
+        match box_future(|| self.pump_turn()).await {
             Ok(ack) => {
                 if !ack.trim().is_empty() {
                     self.pending_seed_reply = Some(ack);

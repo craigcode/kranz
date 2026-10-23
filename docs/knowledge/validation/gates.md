@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-18
+last_verified: 2026-10-23
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,7 @@ verified_against:
   - crates/engine/src/command_exec.rs
   - crates/engine/src/contract_controls.rs
   - crates/engine/src/contract_controls/pair.rs
+  - crates/engine/src/contract_controls/readback.rs
   - crates/engine/src/contract_controls_pair_tests.rs
   - crates/engine/src/agent_env.rs
   - crates/engine/src/merge.rs
@@ -59,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: `contract_controls::readback` adds isolated model read-back and operator comparison disposition (`contract-readback:<assertion>`), and `test_capability` adds `KEYCHAIN` pre-flight coverage on `macos-14`.
 
 Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: validator report parsing requires a schema-matching JSON object, bounded gate process-group cleanup holds the leader until group signaling, and merge twin cleanup refuses symlinks. Gate contracts are unchanged.
 

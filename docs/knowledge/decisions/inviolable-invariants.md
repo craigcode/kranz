@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-18
+last_verified: 2026-10-22
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: read-back sessions run in an isolated scratch directory with all file/shell/search tools disabled and receive only `command` and `checkerFiles`. All documented invariants hold unchanged.
 
 Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: Git tag/config/network guards, sandbox authority masks, validator snapshot nofollow checks, and credential scrubbing were tightened. All documented invariants hold unchanged.
 
