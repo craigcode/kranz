@@ -183,7 +183,38 @@ command receipts, independent judgment, fresh gate consumption or human consent.
 A branch pair does not attest the eventual merge tree; merge keeps its existing
 integration checks.
 
-This implements the negative-controls portion of
+## Independent model read-back and operator comparison
+
+Selected critical assertions can also be evaluated through
+[`contract_controls::readback`](../crates/engine/src/contract_controls/readback.rs)
+(`contract_controls::evaluate_with_readback`). The read-back reviewer receives an
+[`IsolatedReadbackInput`](../crates/engine/src/contract_controls/readback.rs)
+containing **only** the executable `command` and the approved `checkerFiles`. The
+mission `goal`, the assertion's human `statement`, `validFiles`, `defectiveFiles`,
+`expectedFailure`, and worker explanations are excluded from the prompt, and any
+`AgentBackend` session runs in an isolated empty scratch directory with all file,
+shell, and search tools disabled (`Read(*)`, `Bash(*)`, `Edit(*)`, `Write(*)`,
+`Grep(*)`, `Glob(*)`, `LS(*)`, `WebFetch`, `WebSearch`). Comments, test names,
+failure IDs, and labels inside `checkerFiles` are explicitly marked as untrusted
+claims.
+
+When an approved checking input is missing or modified on disk, or when a command
+or checker script references an unprovided script or helper, read-back reports
+`incomplete` without invoking a model to guess test behavior from the command's
+name. Otherwise, the structured read-back records `exercised`, `asserted`,
+`assumptions`, and `omissions`, and pairs them beside the original claim and the
+negative-control outcome (`contract-readback:<assertion>`).
+
+An operator comparison disposition (`pending`, `accepted`, or `rejected`) is
+bound to the exact `assertionSha256`, `statementSha256`, `checkerSha256`,
+`readbackSha256`, and `sourceRevision`. Incomplete read-back evidence cannot be
+accepted as verified, and any later change to the assertion statement, command,
+approved checking inputs, or source revision marks the prior receipt and
+disposition stale in [review packets](review-packets.md). Retained
+`runs/readback-*.json` artifacts are digest-verified and scrubbed on evidence
+bundle export, and missing or modified files remain visibly `unresolved`.
+Model read-back supports operator judgment; it does not certify semantic
+equivalence.
+
+This completes
 [`contract-readback-and-negative-controls`](../.kranz/tickets/contract-readback-and-negative-controls.md).
-Independent model read-back and a recorded operator comparison remain open in
-that ticket; no model read-back is implied by a verified control pair.

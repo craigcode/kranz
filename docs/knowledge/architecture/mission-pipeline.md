@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-18
+last_verified: 2026-10-22
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: `MissionConfig` is shared via `Arc` on `SelectedBackend`, `emit`/`box_future` are outlined to reduce hosted debug stack frames, and review packets project advisory `contractReadbacks` alongside `baselineCandidates`. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: permission proposals validate before event emission, event-log high-water checks cover full-file reads, and validation/final-gate sub-futures are boxed on the heap. Pipeline stages and contracts are unchanged.
 

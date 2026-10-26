@@ -103,7 +103,7 @@ impl MissionEngine {
                         &sandbox,
                     )
                     .await;
-                let event = self.emit(EventKind::OrchestratorDecision {
+                let event = self.emit_event(EventKind::OrchestratorDecision {
                     summary: format!("external gate check {}: exit {exit_code:?}", assertion.id),
                     detail: Some(crate::scrub::scrub_and_truncate(&output, 8192)),
                 })?;
@@ -236,7 +236,7 @@ impl MissionEngine {
                 prior_findings: &prior_refs,
                 consent: None,
             },
-            |kind| self.emit(kind),
+            |kind| self.emit_event(kind),
         ))
         .await?;
         let current = self.external_authority()?.0;
@@ -258,7 +258,7 @@ impl MissionEngine {
                 &record,
                 record.requested.request.params.binding.clone(),
                 action.clone(),
-                |kind| self.emit(kind),
+                |kind| self.emit_event(kind),
             )?;
         }
         Ok(())
@@ -309,7 +309,7 @@ impl MissionEngine {
                     ),
                 }),
             },
-            |kind| self.emit(kind),
+            |kind| self.emit_event(kind),
         )?;
         let current = self.external_authority()?.0;
         if authority.verify(&current).is_err() || self.repo.rev_parse(&branch)? != tip {
@@ -323,7 +323,7 @@ impl MissionEngine {
                 &record,
                 record.requested.request.params.binding.clone(),
                 Action::ApprovePlan,
-                |kind| self.emit(kind),
+                |kind| self.emit_event(kind),
             )?;
         }
         Ok(())
@@ -413,7 +413,7 @@ impl MissionEngine {
                 prior_findings: &[],
                 consent: Some(consent),
             },
-            |kind| self.emit(kind),
+            |kind| self.emit_event(kind),
         )?;
         // Consume only after the whole ladder has succeeded and every binding
         // is still current. A later gate failure consumes none of its peers.
@@ -442,7 +442,7 @@ impl MissionEngine {
         for record in records {
             let binding = record.requested.request.params.binding.clone();
             driver::consume(&record, binding, Action::ApprovePlan, |kind| {
-                self.emit(kind)
+                self.emit_event(kind)
             })?;
         }
         Ok(())

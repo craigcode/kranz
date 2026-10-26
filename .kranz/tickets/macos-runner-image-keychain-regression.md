@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Closed 2026-10-18. ensure_session_login_keychain creates kranz-session.keychain-db with login.keychain-db symlinked to it and serializes securityd calls via SESSION_KEYCHAIN_OPERATION_LOCK, and rust-macos now requires keychain in KRANZ_REQUIRED_CAPABILITIES."
 title: GitHub macOS runner image 20260831 refuses security create-keychain under a relocated HOME
 priority: 2
 schedule: once
@@ -19,12 +20,16 @@ regression is visible in the skip ledger rather than hidden as a red job.
 
 ## Acceptance hints
 
-- Reproduce on the new image: what does `security create-keychain -p x
+- [x] Reproduce on the new image: what does `security create-keychain -p x
   <home>/Library/Keychains/login.keychain-db` return on
   `20260831.0337.3`, and does the cursor backend's seed still work for a real
   session there (the CLI dies with security exit 154 when no login keychain
-  resolves through HOME).
-- Either adapt `ensure_session_login_keychain` to the image's behaviour or
+  resolves through HOME). (`securityd` refuses direct creation of the reserved
+  `login.keychain-db` filename when mutating the primary login store, and
+  concurrent `security` operations contend in `securityd`; creating
+  `kranz-session.keychain-db` and symlinking `login.keychain-db` to it under
+  `SESSION_KEYCHAIN_OPERATION_LOCK` resolves both.)
+- [x] Either adapt `ensure_session_login_keychain` to the image's behaviour or
   document the image as unsupported for the cursor backend, then add
   `keychain` to `KRANZ_REQUIRED_CAPABILITIES` for the macOS job so the tests
   cannot silently skip again.
