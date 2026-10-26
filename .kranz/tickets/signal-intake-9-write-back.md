@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 9: idempotent write-back to the source
 priority: 2
 schedule: once

@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 10: dashboard and Slack surfaces
 priority: 3
 schedule: once

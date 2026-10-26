@@ -606,3 +606,181 @@ fn ghook_handler_source_has_no_git_mutation_paths() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sentry Signal Intake (`POST /api/hooks/sentry`, `GET /api/signals`, consent)
+// ---------------------------------------------------------------------------
+
+fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
+    let (dir, root) = init_repo();
+    if let Some(secret) = secret {
+        let kranz = root.join(".kranz");
+        std::fs::create_dir_all(&kranz).unwrap();
+        std::fs::write(
+            kranz.join("config.json"),
+            json!({
+                "signals": {
+                    "projectMap": { "hello": "hello" },
+                    "dedupeWindowSecs": 3600,
+                    "rules": [{
+                        "name": "prod-errors",
+                        "source": "sentry",
+                        "project": "hello",
+                        "outcome": "proposed"
+                    }],
+                    "sentry": {
+                        "secret": secret,
+                        "allowedHosts": ["sentry.io"]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    (dir, root)
+}
+
+fn sentry_payload() -> Value {
+    json!({
+        "action": "created",
+        "data": {
+            "issue": {
+                "id": "998877",
+                "shortId": "HELLO-1",
+                "title": "Crash in main handler",
+                "culprit": "README.md",
+                "level": "error",
+                "permalink": "https://sentry.io/organizations/octo/issues/998877/",
+                "project": { "slug": "hello" },
+                "metadata": {
+                    "filename": "README.md",
+                    "value": "panic at README.md:1"
+                },
+                "tags": [
+                    { "key": "environment", "value": "production" }
+                ]
+            }
+        }
+    })
+}
+
+fn sentry_post(sign_with: Option<&str>, resource: &str, body: &Value) -> Request<Body> {
+    let text = body.to_string();
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/hooks/sentry")
+        .header("content-type", "application/json")
+        .header("sentry-hook-resource", resource)
+        .header("sentry-hook-timestamp", &ts);
+    if let Some(secret) = sign_with {
+        let sig =
+            kranz_engine::signals::sentry::SentrySignalSource::sign_body(secret, text.as_bytes());
+        builder = builder.header("sentry-hook-signature", sig);
+    }
+    builder.body(Body::from(text)).unwrap()
+}
+
+#[tokio::test]
+async fn sentry_hook_proposes_unconsented_ticket_and_requires_explicit_consent_to_draft() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_sentry_repo(Some(SECRET));
+    let app = hook_app(&root, 1);
+
+    // 1. Bad signature is 401 and records a dropped entry in the signal ledger.
+    let bad_resp = app
+        .clone()
+        .oneshot(sentry_post(
+            Some("wrong-secret"),
+            "issue",
+            &sentry_payload(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(MissionPaths::list_missions(&root).is_empty());
+
+    // 2. Valid Sentry webhook creates an unconsented proposal ticket and NO mission.
+    let ok_resp = app
+        .clone()
+        .oneshot(sentry_post(Some(SECRET), "issue", &sentry_payload()))
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::ACCEPTED);
+    let ok_json = body_json(ok_resp).await;
+    assert_eq!(ok_json["outcome"], "proposed");
+    assert_eq!(ok_json["created"], true);
+    let slug = ok_json["ticketSlug"].as_str().unwrap().to_string();
+    assert!(MissionPaths::list_missions(&root).is_empty());
+
+    // 3. GET /api/signals lists the proposal as unconsented.
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/signals")
+                .header("x-kranz-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
+    let signals = list_json["signals"].as_array().unwrap();
+    assert!(signals.iter().any(|s| {
+        s["ticketSlug"].as_str() == Some(slug.as_str())
+            && s["status"] == json!("proposed")
+            && s["consentedAt"].is_null()
+    }));
+
+    // 4. Attempting to draft the proposal WITHOUT consentSignal: true is refused.
+    let refuse_draft = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/tickets/{slug}/draft"))
+                .header("content-type", "application/json")
+                .header("x-kranz-token", "tok")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        refuse_draft.status().is_client_error(),
+        "expected 4xx refusal when drafting unconsented signal proposal, got {}",
+        refuse_draft.status()
+    );
+    assert!(MissionPaths::list_missions(&root).is_empty());
+
+    // 5. Drafting WITH consentSignal: true records SignalConsented, flips the frontmatter, and drafts!
+    let consent_draft = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/tickets/{slug}/draft"))
+                .header("content-type", "application/json")
+                .header("x-kranz-token", "tok")
+                .body(Body::from(
+                    json!({
+                        "consentSignal": true,
+                        "tracedFromMission": "m-seed01"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consent_draft.status(), StatusCode::ACCEPTED);
+    let ticket = Ticket::load(&Ticket::md_path(&root, &slug)).unwrap();
+    assert!(!ticket.is_unconsented_signal_proposal());
+    assert_eq!(ticket.traced_from_mission.as_deref(), Some("m-seed01"));
+}

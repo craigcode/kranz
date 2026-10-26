@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 8: defect linkage confirmation and latency
 priority: 2
 schedule: once

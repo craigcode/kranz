@@ -172,6 +172,7 @@ pub async fn drive_draft(
     ticket: &Ticket,
     then_enqueue: bool,
 ) -> Result<DraftDrive> {
+    ticket.ensure_signal_consented()?;
     let slug = ticket.slug.as_str();
     // Notes load BEFORE any state flip: a corrupt notes file fails the draft
     // with the ticket untouched, never stranded in Drafting.

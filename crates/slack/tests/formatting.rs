@@ -458,6 +458,7 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             ],
             total_decided: 6,
         },
+        signal_consent_latency: None,
         escalations: vec![EscalationRow {
             ts: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             mission_id: "m-1".into(),
@@ -562,6 +563,7 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
             ],
             total_decided: 0,
         },
+        signal_consent_latency: None,
         escalations: vec![],
         cost_per_change: kranz_engine::outcomes::CostPerChange {
             total_cost_usd: 0.0,

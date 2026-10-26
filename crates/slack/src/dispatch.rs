@@ -739,6 +739,17 @@ pub(crate) async fn dispatch_action(
             }
             DraftGate::Ready(ack) => {
                 reply_ephemeral(cfg, client, response_url.as_deref(), &ack).await;
+                if let Ok(ticket) = kranz_engine::ticket::Ticket::load(
+                    &kranz_engine::ticket::Ticket::md_path(repo_root, slug),
+                ) {
+                    if ticket.is_unconsented_signal_proposal() {
+                        let actor =
+                            format!("slack:{}", user_id.as_deref().unwrap_or("allowed-user"));
+                        let _ = kranz_engine::signals::proposal::consent_signal_proposal(
+                            repo_root, slug, &actor, None, None,
+                        );
+                    }
+                }
                 let host = host.expect("DraftGate::Ready only returned with a host present");
                 let result = run_draft(host, slug).await;
                 reply_ephemeral(cfg, client, response_url.as_deref(), &result).await;

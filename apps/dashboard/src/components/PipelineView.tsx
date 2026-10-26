@@ -16,6 +16,7 @@ import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilte
 import { missionHash, repoHash, ticketHash } from '../lib/routes';
 import { OutcomesPanel } from './OutcomesPanel';
 import { FlightSurgeonPanel } from './FlightSurgeonPanel';
+import { SignalsPanel } from './SignalsPanel';
 
 interface Row {
   key: string;
@@ -24,6 +25,7 @@ interface Row {
   title: string;
   isBlocked: boolean;
   blockedBy: string[];
+  isUnconsentedSignal?: boolean;
   missionId?: string;
   slug?: string;
   missionCreatedAt?: string;
@@ -51,6 +53,7 @@ function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] 
       title: t.title,
       isBlocked: t.isBlocked,
       blockedBy: t.blockedBy,
+      isUnconsentedSignal: t.signalProposal === 'unconsented',
       missionId: t.missionId ?? undefined,
       slug: t.slug,
       missionCreatedAt: mission?.createdAt,
@@ -304,7 +307,11 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
           type="button"
           className="btn-small pipeline-primary-action"
           disabled={ticketBusySlug !== null}
-          onClick={() => void draftTicket(row.slug!)}
+          onClick={() =>
+            void (row.isUnconsentedSignal
+              ? draftTicket(row.slug!, { consentSignal: true })
+              : draftTicket(row.slug!))
+          }
         >
           {busy ? 'Drafting…' : action.label}
         </button>
@@ -550,6 +557,7 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
           </div>
         )}
         <ul className="picker-list">{visibleRows.map(row)}</ul>
+        <SignalsPanel />
         <FlightSurgeonPanel />
         <OutcomesPanel />
       </div>

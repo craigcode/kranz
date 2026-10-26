@@ -119,6 +119,23 @@ export function OutcomesPanel() {
         )}
       </div>
 
+      {outcomes.signalConsentLatency !== undefined &&
+        outcomes.signalConsentLatency.totalDecided > 0 && (
+          <div className="outcomes-section outcomes-signal-latency">
+            <h3 className="outcomes-heading">Signal consent latency</h3>
+            <table className="outcomes-latency-table">
+              <tbody>
+                {outcomes.signalConsentLatency.buckets.map((bucket) => (
+                  <tr key={bucket.label}>
+                    <td className="outcomes-latency-label">{bucket.label}</td>
+                    <td className="outcomes-latency-count mono">{bucket.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
       <div className="outcomes-section outcomes-cost">
         <h3 className="outcomes-heading">Cost per change</h3>
         {costPerChange.usdPerCommit === null ? (
