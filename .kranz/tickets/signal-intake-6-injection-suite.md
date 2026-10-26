@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 6: injection corpus in CI
 priority: 2
 schedule: once

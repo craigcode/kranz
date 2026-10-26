@@ -70,6 +70,28 @@ pub fn work_skip_for_failed_blocker(repo_root: &Path, slug: &str) -> Result<Opti
     Ok(None)
 }
 
+/// Ticket scheduler admission helper (`docs/scoping/signal-intake.md` invariant 1):
+/// evaluates which tickets in `.kranz/tickets/` are currently due for drafting
+/// or scheduled re-instantiation, strictly excluding unconsented signal
+/// proposals (`signal-proposal: unconsented`) and future-deferred tickets.
+pub struct Scheduler;
+
+impl Scheduler {
+    pub fn find_due_tickets(repo_root: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<Ticket> {
+        Ticket::list(repo_root)
+            .into_iter()
+            .filter(|t| {
+                !t.is_unconsented_signal_proposal()
+                    && t.is_ready_at(now)
+                    && Ticket::read_state(repo_root, &t.slug) == TicketState::New
+                    && deps::unsatisfied_blockers(repo_root, &t.slug)
+                        .map(|b| b.is_empty())
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+}
+
 /// Map a terminal (or blocked) mission status to the ticket state recorded
 /// after a run. Only called by [`reconcile_ticket_for_mission`] for
 /// terminal/blocked statuses — live statuses are gated out before this runs.
@@ -281,6 +303,19 @@ where
                     .ticket_slug
                     .clone()
                     .or_else(|| Ticket::slug_for_mission(repo_root, &mission_id));
+
+                if let Some(slug) = &ticket_slug {
+                    if let Ok(ticket) = Ticket::load(&Ticket::md_path(repo_root, slug)) {
+                        if ticket.is_unconsented_signal_proposal() {
+                            queue::finish_claim(claim);
+                            report.skipped.push(mission_id);
+                            if once {
+                                return Ok(report);
+                            }
+                            continue;
+                        }
+                    }
+                }
 
                 // Backend readiness under the claim (no peek/remove race).
                 match probe(repo_root, &mission_id) {

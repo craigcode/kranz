@@ -408,6 +408,9 @@ impl MissionHost {
             return Err(ApiError::not_found(format!("ticket '{slug}' not found")));
         }
         let ticket = Ticket::load(&ticket_path)?;
+        ticket
+            .ensure_signal_consented()
+            .map_err(|e| ApiError::conflict(e.to_string()))?;
 
         let cfg = config_for_ticket(config::load(&self.repo_root)?, &ticket);
         let backend = self.backend(cfg.claude_binary.as_deref()).await?;
@@ -468,6 +471,9 @@ impl MissionHost {
             )));
         }
         let ticket = Ticket::load(&ticket_path)?;
+        ticket
+            .ensure_signal_consented()
+            .map_err(|e| ApiError::conflict(e.to_string()))?;
         let cfg = config_for_ticket(config::load(&self.repo_root)?, &ticket);
         Ticket::write_state(&self.repo_root, slug, TicketState::Drafting, None)?;
 

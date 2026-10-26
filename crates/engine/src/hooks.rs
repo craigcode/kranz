@@ -568,6 +568,6 @@ pub fn trigger_ticket_template(trigger: &Trigger) -> String {
         source = bound_line(&trigger.source_url),
         actor = bound_line(&trigger.actor),
         consent = trigger.consent.as_str(),
-        excerpt = trigger.excerpt,
+        excerpt = crate::signals::fence_untrusted_signal_evidence(&trigger.excerpt),
     )
 }

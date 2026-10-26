@@ -136,6 +136,7 @@ pub fn approve_ticket(
     Ticket::ensure_valid_slug(slug)?;
     let ticket_path = Ticket::tickets_dir(repo_root).join(format!("{slug}.md"));
     let ticket = Ticket::load(&ticket_path)?;
+    ticket.ensure_signal_consented()?;
 
     // Deferral (D-BW-3): a ticket whose `defer-until` is still in the future
     // is fail-closed refused, naming the time — never silently skipped. The

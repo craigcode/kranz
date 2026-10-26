@@ -75,6 +75,11 @@ export interface TicketSummary {
   state: TicketState;
   title: string;
   blockedBy: string[];
+  trigger?: string | null;
+  signal?: string | null;
+  signalProposal?: 'unconsented' | 'consented' | null;
+  signalCandidates?: string[];
+  tracedFromMission?: string | null;
   isBlocked: boolean;
   /** Joined mission id. The server always emits the key (Rust
    *  `Option<String>`): null when the ticket has never been drafted. */
@@ -100,6 +105,11 @@ export interface Ticket {
   taskClass?: string | null;
   reviewArtifact?: string | null;
   reviewOutput?: string | null;
+  trigger?: string | null;
+  signal?: string | null;
+  signalProposal?: 'unconsented' | 'consented' | null;
+  signalCandidates?: string[];
+  tracedFromMission?: string | null;
   state: TicketState;
   needsContext: string[];
   /** Planner's draft-stage wrong-plan escalation reason (server always emits
@@ -878,9 +888,59 @@ export interface Outcomes {
   outcomeReasons?: OutcomeReasonReport;
   autonomyRatio: AutonomyRatio;
   grantLatency: GrantLatency;
+  signalConsentLatency?: GrantLatency;
   escalations: EscalationRow[];
   costPerChange: CostPerChange;
   cycleTime: CycleTime;
+}
+
+export type SignalStatus =
+  | 'received'
+  | 'parked'
+  | 'not-a-code-change'
+  | 'proposed'
+  | 'consented'
+  | 'closed';
+
+export interface SignalLedgerEvent {
+  seq: number;
+  timestamp: string;
+  record: Record<string, unknown>;
+}
+
+export interface SignalProjection {
+  signalId: string;
+  source: string;
+  fingerprint: string;
+  project: string;
+  severity: string;
+  environment?: string | null;
+  externalId?: string | null;
+  rawSha256: string;
+  receivedAt?: string | null;
+  status: SignalStatus;
+  reason?: string | null;
+  ticketSlug?: string | null;
+  dedupeCount: number;
+  candidateMissions: string[];
+  confirmedTracedMission?: string | null;
+  consentedAt?: string | null;
+  consentedBy?: string | null;
+  missionId?: string | null;
+  ledgerEntries: SignalLedgerEvent[];
+}
+
+export interface DroppedSignalRecord {
+  seq: number;
+  timestamp: string;
+  source: string;
+  reason: string;
+  rawSha256: string;
+}
+
+export interface SignalsView {
+  signals: SignalProjection[];
+  dropped: DroppedSignalRecord[];
 }
 
 // ---------------------------------------------------------------------------

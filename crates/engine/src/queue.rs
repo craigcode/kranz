@@ -258,6 +258,18 @@ fn next_seq(repo_root: &Path) -> Result<u64> {
 /// counter (any incoming `seq` is overwritten). Write is atomic (temp + rename).
 /// A no-op if the mission is already queued.
 pub fn enqueue(repo_root: &Path, entry: QueueEntry) -> Result<QueueEntry> {
+    let linked_slug = entry
+        .ticket_slug
+        .clone()
+        .or_else(|| crate::ticket::Ticket::slug_for_mission(repo_root, &entry.mission_id));
+    if let Some(slug) = linked_slug.as_deref() {
+        let md_path = crate::ticket::Ticket::md_path(repo_root, slug);
+        if md_path.exists() {
+            let ticket = crate::ticket::Ticket::load(&md_path)?;
+            ticket.ensure_signal_consented()?;
+        }
+    }
+
     let dir = queue_dir(repo_root);
     std::fs::create_dir_all(&dir)?;
 

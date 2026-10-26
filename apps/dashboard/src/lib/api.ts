@@ -25,6 +25,7 @@ import type {
   QueueState,
   ReadinessReport,
   RepoSummary,
+  SignalsView,
   Ticket,
   TicketSummary,
   TranscriptEntry,
@@ -429,8 +430,18 @@ export const api = {
     return postJson('/api/tickets', fields);
   },
 
-  draftTicket(slug: string): Promise<{ missionId: string }> {
-    return postJson(`/api/tickets/${encodeURIComponent(slug)}/draft`, {});
+  draftTicket(
+    slug: string,
+    opts?: { consentSignal?: boolean; tracedFromMission?: string },
+  ): Promise<{ missionId: string }> {
+    const body: Record<string, unknown> = {};
+    if (opts?.consentSignal !== undefined) body.consentSignal = opts.consentSignal;
+    if (opts?.tracedFromMission !== undefined) body.tracedFromMission = opts.tracedFromMission;
+    return postJson(`/api/tickets/${encodeURIComponent(slug)}/draft`, body);
+  },
+
+  signals(opts?: GetJsonOptions): Promise<SignalsView> {
+    return getJson('/api/signals', opts);
   },
 
   approveTicket(slug: string, force: boolean): Promise<{ approved: boolean; missionId: string }> {

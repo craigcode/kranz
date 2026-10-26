@@ -231,4 +231,34 @@ describe('TicketDetail', () => {
 
     await screen.findByText(/Draft progress/);
   });
+
+  it('lets the operator confirm a traced-from-mission candidate when drafting a signal proposal', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({
+        state: 'new',
+        signal: 'sig-123',
+        signalProposal: 'unconsented',
+        signalCandidates: ['m-aa11bb', 'm-cc22dd'],
+        missionId: null,
+      }),
+    );
+    vi.mocked(api.draftTicket).mockResolvedValueOnce({ missionId: 'm-99' });
+    vi.mocked(api.missions).mockResolvedValue([
+      { id: 'm-99', status: 'planning', goal: 'Ship the fix.', createdAt: '2026-01-01T00:00:00Z' },
+    ]);
+
+    render(<TicketDetail slug="fix-b" />);
+
+    const select = await screen.findByLabelText('Confirm traced-from-mission');
+    fireEvent.change(select, { target: { value: 'm-cc22dd' } });
+
+    const draft = screen.getByRole('button', { name: 'Draft' });
+    fireEvent.click(draft);
+
+    await screen.findByText(/Draft progress/);
+    expect(api.draftTicket).toHaveBeenCalledWith('fix-b', {
+      consentSignal: true,
+      tracedFromMission: 'm-cc22dd',
+    });
+  });
 });
