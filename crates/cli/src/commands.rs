@@ -442,11 +442,13 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             slug,
             yes,
             from_mission,
+            consent_signal,
         } => backlog::cmd_draft(
             repo,
             &slug,
             yes,
             from_mission.as_deref(),
+            consent_signal,
             cli.dangerously_allow_all,
         )
         .await
@@ -605,6 +607,52 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             crate::cli::StandardsCommand::Attest { rule, reason } => {
                 let mission = select_mission(&repo, cli.mission.as_deref())?;
                 cmd_standards_attest(&repo, &mission, &rule, &reason, lock_force)
+            }
+        },
+        Command::Signal { command } => match command {
+            crate::cli::SignalCommand::List { json } => {
+                let entries = kranz_engine::signals::ledger::SignalLedger::read_entries(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else if entries.is_empty() {
+                    println!("no signals recorded");
+                } else {
+                    for entry in &entries {
+                        println!(
+                            "#{:<4}  {}  {}",
+                            entry.seq,
+                            entry.timestamp.to_rfc3339(),
+                            output::sanitize_untrusted(&serde_json::to_string(&entry.record)?)
+                        );
+                    }
+                }
+                Ok(0)
+            }
+            crate::cli::SignalCommand::Consent {
+                slug_or_id,
+                traced_from,
+                actor,
+            } => {
+                let res = kranz_engine::signals::proposal::consent_signal_proposal(
+                    &repo,
+                    &slug_or_id,
+                    &actor,
+                    traced_from.as_deref(),
+                    cli.mission.as_deref(),
+                )?;
+                println!(
+                    "signal proposal '{}' ({}) consented by {}",
+                    output::sanitize_untrusted(&res.ticket_slug),
+                    output::sanitize_untrusted(&res.signal_id),
+                    output::sanitize_untrusted(&res.actor),
+                );
+                if let Some(traced) = &res.confirmed_traced_mission {
+                    println!(
+                        "confirmed traced-from-mission: {}",
+                        output::sanitize_untrusted(traced)
+                    );
+                }
+                Ok(0)
             }
         },
         Command::Otel {

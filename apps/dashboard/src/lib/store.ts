@@ -120,7 +120,10 @@ interface KranzStore {
   /** POST draft for a ticket, then connect to the returned mission's live
    *  feed via the existing `connectMission` action. Reloads tickets and
    *  missions so PipelineView stages stay current. */
-  draftTicket: (slug: string) => Promise<void>;
+  draftTicket: (
+    slug: string,
+    opts?: { consentSignal?: boolean; tracedFromMission?: string },
+  ) => Promise<void>;
   /** POST approve for a ticket; refreshes tickets and missions on success and
    *  surfaces the server's refusal message verbatim on failure. */
   approveTicket: (slug: string, force: boolean) => Promise<void>;
@@ -389,12 +392,16 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       }
     },
 
-    draftTicket: async (slug: string) => {
+    draftTicket: async (
+      slug: string,
+      opts?: { consentSignal?: boolean; tracedFromMission?: string },
+    ) => {
       if (get().ticketBusySlug !== null) return;
       set({ ticketError: null, ticketBusySlug: slug });
       const generation = repoGeneration;
       try {
-        const { missionId } = await api.draftTicket(slug);
+        const { missionId } =
+          opts !== undefined ? await api.draftTicket(slug, opts) : await api.draftTicket(slug);
         if (repoGeneration !== generation) return;
         // connectMission resets draftingSlug (any prior draft's claim is
         // stale for a new connection), so record ours only after it runs.

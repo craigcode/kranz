@@ -70,14 +70,60 @@ pub(crate) async fn get_ticket(
 pub(crate) async fn draft_ticket(
     State(server): State<Arc<ServerState>>,
     UrlPath(slug): UrlPath<String>,
+    body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     Ticket::ensure_valid_slug(&slug)
         .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
+    if !body.is_empty() && !body.iter().all(|b| b.is_ascii_whitespace()) {
+        let value = crate::host::parse_body(&body)?;
+        let consent_signal = value
+            .get("consentSignal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let traced_from_mission = value
+            .get("tracedFromMission")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let actor = value
+            .get("actor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("dashboard:operator");
+        if consent_signal {
+            kranz_engine::signals::proposal::consent_signal_proposal(
+                server.host.repo_root(),
+                &slug,
+                actor,
+                traced_from_mission,
+                None,
+            )?;
+        } else if let Some(traced) = traced_from_mission {
+            Ticket::seed_traced_from_mission(server.host.repo_root(), &slug, traced)?;
+        }
+    }
     let mission_id = server.host.draft_async(&slug, false).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "missionId": mission_id })),
     ))
+}
+
+/// `GET /api/signals` — read-only projection over `.kranz/signals/ledger.jsonl`
+/// (`signal-intake-10-surfaces`). Requires read authority (`serve.read.token`
+/// or `serve.token`).
+pub(crate) async fn list_signals(
+    Extension(reads): Extension<ReadWork>,
+    State(server): State<Arc<ServerState>>,
+) -> Result<Json<Value>, ApiError> {
+    reads
+        .run(move || {
+            let repo_root = server.host.repo_root();
+            let entries = kranz_engine::signals::ledger::SignalLedger::read_entries(repo_root)?;
+            Ok(Json(project_signals_json(repo_root, &entries)))
+        })
+        .await
 }
 
 /// `POST /api/tickets` — create a ticket from `{"slug", "title", "goal"?,
@@ -152,6 +198,10 @@ fn ticket_summary_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "title": ticket.title,
         "blockedBy": ticket.blocked_by,
         "trigger": ticket.trigger,
+        "signal": ticket.signal,
+        "signalProposal": ticket.signal_proposal,
+        "signalCandidates": ticket.signal_candidates,
+        "tracedFromMission": ticket.traced_from_mission,
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
         "missionId": Ticket::mission_for(repo_root, &ticket.slug),
         "merged": kranz_engine::merged::ticket_merged(repo_root, &ticket.slug),
@@ -176,12 +226,260 @@ fn ticket_full_json(repo_root: &std::path::Path, ticket: &Ticket) -> Value {
         "reviewArtifact": ticket.review_artifact,
         "reviewOutput": ticket.review_output,
         "trigger": ticket.trigger,
+        "signal": ticket.signal,
+        "signalProposal": ticket.signal_proposal,
+        "signalCandidates": ticket.signal_candidates,
+        "tracedFromMission": ticket.traced_from_mission,
         "state": state,
         "needsContext": needs_context_questions(&ticket.raw_body),
         "wrongPlan": wrong_plan_reason(&ticket.raw_body),
         "isBlocked": kranz_engine::deps::is_blocked(repo_root, &ticket.slug).unwrap_or(false),
         "missionId": Ticket::mission_for(repo_root, &ticket.slug),
         "merged": kranz_engine::merged::ticket_merged(repo_root, &ticket.slug),
+    })
+}
+
+fn project_signals_json(
+    repo_root: &std::path::Path,
+    entries: &[kranz_engine::signals::ledger::SignalLedgerEntry],
+) -> Value {
+    use kranz_engine::signals::ledger::{DecisionOutcome, SignalRecordKind};
+    use kranz_engine::ticket::TicketState;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct SignalProjection {
+        signal_id: String,
+        source: String,
+        fingerprint: String,
+        project: String,
+        severity: String,
+        environment: Option<String>,
+        external_id: Option<String>,
+        raw_sha256: String,
+        received_at: Option<String>,
+        status: String,
+        reason: Option<String>,
+        ticket_slug: Option<String>,
+        dedupe_count: u64,
+        candidate_missions: Vec<String>,
+        confirmed_traced_mission: Option<String>,
+        consented_at: Option<String>,
+        consented_by: Option<String>,
+        mission_id: Option<String>,
+        events: Vec<Value>,
+    }
+
+    let mut by_id: BTreeMap<String, SignalProjection> = BTreeMap::new();
+    let mut dropped: Vec<Value> = Vec::new();
+
+    for entry in entries {
+        let ts = entry.timestamp.to_rfc3339();
+        let event_json = json!({
+            "seq": entry.seq,
+            "timestamp": ts,
+            "record": entry.record,
+        });
+        match &entry.record {
+            SignalRecordKind::Dropped {
+                source,
+                reason,
+                delivery_id,
+            } => {
+                dropped.push(json!({
+                    "seq": entry.seq,
+                    "timestamp": ts,
+                    "source": source,
+                    "reason": reason,
+                    "rawSha256": delivery_id.as_deref().unwrap_or(""),
+                }));
+            }
+            SignalRecordKind::Received {
+                signal_id,
+                source,
+                raw_sha256,
+                ..
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                proj.signal_id = signal_id.clone();
+                proj.source = source.clone();
+                proj.raw_sha256 = raw_sha256.clone();
+                if proj.received_at.is_none() {
+                    proj.received_at = Some(ts);
+                }
+                if proj.status.is_empty() {
+                    proj.status = "received".to_string();
+                }
+                proj.events.push(event_json);
+            }
+            SignalRecordKind::Triaged {
+                signal_id,
+                source,
+                fingerprint,
+                outcome,
+                rule,
+                dedupe_count,
+                candidate_missions,
+                project,
+                severity,
+                environment,
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                if proj.signal_id.is_empty() {
+                    proj.signal_id = signal_id.clone();
+                }
+                proj.source = source.clone();
+                proj.fingerprint = fingerprint.clone();
+                if let Some(p) = project {
+                    proj.project = p.clone();
+                }
+                if let Some(s) = severity {
+                    proj.severity = s.clone();
+                }
+                if environment.is_some() {
+                    proj.environment = environment.clone();
+                }
+                proj.dedupe_count = *dedupe_count;
+                if !candidate_missions.is_empty() {
+                    proj.candidate_missions = candidate_missions.clone();
+                }
+                match outcome {
+                    DecisionOutcome::Parked => {
+                        proj.status = "parked".to_string();
+                        proj.reason = Some(rule.clone());
+                    }
+                    DecisionOutcome::NotACodeChange => {
+                        proj.status = "not-a-code-change".to_string();
+                        proj.reason = Some(rule.clone());
+                    }
+                    DecisionOutcome::Proposed => {
+                        if proj.status != "consented" && proj.status != "closed" {
+                            proj.status = "proposed".to_string();
+                        }
+                    }
+                }
+                proj.events.push(event_json);
+            }
+            SignalRecordKind::Proposed {
+                signal_id,
+                ticket_slug,
+                fingerprint,
+                dedupe_count,
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                if proj.signal_id.is_empty() {
+                    proj.signal_id = signal_id.clone();
+                }
+                proj.fingerprint = fingerprint.clone();
+                proj.ticket_slug = Some(ticket_slug.clone());
+                proj.dedupe_count = *dedupe_count;
+                if proj.status != "consented" && proj.status != "closed" {
+                    proj.status = "proposed".to_string();
+                }
+                proj.events.push(event_json);
+            }
+            SignalRecordKind::Consented {
+                signal_id,
+                ticket_slug,
+                actor,
+                mission_id,
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                proj.signal_id = signal_id.clone();
+                proj.ticket_slug = Some(ticket_slug.clone());
+                proj.status = "consented".to_string();
+                proj.consented_at = Some(ts);
+                proj.consented_by = Some(actor.clone());
+                if mission_id.is_some() {
+                    proj.mission_id = mission_id.clone();
+                }
+                proj.events.push(event_json);
+            }
+            SignalRecordKind::Linked {
+                signal_id,
+                ticket_slug,
+                traced_from_mission,
+                ..
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                proj.signal_id = signal_id.clone();
+                proj.ticket_slug = Some(ticket_slug.clone());
+                proj.confirmed_traced_mission = Some(traced_from_mission.clone());
+                proj.events.push(event_json);
+            }
+            SignalRecordKind::WriteBackPending {
+                signal_id,
+                external_id,
+                ..
+            }
+            | SignalRecordKind::WriteBackConfirmed {
+                signal_id,
+                external_id,
+                ..
+            }
+            | SignalRecordKind::WriteBackFailed {
+                signal_id,
+                external_id,
+                ..
+            } => {
+                let proj = by_id.entry(signal_id.clone()).or_default();
+                if proj.signal_id.is_empty() {
+                    proj.signal_id = signal_id.clone();
+                }
+                proj.external_id = Some(external_id.clone());
+                proj.events.push(event_json);
+            }
+        }
+    }
+
+    let mut signals: Vec<Value> = Vec::with_capacity(by_id.len());
+    for proj in by_id.into_values() {
+        let mut status = proj.status.clone();
+        let mut mission_id = proj.mission_id.clone();
+        if let Some(slug) = &proj.ticket_slug {
+            if mission_id.is_none() {
+                mission_id = Ticket::mission_for(repo_root, slug);
+            }
+            let ticket_state = Ticket::read_state(repo_root, slug);
+            if matches!(
+                ticket_state,
+                TicketState::Done | TicketState::Superseded | TicketState::Wontfix
+            ) {
+                status = "closed".to_string();
+            } else if status == "proposed" {
+                if let Ok(t) = Ticket::load(&Ticket::md_path(repo_root, slug)) {
+                    if !t.is_unconsented_signal_proposal() {
+                        status = "consented".to_string();
+                    }
+                }
+            }
+        }
+        signals.push(json!({
+            "signalId": proj.signal_id,
+            "source": proj.source,
+            "fingerprint": proj.fingerprint,
+            "project": proj.project,
+            "severity": proj.severity,
+            "environment": proj.environment,
+            "externalId": proj.external_id,
+            "rawSha256": proj.raw_sha256,
+            "receivedAt": proj.received_at,
+            "status": status,
+            "reason": proj.reason,
+            "ticketSlug": proj.ticket_slug,
+            "dedupeCount": proj.dedupe_count,
+            "candidateMissions": proj.candidate_missions,
+            "confirmedTracedMission": proj.confirmed_traced_mission,
+            "consentedAt": proj.consented_at,
+            "consentedBy": proj.consented_by,
+            "missionId": mission_id,
+            "ledgerEntries": proj.events,
+        }));
+    }
+
+    json!({
+        "signals": signals,
+        "dropped": dropped,
     })
 }
 

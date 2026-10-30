@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 2: repo-level signal ledger and raw store
 priority: 2
 schedule: once

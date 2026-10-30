@@ -254,10 +254,12 @@ fn parses_draft_and_draft_yes() {
             slug,
             yes,
             from_mission,
+            consent_signal,
         } => {
             assert_eq!(slug, "slug");
             assert!(!yes);
             assert_eq!(from_mission, None);
+            assert!(!consent_signal);
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -280,9 +282,34 @@ fn parses_draft_from_mission() {
             slug,
             yes,
             from_mission,
+            consent_signal,
         } => {
             assert_eq!(slug, "defect-slug");
             assert!(!yes);
+            assert_eq!(from_mission.as_deref(), Some("m-abc123"));
+            assert!(!consent_signal);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let sig = Cli::try_parse_from([
+        "kranz",
+        "draft",
+        "signal-sentry-1",
+        "--consent-signal",
+        "--traced-from",
+        "m-abc123",
+    ])
+    .unwrap();
+    match sig.command {
+        Command::Draft {
+            slug,
+            from_mission,
+            consent_signal,
+            ..
+        } => {
+            assert_eq!(slug, "signal-sentry-1");
+            assert!(consent_signal);
             assert_eq!(from_mission.as_deref(), Some("m-abc123"));
         }
         other => panic!("unexpected: {other:?}"),

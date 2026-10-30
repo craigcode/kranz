@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 1: fence external text in ticket seeds
 priority: 2
 schedule: once

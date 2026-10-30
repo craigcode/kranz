@@ -120,6 +120,12 @@ pub struct Outcomes {
     pub outcome_reasons: Option<reasons::Report>,
     pub autonomy_ratio: AutonomyRatio,
     pub grant_latency: GrantLatency,
+    /// Signal receipt-to-consent latency (ticket `signal-intake-8-linkage`,
+    /// D-F), folded from `.kranz/signals/ledger.jsonl` (`Received` →
+    /// `Consented`). `None` and omitted from the wire when no signal proposals
+    /// have been consented yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_consent_latency: Option<GrantLatency>,
     pub escalations: Vec<EscalationRow>,
     /// costUsd per merged non-meta commit (outcomes-view lagging metric).
     pub cost_per_change: CostPerChange,
@@ -1237,6 +1243,7 @@ pub fn compute_outcomes_with_options(
             zero_intervention_share,
         },
         grant_latency: bucketize(&all_latencies_ms),
+        signal_consent_latency: compute_signal_consent_latency(repo_root),
         escalations,
         cost_per_change: CostPerChange {
             total_cost_usd,
@@ -1453,6 +1460,40 @@ pub fn bucketize(latencies_ms: &[u64]) -> GrantLatency {
         buckets,
         total_decided: latencies_ms.len() as u64,
     }
+}
+
+/// Fold signal receipt-to-consent latencies from `.kranz/signals/ledger.jsonl`
+/// (`Received` → `Consented`, ticket `signal-intake-8-linkage`). Returns
+/// `None` when the ledger is absent, unreadable, or has no consented signals.
+pub fn compute_signal_consent_latency(repo_root: &std::path::Path) -> Option<GrantLatency> {
+    use crate::signals::ledger::{SignalLedger, SignalRecordKind};
+    let entries = SignalLedger::read_entries(repo_root).ok()?;
+    let mut received_ts: std::collections::BTreeMap<String, DateTime<Utc>> =
+        std::collections::BTreeMap::new();
+    let mut consented_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut latencies_ms = Vec::new();
+
+    for entry in &entries {
+        if let SignalRecordKind::Received { signal_id, .. } = &entry.record {
+            received_ts
+                .entry(signal_id.clone())
+                .or_insert(entry.timestamp);
+        }
+    }
+    for entry in &entries {
+        if let SignalRecordKind::Consented { signal_id, .. } = &entry.record {
+            if !consented_seen.insert(signal_id.clone()) {
+                continue;
+            }
+            if let Some(rec_ts) = received_ts.get(signal_id) {
+                let delta = (entry.timestamp - *rec_ts).num_milliseconds();
+                if delta >= 0 {
+                    latencies_ms.push(delta as u64);
+                }
+            }
+        }
+    }
+    (!latencies_ms.is_empty()).then(|| bucketize(&latencies_ms))
 }
 
 #[cfg(test)]

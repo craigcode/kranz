@@ -62,6 +62,12 @@ pub const ANSWER_QUESTION_ACTION_ID: &str = "kranz_answer_question";
 /// `/kranz queue <slug>`; rendering the todo list itself remains read-only.
 pub const QUEUE_TICKET_ACTION_ID: &str = "kranz_queue_ticket";
 
+/// `action_id` of the "Draft proposal" button on a signal proposal card
+/// ([`build_signal_proposal_ready`]). The button value carries the ticket slug
+/// and routes through the existing [`crate::inbound::Action::Draft`] path
+/// gated by `allow_users` (`signal-intake-10-surfaces`).
+pub const DRAFT_TICKET_ACTION_ID: &str = "kranz_draft_ticket";
+
 /// `callback_id` of the new-mission modal ([`build_new_mission_modal`]); its
 /// `view_submission` routes to [`crate::inbound::Action::NewMission`].
 pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
@@ -889,6 +895,59 @@ pub fn build_needs_context(n: &NeedsContext) -> Vec<Value> {
     ]
 }
 
+/// Inputs for [`build_signal_proposal_ready`] (`signal-intake-10-surfaces`).
+#[derive(Debug, Clone)]
+pub struct SignalProposalReady {
+    pub ticket_slug: String,
+    pub signal_id: String,
+    pub title: String,
+    pub candidate_missions: Vec<String>,
+}
+
+/// Waiting signal proposal notification (`signal-intake-10-surfaces`):
+/// posts once when a monitoring signal is triaged into an undrafted proposal,
+/// linking to the existing Draft action behind `allow_users`.
+pub fn build_signal_proposal_ready(s: &SignalProposalReady) -> Vec<Value> {
+    let candidates_line = if s.candidate_missions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nSuggested `traced-from-mission` candidates: {}",
+            s.candidate_missions
+                .iter()
+                .map(|m| format!("`{}`", escape_mrkdwn(m)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    vec![
+        header(&format!("Signal proposal waiting — {}", s.ticket_slug)),
+        section(&format!(
+            "*{}*\nSignal `{}` → ticket `{}` (undrafted; awaiting human consent).{}",
+            escape_mrkdwn(&s.title),
+            escape_mrkdwn(&s.signal_id),
+            escape_mrkdwn(&s.ticket_slug),
+            candidates_line
+        )),
+        json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Draft proposal" },
+                    "style": "primary",
+                    "action_id": DRAFT_TICKET_ACTION_ID,
+                    "value": s.ticket_slug,
+                }
+            ]
+        }),
+        context(&format!(
+            "Or run `/kranz draft {}` (restricted to `allowUsers`).",
+            escape_mrkdwn(&s.ticket_slug)
+        )),
+    ]
+}
+
 /// Blocked-milestone message: reason + an explicit "reply in this thread to
 /// unblock" instruction (a threaded reply becomes `kranz msg` guidance). When
 /// `dashboard_url` is set, an "Open in dashboard" deep-link button is appended.
@@ -1483,6 +1542,22 @@ pub fn build_outcomes_summary(outcomes: &kranz_engine::outcomes::Outcomes) -> Ve
         "*GRANT LATENCY*\n{}",
         clip(latency_body.trim_end())
     )));
+
+    if let Some(sig_latency) = &outcomes.signal_consent_latency {
+        let mut sig_body = String::new();
+        for bucket in &sig_latency.buckets {
+            let label = bucket
+                .label
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            sig_body.push_str(&format!("• *{}* — {}\n", label, bucket.count));
+        }
+        blocks.push(section(&format!(
+            "*SIGNAL CONSENT LATENCY*\n{}",
+            clip(sig_body.trim_end())
+        )));
+    }
 
     let cost = &outcomes.cost_per_change;
     let cost_line = match cost.usd_per_commit {

@@ -69,6 +69,11 @@ const KNOWN_FRONTMATTER_KEYS: &[&str] = &[
     "review-output",
     "reviewoutput",
     "trigger",
+    "signal",
+    "signal-proposal",
+    "signalproposal",
+    "signal-candidates",
+    "signalcandidates",
     "traced-from-mission",
     "tracedfrommission",
     "defer-until",
@@ -242,6 +247,17 @@ pub struct Ticket {
     /// frontmatter) — set on webhook-drafted tickets (design D-F,
     /// [`crate::hooks`]); `None` on human-authored tickets.
     pub trigger: Option<String>,
+    /// Repo-level signal ledger identifier (`signal:` frontmatter; design:
+    /// `docs/scoping/signal-intake.md`). `None` on non-signal tickets.
+    pub signal: Option<String>,
+    /// Signal consent state (`signal-proposal:` frontmatter): `"unconsented"`
+    /// when proposed by deterministic triage, `"consented"` after explicit
+    /// human consent.
+    pub signal_proposal: Option<String>,
+    /// Suggested `traced-from-mission` candidate mission IDs (`signal-candidates:`
+    /// frontmatter). Informational only until a human explicitly confirms one
+    /// at draft/consent time (`traced-from-mission`).
+    pub signal_candidates: Vec<String>,
     /// Defect→mission link (`traced-from-mission: m-xxxx` frontmatter) — the
     /// ONE data addition of the flight-surgeon console (ticket
     /// `flight-surgeon-dashboard`): a defect ticket traces back to the mission
@@ -480,6 +496,9 @@ impl Ticket {
         let mut review_artifact: Option<String> = None;
         let mut review_output: Option<String> = None;
         let mut trigger: Option<String> = None;
+        let mut signal: Option<String> = None;
+        let mut signal_proposal: Option<String> = None;
+        let mut signal_candidates: Vec<String> = Vec::new();
         let mut traced_from_mission: Option<String> = None;
         let mut defer_until: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut lifecycle: Option<TicketLifecycle> = None;
@@ -515,6 +534,17 @@ impl Ticket {
                 "trigger" => {
                     let v = value.scalar().trim().to_string();
                     trigger = if v.is_empty() { None } else { Some(v) };
+                }
+                "signal" => {
+                    let v = value.scalar().trim().to_string();
+                    signal = if v.is_empty() { None } else { Some(v) };
+                }
+                "signal-proposal" | "signalproposal" => {
+                    let v = value.scalar().trim().to_string();
+                    signal_proposal = if v.is_empty() { None } else { Some(v) };
+                }
+                "signal-candidates" | "signalcandidates" => {
+                    signal_candidates = value.list();
                 }
                 // Defect→mission link (flight-surgeon console); additive —
                 // older readers ignore it via the unknown-key arm below.
@@ -600,6 +630,11 @@ impl Ticket {
         let (review_artifact, review_output) = review_contract
             .map(|contract| (Some(contract.input_path), Some(contract.output_path)))
             .unwrap_or((None, None));
+        if signal.is_some() || signal_proposal.is_some() {
+            // Invariant 1 (docs/scoping/signal-intake.md): signal proposal
+            // tickets always carry `schedule: once` and can never re-instantiate.
+            schedule = Schedule::Once;
+        }
 
         Ok(Ticket {
             slug: slug.to_string(),
@@ -617,6 +652,9 @@ impl Ticket {
             review_artifact,
             review_output,
             trigger,
+            signal,
+            signal_proposal,
+            signal_candidates,
             traced_from_mission,
             defer_until,
             lifecycle,
@@ -674,11 +712,39 @@ impl Ticket {
     }
 
     /// Whether the ticket is ready at `now`: a `defer-until` timestamp in the
-    /// future parks it (D-BW-3); anything else — absent, or past — is ready.
-    /// Callers supply the clock so the check is explicit at each listing /
-    /// admission site (there is no scheduler flipping state).
+    /// future parks it (D-BW-3), and an unconsented signal proposal (`signal-proposal: unconsented`)
+    /// is never ready until explicit human consent; anything else — absent, or
+    /// past — is ready. Callers supply the clock so the check is explicit at
+    /// each listing / admission site (there is no scheduler flipping state).
     pub fn is_ready_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
-        self.defer_until.is_none_or(|until| until <= now)
+        !self.is_unconsented_signal_proposal() && self.defer_until.is_none_or(|until| until <= now)
+    }
+
+    /// True when this ticket is an unconsented signal proposal (`signal-proposal: unconsented`
+    /// or `signal:` set without `signal-proposal: consented`).
+    pub fn is_unconsented_signal_proposal(&self) -> bool {
+        matches!(
+            self.signal_proposal.as_deref(),
+            Some(v) if !v.eq_ignore_ascii_case("consented")
+        ) || (self.signal.is_some()
+            && !matches!(
+                self.signal_proposal.as_deref(),
+                Some(v) if v.eq_ignore_ascii_case("consented")
+            ))
+    }
+
+    /// Refuse with [`EngineError::InvalidState`] when this ticket is an
+    /// unconsented signal proposal (invariant 1, `docs/scoping/signal-intake.md`).
+    pub fn ensure_signal_consented(&self) -> Result<()> {
+        if self.is_unconsented_signal_proposal() {
+            return Err(EngineError::InvalidState(format!(
+                "ticket '{}' is an unconsented signal proposal (signal-proposal: unconsented); \
+                 explicit human consent (`kranz signal consent {}` or `kranz draft {} --consent-signal`) \
+                 is required before drafting, queueing, or running",
+                self.slug, self.slug, self.slug
+            )));
+        }
+        Ok(())
     }
 
     /// Fold the whole ticket into one readable-markdown message: the goal plus
@@ -717,6 +783,16 @@ impl Ticket {
 
         if !self.context.trim().is_empty() {
             out.push_str("\n## Context\n");
+            if self
+                .context
+                .contains("<<<BEGIN KRANZ UNTRUSTED SIGNAL EVIDENCE")
+                && !self
+                    .context
+                    .contains(crate::signals::SIGNAL_EVIDENCE_FENCE_WARNING)
+            {
+                out.push_str(crate::signals::SIGNAL_EVIDENCE_FENCE_WARNING);
+                out.push('\n');
+            }
             out.push_str(self.context.trim());
             out.push('\n');
         }
@@ -761,7 +837,7 @@ impl Ticket {
     }
 
     /// Path of the ticket markdown for a slug.
-    pub(crate) fn md_path(repo_root: &Path, slug: &str) -> PathBuf {
+    pub fn md_path(repo_root: &Path, slug: &str) -> PathBuf {
         Self::tickets_dir(repo_root).join(format!("{slug}.md"))
     }
 
@@ -1163,6 +1239,75 @@ impl Ticket {
         atomic_write(&md, out.as_bytes())?;
         Ok(true)
     }
+
+    /// Upsert `signal-proposal: consented` in the ticket's frontmatter block.
+    /// Returns `Ok(true)` if the file was modified, `Ok(false)` if already
+    /// `"consented"`.
+    pub fn mark_signal_consented(repo_root: &Path, slug: &str) -> Result<bool> {
+        Self::ensure_valid_slug(slug)?;
+        let md = Self::md_path(repo_root, slug);
+        let text = read_nofollow_to_string(&md)?;
+        let new_line = "signal-proposal: consented";
+
+        let (bom, source) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => ("\u{feff}", rest),
+            None => ("", text.as_str()),
+        };
+        let lines: Vec<&str> = source.split_inclusive('\n').collect();
+        let has_frontmatter = lines
+            .first()
+            .map(|line| line.trim_end() == "---")
+            .unwrap_or(false);
+        if !has_frontmatter {
+            return Err(EngineError::Config(format!(
+                "ticket {slug}: signal proposal missing frontmatter"
+            )));
+        }
+
+        let mut closing: Option<usize> = None;
+        let mut existing: Option<(usize, String)> = None;
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            if line.trim_end() == "---" {
+                closing = Some(i);
+                break;
+            }
+            if existing.is_none() && !line.trim_start().starts_with('#') {
+                if let Some((key, value)) = line.split_once(':') {
+                    let key = normalize_key(key);
+                    if key == "signal-proposal" || key == "signalproposal" {
+                        existing = Some((i, unquote(value.trim())));
+                    }
+                }
+            }
+        }
+        if closing.is_none() {
+            return Err(EngineError::Config(format!(
+                "ticket {slug}: frontmatter opened with `---` but was never closed"
+            )));
+        }
+        if let Some((_, value)) = &existing {
+            if value.eq_ignore_ascii_case("consented") {
+                return Ok(false);
+            }
+        }
+        let mut out = String::with_capacity(text.len() + new_line.len() + 8);
+        out.push_str(bom);
+        let replace_idx = existing.as_ref().map(|(i, _)| *i);
+        for (i, line) in lines.iter().enumerate() {
+            if i == 1 && replace_idx.is_none() {
+                out.push_str(new_line);
+                out.push('\n');
+            }
+            if replace_idx == Some(i) {
+                out.push_str(new_line);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+            }
+        }
+        atomic_write(&md, out.as_bytes())?;
+        Ok(true)
+    }
 }
 
 fn read_nofollow_to_string(path: &Path) -> Result<String> {
@@ -1536,7 +1681,7 @@ fn parse_sections(body: &str) -> Sections {
     let mut preamble: Vec<&str> = Vec::new();
     let mut text_buf: Vec<&str> = Vec::new();
     let mut bullets: Vec<String> = Vec::new();
-    let mut in_untrusted_fence = false;
+    let mut expected_fence_end: Option<String> = None;
 
     // Commit the buffer accumulated for `current` into `sections`.
     fn flush(
@@ -1572,13 +1717,19 @@ fn parse_sections(body: &str) -> Sections {
 
     for raw in body.lines() {
         let trimmed = raw.trim();
-        if trimmed.starts_with("<<<BEGIN KRANZ UNTRUSTED ") {
-            in_untrusted_fence = true;
-        } else if trimmed.starts_with("<<<END KRANZ UNTRUSTED ") {
-            in_untrusted_fence = false;
+        if expected_fence_end.is_none()
+            && trimmed.starts_with("<<<BEGIN KRANZ UNTRUSTED ")
+            && trimmed.ends_with(">>>")
+        {
+            expected_fence_end =
+                Some(trimmed.replacen("<<<BEGIN KRANZ UNTRUSTED ", "<<<END KRANZ UNTRUSTED ", 1));
+        } else if let Some(end_marker) = &expected_fence_end {
+            if trimmed == end_marker {
+                expected_fence_end = None;
+            }
         }
 
-        if !in_untrusted_fence {
+        if expected_fence_end.is_none() {
             if let Some(heading) = heading_text(raw) {
                 if sections.first_heading.is_none() {
                     sections.first_heading = Some(heading.to_string());

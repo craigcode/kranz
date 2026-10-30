@@ -52,6 +52,8 @@ struct MissionCursor {
 struct NotifyCursors {
     #[serde(default)]
     by_mission: BTreeMap<String, u64>,
+    #[serde(default)]
+    signal_ledger_seq: u64,
 }
 
 impl NotifyCursors {
@@ -280,9 +282,70 @@ pub async fn run_bridge(
                         tracing::warn!(mission = %mission_id, error = %e, "slack outbound poll failed");
                     }
                 }
+                if let Err(e) = poll_signal_proposals(&cfg, &client, &repo_root).await {
+                    tracing::warn!(error = %e, "slack signal proposal poll failed");
+                }
             }
         }
     }
+}
+
+/// Poll `.kranz/signals/ledger.jsonl` for newly proposed signals (`dedupe_count == 1`)
+/// and post each waiting proposal once to the configured Slack channel
+/// (`signal-intake-10-surfaces`).
+pub async fn poll_signal_proposals(
+    cfg: &SlackConfig,
+    client: &SlackClient,
+    repo_root: &Path,
+) -> Result<usize> {
+    use crate::format::{build_signal_proposal_ready, label_blocks, SignalProposalReady};
+    use kranz_engine::signals::ledger::{SignalLedger, SignalRecordKind};
+    use kranz_engine::ticket::Ticket;
+
+    let entries = SignalLedger::read_entries(repo_root)?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut cursors = NotifyCursors::load(repo_root).unwrap_or_default();
+    let mut posted = 0usize;
+    let mut max_seq = cursors.signal_ledger_seq;
+
+    for entry in &entries {
+        if entry.seq <= cursors.signal_ledger_seq {
+            continue;
+        }
+        if let SignalRecordKind::Proposed {
+            signal_id,
+            ticket_slug,
+            dedupe_count: 1,
+            ..
+        } = &entry.record
+        {
+            let md_path = Ticket::md_path(repo_root, ticket_slug);
+            if let Ok(ticket) = Ticket::load(&md_path) {
+                if ticket.is_unconsented_signal_proposal() {
+                    let blocks = build_signal_proposal_ready(&SignalProposalReady {
+                        ticket_slug: ticket_slug.clone(),
+                        signal_id: signal_id.clone(),
+                        title: ticket.title.clone(),
+                        candidate_missions: ticket.signal_candidates.clone(),
+                    });
+                    let blocks = label_blocks(blocks, cfg.instance_name.as_deref());
+                    client.post_message(&cfg.channel, &blocks, None).await?;
+                    posted += 1;
+                }
+            }
+        }
+        if entry.seq > max_seq {
+            max_seq = entry.seq;
+        }
+    }
+
+    if max_seq > cursors.signal_ledger_seq {
+        cursors.signal_ledger_seq = max_seq;
+        let _ = cursors.save(repo_root);
+    }
+    Ok(posted)
 }
 
 /// Advance one mission's cursor and post any classified notifications for new

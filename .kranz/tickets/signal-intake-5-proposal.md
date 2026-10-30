@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 5: undrafted proposals behind human consent
 priority: 2
 schedule: once

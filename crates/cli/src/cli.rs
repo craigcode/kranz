@@ -326,8 +326,17 @@ pub enum Command {
         /// Seed the ticket's `traced-from-mission` frontmatter with this
         /// mission id (drafting a defect ticket traced back to the mission
         /// that shipped the defect — the flight-surgeon false-green join)
-        #[arg(long = "from-mission", value_name = "MISSION_ID")]
+        #[arg(
+            long = "from-mission",
+            visible_alias = "traced-from",
+            value_name = "MISSION_ID"
+        )]
         from_mission: Option<String>,
+
+        /// Record explicit operator consent for an unconsented signal proposal
+        /// before drafting (`signal-intake-5-proposal`)
+        #[arg(long = "consent-signal")]
+        consent_signal: bool,
     },
 
     /// Decompose a complex goal into a ticket DAG (blocked-by edges).
@@ -700,6 +709,44 @@ pub enum Command {
     Standards {
         #[command(subcommand)]
         command: StandardsCommand,
+    },
+
+    /// Inspect the signal ledger and record human consent on signal proposals
+    /// (`docs/scoping/signal-intake.md`)
+    Signal {
+        #[command(subcommand)]
+        command: SignalCommand,
+    },
+}
+
+/// Subcommands under `kranz signal` — the signal intake ledger and consent
+/// surface (`docs/scoping/signal-intake.md`).
+#[derive(Subcommand, Debug)]
+pub enum SignalCommand {
+    /// List recorded signal ledger entries
+    List {
+        /// Emit the signal ledger entries as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record explicit human consent for an unconsented signal proposal ticket,
+    /// optionally confirming a `traced-from-mission` candidate
+    Consent {
+        /// The proposal ticket slug or signal id (`sig-...`)
+        slug_or_id: String,
+
+        /// Confirm a `traced-from-mission` candidate mission id (`m-...`)
+        #[arg(
+            long = "traced-from",
+            visible_alias = "from-mission",
+            value_name = "MISSION_ID"
+        )]
+        traced_from: Option<String>,
+
+        /// Actor identity recorded on the consent ledger entry
+        #[arg(long, default_value = "cli:operator")]
+        actor: String,
     },
 }
 

@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 7: first monitoring source adapter
 priority: 2
 schedule: once

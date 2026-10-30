@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 4: deterministic triage
 priority: 2
 schedule: once

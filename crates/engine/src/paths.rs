@@ -44,6 +44,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "slack-threads.json",
     "queue/",
     "hook-status/",
+    "signals/",
     "tickets/*.status",
     "serve.token",
     "serve.read.token",
@@ -545,7 +546,6 @@ pub fn open_read_nofollow(path: &Path) -> Result<std::fs::File> {
 /// all; the mission-tree paths never reach here.
 #[cfg(unix)]
 fn open_read_nofollow_weaker_tier(path: &Path) -> Result<std::fs::File> {
-    use cap_fs_ext::DirExt as _;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -554,18 +554,8 @@ fn open_read_nofollow_weaker_tier(path: &Path) -> Result<std::fs::File> {
         .file_name()
         .ok_or_else(|| unsafe_mission_dir_path(path))?;
     let canonical_parent = std::fs::canonicalize(parent)?;
-    let relative = canonical_parent
-        .strip_prefix("/")
+    let dir = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
         .map_err(|_| unsafe_mission_dir_path(path))?;
-    let mut dir = Dir::open_ambient_dir("/", ambient_authority())?;
-    for component in relative.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(unsafe_mission_dir_path(path));
-        };
-        dir = dir
-            .open_dir_nofollow(name)
-            .map_err(|_| unsafe_mission_dir_path(path))?;
-    }
     open_file_nofollow_under(&dir, file_name, path)
 }
 
