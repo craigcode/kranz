@@ -363,6 +363,17 @@ jobs:
         run: |
           cargo build --example acp_compat_probe
           python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
+      - name: Prove signal injection corpus gate
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/kranz-signal-injection-suite.log"
+          set +e
+          cargo test --workspace --test signal_injection_suite_test -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$log"
       # What the run did NOT exercise. libtest captures a passing test's
       # output, and a skipping test passes, so without this ledger the skips
       # are invisible in exactly the case that matters.
@@ -435,6 +446,17 @@ jobs:
         run: |
           cargo build --example acp_compat_probe
           python3 scripts/check-acp-probe.py target/debug/examples/acp_compat_probe
+      - name: Prove signal injection corpus gate
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/kranz-signal-injection-suite.log"
+          set +e
+          cargo test --workspace --test signal_injection_suite_test -- --nocapture >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          test "$status" -eq 0
+          grep -qE 'test result: ok\. [1-9]' "$log"
       - name: Report capabilities macOS skipped
         if: always()
         run: |

@@ -19,9 +19,20 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use kranz_engine::git_ops::GitRepo;
 use kranz_engine::hooks::{self, Consent, Trigger, TriggerDraft};
+use kranz_engine::signals::proposal::{ingest_verified_signal, IngestResult};
+use kranz_engine::signals::sentry::SentrySignalSource;
+use kranz_engine::signals::source::{DropReason, ReplayCache};
+use kranz_engine::signals::triage::SignalsConfig;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+
+static SENTRY_REPLAY_CACHE: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
+
+fn sentry_replay_cache() -> &'static Mutex<ReplayCache> {
+    SENTRY_REPLAY_CACHE.get_or_init(|| Mutex::new(ReplayCache::default()))
+}
 
 /// `POST /api/hooks/github` — see module docs. Always answers a JSON body;
 /// refusals are honest status codes (401 bad signature, 403 wrong repo or
@@ -183,4 +194,111 @@ fn decision_trigger(trigger: &Trigger, outcome: &str, detail: &str) {
         Consent::PreConsentedQueue => "fix-and-queue",
     };
     decision(event, Some(&trigger.actor), Some(consent), outcome, detail);
+}
+
+/// `POST /api/hooks/sentry` — the Sentry issue/alert webhook endpoint
+/// (`docs/scoping/signal-intake.md`, `signal-intake-7-first-source`).
+///
+/// Authenticates via `Sentry-Hook-Signature` (HMAC-SHA256) +
+/// `Sentry-Hook-Timestamp` (5-minute skew window) + bounded replay cache.
+/// Never drafts, queues, or executes a mission automatically; produces at most
+/// an undrafted proposal ticket with `signal-proposal: unconsented`.
+pub(crate) async fn sentry_hook(
+    State(server): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let repo_root = server.host.repo_root().clone();
+    let signals_cfg = SignalsConfig::load(&repo_root).map_err(ApiError::from)?;
+    let sentry_cfg = signals_cfg.sentry.clone().unwrap_or_default();
+    let source = SentrySignalSource::new(sentry_cfg);
+
+    let mut header_map = BTreeMap::new();
+    for (name, value) in &headers {
+        if let Ok(v) = value.to_str() {
+            header_map.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+        }
+    }
+
+    let result = {
+        let mut cache = sentry_replay_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ingest_verified_signal(
+            &repo_root,
+            &source,
+            &header_map,
+            &body,
+            &signals_cfg,
+            chrono::Utc::now(),
+            &mut cache,
+        )
+        .map_err(ApiError::from)?
+    };
+
+    match result {
+        IngestResult::Dropped { reason } => {
+            tracing::info!(
+                target: "kranz::hooks",
+                source = "sentry",
+                reason = reason.as_str(),
+                "sentry hook dropped"
+            );
+            match reason {
+                DropReason::SecretNotConfigured => Err(ApiError::forbidden(
+                    "sentry hooks are not configured for this repository (no signals.sentry.secret)",
+                )),
+                DropReason::MissingSignature
+                | DropReason::InvalidSignature
+                | DropReason::MissingTimestamp
+                | DropReason::InvalidTimestamp
+                | DropReason::TimestampSkew => Err(ApiError::unauthorized(reason.as_str())),
+                DropReason::ReplayedDelivery => Err(ApiError::conflict(reason.as_str())),
+                DropReason::BodyTooLarge | DropReason::MalformedPayload => {
+                    Err(ApiError::bad_request(reason.as_str()))
+                }
+                DropReason::UnsupportedEvent => Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({ "outcome": "ignored", "reason": reason.as_str() })),
+                )),
+            }
+        }
+        IngestResult::Parked {
+            signal_id,
+            rule,
+            dedupe_count,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "outcome": "parked",
+                "signalId": signal_id,
+                "rule": rule,
+                "dedupeCount": dedupe_count,
+            })),
+        )),
+        IngestResult::NotACodeChange {
+            signal_id,
+            rule,
+            dedupe_count,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "outcome": "not_a_code_change",
+                "signalId": signal_id,
+                "rule": rule,
+                "dedupeCount": dedupe_count,
+            })),
+        )),
+        IngestResult::Proposed(proposal) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "outcome": "proposed",
+                "signalId": proposal.signal_id,
+                "ticketSlug": proposal.ticket_slug,
+                "created": proposal.created,
+                "dedupeCount": proposal.dedupe_count,
+                "candidateMissions": proposal.candidate_missions,
+            })),
+        )),
+    }
 }

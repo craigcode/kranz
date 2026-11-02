@@ -40,10 +40,10 @@ use crate::format::{
     CONFIG_BACKEND_BLOCK, CONFIG_CALLBACK_ID, CONFIG_EFFORT_ACTION, CONFIG_EFFORT_BLOCK,
     CONFIG_MISSION_ACTION, CONFIG_MISSION_BLOCK, CONFIG_MODEL_ACTION, CONFIG_MODEL_BLOCK,
     CONFIG_ROLE_ACTION, CONFIG_ROLE_BLOCK, DENY_GRANT_ACTION_ID, DENY_PERMISSION_ACTION_ID,
-    MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION, NEW_MISSION_GOAL_BLOCK,
-    NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION, NEW_TICKET_CONTEXT_BLOCK,
-    NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK, QUEUE_TICKET_ACTION_ID,
-    REJECT_REVISION_ACTION_ID, START_ACTION_ID,
+    DRAFT_TICKET_ACTION_ID, MERGE_ACTION_ID, NEW_MISSION_CALLBACK_ID, NEW_MISSION_GOAL_ACTION,
+    NEW_MISSION_GOAL_BLOCK, NEW_TICKET_CALLBACK_ID, NEW_TICKET_CONTEXT_ACTION,
+    NEW_TICKET_CONTEXT_BLOCK, NEW_TICKET_GOAL_ACTION, NEW_TICKET_GOAL_BLOCK,
+    QUEUE_TICKET_ACTION_ID, REJECT_REVISION_ACTION_ID, START_ACTION_ID,
 };
 use serde_json::Value;
 
@@ -442,6 +442,7 @@ fn route_interactive(payload: &Value) -> Action {
         Start,
         Merge,
         QueueTicket,
+        DraftTicket,
         ApproveRevision,
         RejectRevision,
         ApproveGrant,
@@ -456,6 +457,7 @@ fn route_interactive(payload: &Value) -> Action {
             Some(id) if id == START_ACTION_ID => ButtonKind::Start,
             Some(id) if id == MERGE_ACTION_ID => ButtonKind::Merge,
             Some(id) if id == QUEUE_TICKET_ACTION_ID => ButtonKind::QueueTicket,
+            Some(id) if id == DRAFT_TICKET_ACTION_ID => ButtonKind::DraftTicket,
             Some(id) if id == APPROVE_REVISION_ACTION_ID => ButtonKind::ApproveRevision,
             Some(id) if id == REJECT_REVISION_ACTION_ID => ButtonKind::RejectRevision,
             Some(id) if id == APPROVE_GRANT_ACTION_ID => ButtonKind::ApproveGrant,
@@ -585,6 +587,11 @@ fn route_interactive(payload: &Value) -> Action {
                         response_url,
                     },
                     ButtonKind::QueueTicket => Action::QueueTicket {
+                        slug: value,
+                        user_id,
+                        response_url,
+                    },
+                    ButtonKind::DraftTicket => Action::Draft {
                         slug: value,
                         user_id,
                         response_url,

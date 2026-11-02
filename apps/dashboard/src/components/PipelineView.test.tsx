@@ -14,6 +14,7 @@ vi.mock('../lib/api', async () => {
       tickets: vi.fn(),
       missions: vi.fn(),
       queue: vi.fn().mockResolvedValue({ entries: [], busyWith: null, drain: { live: false, currentMissionId: null, ran: [] } }),
+      signals: vi.fn().mockResolvedValue({ signals: [], dropped: [] }),
       planMd: vi.fn(),
       reportMd: vi.fn(),
       diffStat: vi.fn(),

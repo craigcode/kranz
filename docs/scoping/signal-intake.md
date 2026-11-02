@@ -162,21 +162,21 @@ domain-free (a vendor's public webhook format), so they pass the clean-room
 test. The GitHub trigger is ported onto the trait as its first implementation,
 with no behavior change.
 
-## D-C. First source (OPERATOR DECISION)
+## D-C. First source (DECIDED: Sentry issue alerts)
 
-Sentry issue alerts or New Relic alert webhooks: build whichever the
-operator's telemetry actually uses. The adapter is written against the
-vendor's current documentation for payload shape and signing, checked at the
-time of the work, not from memory.
+Sentry issue alerts (chosen by the operator over New Relic alert webhooks). The
+adapter is written against Sentry's documented Issue Alert / Event Alert
+webhook format and HMAC-SHA256 signing (`Sentry-Hook-Signature`,
+`Sentry-Hook-Timestamp`, `Sentry-Hook-Resource`), checked at the time of the
+work, not from memory.
 
-## D-D. Should GitHub triggers become proposal-first too? (OPERATOR DECISION)
+## D-D. Should GitHub triggers become proposal-first too? (DECIDED: Keep GitHub triggers as-is)
 
 Signal proposals never draft on their own. The GitHub trigger drafts on
 receipt, which is defensible because an allow-listed user's labelled comment
-is the consent. Options: keep it as is (recommended; its trust comes from the
-actor, not the payload), or route it through proposals for one consistent
-path. The CI-failure trigger has no human actor and is the case to look at
-first.
+is the consent. Decided: keep GitHub triggers as-is (their trust comes from the
+allow-listed actor or repository workflow configuration, while monitoring
+signals remain strictly proposal-first behind explicit human consent).
 
 ## D-E. Dedupe window and batching (PROPOSED)
 

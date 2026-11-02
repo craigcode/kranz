@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-10-06
+last_verified: 2026-11-02
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -10,6 +10,8 @@ verified_against:
   - docs/knowledge/decisions/skill-capture-boundary.md
   - .kranz/tickets/repo-knowledge-refresh-drift.md
 ---
+
+Rechecked 2026-11-02 (UTC) against the signal intake skill-capture boundary recheck; knowledge map, ownership, and injection rules are unchanged.
 
 Rechecked 2026-10-06 (UTC) against the R2 skill-capture boundary recheck.
 Resource observations leave this knowledge map, ownership and injection rules

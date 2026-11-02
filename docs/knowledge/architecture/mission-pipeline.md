@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-22
+last_verified: 2026-11-02
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline (`docs/scoping/signal-intake.md`): external monitoring signals stop at undrafted `signal-proposal: unconsented` tickets (`queue::enqueue`, draft, approve, and scheduling refuse them until explicit operator consent), `outcomes` adds read-only `signal_consent_latency`, and `paths::open_read_nofollow_weaker_tier` opens canonical parents directly before no-follow leaf resolution. Mission pipeline stages and `events.jsonl` schemas are unchanged.
 
 Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: `MissionConfig` is shared via `Arc` on `SelectedBackend`, `emit`/`box_future` are outlined to reduce hosted debug stack frames, and review packets project advisory `contractReadbacks` alongside `baselineCandidates`. Pipeline stages and event schemas are unchanged.
 

@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-22
+last_verified: 2026-11-02
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline: undrafted `signal-proposal: unconsented` tickets and Slack `SignalProposalReady` cards extend intake and human consent without changing existing role or mission lifecycle vocabulary.
 
 Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back; no vocabulary or role boundary changed.
 

@@ -1,5 +1,5 @@
 ---
-state: open
+state: done
 title: Signal intake 3: signal source contract, with GitHub as its first adapter
 priority: 2
 schedule: once
