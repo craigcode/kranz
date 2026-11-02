@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Implemented mechanical_maintenance module with bounded routine validation, external draft-PR publisher contract, two-phase 24h dead-code observation/deletion gate, and replay-gated routine correction workflow."
 title: Mechanical maintenance — draft PRs, observed dead code, reviewed routine fixes
 priority: 3
 schedule: once

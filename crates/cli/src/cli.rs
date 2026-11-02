@@ -993,6 +993,10 @@ pub enum TicketCommand {
         /// Ticket slug (defaults to the change directory's name)
         #[arg(long)]
         slug: Option<String>,
+
+        /// Overwrite `.kranz/tickets/<slug>.md` if it already exists
+        #[arg(long)]
+        force: bool,
     },
 
     /// Append a note to a ticket's discussion

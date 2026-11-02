@@ -19,8 +19,10 @@ use tokio::sync::{watch, Notify};
 pub(crate) const FIXTURE_IMAGE: &str =
     "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_TERMINALS: usize = 8;
-const MAX_CREATIONS: usize = 32;
+pub(crate) const RETENTION_SECONDS: u64 = 300;
+pub(crate) const MAX_TERMINALS: usize = 8;
+pub(crate) const MAX_CREATIONS: usize = 32;
+pub(crate) const MAX_OUTPUT_POLLS_PER_SEC: usize = 10;
 
 pub(crate) struct Context {
     pub(crate) client: DockerEvaluator,
@@ -29,6 +31,7 @@ pub(crate) struct Context {
     pub(crate) workspace: PathBuf,
     pub(crate) scratch: PathBuf,
     pub(crate) alive: Arc<AtomicBool>,
+    pub(crate) command_seconds: u64,
 }
 
 pub(crate) struct Authority {
@@ -45,8 +48,10 @@ struct State {
     exit: Option<ExitStatus>,
     released: bool,
     releasing: bool,
+    retention_expired: bool,
     driver_ok: bool,
     failed: bool,
+    output_polls: VecDeque<std::time::Instant>,
 }
 
 struct Entry {
@@ -88,6 +93,17 @@ pub(crate) struct Provider {
     failed: Arc<AtomicBool>,
     failure: Arc<Notify>,
     receipts: Receipts,
+    retention_seconds: u64,
+}
+
+fn evict_retention_expired(registry: &mut Registry) {
+    registry.entries.retain(|_, entry| {
+        entry
+            .state
+            .lock()
+            .map(|state| !(state.retention_expired && state.driver_ok))
+            .unwrap_or(true)
+    });
 }
 
 impl Provider {
@@ -109,7 +125,27 @@ impl Provider {
             failed: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(Notify::new()),
             receipts: Receipts::default(),
+            retention_seconds: RETENTION_SECONDS,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_retention_seconds(mut self, seconds: u64) -> Self {
+        self.retention_seconds = seconds.clamp(1, 3_600);
+        self
+    }
+
+    /// Checks active terminal and lifetime creation caps before human consent
+    /// or one-use authority creation, evicting any handle whose post-exit
+    /// retention window already expired cleanly.
+    pub(crate) fn check_create_capacity(&self) -> Result<(), Error> {
+        self.check_scope(&self.scope)?;
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        evict_retention_expired(&mut registry);
+        if registry.entries.len() >= MAX_TERMINALS || registry.creations >= MAX_CREATIONS {
+            return Err(Error::Unavailable);
+        }
+        Ok(())
     }
 
     fn check_scope(&self, scope: &Scope) -> Result<(), Error> {
@@ -211,14 +247,11 @@ impl Provider {
             .get(id)
             .cloned()
             .ok_or(Error::InvalidHandle)?;
-        if entry
-            .state
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .releasing
-        {
+        let state = entry.state.lock().map_err(|_| Error::Unavailable)?;
+        if state.releasing || (state.retention_expired && state.driver_ok) {
             return Err(Error::InvalidHandle);
         }
+        drop(state);
         Ok(entry)
     }
 
@@ -273,14 +306,11 @@ impl Provider {
 
     pub(crate) async fn close(&self) -> Result<Vec<CleanupReceipt>, Error> {
         self.check_scope(&self.scope)?;
-        let ids: Vec<_> = self
-            .registry
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .entries
-            .keys()
-            .cloned()
-            .collect();
+        let ids: Vec<_> = {
+            let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+            evict_retention_expired(&mut registry);
+            registry.entries.keys().cloned().collect()
+        };
         let mut receipts = Vec::new();
         // At most eight handles. Each release is bounded; the outer session
         // applies a shared close deadline and tears down the namespace on error.
@@ -360,8 +390,10 @@ impl TerminalProvider for Provider {
                 exit: None,
                 released: false,
                 releasing: false,
+                retention_expired: false,
                 driver_ok: false,
                 failed: false,
+                output_polls: VecDeque::new(),
             }),
             stdin: tokio::sync::Mutex::new(None),
             changed,
@@ -375,6 +407,7 @@ impl TerminalProvider for Provider {
             {
                 return Err(Error::NotAuthorized);
             }
+            evict_retention_expired(&mut registry);
             if registry.entries.len() >= MAX_TERMINALS || registry.creations >= MAX_CREATIONS {
                 return Err(Error::Unavailable);
             }
@@ -403,8 +436,13 @@ impl TerminalProvider for Provider {
                 crate::command_exec::ControlChild(command.spawn().map_err(|_| Error::Unavailable)?);
             let mut stdin = child.0.stdin.take().ok_or(Error::Unavailable)?;
             let stdout = child.0.stdout.take().ok_or(Error::Unavailable)?;
-            let launch = serde_json::to_vec(&json!({"workspace":self.context.workspace,
-                "scratch":self.context.scratch, "action":action}))
+            let launch = serde_json::to_vec(&json!({
+                "workspace":self.context.workspace,
+                "scratch":self.context.scratch,
+                "action":action,
+                "commandSeconds":self.context.command_seconds,
+                "retentionSeconds":self.retention_seconds,
+            }))
             .map_err(|_| Error::InvalidRequest)?;
             if launch.len() > kranz_acp::terminal::MAX_REQUEST_BYTES {
                 return Err(Error::InvalidRequest);
@@ -425,9 +463,14 @@ impl TerminalProvider for Provider {
             let receipts = self.receipts.clone();
             let binding =
                 json!({"terminalId":id,"scope":scope,"actionDigest":authority.action_digest});
+            let supervision_seconds = self
+                .context
+                .command_seconds
+                .saturating_add(self.retention_seconds)
+                .saturating_add(10);
             let task = tokio::spawn(async move {
                 let outcome = tokio::time::timeout(
-                    Duration::from_secs(40),
+                    Duration::from_secs(supervision_seconds),
                     capture_driver(&capture, &mut child, stdout, receipts, binding),
                 )
                 .await;
@@ -457,24 +500,34 @@ impl TerminalProvider for Provider {
 
     async fn output(&self, scope: Scope, id: String) -> Result<OutputSnapshot, Error> {
         let entry = self.entry(&scope, &id)?;
-        let state = entry.state.lock().map_err(|_| Error::Unavailable)?;
+        let mut state = entry.state.lock().map_err(|_| Error::Unavailable)?;
         if state.failed {
             return Err(Error::CleanupUnconfirmed);
         }
+        let now = std::time::Instant::now();
+        while state
+            .output_polls
+            .front()
+            .is_some_and(|ts| now.saturating_duration_since(*ts) >= Duration::from_secs(1))
+        {
+            state.output_polls.pop_front();
+        }
+        if state.output_polls.len() >= MAX_OUTPUT_POLLS_PER_SEC {
+            return Err(Error::Unavailable);
+        }
+        state.output_polls.push_back(now);
         Ok(state.tail.snapshot(state.exit.clone()))
     }
 
     async fn wait_for_exit(&self, scope: Scope, id: String) -> Result<ExitStatus, Error> {
         let entry = self.entry(&scope, &id)?;
-        tokio::time::timeout(
-            Duration::from_secs(35),
-            wait_state(&entry, |s| s.exit.clone()),
-        )
-        .await
-        .map_err(|_| {
-            self.fail();
-            Error::CleanupUnconfirmed
-        })?
+        let wait_timeout = Duration::from_secs(self.context.command_seconds.saturating_add(5));
+        tokio::time::timeout(wait_timeout, wait_state(&entry, |s| s.exit.clone()))
+            .await
+            .map_err(|_| {
+                self.fail();
+                Error::CleanupUnconfirmed
+            })?
     }
 
     async fn kill(&self, scope: Scope, id: String) -> Result<CleanupReceipt, Error> {
@@ -589,13 +642,18 @@ async fn capture_driver(
                     if status.exit_code.is_some() == status.signal.is_some() {
                         return Err(Error::InvalidRequest);
                     }
+                    let wall_expired = value.get("wallClockExpired") == Some(&Value::Bool(true));
                     receipts.record(json!({"terminalExited": {
                         "binding":binding,"exitStatus":status,"descendantsReaped":true,"outputDrained":true,
+                        "wallClockExpired":wall_expired,
                     }}))?;
                     state.exit = Some(status);
                 }
                 Some("released") if state.exit.is_some() && !state.released => {
-                    state.released = true
+                    state.released = true;
+                    if value.get("retentionExpired") == Some(&Value::Bool(true)) {
+                        state.retention_expired = true;
+                    }
                 }
                 _ => return Err(Error::CleanupUnconfirmed),
             }
@@ -630,6 +688,7 @@ mod tests {
                 workspace: "/workspace".into(),
                 scratch: "/scratch".into(),
                 alive: Arc::new(AtomicBool::new(true)),
+                command_seconds: 30,
             },
             "run".into(),
             "engine".into(),
@@ -765,5 +824,152 @@ mod tests {
             Err(Error::Unavailable)
         );
         assert_eq!(provider.registry.lock().unwrap().creations, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_capacity_and_output_rate_limits_fail_safely_without_burning_authority() {
+        let (provider, _, _) = fixture();
+        let provider = provider.with_retention_seconds(5);
+        assert_eq!(provider.retention_seconds, 5);
+        provider.check_create_capacity().unwrap();
+
+        for idx in 0..MAX_TERMINALS {
+            let (changed, _) = watch::channel(());
+            let entry = Arc::new(Entry {
+                state: Mutex::new(State {
+                    tail: OutputTail::new(64).unwrap(),
+                    started: true,
+                    exit: None,
+                    released: false,
+                    releasing: false,
+                    retention_expired: idx == 0,
+                    driver_ok: idx == 0,
+                    failed: false,
+                    output_polls: VecDeque::new(),
+                }),
+                stdin: tokio::sync::Mutex::new(None),
+                changed,
+                abort: Mutex::new(None),
+            });
+            provider
+                .registry
+                .lock()
+                .unwrap()
+                .entries
+                .insert(format!("terminal-{idx}"), entry);
+        }
+
+        // An entry whose retention window expired and whose driver exited cleanly is evicted.
+        provider.check_create_capacity().unwrap();
+        assert_eq!(
+            provider
+                .output(provider.scope.clone(), "terminal-0".into())
+                .await,
+            Err(Error::InvalidHandle)
+        );
+
+        // Fill the remaining slot so MAX_TERMINALS is reached.
+        let (changed, _) = watch::channel(());
+        provider.registry.lock().unwrap().entries.insert(
+            "terminal-8".into(),
+            Arc::new(Entry {
+                state: Mutex::new(State {
+                    tail: OutputTail::new(64).unwrap(),
+                    started: true,
+                    exit: None,
+                    released: false,
+                    releasing: false,
+                    retention_expired: false,
+                    driver_ok: false,
+                    failed: false,
+                    output_polls: VecDeque::new(),
+                }),
+                stdin: tokio::sync::Mutex::new(None),
+                changed,
+                abort: Mutex::new(None),
+            }),
+        );
+        assert_eq!(provider.check_create_capacity(), Err(Error::Unavailable));
+        assert!(provider.registry.lock().unwrap().authorities.is_empty());
+
+        // Per-terminal output polling is rate-limited at MAX_OUTPUT_POLLS_PER_SEC.
+        for _ in 0..MAX_OUTPUT_POLLS_PER_SEC {
+            assert!(provider
+                .output(provider.scope.clone(), "terminal-1".into())
+                .await
+                .is_ok());
+        }
+        assert_eq!(
+            provider
+                .output(provider.scope.clone(), "terminal-1".into())
+                .await,
+            Err(Error::Unavailable)
+        );
+        // Other handles keep their own independent output polling window.
+        assert!(provider
+            .output(provider.scope.clone(), "terminal-2".into())
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn terminal_budget_classification_requires_confirmed_exhaustion_and_surfaces_message() {
+        use crate::acp_resources::{
+            ContainerState, Counters, FailureClass, ResourceEvidence, Sample,
+        };
+        let now = chrono::Utc::now();
+        let mut evidence = ResourceEvidence {
+            container_id: "a".repeat(64),
+            image: FIXTURE_IMAGE.into(),
+            supervisor_sha256: "b".repeat(64),
+            owner: "c".repeat(32),
+            limits: crate::acp_worker::Resources {
+                memory_mib: 256,
+                cpu_millis: 1_000,
+                pids: 64,
+                nofile: 256,
+                fsize_mib: 64,
+                tmpfs_mib: 64,
+                session_seconds: 600,
+            },
+            observation_started_at: now,
+            observation_finished_at: now,
+            namespace_cleanup_confirmed: true,
+            state: Some(ContainerState {
+                running: false,
+                oom_killed: false,
+                exit_code: 1,
+            }),
+            sample: Some(Sample {
+                owner: "c".repeat(32),
+                elapsed_ms: 100,
+                complete: true,
+                wall_clock_expired: false,
+                baseline: Counters {
+                    oom_kill: Some(0),
+                    pids_max: Some(0),
+                    throttled_usec: Some(0),
+                },
+                current: Counters {
+                    oom_kill: Some(0),
+                    pids_max: Some(0),
+                    throttled_usec: Some(0),
+                },
+                usage: None,
+            }),
+            unavailable: Vec::new(),
+            failure: None,
+        };
+        evidence.classify_with_terminal_budget(true, true);
+        assert_eq!(evidence.failure, Some(FailureClass::TerminalBudget));
+        assert!(evidence
+            .failure_message()
+            .unwrap()
+            .contains("ACP terminal budget exhaustion observed"));
+
+        // Concurrent memory OOM + terminal budget hit stays Other rather than guessing one cause.
+        evidence.state.as_mut().unwrap().oom_killed = true;
+        evidence.classify_with_terminal_budget(true, true);
+        assert_eq!(evidence.failure, Some(FailureClass::Other));
     }
 }

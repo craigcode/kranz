@@ -445,6 +445,17 @@ impl Ticket {
     /// existing entry. Retain directory capabilities through the write so a
     /// concurrent parent rename cannot redirect it outside the ticket tree.
     pub fn create_markdown(repo_root: &Path, slug: &str, body: &str) -> Result<PathBuf> {
+        Self::create_or_replace_markdown(repo_root, slug, body, false)
+    }
+
+    /// Create or (when `force` is true) overwrite `.kranz/tickets/<slug>.md`
+    /// without following symlinks at any component.
+    pub fn create_or_replace_markdown(
+        repo_root: &Path,
+        slug: &str,
+        body: &str,
+        force: bool,
+    ) -> Result<PathBuf> {
         use cap_fs_ext::OpenOptionsFollowExt as _;
         use cap_primitives::fs::FollowSymlinks;
         use cap_std::ambient_authority;
@@ -462,12 +473,28 @@ impl Ticket {
         let name = format!("{slug}.md");
         path.push(&name);
         let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
+        if force {
+            if let Ok(meta) = dir.symlink_metadata(&name) {
+                if !meta.is_file() {
+                    return Err(EngineError::Config(format!(
+                        "refusing to overwrite non-regular ticket path {}",
+                        path.display()
+                    )));
+                }
+            }
+            options
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .follow(FollowSymlinks::No);
+        } else {
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+        }
         let mut file = dir.open_with(&name, &options).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
+            if !force && error.kind() == std::io::ErrorKind::AlreadyExists {
                 EngineError::InvalidState(format!(
                     "ticket '{slug}' already exists at {}",
                     path.display()

@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Read-only Sgian pane observation contract (PaneBinding, PaneObservation, sgian::project_terminal_pane) implemented and verified with scope/generation binding, delayed-exit/release validation, and fail-closed DaemonLost/CleanupUnconfirmed handling without making kranz-engine a Sgian dependency
 title: Qualify Sgian panes over the contained terminal provider
 priority: 3
 schedule: once

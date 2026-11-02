@@ -528,8 +528,8 @@ impl AcpBackend {
         }
     }
 
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-    pub(crate) fn with_terminal_fixture(mut self, run_id: &str) -> Self {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn with_terminal_fixture(mut self, run_id: &str) -> Self {
         self.terminal_fixture_run = Some(run_id.to_owned());
         self
     }
@@ -1530,9 +1530,12 @@ impl AcpSession {
         let peer_id = serde_json::to_string(&id)?;
         let pending_count = self.pending_permissions.len();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let pending_count = pending_count + self.terminals.pending();
+        let collides_in_flight = self.terminals.in_flight_control_ids.contains(&peer_id);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let collides_in_flight = false;
         if pending_count >= crate::live_permission::MAX_PENDING
             || self.seen_permission_ids.len() >= 1024
+            || collides_in_flight
             || !self.seen_permission_ids.insert(peer_id)
             || self
                 .pending_permissions
@@ -1661,6 +1664,10 @@ impl AcpSession {
     }
 
     async fn complete_terminal(&mut self, completion: TerminalCompletion) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Ok(peer_id) = serde_json::to_string(&completion.id) {
+            self.terminals.in_flight_control_ids.remove(&peer_id);
+        }
         let response = match &completion.result {
             Ok(result) => json!({"jsonrpc":"2.0", "id":completion.id, "result":result}),
             Err(error) => json!({"jsonrpc":"2.0", "id":completion.id,

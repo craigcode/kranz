@@ -266,6 +266,43 @@ pub fn seed_env(env: &mut HashMap<String, String>, token: String) {
     env.insert(TOKEN_ENV.to_string(), token);
 }
 
+/// Projects a read-only Sgian pane observation over a contained ACP terminal
+/// handle without transferring execution or consent authority.
+///
+/// The returned [`kranz_acp::terminal::PaneObservation`] is verified against
+/// `expected_binding` (`run_id`, `engine_session_id`, `peer_session_id`,
+/// `generation`, `terminal_id`, `action_digest`). Any generation mismatch,
+/// daemon loss, or unconfirmed cleanup fails closed.
+pub fn project_terminal_pane(
+    expected_binding: &kranz_acp::terminal::PaneBinding,
+    observed_binding: kranz_acp::terminal::PaneBinding,
+    snapshot: kranz_acp::terminal::OutputSnapshot,
+    cleanup: Option<kranz_acp::terminal::CleanupReceipt>,
+    daemon_alive: bool,
+    cleanup_confirmed: bool,
+) -> Result<kranz_acp::terminal::PaneObservation, kranz_acp::terminal::Error> {
+    use kranz_acp::terminal::{PaneLifecycleState, PaneObservation};
+    let state = if !cleanup_confirmed {
+        PaneLifecycleState::CleanupUnconfirmed
+    } else if !daemon_alive {
+        PaneLifecycleState::DaemonLost
+    } else if cleanup.is_some() {
+        PaneLifecycleState::Released
+    } else if snapshot.exit_status.is_some() {
+        PaneLifecycleState::Exited
+    } else {
+        PaneLifecycleState::Active
+    };
+    let observation = PaneObservation {
+        binding: observed_binding,
+        snapshot,
+        state,
+        cleanup,
+    };
+    observation.verify_against(expected_binding)?;
+    Ok(observation)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -445,5 +482,89 @@ mod tests {
     #[test]
     fn holder_names_the_run() {
         assert_eq!(holder_for("abc"), "kranz:abc");
+    }
+
+    #[test]
+    fn sgian_pane_projection_refuses_generation_drift_daemon_loss_and_unconfirmed_cleanup() {
+        use kranz_acp::terminal::{
+            CleanupReceipt, Error, ExitStatus, OutputSnapshot, PaneBinding, PaneLifecycleState,
+            Scope,
+        };
+        let binding = PaneBinding {
+            scope: Scope {
+                run_id: "run-sgian".into(),
+                engine_session_id: "engine-sgian".into(),
+                peer_session_id: "peer-sgian".into(),
+                generation: "gen-live".into(),
+            },
+            terminal_id: "terminal-7".into(),
+            action_digest: "sha256:action".into(),
+        };
+        let active_snap = OutputSnapshot {
+            output: "compiling...\n".into(),
+            truncated: false,
+            exit_status: None,
+        };
+        let active = project_terminal_pane(
+            &binding,
+            binding.clone(),
+            active_snap.clone(),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(active.state, PaneLifecycleState::Active);
+
+        // Stale generation after daemon/provider restart is refused.
+        let mut stale = binding.clone();
+        stale.scope.generation = "gen-previous".into();
+        assert_eq!(
+            project_terminal_pane(&binding, stale, active_snap.clone(), None, true, true),
+            Err(Error::InvalidHandle)
+        );
+
+        // Daemon death surfaces Unavailable; unconfirmed cleanup surfaces CleanupUnconfirmed.
+        assert_eq!(
+            project_terminal_pane(
+                &binding,
+                binding.clone(),
+                active_snap.clone(),
+                None,
+                false,
+                true
+            ),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(
+            project_terminal_pane(&binding, binding.clone(), active_snap, None, true, false),
+            Err(Error::CleanupUnconfirmed)
+        );
+
+        // Clean release requires matching exitStatus and confirmed descendant/drain flags.
+        let exit = ExitStatus {
+            exit_code: Some(0),
+            signal: None,
+        };
+        let released = project_terminal_pane(
+            &binding,
+            binding.clone(),
+            OutputSnapshot {
+                output: "done\n".into(),
+                truncated: false,
+                exit_status: Some(exit.clone()),
+            },
+            Some(CleanupReceipt {
+                terminal_id: "terminal-7".into(),
+                descendants_reaped: true,
+                output_drained: true,
+                released: true,
+                exit_status: exit,
+            }),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(released.state, PaneLifecycleState::Released);
     }
 }

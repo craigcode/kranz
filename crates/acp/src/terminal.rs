@@ -153,6 +153,110 @@ pub struct CleanupReceipt {
     pub exit_status: ExitStatus,
 }
 
+/// Read-only pane identity binding a contained terminal handle to its exact
+/// `(run_id, engine_session_id, peer_session_id, generation)` scope and
+/// canonical action digest. Holding a [`PaneBinding`] never constructs a
+/// [`TerminalProvider::Authority`] or bypasses Kranz one-call consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneBinding {
+    pub scope: Scope,
+    pub terminal_id: String,
+    pub action_digest: String,
+}
+
+impl PaneBinding {
+    pub fn validate(&self) -> Result<(), Error> {
+        let non_empty_safe = |s: &str| !s.trim().is_empty() && s.len() <= 256 && !s.contains('\0');
+        if ![
+            &self.scope.run_id,
+            &self.scope.engine_session_id,
+            &self.scope.peer_session_id,
+            &self.scope.generation,
+            &self.terminal_id,
+            &self.action_digest,
+        ]
+        .into_iter()
+        .all(|s| non_empty_safe(s))
+        {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PaneLifecycleState {
+    Active,
+    Exited,
+    Released,
+    DaemonLost,
+    CleanupUnconfirmed,
+}
+
+/// Read-only Sgian pane observation envelope over a contained ACP terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneObservation {
+    pub binding: PaneBinding,
+    pub snapshot: OutputSnapshot,
+    pub state: PaneLifecycleState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupReceipt>,
+}
+
+impl PaneObservation {
+    /// Verifies that the observation matches `expected` scope, generation,
+    /// terminal ID, and action digest, and enforces delayed-exit, release,
+    /// daemon-death, and unconfirmed-cleanup invariants.
+    pub fn verify_against(&self, expected: &PaneBinding) -> Result<(), Error> {
+        self.binding.validate()?;
+        expected.validate()?;
+        if &self.binding != expected {
+            return Err(Error::InvalidHandle);
+        }
+        if self.snapshot.output.len() > MAX_OUTPUT_BYTES {
+            return Err(Error::InvalidRequest);
+        }
+        match self.state {
+            PaneLifecycleState::Active => {
+                if self.snapshot.exit_status.is_some() || self.cleanup.is_some() {
+                    return Err(Error::InvalidRequest);
+                }
+                Ok(())
+            }
+            PaneLifecycleState::Exited => {
+                let Some(status) = &self.snapshot.exit_status else {
+                    return Err(Error::InvalidRequest);
+                };
+                if status.exit_code.is_some() == status.signal.is_some() || self.cleanup.is_some() {
+                    return Err(Error::InvalidRequest);
+                }
+                Ok(())
+            }
+            PaneLifecycleState::Released => {
+                let Some(cleanup) = &self.cleanup else {
+                    return Err(Error::CleanupUnconfirmed);
+                };
+                if cleanup.terminal_id != expected.terminal_id
+                    || !cleanup.descendants_reaped
+                    || !cleanup.output_drained
+                    || !cleanup.released
+                    || (cleanup.exit_status.exit_code.is_some()
+                        == cleanup.exit_status.signal.is_some())
+                    || self.snapshot.exit_status.as_ref() != Some(&cleanup.exit_status)
+                {
+                    return Err(Error::CleanupUnconfirmed);
+                }
+                Ok(())
+            }
+            PaneLifecycleState::DaemonLost => Err(Error::Unavailable),
+            PaneLifecycleState::CleanupUnconfirmed => Err(Error::CleanupUnconfirmed),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     InvalidRequest,
@@ -352,5 +456,87 @@ mod tests {
         assert!(configured
             .initialize(json!({"name":"fixture","version":"1"}))
             .is_err());
+    }
+
+    #[test]
+    fn sgian_pane_observation_binds_scope_generation_and_preserves_unconfirmed_cleanup() {
+        let binding = PaneBinding {
+            scope: Scope {
+                run_id: "run-1".into(),
+                engine_session_id: "engine-1".into(),
+                peer_session_id: "peer-1".into(),
+                generation: "gen-1".into(),
+            },
+            terminal_id: "terminal-1".into(),
+            action_digest: "digest-1".into(),
+        };
+        let active = PaneObservation {
+            binding: binding.clone(),
+            snapshot: OutputSnapshot {
+                output: "hello pane\n".into(),
+                truncated: false,
+                exit_status: None,
+            },
+            state: PaneLifecycleState::Active,
+            cleanup: None,
+        };
+        assert_eq!(active.verify_against(&binding), Ok(()));
+
+        // Any drift in run, session, generation, terminal ID, or action digest fails closed.
+        let mut stale_gen = binding.clone();
+        stale_gen.scope.generation = "gen-old".into();
+        assert_eq!(active.verify_against(&stale_gen), Err(Error::InvalidHandle));
+
+        let exit_status = ExitStatus {
+            exit_code: Some(0),
+            signal: None,
+        };
+        let exited = PaneObservation {
+            binding: binding.clone(),
+            snapshot: OutputSnapshot {
+                output: "hello pane\n".into(),
+                truncated: false,
+                exit_status: Some(exit_status.clone()),
+            },
+            state: PaneLifecycleState::Exited,
+            cleanup: None,
+        };
+        assert_eq!(exited.verify_against(&binding), Ok(()));
+
+        let released = PaneObservation {
+            binding: binding.clone(),
+            snapshot: OutputSnapshot {
+                output: "hello pane\n".into(),
+                truncated: false,
+                exit_status: Some(exit_status.clone()),
+            },
+            state: PaneLifecycleState::Released,
+            cleanup: Some(CleanupReceipt {
+                terminal_id: "terminal-1".into(),
+                descendants_reaped: true,
+                output_drained: true,
+                released: true,
+                exit_status,
+            }),
+        };
+        assert_eq!(released.verify_against(&binding), Ok(()));
+
+        let daemon_lost = PaneObservation {
+            state: PaneLifecycleState::DaemonLost,
+            ..active.clone()
+        };
+        assert_eq!(
+            daemon_lost.verify_against(&binding),
+            Err(Error::Unavailable)
+        );
+
+        let unconfirmed = PaneObservation {
+            state: PaneLifecycleState::CleanupUnconfirmed,
+            ..active
+        };
+        assert_eq!(
+            unconfirmed.verify_against(&binding),
+            Err(Error::CleanupUnconfirmed)
+        );
     }
 }

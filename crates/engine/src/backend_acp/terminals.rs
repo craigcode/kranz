@@ -3,11 +3,14 @@ use super::*;
 use crate::acp_terminal::{Context, Provider};
 use kranz_acp::terminal::{self, Create, Error, Target, TerminalProvider};
 
+pub(super) const MAX_IN_FLIGHT_CONTROL: usize = 32;
+
 #[derive(Default)]
 pub(super) struct Broker {
     prepared: Option<(Context, String)>,
     pub(super) provider: Option<Arc<Provider>>,
     tasks: tokio::task::JoinSet<TerminalCompletion>,
+    pub(super) in_flight_control_ids: std::collections::HashSet<String>,
     pub(super) cleanup_recorded: bool,
 }
 
@@ -30,6 +33,7 @@ impl Broker {
             prepared,
             provider: None,
             tasks: tokio::task::JoinSet::new(),
+            in_flight_control_ids: std::collections::HashSet::new(),
             cleanup_recorded: false,
         })
     }
@@ -62,12 +66,9 @@ impl Broker {
         }
     }
 
-    pub(super) fn pending(&self) -> usize {
-        self.tasks.len()
-    }
-
     pub(super) fn stop(&mut self) {
         self.tasks.abort_all();
+        self.in_flight_control_ids.clear();
         if let Some(provider) = &self.provider {
             provider.stop();
         }
@@ -106,10 +107,20 @@ impl AcpSession {
                 "ACP terminal request exceeds its byte budget".into(),
             ));
         }
-        if self.terminals.tasks.len() + self.pending_permissions.len()
-            >= crate::live_permission::MAX_PENDING
-            || self.seen_permission_ids.len() >= 1024
-            || !self.seen_permission_ids.insert(serde_json::to_string(&id)?)
+        let peer_id = serde_json::to_string(&id)?;
+        if method == terminal::CREATE {
+            if self.pending_permissions.len() >= crate::live_permission::MAX_PENDING
+                || self.seen_permission_ids.len() >= 1024
+                || self.terminals.in_flight_control_ids.contains(&peer_id)
+                || !self.seen_permission_ids.insert(peer_id)
+            {
+                return Err(EngineError::Backend(
+                    "duplicate or excessive ACP client requests".into(),
+                ));
+            }
+        } else if self.terminals.in_flight_control_ids.len() >= MAX_IN_FLIGHT_CONTROL
+            || self.seen_permission_ids.contains(&peer_id)
+            || !self.terminals.in_flight_control_ids.insert(peer_id)
         {
             return Err(EngineError::Backend(
                 "duplicate or excessive ACP client requests".into(),
@@ -159,6 +170,17 @@ impl AcpSession {
         };
         match request {
             Ok(action) => {
+                if let Err(error) = provider.check_create_capacity() {
+                    return self
+                        .complete_terminal(TerminalCompletion {
+                            id,
+                            method: method.into(),
+                            result: Err(error),
+                            receipt: json!({"refusedBeforeConsent":true}),
+                            permission_id: None,
+                        })
+                        .await;
+                }
                 let value = provider.action(&action).map_err(|_| failure())?;
                 let options = vec![
                     json!({"optionId":"execute-once","kind":"allow_once","name":"Execute this exact command"}),

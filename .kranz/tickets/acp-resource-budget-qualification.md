@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: R1-R5 resource contracts, protected cgroup usage accounting, separated terminal command/retention/supervision deadlines, split consent/control counters, pre-consent capacity checks, and terminalBudget failure classification implemented and verified; live paid R3 provider runs remain separately operator-authorized
 title: Qualify ACP resource budgets before Sgian terminal rollout
 priority: 2
 schedule: once
