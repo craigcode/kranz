@@ -184,11 +184,27 @@ fn read_change_pinned(
 /// overwrite an existing ticket stay in one place: an operator who has
 /// already edited an imported ticket does not lose that work to a re-import.
 pub fn import_change(repo: &Path, dir: &Path, slug_override: Option<&str>) -> Result<PathBuf> {
+    import_change_with_options(repo, dir, slug_override, false)
+}
+
+/// Import a change directory as `.kranz/tickets/<slug>.md`, overwriting an
+/// existing ticket only when `force` is `true`.
+pub fn import_change_with_options(
+    repo: &Path,
+    dir: &Path,
+    slug_override: Option<&str>,
+    force: bool,
+) -> Result<PathBuf> {
     let change = read_change_pinned(open_change_root(Some(repo), dir)?, dir, slug_override)?;
     let mut body =
         Ticket::ticket_template(&change.title, Some(&change.goal), Some(&change.context));
     body.push_str(&format!("\n{ACCEPTANCE_PLACEHOLDER}\n"));
-    Ok(Ticket::create_markdown(repo, &change.slug, &body)?)
+    Ok(Ticket::create_or_replace_markdown(
+        repo,
+        &change.slug,
+        &body,
+        force,
+    )?)
 }
 
 fn read_text(dir: &Dir, name: &Path, remaining: &mut u64) -> kranz_engine::error::Result<String> {
@@ -552,5 +568,11 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "operator rewrote this ticket"
         );
+
+        let overwritten = import_change_with_options(repo.path(), &dir, None, true).unwrap();
+        assert_eq!(overwritten, path);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("title: Add a dark theme"));
     }
 }

@@ -792,6 +792,51 @@ enum ToolchainMount {
     Gate,
 }
 
+/// Optional host environment variable selecting an isolated, read-only
+/// toolchain cache root (`<root>/{.rustup,.cargo,.npm}`) instead of the
+/// operator's ambient `$HOME` / `$CARGO_HOME` / `$RUSTUP_HOME` / `$NPM_CONFIG_CACHE`.
+/// When unset or empty, `-v1` container argv is unchanged byte-for-byte.
+pub const ISOLATED_CACHE_DIR_ENV: &str = "KRANZ_CONTAINER_ISOLATED_CACHE_DIR";
+
+/// Validates an isolated toolchain cache directory before any mount is emitted.
+/// Refuses relative paths, symlinks, paths overlapping the global authority
+/// directory, or any Cargo credential file (`credentials.toml` or `credentials`).
+pub fn validate_isolated_cache_dir(root: &Path) -> std::result::Result<PathBuf, String> {
+    if !root.is_absolute() {
+        return Err("isolated cache directory must be an absolute path".into());
+    }
+    let meta = std::fs::symlink_metadata(root)
+        .map_err(|e| format!("isolated cache directory unavailable: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err("isolated cache directory must be a real directory, not a symlink".into());
+    }
+    if let Some(global) = crate::sandbox::global_authority_dir() {
+        if crate::sandbox::absolutize(root).starts_with(&global) {
+            return Err(
+                "isolated cache directory must not overlap global authority directory".into(),
+            );
+        }
+    }
+    for subdir in [".rustup", ".cargo", ".npm"] {
+        let candidate = root.join(subdir);
+        if let Ok(sub_meta) = std::fs::symlink_metadata(&candidate) {
+            if sub_meta.file_type().is_symlink() {
+                return Err(format!(
+                    "isolated cache subdir {subdir} must not be a symlink"
+                ));
+            }
+        }
+    }
+    for cred in [".cargo/credentials.toml", ".cargo/credentials"] {
+        if std::fs::symlink_metadata(root.join(cred)).is_ok() {
+            return Err(format!(
+                "isolated cache directory must not contain Cargo credential file {cred}"
+            ));
+        }
+    }
+    Ok(root.to_path_buf())
+}
+
 /// Toolchain caches cross as READ-ONLY mounts + matching env (6th-pass
 /// review: without them a container session cold-bootstraps a whole
 /// rustup toolchain + registry into scratch, the container twin of the
@@ -801,16 +846,33 @@ enum ToolchainMount {
 /// container rather than writing through to the operator's cache.
 fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
     let global = crate::sandbox::global_authority_dir();
+    let isolated_override = std::env::var_os(ISOLATED_CACHE_DIR_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let validated_isolated = match &isolated_override {
+        Some(path) => match validate_isolated_cache_dir(path) {
+            Ok(valid) => Some(valid),
+            // Fail closed on an invalid isolated cache root: mount no operator
+            // or isolated toolchain caches rather than falling back to $HOME.
+            Err(_) => return,
+        },
+        None => None,
+    };
     for (var, default_subdir) in [
         ("RUSTUP_HOME", ".rustup"),
         ("CARGO_HOME", ".cargo"),
         ("NPM_CONFIG_CACHE", ".npm"),
     ] {
-        let host = std::env::var_os(var)
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(default_subdir))
-            });
+        let host = if let Some(isolated) = &validated_isolated {
+            Some(isolated.join(default_subdir))
+        } else {
+            std::env::var_os(var)
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(default_subdir))
+                })
+        };
         if let Some(host) = host {
             if global
                 .as_ref()
@@ -1204,6 +1266,134 @@ mod tests {
                 "synthetic-cache-source"
             );
         }
+
+        // Second probe: when KRANZ_CONTAINER_ISOLATED_CACHE_DIR is set, the
+        // operator's host cache is unmounted and only the isolated cache crosses ro.
+        let isolated = root.path().join("isolated-cache");
+        for path in cache_paths {
+            let path = isolated.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "isolated-cache-source").unwrap();
+        }
+        let isolated_args = {
+            let cargo = operator.join(".cargo");
+            let rustup = operator.join(".rustup");
+            let npm = operator.join(".npm");
+            let _env = crate::agent_env::EnvTestGuard::engage(&[
+                ("HOME", operator.to_str().unwrap()),
+                ("CARGO_HOME", cargo.to_str().unwrap()),
+                ("RUSTUP_HOME", rustup.to_str().unwrap()),
+                ("NPM_CONFIG_CACHE", npm.to_str().unwrap()),
+                (ISOLATED_CACHE_DIR_ENV, isolated.to_str().unwrap()),
+            ]);
+            let mut command = vec![
+                "-c".into(),
+                "set -eu; op_cache=$1; shift; test ! -e \"$op_cache\"; for cache do test \"$(cat \"$cache\")\" = isolated-cache-source; if printf tampered > \"$cache\" 2>/dev/null; then exit 9; fi; done; printf 'CACHE-ISOLATED: operator cache absent; isolated cache ro\\n'".into(),
+                "probe".into(),
+                operator.join(".cargo/registry/fixture").display().to_string(),
+            ];
+            command.extend(
+                cache_paths
+                    .iter()
+                    .map(|p| isolated.join(p).display().to_string()),
+            );
+            container_run_args(
+                &input,
+                &ContainerSpec {
+                    runtime,
+                    network: None,
+                    name: None,
+                    image: "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d".into(),
+                },
+                Path::new("/bin/sh"),
+                &command,
+                None,
+            )
+        };
+        let (iso_code, iso_output) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::command_exec::run_bounded_argv(
+                root.path(),
+                Path::new(runtime.binary()),
+                &isolated_args,
+                std::time::Duration::from_secs(30),
+                &client_env,
+            ));
+        assert_eq!(iso_code, Some(0), "{iso_output}");
+        assert!(
+            iso_output.contains("CACHE-ISOLATED: operator cache absent; isolated cache ro"),
+            "{iso_output}"
+        );
+    }
+
+    #[test]
+    fn isolated_toolchain_cache_replaces_operator_cache_and_rejects_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let operator = root.path().join("operator");
+        let isolated = root.path().join("isolated");
+        let session = root.path().join("session");
+        let scratch = root.path().join("scratch");
+        let mission = session.join(".kranz/missions/m-iso");
+        for dir in [&operator, &isolated, &session, &scratch, &mission] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for sub in [
+            ".rustup/toolchains",
+            ".cargo/bin",
+            ".cargo/registry",
+            ".cargo/git",
+            ".npm",
+        ] {
+            std::fs::create_dir_all(operator.join(sub)).unwrap();
+            std::fs::create_dir_all(isolated.join(sub)).unwrap();
+        }
+        let input = SandboxInputs {
+            enforce: SandboxEnforce::FsNet,
+            session_cwd: session,
+            mission_dir: mission,
+            tmpdir: scratch,
+            extra_write: vec![],
+            egress: vec![],
+            validator_read_deny_roots: vec![],
+        };
+        let spec = ContainerSpec {
+            runtime: ContainerRuntime::Docker,
+            image: DEFAULT_IMAGE.into(),
+            network: None,
+            name: None,
+        };
+        let args = {
+            let _env = crate::agent_env::EnvTestGuard::engage(&[
+                ("HOME", operator.to_str().unwrap()),
+                (ISOLATED_CACHE_DIR_ENV, isolated.to_str().unwrap()),
+            ]);
+            container_run_args(&input, &spec, Path::new("/bin/true"), &[], None)
+        };
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains(&operator.display().to_string()),
+            "operator cache must not be mounted when isolated cache is active: {joined}"
+        );
+        assert!(
+            joined.contains(&isolated.join(".cargo/registry").display().to_string()),
+            "isolated cargo registry must be mounted read-only: {joined}"
+        );
+
+        // Any Cargo credential file inside the isolated cache root is refused fail-closed.
+        std::fs::write(isolated.join(".cargo/credentials.toml"), "secret").unwrap();
+        assert!(validate_isolated_cache_dir(&isolated).is_err());
+        let refused_args = {
+            let _env = crate::agent_env::EnvTestGuard::engage(&[
+                ("HOME", operator.to_str().unwrap()),
+                (ISOLATED_CACHE_DIR_ENV, isolated.to_str().unwrap()),
+            ]);
+            container_run_args(&input, &spec, Path::new("/bin/true"), &[], None)
+        };
+        let refused_joined = refused_args.join(" ");
+        assert!(!refused_joined.contains(&operator.display().to_string()));
+        assert!(!refused_joined.contains(&isolated.display().to_string()));
     }
     use crate::sandbox::SandboxInputs;
     use crate::types::SandboxEnforce;

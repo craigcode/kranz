@@ -308,6 +308,7 @@ impl OwnedContainer {
                 "ownerPid":std::process::id(), "supervisorSha256":crate::standards_waiver::sha256_hex(supervisor.as_bytes()),
                 "ownerIdentity":crate::event_log::process_identity_token(std::process::id() as i32),
                 "cleanupConfirmed":false,
+                "creationFinished":false,
             }))?,
         )?;
         let mut owned = Self {
@@ -425,6 +426,20 @@ impl OwnedContainer {
         }
         self.creation_finished = true;
         self.id = Some(id.to_owned());
+        if let Some(root) = &self.root {
+            let ledger = root.path().join("container.json");
+            if let Ok(bytes) = std::fs::read(&ledger) {
+                if let Ok(mut record) = crate::strict_json::parse(&bytes) {
+                    if let Some(obj) = record.as_object_mut() {
+                        obj.insert("creationFinished".into(), serde_json::json!(true));
+                        obj.insert("containerId".into(), serde_json::json!(id));
+                        if let Ok(updated) = serde_json::to_vec(&record) {
+                            let _ = std::fs::write(&ledger, updated);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -472,6 +487,10 @@ impl OwnedContainer {
             workspace: crate::sandbox::absolutize(&spec.cwd),
             scratch,
             alive: self.alive.clone(),
+            command_seconds: self
+                .resources
+                .map(|r| u64::from(r.session_seconds).min(1_800))
+                .unwrap_or(30),
         })
     }
 
@@ -778,6 +797,140 @@ fn trusted_docker(inputs: &SandboxInputs) -> Result<PathBuf> {
         }
     }
     Err(error("trusted Docker executable unavailable"))
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LedgerRecoveryReport {
+    pub inspected: usize,
+    pub removed: Vec<String>,
+    pub skipped_live: usize,
+    pub unconfirmed: Vec<String>,
+}
+
+/// Reap dead-owner `kranz-acp-owned-*` recovery ledgers under `scratch_root`.
+///
+/// Only ledgers whose recorded `ownerPid` + `ownerIdentity` is provably no
+/// longer running and whose recorded `docker` binary matches `expected_docker`
+/// are eligible. A ledger directory is deleted only after `remove` confirms the
+/// `com.kranz.acp-owner=<owner>` container is absent from the daemon inventory.
+pub async fn recover_dead_owner_ledgers(
+    scratch_root: &Path,
+    expected_docker: &Path,
+) -> Result<LedgerRecoveryReport> {
+    use std::io::Read;
+    let expected_canonical = expected_docker
+        .canonicalize()
+        .unwrap_or_else(|_| expected_docker.to_path_buf());
+    let client = DockerEvaluator::new(&expected_canonical).map_err(error)?;
+    let mut report = LedgerRecoveryReport::default();
+    let entries = std::fs::read_dir(scratch_root).map_err(error)?;
+    for entry in entries {
+        let entry = entry.map_err(error)?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("kranz-acp-owned-") {
+            continue;
+        }
+        report.inspected += 1;
+        let ledger_dir = entry.path();
+        let Ok(dir_meta) = std::fs::symlink_metadata(&ledger_dir) else {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        };
+        if !dir_meta.file_type().is_dir() {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        }
+        let record_path = ledger_dir.join("container.json");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&record_path);
+        let Ok(file) = file else {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        };
+        let Ok(file_meta) = file.metadata() else {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        };
+        if !file_meta.is_file() || file_meta.len() > 64 * 1024 {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.take(64 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.len() > 64 * 1024 {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        }
+        let Ok(record) = crate::strict_json::parse(&bytes) else {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        };
+        let valid_version = record.get("version").and_then(|v| v.as_u64()) == Some(1);
+        let owner = record.get("owner").and_then(|v| v.as_str()).filter(|s| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        });
+        let recorded_docker = record
+            .get("docker")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let owner_pid = record
+            .get("ownerPid")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|pid| *pid > 0);
+        let owner_identity = record
+            .get("ownerIdentity")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        let (true, Some(owner), Some(recorded_docker), Some(owner_pid), Some(owner_identity)) = (
+            valid_version,
+            owner,
+            recorded_docker,
+            owner_pid,
+            owner_identity,
+        ) else {
+            report.unconfirmed.push(name_str.to_owned());
+            continue;
+        };
+        if crate::event_log::process_identity_token(owner_pid as i32).as_deref()
+            == Some(owner_identity)
+        {
+            report.skipped_live += 1;
+            continue;
+        }
+        let recorded_canonical = recorded_docker
+            .canonicalize()
+            .unwrap_or_else(|_| recorded_docker.clone());
+        if recorded_canonical != expected_canonical && recorded_docker != expected_docker {
+            report.unconfirmed.push(owner.to_owned());
+            continue;
+        }
+        let creation_finished = match record.get("creationFinished").and_then(|v| v.as_bool()) {
+            Some(true) => true,
+            Some(false) => file_meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > CREATE_TIMEOUT),
+            None => true,
+        };
+        if remove(&client, owner, true, creation_finished)
+            .await
+            .is_ok()
+            && std::fs::remove_dir_all(&ledger_dir).is_ok()
+        {
+            report.removed.push(owner.to_owned());
+        } else {
+            report.unconfirmed.push(owner.to_owned());
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

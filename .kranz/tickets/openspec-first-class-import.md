@@ -2,7 +2,8 @@
 title: Make OpenSpec a first-class authoring front end for kranz tickets
 priority: 2
 schedule: once
-state: open
+state: done
+state-note: landed kranz ticket import-openspec (--slug, --force) with nofollow/cap-std bounds, tasks.md omission, and non-vacuous acceptance placeholder
 ---
 
 ## Goal

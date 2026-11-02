@@ -21,6 +21,7 @@ enum Mode {
     #[default]
     ReportOnly,
     ShellOnce,
+    TerminalOnce,
 }
 
 const REPORT: &str = r#"{"result":"partial","summary":"kranz-acp-live-fixture-v1","filesTouched":[],"testsAdded":[],"dependenciesAdded":[],"knownGaps":["Protocol fixture only; no feature implemented or mission completion claimed."],"commits":[],"commandsRun":[],"escalation":null,"questions":[]}"#;
@@ -59,8 +60,8 @@ struct Container {
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        if self.mode == Mode::ShellOnce && self.container.is_none() {
-            bail!("shell-once requires an enforced pinned container");
+        if matches!(self.mode, Mode::ShellOnce | Mode::TerminalOnce) && self.container.is_none() {
+            bail!("shell-once and terminal-once require an enforced pinned container");
         }
         let native = self.native_login_home.is_some();
         let valid = match self.provider.as_str() {
@@ -343,7 +344,8 @@ async fn main() -> Result<()> {
     }
     let config: Config = serde_json::from_slice(&std::fs::read(&args[2])?)?;
     config.validate()?;
-    let tool_mode = config.mode == Mode::ShellOnce;
+    let tool_mode = matches!(config.mode, Mode::ShellOnce | Mode::TerminalOnce);
+    let terminal_mode = config.mode == Mode::TerminalOnce;
     // Probe-only startup policy. Keep provider telemetry off without expanding
     // the approved egress list; any remaining denied connection still fails.
     let claude_startup_env: HashMap<String, String> = if config.provider == "claude" {
@@ -351,7 +353,9 @@ async fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
-    let prompt = if tool_mode {
+    let prompt = if terminal_mode {
+        tool_fixture::terminal_prompt()
+    } else if tool_mode {
         tool_fixture::prompt()
     } else {
         format!("{PREFIX}{REPORT}")
@@ -524,12 +528,18 @@ async fn main() -> Result<()> {
     let mut events = 0usize;
     let mut captured_bytes = 0usize;
     let mut evidence = tool_fixture::Evidence::default();
+    let mut terminal_evidence = tool_fixture::TerminalEvidence::default();
     let run = async {
         let boundary =
             kranz_engine::egress_proxy::maybe_start_for_session(&mut spec, &paths).await?;
-        let mut session = AcpBackend::new(&config.program, config.args.clone())
-            .start(spec)
-            .await?;
+        let backend = AcpBackend::new(&config.program, config.args.clone());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let backend = if terminal_mode {
+            backend.with_terminal_fixture(tool_fixture::TERMINAL_RUN_ID)
+        } else {
+            backend
+        };
+        let mut session = backend.start(spec).await?;
         let responder = session.permission_responder();
         let mut final_text = None;
         let turn = async {
@@ -587,7 +597,11 @@ async fn main() -> Result<()> {
                 if let Some(fixture) = &tool_workspace {
                     if let AgentEvent::PermissionRequested { proposal, .. } = &event {
                         fixture.verify(false)?;
-                        let option = evidence.authorize(proposal, &workspace)?;
+                        let option = if terminal_mode {
+                            terminal_evidence.authorize(proposal, &workspace)?
+                        } else {
+                            evidence.authorize(proposal, &workspace)?
+                        };
                         // This is a pre-authorized fixture decision, never a
                         // fabricated human gate. Sync the receipt before send.
                         append_receipt(
@@ -601,7 +615,11 @@ async fn main() -> Result<()> {
                             .context("backend has no permission responder")?
                             .respond(proposal, true)?;
                     }
-                    evidence.observe(&event, &workspace)?;
+                    if terminal_mode {
+                        terminal_evidence.observe(&event)?;
+                    } else {
+                        evidence.observe(&event, &workspace)?;
+                    }
                 }
                 if let Some((text, is_error)) = result {
                     if is_error {
@@ -658,7 +676,11 @@ async fn main() -> Result<()> {
             bail!("report differs from the fixed fixture");
         }
         if let Some(fixture) = &tool_workspace {
-            evidence.finish()?;
+            if terminal_mode {
+                terminal_evidence.finish()?;
+            } else {
+                evidence.finish()?;
+            }
             fixture.verify(true)?;
             return Result::<()>::Ok(());
         }

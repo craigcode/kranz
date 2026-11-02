@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Implemented review_memory module with feedback-to-candidate derivation, scoped rule retrieval, replay suite evaluation, explicit human approval gate, rollback, and redacted evidence bundle export."
 title: Review memory — scoped rules must pass replay before promotion
 priority: 3
 schedule: once

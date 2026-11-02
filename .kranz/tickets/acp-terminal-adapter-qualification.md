@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Provider-free client-terminal qualification mode (Mode::TerminalOnce and TerminalEvidence in acp_compat_probe) implemented and verified to require exact terminal/create -> wait/output -> release -> cleanup correlation and reject internal-execution bypasses; live paid provider runs remain separately operator-authorized
 title: Qualify one pinned ACP adapter using client terminals
 priority: 3
 schedule: once

@@ -316,6 +316,15 @@ Only then may a reviewed change admit v2. R4/R5 terminal budgets and production
 terminal qualification remain separate. One small fixture is not evidence that
 a large application build fits the same ceilings.
 
+## R4/R5 terminal budget implementation
+
+- **Separate command lifetime, handle retention, `wait_for_exit` and host supervision deadlines:**
+  `acp_container::OwnedContainer::terminal_context` derives `command_seconds` from the container's `session_seconds` ceiling (capped at 1,800 seconds, or 30 seconds for unbounded fixtures). The guest terminal supervisor (`acp_container/terminal.py`) enforces `commandSeconds` and `retentionSeconds` (default 300 seconds) separately, raises child `oom_score_adj` best-effort (`+300`), reaps descendants on command-lifetime expiry, emits the exit receipt with `wallClockExpired`, and releases expired handles after `retentionSeconds` (`retentionExpired: true`).
+- **Separate consent and control request classes:**
+  `terminal/create` and `session/request_permission` share the 16-slot pending consent cap and 1,024-entry lifetime replay set. Terminal control requests (`output`, `wait_for_exit`, `kill`, `release`) use a separate 32-slot in-flight control budget (`MAX_IN_FLIGHT_CONTROL`), refuse duplicate request IDs while in flight, and enforce a per-terminal `output` poll rate limit (`MAX_OUTPUT_POLLS_PER_SEC = 10` per second) without consuming mission consent IDs.
+- **Pre-consent capacity check and `terminalBudget` classification:**
+  `Provider::check_create_capacity` evicts handles whose post-exit retention window expired cleanly and checks `MAX_TERMINALS` and `MAX_CREATIONS` before `handle_terminal` emits a consent proposal, so capacity exhaustion returns a recoverable error without burning human consent or a one-use authority. `ResourceEvidence::classify_with_terminal_budget` attributes confirmed terminal-budget failures to `FailureClass::TerminalBudget` with an operator-visible remediation message.
+
 ## D-R: proposed decisions
 
 | Decision | Recommendation | Consequence |

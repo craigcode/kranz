@@ -16,7 +16,20 @@ import time
 
 MAX_REQUEST = 32768
 WALL_SECONDS = 30
+RETENTION_SECONDS = 300
 CLEANUP_SECONDS = 3
+OOM_SCORE_ADJ = 300
+
+
+def set_oom_score_adj():
+    try:
+        fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            os.write(fd, (str(OOM_SCORE_ADJ) + "\n").encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def send(value):
@@ -108,6 +121,10 @@ def main():
                 raise EOFError("launch")
             data.extend(byte)
     launch = json.loads(data)
+    wall_seconds = int(launch.get("commandSeconds", WALL_SECONDS))
+    retention_seconds = int(launch.get("retentionSeconds", RETENTION_SECONDS))
+    if not (1 <= wall_seconds <= 14400) or not (1 <= retention_seconds <= 3600):
+        raise ValueError("budget range")
     workspace = launch["workspace"]
     action = launch["action"]
     # The initial fixture contract accepts only the bound mount root. Nested
@@ -133,7 +150,8 @@ def main():
                             cwd="/proc/self/fd/" + str(cwd), env=env,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, close_fds=True,
-                            pass_fds=(cwd, program), start_new_session=True)
+                            pass_fds=(cwd, program), start_new_session=True,
+                            preexec_fn=set_oom_score_adj)
     os.close(program)
     os.close(cwd)
     send({"event": "started"})
@@ -142,17 +160,21 @@ def main():
     output_eof = False
     exit_sent = False
     releasing = False
+    wall_expired = False
     control = bytearray()
-    deadline = time.monotonic() + WALL_SECONDS
+    deadline = time.monotonic() + wall_seconds
     drain_deadline = None
+    retention_deadline = None
     while True:
         reap(peer)
         if peer.returncode is not None and drain_deadline is None:
             stop_children(peer)
             drain_deadline = time.monotonic() + CLEANUP_SECONDS
-        if time.monotonic() >= deadline:
+        if peer.returncode is None and time.monotonic() >= deadline:
+            wall_expired = True
             stop_children(peer)
-            raise TimeoutError("terminal wall budget")
+            if drain_deadline is None:
+                drain_deadline = time.monotonic() + CLEANUP_SECONDS
         if drain_deadline is not None and not output_eof and time.monotonic() >= drain_deadline:
             raise TimeoutError("output drain")
         readers = [0] + ([] if output_eof else [peer.stdout.fileno()])
@@ -188,10 +210,15 @@ def main():
             send({"event": "exit", "status": {
                 "exitCode": code if code >= 0 else None,
                 "signal": signal.Signals(-code).name if code < 0 else None},
-                "descendantsReaped": True, "outputDrained": True})
+                "descendantsReaped": True, "outputDrained": True,
+                "wallClockExpired": wall_expired})
             exit_sent = True
+            retention_deadline = time.monotonic() + retention_seconds
         if releasing and exit_sent:
             send({"event": "released"})
+            return
+        if exit_sent and retention_deadline is not None and time.monotonic() >= retention_deadline:
+            send({"event": "released", "retentionExpired": True})
             return
 
 

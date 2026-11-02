@@ -110,18 +110,34 @@ impl ResourceEvidence {
     }
 
     pub(crate) fn classify(&mut self, failed: bool) {
-        self.failure = if failed || self.requires_failure() {
+        self.classify_with_terminal_budget(failed, false);
+    }
+
+    pub(crate) fn classify_with_terminal_budget(
+        &mut self,
+        failed: bool,
+        terminal_budget_hit: bool,
+    ) {
+        self.failure = if failed || self.requires_failure() || terminal_budget_hit {
             let pids = self
                 .sample
                 .as_ref()
                 .is_some_and(|s| increased(s.baseline.pids_max, s.current.pids_max));
-            Some(match (self.memory_hit(), pids, self.wall_hit()) {
-                (true, false, false) => FailureClass::Memory,
-                (false, true, false) => FailureClass::Pids,
-                (false, false, true) => FailureClass::WallClock,
-                // Multiple hits do not identify which ended the attempt.
-                _ => FailureClass::Other,
-            })
+            Some(
+                match (
+                    self.memory_hit(),
+                    pids,
+                    self.wall_hit(),
+                    terminal_budget_hit,
+                ) {
+                    (true, false, false, false) => FailureClass::Memory,
+                    (false, true, false, false) => FailureClass::Pids,
+                    (false, false, true, false) => FailureClass::WallClock,
+                    (false, false, false, true) => FailureClass::TerminalBudget,
+                    // Multiple hits do not identify which ended the attempt.
+                    _ => FailureClass::Other,
+                },
+            )
         } else {
             None
         };
@@ -132,7 +148,8 @@ impl ResourceEvidence {
             FailureClass::Memory => ("memory", format!("{} MiB (no swap)", self.limits.memory_mib), "memoryMib"),
             FailureClass::Pids => ("process count", self.limits.pids.to_string(), "pids"),
             FailureClass::WallClock => ("session wall clock", format!("{} seconds", self.limits.session_seconds), "sessionSeconds"),
-            FailureClass::TerminalBudget | FailureClass::Other => return Some("ACP attempt failed; resource observations do not establish a unique exhausted limit. Inspect resourceEvidence; exit codes alone are not resource attribution.".into()),
+            FailureClass::TerminalBudget => return Some("ACP terminal budget exhaustion observed during this failed attempt (concurrent handle cap, session creation cap, control-request rate/in-flight cap, or command lifetime expiry). Inspect resourceEvidence and terminalReceipts.".into()),
+            FailureClass::Other => return Some("ACP attempt failed; resource observations do not establish a unique exhausted limit. Inspect resourceEvidence; exit codes alone are not resource attribution.".into()),
         };
         Some(format!("ACP {name} exhaustion observed during this failed attempt; configured ceiling: {value}; operator setting worker.acpProfile.resources.{key} in ~/.kranz/config.json (within the profile maximum)."))
     }
