@@ -1372,17 +1372,24 @@ mod tests {
             container_run_args(&input, &spec, Path::new("/bin/true"), &[], None)
         };
         let joined = args.join(" ");
+        let op_host = container_host_path(&operator);
+        let iso_host = container_host_path(&isolated);
+        let iso_registry = container_host_path(&isolated.join(".cargo").join("registry"));
         assert!(
-            !joined.contains(&operator.display().to_string()),
+            !joined.contains(&op_host),
             "operator cache must not be mounted when isolated cache is active: {joined}"
         );
         assert!(
-            joined.contains(&isolated.join(".cargo/registry").display().to_string()),
+            joined.contains(&mount_arg(&iso_registry, true)),
             "isolated cargo registry must be mounted read-only: {joined}"
         );
 
         // Any Cargo credential file inside the isolated cache root is refused fail-closed.
-        std::fs::write(isolated.join(".cargo/credentials.toml"), "secret").unwrap();
+        std::fs::write(
+            isolated.join(".cargo").join("credentials.toml"),
+            "synthetic-cred",
+        )
+        .unwrap();
         assert!(validate_isolated_cache_dir(&isolated).is_err());
         let refused_args = {
             let _env = crate::agent_env::EnvTestGuard::engage(&[
@@ -1392,8 +1399,8 @@ mod tests {
             container_run_args(&input, &spec, Path::new("/bin/true"), &[], None)
         };
         let refused_joined = refused_args.join(" ");
-        assert!(!refused_joined.contains(&operator.display().to_string()));
-        assert!(!refused_joined.contains(&isolated.display().to_string()));
+        assert!(!refused_joined.contains(&op_host));
+        assert!(!refused_joined.contains(&iso_host));
     }
     use crate::sandbox::SandboxInputs;
     use crate::types::SandboxEnforce;

@@ -61,7 +61,7 @@ struct Container {
 impl Config {
     fn validate(&self) -> Result<()> {
         if matches!(self.mode, Mode::ShellOnce | Mode::TerminalOnce) && self.container.is_none() {
-            bail!("shell-once and terminal-once require an enforced pinned container");
+            bail!("shell-once requires an enforced pinned container");
         }
         let native = self.native_login_home.is_some();
         let valid = match self.provider.as_str() {
