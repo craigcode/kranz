@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-11-02
+last_verified: 2026-11-06
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -11,24 +11,7 @@ verified_against:
   - .kranz/tickets/repo-knowledge-refresh-drift.md
 ---
 
-Rechecked 2026-11-02 (UTC) against the signal intake skill-capture boundary recheck; knowledge map, ownership, and injection rules are unchanged.
-
-Rechecked 2026-10-06 (UTC) against the R2 skill-capture boundary recheck.
-Resource observations leave this knowledge map, ownership and injection rules
-unchanged.
-
-Rechecked 2026-10-03 (UTC) against the skill-capture boundary recheck.
-Container-denial test completion leaves this knowledge map and its ownership unchanged.
-
-Rechecked 2026-09-29 (UTC) against the public-documentation rule and architecture notes; knowledge ownership, freshness checking and injection boundaries are unchanged.
-
-Rechecked 2026-09-26 against the remediation and skill-capture decision. The vault retains the same ownership and freshness model; updated invariants and gate notes describe the stricter approval/evidence boundary.
-
 # Kranz knowledge vault
-
-Rechecked 2026-09-25 against the skill-capture decision after shared ACP
-extraction. Protocol sharing extends dispatch; the knowledge, lesson and skill
-boundaries described by this map remain unchanged.
 
 The canonical, reviewed knowledge store for kranz: what the system is, how it is
 run, how it is gated, and the invariants that must never break. Both humans and
@@ -52,6 +35,8 @@ The gates a mission must pass.
 - [The two readiness axes](validation/readiness-axes.md) — the AMM projection
   (mapped, never adopted) and contract/consent health: why the second axis
   exists and the mapping rules.
+- [Child containment](validation/child-containment.md) — env_clear'd children,
+  sandbox-wrapped gates, validator snapshots that fail closed.
 
 ### surfaces/
 Operator surfaces.
@@ -68,8 +53,9 @@ Load-bearing invariants and design history.
   — wontfix; no in-harness skill proposal or install.
 
 ### operations/
-How kranz is run — CLI, `kranz serve`, backends, config. _(To populate: no seed
-note in slice 1; add as operational facts accumulate.)_
+How kranz is run — CLI, `kranz serve`, backends, config.
+- [Tracked vs runtime](operations/tracked-vs-runtime.md) — what is committed,
+  what is gitignored runtime, and where ticket lifecycle state lives.
 
 ### Cross-cutting
 - [lessons.md](lessons.md) — curated index into `.kranz/lessons/`.
