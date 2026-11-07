@@ -1,5 +1,6 @@
 ---
-state: open
+state: wontfix
+state-note: "Declined per operator decision on D-E/D-F (2026-11-06): ship the zero-dependency 2D board (slices 1–4) and act-in-place reuse (slice 6) without three.js or third-party Space Kit props."
 title: Trajectory board 5: the 3D scene under the plot
 priority: 3
 schedule: once

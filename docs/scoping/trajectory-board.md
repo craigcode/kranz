@@ -1,10 +1,8 @@
 # Trajectory board: a Board lens on the pipeline view (scoping)
 
-Status: scoped 2026-10-08, DESIGN-FIRST. The decisions marked OPERATOR
-DECISION are the operator's; the ones marked PROPOSED are recommendations that
-stand unless the operator changes them. Review this note before drafting any
-`trajectory-board-*` ticket. Reference prototype:
-[`trajectory-board-prototype/`](trajectory-board-prototype/README.md).
+Status: scoped 2026-10-08; operator decisions `D-A`–`D-G` recorded 2026-11-06.
+Review this note before drafting any `trajectory-board-*` ticket. Reference
+prototype: [`trajectory-board-prototype/`](trajectory-board-prototype/README.md).
 
 ## Why
 
@@ -92,7 +90,7 @@ Rules that keep the picture honest:
 - **The plot is not the only way in.** The list is the accessible form of the
   board. With reduced motion, or without a canvas, the lens still works.
 
-## D-A. Where it lives (PROPOSED)
+## D-A. Where it lives (DECIDED — accepted 2026-11-06)
 
 A fifth lens on the pipeline view, `Board`, with `#/board` and
 `#/r/<repo>/board` as aliases in the way `#/backlog` already is. The lens body
@@ -104,7 +102,7 @@ in `crates/server/src/lib.rs`), and that allowlist should not be widened for a
 toy. A separate app under `apps/` would have to be served by `kranz serve`
 anyway to be usable.
 
-## D-B. Where its state comes from (PROPOSED)
+## D-B. Where its state comes from (DECIDED — accepted 2026-11-06)
 
 Server folds only: the pipeline's `tickets` and `missions`, plus
 `GET /api/missions/:id/state` for each mission in the `running` stage. The lens
@@ -121,7 +119,7 @@ request (`docs/protocol.md`), so the lists refresh no more often than every
 ten seconds, mission states every five, and nothing is fetched while the tab is
 hidden.
 
-## D-C. Acting from the board (OPERATOR DECISION)
+## D-C. Acting from the board (DECIDED — Option 2, 2026-11-06)
 
 The prototype's simulated mode has GO and NO-GO buttons on the board. Against a
 real server those would be a second, uninformed copy of gates this project has
@@ -139,12 +137,11 @@ Options:
    site for any POST. This is slice 6.
 3. **Board-native buttons that POST directly.** Not proposed.
 
-Recommendation: 1, then 2 as its own slice once the read-only lens has been
-used for a while. The operator decides whether slice 6 is built at all, and
-whether plan queueing and merge may be reached in place or must always
-navigate.
+Decision (2026-11-06): **Option 2** — include slice 6 (`trajectory-board-6-act-in-place`)
+reusing existing in-flight ask panels, the extracted reviewable ticket row
+(`approveTicket`), and `DeliveredPanel` (`Merge`) with zero new POST call sites.
 
-## D-D. What rings (PROPOSED)
+## D-D. What rings (DECIDED — accepted 2026-11-06)
 
 The Actionable lens's stages without `captured` (`needs-you`, `wrong-plan`,
 `reviewable`, `delivered`, `failed`), plus the six in-flight asks above.
@@ -153,7 +150,7 @@ The Actionable lens's stages without `captured` (`needs-you`, `wrong-plan`,
 make the signal meaningless. `queued` work is not ringed either: the existing
 Run queue control stays above the plot and says whether anything is draining.
 
-## D-E. three.js as a dependency (OPERATOR DECISION)
+## D-E. three.js as a dependency (DECIDED — declined 2026-11-06)
 
 The 3D layer needs three.js (MIT). It would be the dashboard's fifth runtime
 dependency, beside `react`, `react-dom`, `zustand` and `@tauri-apps/api`, and
@@ -174,7 +171,11 @@ binary either way, and Vite will warn about a chunk over 500 KB.
 The slicing makes this decision separable: slices 1 to 4 deliver a complete 2D
 board with no new dependency. Declining D-E loses the models, not the board.
 
-## D-F. Ground props from a third-party kit (OPERATOR DECISION)
+Decision (2026-11-06): **Declined** — ship the complete 2D board in slices 1 to
+4 (plus slice 6 act-in-place reuse) with zero new runtime dependencies; slice 5
+(`trajectory-board-5-scene`) is closed `wontfix`.
+
+## D-F. Ground props from a third-party kit (DECIDED — declined 2026-11-06)
 
 The prototype dresses the launch site and the Moon with twelve models from
 Kenney's Space Kit 2.0 (CC0 1.0): a hangar, a dish, craters, rocks, a rover,
@@ -185,9 +186,10 @@ mirror and have not been compared with the original download. Options: verify
 them against the original and ship them; or drop them and draw craters and
 rocks in code, which removes every third-party asset from the dashboard.
 
-Recommendation: decide after seeing slice 5 without them.
+Decision (2026-11-06): **Declined** — ship no third-party Space Kit props or
+binary model assets.
 
-## D-G. Wording (PROPOSED)
+## D-G. Wording (DECIDED — accepted 2026-11-06)
 
 Labels on the plot may use flight-controller phrases: GO FOR LAUNCH? on a
 reviewable craft, GO FOR LANDING? on a delivered one. Buttons, links and the
