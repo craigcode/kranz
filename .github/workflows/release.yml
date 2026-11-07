@@ -143,6 +143,8 @@ jobs:
 
       - run: cargo build --workspace --locked
 
+      - name: Verify desktop security backport integrity
+        run: python3 scripts/check-desktop-backports.py
       - name: Check the committed domain policy
         run: target/debug/kranz domain-lint
 

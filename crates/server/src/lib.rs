@@ -15,6 +15,7 @@
 //! and therefore the single-writer lock — in [`MissionHost`], which is the
 //! engine writing `events.jsonl`. See [`host`].
 
+mod dashboard;
 mod error;
 mod hooks;
 mod host;
@@ -44,11 +45,30 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
 
 /// Header carrying the per-serve mutation token (docs/protocol.md
 /// "Authority: mutation token").
 pub const TOKEN_HEADER: &str = "x-kranz-token";
+
+/// Operator-selected serve policy. Reads require authority by default; local
+/// development origins are admitted only by an explicit development launch.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeOptions {
+    pub read_auth: bool,
+    pub development_origins: bool,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            read_auth: true,
+            development_origins: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DevelopmentOrigins(pub bool);
 
 /// Validated mutation authority required by every published router and serve
 /// constructor. Keeping the unauthenticated state unrepresentable prevents an
@@ -128,8 +148,8 @@ pub struct ServerState {
     /// keeps the test/back-compat wildcard (any loopback host, any port).
     pub bind_addr: Option<SocketAddr>,
     /// Whether the serve bind is loopback. Loopback keeps the strict browser
-    /// origin allowlist on the WS upgrade (reads are tokenless there, so the
-    /// Origin check is the guard); off loopback the read token authenticates
+    /// origin allowlist on the WS upgrade in addition to read authentication;
+    /// off loopback the read token authenticates
     /// and IP-literal / missing origins are accepted.
     pub bind_is_loopback: bool,
 }
@@ -218,8 +238,8 @@ pub fn router_with_shared_host_and_bind(
 }
 
 /// The full router constructor: the REAL bound address (when known) scopes
-/// CORS / WS origin approval to that exact ip:port plus the dev-server
-/// ports, `bind_is_loopback` selects the strict loopback Host/origin
+/// CORS / WS origin approval to that exact ip:port. `bind_is_loopback`
+/// selects the strict loopback Host/origin
 /// allowlist vs the LAN one, and `require_read_token` independently arms the
 /// read/WS token gate.
 pub fn router_with_shared_host_and_addr(
@@ -279,6 +299,30 @@ pub fn router_with_read_authority_and_addr(
     bind_is_loopback: bool,
     require_read_token: bool,
 ) -> Router {
+    router_with_serve_options(
+        multi_host,
+        static_assets,
+        authority,
+        read_authority,
+        bind_addr,
+        bind_is_loopback,
+        ServeOptions {
+            read_auth: require_read_token,
+            development_origins: false,
+        },
+    )
+}
+
+fn router_with_serve_options(
+    multi_host: Arc<MultiRepoHost>,
+    static_assets: Option<DashboardStatic>,
+    authority: MutationAuthority,
+    read_authority: Option<String>,
+    bind_addr: Option<SocketAddr>,
+    bind_is_loopback: bool,
+    options: ServeOptions,
+) -> Router {
+    let require_read_token = options.read_auth;
     let gate = TokenGate {
         read_authority: read_authority
             .filter(|read| !read.is_empty() && !token_matches(read, authority.as_str()))
@@ -386,8 +430,11 @@ pub fn router_with_read_authority_and_addr(
 
     let app = match static_assets {
         Some(DashboardStatic::Dir(dir)) => {
-            let index = dir.join("index.html");
-            app.fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(index)))
+            let dashboard = dashboard::DashboardDir::open(&dir);
+            app.fallback(move |method: Method, uri: Uri| {
+                let dashboard = dashboard.clone();
+                async move { dashboard.respond(method, uri).await }
+            })
         }
         Some(DashboardStatic::Embedded(files)) => {
             app.fallback(move |uri: Uri| async move { embedded_static_response(uri, files) })
@@ -404,7 +451,10 @@ pub fn router_with_read_authority_and_addr(
             HostGate { bind_is_loopback },
             require_host,
         ))
-        .layer(cors_layer(bind_addr))
+        .layer(cors_layer(bind_addr, options.development_origins))
+        .layer(axum::Extension(DevelopmentOrigins(
+            options.development_origins,
+        )))
         // Outermost: every response — including gate rejections — carries the
         // cache policy, so no rejection HTML can poison a browser cache either.
         .layer(middleware::from_fn(cache_response_headers))
@@ -662,11 +712,13 @@ fn embedded_static_response(uri: Uri, files: &'static [EmbeddedFile]) -> Respons
 ///
 /// Non-browser clients (curl, the engine, tests) send no `Origin` header and
 /// pass through untouched — CORS is a browser-enforced mechanism.
-fn cors_layer(bind_addr: Option<SocketAddr>) -> CorsLayer {
+fn cors_layer(bind_addr: Option<SocketAddr>, development_origins: bool) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, _request_parts| {
-                origin.to_str().is_ok_and(|o| origin_allowed(o, bind_addr))
+                origin.to_str().is_ok_and(|o| {
+                    origin_allowed_with_development(o, bind_addr, development_origins)
+                })
             },
         ))
         .allow_methods([Method::GET, Method::POST])
@@ -679,12 +731,12 @@ fn cors_layer(bind_addr: Option<SocketAddr>) -> CorsLayer {
 /// `http://tauri.localhost` (Windows Tauri). Beyond those, an origin is
 /// approved only when its host is LOCAL (the `localhost` name or a loopback
 /// IP literal — DNS names like `localhost.evil.example` fail the IP parse)
-/// AND its port fits the bind scoping below. On loopback binds GETs and the
-/// WS upgrade are tokenless, so this allowlist is what stands between an
-/// unrelated local page and mission state.
+/// AND its port fits the bind scoping below. This allowlist supplements read
+/// authentication and also protects legacy embedders that opt out of it.
 ///
 /// Scoping against the bound address (`Some(bind)`):
-/// - the dev-server ports (vite :5173, Tauri devUrl :1420) are approved for
+/// - with explicit development mode, the dev-server ports (vite :5173,
+///   Tauri devUrl :1420) are approved for
 ///   canonical localhost only (`localhost`, `127.0.0.1`, or `::1`), never
 ///   another address in 127/8 that a co-resident process can claim;
 /// - the bind port is approved only for the SAME-ORIGIN page: an IP host
@@ -698,12 +750,21 @@ fn cors_layer(bind_addr: Option<SocketAddr>) -> CorsLayer {
 ///
 /// `bind_addr: None` (back-compat test wrappers only) keeps the old
 /// any-loopback-host, any-port wildcard.
+#[cfg(test)]
 pub(crate) fn origin_allowed(origin: &str, bind_addr: Option<SocketAddr>) -> bool {
+    origin_allowed_with_development(origin, bind_addr, false)
+}
+
+fn origin_allowed_with_development(
+    origin: &str,
+    bind_addr: Option<SocketAddr>,
+    development_origins: bool,
+) -> bool {
     if origin == "tauri://localhost" || origin == "http://tauri.localhost" {
         return true;
     }
-    // Dev-server origins that must keep working on every bind: the vite
-    // proxy (5173) and Tauri's devUrl (1420). Restrict these privileged ports
+    // Explicit development origins: the vite proxy (5173) and Tauri's
+    // devUrl (1420). Restrict these privileged ports
     // to canonical localhost; every other 127/8 address is independently
     // bindable by an unprivileged co-resident process.
     const DEV_PORTS: [u16; 2] = [5173, 1420];
@@ -721,7 +782,7 @@ pub(crate) fn origin_allowed(origin: &str, bind_addr: Option<SocketAddr>) -> boo
     let Some(bind) = bind_addr else {
         return true; // back-compat wildcard
     };
-    if DEV_PORTS.contains(&port) {
+    if development_origins && DEV_PORTS.contains(&port) {
         return host == "localhost"
             || host_ip == Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
             || host_ip == Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
@@ -766,21 +827,23 @@ fn split_host_port(authority: &str) -> Option<(&str, u16)> {
 ///
 /// Browsers send the page origin on SAME-origin WS handshakes too, so a
 /// dashboard served off a LAN/tailnet bind presents `http://<ip>:<port>` —
-/// which [`origin_allowed`] rejects. Off loopback the read token already
+/// which [`origin_allowed_with_development`] rejects. Off loopback the read token already
 /// gates the upgrade, so the Origin check only needs to keep DNS-named
 /// (rebinding) pages out: accept any origin whose host parses as an IP
 /// literal, and accept a MISSING Origin (native, non-browser clients). On
-/// loopback binds reads are tokenless and the strict browser allowlist
-/// stays the guard — missing Origin remains rejected there.
+/// loopback binds the strict browser allowlist remains an additional guard;
+/// missing Origin remains rejected there, including for legacy embedders.
 pub(crate) fn ws_origin_allowed(
     origin: Option<&str>,
     bind_addr: Option<SocketAddr>,
     bind_is_loopback: bool,
+    development_origins: bool,
 ) -> bool {
     match origin {
         None => !bind_is_loopback,
         Some(origin) => {
-            origin_allowed(origin, bind_addr) || (!bind_is_loopback && origin_host_is_ip(origin))
+            origin_allowed_with_development(origin, bind_addr, development_origins)
+                || (!bind_is_loopback && origin_host_is_ip(origin))
         }
     }
 }
@@ -796,8 +859,8 @@ fn origin_host_is_ip(origin: &str) -> bool {
 }
 
 /// Host gate: browsers always send `Host`, so DNS rebinding attempts arrive
-/// as the attacker-controlled hostname and are rejected before tokenless
-/// reads can return mission state or transcripts.
+/// as the attacker-controlled hostname and are rejected before reads can
+/// return mission state or transcripts.
 ///
 /// Path-only in-process requests used by `tower::ServiceExt::oneshot` carry no
 /// Host header and are allowed; real network HTTP/1.1 requests present Host.
@@ -1169,7 +1232,7 @@ pub async fn serve_on_listener(
         static_assets,
         authority,
         None,
-        false,
+        true,
         shutdown,
     )
     .await
@@ -1190,17 +1253,43 @@ pub async fn serve_multi_on_listener(
     read_auth: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_multi_on_listener_with_options(
+        multi_host,
+        listener,
+        static_assets,
+        authority,
+        read_authority,
+        ServeOptions {
+            read_auth,
+            development_origins: false,
+        },
+        shutdown,
+    )
+    .await
+}
+
+/// Serve with explicit development-origin policy. Normal launches use
+/// [`ServeOptions::default`]; this option never relaxes off-loopback read auth.
+pub async fn serve_multi_on_listener_with_options(
+    multi_host: Arc<MultiRepoHost>,
+    listener: tokio::net::TcpListener,
+    static_assets: Option<DashboardStatic>,
+    authority: MutationAuthority,
+    read_authority: Option<String>,
+    mut options: ServeOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let bind_is_loopback = local_addr.ip().is_loopback();
-    let require_read_token = !bind_is_loopback || read_auth;
-    let app = router_with_read_authority_and_addr(
+    options.read_auth |= !bind_is_loopback;
+    let app = router_with_serve_options(
         multi_host,
         static_assets,
         authority,
         read_authority,
         Some(local_addr),
         bind_is_loopback,
-        require_read_token,
+        options,
     );
     tracing::info!("kranz server listening on http://{local_addr}");
     axum::serve(listener, app)
@@ -1229,6 +1318,91 @@ mod tests {
 
     fn authority() -> super::MutationAuthority {
         super::MutationAuthority::new("tok").unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_serve_policy_authenticates_reads_and_requires_explicit_dev_origins() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+        let repo = tempfile::tempdir().unwrap();
+        for development_origins in [false, true] {
+            let app = super::router_with_serve_options(
+                std::sync::Arc::new(super::MultiRepoHost::with_host(std::sync::Arc::new(
+                    super::MissionHost::new(repo.path().into()),
+                ))),
+                None,
+                super::MutationAuthority::new("synthetic-mutation").unwrap(),
+                Some("synthetic-read".into()),
+                Some(([127, 0, 0, 1], 4560).into()),
+                true,
+                super::ServeOptions {
+                    development_origins,
+                    ..Default::default()
+                },
+            );
+            for method in ["GET", "HEAD"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/api/repos")
+                            .header("host", "127.0.0.1:4560")
+                            .header("origin", "http://localhost:5173")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(
+                    response
+                        .headers()
+                        .contains_key("access-control-allow-origin"),
+                    development_origins
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/repos")
+                        .header("host", "127.0.0.1:4560")
+                        .header(super::TOKEN_HEADER, "synthetic-read")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/queue/drain")
+                        .header("host", "127.0.0.1:4560")
+                        .header("content-type", "application/json")
+                        .header(super::TOKEN_HEADER, "synthetic-read")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .header("host", "127.0.0.1:4560")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]
@@ -1559,16 +1733,13 @@ mod tests {
 
     #[test]
     fn origin_allowlist_scopes_localhost_to_bind_and_dev_ports() {
-        // Same-origin (bound ip:port), the vite proxy (:5173), and Tauri dev
-        // (:1420) must work; any OTHER localhost port is an unrelated local
+        // Same-origin (bound ip:port) must work. Development ports need explicit
+        // opt-in; any unrelated localhost port belongs to a separate local
         // app whose page must not get cross-origin read approval.
         let bind = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 4560)));
         for allowed in [
             "http://localhost:4560",
             "http://127.0.0.1:4560",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:1420",
             "tauri://localhost",
             "http://tauri.localhost",
         ] {
@@ -1578,6 +1749,9 @@ mod tests {
             );
         }
         for denied in [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:1420",
             "http://localhost:8080",
             "http://127.0.0.1:8080",
             "http://localhost", // implied :80 != 4560
@@ -1614,8 +1788,17 @@ mod tests {
         assert!(origin_allowed("http://127.0.0.2:4560", bind));
         assert!(!origin_allowed("http://127.0.0.1:4560", bind));
         assert!(!origin_allowed("http://localhost:4560", bind));
-        // Dev-server pages stay approved regardless of bind IP.
-        assert!(origin_allowed("http://localhost:5173", bind));
+        assert!(!origin_allowed("http://localhost:5173", bind));
+        assert!(super::origin_allowed_with_development(
+            "http://localhost:5173",
+            bind,
+            true
+        ));
+        assert!(!super::origin_allowed_with_development(
+            "http://127.0.0.2:5173",
+            bind,
+            true
+        ));
 
         // `--host ::1`: bracketed v6 same-origin plus the localhost name.
         let bind_v6 = Some(std::net::SocketAddr::from((
@@ -1639,26 +1822,48 @@ mod tests {
     fn ws_origin_loopback_keeps_strict_browser_allowlist() {
         use super::ws_origin_allowed;
         let bind = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 4560)));
-        assert!(ws_origin_allowed(Some("http://localhost:4560"), bind, true));
-        assert!(ws_origin_allowed(Some("http://localhost:5173"), bind, true));
+        assert!(ws_origin_allowed(
+            Some("http://localhost:4560"),
+            bind,
+            true,
+            false
+        ));
+        assert!(!ws_origin_allowed(
+            Some("http://localhost:5173"),
+            bind,
+            true,
+            false
+        ));
+        assert!(ws_origin_allowed(
+            Some("http://localhost:5173"),
+            bind,
+            true,
+            true
+        ));
         assert!(
-            !ws_origin_allowed(None, bind, true),
+            !ws_origin_allowed(None, bind, true, false),
             "missing Origin stays rejected on loopback (reads are tokenless)"
         );
         assert!(!ws_origin_allowed(
             Some("http://192.168.1.5:4560"),
             bind,
-            true
+            true,
+            false
         ));
         assert!(
-            !ws_origin_allowed(Some("http://127.0.0.2:4560"), bind, true),
+            !ws_origin_allowed(Some("http://127.0.0.2:4560"), bind, true, false),
             "co-resident loopback listener page must not open the tokenless WS"
         );
         assert!(
-            !ws_origin_allowed(Some("http://127.0.0.2:5173"), bind, true),
+            !ws_origin_allowed(Some("http://127.0.0.2:5173"), bind, true, false),
             "a dev port must not privilege another independently bindable loopback IP"
         );
-        assert!(!ws_origin_allowed(Some("http://evil.example"), bind, true));
+        assert!(!ws_origin_allowed(
+            Some("http://evil.example"),
+            bind,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -1670,19 +1875,28 @@ mod tests {
         assert!(ws_origin_allowed(
             Some("http://192.168.1.5:4560"),
             bind,
+            false,
             false
         ));
         assert!(ws_origin_allowed(
             Some("http://[fd00::5]:4560"),
             bind,
+            false,
+            false
+        ));
+        assert!(!ws_origin_allowed(
+            Some("http://localhost:5173"),
+            bind,
+            false,
             false
         ));
         assert!(ws_origin_allowed(
             Some("http://localhost:5173"),
             bind,
-            false
+            false,
+            true
         ));
-        assert!(ws_origin_allowed(None, bind, false));
+        assert!(ws_origin_allowed(None, bind, false, false));
         // DNS-named (rebinding) pages and non-http schemes stay out.
         for denied in [
             "http://evil.example:4560",
@@ -1693,7 +1907,7 @@ mod tests {
             "",
         ] {
             assert!(
-                !ws_origin_allowed(Some(denied), bind, false),
+                !ws_origin_allowed(Some(denied), bind, false, false),
                 "should deny {denied} off loopback"
             );
         }

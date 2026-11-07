@@ -841,7 +841,11 @@ mod tests {
         ProvisionSpec {
             mission_id: "m-test".to_string(),
             repo_root: root.to_path_buf(),
-            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(&runtime_dir, &[]),
+            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(
+                &runtime_dir,
+                &[],
+                Default::default(),
+            ),
             runtime_dir,
             base_sha: Some("deadbeefcafe".to_string()),
             contract,

@@ -2147,7 +2147,7 @@ express Statement of Purpose.
 ================================================================================
 Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 Used by:
-- webpki-roots 1.0.10 <https://github.com/rustls/webpki-roots>
+- webpki-roots 1.0.11 <https://github.com/rustls/webpki-roots>
 
 # Community Data License Agreement - Permissive - Version 2.0
 
@@ -6878,11 +6878,11 @@ SOFTWARE.
 ================================================================================
 MIT License (MIT)
 Used by:
-- kranz-acp 0.4.3 <https://github.com/craigcode/kranz>
-- kranz 0.4.3 <https://github.com/craigcode/kranz>
-- kranz-engine 0.4.3 <https://github.com/craigcode/kranz>
-- kranz-server 0.4.3 <https://github.com/craigcode/kranz>
-- kranz-slack 0.4.3 <https://github.com/craigcode/kranz>
+- kranz-acp 0.4.4 <https://github.com/craigcode/kranz>
+- kranz 0.4.4 <https://github.com/craigcode/kranz>
+- kranz-engine 0.4.4 <https://github.com/craigcode/kranz>
+- kranz-server 0.4.4 <https://github.com/craigcode/kranz>
+- kranz-slack 0.4.4 <https://github.com/craigcode/kranz>
 
 MIT License
 

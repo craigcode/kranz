@@ -47,7 +47,7 @@ in configuration. Other backends have role and sandbox restrictions; run
 `kranz ready` before the first mission.
 
 ```sh
-cargo install kranz --version 0.4.3 --locked
+cargo install kranz --version 0.4.4 --locked
 cd /path/to/your/repo             # must be a git repo
 
 # 0. Onboard the repo. This detects common Rust/Node/Python gates, adds the
@@ -75,12 +75,14 @@ kranz config role worker opus xhigh      # MID-MISSION: applies at next worker s
 kranz serve --open                # Mission Control dashboard (browser)
 ```
 
-`kranz serve` includes an embedded dashboard bundle. When developing the UI,
-run `cd <kranz checkout>/apps/dashboard && npm install && npm run build && npm run sync-embedded`;
-`kranz serve` will prefer that fresh build automatically (searching
-`--dashboard DIR`, `$KRANZ_DASHBOARD_DIST`, `<repo>/apps/dashboard/dist`,
-installed asset dirs such as `~/.kranz/dashboard/dist`, then the kranz checkout
-used to build the binary, before falling back to the embedded bundle).
+`kranz serve` uses its embedded dashboard and requires a read-only or mutation
+token for API reads. Paste the printed token when prompted. Repository files
+are never selected as dashboard code automatically. To develop a trusted local
+build, run `npm ci && npm run build` in `apps/dashboard`, then explicitly select
+it with `kranz serve --dashboard /absolute/path/to/apps/dashboard/dist` (or
+`KRANZ_DASHBOARD_DIST`). Directory assets cannot traverse symlinks. For Vite
+iteration, start `kranz serve --dev-origins`; authentication still applies.
+Run `npm run sync-embedded` before rebuilding the CLI to embed a changed UI.
 
 Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev`
 (reads `KRANZ_REPO`; see `apps/dashboard/README.md`).
@@ -88,17 +90,17 @@ Desktop app: `cd apps/dashboard && npm install && npm run build && npx tauri dev
 ## Install
 
 **With Cargo.** Install the published
-[v0.4.3 release](https://crates.io/crates/kranz/0.4.3), including the embedded
+[v0.4.4 release](https://crates.io/crates/kranz/0.4.4), including the embedded
 web dashboard:
 
 ```sh
-cargo install kranz --version 0.4.3 --locked
+cargo install kranz --version 0.4.4 --locked
 ```
 
 Most users install only `kranz`; Cargo builds its library dependencies
 automatically.
 
-**Prebuilt binaries.** [Download v0.4.3 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.4.3)
+**Prebuilt binaries.** [Download v0.4.4 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.4.4)
 for Linux x86_64, macOS Apple Silicon or Intel, and Windows ARM64 or x86_64.
 Extract the archive and put `kranz` (`kranz.exe` on Windows) on your `PATH`.
 The release includes checksums, build provenance attestations, an SBOM, and
@@ -142,11 +144,11 @@ are reusable components of the product:
 
 | Crate | Provides |
 |---|---|
-| [`kranz`](https://crates.io/crates/kranz/0.4.3) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
-| [`kranz-acp`](https://crates.io/crates/kranz-acp/0.4.3) | Bounded ACP v1 framing and session protocol for independent clients. |
-| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.4.3) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
-| [`kranz-server`](https://crates.io/crates/kranz-server/0.4.3) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
-| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.4.3) | The Slack Socket Mode bridge for operating and observing missions. |
+| [`kranz`](https://crates.io/crates/kranz/0.4.4) | The CLI, `kranz serve`, and embedded Mission Control dashboard. |
+| [`kranz-acp`](https://crates.io/crates/kranz-acp/0.4.4) | Bounded ACP v1 framing and session protocol for independent clients. |
+| [`kranz-engine`](https://crates.io/crates/kranz-engine/0.4.4) | Mission orchestration, isolation, gates, validation, evidence, and controlled local merging. |
+| [`kranz-server`](https://crates.io/crates/kranz-server/0.4.4) | The REST/WebSocket mission host used by `kranz serve` and custom front ends. |
+| [`kranz-slack`](https://crates.io/crates/kranz-slack/0.4.4) | The Slack Socket Mode bridge for operating and observing missions. |
 
 The four library crates are public for reuse, but their Rust APIs are early
 and evolving in the v0.4 line. Pin exact versions if embedding them; semantic

@@ -764,9 +764,32 @@ jobs:
       # Dependabot alert was open) — gate them with --deny unsound, and pin
       # the installer version instead of floating on latest.
       - run: cargo install cargo-audit --locked --version 0.22.1
-      - run: cargo audit --deny unsound
+      - run: python3 scripts/check-desktop-backports.py
+      - run: cargo audit --deny warnings
         working-directory: apps/dashboard/src-tauri
       - run: cargo audit --deny unsound
+
+  tauri-linux-security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: python3 scripts/check-desktop-backports.py
+      - run: cargo test --release --locked --manifest-path apps/dashboard/src-tauri/security-tests/Cargo.toml
+      - run: python3 scripts/test-desktop-diagnostics.py
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: apps/dashboard
+      - run: cargo check --locked
+        working-directory: apps/dashboard/src-tauri
 
   # The Windows desktop binary is also a production mission host: its main
   # must route the private LPAC launcher re-entry before Tauri initializes.
