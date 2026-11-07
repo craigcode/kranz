@@ -582,6 +582,7 @@ fn protected_repo_api_routes() -> Router<Arc<ServerState>> {
         .route("/tickets/{slug}", get(tickets::get_ticket))
         .route("/tickets/{slug}/draft", post(tickets::draft_ticket))
         .route("/tickets/{slug}/approve", post(tickets::approve_ticket))
+        .route("/signals", get(tickets::list_signals))
         .route("/queue", get(host::queue_state_route))
         .route("/queue/drain", post(host::drain_queue_route));
     // Exercise future suffix collisions through the real router composition,
@@ -600,10 +601,16 @@ fn protected_repo_api_routes() -> Router<Arc<ServerState>> {
 }
 
 /// Only these POSTs bypass serve-token authentication. Each handler checks
-/// its own authority: GitHub HMAC or a per-run hook capability.
+/// its own authority: GitHub/Sentry HMAC or a per-run hook capability.
 fn independently_authenticated_hook_routes() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/hooks/github", post(hooks::github_hook))
+        .route(
+            "/hooks/sentry",
+            post(hooks::sentry_hook).route_layer(axum::extract::DefaultBodyLimit::max(
+                kranz_engine::signals::ledger::MAX_RAW_SIGNAL_BYTES,
+            )),
+        )
         .route(
             "/hook-status",
             post(rest::post_hook_status).route_layer(axum::extract::DefaultBodyLimit::max(
@@ -794,17 +801,35 @@ fn origin_host_is_ip(origin: &str) -> bool {
 ///
 /// Path-only in-process requests used by `tower::ServiceExt::oneshot` carry no
 /// Host header and are allowed; real network HTTP/1.1 requests present Host.
+fn is_github_webhook_post(request: &Request) -> bool {
+    if request.method() != Method::POST {
+        return false;
+    }
+    let path = request.uri().path();
+    path == "/api/hooks/github"
+        || path == "/api/hooks/sentry"
+        || path
+            .strip_prefix("/api/repos/")
+            .and_then(|rest| {
+                rest.strip_suffix("/hooks/github")
+                    .or_else(|| rest.strip_suffix("/hooks/sentry"))
+            })
+            .is_some_and(|repo_id| !repo_id.is_empty() && !repo_id.contains('/'))
+}
+
 async fn require_host(State(gate): State<HostGate>, request: Request, next: Next) -> Response {
-    if let Some(host) = request.headers().get(header::HOST) {
-        if !host
-            .to_str()
-            .is_ok_and(|h| host_allowed(h, gate.bind_is_loopback))
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "invalid host" })),
-            )
-                .into_response();
+    if !is_github_webhook_post(&request) {
+        if let Some(host) = request.headers().get(header::HOST) {
+            if !host
+                .to_str()
+                .is_ok_and(|h| host_allowed(h, gate.bind_is_loopback))
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "invalid host" })),
+                )
+                    .into_response();
+            }
         }
     }
     next.run(request).await
@@ -941,6 +966,7 @@ async fn require_mutation_token(
     // Human review must not be reachable by a sandboxed validator through
     // otherwise anonymous loopback reads. Reuse the existing read capability.
     let human_review = path.ends_with("/review-packet")
+        || path.ends_with("/signals")
         || (path.ends_with("/report.md")
             && axum::extract::Query::<rest::ReportQuery>::try_from_uri(request.uri())
                 .map_or(true, |query| query.review));

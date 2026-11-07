@@ -2,13 +2,21 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-11
+last_verified: 2026-11-07
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-07 (UTC) after the ACP reconciliation and AGENTS.md reference split. Full-workspace gates, exact staging, containment, provenance and lesson capture remain unchanged.
+
+Rechecked 2026-11-02 (UTC) after the signal intake invariants update; no lesson changed.
+
+Rechecked 2026-10-22 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
+
+Rechecked 2026-10-18 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 
 Rechecked 2026-10-11 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 

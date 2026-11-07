@@ -1438,3 +1438,72 @@ async fn acp_v2_admission_real_host_seeds_synthetic_credentials_and_removes_name
         );
     }
 }
+
+#[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_writeback() {
+    let f = Fixture::new();
+    let initial_bytes = std::fs::read(&f.profile.credential_file).unwrap();
+    let scratch_dir = f._dir.path().join("scratch-check");
+    std::fs::create_dir(&scratch_dir).unwrap();
+    let receipt_v1 = f
+        .profile
+        .verify_credential_source(&f.primary, &f.workspace, &scratch_dir)
+        .unwrap();
+    assert_eq!(receipt_v1.token_count, 1);
+    assert!(!receipt_v1.writeback_enabled);
+
+    let mut spec1 = f.spec();
+    let mut prepared1 = f.profile.prepare(&mut spec1).await.unwrap();
+    let home1 = spec1.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
+    let worker_auth = home1.join(".codex/auth.json");
+
+    // Simulate the adapter or a hostile worker rotating/poisoning auth.json inside
+    // the disposable CODEX_HOME during the session.
+    let worker_payload = serde_json::to_vec(&json!({
+        "tokens": {
+            "access_token": format!("worker-{}", "rotated-access-token-99999"),
+            "refresh_token": format!("worker-{}", "rotated-refresh-token-99999")
+        }
+    }))
+    .unwrap();
+    std::fs::write(&worker_auth, &worker_payload).unwrap();
+    prepared1.close().unwrap();
+    assert!(!home1.exists(), "disposable home must be removed on close");
+    assert_eq!(
+        std::fs::read(&f.profile.credential_file).unwrap(),
+        initial_bytes,
+        "worker-writable auth.json must never be copied back to operator credentialFile"
+    );
+
+    // Out-of-band operator renewal: atomic replacement of credentialFile on the host.
+    let renewed_tmp = f._dir.path().join("operator-auth.renewed.tmp");
+    let renewed_payload = serde_json::to_vec(&json!({
+        "tokens": {
+            "access_token": format!("synthetic-{}", "renewed-access-token-67890"),
+            "refresh_token": format!("synthetic-{}", "renewed-refresh-token-67890")
+        }
+    }))
+    .unwrap();
+    private_write(&renewed_tmp, &renewed_payload).unwrap();
+    std::fs::rename(&renewed_tmp, &f.profile.credential_file).unwrap();
+
+    let receipt_v2 = f
+        .profile
+        .verify_credential_source(&f.primary, &f.workspace, &scratch_dir)
+        .unwrap();
+    assert_eq!(receipt_v2.token_count, 2);
+    assert_ne!(receipt_v1.credential_sha256, receipt_v2.credential_sha256);
+
+    let mut spec2 = f.spec();
+    let mut prepared2 = f.profile.prepare(&mut spec2).await.unwrap();
+    let home2 = spec2.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
+    assert_eq!(
+        std::fs::read(home2.join(".codex/auth.json")).unwrap(),
+        renewed_payload
+    );
+    assert!(prepared2.contains_secret("synthetic-renewed-access-token-67890"));
+    assert!(prepared2.contains_secret("synthetic-renewed-refresh-token-67890"));
+    assert!(!prepared2.contains_secret("worker-rotated-access-token-99999"));
+    prepared2.close().unwrap();
+}

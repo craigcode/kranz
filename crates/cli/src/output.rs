@@ -310,6 +310,10 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
     let has_history = ratio.closed_missions > 0
         || !outcomes.escalations.is_empty()
         || outcomes.grant_latency.total_decided > 0
+        || outcomes
+            .signal_consent_latency
+            .as_ref()
+            .is_some_and(|l| l.total_decided > 0)
         || !outcomes.task_classes.is_empty();
 
     if !has_history {
@@ -327,6 +331,18 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         "  total decided: {}\n",
         outcomes.grant_latency.total_decided
     ));
+
+    if let Some(sig_latency) = &outcomes.signal_consent_latency {
+        out.push('\n');
+        out.push_str("Signal consent latency\n");
+        for bucket in &sig_latency.buckets {
+            out.push_str(&format!("  {}: {}\n", bucket.label, bucket.count));
+        }
+        out.push_str(&format!(
+            "  total consented: {}\n",
+            sig_latency.total_decided
+        ));
+    }
 
     // Rubber-stamp flag (KRZ-323) beside the latency distribution — a flag,
     // never an enforcement.
@@ -508,10 +524,10 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
         out.push_str(&format!(
             "  {}  {}  {}  {}  {}  {}{}\n",
             row.ts.to_rfc3339(),
-            row.mission_id,
+            sanitize_untrusted(&row.mission_id),
             row.kind.as_str(),
-            row.summary,
-            row.decision,
+            sanitize_untrusted(&row.summary),
+            sanitize_untrusted(&row.decision),
             latency,
             flag
         ));
@@ -679,7 +695,8 @@ pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
     for defect in &greens.traced_defects {
         out.push_str(&format!(
             "  traced: {} → {}\n",
-            defect.ticket, defect.mission_id
+            sanitize_untrusted(&defect.ticket),
+            sanitize_untrusted(&defect.mission_id)
         ));
     }
 
@@ -694,11 +711,11 @@ pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
         out.push_str(&format!(
             "  {}  {}  {}  {}  {}  {}  {}\n",
             row.ts.to_rfc3339(),
-            row.mission_id,
+            sanitize_untrusted(&row.mission_id),
             row.kind.as_str(),
-            milestone,
-            row.ask,
-            row.decision,
+            sanitize_untrusted(milestone),
+            sanitize_untrusted(&row.ask),
+            sanitize_untrusted(&row.decision),
             latency
         ));
     }

@@ -291,13 +291,20 @@ fn wire_name<T: Serialize>(value: &T) -> String {
 /// Collapse all whitespace runs to single spaces (goal text, decision
 /// summaries) so one logical line of the summary stays one physical line.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::presentation::visible(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Escape a markdown table cell: pipes would break the column structure,
-/// newlines the row structure.
+/// newlines the row structure, and backticks/brackets inline code/links.
 fn md_cell(text: &str) -> String {
-    one_line(text).replace('|', "\\|")
+    one_line(text)
+        .replace('|', "\\|")
+        .replace('`', "\\`")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 /// Milliseconds as a compact duration ("12s", "47m", "2.3h", "3.1d") — the
@@ -442,6 +449,38 @@ fn render_summary(
                 request.attempt_id.as_str(),
                 status,
                 record.consumed.is_some()
+            ));
+        }
+        out.push('\n');
+    }
+
+    let readback_descriptors: Vec<_> = chain
+        .gates
+        .iter()
+        .filter(|gate| gate.gate.starts_with("contract-readback:"))
+        .filter_map(|gate| {
+            crate::contract_controls::readback::descriptor(gate.artefact_detail.as_deref())
+                .map(|d| (gate, d.summary))
+        })
+        .collect();
+    if !readback_descriptors.is_empty() {
+        out.push_str("## Contract read-back and operator comparison\n\n");
+        for (gate, summary) in &readback_descriptors {
+            out.push_str(&format!(
+                "- [seq {}] `{}`: claim=\"{}\" | read-back={} | disposition={} | input_sha256=`{}` | checker_sha256=`{}` | control={} | omissions={}\n",
+                gate.seq,
+                md_cell(&summary.assertion_id),
+                md_cell(&summary.original_claim),
+                wire_name(&summary.translation.status),
+                wire_name(&summary.disposition.status),
+                summary.input_isolation.input_sha256,
+                summary.checker_sha256,
+                summary
+                    .control_outcome
+                    .as_ref()
+                    .map(|c| wire_name(&c.status))
+                    .unwrap_or_else(|| "none".into()),
+                md_cell(&summary.translation.omissions.join("; ")),
             ));
         }
         out.push('\n');
@@ -609,6 +648,7 @@ pub fn assemble_evidence_bundle(
     }
     let mut gate_expected = std::collections::BTreeMap::new();
     let mut paired = std::collections::BTreeMap::new();
+    let mut readbacks = std::collections::BTreeMap::new();
     for gate in &chain.gates {
         if gate.gate.starts_with("baseline-candidate:") {
             let descriptor =
@@ -623,6 +663,19 @@ pub fn assemble_evidence_bundle(
                 })
                 .or_insert(expected);
             paired.insert(gate.artefact_ref.clone(), descriptor);
+        } else if gate.gate.starts_with("contract-readback:") {
+            let descriptor =
+                crate::contract_controls::readback::descriptor(gate.artefact_detail.as_deref());
+            let expected = descriptor.as_ref().map(|d| (d.digest.clone(), d.bytes));
+            gate_expected
+                .entry(gate.artefact_ref.clone())
+                .and_modify(|prior: &mut Option<_>| {
+                    if *prior != expected {
+                        *prior = None;
+                    }
+                })
+                .or_insert(expected);
+            readbacks.insert(gate.artefact_ref.clone(), descriptor);
         }
     }
     for record in &chain.gate_evaluations {
@@ -658,6 +711,13 @@ pub fn assemble_evidence_bundle(
         let (mut status, mut bytes) = if let Some(descriptor) = paired.get(reference) {
             match descriptor.as_ref().and_then(|d| {
                 crate::contract_controls::pair::retained_bytes(&mission_dir, reference, d)
+            }) {
+                Some(bytes) => (ArtefactStatus::Resolved, Some(bytes)),
+                None => (ArtefactStatus::Unresolved, None),
+            }
+        } else if let Some(descriptor) = readbacks.get(reference) {
+            match descriptor.as_ref().and_then(|d| {
+                crate::contract_controls::readback::retained_bytes(&mission_dir, reference, d)
             }) {
                 Some(bytes) => (ArtefactStatus::Resolved, Some(bytes)),
                 None => (ArtefactStatus::Unresolved, None),

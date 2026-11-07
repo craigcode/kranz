@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-26
+last_verified: 2026-11-02
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,10 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline: `SignalProposalReady` cards post an `allowUsers`-gated **Draft** button (`kranz_draft_ticket`) that records explicit operator consent on `signal-proposal: unconsented` tickets through `MissionHost::draft_async_with_consent` before starting a draft.
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: plain-text button labels use control-character escaping, slug lengths are bounded, and ask sessions run with read/write tools disabled. Command routing and allowlists are unchanged.
 
 Rechecked 2026-09-26: permission cards render control characters visibly and omit Allow for ambiguous requests. Existing authenticated routing and exact binding checks remain in force.
 
@@ -89,6 +93,7 @@ opens spend deliberately) on refusal before touching the host.
 `ticket new <slug> <title…>` (the modal-open is gated). Buttons carry the same
 gate: **Approve & queue** (`kranz_approve`), **Approve & start** (`kranz_start`),
 **Merge** (`kranz_merge`), the todo **Queue** button (`kranz_queue_ticket`),
+the signal-proposal **Draft** button (`kranz_draft_ticket`),
 **Approve/Reject revision**, and **Approve/Deny grant** (`kranz_approve_grant` /
 `kranz_deny_grant`, on the parked capability-grant card) all capture `user.id` +
 `response_url` so the bridge refuses an unlisted clicker exactly like the slash

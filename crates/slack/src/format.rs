@@ -62,6 +62,12 @@ pub const ANSWER_QUESTION_ACTION_ID: &str = "kranz_answer_question";
 /// `/kranz queue <slug>`; rendering the todo list itself remains read-only.
 pub const QUEUE_TICKET_ACTION_ID: &str = "kranz_queue_ticket";
 
+/// `action_id` of the "Draft proposal" button on a signal proposal card
+/// ([`build_signal_proposal_ready`]). The button value carries the ticket slug
+/// and routes through the existing [`crate::inbound::Action::Draft`] path
+/// gated by `allow_users` (`signal-intake-10-surfaces`).
+pub const DRAFT_TICKET_ACTION_ID: &str = "kranz_draft_ticket";
+
 /// `callback_id` of the new-mission modal ([`build_new_mission_modal`]); its
 /// `view_submission` routes to [`crate::inbound::Action::NewMission`].
 pub const NEW_MISSION_CALLBACK_ID: &str = "kranz_new_mission";
@@ -850,10 +856,10 @@ pub fn build_question_ready(q: &QuestionReady, dashboard_url: Option<&str>) -> V
                 json!({
                     "type": "button",
                     "style": "primary",
-                    // Button text is capped (Slack 75 chars) and escaped like
-                    // the options list above (model-authored label); the full
-                    // label rides in the list.
-                    "text": { "type": "plain_text", "text": clip_to(&format!("{i}: {}", escape_mrkdwn(o.trim())), 75) },
+                    // Button text is capped (Slack 75 chars) and control-sanitized
+                    // for a `plain_text` object (which renders HTML entities literally);
+                    // the full mrkdwn-escaped label rides in the list above.
+                    "text": { "type": "plain_text", "text": clip_to(&format!("{i}: {}", kranz_engine::presentation::visible(o.trim())), 75) },
                     "action_id": ANSWER_QUESTION_ACTION_ID,
                     "value": format!("{}:{}:{i}", q.mission_id, q.question_id),
                 })
@@ -886,6 +892,59 @@ pub fn build_needs_context(n: &NeedsContext) -> Vec<Value> {
             clip(body.trim_end())
         )),
         context("Reply in this thread with the answers to re-draft the plan."),
+    ]
+}
+
+/// Inputs for [`build_signal_proposal_ready`] (`signal-intake-10-surfaces`).
+#[derive(Debug, Clone)]
+pub struct SignalProposalReady {
+    pub ticket_slug: String,
+    pub signal_id: String,
+    pub title: String,
+    pub candidate_missions: Vec<String>,
+}
+
+/// Waiting signal proposal notification (`signal-intake-10-surfaces`):
+/// posts once when a monitoring signal is triaged into an undrafted proposal,
+/// linking to the existing Draft action behind `allow_users`.
+pub fn build_signal_proposal_ready(s: &SignalProposalReady) -> Vec<Value> {
+    let candidates_line = if s.candidate_missions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nSuggested `traced-from-mission` candidates: {}",
+            s.candidate_missions
+                .iter()
+                .map(|m| format!("`{}`", escape_mrkdwn(m)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    vec![
+        header(&format!("Signal proposal waiting — {}", s.ticket_slug)),
+        section(&format!(
+            "*{}*\nSignal `{}` → ticket `{}` (undrafted; awaiting human consent).{}",
+            escape_mrkdwn(&s.title),
+            escape_mrkdwn(&s.signal_id),
+            escape_mrkdwn(&s.ticket_slug),
+            candidates_line
+        )),
+        json!({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Draft proposal" },
+                    "style": "primary",
+                    "action_id": DRAFT_TICKET_ACTION_ID,
+                    "value": s.ticket_slug,
+                }
+            ]
+        }),
+        context(&format!(
+            "Or run `/kranz draft {}` (restricted to `allowUsers`).",
+            escape_mrkdwn(&s.ticket_slug)
+        )),
     ]
 }
 
@@ -1483,6 +1542,22 @@ pub fn build_outcomes_summary(outcomes: &kranz_engine::outcomes::Outcomes) -> Ve
         "*GRANT LATENCY*\n{}",
         clip(latency_body.trim_end())
     )));
+
+    if let Some(sig_latency) = &outcomes.signal_consent_latency {
+        let mut sig_body = String::new();
+        for bucket in &sig_latency.buckets {
+            let label = bucket
+                .label
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            sig_body.push_str(&format!("• *{}* — {}\n", label, bucket.count));
+        }
+        blocks.push(section(&format!(
+            "*SIGNAL CONSENT LATENCY*\n{}",
+            clip(sig_body.trim_end())
+        )));
+    }
 
     let cost = &outcomes.cost_per_change;
     let cost_line = match cost.usd_per_commit {
@@ -2213,7 +2288,9 @@ mod tests {
     }
 
     /// Model-authored asks must never inject Slack control sequences into
-    /// the card (the grant card's defensive-escape discipline).
+    /// mrkdwn blocks (the grant card's defensive-escape discipline), while
+    /// `plain_text` button labels stay literal (where HTML entities would
+    /// render verbatim).
     #[test]
     fn question_events_card_escapes_mrkdwn() {
         let blocks = build_question_ready(
@@ -2227,12 +2304,20 @@ mod tests {
             },
             None,
         );
-        let text = all_text(&blocks);
+        let non_action_blocks: Vec<Value> = blocks
+            .iter()
+            .filter(|b| b["type"].as_str() != Some("actions"))
+            .cloned()
+            .collect();
+        let text = all_text(&non_action_blocks);
         assert!(
             !text.contains("<!channel>"),
             "broadcast ping escaped: {text}"
         );
         assert!(!text.contains("<@U123>"), "user ping escaped: {text}");
+        let buttons = all_buttons(&blocks);
+        assert_eq!(buttons[0]["text"]["type"].as_str(), Some("plain_text"));
+        assert_eq!(buttons[0]["text"]["text"].as_str(), Some("0: yes <@U123>"));
     }
 
     /// M1: every agent-authored field posted as mrkdwn. `<!channel>` is a

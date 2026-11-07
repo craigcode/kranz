@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-10-12
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,14 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-07 (UTC): Reconciled the typed terminal-budget vocabulary with upstream pane observation types. A read-only pane binding conveys no execution authority, and resource/terminal implementation does not establish R5 qualification.
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline: undrafted `signal-proposal: unconsented` tickets and Slack `SignalProposalReady` cards extend intake and human consent without changing existing role or mission lifecycle vocabulary.
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back; no vocabulary or role boundary changed.
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep; no vocabulary or role boundary changed.
 
 Rechecked 2026-10-12 (UTC): R4 adds named terminal-budget errors and separates consent accounting from terminal controls. The synthetic provider retains exact authority and contained execution; released profiles keep terminal capability disabled. V2 worker admission remains limited to the previously qualified host and fixed resources.
 

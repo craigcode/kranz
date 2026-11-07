@@ -403,6 +403,13 @@ pub fn seed_worker_scratch_home(
     let home_dir = scratch_root.join("home");
     let config_dir = home_dir.join(".claude");
     std::fs::create_dir_all(&config_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [scratch_root, home_dir.as_path(), config_dir.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
 
     let source_config_dir = real_config_dir
         .map(std::path::Path::to_path_buf)
@@ -411,7 +418,13 @@ pub fn seed_worker_scratch_home(
         for entry in claude_min_config_entries() {
             let src = source_config_dir.join(entry);
             if src.is_file() {
-                std::fs::copy(&src, config_dir.join(entry))?;
+                let dst = config_dir.join(entry);
+                std::fs::copy(&src, &dst)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+                }
             }
         }
     }
@@ -422,6 +435,10 @@ pub fn seed_worker_scratch_home(
         if real_keychains.is_dir() {
             let scratch_library = home_dir.join("Library");
             std::fs::create_dir_all(&scratch_library)?;
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&scratch_library, std::fs::Permissions::from_mode(0o700))?;
+            }
             let link = scratch_library.join("Keychains");
             if !link.exists() {
                 std::os::unix::fs::symlink(&real_keychains, &link)?;

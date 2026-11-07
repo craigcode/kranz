@@ -2147,7 +2147,7 @@ express Statement of Purpose.
 ================================================================================
 Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 Used by:
-- webpki-roots 1.0.8 <https://github.com/rustls/webpki-roots>
+- webpki-roots 1.0.10 <https://github.com/rustls/webpki-roots>
 
 # Community Data License Agreement - Permissive - Version 2.0
 
@@ -3062,7 +3062,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ================================================================================
 ISC License (ISC)
 Used by:
-- rustls-webpki 0.103.15 <https://github.com/rustls/webpki>
+- rustls-webpki 0.103.16 <https://github.com/rustls/webpki>
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -4463,7 +4463,7 @@ MIT License (MIT)
 Used by:
 - hyper-rustls 0.27.9 <https://github.com/rustls/hyper-rustls>
 - rustls-native-certs 0.8.4 <https://github.com/rustls/rustls-native-certs>
-- rustls 0.23.45 <https://github.com/rustls/rustls>
+- rustls 0.23.46 <https://github.com/rustls/rustls>
 
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
 
@@ -6878,11 +6878,11 @@ SOFTWARE.
 ================================================================================
 MIT License (MIT)
 Used by:
-- kranz-acp 0.4.2 <https://github.com/craigcode/kranz>
-- kranz 0.4.2 <https://github.com/craigcode/kranz>
-- kranz-engine 0.4.2 <https://github.com/craigcode/kranz>
-- kranz-server 0.4.2 <https://github.com/craigcode/kranz>
-- kranz-slack 0.4.2 <https://github.com/craigcode/kranz>
+- kranz-acp 0.4.3 <https://github.com/craigcode/kranz>
+- kranz 0.4.3 <https://github.com/craigcode/kranz>
+- kranz-engine 0.4.3 <https://github.com/craigcode/kranz>
+- kranz-server 0.4.3 <https://github.com/craigcode/kranz>
+- kranz-slack 0.4.3 <https://github.com/craigcode/kranz>
 
 MIT License
 
@@ -6911,7 +6911,7 @@ SOFTWARE.
 MIT License (MIT)
 Used by:
 - tokio-util 0.7.18 <https://github.com/tokio-rs/tokio>
-- tokio 1.53.2 <https://github.com/tokio-rs/tokio>
+- tokio 1.53.3 <https://github.com/tokio-rs/tokio>
 
 MIT License
 

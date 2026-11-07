@@ -31,6 +31,7 @@ const RUNTIME_IGNORE_PATTERNS: &[&str] = &[
     ".kranz/slack/",
     ".kranz/queue/",
     ".kranz/hook-status/",
+    ".kranz/signals/",
     ".kranz/tickets/*.status",
     ".kranz/serve.token",
     ".kranz/serve.read.token",

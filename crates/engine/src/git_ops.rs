@@ -537,7 +537,12 @@ impl GitRepo {
             "core.fsmonitor=",
             "core.attributesFile=/dev/null",
             "commit.gpgSign=false",
+            "tag.gpgSign=false",
+            "tag.forceSignAnnotated=false",
             "gpg.program=/bin/false",
+            "gpg.openpgp.program=/bin/false",
+            "gpg.ssh.program=/bin/false",
+            "gpg.x509.program=/bin/false",
             "merge.default=text",
             CREDENTIAL_HELPER_RESET,
             SSH_COMMAND_OVERRIDE,
@@ -609,30 +614,30 @@ impl GitRepo {
         })?;
         let mut drivers = ConfiguredDrivers::default();
         for key in stdout.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((section, rest)) = key.split_once('.') else {
+                continue;
+            };
             // An ordinary include can point outside protected Git metadata,
             // including into the worker's writable source tree. Protecting
             // only config/config.worktree cannot pin that dependency graph.
-            if key == "include.path" {
+            if section == "include" {
                 return Err(EngineError::Git(
                     "refusing git operation: ordinary repository config includes cannot be protected; move repository settings into config or config.worktree".into(),
                 ));
             }
-            let Some((section, rest)) = key.split_once('.') else {
-                continue;
-            };
-            let Some((name, subkey)) = rest.rsplit_once('.') else {
-                continue;
-            };
             // A checkout/worktree command can activate an include in a child
             // Git process after this read, without any concurrent writer.
             // Refuse even currently inactive conditions: their future driver
             // set cannot be pinned by enumerating the current context.
-            if section == "includeif" && subkey == "path" {
+            if section == "includeif" {
                 return Err(EngineError::Git(
                     "refusing git operation: conditional repository config includes cannot be safely overridden across branch or worktree changes"
                         .into(),
                 ));
             }
+            let Some((name, subkey)) = rest.rsplit_once('.') else {
+                continue;
+            };
             if name.is_empty() {
                 continue;
             }
@@ -709,7 +714,7 @@ impl GitRepo {
     ///
     /// Failing to read the config is itself a refusal: a network operation
     /// that cannot rule the repo scope out has not ruled it out.
-    fn refuse_network_on_armed_local_config(&self) -> Result<()> {
+    pub(crate) fn refuse_network_on_armed_local_config(&self) -> Result<()> {
         if self.exec_disable_flags.is_none() {
             // An unhardened handle is the explicit escape hatch
             // ([`Self::open_unhardened`]): it promises nothing, and this
@@ -728,9 +733,9 @@ impl GitRepo {
              |core\\.askpass$\
              |core\\.gitproxy$\
              |protocol\\.\
-             |http\\.(proxy|sslcainfo|sslcert|sslkey)$\
+             |http\\.(.*\\.)?(proxy|proxyauthmethod|sslcainfo|sslcapath|sslcert|sslkey|sslbackend|extraheader|pinnedpubkey|followredirects)$\
              |url\\..*\\.(insteadof|pushinsteadof)$\
-             |remote\\..*\\.(uploadpack|receivepack)$)";
+             |remote\\..*\\.(vcs|proxy|proxyauthmethod|uploadpack|receivepack)$)";
         // Deliberately NOT `self.probe`: the handle's own `-c` segment sets
         // `credential.helper=` and `protocol.ext.allow=never`, and
         // `--get-regexp` would report those command-line values as matches
@@ -922,8 +927,18 @@ impl GitRepo {
     /// Create branch `name` at `from` (a sha or ref), or at `HEAD` when
     /// `from` is `None`. Does not check the branch out.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<()> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing create_branch with flag-shaped name {name:?}"
+            )));
+        }
         let mut args = vec!["branch", name];
         if let Some(start) = from {
+            if start.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing create_branch with flag-shaped start ref {start:?}"
+                )));
+            }
             args.push(start);
         }
         self.run(&args)?;
@@ -932,6 +947,11 @@ impl GitRepo {
 
     /// Check out an existing branch (or any committish).
     pub fn checkout(&self, name: &str) -> Result<()> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing checkout with flag-shaped ref {name:?}"
+            )));
+        }
         self.run(&["checkout", name])?;
         Ok(())
     }
@@ -1283,6 +1303,13 @@ impl GitRepo {
 
     /// Commits reachable from `to` but not `from` (`from..to`), oldest first.
     pub fn commits_between(&self, from: &str, to: &str) -> Result<Vec<CommitInfo>> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing commits_between with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
         let range = format!("{from}..{to}");
         // %x09 = tab separator; a subject can contain anything but a newline.
         let out = self.run(&["log", "--reverse", "--format=%H%x09%s", &range])?;
@@ -1357,12 +1384,26 @@ impl GitRepo {
 
     /// `git diff --stat <from>..<to>` output, verbatim.
     pub fn diff_stat(&self, from: &str, to: &str) -> Result<String> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing diff_stat with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
         let range = format!("{from}..{to}");
         self.run(&["diff", "--stat", &range])
     }
 
     /// Full `git diff <from>..<to>` output, verbatim.
     pub fn diff_full(&self, from: &str, to: &str) -> Result<String> {
+        for slot in [from, to] {
+            if slot.starts_with('-') {
+                return Err(EngineError::Git(format!(
+                    "refusing diff_full with flag-shaped ref {slot:?}"
+                )));
+            }
+        }
         let range = format!("{from}..{to}");
         self.run(&["diff", &range])
     }
@@ -1670,9 +1711,14 @@ impl GitRepo {
         Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
     }
 
-    /// Create an annotated tag at `HEAD` (`git tag -a <name> -m <message>`).
+    /// Create an annotated tag at `HEAD` (`git tag --no-sign -a <name> -m <message>`).
     pub fn tag(&self, name: &str, message: &str) -> Result<()> {
-        self.run(&["tag", "-a", name, "-m", message])?;
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing tag with flag-shaped name {name:?}"
+            )));
+        }
+        self.run(&["tag", "--no-sign", "-a", name, "-m", message])?;
         Ok(())
     }
 
@@ -2092,6 +2138,15 @@ impl GitRepo {
                 )));
             }
         }
+        self.refuse_network_on_armed_local_config()?;
+        if self
+            .remote_url(remote)?
+            .is_some_and(|url| url.contains("::"))
+        {
+            return Err(EngineError::Git(format!(
+                "refusing remote_has_branch on remote {remote:?}: remote helper URLs containing '::' are not permitted"
+            )));
+        }
         // Network mode: the operator's ~/.gitconfig stays in force (an
         // ls-remote against an https host needs the same credential helper a
         // push does) and this repo's own config is pre-flighted first.
@@ -2187,9 +2242,14 @@ impl GitRepo {
         // Report every armed network key before the remote lookup's narrower
         // local-execution guard runs. run_network rechecks before transport.
         self.refuse_network_on_armed_local_config()?;
-        if self.remote_url(remote)?.is_none() {
+        let Some(remote_url) = self.remote_url(remote)? else {
             return Err(EngineError::Git(format!(
                 "refusing to push to unconfigured remote {remote:?}: add and review the remote before cloud handoff"
+            )));
+        };
+        if remote_url.contains("::") {
+            return Err(EngineError::Git(format!(
+                "refusing to push to remote {remote:?}: remote helper URLs containing '::' are not permitted"
             )));
         }
         // Plain push to one already-configured remote of one local branch to

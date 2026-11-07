@@ -281,7 +281,9 @@ fn probe_role(role: Role, cfg: &MissionConfig) -> RoleReadiness {
     }
 
     let discover = match kind {
-        BackendKind::Claude => crate::backend_claude::discover_claude_binary(None),
+        BackendKind::Claude => {
+            crate::backend_claude::discover_claude_binary(cfg.claude_binary.as_deref())
+        }
         BackendKind::Codex => crate::backend_codex::discover_codex_binary(None),
         BackendKind::Droid => crate::backend_droid::discover_droid_binary(None),
         BackendKind::Kimi => crate::backend_kimi::discover_kimi_binary(None),
@@ -519,18 +521,30 @@ fn run_bounded(
         .env_clear()
         .envs(crate::agent_env::probe_child_env(&extra));
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.take(64 * 1024).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.take(64 * 1024).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr);
-                }
+                let stdout = stdout_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                let stderr = stderr_handle
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
                 let combined = format!("{stdout}{stderr}").trim().to_string();
                 return Ok((status.code().unwrap_or(-1), combined));
             }

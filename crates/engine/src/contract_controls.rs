@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod pair;
+pub mod readback;
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 512 * 1024;
@@ -502,6 +503,31 @@ pub fn evaluate(
         config,
         &AtomicBool::new(false),
     )
+}
+
+/// Evaluate negative controls and pair their outcomes with an independent
+/// contract read-back reviewer.
+pub fn evaluate_with_readback(
+    repo: &GitRepo,
+    paths: &MissionPaths,
+    revision: &str,
+    mission_goal: Option<&str>,
+    assertions: &[Assertion],
+    config: &MissionConfig,
+    reviewer: &dyn readback::ReadbackReviewer,
+) -> Vec<GateReport> {
+    let mut reports = evaluate(repo, paths, revision, assertions, config);
+    let readback_reports = readback::evaluate(
+        repo,
+        paths,
+        revision,
+        mission_goal,
+        assertions,
+        &reports,
+        reviewer,
+    );
+    reports.extend(readback_reports);
+    reports
 }
 
 pub(crate) fn evaluate_cancellable(

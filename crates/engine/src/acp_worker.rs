@@ -1,5 +1,7 @@
 //! Explicit ordinary-worker admission for the reviewed ACP image profiles.
 //! No discovery, image pulling, ambient credentials or user-config inheritance.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use crate::acp_container::{recover_dead_owner_ledgers, LedgerRecoveryReport};
 use crate::backend::SessionSpec;
 use crate::error::{EngineError, Result};
 use crate::types::{Role, RoleConfig, SandboxEnforce, SandboxProvider, WorkerIsolation};
@@ -130,7 +132,86 @@ fn refusal(reason: &str) -> EngineError {
     EngineError::Config(format!("ACP worker profile refused: {reason}"))
 }
 
+/// Non-secret verification receipt for an operator-owned credential file.
+/// Records the SHA-256 digest of the canonical file so out-of-band renewal
+/// between sessions is auditable without persisting or logging token values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSourceReceipt {
+    pub profile_id: String,
+    pub credential_sha256: String,
+    pub token_count: usize,
+    pub writeback_enabled: bool,
+}
+
 impl AcpWorkerProfile {
+    /// Validate the operator-owned credential source against the containment and
+    /// renewal rules without exposing secret bytes or writing back from any
+    /// worker-writable directory.
+    pub fn verify_credential_source(
+        &self,
+        primary_repo: &Path,
+        worker_cwd: &Path,
+        scratch_tmpdir: &Path,
+    ) -> Result<CredentialSourceReceipt> {
+        self.validate_target(std::env::consts::OS, std::env::consts::ARCH)?;
+        let definition = self.definition()?;
+        let source = self
+            .credential_file
+            .canonicalize()
+            .map_err(|_| refusal("credential source is unavailable"))?;
+        if [worker_cwd, scratch_tmpdir, primary_repo]
+            .into_iter()
+            .any(|root| source.starts_with(crate::sandbox::absolutize(root)))
+        {
+            return Err(refusal(
+                "credential source must be outside repository and worker-writable roots",
+            ));
+        }
+        let bytes = private_credential(&self.credential_file)?;
+        let value = crate::strict_json::parse(&bytes)
+            .map_err(|_| refusal("credential source is not valid unique-key JSON"))?;
+        let mut token_count = 0usize;
+        if definition.claude {
+            if value.get("credentialEnv").and_then(Value::as_str) != Some("CLAUDE_CODE_OAUTH_TOKEN")
+            {
+                return Err(refusal(
+                    "Claude profile requires the explicit OAuth credential file",
+                ));
+            }
+            let _token = value
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|s| s.len() >= 16 && *s == s.trim())
+                .ok_or_else(|| refusal("Claude OAuth token is missing or malformed"))?;
+            token_count = 1;
+        } else {
+            let tokens = value
+                .get("tokens")
+                .and_then(Value::as_object)
+                .filter(|tokens| tokens.contains_key("access_token"))
+                .ok_or_else(|| refusal("Codex OAuth access token is missing"))?;
+            for key in ["access_token", "refresh_token", "id_token"] {
+                if let Some(value) = tokens.get(key) {
+                    let _token = value
+                        .as_str()
+                        .filter(|s| s.len() >= 16 && *s == s.trim())
+                        .ok_or_else(|| refusal("Codex OAuth token is malformed"))?;
+                    token_count += 1;
+                }
+            }
+            if token_count == 0 || value.get("OPENAI_API_KEY").is_some_and(|v| !v.is_null()) {
+                return Err(refusal("Codex profile requires an existing CLI OAuth login; API-key login is not qualified"));
+            }
+        }
+        Ok(CredentialSourceReceipt {
+            profile_id: self.id.clone(),
+            credential_sha256: crate::standards_waiver::sha256_hex(&bytes),
+            token_count,
+            writeback_enabled: false,
+        })
+    }
+
     pub(crate) fn definition(&self) -> Result<Definition> {
         match self.id.as_str() {
             CLAUDE_V2 | CODEX_V2 => {

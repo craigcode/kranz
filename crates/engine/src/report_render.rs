@@ -261,7 +261,7 @@ pub fn render_plan_markdown(
         md.pop();
     }
     md.push('\n');
-    md
+    crate::presentation::visible(&scrub::scrub(&md))
 }
 
 /// The `research` evidence object the orchestrator may emit alongside the plan
@@ -351,7 +351,7 @@ pub(crate) fn render_research_markdown(research: &Research, mission_id: &str) ->
         "Candidate knowledge updates",
         &research.candidate_knowledge_updates,
     );
-    md
+    crate::presentation::visible(&scrub::scrub(&md))
 }
 
 /// Render the revised plan as human-readable markdown for review (roadmap M2),
@@ -426,7 +426,7 @@ pub fn render_revised_plan_markdown(
         md.pop();
     }
     md.push('\n');
-    md
+    crate::presentation::visible(&scrub::scrub(&md))
 }
 
 /// Latest `orchestrator.decision` summary carrying `prefix`, with the prefix
@@ -858,7 +858,7 @@ pub fn render_mission_report(
              the validation history)."
         );
     }
-    md
+    crate::presentation::visible(&scrub::scrub(&md))
 }
 
 /// One validation round replayed from the event log: a `milestone.validating`

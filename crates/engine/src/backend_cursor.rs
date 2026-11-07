@@ -271,6 +271,20 @@ fn security_bounded_with_timeout(
             let _ = stdin.write_all(script.as_bytes());
         }
     }
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.take(64 * 1024).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.take(64 * 1024).read_to_end(&mut buf);
+            buf
+        })
+    });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -294,15 +308,12 @@ fn security_bounded_with_timeout(
             }
         }
     };
-    // The process has exited, so both pipes are at EOF and drain immediately.
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_end(&mut stderr);
-    }
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     Ok(std::process::Output {
         status,
         stdout,
@@ -695,6 +706,13 @@ fn seed_cursor_scratch_home(
     let home = scratch_root.join("home");
     let cursor_dir = home.join(".cursor");
     std::fs::create_dir_all(&cursor_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [scratch_root, home.as_path(), cursor_dir.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
     if let Some(real_home) = real_home {
         let source = real_home.join(".cursor");
         for entry in CURSOR_SEED_ENTRIES {
@@ -702,6 +720,11 @@ fn seed_cursor_scratch_home(
             let dst = cursor_dir.join(entry);
             if src.is_file() {
                 std::fs::copy(&src, &dst)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+                }
             } else if src.is_dir() {
                 copy_dir_recursive(&src, &dst)?;
             }
@@ -714,6 +737,11 @@ fn seed_cursor_scratch_home(
 /// are skipped rather than followed).
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))?;
+    }
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -722,6 +750,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir_recursive(&entry.path(), &target)?;
         } else if file_type.is_file() {
             std::fs::copy(entry.path(), &target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+            }
         }
     }
     Ok(())
@@ -1713,13 +1746,13 @@ mod tests {
     /// against a db the seed JUST reported unlocked.
     /// Whether this host's `security` can seed a login keychain under a
     /// relocated HOME at all, probed by running the seed itself against a
-    /// throwaway HOME. On a host where it cannot (the GitHub macOS runner
-    /// image 20260831.0337.3 refuses it; 20260728.0273.1 did not; a
-    /// sandboxed developer shell refuses the unlock), the keychain tests
-    /// skip with the capability marker instead of reporting a runner
-    /// regression as a defect in the seed. `KRANZ_REQUIRED_CAPABILITIES`
-    /// can still demand it, in which case the skip is a panic that names
-    /// the missing capability.
+    /// throwaway HOME. `ensure_session_login_keychain` creates
+    /// `kranz-session.keychain-db` and symlinks `login.keychain-db` to it so
+    /// `securityd` on GitHub's `macos-26-arm64` (`20260831.0337.3`+) runner
+    /// image succeeds (`rust-macos` requires `keychain` via
+    /// `KRANZ_REQUIRED_CAPABILITIES`). Inside a Seatbelt-wrapped shell (such
+    /// as `rust-macos-wrapped-suite`), `securityd` refuses the unlock and the
+    /// keychain tests skip with the capability marker.
     #[cfg(target_os = "macos")]
     fn keychain_can_be_created() -> bool {
         let home = tempfile::tempdir().unwrap();

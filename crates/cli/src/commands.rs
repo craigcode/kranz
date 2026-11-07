@@ -442,11 +442,13 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             slug,
             yes,
             from_mission,
+            consent_signal,
         } => backlog::cmd_draft(
             repo,
             &slug,
             yes,
             from_mission.as_deref(),
+            consent_signal,
             cli.dangerously_allow_all,
         )
         .await
@@ -607,6 +609,52 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 cmd_standards_attest(&repo, &mission, &rule, &reason, lock_force)
             }
         },
+        Command::Signal { command } => match command {
+            crate::cli::SignalCommand::List { json } => {
+                let entries = kranz_engine::signals::ledger::SignalLedger::read_entries(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else if entries.is_empty() {
+                    println!("no signals recorded");
+                } else {
+                    for entry in &entries {
+                        println!(
+                            "#{:<4}  {}  {}",
+                            entry.seq,
+                            entry.timestamp.to_rfc3339(),
+                            output::sanitize_untrusted(&serde_json::to_string(&entry.record)?)
+                        );
+                    }
+                }
+                Ok(0)
+            }
+            crate::cli::SignalCommand::Consent {
+                slug_or_id,
+                traced_from,
+                actor,
+            } => {
+                let res = kranz_engine::signals::proposal::consent_signal_proposal(
+                    &repo,
+                    &slug_or_id,
+                    &actor,
+                    traced_from.as_deref(),
+                    cli.mission.as_deref(),
+                )?;
+                println!(
+                    "signal proposal '{}' ({}) consented by {}",
+                    output::sanitize_untrusted(&res.ticket_slug),
+                    output::sanitize_untrusted(&res.signal_id),
+                    output::sanitize_untrusted(&res.actor),
+                );
+                if let Some(traced) = &res.confirmed_traced_mission {
+                    println!(
+                        "confirmed traced-from-mission: {}",
+                        output::sanitize_untrusted(traced)
+                    );
+                }
+                Ok(0)
+            }
+        },
         Command::Otel {
             endpoint,
             from_start,
@@ -636,8 +684,9 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             println!("created ticket '{slug}' at {}", path.display());
             Ok(0)
         }
-        TicketCommand::ImportOpenspec { path, slug } => {
-            let written = crate::openspec::import_change(repo, &path, slug.as_deref())?;
+        TicketCommand::ImportOpenspec { path, slug, force } => {
+            let written =
+                crate::openspec::import_change_with_options(repo, &path, slug.as_deref(), force)?;
             println!("imported {} as {}", path.display(), written.display());
             println!(
                 "acceptance criteria are still prose: replace the placeholder in \
@@ -1280,7 +1329,8 @@ fn print_orchestrator_reply(text: &str, tty: bool) {
     } else {
         "orchestrator> ".to_string()
     };
-    for line in text.lines() {
+    let sanitized = output::sanitize_untrusted(text);
+    for line in sanitized.lines() {
         println!("{prefix}{line}");
     }
 }
@@ -1562,13 +1612,16 @@ pub fn cmd_list_questions(repo: &Path, mission_id: &str) -> Result<String> {
             "{} ({}): {}\n",
             q.question_id,
             q.feature_id.as_deref().unwrap_or("mission"),
-            q.text
+            output::sanitize_untrusted(&q.text)
         ));
         if q.options.is_empty() {
             out.push_str("  free-text answer expected\n");
         } else {
             for (index, option) in q.options.iter().enumerate() {
-                out.push_str(&format!("  [{index}] {option}\n"));
+                out.push_str(&format!(
+                    "  [{index}] {}\n",
+                    output::sanitize_untrusted(option)
+                ));
             }
         }
     }
@@ -2053,7 +2106,9 @@ fn cmd_standards_waive(
     println!("  statement: {}", pinned.statement);
     println!(
         "finding: {} (run {})\n  evidence: {}",
-        outcome.finding_subject, outcome.run_id, outcome.finding_evidence
+        output::sanitize_untrusted(&outcome.finding_subject),
+        outcome.run_id,
+        output::sanitize_untrusted(&outcome.finding_evidence)
     );
     println!("  fingerprint: sha256:{}", outcome.finding_fingerprint);
     if pinned.when_paths.is_empty() {
@@ -2180,7 +2235,7 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
             Ok(state) => out.push_str(&format!(
                 "{id}  {:<10}  {}{ticket}\n",
                 output::mission_status_label(state.mission.status),
-                state.mission.goal
+                output::sanitize_untrusted(&state.mission.goal)
             )),
             Err(e) => out.push_str(&format!("{id}  {:<10}  (unreadable: {e:#})\n", "FAILED")),
         }
@@ -2263,7 +2318,12 @@ pub fn render_clean_listing(entries: &[CleanEntry]) -> String {
     }
     let mut out = String::new();
     for e in entries {
-        out.push_str(&format!("{:<10}  {}  {}\n", e.status_label, e.id, e.goal));
+        out.push_str(&format!(
+            "{:<10}  {}  {}\n",
+            e.status_label,
+            e.id,
+            output::sanitize_untrusted(&e.goal)
+        ));
     }
     out
 }

@@ -1695,3 +1695,168 @@ async fn acp_resource_qualification_selected_limits() {
         }
     }
 }
+
+#[tokio::test]
+async fn acp_recovery_ledger_reaps_dead_owner_and_preserves_live_or_unconfirmed() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let docker = root.path().join("fake-docker");
+    let other_docker = root.path().join("other-docker");
+    std::fs::write(&other_docker, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&other_docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let dead_owner = "a".repeat(32);
+    let live_owner = "b".repeat(32);
+    let foreign_daemon_owner = "c".repeat(32);
+    let in_flight_owner = "d".repeat(32);
+    let persisting_owner = "e".repeat(32);
+
+    std::fs::write(
+        &docker,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+    container)
+        case "$*" in
+            *"label=com.kranz.acp-owner={dead_owner}"*)
+                if [ ! -e "$0.dead-removed" ]; then
+                    printf '%064d\n' 7
+                fi
+                ;;
+            *"label=com.kranz.acp-owner={persisting_owner}"*)
+                printf '%064d\n' 8
+                ;;
+            *)
+                ;;
+        esac
+        ;;
+    rm)
+        printf '%s\n' "$*" >> "$0.rm-calls"
+        touch "$0.dead-removed"
+        ;;
+    *)
+        exit 97
+        ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let write_ledger = |suffix: &str, value: serde_json::Value| -> PathBuf {
+        let dir = scratch.join(format!("kranz-acp-owned-{suffix}"));
+        std::fs::create_dir(&dir).unwrap();
+        private_write(
+            &dir.join("container.json"),
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        dir
+    };
+
+    let dead_dir = write_ledger(
+        "dead",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-dead",
+            "owner": dead_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-identity-from-crashed-owner",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+    let live_dir = write_ledger(
+        "live",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-live",
+            "owner": live_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": crate::event_log::process_identity_token(std::process::id() as i32),
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+    let foreign_dir = write_ledger(
+        "foreign-daemon",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-foreign",
+            "owner": foreign_daemon_owner,
+            "image": IMAGE,
+            "docker": other_docker,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-identity-from-crashed-owner",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+    let in_flight_dir = write_ledger(
+        "in-flight",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-in-flight",
+            "owner": in_flight_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-identity-from-crashed-owner",
+            "cleanupConfirmed": false,
+            "creationFinished": false,
+        }),
+    );
+    let persisting_dir = write_ledger(
+        "persisting",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-persisting",
+            "owner": persisting_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-identity-from-crashed-owner",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+
+    let report = recover_dead_owner_ledgers(&scratch, &docker).await.unwrap();
+    assert_eq!(report.inspected, 5);
+    assert_eq!(report.removed, vec![dead_owner]);
+    assert_eq!(report.skipped_live, 1);
+    assert_eq!(report.unconfirmed.len(), 3);
+    assert!(report.unconfirmed.contains(&foreign_daemon_owner));
+    assert!(report.unconfirmed.contains(&in_flight_owner));
+    assert!(report.unconfirmed.contains(&persisting_owner));
+
+    assert!(
+        !dead_dir.exists(),
+        "confirmed dead-owner ledger must be deleted"
+    );
+    assert!(live_dir.exists(), "live sibling ledger must not be touched");
+    assert!(
+        foreign_dir.exists(),
+        "mismatched daemon ledger must be retained"
+    );
+    assert!(
+        in_flight_dir.exists(),
+        "interrupted create ledger must be retained"
+    );
+    assert!(
+        persisting_dir.exists(),
+        "unconfirmed removal ledger must be retained"
+    );
+}

@@ -40,6 +40,8 @@ impl SlackClient {
     pub fn new(cfg: &crate::config::SlackConfig) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .context("building reqwest client")?,
             bot_token: cfg.bot_token.clone(),

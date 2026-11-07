@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/acp", "crates/engine", "crates/cli", "crates/server", "crates/slack"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 # README quick-start floor; inherited by every member crate and checked in CI.
 rust-version = "1.88"
@@ -18,10 +18,10 @@ keywords = ["agent", "orchestration", "mission-control", "validation", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
-kranz-acp = { version = "0.4.2", path = "crates/acp" }
-kranz-engine = { version = "0.4.2", path = "crates/engine" }
-kranz-server = { version = "0.4.2", path = "crates/server" }
-kranz-slack = { version = "0.4.2", path = "crates/slack" }
+kranz-acp = { version = "0.4.3", path = "crates/acp" }
+kranz-engine = { version = "0.4.3", path = "crates/engine" }
+kranz-server = { version = "0.4.3", path = "crates/server" }
+kranz-slack = { version = "0.4.3", path = "crates/slack" }
 serde = { version = "1", features = ["derive"] }
 # Event integrity requires serialized floats to survive parsing bit-for-bit.
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
@@ -54,7 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # the dependency graph enables both of rustls's provider features (reqwest
 # pulls aws-lc-rs, the OTLP client pulls ring), and rustls 0.23 panics at
 # the first TLS connection rather than guessing. See crates/cli/src/main.rs.
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["trace"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "reqwest-client", "reqwest-rustls"] }

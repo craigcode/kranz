@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Implemented independent model read-back, input-isolation proof, and operator comparison disposition in crates/engine/src/contract_controls/readback.rs alongside review_packet.rs and evidence_bundle.rs integration."
 title: Contract read-back and negative controls for critical assertions
 priority: 2
 schedule: once

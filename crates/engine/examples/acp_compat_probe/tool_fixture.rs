@@ -10,12 +10,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const COMMAND: &str = "echo kranz-acp-tool-fixture-v1 > fixture-result.txt";
+pub const TERMINAL_RUN_ID: &str = "acp-probe-terminal";
 const OUTPUT: &[u8] = b"kranz-acp-tool-fixture-v1\n";
 const FILE: &str = "fixture-result.txt";
 pub const REPORT: &str = r#"{"result":"partial","summary":"kranz-acp-tool-fixture-v1","filesTouched":["fixture-result.txt"],"testsAdded":[],"dependenciesAdded":[],"knownGaps":["Tool compatibility fixture only; no mission completion claimed."],"commits":[],"commandsRun":["echo kranz-acp-tool-fixture-v1 > fixture-result.txt"],"escalation":null,"questions":[]}"#;
 
 pub fn prompt() -> String {
     format!("Tool compatibility fixture only. Use your native shell tool exactly once to run exactly this command in the session working directory: {COMMAND}\nRequest explicit one-time approval before executing it (Codex: require_escalated with no prefix rule). Do not run a preliminary command, read files, use any other tool, change mode, add permissions, call the network, retry, or create a commit. If approval is unavailable, stop. After successful execution return exactly this JSON, without Markdown fences:\n{REPORT}")
+}
+
+pub fn terminal_prompt() -> String {
+    format!("Terminal compatibility fixture only. Use the ACP client terminal provider (terminal/create, terminal/wait_for_exit, terminal/release) exactly once to run `/bin/sh -c \"{COMMAND}\"` in the session working directory. Do not use a native internal shell tool, read files, use any other tool, change mode, add permissions, call the network, retry, or create a commit. After releasing the terminal return exactly this JSON, without Markdown fences:\n{REPORT}")
 }
 
 // Read only bounded, single-link regular files. O_NONBLOCK prevents a planted
@@ -373,5 +378,241 @@ impl Evidence {
             bail!("missing tool/permission/completion evidence");
         }
         Ok(())
+    }
+}
+
+/// Qualification evidence for `Mode::TerminalOnce`: proves the adapter
+/// drives the client terminal provider (`terminal/create`, `terminal/output` or
+/// `terminal/wait_for_exit`, `terminal/release`) and rejects any internal
+/// execution bypass (native `execute` tool call or unrequested workspace write).
+#[derive(Default)]
+pub struct TerminalEvidence {
+    request_id: Option<String>,
+    sent: bool,
+    terminal_id: Option<String>,
+    saw_create_receipt: bool,
+    saw_wait_or_output: bool,
+    saw_release: bool,
+    saw_session_cleanup: bool,
+    bypass_detected: bool,
+}
+
+impl TerminalEvidence {
+    pub fn authorize(&mut self, proposal: &Proposal, workspace: &Path) -> Result<String> {
+        proposal.validate()?;
+        if proposal.action.get("terminalScope").is_none() {
+            self.bypass_detected = true;
+            bail!("adapter bypassed client terminal provider with native permission request");
+        }
+        if self.request_id.is_some()
+            || self.saw_release
+            || proposal.prohibition.is_some()
+            || proposal.action["kind"] != "execute"
+            || proposal.action["terminalScope"]["runId"] != TERMINAL_RUN_ID
+        {
+            bail!("terminal permission is repeated, prohibited or out of scope");
+        }
+        let raw = &proposal.action["rawInput"];
+        if raw["command"] != "/bin/sh"
+            || raw["args"] != json!(["-c", COMMAND])
+            || raw["cwd"].as_str() != workspace.to_str()
+        {
+            bail!("terminal/create command differs from the authorized fixture");
+        }
+        let selected = proposal
+            .option(true)
+            .context("no unique allow_once option")?;
+        self.request_id = Some(proposal.id.clone());
+        Ok(selected)
+    }
+
+    pub fn observe(&mut self, event: &AgentEvent) -> Result<()> {
+        match event {
+            AgentEvent::PermissionResponded {
+                request_id,
+                delivery,
+                ..
+            } => {
+                if self.request_id.as_ref() != Some(request_id)
+                    || self.sent
+                    || *delivery != Delivery::Sent
+                {
+                    bail!("terminal permission delivery is missing, repeated or uncertain");
+                }
+                self.sent = true;
+            }
+            AgentEvent::ToolUse { raw, .. } | AgentEvent::ToolResult { raw, .. } => {
+                let update = &raw["params"]["update"];
+                if update.get("kind").is_some_and(|v| v == "execute") && self.request_id.is_none() {
+                    self.bypass_detected = true;
+                    bail!("adapter bypassed client terminal provider with native execute tool");
+                }
+            }
+            AgentEvent::Other { raw } => {
+                if raw["terminalReceipt"].is_object() {
+                    let tr = &raw["terminalReceipt"];
+                    if tr["succeeded"] != true {
+                        bail!("terminal RPC failed: {tr}");
+                    }
+                    match tr["method"].as_str() {
+                        Some("terminal/create") => {
+                            if !self.sent || self.saw_create_receipt {
+                                bail!("unexpected or duplicate terminal/create receipt");
+                            }
+                            let tid = tr["evidence"]["terminalId"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .context("missing terminalId in create receipt")?;
+                            self.terminal_id = Some(tid.to_owned());
+                            self.saw_create_receipt = true;
+                        }
+                        Some("terminal/output" | "terminal/wait_for_exit") => {
+                            if self.terminal_id.as_deref() != tr["evidence"]["terminalId"].as_str()
+                            {
+                                bail!("terminal control receipt names foreign terminalId");
+                            }
+                            self.saw_wait_or_output = true;
+                        }
+                        Some("terminal/release") => {
+                            if self.terminal_id.as_deref() != tr["evidence"]["terminalId"].as_str()
+                            {
+                                bail!("terminal/release receipt names foreign terminalId");
+                            }
+                            let cleanup = &tr["evidence"]["cleanup"];
+                            if cleanup["released"] != true
+                                || cleanup["descendantsReaped"] != true
+                                || cleanup["outputDrained"] != true
+                            {
+                                bail!("terminal/release cleanup receipt is incomplete");
+                            }
+                            self.saw_release = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if raw["terminalSessionCleanup"].is_object() {
+                    if raw["terminalSessionCleanup"]["confirmed"] != true {
+                        bail!("terminalSessionCleanup not confirmed");
+                    }
+                    self.saw_session_cleanup = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        if self.bypass_detected
+            || !self.sent
+            || !self.saw_create_receipt
+            || !self.saw_wait_or_output
+            || !self.saw_release
+            || !self.saw_session_cleanup
+        {
+            bail!("incomplete client terminal lifecycle or internal-execution bypass detected");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kranz_engine::live_permission::digest;
+
+    #[test]
+    fn terminal_evidence_accepts_full_client_terminal_lifecycle_and_rejects_bypass() {
+        let ws = Path::new("/workspace");
+        let now = chrono::Utc::now();
+        let action = json!({
+            "kind": "execute",
+            "rawInput": {
+                "sessionId": "peer",
+                "command": "/bin/sh",
+                "args": ["-c", COMMAND],
+                "cwd": "/workspace",
+            },
+            "terminalScope": {
+                "runId": TERMINAL_RUN_ID,
+                "engineSessionId": "engine",
+                "peerSessionId": "peer",
+                "generation": "gen-1",
+            },
+        });
+        let options = vec![json!({"optionId": "execute-once", "kind": "allow_once"})];
+        let proposal = Proposal {
+            id: "perm-1".into(),
+            engine_session_id: "engine".into(),
+            peer_session_id: "peer".into(),
+            peer_request_id: json!(1),
+            tool_call_id: "terminal-create-1".into(),
+            action_digest: digest(&action).unwrap(),
+            options_digest: digest(&options).unwrap(),
+            action,
+            options: options.clone(),
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(30),
+            prohibition: None,
+        };
+
+        let mut ev = TerminalEvidence::default();
+        assert_eq!(ev.authorize(&proposal, ws).unwrap(), "execute-once");
+        ev.observe(&AgentEvent::PermissionResponded {
+            request_id: "perm-1".into(),
+            delivery: Delivery::Sent,
+            raw: json!({}),
+        })
+        .unwrap();
+        ev.observe(&AgentEvent::Other {
+            raw: json!({"terminalReceipt": {
+                "method": "terminal/create",
+                "succeeded": true,
+                "evidence": {"terminalId": "terminal-1"}
+            }}),
+        })
+        .unwrap();
+        ev.observe(&AgentEvent::Other {
+            raw: json!({"terminalReceipt": {
+                "method": "terminal/wait_for_exit",
+                "succeeded": true,
+                "evidence": {"terminalId": "terminal-1", "exitStatus": {"exitCode": 0}}
+            }}),
+        })
+        .unwrap();
+        ev.observe(&AgentEvent::Other {
+            raw: json!({"terminalReceipt": {
+                "method": "terminal/release",
+                "succeeded": true,
+                "evidence": {
+                    "terminalId": "terminal-1",
+                    "cleanup": {
+                        "released": true,
+                        "descendantsReaped": true,
+                        "outputDrained": true,
+                        "exitStatus": {"exitCode": 0}
+                    }
+                }
+            }}),
+        })
+        .unwrap();
+        ev.observe(&AgentEvent::Other {
+            raw: json!({"terminalSessionCleanup": {"confirmed": true}}),
+        })
+        .unwrap();
+        ev.finish().unwrap();
+
+        // Bypass detection: native execute tool without terminalScope is rejected.
+        let mut bypass = TerminalEvidence::default();
+        let err = bypass
+            .observe(&AgentEvent::ToolUse {
+                tool: "Bash".into(),
+                summary: "kranz-acp-probe-terminal".into(),
+                raw: json!({"params": {"update": {"sessionUpdate": "tool_call", "kind": "execute"}}}),
+            })
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("bypassed client terminal provider"));
     }
 }

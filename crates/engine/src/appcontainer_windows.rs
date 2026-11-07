@@ -2411,7 +2411,12 @@ fn validate_recursive_roots(
     let shared_git = crate::sandbox::absolutize(shared_git);
     let cwd = crate::sandbox::absolutize(&inputs.session_cwd);
     let session_authority = cwd.join(".kranz");
-    let session_files = crate::sandbox::kranz_authority_entries(&session_authority).files;
+    let session_authority_entries = crate::sandbox::kranz_authority_entries(&session_authority);
+    let session_files: Vec<_> = session_authority_entries
+        .files
+        .into_iter()
+        .chain(session_authority_entries.dirs)
+        .collect();
     let gitlink = cwd.join(".git");
     let sealed_file = |root: &Path, protected: &Path| {
         comparable_path(root) == comparable_path(&cwd)
@@ -2693,6 +2698,7 @@ fn acl_changes(
     // `git commit` into host execution, plus the worktree gitlink. Narrow by
     // design; the positive root policy already keeps shared metadata
     // read-only on this provider.
+    crate::sandbox::ensure_writable_git_metadata_subdirs(inputs)?;
     let git_writes = crate::sandbox::git_metadata_write_denies(inputs);
     for path in git_writes.files {
         // Resolve short (8.3) aliases as well as verbatim paths. A generic

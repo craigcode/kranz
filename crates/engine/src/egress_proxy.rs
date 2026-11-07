@@ -435,10 +435,11 @@ async fn handle_connection_inner(
             return Ok(());
         }
     }
-    if !allowlist
+    let matching_entries: Vec<&AllowEntry> = allowlist
         .iter()
-        .any(|entry| entry.matches(&target.host, target.port))
-    {
+        .filter(|entry| entry.matches(&target.host, target.port))
+        .collect();
+    if matching_entries.is_empty() {
         tracing::info!(host = %target.host, port = target.port, "egress denied");
         if let Err(e) = sink.record(&target.host, target.port).await {
             tracing::warn!(error = %e, host = %target.host, "egress denial record write failed (audit lost; denial stands)");
@@ -450,7 +451,45 @@ async fn handle_connection_inner(
         write_response(reader.get_mut(), "403 Forbidden", body.as_bytes()).await?;
         return Ok(());
     }
-    let mut upstream = match TcpStream::connect((target.host.as_str(), target.port)).await {
+    let resolved_addrs: Vec<SocketAddr> =
+        match tokio::net::lookup_host((target.host.as_str(), target.port)).await {
+            Ok(iter) => iter.collect(),
+            Err(e) => {
+                let lower = target.host.to_ascii_lowercase();
+                let trimmed = lower.trim_end_matches('.');
+                if trimmed == "localhost" || trimmed.ends_with(".localhost") {
+                    vec![SocketAddr::from((Ipv4Addr::LOCALHOST, target.port))]
+                } else {
+                    let body = format!(
+                        "kranz egress proxy: connect to {}:{} failed: {e}\r\n",
+                        target.host, target.port
+                    );
+                    write_response(reader.get_mut(), "502 Bad Gateway", body.as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        };
+    let allowed_addrs: Vec<SocketAddr> = resolved_addrs
+        .into_iter()
+        .filter(|addr| is_resolved_ip_allowed_for_entries(addr.ip(), &matching_entries))
+        .collect();
+    if allowed_addrs.is_empty() {
+        tracing::info!(
+            host = %target.host,
+            port = target.port,
+            "egress denied (resolved to restricted IP)"
+        );
+        if let Err(e) = sink.record(&target.host, target.port).await {
+            tracing::warn!(error = %e, host = %target.host, "egress denial record write failed (audit lost; denial stands)");
+        }
+        let body = format!(
+            "kranz egress proxy: {}:{} resolved to a restricted address not explicitly in the mission egress allowlist\r\n",
+            target.host, target.port
+        );
+        write_response(reader.get_mut(), "403 Forbidden", body.as_bytes()).await?;
+        return Ok(());
+    }
+    let mut upstream = match TcpStream::connect(&allowed_addrs[..]).await {
         Ok(upstream) => upstream,
         Err(e) => {
             let body = format!(
@@ -474,6 +513,39 @@ async fn handle_connection_inner(
     }
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+fn is_resolved_ip_allowed_for_entries(
+    ip: std::net::IpAddr,
+    matching_entries: &[&AllowEntry],
+) -> bool {
+    let canonical_ip = match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        std::net::IpAddr::V4(v4) => std::net::IpAddr::V4(v4),
+    };
+    // An explicit non-wildcard IP literal in the allowlist authorizes that IP.
+    if matching_entries
+        .iter()
+        .any(|entry| !entry.wildcard && entry.host.parse::<std::net::IpAddr>() == Ok(canonical_ip))
+    {
+        return true;
+    }
+    if canonical_ip.is_loopback() {
+        return matching_entries
+            .iter()
+            .any(|entry| !entry.wildcard && entry.host == "localhost");
+    }
+    let is_link_local = match canonical_ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    if canonical_ip.is_unspecified() || is_link_local {
+        return false;
+    }
+    true
 }
 
 fn proxy_authorization(head: &str) -> Option<&str> {
@@ -1120,6 +1192,93 @@ mod tests {
         assert!(
             !spec.env.contains_key(HTTPS_PROXY_ENV),
             "a failed start must not leave proxy env behind"
+        );
+    }
+
+    #[test]
+    fn egress_proxy_resolved_ip_filter_rejects_loopback_and_link_local_unless_explicit() {
+        let wildcard_local = AllowEntry::parse("*.localhost:8080").unwrap();
+        let exact_sub = AllowEntry::parse("rebind.localhost:8080").unwrap();
+        let exact_localhost = AllowEntry::parse("localhost:8080").unwrap();
+        let exact_loopback_ip = AllowEntry::parse("127.0.0.1:8080").unwrap();
+        let exact_imds_ip = AllowEntry::parse("169.254.169.254:80").unwrap();
+        let domain_entry = AllowEntry::parse("api.example.com:80").unwrap();
+
+        let loopback_v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped_loopback_v6: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let imds_v4: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+        let link_local_v6: std::net::IpAddr = "fe80::1".parse().unwrap();
+        let unspec_v4: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+
+        assert!(
+            !is_resolved_ip_allowed_for_entries(loopback_v4, &[&wildcard_local, &exact_sub]),
+            "non-localhost domain or wildcard must not resolve to loopback"
+        );
+        assert!(
+            !is_resolved_ip_allowed_for_entries(mapped_loopback_v6, &[&wildcard_local, &exact_sub]),
+            "IPv4-mapped IPv6 loopback must also be rejected"
+        );
+        assert!(
+            is_resolved_ip_allowed_for_entries(loopback_v4, &[&exact_localhost]),
+            "exact localhost entry authorizes loopback"
+        );
+        assert!(
+            is_resolved_ip_allowed_for_entries(loopback_v4, &[&exact_loopback_ip]),
+            "exact 127.0.0.1 entry authorizes 127.0.0.1"
+        );
+        assert!(
+            !is_resolved_ip_allowed_for_entries(imds_v4, &[&domain_entry]),
+            "domain resolving to link-local IMDS must be rejected"
+        );
+        assert!(
+            is_resolved_ip_allowed_for_entries(imds_v4, &[&exact_imds_ip]),
+            "explicit link-local IP literal is allowed"
+        );
+        assert!(!is_resolved_ip_allowed_for_entries(
+            link_local_v6,
+            &[&domain_entry]
+        ));
+        assert!(!is_resolved_ip_allowed_for_entries(
+            unspec_v4,
+            &[&domain_entry]
+        ));
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_rejects_hostname_resolving_to_loopback_or_link_local_unless_explicit() {
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+
+        // Live proxy proof: `rebind.localhost:<port>` matches `*.localhost:<port>`
+        // in the allowlist, resolves to 127.0.0.1, and is rejected with 403 +
+        // denial record because neither `localhost` nor `127.0.0.1` was
+        // explicitly allowlisted.
+        let dir = tempfile::tempdir().unwrap();
+        let denial_file = dir.path().join("denials.jsonl");
+        let proxy = EgressProxy::start(
+            vec![format!("*.localhost:{echo_port}")],
+            denial_file.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(proxy.addr()).await.unwrap();
+        client
+            .write_all(format!("CONNECT rebind.localhost:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_response_head(&mut client).await;
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "domain resolving to loopback without explicit localhost/127.0.0.1 allowlist must get 403: {head}"
+        );
+        let denials = proxy.shutdown().await;
+        assert_eq!(
+            denials,
+            vec![EgressDenial {
+                host: "rebind.localhost".to_string(),
+                port: echo_port,
+            }]
         );
     }
 }

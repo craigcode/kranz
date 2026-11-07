@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: "Scoped in docs/scoping/acp-recovery-and-credential-lifecycle.md and implemented dead-owner Docker ledger recovery (acp_container::recover_dead_owner_ledgers) and one-way file-only credential renewal verification (AcpWorkerProfile::verify_credential_source) with synthetic recovery and rotation proofs."
 title: Qualify ACP crash recovery and credential renewal
 priority: 2
 schedule: once

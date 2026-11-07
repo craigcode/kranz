@@ -169,23 +169,37 @@ pub fn normalize_term(text: &str) -> String {
         .join(" ")
 }
 
+fn is_zero_width_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+    )
+}
+
 /// Split `text` into normalized tokens with the byte offset of each token's
 /// start in the ORIGINAL text (offsets feed the line-number lookup; the
-/// normalized form alone cannot locate a hit).
+/// normalized form alone cannot locate a hit). Zero-width format characters
+/// are ignored inside or around runs so zero-width insertion cannot split a
+/// denied token.
 fn tokens(text: &str) -> Vec<(String, usize)> {
     let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_alphanumeric() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-                i += 1;
-            }
-            out.push((text[start..i].to_ascii_lowercase(), start));
-        } else {
-            i += 1;
+    let mut cur = String::new();
+    let mut cur_start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if is_zero_width_format_char(ch) {
+            continue;
         }
+        if ch.is_ascii_alphanumeric() {
+            if cur.is_empty() {
+                cur_start = idx;
+            }
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            out.push((std::mem::take(&mut cur), cur_start));
+        }
+    }
+    if !cur.is_empty() {
+        out.push((cur, cur_start));
     }
     out
 }
@@ -400,16 +414,15 @@ fn scan_text(denylist: &Denylist, path: &str, text: &str, findings: &mut Vec<Dom
 /// fatal — the operator's own tree is the input, and one bad file must not
 /// silence the rest of it.
 pub fn lint_files(repo_root: &Path, paths: &[PathBuf], denylist: &Denylist) -> LintReport {
+    use std::io::Read as _;
     let mut report = LintReport::default();
     for path in paths {
         if is_excluded_path(path) {
             continue;
         }
         let full = repo_root.join(path);
-        // symlink_metadata + is_file: never read through a symlink — a
-        // checked-in link carries no lintable bytes of its own (scrub's
-        // posture, minus the no-follow machinery: this scanner walks the
-        // operator's checkout, not a worker-planted tree).
+        // symlink_metadata + is_file + open_read_nofollow: never read through
+        // a symlink and bound reads via take(MAX_FILE_BYTES + 1).
         let Ok(metadata) = std::fs::symlink_metadata(&full) else {
             report.files_skipped += 1;
             continue;
@@ -418,10 +431,20 @@ pub fn lint_files(repo_root: &Path, paths: &[PathBuf], denylist: &Denylist) -> L
             report.files_skipped += 1;
             continue;
         }
-        let Ok(bytes) = std::fs::read(&full) else {
+        let Ok(file) = crate::paths::open_read_nofollow(&full) else {
             report.files_skipped += 1;
             continue;
         };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || (bytes.len() as u64) > MAX_FILE_BYTES
+        {
+            report.files_skipped += 1;
+            continue;
+        }
         // Binary content is unlintable prose-wise; a NUL byte is the marker.
         if bytes.contains(&0) {
             report.files_skipped += 1;
@@ -655,5 +678,20 @@ mod tests {
             !denylist.hashes.contains(&synthetic),
             "synthetic test vocabulary must never seed the real config"
         );
+    }
+
+    #[test]
+    fn domain_lint_zero_width_format_chars_do_not_bypass_matching() {
+        let denylist = test_denylist();
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("zw.md");
+        std::fs::write(
+            dir.path().join(&path),
+            "line 1\nzz\u{200B} ac\u{200C}me li\u{200D}nt ca\u{FEFF}na\u{00AD}ry\n",
+        )
+        .unwrap();
+        let report = lint_files(dir.path(), &[path], &denylist);
+        assert_eq!(report.findings.len(), 1, "{report:?}");
+        assert_eq!(report.findings[0].line, 2);
     }
 }

@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-12
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,7 @@ verified_against:
   - crates/engine/src/command_exec.rs
   - crates/engine/src/contract_controls.rs
   - crates/engine/src/contract_controls/pair.rs
+  - crates/engine/src/contract_controls/readback.rs
   - crates/engine/src/contract_controls_pair_tests.rs
   - crates/engine/src/agent_env.rs
   - crates/engine/src/merge.rs
@@ -59,6 +60,14 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-07 (UTC): Reconciled the nine named terminal Docker proofs with upstream security and pane regressions. R5 remains open; recoverable terminal-budget receipts do not by themselves establish an attempt-level resource failure or real-adapter qualification.
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline: Ubuntu and macOS CI lanes run the non-vacuous `signal_injection_suite_test` gate proving nonced untrusted signal fences hold and `signal-proposal: unconsented` tickets refuse draft, approve, queue, and scheduling, while `commands.rs` adds `kranz signal` and `kranz draft --consent-signal`.
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: `contract_controls::readback` adds isolated model read-back and operator comparison disposition (`contract-readback:<assertion>`), and `test_capability` adds `KEYCHAIN` pre-flight coverage on `macos-14`.
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: validator report parsing requires a schema-matching JSON object, bounded gate process-group cleanup holds the leader until group signaling, and merge twin cleanup refuses symlinks. Gate contracts are unchanged.
 
 Rechecked 2026-10-12 (UTC): R4 adds three named Docker terminal proofs for expiry/retention and the child OOM hint, capacity before consent, and repeated polling plus independent pending controls. CI requires all nine terminal cases without skip markers. R5 still owns multi-minute builds and the remaining cancellation/exhaustion qualification.
 

@@ -47,6 +47,11 @@ fn notes_path(repo_root: &Path, slug: &str) -> PathBuf {
 /// bodies), and must not be empty. Returns the stored note.
 pub fn append_note(repo_root: &Path, slug: &str, author: &str, text: &str) -> Result<TicketNote> {
     Ticket::ensure_valid_slug(slug)?;
+    let author: String = author
+        .trim()
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect();
     let author = author.trim();
     if author.is_empty() {
         return Err(EngineError::Config(

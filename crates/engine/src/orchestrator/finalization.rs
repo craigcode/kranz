@@ -437,13 +437,14 @@ impl MissionEngine {
                 .with_rule_ids(rule_ids),
             });
         }
-        prepared_standard_reports.extend(self.judge_standards_rules(&contextual_rules).await?);
+        prepared_standard_reports
+            .extend(box_future(|| self.judge_standards_rules(&contextual_rules)).await?);
 
         let control_reports = if contract.iter().any(|a| a.negative_control.is_some()) {
             let repo = self.active_repo().clone();
             let paths = self.paths.clone();
             let assertions = contract.clone();
-            let config = self.state.config.clone();
+            let config = std::sync::Arc::new(self.state.config.clone());
             // Dropping the awaiting mission signals the admitted evaluator to
             // finish its bounded active case and stop before any further work.
             let cancellation = crate::contract_controls::CancellationGuard::default();
@@ -726,7 +727,7 @@ impl MissionEngine {
             .filter(|a| a.check == AssertionCheck::AgentJudgement)
             .collect();
         if !judgement.is_empty() {
-            findings.extend(self.judge_contract_assertions(&judgement).await?);
+            findings.extend(box_future(|| self.judge_contract_assertions(&judgement)).await?);
         }
 
         if !self.check_final_review_checkout(reviewed_checkout.as_ref())? {
@@ -734,8 +735,7 @@ impl MissionEngine {
         }
 
         if findings.is_empty() {
-            return self
-                .complete_mission(reviewed_checkout.as_ref())
+            return box_future(|| self.complete_mission(reviewed_checkout.as_ref()))
                 .await
                 .map(Some);
         }
@@ -797,10 +797,7 @@ impl MissionEngine {
             .map(|f| f.subject.clone())
             .collect();
         let all_findings = findings;
-        match self
-            .convert_findings(&last_milestone_id, &all_findings)
-            .await?
-        {
+        match box_future(|| self.convert_findings(&last_milestone_id, &all_findings)).await? {
             FindingsConversion::Escalate { escalations, text } => {
                 let subjects = escalations
                     .iter()
@@ -846,7 +843,7 @@ impl MissionEngine {
                 self.emit_waive_decision(&waived)?;
                 // Report AFTER the waive decision (so the gate waiver is in
                 // the replayed history) and BEFORE mission.completed.
-                self.complete_mission(reviewed_checkout.as_ref())
+                box_future(|| self.complete_mission(reviewed_checkout.as_ref()))
                     .await
                     .map(Some)
             }
@@ -1012,7 +1009,7 @@ impl MissionEngine {
         {
             return Ok(MissionStatus::Blocked);
         }
-        let lesson = self.prepare_lesson().await;
+        let lesson = box_future(|| self.prepare_lesson()).await;
         if !self.check_final_review_checkout(reviewed_checkout)? {
             return Ok(MissionStatus::Blocked);
         }
@@ -1033,7 +1030,7 @@ impl MissionEngine {
             None => self.emit_decision("no cross-mission lesson captured", None)?,
         }
         self.write_mission_report(lesson_paths);
-        if !Box::pin(self.external_completion_checks(None)).await? {
+        if !box_future(|| self.external_completion_checks(None)).await? {
             return Ok(MissionStatus::Blocked);
         }
         // Structured human questions (ticket

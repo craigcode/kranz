@@ -453,14 +453,32 @@ pub async fn cmd_draft(
     slug: &str,
     yes: bool,
     from_mission: Option<&str>,
+    consent_signal: bool,
     dangerously_allow_all: bool,
 ) -> Result<i32> {
-    if let Some(mission_id) = from_mission {
+    if consent_signal {
+        let res = kranz_engine::signals::proposal::consent_signal_proposal(
+            &repo,
+            slug,
+            "cli:operator",
+            from_mission,
+            None,
+        )
+        .with_context(|| format!("recording operator consent for signal proposal '{slug}'"))?;
+        println!(
+            "signal proposal '{}' ({}) consented by {}",
+            res.ticket_slug, res.signal_id, res.actor
+        );
+        if let Some(traced) = &res.confirmed_traced_mission {
+            println!("ticket '{}' traced from mission {traced}", res.ticket_slug);
+        }
+    } else if let Some(mission_id) = from_mission {
         Ticket::seed_traced_from_mission(&repo, slug, mission_id)
             .with_context(|| format!("seeding traced-from-mission on ticket '{slug}'"))?;
         println!("ticket '{slug}' traced from mission {mission_id}");
     }
     let ticket = load_ticket(&repo, slug)?;
+    ticket.ensure_signal_consented()?;
     let cfg = config_for_ticket(load_config(&repo, dangerously_allow_all)?, &ticket);
     let backend = build_backend(&cfg)?;
 

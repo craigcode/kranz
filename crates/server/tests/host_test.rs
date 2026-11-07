@@ -1326,10 +1326,13 @@ fn hosted_lifecycle_reaches_complete_without_a_terminal() {
     // equivalent arm64 macOS regression reproduces at 1 MiB; other platforms
     // retain the normal 2 MiB budget rather than inheriting that test constraint.
     //
-    // Headroom (arm64 macOS debug, 2026-10-11): passes at 709 KiB, overflows
-    // at 694 KiB. A synthetic 512-byte MissionConfig field raises the floor to
-    // about 818 KiB, so config bytes cost roughly 200x on this stack. Re-measure
-    // after growing MissionConfig/MissionState with KRANZ_HOSTED_STACK_KIB.
+    // Headroom (arm64 macOS debug, 2026-10-19, ticket mission-state-by-reference):
+    // passes at 240 KiB, overflows at 224 KiB (down from 736 KiB before moving
+    // selected configs to Arc, returning Result<()> from emit, guarding unredacted
+    // Event deserialization, and heap-pinning sub-futures via box_future). A
+    // synthetic 512-byte MissionConfig field raises the floor to 272 KiB (+32 KiB,
+    // down from +128 KiB). Re-measure with KRANZ_HOSTED_STACK_KIB when changing
+    // MissionConfig/MissionState or orchestrator async boundaries.
     let stack_bytes = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         1 << 20
     } else {

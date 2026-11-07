@@ -230,6 +230,10 @@ drain_native_one() {
                 echo "kranz-city-worker: bead $ID is '$STATUS'; abandoning stale native mission $MID"
                 ( cd "$RIG_DIR" && kranz abandon "$MID" --reason "Gas City bead $ID left in_progress before execution" >/dev/null 2>&1 ) || true
                 ( cd "$RIG_DIR" && kranz queue --remove "$MID" >/dev/null 2>&1 ) || true
+                if [ -e "$RIG_DIR/.kranz/missions/$MID/enqueue-source.json" ]; then
+                    mv -f "$RIG_DIR/.kranz/missions/$MID/enqueue-source.json" \
+                        "$RIG_DIR/.kranz/missions/$MID/enqueue-source.cancelled.json" 2>/dev/null || true
+                fi
                 return 0
                 ;;
         esac

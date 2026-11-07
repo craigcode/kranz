@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Relay listener bound exclusively to the owned internal network interface (kranz-egress) and isolated read-only toolchain cache root (KRANZ_CONTAINER_ISOLATED_CACHE_DIR) implemented and verified while preserving -v1 profile argv compatibility
 title: Qualify isolated ACP cache inputs and relay listener
 priority: 3
 schedule: once

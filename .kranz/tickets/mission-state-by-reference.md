@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "SelectedBackend holds Arc<MissionConfig>, emit returns Result<()> via #[inline(never)] emit_event, unredacted events skip EventKind::deserialize, and stage sub-futures construct inside #[inline(never)] box_future; hosted stack floor dropped from 736 KiB to 240 KiB (+512B config pad delta dropped from +128 KiB to +32 KiB)"
 title: Stop copying mission state by value on the hosted stack
 priority: 3
 schedule: once

@@ -4,7 +4,8 @@ This starts the third slice of the [shared ACP stream](shared-acp-client.md).
 The shared client extraction is PR #82; the implementing ticket is
 [acp-contained-terminal-provider](../../.kranz/tickets/acp-contained-terminal-provider.md).
 The contract now has a contained synthetic implementation and adversarial tests.
-Only a private test constructor enables it. Released profiles still advertise
+An explicit fixture constructor enables it for synthetic tests and the contained
+compatibility probe. It refuses released worker profiles, which still advertise
 `terminal: false`; this does not qualify Sgian or a real agent adapter.
 
 ## Wire boundary
@@ -198,3 +199,10 @@ proof and rejects skip markers. Pure contract and authority tests also cover
 changed arguments/environment/output limits, expired and consumed consent,
 foreign runs/sessions/generations, malformed schemas and UTF-8 tail boundaries.
 These are synthetic proofs without provider credentials or paid model calls.
+
+## Sgian pane observation and adapter terminal qualification seams
+
+- **Sgian pane observation (`kranz_acp::terminal::PaneBinding`, `PaneObservation`, `sgian::project_terminal_pane`):**
+  Sgian pane consumers receive read-only `PaneObservation` envelopes bound to `(run_id, engine_session_id, peer_session_id, generation, terminal_id, action_digest)`. Holding a `PaneBinding` never constructs a `TerminalProvider::Authority` or bypasses Kranz one-call consent. `PaneObservation::verify_against` and `sgian::project_terminal_pane` refuse stale generations after daemon/provider restarts, surface `Error::Unavailable` on `DaemonLost`, and surface `Error::CleanupUnconfirmed` whenever release or descendant cleanup is unconfirmed.
+- **Adapter client-terminal qualification (`acp_compat_probe` `Mode::TerminalOnce`):**
+  `crates/engine/examples/acp_compat_probe.rs` supports `mode: "terminal-once"` (`tool_fixture::TerminalEvidence`), verifying that a candidate adapter routes command execution through `terminal/create` -> `terminal/output`/`terminal/wait_for_exit` -> `terminal/release` with confirmed `terminalSessionCleanup`, and failing closed on any internal-execution bypass (native `execute` tool call or unrequested permission proposal without `terminalScope`). Released worker profiles keep `terminal: false` until a live provider run is separately operator-authorized.

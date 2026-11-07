@@ -969,8 +969,14 @@ pub(crate) fn authority_read_deny_dirs(inputs: &SandboxInputs) -> Vec<PathBuf> {
             .and_then(Path::parent)
         {
             dirs.push(kranz_dir.join("hook-status"));
+            dirs.push(kranz_dir.join("signals"));
         }
     }
+    dirs.push(
+        absolutize(&inputs.session_cwd)
+            .join(".kranz")
+            .join("signals"),
+    );
     if let Some(global) = crate::paths::global_kranz_dir() {
         dirs.extend([global.clone(), absolutize(&global)]);
     }
@@ -1107,7 +1113,7 @@ fn global_key_dirs() -> Vec<PathBuf> {
 /// explicitly (not only enumerated from the live directory) so the deny
 /// exists before the store does: a session that could CREATE
 /// `.kranz/queue/` would own the autoWork drain outright.
-const KRANZ_ENGINE_OWNED_DIRS: &[&str] = &["queue", "tickets", "lessons", "hook-status"];
+const KRANZ_ENGINE_OWNED_DIRS: &[&str] = &["queue", "tickets", "lessons", "hook-status", "signals"];
 
 /// Authority FILES that live directly under a `<repo>/.kranz` dir — the
 /// same four [`authority_read_deny_paths`] names, factored out so the
@@ -1466,6 +1472,70 @@ pub(crate) fn validate_git_config_protection(
             }
         }
     }
+    ensure_writable_git_metadata_subdirs(inputs)?;
+    Ok(())
+}
+
+/// Ensure `.git/hooks`, `.git/info`, and `.git/modules` exist as real
+/// directories (never symlinks or files) inside every writable Git metadata
+/// directory before mount/ACL setup, and verify that any existing ones in
+/// read-only Git metadata directories are real directories (2026-09-01
+/// adversarial audit, H4).
+///
+/// Mount-based sandboxes (bwrap, Docker/Podman) and Windows AppContainer
+/// skip non-existent paths when constructing read-only bind mounts or deny
+/// ACEs. A freshly initialized repository or worktree may lack `.git/hooks`,
+/// `.git/info`, or `.git/modules` at spawn time, leaving a contained worker
+/// free to `mkdir .git/hooks` inside its writable session mount and plant a
+/// `post-checkout` or `pre-commit` hook that executes on the host when the
+/// engine runs git. Pre-creating those three subdirectories inside writable
+/// Git metadata directories (and refusing symlinks or non-directories)
+/// ensures the read-only mount or deny ACE is always applied.
+pub(crate) fn ensure_writable_git_metadata_subdirs(
+    inputs: &SandboxInputs,
+) -> crate::error::Result<()> {
+    let writable = write_allowlist(inputs);
+    for git in git_metadata_dirs(&inputs.session_cwd) {
+        let Ok(git_meta) = std::fs::symlink_metadata(&git) else {
+            continue;
+        };
+        if !git_meta.file_type().is_dir() {
+            continue;
+        }
+        let git_abs = absolutize(&git);
+        let is_writable = writable.iter().any(|root| git_abs.starts_with(root));
+        for sub in ["hooks", "info", "modules"] {
+            let subdir = git.join(sub);
+            match std::fs::symlink_metadata(&subdir) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(crate::error::EngineError::Backend(format!(
+                        "cannot protect Git metadata directory through symlink {}; use a regular directory",
+                        subdir.display()
+                    )));
+                }
+                Ok(_) => {
+                    return Err(crate::error::EngineError::Backend(format!(
+                        "cannot protect Git metadata directory {}; expected a directory",
+                        subdir.display()
+                    )));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if is_writable {
+                        std::fs::create_dir_all(&subdir)?;
+                        let meta = std::fs::symlink_metadata(&subdir)?;
+                        if !meta.file_type().is_dir() {
+                            return Err(crate::error::EngineError::Backend(format!(
+                                "cannot protect Git metadata directory {}; expected a directory",
+                                subdir.display()
+                            )));
+                        }
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1473,6 +1543,133 @@ fn git_marker(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
         .map(|path| path.join(".git"))
         .find(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn is_safe_git_indirection_path(
+    path: &Path,
+    session_cwd: &Path,
+    writable: &[PathBuf],
+    expect_dir: bool,
+) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if expect_dir {
+        if !meta.file_type().is_dir() {
+            return false;
+        }
+    } else if !meta.file_type().is_file() {
+        return false;
+    }
+    let temp_dir = std::env::temp_dir();
+    for ancestor in path.ancestors() {
+        let Ok(anc_meta) = std::fs::symlink_metadata(ancestor) else {
+            return false;
+        };
+        if anc_meta.file_type().is_symlink() {
+            if ancestor == path {
+                return false;
+            }
+            let in_writable = writable.iter().any(|root| {
+                ancestor
+                    .parent()
+                    .map(absolutize)
+                    .map(|parent| parent.join(ancestor.file_name().unwrap_or_default()))
+                    .is_some_and(|candidate| candidate.starts_with(root))
+            });
+            let system_prefix = session_cwd.starts_with(ancestor) || temp_dir.starts_with(ancestor);
+            if in_writable || !system_prefix {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Resolve external Git metadata/common directories for a worktree session
+/// that lie outside `writable_roots`, refusing any symlink in the `.git`
+/// gitlink, `gitdir` target, `commondir` pointer, or resolved common `.git`
+/// directory (2026-09-01 adversarial audit, M8).
+///
+/// Container sandboxes only mount `session_cwd`, `mission_dir`, `tmpdir`, and
+/// `extra_write`. In worktree mode `<worktree>/.git` points to
+/// `<repo>/.git/worktrees/<wt>` (whose `commondir` points to `<repo>/.git`),
+/// which lies outside the mounted roots unless explicitly bound read-only.
+/// When `<git_dir>` is inside `<common_dir>`, only `<common_dir>` is returned
+/// so a single `:ro` mount covers both.
+pub(crate) fn external_git_common_dirs(
+    session_cwd: &Path,
+    writable_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let writable: Vec<PathBuf> = writable_roots.iter().map(|p| absolutize(p)).collect();
+    let Some(marker) = git_marker(session_cwd) else {
+        return Vec::new();
+    };
+    if !is_safe_git_indirection_path(&marker, session_cwd, &writable, false) {
+        return Vec::new();
+    }
+    let read = |path: &Path| {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| crate::paths::read_regular_file_bounded(file, 16384).ok())
+    };
+    let Some(link) = read(&marker) else {
+        return Vec::new();
+    };
+    let Some(raw_gitdir) = link.trim().strip_prefix("gitdir: ") else {
+        return Vec::new();
+    };
+    let base = marker.parent().expect("git marker has a parent");
+    let git_dir = normalize_lexical(&lexical_absolute(base).join(raw_gitdir.trim()));
+    if !is_safe_git_indirection_path(&git_dir, session_cwd, &writable, true) {
+        return Vec::new();
+    }
+    let mut candidate_dirs = vec![absolutize(&git_dir)];
+    let commondir_file = git_dir.join("commondir");
+    if std::fs::symlink_metadata(&commondir_file).is_ok() {
+        if !is_safe_git_indirection_path(&commondir_file, session_cwd, &writable, false) {
+            return Vec::new();
+        }
+        let Some(common_rel) = read(&commondir_file) else {
+            return Vec::new();
+        };
+        let common_dir = normalize_lexical(&git_dir.join(common_rel.trim()));
+        if !is_safe_git_indirection_path(&common_dir, session_cwd, &writable, true) {
+            return Vec::new();
+        }
+        candidate_dirs.push(absolutize(&common_dir));
+    }
+    let external: Vec<PathBuf> = candidate_dirs
+        .into_iter()
+        .filter(|dir| !writable.iter().any(|root| dir.starts_with(root)))
+        .collect();
+    let mut collapsed = Vec::new();
+    for dir in &external {
+        if external
+            .iter()
+            .any(|other| other != dir && dir.starts_with(other))
+        {
+            continue;
+        }
+        if !collapsed.contains(dir) {
+            collapsed.push(dir.clone());
+        }
+    }
+    collapsed
 }
 
 /// Follow only the two bounded Git indirection files to describe denies. The
@@ -1597,61 +1794,26 @@ pub(crate) struct ValidatorReadDenyEntry {
     pub is_dir: bool,
 }
 
-/// Top-level names a validator read-deny root ALWAYS keeps readable, because
-/// the validator's own machinery cannot work without them:
-///
-/// - `.git` — the shared git directory. The snapshot is a WORKTREE: its
-///   `.git` file points into `<root>/.git/worktrees/<n>`, and every
-///   `git log`/`diff`/`show` the scrutiny/inspection flow runs resolves
-///   objects and refs through the common dir. This is the narrow
-///   `.git` surface the ticket keeps: READABLE (the fold needs it), never
-///   writable (deny-default; a ref move is the tripwire's `for-each-ref`
-///   half). `.git/config` stays readable for the same reason git itself
-///   reads it — the same posture today's broad-read sandbox has.
-/// - `.kranz` — the mission dir lives here, and the validator's snapshot
-///   worktree sits under it (`<root>/.kranz/missions/<id>/runs/`). The
-///   engine-owned metadata inside stays write-denied
-///   ([`mission_write_denies`]) and the authority files read-denied
-///   ([`authority_read_deny_paths`]) exactly as for any session; the rest
-///   (tracked `workspace.json`, tickets) is content the snapshot already
-///   carries.
-const VALIDATOR_READ_DENY_CARVEOUTS: &[&str] = &[".git", ".kranz"];
-
 /// The validator read-deny set (ticket `validator-mandatory-containment`):
 /// every TOP-LEVEL entry of each [`SandboxInputs::validator_read_deny_roots`]
-/// root EXCEPT the [`VALIDATOR_READ_DENY_CARVEOUTS`]. Denying whole top-level
-/// entries covers the source tree without naming the root itself as a
-/// subpath (which would swallow the carved-out `.git`/`.kranz` beneath it —
-/// SBPL denies take precedence over every allow, so no allow could carve
-/// them back out).
-///
-/// Entries are classified by `std::fs::metadata` — which FOLLOWS symlinks —
-/// so a symlinked top-level dir is denied as a dir (and the canonical form
-/// emitted alongside covers the link TARGET, the same raw+canonical idiom
-/// [`authority_read_deny_paths`] uses; Seatbelt matches canonical paths).
-/// Entries whose metadata fails (a broken symlink, a racer's unlink) are
-/// skipped: a dangling link leaks nothing, and a vanished entry is gone.
-///
-/// The root ITSELF is not in this set: a literal deny on the root dir would
-/// block stat/readdir of it, and coreutils `mkdir -p` stats every ancestor
-/// of an absolute path — denying the root broke `mkdir -p` under the
-/// snapshot (probed 2026-08-04). The root's directory LISTING therefore
-/// stays readable on both tiers (names, never contents — the bwrap side
-/// cannot express a listing deny without masking the carve-outs anyway).
-///
-/// One documented residual gap, outside the threat model (validator code can
-/// create NOTHING at a deny root — writes there are deny-default): an entry
-/// created at a root AFTER profile generation is not in the set — the same
-/// spawn-time shape the bwrap authority masks already accept.
+/// root EXCEPT `.git` (always kept readable because the snapshot worktree's
+/// `.git` file resolves objects and refs through the shared `.git` dir) and,
+/// ONLY when `session_cwd` sits inside `<root>/.kranz`, `.kranz` (2026-09-01
+/// adversarial audit, L1). When the validator snapshot lies outside
+/// `<root>/.kranz`, `<root>/.kranz` is denied along with the rest of the
+/// real checkout.
 pub(crate) fn validator_read_deny_entries(inputs: &SandboxInputs) -> Vec<ValidatorReadDenyEntry> {
     let mut entries = std::collections::BTreeSet::new();
+    let session_cwd = absolutize(&inputs.session_cwd);
     for root in &inputs.validator_read_deny_roots {
         let Ok(read_dir) = std::fs::read_dir(root) else {
             continue;
         };
+        let kranz_carved_out = session_cwd.starts_with(absolutize(&root.join(".kranz")));
         for entry in read_dir.flatten() {
             let name = entry.file_name();
-            if VALIDATOR_READ_DENY_CARVEOUTS.contains(&name.to_string_lossy().as_ref()) {
+            let name_str = name.to_string_lossy();
+            if name_str == ".git" || (name_str == ".kranz" && kranz_carved_out) {
                 continue;
             }
             let path = entry.path();
@@ -2200,6 +2362,7 @@ pub fn bubblewrap_args(
         let node = node.display().to_string();
         out.extend(["--bind".to_string(), node.clone(), node]);
     }
+    ensure_writable_git_metadata_subdirs(inputs)?;
     let authority_writes = authority_write_denies(inputs);
     let git_writes = git_metadata_write_denies(inputs);
     let write_ro_binds: std::collections::BTreeSet<String> = authority_writes
@@ -5228,7 +5391,7 @@ mod tests {
         inputs.validator_read_deny_roots = Vec::new();
         let profile = generate_profile(&inputs);
         assert_eq!(
-            profile.matches("(deny file-read*").count(),
+            profile.matches("(deny file-read*\n").count(),
             1,
             "empty roots must leave the pre-containment profile shape alone:\n{profile}"
         );
@@ -5240,7 +5403,7 @@ mod tests {
             scratch.path(),
         ));
         assert_eq!(
-            profile.matches("(deny file-read*").count(),
+            profile.matches("(deny file-read*\n").count(),
             2,
             "the validator read-deny block must land when roots are set:\n{profile}"
         );
@@ -5899,6 +6062,145 @@ mod tests {
             git_log.status.success(),
             "read-only git must work in the snapshot: {}",
             String::from_utf8_lossy(&git_log.stderr)
+        );
+    }
+
+    #[test]
+    fn ensure_writable_git_metadata_subdirs_creates_absent_dirs_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = absolutize(dir.path());
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\nrepositoryformatversion = 0\n").unwrap();
+        let inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: root.clone(),
+            mission_dir: root.join(".kranz/missions/m-test"),
+            tmpdir: root.join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        assert!(!git.join("hooks").exists());
+        assert!(!git.join("info").exists());
+        assert!(!git.join("modules").exists());
+
+        ensure_writable_git_metadata_subdirs(&inputs).unwrap();
+        for sub in ["hooks", "info", "modules"] {
+            let meta = std::fs::symlink_metadata(git.join(sub)).unwrap();
+            assert!(meta.file_type().is_dir(), "{sub} must be a real directory");
+        }
+
+        // Replace `.git/hooks` with a regular file -> refused.
+        std::fs::remove_dir(git.join("hooks")).unwrap();
+        std::fs::write(git.join("hooks"), "not-a-dir").unwrap();
+        let err = ensure_writable_git_metadata_subdirs(&inputs).unwrap_err();
+        assert!(
+            err.to_string().contains("expected a directory"),
+            "unexpected error: {err}"
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(git.join("hooks")).unwrap();
+            let outside = root.join("outside-hooks");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, git.join("hooks")).unwrap();
+            let err = ensure_writable_git_metadata_subdirs(&inputs).unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn signals_dir_is_in_authority_read_and_write_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = absolutize(dir.path());
+        let mission_dir = root.join(".kranz/missions/m-sig");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        let session_cwd = root.join("wt");
+        std::fs::create_dir_all(&session_cwd).unwrap();
+        let inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: session_cwd.clone(),
+            mission_dir,
+            tmpdir: root.join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let read_dirs = authority_read_deny_dirs(&inputs);
+        assert!(
+            read_dirs.contains(&root.join(".kranz/signals")),
+            "repo .kranz/signals must be read-denied: {read_dirs:?}"
+        );
+        assert!(
+            read_dirs.contains(&session_cwd.join(".kranz/signals")),
+            "session_cwd .kranz/signals must be read-denied: {read_dirs:?}"
+        );
+        let write_denies = authority_write_denies(&inputs);
+        assert!(
+            write_denies.dirs.contains(&root.join(".kranz/signals")),
+            "repo .kranz/signals must be write-denied: {:?}",
+            write_denies.dirs
+        );
+        assert!(
+            write_denies
+                .dirs
+                .contains(&session_cwd.join(".kranz/signals")),
+            "session_cwd .kranz/signals must be write-denied: {:?}",
+            write_denies.dirs
+        );
+    }
+
+    #[test]
+    fn validator_read_deny_entries_denies_kranz_when_snapshot_is_outside_kranz() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = absolutize(dir.path()).join("repo");
+        let external_snap = absolutize(dir.path()).join("external-snap");
+        let internal_snap = root.join(".kranz/missions/m-1/runs/internal-snap");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&internal_snap).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&external_snap).unwrap();
+
+        let inside_inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: internal_snap,
+            mission_dir: root.join(".kranz/missions/m-1"),
+            tmpdir: absolutize(dir.path()).join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: vec![root.clone()],
+        };
+        let inside_entries = validator_read_deny_entries(&inside_inputs);
+        assert!(
+            !inside_entries.iter().any(|e| e.path == root.join(".kranz")),
+            ".kranz must stay carved out when session_cwd is inside <root>/.kranz"
+        );
+
+        let outside_inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: external_snap,
+            mission_dir: root.join(".kranz/missions/m-1"),
+            tmpdir: absolutize(dir.path()).join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: vec![root.clone()],
+        };
+        let outside_entries = validator_read_deny_entries(&outside_inputs);
+        assert!(
+            outside_entries.contains(&ValidatorReadDenyEntry {
+                path: root.join(".kranz"),
+                is_dir: true,
+            }),
+            ".kranz must be read-denied when session_cwd is outside <root>/.kranz: {outside_entries:?}"
+        );
+        assert!(
+            !outside_entries.iter().any(|e| e.path == root.join(".git")),
+            ".git must remain carved out for git object/ref resolution"
         );
     }
 }

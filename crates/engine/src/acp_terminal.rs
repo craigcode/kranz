@@ -975,4 +975,64 @@ mod tests {
         );
         assert_eq!(provider.registry.lock().unwrap().creations, 0);
     }
+    #[test]
+    fn terminal_budget_classification_requires_confirmed_exhaustion_and_surfaces_message() {
+        use crate::acp_resources::{
+            ContainerState, Counters, FailureClass, ResourceEvidence, Sample,
+        };
+        let now = chrono::Utc::now();
+        let mut evidence = ResourceEvidence {
+            container_id: "a".repeat(64),
+            image: FIXTURE_IMAGE.into(),
+            supervisor_sha256: "b".repeat(64),
+            owner: "c".repeat(32),
+            limits: crate::acp_worker::Resources {
+                memory_mib: 256,
+                cpu_millis: 1_000,
+                pids: 64,
+                nofile: 256,
+                fsize_mib: 64,
+                tmpfs_mib: 64,
+                session_seconds: 600,
+            },
+            observation_started_at: now,
+            observation_finished_at: now,
+            namespace_cleanup_confirmed: true,
+            state: Some(ContainerState {
+                running: false,
+                oom_killed: false,
+                exit_code: 1,
+            }),
+            sample: Some(Sample {
+                owner: "c".repeat(32),
+                elapsed_ms: 100,
+                complete: true,
+                wall_clock_expired: false,
+                baseline: Counters {
+                    oom_kill: Some(0),
+                    pids_max: Some(0),
+                    throttled_usec: Some(0),
+                },
+                current: Counters {
+                    oom_kill: Some(0),
+                    pids_max: Some(0),
+                    throttled_usec: Some(0),
+                },
+                usage: None,
+            }),
+            unavailable: Vec::new(),
+            failure: None,
+        };
+        evidence.classify_with_terminal_budget(true, true);
+        assert_eq!(evidence.failure, Some(FailureClass::TerminalBudget));
+        assert!(evidence
+            .failure_message()
+            .unwrap()
+            .contains("ACP terminal budget exhaustion observed"));
+
+        // Concurrent memory OOM + terminal budget hit stays Other rather than guessing one cause.
+        evidence.state.as_mut().unwrap().oom_killed = true;
+        evidence.classify_with_terminal_budget(true, true);
+        assert_eq!(evidence.failure, Some(FailureClass::Other));
+    }
 }

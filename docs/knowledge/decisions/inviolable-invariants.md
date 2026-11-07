@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-10-12
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,14 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-07 (UTC): Reconciled ACP R4 with current main: exact-action authority, environment clearing, owned cleanup and pre-credential v2 host admission remain enforced. Terminal expiry is recoverable only after confirmed cleanup. The public compatibility-probe constructor still refuses released worker profiles.
+
+Rechecked 2026-11-02 (UTC) against the signal intake pipeline: `.kranz/signals/` is both read-denied and write-denied across sandboxed sessions and permission profiles, its append-only ledger uses domain-separated HMAC sealing (`kranz.signal-ledger.v1`) and an out-of-repo high-water mark, and `/api/hooks/sentry` joins `/api/hooks/github` as an independently HMAC-authenticated webhook route that creates only undrafted `signal-proposal: unconsented` tickets. All documented invariants hold unchanged.
+
+Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: read-back sessions run in an isolated scratch directory with all file/shell/search tools disabled and receive only `command` and `checkerFiles`. All documented invariants hold unchanged.
+
+Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: Git tag/config/network guards, sandbox authority masks, validator snapshot nofollow checks, and credential scrubbing were tightened. All documented invariants hold unchanged.
 
 Rechecked 2026-10-12 (UTC): R4 keeps exact one-use terminal authority and owned-namespace execution. Capacity is reserved before consent; controls have separate bounded accounting. Command/retention expiry is recoverable only with confirmed cleanup. Production terminal capability and the qualified 600-second v2 session ceiling stay unchanged.
 
@@ -300,7 +308,7 @@ untouched (AGENTS.md rules 1–3).
   boundary assumes a trusted host/daemon, not hostile Docker tenants.
 - **Authority material is write-denied, not only read-denied**: every path the
   read deny names, plus `<repo>/.kranz`'s engine-owned stores (`queue/`,
-  `tickets/`, `lessons/`, `hook-status/`), every SIBLING mission dir, the
+  `tickets/`, `lessons/`, `hook-status/`, `signals/`), every SIBLING mission dir, the
   global key and seal dirs, and the session cwd's `.git` config-and-hook
   surface. Seatbelt also seals the direct children of `<repo>/.kranz` and
   `.kranz/missions` and denies the operator's own tty read, write and ioctl;

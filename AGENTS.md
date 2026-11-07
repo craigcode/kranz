@@ -7,6 +7,9 @@ here — read it before making changes.
 
 ## Layout
 
+Start at `docs/knowledge/index.md` for the reviewed knowledge map, and
+`docs/README.md` for the rest of `docs/`.
+
 - `crates/engine` — the mission engine: orchestrator, agent backends
   (`backend_claude`, `backend_codex`, `backend_droid`), runner, config,
   gates, append-only event log, worktree isolation, filtering egress proxy
@@ -14,7 +17,11 @@ here — read it before making changes.
 - `crates/cli` — the `kranz` binary (draft/queue/work/serve/exec/abandon).
 - `crates/server` — REST + WebSocket host (`kranz serve`), the MissionHost.
 - `crates/slack` — the Slack bridge (socket-mode).
+- `crates/acp` — ACP client crate (see its README).
 - `apps/dashboard` — React/Vite (+ Tauri) Mission Control UI.
+- `apps/landing` — landing site. `apps/even-g2` — experimental glasses client.
+- `packaging/` — homebrew, release and gascity pack. `scripts/` — CI and audit helpers.
+- `.kranz/lessons/` — per-mission lessons.
 - `docs/scoping/` — design docs; each carries flagged **D-X operator
   decisions**. `docs/roadmap.md` — milestones. `.kranz/tickets/` — backlog.
 
@@ -54,20 +61,8 @@ kranz work                      # drain the queue (run missions)
    its raw exit code.
 3. **Run `cargo fmt --all` before finishing.** A skipped fmt has cost full
    respawns; CI gates `cargo fmt --check`.
-4. **kranz never pushes by default.** Mission execution and gated merge only
-   advance local refs / merge `--no-ff`; a human pushes reviewed work. The sole
-   exception is the human-invoked cloud handoff `kranz exec --push <REMOTE>`:
-   it may push one completed `kranz/*` branch to an already-configured remote,
-   never a base branch, tag, refspec, force, or merge. No other push path is
-   permitted.
-5. **When committing alongside in-flight subagents, stage by exact file
-   list.** Three times in one week a scoped fix swept a subagent's
-   uncommitted edits into a commit WITHOUT the rest of its feature
-   (4115a9b, 475ecb8, 5c30396) — CI red on every platform until the
-   completing commit. Before `git add`, check `git status` for files the
-   agent also touched, and either include its whole change set or leave
-   its files alone. Never `git add` a file an in-flight agent has also
-   edited on its own.
+4. **kranz never pushes by default.** A human pushes reviewed work; the only
+   exception is the human-invoked `kranz exec --push`. See docs/knowledge/decisions/inviolable-invariants.md.
 5. **Anti-vacuity in contract commands:** write test-gate checks as
    `cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'`.
    The `[1-9]` guards against a filter that matches **zero** tests passing
@@ -77,87 +72,35 @@ kranz work                      # drain the queue (run missions)
    zero implementation). Grep existing test names for your substring before
    shipping the contract; match ONLY the not-yet-written test (or use
    `--exact`).
-6. **Contract files are additive-only:** `crates/engine/src/events.rs` and
-   `types.rs` define the event schema and persisted state. Add fields
-   (`#[serde(default)]`); never break old logs/configs. Schema changes are a
-   deliberate `contractChangeRequest`.
-7. **Worktree isolation:** in worktree mode, workers run in dedicated git
-   worktrees; the **primary checkout must stay byte-untouched** across a
-   mission. Never check out the mission branch in, or commit to, the primary
-   tree from run()/approve/validation.
-8. **A mission must deliver:** a run whose diff against the pinned `base_sha`
-   has zero feature commits FAILS honestly — never COMPLETE on an empty
-   deliverable. Don't defeat that gate.
+6. **Contract files are additive-only:** `events.rs` and `types.rs` only gain
+   `#[serde(default)]` fields; schema changes are a `contractChangeRequest`.
+   See docs/knowledge/decisions/inviolable-invariants.md.
+7. **Worktree isolation:** the primary checkout stays byte-untouched across a
+   mission. See docs/knowledge/decisions/inviolable-invariants.md.
+8. **A mission must deliver:** a zero-commit diff against `base_sha` FAILS;
+   never defeat that gate. See docs/knowledge/decisions/inviolable-invariants.md.
 9. **Match the surrounding code** — comment density, naming, idiom. New
    abstractions earn their keep only on the third use.
 10. **Children are hostile by default (2026-07-28 hardening):** every
-    prompt-injectable child spawns `env_clear`d (`agent_env.rs`) — never
-    reintroduce ambient inheritance; the sanctioned credential channels are
-    `contractEnvPassthrough` (contract commands) and the workspace contract's
-    `secrets` (bootstrap/data hooks). Enforced sandboxes are honored by the native claude backend and the two
-    explicit ACP worker profiles (docs/acp-containment.md). ACP profiles pin
-    image, startup and selected file credentials; generic ACP commands and all
-    other unsupported pairs remain refused. Do not widen without proof. `serve.token` is mutation authority, `serve.read.token`
-    reads only; both must stay unreadable inside sandboxes
-    (`authority_read_deny_paths`). Engine-run gates (validation-round,
-    final-gate, and merge-gate commands) also execute worker-authored code:
-    they run WRAPPED in the resolved worker sandbox profile when
-    `sandbox.enforce != off` (`command_exec::GateSandbox`,
-    `run_bounded_gate_command_sandboxed`); `off` keeps the env-only posture
-    byte-for-byte. The gate wrap's supervision policy is gate-SPECIFIC
-    (ticket gate-sandbox-supervision-dogfood, `gate_profile_extras`):
-    `(allow signal (target same-sandbox))` lets a wrapped gate signal its
-    OWN descendant tree (never host processes) so `cargo test --workspace`
-    runs green as a wrapped contract command — the session profile
-    generator stays untouched, and what no sandbox can host (setuid
-    `/bin/ps` exec, nested `sandbox_apply`) skips with the detectable
-    `SKIP-UNDER-WRAP` marker, held green by the `rust-macos-wrapped-suite`
-    CI job. Validators never see the real checkout:
-    each session runs in a throwaway snapshot (`validator_snapshot.rs`,
-    warmed `target/` copy included) and only its verdict crosses back — and
-    the snapshot is separation, not containment, so validator sessions are
-    ADDITIONALLY wrapped regardless of `sandbox.enforce`
-    (`sandbox::resolve_validator_containment`): the snapshot is the sole
-    writable root, the real checkout's source tree is read-denied, and the
-    shared `.git` is readable but write-denied; uncontainable
-    platforms/backends FAIL CLOSED by default (14th-pass reversal of the
-    224fa73 loud-degrade decision — the degrade reopens the
-    modify→use→restore path; `validatorAllowUncontainedDegrade` in
-    `.kranz/config.json` is the explicit per-repo opt-in back to the loud
-    per-round degrade). The `validator.tamper` fingerprint on the real checkout is
-    the tripwire (defense-in-depth) whose drift means the isolation itself
-    failed.
+    prompt-injectable child spawns `env_clear`d (`agent_env.rs`); never
+    reintroduce ambient inheritance. Credentials reach children only via
+    `contractEnvPassthrough` and workspace `secrets`. `serve.token` and
+    `serve.read.token` must stay unreadable inside sandboxes. Gates and
+    validators run wrapped and fail closed. Full detail, including
+    `SKIP-UNDER-WRAP` and the gate signal policy:
+    [docs/knowledge/validation/child-containment.md](docs/knowledge/validation/child-containment.md).
+    Read it and docs/acp-containment.md before widening anything.
+11. **When committing alongside in-flight subagents, stage by exact file
+    list.** Before `git add`, check `git status` for files an agent also
+    touched; include its whole change set or leave its files alone. Never use
+    `git add -u` or `-A` unless `git status` shows only your own changes: the
+    operator keeps live uncommitted doc edits in this tree.
 
 ## Tracked vs runtime
 
-Committed: `.kranz/merge-gates.json`, `.kranz/workspace.json` (workspace
-contract, validated at draft/approve; `crates/engine/src/workspace_contract.rs`),
-`.kranz/routing-rules.json` (routing rules, base-branch-owned, validated at
-draft/approve; `crates/engine/src/routing_rules.rs`, docs/routing-rules.md),
-`.kranz/tickets/<slug>.md`, `.kranz/tickets/<slug>.notes.jsonl` (append-only
-discussion sidecar, D-BW-3; `crates/engine/src/ticket_notes.rs`),
-`.kranz/domain-denylist.json` + `.kranz/domain-allowlist` (clean-room lint
-policy — salted hashes and reviewed waiver fingerprints only, never readable
-terms; `crates/engine/src/domain_lint.rs`, docs/domain-lint.md), and each
-mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
-(never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
-`missions/*/workspace/` (container-provider compose files),
-`.kranz/config.json`, `serve.token`, `serve.read.token`,
-`.kranz/missions/*/enqueue-source*.json` (external-producer ownership and
-returned receipts),
-`.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`,
-`.kranz/hook-status/` (ephemeral hook-signal projection — registrations +
-latest signal per run; `crates/engine/src/hook_status.rs`).
-Ticket lifecycle state is committed in the ticket .md itself: the additive
-`state:` frontmatter key (`open` default; terminal `done`/`superseded`/
-`wontfix`, optional `state-note:`) is the single source of truth — the
-gitignored `.status` sidecar is a write-through cache of it (frontmatter
-wins on conflict, logged; absent key = sidecar governs as before). Reads
-resolve via `Ticket::read_state`; lifecycle writes go through
-`Ticket::write_lifecycle` (both files); `kranz ticket migrate-state`
-(dry-run, `--yes` to apply) folds existing terminal sidecars into
-frontmatter, skipping git-dirty tickets by name
-(`crates/engine/src/migrate_state.rs`).
+Never commit `events.jsonl`, `state.json`, `runs/`, `control/`,
+`.kranz/config.json` or the serve tokens. Full tracked vs runtime list and
+ticket lifecycle state: [docs/knowledge/operations/tracked-vs-runtime.md](docs/knowledge/operations/tracked-vs-runtime.md).
 
 ## Public documentation boundary
 

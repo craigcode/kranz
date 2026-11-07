@@ -49,6 +49,7 @@ function ListSection({ title, items }: { title: string; items: string[] }) {
 export function TicketDetail({ slug }: { slug: string }) {
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [selectedTracedMission, setSelectedTracedMission] = useState<string>('');
 
   const loadTickets = useKranzStore((s) => s.loadTickets);
   const ticketError = useKranzStore((s) => s.ticketError);
@@ -65,7 +66,10 @@ export function TicketDetail({ slug }: { slug: string }) {
     setLoadError(null);
     api
       .ticket(slug)
-      .then(setTicket)
+      .then((t) => {
+        setTicket(t);
+        setSelectedTracedMission(t.tracedFromMission ?? '');
+      })
       .catch((err: unknown) => setLoadError(err instanceof Error ? err.message : String(err)));
   };
 
@@ -157,6 +161,46 @@ export function TicketDetail({ slug }: { slug: string }) {
             </div>
           </div>
         )}
+        {(ticket.signal != null || ticket.signalProposal != null) && (
+          <div className="ticket-section" data-testid="signal-proposal-section">
+            <div className="section-label">Signal proposal</div>
+            {ticket.signal != null && (
+              <div>
+                <span className="dim">signal </span>
+                <code>{ticket.signal}</code>
+              </div>
+            )}
+            <div>
+              <span className="dim">consent </span>
+              <code>{ticket.signalProposal ?? 'consented'}</code>
+            </div>
+            {ticket.tracedFromMission != null && (
+              <div>
+                <span className="dim">traced from mission </span>
+                <code>{ticket.tracedFromMission}</code>
+              </div>
+            )}
+            {ticket.signalCandidates != null && ticket.signalCandidates.length > 0 && (
+              <div>
+                <label>
+                  <span className="dim">Confirm traced-from-mission </span>
+                  <select
+                    aria-label="Confirm traced-from-mission"
+                    value={selectedTracedMission}
+                    onChange={(e) => setSelectedTracedMission(e.target.value)}
+                  >
+                    <option value="">None (unconfirmed)</option>
+                    {ticket.signalCandidates.map((cand) => (
+                      <option key={cand} value={cand}>
+                        {cand}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
+          </div>
+        )}
         <ListSection title="Needs context" items={ticket.needsContext} />
         {ticket.wrongPlan !== null && (
           <div className="ticket-section">
@@ -176,7 +220,18 @@ export function TicketDetail({ slug }: { slug: string }) {
             type="button"
             className="btn-small"
             disabled={ticketBusy}
-            onClick={() => void draftTicket(slug)}
+            onClick={() => {
+              const isSignal = ticket.signal != null || ticket.signalProposal != null;
+              const traced = selectedTracedMission.trim();
+              if (isSignal || traced !== '') {
+                void draftTicket(slug, {
+                  consentSignal: isSignal ? true : undefined,
+                  tracedFromMission: traced !== '' ? traced : undefined,
+                });
+              } else {
+                void draftTicket(slug);
+              }
+            }}
           >
             Draft
           </button>

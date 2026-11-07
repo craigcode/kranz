@@ -692,37 +692,41 @@ pub(crate) async fn mission_events(
 /// `GET /api/missions/:id/plan` — contents of plan.json; 404 until the plan
 /// has been approved (i.e. the file exists).
 pub(crate) async fn mission_plan(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    crate::read_work::run(move || {
-        let paths = mission_paths(&server, &id)?;
-        let content = read_file_or_404_sync(
-            &paths.plan_file(),
-            format!("mission '{id}' has no approved plan yet"),
-        )?;
-        let plan: Value = serde_json::from_str(&content)
-            .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
-        Ok(Json(plan))
-    })
-    .await
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            let content = read_file_or_404_sync(
+                &paths.plan_file(),
+                format!("mission '{id}' has no approved plan yet"),
+            )?;
+            let plan: Value = serde_json::from_str(&content)
+                .map_err(|e| ApiError::internal(format!("plan.json is not valid JSON: {e}")))?;
+            Ok(Json(plan))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/plan.md` — rendered plan markdown; 404 until
 /// plan.md has been written (alongside plan.json, at approval time).
 pub(crate) async fn mission_plan_md(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    crate::read_work::run(move || {
-        let paths = mission_paths(&server, &id)?;
-        let markdown = read_file_or_404_sync(
-            &paths.plan_md_file(),
-            format!("mission '{id}' has no approved plan yet"),
-        )?;
-        Ok(Json(json!({ "markdown": markdown })))
-    })
-    .await
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            let markdown = read_file_or_404_sync(
+                &paths.plan_md_file(),
+                format!("mission '{id}' has no approved plan yet"),
+            )?;
+            Ok(Json(json!({ "markdown": markdown })))
+        })
+        .await
 }
 
 /// `GET /api/missions/:id/revision-diff` — pending revision review artifact.
@@ -987,27 +991,29 @@ pub(crate) async fn mission_hook_status(
 /// `GET /api/missions/:id/runs/:runId/transcript` — the run's JSONL parsed
 /// into a JSON array of raw stream values; 404 if the file is missing.
 pub(crate) async fn run_transcript(
+    Extension(reads): Extension<ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath((id, run_id)): UrlPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    crate::read_work::run(move || {
-        let paths = mission_paths(&server, &id)?;
-        if !safe_id(&run_id) {
-            return Err(ApiError::not_found(format!("unknown run '{run_id}'")));
-        }
-        let content = read_file_or_404_sync(
-            &paths.transcript_file(&run_id),
-            format!("no transcript for run '{run_id}'"),
-        )?;
-        // Tolerate torn/garbage lines (a live transcript may end mid-write).
-        let values: Vec<Value> = content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        Ok(Json(Value::Array(values)))
-    })
-    .await
+    reads
+        .run(move || {
+            let paths = mission_paths(&server, &id)?;
+            if !safe_id(&run_id) {
+                return Err(ApiError::not_found(format!("unknown run '{run_id}'")));
+            }
+            let content = read_file_or_404_sync(
+                &paths.transcript_file(&run_id),
+                format!("no transcript for run '{run_id}'"),
+            )?;
+            // Tolerate torn/garbage lines (a live transcript may end mid-write).
+            let values: Vec<Value> = content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            Ok(Json(Value::Array(values)))
+        })
+        .await
 }
 
 /// `POST /api/missions/:id/control` — enqueue a [`ControlCommand`] into the
@@ -1457,7 +1463,9 @@ async fn read_file_or_404(
 ) -> Result<String, ApiError> {
     let path = path.to_path_buf();
     let missing = not_found_msg();
-    crate::read_work::run(move || read_file_or_404_sync(&path, missing)).await
+    ReadWork::default()
+        .run(move || read_file_or_404_sync(&path, missing))
+        .await
 }
 
 fn read_file_or_404_sync(path: &Path, missing: String) -> Result<String, ApiError> {

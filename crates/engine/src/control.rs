@@ -252,6 +252,12 @@ pub fn drain(paths: &MissionPaths) -> Result<Vec<(PathBuf, ControlCommand)>> {
         let path = paths.control_dir().join(&name);
         let content = match read_control_file(&control_dir, &name) {
             Ok(c) => c,
+            Err(EngineError::Io(ref io_err))
+                if io_err.kind() == std::io::ErrorKind::InvalidData =>
+            {
+                quarantine(&control_dir, &name, &path, &io_err.to_string());
+                continue;
+            }
             Err(e) => {
                 // Transient (e.g. racing another drain); skip, never block.
                 tracing::warn!(path = %path.display(), error = %e, "unreadable control file, skipping");
@@ -435,16 +441,18 @@ fn queued_files(dir: &cap_std::fs::Dir) -> Result<Vec<OsString>> {
     Ok(files)
 }
 
+const MAX_CONTROL_FILE_BYTES: u64 = 64 * 1024;
+
 fn read_control_file(dir: &cap_std::fs::Dir, name: &OsStr) -> Result<String> {
     use cap_fs_ext::OpenOptionsFollowExt as _;
     use cap_primitives::fs::FollowSymlinks;
-    use std::io::Read;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let mut file = dir.open_with(name, &options)?.into_std();
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    let file = dir.open_with(name, &options)?.into_std();
+    Ok(crate::paths::read_regular_file_bounded(
+        file,
+        MAX_CONTROL_FILE_BYTES,
+    )?)
 }
 
 /// Rename an unparseable or inauthentic command file to `<name>.bad` so it

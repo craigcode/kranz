@@ -139,6 +139,8 @@ pub struct ContainerWorkspace {
     /// back from the runtime after the service came up — previews substitute
     /// only these ports (never fabricated).
     pub assigned_ports: Vec<(String, u16)>,
+    /// Two-party consented secret names (`contract.secrets` ∩ `gate_env.passthrough`).
+    pub consented_secrets: Vec<String>,
 }
 
 /// What runtime detection sees — the production hook is the host's real
@@ -170,6 +172,35 @@ impl RuntimeHooks {
     }
 }
 
+fn resolve_present_secrets(consented_secrets: &[String]) -> Vec<(String, String)> {
+    consented_secrets
+        .iter()
+        .filter_map(|name| {
+            let value = std::env::var(name).ok().filter(|v| !v.is_empty())?;
+            Some((name.clone(), value))
+        })
+        .collect()
+}
+
+fn extract_exec_secret_env(args: &[String]) -> Vec<(String, String)> {
+    let Some(exec_idx) = args.iter().position(|arg| arg == "exec") else {
+        return Vec::new();
+    };
+    let mut i = exec_idx + 1;
+    if args.get(i).map(String::as_str) == Some("-T") {
+        i += 1;
+    }
+    let mut names = Vec::new();
+    while args.get(i).map(String::as_str) == Some("-e") {
+        let Some(name) = args.get(i + 1) else {
+            break;
+        };
+        names.push(name.clone());
+        i += 2;
+    }
+    resolve_present_secrets(&names)
+}
+
 /// Bounded argv spawn with a combined-output tail — the production `run`
 /// hook. Reuses the shared `command_exec` runner (timeout kill discipline)
 /// rather than open-coding a spawn.
@@ -177,7 +208,9 @@ fn spawn_bounded(argv: &[String], timeout: Duration) -> (Option<i32>, String) {
     let Some((program, args)) = argv.split_first() else {
         return (None, "empty argv".to_string());
     };
-    match crate::command_exec::run_with_timeout(Path::new(program), args, timeout) {
+    let secret_env = extract_exec_secret_env(args);
+    match crate::command_exec::run_with_timeout_env(Path::new(program), args, &secret_env, timeout)
+    {
         Some(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -290,22 +323,31 @@ fn compose_argv(
     argv
 }
 
-/// `<compose argv> exec -T <service> sh -c <command>` — the command goes in
-/// as ONE argv entry (no host shell re-parsing); the container's `sh` gets
-/// it verbatim, exactly like the host gate hands commands to `sh -c`.
+/// `<compose argv> exec -T [-e <NAME> ...] <service> sh -c <command>` — the
+/// command goes in as ONE argv entry (no host shell re-parsing); the
+/// container's `sh` gets it verbatim, and consented secrets present in the
+/// host environment are forwarded by name via `-e <NAME>` without writing
+/// secret values into `compose.json` on disk.
 fn exec_argv(
     runtime: ContainerRuntime,
     project: &str,
     compose_file: &Path,
     service: &str,
     command: &str,
+    consented_secrets: &[String],
 ) -> Vec<String> {
-    compose_argv(
-        runtime,
-        project,
-        compose_file,
-        &["exec", "-T", service, "sh", "-c", command],
-    )
+    let mut argv = compose_argv(runtime, project, compose_file, &["exec", "-T"]);
+    for (name, _) in resolve_present_secrets(consented_secrets) {
+        argv.push("-e".to_string());
+        argv.push(name);
+    }
+    argv.extend([
+        service.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]);
+    argv
 }
 
 /// How a runtime invocation ended, for error messages (`Some(n)` a real
@@ -562,6 +604,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                     &compose_file,
                     &service.name,
                     health_check,
+                    &[],
                 );
                 let (code, _tail) = self.run_argv(&argv, HEALTH_EXEC_TIMEOUT).await;
                 if code == Some(0) {
@@ -613,6 +656,9 @@ impl WorkspaceProvider for LocalContainerProvider {
             assigned_ports.push((service.name.clone(), port));
         }
 
+        let consented_secrets =
+            crate::workspace_gate::two_party_secrets(&contract.secrets, &spec.gate_env.passthrough);
+
         Ok(WorkspaceHandle {
             cwd: spec.repo_root.clone(),
             env,
@@ -624,6 +670,7 @@ impl WorkspaceProvider for LocalContainerProvider {
                 project,
                 compose_file,
                 assigned_ports,
+                consented_secrets,
             }),
             remote: None,
             gate_env: spec.gate_env.clone(),
@@ -751,6 +798,7 @@ impl WorkspaceProvider for LocalContainerProvider {
             &workspace.compose_file,
             WORKSPACE_SERVICE,
             command,
+            &workspace.consented_secrets,
         );
         let (code, output_tail) = self.run_argv(&argv, EXEC_TIMEOUT).await;
         crate::workspace_data::hook_outcome(hook, command, code, output_tail, progress)
@@ -878,6 +926,7 @@ impl LocalContainerProvider {
                 &workspace.compose_file,
                 WORKSPACE_SERVICE,
                 command,
+                &workspace.consented_secrets,
             );
             let (code, output_tail) = self.run_argv(&argv, EXEC_TIMEOUT).await;
             let outcome = CommandOutcome {
@@ -999,8 +1048,8 @@ mod tests {
                 "up" | "stop" | "down" | "ps" => (Some(0), String::new()),
                 "port" => (Some(0), "0.0.0.0:32768\n".to_string()),
                 "exec" => {
-                    // rest = ["exec", "-T", service, "sh", "-c", command]
-                    let command = rest[5];
+                    // rest = ["exec", "-T", ("-e", NAME)*, service, "sh", "-c", command]
+                    let command = rest.last().copied().unwrap_or("");
                     if let Some(needle) = &self.fail_exec_containing {
                         if command.contains(needle.as_str()) {
                             return (Some(3), format!("boom running `{command}`"));
@@ -1031,8 +1080,8 @@ mod tests {
         fn execed(&self, service: &str, command: &str) -> bool {
             self.calls().iter().any(|argv| {
                 let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-                args.windows(6)
-                    .any(|w| w == ["exec", "-T", service, "sh", "-c", command])
+                args.contains(&"exec")
+                    && args.windows(4).any(|w| w == [service, "sh", "-c", command])
             })
         }
     }
@@ -1775,6 +1824,93 @@ mod tests {
                     && String::from_utf8_lossy(&output.stdout).trim().is_empty(),
                 "Destroy removes the project {project}: {}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_hooks_forward_two_party_consented_secrets_via_exec_e_flags() {
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("CONSENTED_SECRET", "super-secret-value"),
+            ("CONTRACT_ONLY_SECRET", "not-in-passthrough"),
+            ("PASSTHROUGH_ONLY_SECRET", "not-in-contract"),
+            ("EMPTY_CONSENTED_SECRET", ""),
+        ]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = Arc::new(FakeRuntime::default());
+        let provider = LocalContainerProvider::with_hooks(fake.hooks());
+        let c = contract(
+            br#"{
+                "schemaVersion": 1,
+                "secrets": ["CONSENTED_SECRET", "CONTRACT_ONLY_SECRET", "EMPTY_CONSENTED_SECRET"],
+                "bootstrap": ["echo boot"],
+                "readiness": ["echo ready"],
+                "data": {
+                    "clone": "clone-db"
+                }
+            }"#,
+        );
+        let runtime_dir = dir.path().join(".kranz/missions/m-sec");
+        let s = ProvisionSpec {
+            mission_id: "m-sec".to_string(),
+            repo_root: dir.path().to_path_buf(),
+            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(
+                &runtime_dir,
+                &[
+                    "CONSENTED_SECRET".to_string(),
+                    "PASSTHROUGH_ONLY_SECRET".to_string(),
+                    "EMPTY_CONSENTED_SECRET".to_string(),
+                ],
+            ),
+            runtime_dir,
+            base_sha: Some("deadbeef".to_string()),
+            contract: Some(c),
+        };
+        let handle = provider.provision(&s).await.expect("provision");
+        let compose_bytes =
+            std::fs::read_to_string(&handle.container.as_ref().unwrap().compose_file)
+                .expect("compose.json");
+        assert!(
+            !compose_bytes.contains("super-secret-value"),
+            "secret values must never be written to compose.json on disk"
+        );
+
+        let mut progress = Progress::default();
+        let outcome = provider
+            .readiness(&handle, &mut progress.sink())
+            .await
+            .expect("readiness");
+        assert!(matches!(outcome, ReadinessOutcome::Ready));
+
+        for cmd in ["clone-db", "echo boot", "echo ready"] {
+            let call = fake
+                .calls()
+                .into_iter()
+                .find(|argv| argv.last().map(String::as_str) == Some(cmd))
+                .unwrap_or_else(|| panic!("missing exec call for {cmd}"));
+            let args: Vec<&str> = call.iter().map(String::as_str).collect();
+            assert!(
+                args.windows(7).any(|w| {
+                    w == [
+                        "exec",
+                        "-T",
+                        "-e",
+                        "CONSENTED_SECRET",
+                        WORKSPACE_SERVICE,
+                        "sh",
+                        "-c",
+                    ]
+                }),
+                "expected only CONSENTED_SECRET -e flag on {cmd}, got: {args:?}"
+            );
+            assert_eq!(
+                extract_exec_secret_env(&call[1..]),
+                vec![(
+                    "CONSENTED_SECRET".to_string(),
+                    "super-secret-value".to_string()
+                )]
             );
         }
     }

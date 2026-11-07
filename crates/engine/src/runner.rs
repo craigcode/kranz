@@ -823,9 +823,115 @@ pub fn parse_worker_report(text: &str) -> Option<WorkerReport> {
     parse_report(text)
 }
 
-/// [`parse_report`] for [`ValidatorReport`].
+/// Content of the final fenced code block when no non-whitespace trails its
+/// closing fence. Handles multi-fence validator prose (e.g. quoting an
+/// earlier JSON snippet or example fence before emitting the final verdict
+/// block at the end of the turn).
+fn trailing_fenced_block(text: &str) -> Option<&str> {
+    fn fence_info_offset(line: &str) -> Option<usize> {
+        let indent = line.len() - line.trim_start().len();
+        line.trim_start()
+            .starts_with("```")
+            .then_some(indent + "```".len())
+    }
+
+    let mut open: Option<(usize, usize)> = None;
+    let mut last_closed: Option<((usize, usize), (usize, usize))> = None;
+    let mut cursor = 0usize;
+    for line in text.split_inclusive('\n') {
+        let start = cursor;
+        cursor += line.len();
+        let Some(info) = fence_info_offset(line) else {
+            continue;
+        };
+        match open {
+            None => {
+                let info_start = start + info;
+                if let Some(offset) = text.get(info_start..cursor)?.find("```") {
+                    last_closed = Some((
+                        (info_start, cursor),
+                        (info_start + offset, info_start + offset + "```".len()),
+                    ));
+                } else {
+                    open = Some((info_start, cursor));
+                }
+            }
+            Some(opened) => {
+                last_closed = Some((opened, (start, cursor)));
+                open = None;
+            }
+        }
+    }
+
+    if open.is_some() {
+        return None;
+    }
+    let ((info_start, open_line_end), (close_line_start, close_line_end)) = last_closed?;
+    if !text.get(close_line_end..)?.trim().is_empty() {
+        return None;
+    }
+    if close_line_start < open_line_end {
+        let inner = text.get(info_start..close_line_start)?.trim();
+        let body = inner
+            .strip_prefix("json")
+            .map(str::trim_start)
+            .filter(|s| s.starts_with(['{', '[']))
+            .unwrap_or(inner);
+        return Some(body);
+    }
+    let info = text.get(info_start..open_line_end)?;
+    let trimmed_info = info.trim_start();
+    if trimmed_info.starts_with(['{', '[']) {
+        Some(text.get(info_start..close_line_start)?.trim())
+    } else if let Some(after_json) = trimmed_info
+        .strip_prefix("json")
+        .map(str::trim_start)
+        .filter(|s| s.starts_with(['{', '[']))
+    {
+        let json_body_offset = open_line_end - after_json.len();
+        Some(text.get(json_body_offset..close_line_start)?.trim())
+    } else {
+        Some(text.get(open_line_end..close_line_start)?.trim())
+    }
+}
+
+fn parse_strict_validator_report_slice(slice: &str) -> Option<ValidatorReport> {
+    let value: serde_json::Value = serde_json::from_str(slice).ok()?;
+    let map = value.as_object()?;
+    if !(map.contains_key("findings") || map.contains_key("summary")) {
+        return None;
+    }
+    if !map.keys().all(|k| k == "findings" || k == "summary") {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// [`parse_report`] for [`ValidatorReport`], hardened against vacuous
+/// `{}` deserialization and earlier fenced JSON blocks in validator prose.
 pub fn parse_validator_report(text: &str) -> Option<ValidatorReport> {
-    parse_report(text)
+    let trimmed = text.trim();
+    if let Some(block) = sole_fenced_block(trimmed) {
+        if let Some(report) = parse_strict_validator_report_slice(block) {
+            return Some(report);
+        }
+    }
+    if let Some(block) = trailing_fenced_block(trimmed) {
+        if let Some(report) = parse_strict_validator_report_slice(block) {
+            return Some(report);
+        }
+    }
+    if let Some(report) = parse_strict_validator_report_slice(trimmed) {
+        return Some(report);
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Some(report) = parse_strict_validator_report_slice(&trimmed[start..=end]) {
+                return Some(report);
+            }
+        }
+    }
+    fenced_block(trimmed).and_then(parse_strict_validator_report_slice)
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,7 +1768,12 @@ pub async fn run_validator_in(
     let reported_only: Vec<String> = worker_commands
         .iter()
         .filter(|command| !allowed_commands.contains(command))
-        .cloned()
+        .map(|command| {
+            crate::presentation::visible(command)
+                .replace(['\r', '\n'], " ")
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e")
+        })
         .collect();
     let mut commands = bullet_list(&allowed_commands);
     if !reported_only.is_empty() {
@@ -2452,5 +2563,30 @@ mod tests {
         assert!(!spec.env.contains_key("HOME"));
         assert!(!spec.env.contains_key("CLAUDE_CONFIG_DIR"));
         assert!(!spec.env.contains_key("GIT_AUTHOR_NAME"));
+    }
+
+    #[test]
+    fn parse_validator_report_prefers_final_verdict_over_earlier_fenced_blocks() {
+        let output = r#"I inspected the worker's output:
+```json
+{ "foo": 1 }
+```
+And the prompt's schema example:
+```json
+{ "findings": [], "summary": "example" }
+```
+Final verdict:
+```json
+{ "findings": [{"subject": "a1", "severity": "critical", "evidence": "broken"}], "summary": "fail" }
+```"#;
+        let report = parse_validator_report(output).expect("must parse final validator report");
+        assert_eq!(report.summary, "fail");
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].subject, "a1");
+        assert_eq!(report.findings[0].evidence, "broken");
+
+        // Arbitrary JSON objects without findings/summary must not deserialize as a vacuous pass.
+        assert!(parse_validator_report(r#"{ "foo": 1 }"#).is_none());
+        assert!(parse_validator_report(r#"{ "findings": [], "extra": 1 }"#).is_none());
     }
 }

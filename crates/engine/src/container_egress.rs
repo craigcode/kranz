@@ -49,11 +49,13 @@ const RELAY_IMAGE: &str =
     "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d";
 
 const RELAY_SCRIPT: &str = r#"import asyncio
+import socket
 import sys
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
 AUTHORITY = open(sys.argv[3], "rb").read().strip()
+BIND_HOST = socket.gethostbyname("kranz-egress")
 MAX_HEAD = 8192
 
 async def pump(reader, writer):
@@ -95,7 +97,7 @@ async def relay(client_reader, client_writer):
         await client_writer.wait_closed()
 
 async def main():
-    server = await asyncio.start_server(relay, "0.0.0.0", 3128)
+    server = await asyncio.start_server(relay, BIND_HOST, 3128)
     print("READY", flush=True)
     async with server:
         await server.serve_forever()
@@ -1232,7 +1234,7 @@ mod tests {
         let allowed_port = allowed.local_addr().unwrap().port();
         let allowed_task = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for _ in 0..2 {
+            for _ in 0..1 {
                 let (mut stream, _) = allowed.accept().await.unwrap();
                 let mut request = [0_u8; 4];
                 stream.read_exact(&mut request).await.unwrap();
@@ -1284,10 +1286,9 @@ mod tests {
             "{allowed_text}"
         );
         assert!(allowed_text.contains("pong"), "{allowed_text}");
-        // The relay listens on both interfaces. Default-bridge peers share
-        // this allowlist authority; they are trusted host peers, not isolated
-        // tenants. Keep this limitation explicit until a separately qualified
-        // relay profile isolates the listener.
+        // The relay binds exclusively to its owned internal network interface
+        // (resolved from `kranz-egress`), so an unrelated peer on the default
+        // `bridge` network cannot connect to the relay's bridge IP.
         let relay_ip = docker_checked(
             ContainerRuntime::Docker,
             &[
@@ -1303,17 +1304,33 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let bridge_probe = docker_checked(ContainerRuntime::Docker,
-            &["run".into(), "--rm".into(), "--network".into(), "bridge".into(),
-                crate::sandbox_container::DEFAULT_IMAGE.into(), "sh".into(), "-c".into(),
-                format!("printf 'CONNECT 127.0.0.1:{allowed_port} HTTP/1.1\\r\\nHost: 127.0.0.1:{allowed_port}\\r\\n\\r\\nping' | nc -w 5 {relay_ip} {RELAY_PORT}")],
-            "record default-bridge relay trust assumption").unwrap();
+        let bridge_probe = docker_checked(
+            ContainerRuntime::Docker,
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                "bridge".into(),
+                crate::sandbox_container::DEFAULT_IMAGE.into(),
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "if printf 'CONNECT 127.0.0.1:{allowed_port} HTTP/1.1\\r\\nHost: 127.0.0.1:{allowed_port}\\r\\n\\r\\nping' | nc -w 5 {relay_ip} {RELAY_PORT}; then exit 9; fi; printf 'RELAY-ISOLATED: default bridge peer refused\\n'"
+                ),
+            ],
+            "prove default-bridge peer cannot reach relay listener",
+        )
+        .unwrap();
         let bridge_text = String::from_utf8_lossy(&bridge_probe.stdout);
         assert!(
-            bridge_text.contains("200 Connection Established") && bridge_text.contains("pong"),
+            bridge_text.contains("RELAY-ISOLATED: default bridge peer refused")
+                && !bridge_text.contains("200 Connection Established")
+                && !bridge_text.contains("pong"),
             "{bridge_text}"
         );
-        println!("RELAY-TRUST: default bridge peers can use the relay allowlist; hostile co-tenancy is unsupported");
+        println!(
+            "RELAY-ISOLATED: default bridge peer connection to {relay_ip}:{RELAY_PORT} refused"
+        );
         allowed_task.await.unwrap();
 
         let dns_control = docker_checked(
@@ -1513,5 +1530,12 @@ mod tests {
         assert!(!inspect_exists("container", &stale_loader));
         assert!(!inspect_exists("volume", &stale_volume));
         assert!(!stale_dir.exists());
+    }
+
+    #[test]
+    fn relay_script_binds_only_to_internal_worker_network_alias() {
+        assert!(RELAY_SCRIPT.contains("BIND_HOST = socket.gethostbyname(\"kranz-egress\")"));
+        assert!(RELAY_SCRIPT.contains("asyncio.start_server(relay, BIND_HOST, 3128)"));
+        assert!(!RELAY_SCRIPT.contains("0.0.0.0"));
     }
 }

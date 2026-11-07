@@ -1,0 +1,116 @@
+{
+  "date": "2026-11-07",
+  "branchParent": "87c6481ba4f0d532b34f40d0764255c32168fed0",
+  "mergedMain": "47cc3a8f5fef7a79311f31ba16d7a8ab9556fb75",
+  "sourceSha256": {
+    "crates/acp/src/terminal.rs": "a629c8eecac9b881543cb2ee135f08e84f1e0fa7d1cc8b6d50cefa2deeaf78df",
+    "crates/engine/src/acp_container.rs": "76b8ef077cb544b4d49b0c8078c9887000a9f5a7b40cc658127359630922c409",
+    "crates/engine/src/acp_container/terminal.py": "dc1d361a6bbe976618533eb65fe16b6d7a06818b65dcb6561b0b6f8cec6e0bfb",
+    "crates/engine/src/acp_container/terminal_peer.py": "823278dcb569b00d880cf98787b347229d4962ea9e9d45c8470c9a00d0847833",
+    "crates/engine/src/acp_container/tests.rs": "62e56290b6ddb131ad86818a911259022edd20afc54103f4b7f114b1e1af5545",
+    "crates/engine/src/acp_container/tests/terminals.rs": "c29307b39381fed9c9defe3b9cf3ae7b4ba351fed1896a2a88947628bba465b6",
+    "crates/engine/src/acp_resources.rs": "1867293da322297c723ddc56e09eedb87e6317d11b4f2e93dc959786022965e1",
+    "crates/engine/src/acp_terminal.rs": "ac9591d53bbd5270b1b68d87a4d7055d5c3a29c76e60d821a855b34efba9ac51",
+    "crates/engine/src/acp_worker.rs": "fa06d5067a2873e9be315508aa314112814a6f8ddc436cb34cc54f22673852f1",
+    "crates/engine/src/acp_worker/admission.rs": "72c4683f83a7b03e3baedc743a8ba5b3b6c33f7653729c176a74fb6dafd01a2e",
+    "crates/engine/src/acp_worker/tests.rs": "cd2dfb6654b5be905f0af22f8fb3c5fce9985b982b97a1c25e384694bc886d70",
+    "crates/engine/src/backend_acp.rs": "b6634e17d18d7679d3aeff1947b4f55b947e66ebae4e8a15a073e11e0aab08c3",
+    "crates/engine/src/backend_acp/terminals.rs": "acc62ceadfb1724b6b29f8d1989458cb3f5e57ca79e602c19b3bd4b4bafc60b5",
+    "crates/engine/examples/acp_compat_probe.rs": "adb6ed05a03be55a9fcfe544108c55760fbecb3d35dfca9308f78e0133793d8d",
+    "crates/engine/examples/acp_compat_probe/tool_fixture.rs": "b6fbad098cc63f2a19c043ac8330c480b288714db14e8f6b57c7ba88d0256b09"
+  },
+  "logs": {
+    "workspaceTests": {
+      "file": "kranz-acp-reconcile-tests-final.log",
+      "exitCode": 0,
+      "sha256": "518b38e64da3260786e7e28d0a151505505c5e013e9842bfe675351207cdde66"
+    },
+    "clippy": {
+      "file": "kranz-acp-reconcile-clippy.log",
+      "exitCode": 0,
+      "sha256": "1658d919088d4a33d3670a2134972d40e36f43c8b276dbff9cd149c53525ea7d"
+    },
+    "format": {
+      "file": "kranz-acp-reconcile-fmt.log",
+      "exitCode": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "workspaceBuild": {
+      "file": "kranz-acp-reconcile-build.log",
+      "exitCode": 0,
+      "sha256": "b99fc76b99c5343cbec76fa575c995f59bce11fb708ad293d17b8c10df463961"
+    },
+    "terminalDockerProofs": {
+      "file": "kranz-acp-reconcile-terminals.log",
+      "exitCode": 0,
+      "sha256": "48f1e6eb20442d2c20c0adcdea436a9680bff688333cce23f347c06c7a4d1137"
+    },
+    "compatibilityProbeTests": {
+      "file": "kranz-acp-reconcile-probe-tests.log",
+      "exitCode": 0,
+      "sha256": "85f8244f4dbe0ed3c333258c6e88b6247377e720cee64f53faaa0c86033b9bc6"
+    },
+    "currentHostAdmissionAttempt": {
+      "file": "kranz-acp-reconcile-admission.log",
+      "exitCode": 101,
+      "sha256": "38342bd8beac074108dddb81e00f8e8ce1fad5a80faec2c2cb160365b4a04a3b"
+    },
+    "initialCompileAttempt": {
+      "file": "kranz-acp-reconcile-tests.log",
+      "exitCode": 101,
+      "sha256": "c92b071342f6f8f190aa98cbe5b64c4aac4f6a329bd32f8464a3ce45983b5935"
+    }
+  },
+  "workspaceTests": {
+    "passed": 3236,
+    "failed": 0,
+    "ignored": 16
+  },
+  "requiredTerminalProofs": [
+    "acp_terminal_v1_default_capability_refuses_execution",
+    "acp_terminal_v1_paths_and_environment_fail_before_consent",
+    "acp_terminal_v1_capacity_reserved_before_consent",
+    "acp_terminal_v1_consent_concurrency_bounds_and_descendants",
+    "acp_terminal_v1_engine_death_expires_terminal_namespace",
+    "acp_terminal_v1_pending_consent_and_late_create_cannot_complete",
+    "acp_terminal_v1_budget_expiry_retention_and_oom_hint",
+    "acp_terminal_v1_peer_provider_death_and_drop_stop_namespace",
+    "acp_terminal_v1_control_polling_and_pending_limits_recover"
+  ],
+  "compatibilityProbeTests": {
+    "passed": 6,
+    "failed": 0
+  },
+  "dashboard": {
+    "passed": 266,
+    "failed": 0,
+    "dependencyAuditVulnerabilities": 0,
+    "typecheck": true,
+    "build": true,
+    "embeddedSyncAndCheck": true,
+    "lintExitCode": 0,
+    "lintWarnings": "existing react(set-state-in-effect) warnings"
+  },
+  "evenG2": {
+    "passed": 22,
+    "failed": 0,
+    "dependencyAuditVulnerabilities": 0,
+    "pack": true,
+    "lintExitCode": 0
+  },
+  "currentHostAdmission": {
+    "passed": false,
+    "refusedBeforeCredentialUse": true,
+    "mismatchedField": "/docker/MemTotal",
+    "qualifiedBytes": 6198104064,
+    "observedBytes": 6198095872,
+    "configuredVmMemoryBytes": 6442450944,
+    "policyChanged": false
+  },
+  "providerCalls": 0,
+  "finalDockerInventory": {
+    "containers": 0,
+    "ownedNetworks": 0
+  },
+  "qualification": "R5 remains open; this merge does not qualify the changed host memory observation or enable released terminal profiles"
+}

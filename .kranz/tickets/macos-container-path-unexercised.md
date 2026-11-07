@@ -1,6 +1,6 @@
 ---
-state: open
-state-note: "Reopened 2026-08-31. The v0.2.0 narrowing stands on its own evidence and is NOT being reverted: hosted macOS cannot renew a CI receipt. What reopens this is a third option the ticket did not consider — proving the contract on the operator's own host at run time instead of in a lane that cannot execute. A 2026-08-31 M4 Pro receipt showed the macOS path passing its live container tests once its mounts were real, and showed the specific defect that made them fail: a runtime can accept a bind mount and share nothing, silently."
+state: done
+state-note: "Closed 2026-10-18. Session and gate container resolution prove every declared bind-mount root at run time on non-Linux POSIX hosts via sandbox_container::mount_proof (honoring KRANZ_SCRATCH_ROOT), Windows remains refused, Linux stays continuously CI-proven, and CI/test_capability comments now match the runtime mount-proof contract."
 title: The macOS container path is claimed-supported but never exercised in CI
 priority: 2
 schedule: once
