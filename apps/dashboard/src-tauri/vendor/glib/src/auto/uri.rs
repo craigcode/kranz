@@ -432,7 +432,8 @@ impl Uri {
         unsafe {
             let mut scheme = ptr::null_mut();
             let mut user = ptr::null_mut();
-            let mut password = ptr::null_mut();
+            let mut password =
+                ptr::null_mut();
             let mut auth_params = ptr::null_mut();
             let mut host = ptr::null_mut();
             let mut port = mem::MaybeUninit::uninit();

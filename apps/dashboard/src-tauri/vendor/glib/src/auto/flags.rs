@@ -489,7 +489,8 @@ bitflags! {
         #[doc(alias = "G_URI_FLAGS_PARSE_RELAXED")]
         const PARSE_RELAXED = ffi::G_URI_FLAGS_PARSE_RELAXED as _;
         #[doc(alias = "G_URI_FLAGS_HAS_PASSWORD")]
-        const HAS_PASSWORD = ffi::G_URI_FLAGS_HAS_PASSWORD as _;
+        const HAS_PASSWORD =
+            ffi::G_URI_FLAGS_HAS_PASSWORD as _;
         #[doc(alias = "G_URI_FLAGS_HAS_AUTH_PARAMS")]
         const HAS_AUTH_PARAMS = ffi::G_URI_FLAGS_HAS_AUTH_PARAMS as _;
         #[doc(alias = "G_URI_FLAGS_ENCODED")]
@@ -548,7 +549,8 @@ bitflags! {
         #[doc(alias = "G_URI_HIDE_USERINFO")]
         const USERINFO = ffi::G_URI_HIDE_USERINFO as _;
         #[doc(alias = "G_URI_HIDE_PASSWORD")]
-        const PASSWORD = ffi::G_URI_HIDE_PASSWORD as _;
+        const PASSWORD =
+            ffi::G_URI_HIDE_PASSWORD as _;
         #[doc(alias = "G_URI_HIDE_AUTH_PARAMS")]
         const AUTH_PARAMS = ffi::G_URI_HIDE_AUTH_PARAMS as _;
         #[doc(alias = "G_URI_HIDE_QUERY")]

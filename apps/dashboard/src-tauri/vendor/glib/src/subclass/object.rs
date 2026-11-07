@@ -307,7 +307,8 @@ pub trait ObjectImplExt: sealed::Sealed + ObjectSubclass {
     /// Chain up to parent class signal handler.
     fn signal_chain_from_overridden(
         &self,
-        token: &super::SignalClassHandlerToken,
+        token:
+            &super::SignalClassHandlerToken,
         values: &[Value],
     ) -> Option<Value> {
         unsafe {

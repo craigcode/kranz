@@ -1108,7 +1108,8 @@ pub(crate) unsafe fn signal_override_class_handler<F>(
 
 pub(crate) unsafe fn signal_chain_from_overridden(
     instance: *mut gobject_ffi::GTypeInstance,
-    token: &super::SignalClassHandlerToken,
+    token:
+        &super::SignalClassHandlerToken,
     values: &[Value],
 ) -> Option<Value> {
     assert_eq!(instance, token.0);

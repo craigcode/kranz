@@ -258,8 +258,8 @@ impl SimpleToken {
 impl PartialEq<TokenTree> for SimpleToken {
     fn eq(&self, other: &TokenTree) -> bool {
         match (self, other) {
-            (SimpleToken::Punct(p1), TokenTree::Punct(ref p2)) => *p1 == p2.to_string(),
-            (SimpleToken::Ident(i1), TokenTree::Ident(ref i2)) => *i1 == i2.to_string(),
+            (Self::Punct(p1), TokenTree::Punct(ref p2)) => *p1 == p2.to_string(),
+            (Self::Ident(i1), TokenTree::Ident(ref i2)) => *i1 == i2.to_string(),
             _ => false,
         }
     }

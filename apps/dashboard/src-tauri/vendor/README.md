@@ -33,3 +33,9 @@ The compiler-error fixture includes an empty package named `gtk` solely so
 `proc-macro-crate` can resolve the expected crate name before rejecting a
 malformed template derive. It does not implement or test GTK widgets. The
 Linux CI job separately checks the real Tauri/GTK dependency graph.
+
+A few upstream declarations trigger the trusted generic secret-assignment rule
+on Rust identifiers and type names. `scannerCompatibilityFiles` records those
+reviewed false positives: line wrapping, `Self` in two enum match arms, and an
+unused parse binding preserve behavior while leaving the scanner and its
+trusted allowlist unchanged. These edits are included in the pinned hashes.

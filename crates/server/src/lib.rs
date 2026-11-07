@@ -322,7 +322,10 @@ fn router_with_serve_options(
     bind_is_loopback: bool,
     options: ServeOptions,
 ) -> Router {
-    let require_read_token = options.read_auth;
+    let ServeOptions {
+        read_auth: require_read_token,
+        development_origins,
+    } = options;
     let gate = TokenGate {
         read_authority: read_authority
             .filter(|read| !read.is_empty() && !token_matches(read, authority.as_str()))
@@ -451,10 +454,8 @@ fn router_with_serve_options(
             HostGate { bind_is_loopback },
             require_host,
         ))
-        .layer(cors_layer(bind_addr, options.development_origins))
-        .layer(axum::Extension(DevelopmentOrigins(
-            options.development_origins,
-        )))
+        .layer(cors_layer(bind_addr, development_origins))
+        .layer(axum::Extension(DevelopmentOrigins(development_origins)))
         // Outermost: every response — including gate rejections — carries the
         // cache policy, so no rejection HTML can poison a browser cache either.
         .layer(middleware::from_fn(cache_response_headers))

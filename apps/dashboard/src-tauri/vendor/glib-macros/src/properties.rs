@@ -146,7 +146,7 @@ impl Parse for PropAttr {
         let name_str = name.to_string();
 
         let res = if input.peek(Token![=]) {
-            let _assign_token: Token![=] = input.parse()?;
+            let _: Token![=] = input.parse()?;
             // name = expr | type | ident
             match &*name_str {
                 "name" => PropAttr::Name(input.parse()?),
