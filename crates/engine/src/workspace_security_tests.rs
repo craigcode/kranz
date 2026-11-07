@@ -218,3 +218,53 @@ async fn workspace_lanes_deny_network_under_fs_net() {
         );
     }
 }
+
+#[tokio::test]
+async fn reset_honors_sandbox_changes_after_provisioning() {
+    use std::sync::Arc;
+    let Some((_repo, root)) = crate::orchestrator::tests::lessons_test_repo() else {
+        return;
+    };
+    let mut engine = crate::orchestrator::MissionEngine::create(
+        Arc::new(crate::backend_mock::MockBackend::new()),
+        &root,
+        "workspace reset policy regression",
+        Default::default(),
+    )
+    .unwrap();
+    let command = crate::test_shell::write_line("reset", "reset-marker.txt");
+    let runtime_dir = engine.paths.mission_dir();
+    let spec = ProvisionSpec {
+        mission_id: engine.state.mission.id.clone(),
+        repo_root: root.clone(),
+        gate_env: GateEnvPolicy::for_mission(&runtime_dir, &[], Default::default()),
+        runtime_dir,
+        base_sha: None,
+        contract: Some(
+            crate::workspace_contract::parse_workspace_contract(
+                &serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "data": {"reset": command, "resetBetweenRounds": true}
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    };
+    engine.workspace_handle = Some(LocalWorktreeProvider.provision(&spec).await.unwrap());
+    engine.workspace_provider = Some(Arc::new(LocalWorktreeProvider));
+    assert!(!engine.run_data_reset_between_rounds().await.unwrap());
+    let marker = root.join("reset-marker.txt");
+    assert!(marker.exists(), "off-mode negative control did not execute");
+    std::fs::remove_file(&marker).unwrap();
+    engine.state.config.worker.sandbox = SandboxConfig {
+        provider: SandboxProvider::Container,
+        enforce: SandboxEnforce::FsNet,
+        egress: vec!["example.com:443".into()],
+        ..Default::default()
+    };
+    // This newly selected pairing cannot be enforced by gates on any host.
+    // The saved handle still says off, so using it would execute the command.
+    assert!(engine.run_data_reset_between_rounds().await.is_err());
+    assert!(!marker.exists(), "reset reused the old unsandboxed policy");
+}
