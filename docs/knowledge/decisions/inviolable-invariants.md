@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-07 (UTC) after `AGENTS.md` trimmed reference detail into the knowledge vault and minor CI/dependency bumps; all documented invariants hold unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: `.kranz/signals/` is both read-denied and write-denied across sandboxed sessions and permission profiles, its append-only ledger uses domain-separated HMAC sealing (`kranz.signal-ledger.v1`) and an out-of-repo high-water mark, and `/api/hooks/sentry` joins `/api/hooks/github` as an independently HMAC-authenticated webhook route that creates only undrafted `signal-proposal: unconsented` tickets. All documented invariants hold unchanged.
 
