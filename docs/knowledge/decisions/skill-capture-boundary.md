@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-07
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -11,6 +11,8 @@ verified_against:
   - .kranz/tickets/m5-skill-capture-positioning-decision.md
   - .kranz/tickets/training-corpus-export.md
 ---
+
+Rechecked 2026-11-07 (UTC) after syncing ACP qualification roadmap checkboxes; no skill creation, installation, or prompt optimization is introduced.
 
 Rechecked 2026-11-02 (UTC) against the signal intake positioning note: sealed signal intake and human-consented proposal tickets do not create, install, or optimize skills. The skill-capture decision is unchanged.
 

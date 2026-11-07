@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-07 (UTC) after `AGENTS.md` reference trimming and GitHub Actions minor bumps (`Swatinem/rust-cache` 2.9.3, `github/codeql-action` 4.39.2); gate contracts and CI coverage are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: Ubuntu and macOS CI lanes run the non-vacuous `signal_injection_suite_test` gate proving nonced untrusted signal fences hold and `signal-proposal: unconsented` tickets refuse draft, approve, queue, and scheduling, while `commands.rs` adds `kranz signal` and `kranz draft --consent-signal`.
 

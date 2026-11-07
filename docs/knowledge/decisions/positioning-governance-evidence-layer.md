@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,8 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-11-07 (UTC) after marking the four shipped ACP qualification roadmap checkboxes complete; execution freeze and evidence boundaries are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline (`docs/scoping/signal-intake.md`): verified external signals land in a sealed evidence ledger, deterministic triage proposes nonced-fenced `signal-proposal: unconsented` tickets behind explicit human consent, and `outcomes` reports read-only `signalConsentLatency`. No autonomous execution, code-generation, or prompt-optimization primitive is added.
 
