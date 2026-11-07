@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-07
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
