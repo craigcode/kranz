@@ -1,6 +1,6 @@
 [package]
 name = "kranz-dashboard"
-version = "0.4.3"
+version = "0.4.4"
 description = "Kranz Mission Control — Tauri desktop shell embedding the kranz server"
 authors = ["Kranz"]
 license = "MIT"
@@ -32,3 +32,10 @@ serde = { version = "1", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
+
+# GTK 3 still requires GLib 0.18. Keep the ABI while applying the upstream
+# iterator fix and replacing the unmaintained compile-time error helper.
+[patch.crates-io]
+glib = { path = "vendor/glib" }
+glib-macros = { path = "vendor/glib-macros" }
+gtk3-macros = { path = "vendor/gtk3-macros" }

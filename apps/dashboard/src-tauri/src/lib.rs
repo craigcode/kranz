@@ -79,13 +79,16 @@ async fn embedded_serve(
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let host = std::sync::Arc::new(kranz_server::MissionHost::new(repo_root));
-    kranz_server::serve_multi_on_listener(
+    kranz_server::serve_multi_on_listener_with_options(
         std::sync::Arc::new(kranz_server::MultiRepoHost::with_host(host)),
         listener,
         None,
         kranz_server::MutationAuthority::new(token)?,
         None,
-        true,
+        kranz_server::ServeOptions {
+            development_origins: cfg!(debug_assertions),
+            ..Default::default()
+        },
         std::future::pending::<()>(),
     )
     .await

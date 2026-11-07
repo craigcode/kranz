@@ -215,10 +215,13 @@ impl MissionEngine {
             // no provider — treat as no reset.
             return Ok(false);
         };
-        let handle = self
+        let mut handle = self
             .workspace_handle
             .clone()
             .expect("a reset hook implies a provisioned handle");
+        // Enforcement can be tightened while a mission is running. A reset
+        // must use the current policy, never the posture saved at provision.
+        handle.gate_env.sandbox = crate::command_exec::worker_gate_sandbox(&self.state.config)?;
         let failed = {
             let mut progress = |summary: &str, detail: Option<String>| -> Result<()> {
                 self.emit_decision(summary, detail)

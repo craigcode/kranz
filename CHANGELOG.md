@@ -5,6 +5,25 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.4.4 - 2026-11-07
+
+- Serve the embedded dashboard by default. Filesystem dashboards require an
+  explicit trusted override; pinned directory handles refuse symlinks in asset
+  paths and SPA fallbacks, preventing reads outside the selected directory.
+- Require read authentication for ordinary CLI serving, including loopback.
+  Development browser origins require `--dev-origins`; desktop debug builds
+  enable them explicitly. The health endpoint remains public.
+- Apply the selected mission sandbox to local workspace bootstrap, readiness,
+  clone, migrate, skew-check and reset commands. Refuse unsupported containment
+  before execution. Container contracts with host-shell `disk.prune` commands
+  are refused; owned Compose resource cleanup remains available.
+- Include the TLS certificate and Tokio fixes already on main, and refresh
+  both root-store dependencies to 1.0.11. Refresh dependency license notices.
+- Backport the upstream GLib iterator pointer fix for the GTK 3 desktop stack,
+  remove the unmaintained macro-error helpers, and verify the narrow vendored
+  patches with source hashes, optimized iterator tests, compiler diagnostics
+  tests and a full Linux desktop build check.
+
 ## 0.4.3 - 2026-10-18
 
 - Hardened Git execution and network boundaries: disabled tag signing and GPG

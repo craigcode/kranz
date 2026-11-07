@@ -199,8 +199,7 @@ pub(crate) fn effective_teardown_mode(
 
 /// The OPERATOR-owned half of every gate command's environment, carried from
 /// mission config through [`ProvisionSpec`] onto the [`WorkspaceHandle`] so
-/// each of the four contract-declared command lanes (bootstrap, readiness,
-/// data hooks, `disk.prune`) builds the same env from the same inputs.
+/// each contract-declared command lane (bootstrap, readiness and data hooks) builds the same env from the same inputs.
 #[derive(Debug, Clone)]
 pub struct GateEnvPolicy {
     /// The ONE scratch `HOME`/`TMPDIR`/`CARGO_HOME` every gate phase of this
@@ -212,15 +211,25 @@ pub struct GateEnvPolicy {
     /// (follow-up review, H-6). Operator-only by construction: the key is in
     /// `config.rs`'s `PROJECT_LAYER_REFUSED`, so repo content cannot set it.
     pub passthrough: Vec<String>,
+    /// Mission authority denies and the resolved worker gate policy. Repository
+    /// content cannot select a weaker posture for setup or reset commands.
+    pub mission_dir: PathBuf,
+    pub sandbox: crate::types::SandboxConfig,
 }
 
 impl GateEnvPolicy {
     /// The policy for one mission run: the gate home under the mission's own
     /// writable `runs/` dir, plus the operator's passthrough list.
-    pub fn for_mission(runtime_dir: &std::path::Path, passthrough: &[String]) -> Self {
+    pub fn for_mission(
+        runtime_dir: &std::path::Path,
+        passthrough: &[String],
+        sandbox: crate::types::SandboxConfig,
+    ) -> Self {
         Self {
             home: crate::workspace_gate::mission_gate_home(runtime_dir),
             passthrough: passthrough.to_vec(),
+            mission_dir: runtime_dir.to_path_buf(),
+            sandbox,
         }
     }
 }
@@ -380,14 +389,14 @@ pub trait WorkspaceProvider: Send + Sync {
         command: &str,
         progress: &mut ProgressSink<'_>,
     ) -> Result<Option<CommandOutcome>> {
-        let env = crate::workspace_gate::gate_command_env(
+        let (code, output_tail) = crate::workspace_gate::run_workspace_command(
+            &handle.cwd,
+            command,
             &handle.gate_env,
             &handle.env,
             handle.contract.as_ref(),
-        );
-        let (code, output_tail) =
-            crate::command_exec::run_shell_command_with_code_cleared(&handle.cwd, command, &env)
-                .await;
+        )
+        .await?;
         crate::workspace_data::hook_outcome(hook, command, code, output_tail, progress)
     }
 }
@@ -656,7 +665,7 @@ async fn run_gate_phase(
         &handle.env,
         handle.contract.as_ref(),
     )
-    .await;
+    .await?;
     report_gate_outcomes(phase, outcomes, progress)
 }
 
@@ -731,6 +740,7 @@ impl MissionEngine {
             gate_env: GateEnvPolicy::for_mission(
                 &runtime_dir,
                 &self.state.config.contract_env_passthrough,
+                crate::command_exec::worker_gate_sandbox(&self.state.config)?,
             ),
             runtime_dir,
             base_sha: self.state.mission.base_sha.clone(),
@@ -851,10 +861,8 @@ impl MissionEngine {
             return; // never provisioned this run (e.g. resolve/provision failed)
         };
         // The mission's ONE shared gate home (follow-up review, M-1) is
-        // removed HERE, not per phase: teardown is the last point any
-        // contract-declared command can fire (`disk.prune` runs inside the
-        // provider call below), so anything earlier would delete a home a
-        // later phase still needs.
+        // removed HERE, not per phase: readiness and between-round resets
+        // share its toolchain and data state for the lifetime of the workspace.
         let gate_home = handle.gate_env.home.clone();
         let state = match provider.teardown(handle, mode).await {
             Ok(()) => mode.success_state(),
@@ -929,7 +937,7 @@ mod tests {
         let runtime_dir = root.join(".kranz").join("missions").join("m-test");
         ProvisionSpec {
             mission_id: "m-test".to_string(),
-            gate_env: GateEnvPolicy::for_mission(&runtime_dir, passthrough),
+            gate_env: GateEnvPolicy::for_mission(&runtime_dir, passthrough, Default::default()),
             runtime_dir,
             repo_root: root,
             base_sha: base_sha.map(|s| s.to_string()),

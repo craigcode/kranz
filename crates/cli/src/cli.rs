@@ -538,22 +538,23 @@ pub enum Command {
         #[arg(long)]
         insecure_lan: bool,
 
-        /// Require either the read-only or mutation token on `/api` GETs and
-        /// the WS upgrade on ANY bind class, including loopback. POSTs still
-        /// require the mutation token. Off-loopback binds already gate reads;
-        /// this flag forces that posture on loopback too. Still requires
-        /// `--insecure-lan` for a non-loopback bind (unchanged).
-        #[arg(long)]
+        /// Require a read-only or mutation token on API reads and WebSocket
+        /// upgrades. Enabled by default; retained for existing scripts.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
         read_auth: bool,
+
+        /// Allow localhost Vite/Tauri development origins (ports 5173/1420).
+        /// API reads and mutations still require their respective tokens.
+        #[arg(long)]
+        dev_origins: bool,
 
         /// Open the dashboard in the default browser
         #[arg(long)]
         open: bool,
 
-        /// Directory holding the built dashboard (index.html + assets).
-        /// Default search order: `$KRANZ_DASHBOARD_DIST`, `<repo>/apps/dashboard/dist`,
-        /// installed asset dirs, the kranz source checkout used to build the
-        /// binary, then the embedded dashboard bundled into the CLI.
+        /// Explicit trusted dashboard directory (index.html + assets).
+        /// Defaults to the embedded application. KRANZ_DASHBOARD_DIST is an
+        /// alternative explicit override; repository files are never discovered.
         #[arg(long, value_name = "DIR")]
         dashboard: Option<std::path::PathBuf>,
 
@@ -1065,6 +1066,28 @@ pub enum TicketCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_defaults_to_authenticated_reads_without_development_origins() {
+        let cli = Cli::try_parse_from(["kranz", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                read_auth: true,
+                dev_origins: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["kranz", "serve", "--dev-origins"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                read_auth: true,
+                dev_origins: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn serve_parses_read_auth_flag() {

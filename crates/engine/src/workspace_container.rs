@@ -57,8 +57,8 @@
 //! Teardown: [`TeardownMode::Keep`] leaves the project running (documented:
 //! previews stay live); `Hibernate` is `compose stop` (containers paused,
 //! project kept); `Destroy` is `compose down -v` (project + volumes
-//! removed), then the contract's `disk.prune` hint runs on the host when
-//! declared. The run loop drives `Keep` at non-terminal ends (a
+//! removed). Repository-declared `disk.prune` host commands are refused before
+//! provisioning. The run loop drives `Keep` at non-terminal ends (a
 //! blocked/paused mission keeps its project for resume) and the configured
 //! `workspace.teardownMode` when a run reaches a terminal state (ticket
 //! `workspace-idle-hibernate`).
@@ -523,6 +523,18 @@ impl WorkspaceProvider for LocalContainerProvider {
             });
         };
 
+        if contract
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.prune.is_some())
+        {
+            return Err(EngineError::Config(
+                "workspace disk.prune host commands are no longer supported; remove the hint. \
+                 Destroy removes only this mission's Compose project and volumes"
+                    .into(),
+            ));
+        }
+
         // Host-local precondition first (its refusal must not depend on a
         // runtime being installed), then the runtime boundary.
         check_fixed_port_collisions(contract)?;
@@ -834,9 +846,8 @@ impl WorkspaceProvider for LocalContainerProvider {
                     )))
                 }
             }
-            // Project + volumes removed; then honor the contract's disk
-            // prune hint when declared (a HOST command — it prunes the
-            // daemon, not anything inside the container network).
+            // Remove only the mission-owned project and volumes. Repository
+            // content never supplies a host-side daemon cleanup command.
             TeardownMode::Destroy => {
                 let (code, tail) = self
                     .run_argv(
@@ -855,41 +866,6 @@ impl WorkspaceProvider for LocalContainerProvider {
                         code_phrase(code),
                         crate::scrub::scrub(&tail)
                     )));
-                }
-                if let Some(prune) = handle
-                    .contract
-                    .as_ref()
-                    .and_then(|contract| contract.disk.as_ref())
-                    .and_then(|disk| disk.prune.as_deref())
-                {
-                    let cwd = workspace
-                        .compose_file
-                        .parent()
-                        .unwrap_or(handle.cwd.as_path());
-                    // `disk.prune` is the FOURTH contract-declared command
-                    // lane, and it was the one left running on the host with
-                    // the engine's full ambient environment (follow-up
-                    // review, M-3) — the same repo-authored
-                    // `.kranz/workspace.json` the other three lanes were
-                    // cleared for. It goes through the same cleared builder:
-                    // one env discipline for every command the contract can
-                    // name.
-                    let env = crate::workspace_gate::gate_command_env(
-                        &handle.gate_env,
-                        &handle.env,
-                        handle.contract.as_ref(),
-                    );
-                    let (code, tail) =
-                        crate::command_exec::run_shell_command_with_code_cleared(cwd, prune, &env)
-                            .await;
-                    if code != Some(0) {
-                        return Err(EngineError::InvalidState(format!(
-                            "container teardown (destroy): disk prune command `{prune}` failed \
-                             ({}): {}",
-                            code_phrase(code),
-                            crate::scrub::scrub(&tail)
-                        )));
-                    }
                 }
                 Ok(())
             }
@@ -959,7 +935,11 @@ mod tests {
         ProvisionSpec {
             mission_id: mission_id.to_string(),
             repo_root: root.to_path_buf(),
-            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(&runtime_dir, &[]),
+            gate_env: crate::workspace_provider::GateEnvPolicy::for_mission(
+                &runtime_dir,
+                &[],
+                Default::default(),
+            ),
             runtime_dir,
             base_sha: Some("deadbeefcafe".to_string()),
             contract,
@@ -974,10 +954,7 @@ mod tests {
         contract(br#"{"schemaVersion": 1, "readiness": ["true"]}"#)
     }
 
-    /// One dynamic service with a health check, bootstrap + readiness, a
-    /// preview, and a disk prune hint (the no-op is shell-portable; Destroy
-    /// runs it with the compose dir as cwd, so the relative marker lands at
-    /// a known path — the portable idiom, no absolute-path interpolation).
+    /// One dynamic service with a health check, bootstrap, readiness and preview.
     fn fake_contract() -> WorkspaceContract {
         contract(
             br#"{
@@ -992,8 +969,7 @@ mod tests {
                     }
                 ],
                 "readiness": ["test -f .boot-marker"],
-                "previews": [{ "name": "app", "urlTemplate": "http://localhost:{port}/" }],
-                "disk": { "prune": "echo pruned > prune-marker.txt" }
+                "previews": [{ "name": "app", "urlTemplate": "http://localhost:{port}/" }]
             }"#,
         )
     }
@@ -1560,9 +1536,7 @@ mod tests {
         assert!(fake.called_with(&["stop"]), "{:?}", fake.calls());
         assert!(!fake.called_with(&["down", "-v"]), "{:?}", fake.calls());
 
-        // Destroy: compose down -v (project + volumes removed), then the
-        // contract's disk prune hint runs on the host (relative marker in
-        // the prune cwd = the compose dir — the portable idiom).
+        // Destroy removes only the owned project and volumes.
         let fake = Arc::new(FakeRuntime::default());
         let provider = LocalContainerProvider::with_hooks(fake.hooks());
         let handle = provider
@@ -1574,74 +1548,35 @@ mod tests {
             .await
             .expect("destroy");
         assert!(fake.called_with(&["down", "-v"]), "{:?}", fake.calls());
-        assert!(
-            dir.path()
-                .join(".kranz/missions/m-fake6/workspace/prune-marker.txt")
-                .exists(),
-            "the disk prune hint ran with the compose dir as cwd"
-        );
     }
 
-    /// M-3 (follow-up review): `disk.prune` is the FOURTH contract-declared
-    /// command lane and was the one still running on the host with the
-    /// engine's full ambient environment, from the same repo-authored
-    /// `.kranz/workspace.json` the other three lanes were cleared for. It now
-    /// goes through the same cleared builder: undeclared ambient credentials
-    /// do not cross, and `HOME` is the mission's shared gate home rather than
-    /// the operator's.
-    #[cfg(unix)]
     #[tokio::test]
-    async fn disk_prune_runs_with_the_same_cleared_gate_env_as_the_other_lanes() {
-        let _guard = crate::agent_env::EnvTestGuard::engage(&[(
-            "KRANZ_SECRET_TEST",
-            "must-not-reach-disk-prune",
-        )]);
-
-        let dir = tempfile::tempdir().expect("tempdir");
+    async fn disk_prune_is_refused_before_any_runtime_or_host_command() {
+        let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeRuntime::default());
         let provider = LocalContainerProvider::with_hooks(fake.hooks());
         let contract = contract(
             br#"{
-                "schemaVersion": 1,
-                "readiness": ["true"],
-                "services": [
-                    {
-                        "name": "api",
-                        "start": "sleep infinity",
-                        "healthCheck": "true",
-                        "port": { "policy": "dynamic" }
-                    }
-                ],
-                "disk": {
-                  "prune": "printf '%s|%s' \"$KRANZ_SECRET_TEST\" \"$HOME\" > prune-env.txt"
-                }
-            }"#,
+            "schemaVersion": 1,
+            "readiness": ["true"],
+            "disk": {"prune": "echo escaped > prune-marker.txt"}
+        }"#,
         );
-        let handle = provider
+        let error = provider
             .provision(&spec(dir.path(), "m-prune", Some(contract)))
             .await
-            .expect("provision");
-        let gate_home = handle.gate_env.home.clone();
-        provider
-            .teardown(handle, TeardownMode::Destroy)
-            .await
-            .expect("destroy");
-
-        let recorded = std::fs::read_to_string(
-            dir.path()
-                .join(".kranz/missions/m-prune/workspace/prune-env.txt"),
-        )
-        .expect("the prune command ran");
-        let (secret, home) = recorded.split_once('|').expect("both values recorded");
+            .unwrap_err();
         assert!(
-            secret.is_empty(),
-            "an undeclared ambient credential reached disk.prune: {recorded:?}"
+            error
+                .to_string()
+                .contains("disk.prune host commands are no longer supported"),
+            "{error}"
         );
-        assert_eq!(
-            home,
-            gate_home.to_str().expect("utf-8 gate home"),
-            "disk.prune must run with the mission's shared gate HOME, not the operator's"
+        assert!(
+            fake.calls().is_empty(),
+            "refuse before invoking the runtime"
         );
+        assert!(!dir.path().join("prune-marker.txt").exists());
     }
 
     #[tokio::test]
@@ -1863,6 +1798,7 @@ mod tests {
                     "PASSTHROUGH_ONLY_SECRET".to_string(),
                     "EMPTY_CONSENTED_SECRET".to_string(),
                 ],
+                Default::default(),
             ),
             runtime_dir,
             base_sha: Some("deadbeef".to_string()),

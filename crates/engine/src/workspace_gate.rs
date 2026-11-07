@@ -372,14 +372,8 @@ pub(crate) fn two_party_secrets(declared: &[String], operator_allows: &[String])
 /// here, because admitting it means either handing the contract the operator's
 /// private keys or letting it name an ssh program.
 ///
-/// Remaining gap, named rather than papered over: these commands are still
-/// not SANDBOX-WRAPPED. Every other engine-run command goes through
-/// `command_exec::run_shell_command_sandboxed` with the mission's resolved
-/// `GateSandbox`, but the [`crate::workspace_provider::WorkspaceProvider`]
-/// seam carries neither the mission's sandbox config nor its mission dir,
-/// and both are needed to resolve a target. Closing it means widening
-/// `WorkspaceHandle`, which every provider constructs. The credential half
-/// of H4 — the half the audit confirmed — is closed here.
+/// Filesystem and network containment are applied by
+/// [`run_workspace_command`] after constructing this cleared environment.
 pub(crate) fn gate_command_env(
     policy: &crate::workspace_provider::GateEnvPolicy,
     handle_env: &HashMap<String, String>,
@@ -410,6 +404,39 @@ pub(crate) fn gate_command_env(
     env
 }
 
+/// Run repository-authored setup/data commands under the same resolved policy
+/// as validation gates. Resolution, launch, and cleanup failures propagate;
+/// an enforced mission never falls back to an ordinary host shell.
+pub(crate) async fn run_workspace_command(
+    cwd: &std::path::Path,
+    command: &str,
+    policy: &crate::workspace_provider::GateEnvPolicy,
+    handle_env: &HashMap<String, String>,
+    contract: Option<&crate::workspace_contract::WorkspaceContract>,
+) -> crate::error::Result<(Option<i32>, String)> {
+    let env = gate_command_env(policy, handle_env, contract);
+    if policy.sandbox.enforce == crate::types::SandboxEnforce::Off {
+        return Ok(run_shell_command_with_code_cleared(cwd, command, &env).await);
+    }
+    let mut resolved = crate::command_exec::resolve_gate_sandbox(
+        &policy.sandbox,
+        cwd,
+        &policy.mission_dir,
+        &policy.home,
+        &policy.mission_dir.join("runs"),
+    )?;
+    let outcome = crate::command_exec::run_shell_command_sandboxed_with_code(
+        cwd,
+        command,
+        crate::command_exec::COMMAND_TIMEOUT,
+        &env,
+        &resolved.sandbox,
+    )
+    .await;
+    resolved.sandbox.cleanup()?;
+    Ok(outcome)
+}
+
 /// Run one phase's command lines in the workspace cwd — bounded,
 /// process-tree-killed, output-tailed (the shared `command_exec` runner
 /// used by validation-contract commands), with the CLEARED gate env
@@ -420,12 +447,12 @@ pub(crate) async fn run_gate_commands(
     policy: &crate::workspace_provider::GateEnvPolicy,
     handle_env: &HashMap<String, String>,
     contract: Option<&crate::workspace_contract::WorkspaceContract>,
-) -> Vec<CommandOutcome> {
-    let env = gate_command_env(policy, handle_env, contract);
+) -> crate::error::Result<Vec<CommandOutcome>> {
     let total = phase.commands.len();
     let mut outcomes = Vec::with_capacity(total);
     for (i, command) in phase.commands.iter().enumerate() {
-        let (code, output_tail) = run_shell_command_with_code_cleared(cwd, command, &env).await;
+        let (code, output_tail) =
+            run_workspace_command(cwd, command, policy, handle_env, contract).await?;
         let outcome = CommandOutcome {
             ordinal: i + 1,
             total,
@@ -439,7 +466,7 @@ pub(crate) async fn run_gate_commands(
             break;
         }
     }
-    outcomes
+    Ok(outcomes)
 }
 
 /// Per-command lines for the decision's `detail` (the audit trail): one
@@ -552,6 +579,8 @@ mod tests {
         crate::workspace_provider::GateEnvPolicy {
             home: home.to_path_buf(),
             passthrough: passthrough.iter().map(|s| s.to_string()).collect(),
+            mission_dir: home.join("mission"),
+            sandbox: Default::default(),
         }
     }
 

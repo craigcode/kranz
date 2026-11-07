@@ -1,0 +1,29 @@
+[package]
+name = "kranz-desktop-security-tests"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+glib = { path = "../vendor/glib" }
+gtk3-macros = { path = "../vendor/gtk3-macros" }
+
+[patch.crates-io]
+glib-macros = { path = "../vendor/glib-macros" }
+
+[features]
+compile-fail = []
+
+[[example]]
+name = "invalid-glib"
+required-features = ["compile-fail"]
+
+[[example]]
+name = "invalid-gtk"
+required-features = ["compile-fail"]
+
+[dev-dependencies]
+gtk = { path = "fixtures/gtk" }

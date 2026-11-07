@@ -116,6 +116,8 @@ pub mod workspace_data;
 pub mod workspace_gate;
 pub mod workspace_provider;
 pub mod workspace_remote;
+#[cfg(test)]
+mod workspace_security_tests;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod acp_container;

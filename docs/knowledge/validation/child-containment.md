@@ -2,15 +2,21 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-06
+last_verified: 2026-11-07
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
   - crates/engine/src/command_exec.rs
+  - crates/engine/src/workspace_gate.rs
+  - crates/engine/src/workspace_data.rs
+  - crates/engine/src/workspace_provider.rs
+  - crates/engine/src/workspace_container.rs
   - crates/engine/src/sandbox.rs
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Workspace bootstrap, readiness and data hooks now use the resolved worker gate sandbox as well as the cleared environment. Resolution or launch failures refuse execution. Between-round resets refresh the current worker policy after runtime changes. Container `disk.prune` host commands are refused before provisioning; owned Compose teardown remains available.
 
 # Child containment
 
