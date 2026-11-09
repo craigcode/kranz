@@ -238,6 +238,7 @@ pub enum MountProof {
 }
 
 /// Base scratch root for container-owned private ledgers and worker homes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn scratch_root_base() -> PathBuf {
     crate::backend_claude::scratch_root_base()
 }
@@ -645,7 +646,7 @@ fn rendered_has_colon(rendered: &str) -> bool {
         if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
             return stripped[2..].contains(':');
         }
-        return stripped.contains(':');
+        stripped.contains(':')
     }
     #[cfg(not(windows))]
     {

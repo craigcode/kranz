@@ -118,6 +118,7 @@ fn validate_host(observed: &Value, policy: Policy) -> Result<Value> {
     }))
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn validate_env_map(env: &std::collections::HashMap<String, String>) -> Result<()> {
     for key in [
         "DOCKER_HOST",
@@ -146,6 +147,7 @@ pub(crate) fn validate_env_map(env: &std::collections::HashMap<String, String>) 
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn validate_ambient_docker_env() -> Result<()> {
     for (raw_key, raw_val) in std::env::vars_os() {
         let key = raw_key.to_string_lossy();
@@ -497,10 +499,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
-        let base = tempfile::Builder::new()
-            .prefix("kcol-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        if std::env::var_os("KRANZ_TEST_BIND_RELATIVE_SOCK").is_some() {
+            let _ = UnixListener::bind("docker.sock").unwrap();
+            return;
+        }
+
+        let base = tempfile::Builder::new().prefix("k").tempdir().unwrap();
         let home = base.path().join("h");
         let colima = home.join(".colima");
         let default = colima.join("default");
@@ -509,7 +513,26 @@ mod tests {
         std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let sock_path = default.join("docker.sock");
-        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let _listener = match UnixListener::bind(&sock_path) {
+            Ok(listener) => Some(listener),
+            Err(_) => {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .current_dir(&default)
+                    .env("KRANZ_TEST_BIND_RELATIVE_SOCK", "1")
+                    .args([
+                        "--exact",
+                        "acp_worker::admission::tests::acp_v2_admission_verifies_colima_parent_dirs_and_socket_permissions",
+                        "--nocapture",
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(
+                    status.success(),
+                    "relative UnixListener::bind helper failed"
+                );
+                None
+            }
+        };
         std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let work = base.path().join("w");

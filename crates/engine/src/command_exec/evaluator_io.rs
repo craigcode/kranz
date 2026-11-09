@@ -12,6 +12,7 @@ pub(crate) struct Output {
     pub stderr: Vec<u8>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     program: &Path,

@@ -102,7 +102,7 @@ impl DockerEvaluator {
         self.pinned_endpoint.as_deref()
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn environment(&self) -> &HashMap<String, String> {
         &self.env
     }

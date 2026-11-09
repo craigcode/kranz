@@ -114,6 +114,7 @@ asyncio.run(main())
 "#;
 
 #[derive(Debug)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 struct ControlOutput {
     code: Option<i32>,
     stdout: Vec<u8>,
@@ -192,9 +193,9 @@ impl ContainerEgressBoundary {
                 NO_PROXY_ENV,
                 NO_PROXY_VALUE,
             );
-            return Err(EngineError::Backend(
+            Err(EngineError::Backend(
                 "container per-host egress is supported only on macOS and Linux".to_string(),
-            ));
+            ))
         }
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -790,6 +791,7 @@ fn output_text(output: &ControlOutput) -> String {
     crate::command_exec::last_chars_local(text.trim(), 1200)
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn owner_identity_hash(pid: i32) -> Option<String> {
     crate::event_log::process_identity_token(pid).map(|identity| {
         let digest = Sha256::digest(identity.as_bytes());

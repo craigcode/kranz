@@ -693,7 +693,7 @@ fn same_egress(actual: &[String], expected: &[&str]) -> bool {
     actual == expected
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(unix, test))]
 fn private_credential(path: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
