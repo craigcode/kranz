@@ -2,18 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
+import { isRevisableStatus, pendingRevision as selectPendingRevision } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
-import type { MissionStatus } from '../lib/types';
 
-const REVISABLE: ReadonlySet<MissionStatus> = new Set([
-  'approved',
-  'running',
-  'paused',
-  'blocked',
-  'validating',
-]);
-
-export function RevisionPanel() {
+export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
   const state = useKranzStore((s) => s.state);
   const [instructions, setInstructions] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -22,12 +14,12 @@ export function RevisionPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const mission = state?.mission ?? null;
-  const pending = state?.pendingRevision;
+  const pending = selectPendingRevision(state);
   const missionId = mission?.id ?? null;
-  const pendingRevision = pending?.revision ?? null;
+  const pendingRevisionNum = pending?.revision ?? null;
 
   useEffect(() => {
-    if (missionId === null || pendingRevision === null) {
+    if (missionId === null || pendingRevisionNum === null) {
       setDiff(null);
       setError(null);
       return;
@@ -46,9 +38,9 @@ export function RevisionPanel() {
     return () => {
       cancelled = true;
     };
-  }, [missionId, pendingRevision]);
+  }, [missionId, pendingRevisionNum]);
 
-  if (mission === null || !REVISABLE.has(mission.status)) return null;
+  if (mission === null || !isRevisableStatus(mission.status)) return null;
 
   const requestRevision = async () => {
     const trimmed = instructions.trim();
@@ -58,6 +50,7 @@ export function RevisionPanel() {
     try {
       await api.requestRevision(mission.id, trimmed);
       setInstructions('');
+      onActed?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -66,7 +59,7 @@ export function RevisionPanel() {
   };
 
   const decide = async (kind: 'approve' | 'reject') => {
-    if (pending === undefined) return;
+    if (pending === null) return;
     setDecisionBusy(kind);
     setError(null);
     try {
@@ -75,6 +68,7 @@ export function RevisionPanel() {
       } else {
         await api.rejectRevision(mission.id, pending.revision);
       }
+      onActed?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -86,9 +80,9 @@ export function RevisionPanel() {
     <section className="panel panel-revision">
       <div className="section-label">
         Revision
-        {pending !== undefined && <span className="section-count mono">rev {pending.revision}</span>}
+        {pending !== null && <span className="section-count mono">rev {pending.revision}</span>}
       </div>
-      {pending !== undefined ? (
+      {pending !== null ? (
         <div className="revision-body">
           <div className="revision-instructions">{pending.instructions}</div>
           <div className="revision-actions">

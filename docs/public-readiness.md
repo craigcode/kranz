@@ -1,8 +1,10 @@
 # Public-readiness gate
 
-Status (2026-09-14 UTC): **the source repository is public, and v0.2.2 GitHub
-binaries and all four crates.io packages are published**. The v0.2.3 security
-patch is being prepared through the same reviewed release process.
+Status (2026-11-09 UTC): **the source repository is public, and matching v0.5.0
+GitHub binaries and all five crates.io packages (`kranz`, `kranz-acp`,
+`kranz-engine`, `kranz-server`, `kranz-slack`) are published**. Subsequent
+releases continue through the same reviewed release process in
+[`docs/releasing.md`](releasing.md).
 
 The owner authorized the public source snapshot and crates.io publication.
 The first public `main` snapshot was one `Initial commit`; older branch and
@@ -15,9 +17,11 @@ that have actually been published. Source availability is not evidence that
 registry packages or prebuilt binaries exist.
 
 Main branch protection is active. The `release` environment has an owner
-reviewer, and `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`. Both settings were
-rechecked for the v0.2.3 preparation. Every new release still requires the
-source, packaging, platform, provenance, and protected-environment checks.
+reviewer, `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`, and GitHub Private
+Vulnerability Reporting, Secret Scanning, Secret Scanning Push Protection, and
+Dependabot Security Updates are enabled (rechecked for v0.5.0 on 2026-11-09
+UTC). Every new release still requires the source, packaging, platform,
+provenance, and protected-environment checks.
 The historical [owner review packet](reviews/2026-09-06-owner-publication-review.md)
 and [acceptance receipt](reviews/2026-09-06-unattended-acceptance.md) retain their
 original scope and dates. They do not certify artifacts from a later commit.
@@ -105,9 +109,10 @@ new releases still need review of their advertised refs and distribution artifac
 
 The v0.1.0 private-preview binaries predate substantial security hardening and
 remain only in the private archive. The active origin's v0.2.1 tag records an
-unpublished candidate; v0.2.2 has matching published binaries and registry packages.
-The private-preview artifacts must never silently become the supported
-distribution.
+unpublished candidate; public releases from v0.2.2 through v0.5.0 ship matching
+GitHub binaries (with v0.4.4 as a binary-only security hotfix and v0.5.0
+aligning all five crates.io packages). The private-preview artifacts must never
+silently become the supported distribution.
 
 ## GitHub controls
 

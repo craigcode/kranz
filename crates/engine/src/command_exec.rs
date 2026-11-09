@@ -146,7 +146,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 const COMMAND_OUTPUT_TAIL: usize = 1500;
 
 /// Hard cap on one contract `command` assertion at the final gate.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Maximum bytes retained per stream in [`run_with_timeout`]; any additional
 /// output is drained to `std::io::sink()` so a chatty child never blocks on a
@@ -315,9 +315,9 @@ pub(crate) async fn run_shell_command_with_code(
 /// the child's COMPLETE environment, the same trust channel every
 /// validation-contract command runs on.
 ///
-/// All FOUR contract-declared command lanes use this — bootstrap, readiness,
-/// the golden-data hooks, and (since the follow-up review's M-3)
-/// `disk.prune`. They used to inherit the engine's whole ambient environment
+/// Workspace bootstrap, readiness and data hooks use this only when the
+/// operator selected `enforce: off`; enforced missions use the gate wrapper.
+/// These commands used to inherit the engine's whole ambient environment
 /// on the strength of a doc comment about the workspace contract's
 /// `secrets[]` list that nothing actually enforced (2026-09-01 adversarial
 /// audit, H4). Their env is built by

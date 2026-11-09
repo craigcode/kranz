@@ -3,13 +3,14 @@
 
 import { pipelineStage, type PipelineStage, type WorkItem } from './pipelineStage';
 
-export type Lens = 'actionable' | 'backlog' | 'missions' | 'all';
+export type Lens = 'actionable' | 'backlog' | 'missions' | 'all' | 'board';
 
 export const LENSES: ReadonlyArray<{ id: Lens; label: string }> = [
   { id: 'actionable', label: 'Actionable' },
   { id: 'backlog', label: 'Backlog' },
   { id: 'missions', label: 'Missions' },
   { id: 'all', label: 'All' },
+  { id: 'board', label: 'Board' },
 ];
 
 /** The minimal row shape the filter needs; the real PipelineView Row satisfies this structurally. */
@@ -89,6 +90,7 @@ function filterMissions<T extends LensRow>(rows: T[]): T[] {
 export function filterLensRows<T extends LensRow>(rows: T[], lens: Lens): T[] {
   switch (lens) {
     case 'all':
+    case 'board':
       return rows;
     case 'actionable':
       return filterActionable(rows);

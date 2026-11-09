@@ -39,6 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// `GET /api/missions/:id/ws?since=<seq>`
 pub(crate) async fn ws_handler(
+    development: Option<Extension<crate::DevelopmentOrigins>>,
     Extension(read_work): Extension<crate::read_work::ReadWork>,
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
@@ -49,7 +50,12 @@ pub(crate) async fn ws_handler(
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
-    if !crate::ws_origin_allowed(origin, server.bind_addr, server.bind_is_loopback) {
+    if !crate::ws_origin_allowed(
+        origin,
+        server.bind_addr,
+        server.bind_is_loopback,
+        development.is_some_and(|Extension(policy)| policy.0),
+    ) {
         return StatusCode::FORBIDDEN.into_response();
     }
 

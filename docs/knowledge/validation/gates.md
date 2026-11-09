@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -61,7 +61,11 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-09 (UTC): Merged the nine named terminal Docker proofs and ACP v2 admission checks onto v0.5.0 main alongside workspace gate sandboxing and GLib backport checks. Gate contracts and acceptance requirements remain unchanged.
+
 Rechecked 2026-11-07 (UTC): Reconciled the nine named terminal Docker proofs with upstream security and pane regressions. R5 remains open; recoverable terminal-budget receipts do not by themselves establish an attempt-level resource failure or real-adapter qualification.
+
+Rechecked 2026-11-07 against the security audit fixes: all six workspace command lanes use the existing gate sandbox, static dashboard paths use pinned no-follow directory handles, and ordinary serving authenticates reads. CI adds verified GLib source backports, optimized iterator and macro-diagnostic regressions, and a full Linux desktop check. Gate contracts and acceptance requirements remain unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: Ubuntu and macOS CI lanes run the non-vacuous `signal_injection_suite_test` gate proving nonced untrusted signal fences hold and `signal-proposal: unconsented` tickets refuse draft, approve, queue, and scheduling, while `commands.rs` adds `kranz signal` and `kranz draft --consent-signal`.
 

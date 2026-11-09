@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -41,7 +41,11 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal budgets and v2 host admission onto v0.5.0 main alongside workspace containment and Trajectory Board changes. Pipeline stages and event schemas are unchanged.
+
 Rechecked 2026-11-07 (UTC): Reconciled ACP R4 with current main: upstream tool-call subject tracking and read-only pane contracts coexist with atomic terminal reservations and independent control accounting. Released profiles still refuse terminal capability; pipeline stages and event schemas are unchanged.
+
+Rechecked 2026-11-07 against workspace containment: the provider carries the resolved worker gate policy into bootstrap, readiness and all local data hooks. Commands run through the existing bounded sandbox runner before workers start and between rounds; sandbox resolution failures refuse execution. Lifecycle and event contracts remain unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline (`docs/scoping/signal-intake.md`): external monitoring signals stop at undrafted `signal-proposal: unconsented` tickets (`queue::enqueue`, draft, approve, and scheduling refuse them until explicit operator consent), `outcomes` adds read-only `signal_consent_latency`, and `paths::open_read_nofollow_weaker_tier` opens canonical parents directly before no-follow leaf resolution. Mission pipeline stages and `events.jsonl` schemas are unchanged.
 

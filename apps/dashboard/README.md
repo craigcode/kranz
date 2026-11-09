@@ -19,12 +19,13 @@ npm install
 npm run build          # emits apps/dashboard/dist
 npm run sync-embedded  # updates the CLI's committed release bundle
 
-kranz serve --open     # serves the API + the dist bundle, opens a browser
+kranz serve --dashboard "$PWD/dist" --open  # explicitly serve this trusted build
 ```
 
 For frontend iteration you can also run `npm run dev` (Vite on
-`http://localhost:5173`) alongside `kranz serve`; the server sends permissive
-CORS headers, so the dev page can call the API directly.
+`http://localhost:5173`) alongside `kranz serve --dev-origins`. Only the
+explicit development launch admits Vite/Tauri dev origins; reads still require
+the printed read-only or mutation token. Release builds use bundled assets.
 
 ## Desktop mode (Tauri)
 

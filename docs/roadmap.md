@@ -290,11 +290,11 @@ Sgian owns pane presentation, while Kranz owns mission authority and evidence.
 - [x] [Boundary and consumer spike](../.kranz/tickets/shared-acp-boundary-spike.md) — PR #82.
 - [x] [Client extraction](../.kranz/tickets/shared-acp-client-extraction.md) — PR #82.
 - [x] [Contained terminal-provider contract](../.kranz/tickets/acp-contained-terminal-provider.md) — [synthetic proof and review](reviews/2026-09-25-contained-acp-terminals.md); production admission remains closed.
-- [ ] [ACP recovery and credential lifecycle](../.kranz/tickets/acp-recovery-and-credential-lifecycle.md).
-- [ ] [ACP resource-budget qualification](../.kranz/tickets/acp-resource-budget-qualification.md), before Sgian terminal rollout.
+- [x] [ACP recovery and credential lifecycle](../.kranz/tickets/acp-recovery-and-credential-lifecycle.md) — PR #138.
+- [ ] [ACP resource-budget qualification](../.kranz/tickets/acp-resource-budget-qualification.md), before Sgian terminal rollout — R1–R4 landed; R5 terminal qualification remains open.
 - [x] [Conclusive container denial proof receipts](../.kranz/tickets/container-denial-proof-receipts.md).
-- [ ] [Sgian integration qualification](../.kranz/tickets/acp-sgian-terminal-qualification.md).
-- [ ] [Pinned adapter qualification](../.kranz/tickets/acp-terminal-adapter-qualification.md).
+- [x] [Sgian integration qualification](../.kranz/tickets/acp-sgian-terminal-qualification.md) — PR #138.
+- [x] [Pinned adapter qualification](../.kranz/tickets/acp-terminal-adapter-qualification.md) — PR #138.
 
 Ticket frontmatter owns ordering and dependencies. No live-provider run, host
 execution fallback, prompt ownership transfer or release is authorized by this

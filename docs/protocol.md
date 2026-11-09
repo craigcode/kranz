@@ -61,7 +61,7 @@ Absent fields retain legacy behavior.
 | `GET /api/missions/:id/diff-stat` | `{"diffStat", "baseSha", "tip"}` — `git diff --stat` of the pinned `base_sha` (set at plan approval) against the mission branch tip. 404 if the plan is not approved yet (no `base_sha`) or the mission branch does not exist yet |
 | `GET /api/missions/:id/pr-handoff` | PR handoff for a COMPLETE mission (never pushes): `{"kind":"needsPush","command",…}` \| `{"kind":"readyToCreate",…}` \| `{"kind":"unavailable","reason"}`. Probes whether `origin` advertises the mission branch (`git ls-remote`); missing remote branch → copyable `git push` only |
 | `POST /api/missions/:id/pr-handoff/create` | runs `gh pr create` only when handoff is `readyToCreate` (remote branch already present). Never `git push`. `409` otherwise |
-| `GET /api/missions/:id/readiness` | backend readiness probe for the mission's config: `{"missionId","roles":[{role,backend,status,detail,nextAction}],"overall","warnings"}`. Status enum: `ok` / `missing` / `unauthenticated` / `rate_limited` / `unsupported` / `unknown` / `meterless`. Tokenless |
+| `GET /api/missions/:id/readiness` | backend readiness probe for the mission's config: `{"missionId","roles":[{role,backend,status,detail,nextAction}],"overall","warnings"}`. Status enum: `ok` / `missing` / `unauthenticated` / `rate_limited` / `unsupported` / `unknown` / `meterless`. Requires read authority |
 | `GET /api/missions/:id/runs/:runId/transcript` | JSONL parsed into a JSON array of raw stream values (404 if missing) |
 | `GET /api/missions/:id/hook-status` | the EPHEMERAL hook-signal projection (ticket `agent-hooks-status-signals`): `{"missionId","authoritative":false,"note","runs":[{"runId","registeredAt","signal":{"signal","detail","receivedAt"}?}]}`. Signals are hook-derived lifecycle hints (`running` / `needs-input` / `interrupted` / `turn-finished`) re-read per request from the gitignored `.kranz/hook-status/` runtime dir — observability only, NEVER folded mission state; `authoritative` is always `false`. 404 for an unknown mission |
 | `POST /api/missions/:id/permission/answer` | body `{"requestId","bindingDigest","allow"}` → `202 {"queued":true}`; exact pending one-call consent, mutation authority required. Unknown/stale/expired/prohibited allows are `409`; extra actor fields rejected. See [live permissions](acp-live-permissions.md). |
@@ -161,9 +161,12 @@ observable/resumable from anywhere.
 ## Authority: mutation token
 
 Every `POST /api/...` requires the per-serve session token via the
-`x-kranz-token` header. GETs and WS stay tokenless on the default loopback
-posture; `--read-auth` or any non-loopback bind gates them with either the
-mutation token or the separate read-only token described below.
+`x-kranz-token` header. CLI serving requires authentication for GET/HEAD and
+WebSocket upgrades on every bind, including loopback, using either the mutation
+token or the separate read-only token described below. `/api/health` remains
+public. `--read-auth` is retained as a compatibility flag and is enabled by
+default. Development origins on localhost ports 5173/1420 require
+`--dev-origins`; normal serving admits its own origin and the Tauri app.
 Human review packets and `report.md?review=true` requests always
 require a header capability, even on loopback; see [human review packets](review-packets.md).
 ONE exemption: `POST /api/hooks/github` (and its repo-scoped twin) — GitHub
@@ -172,7 +175,7 @@ HMAC signature and refuses closed when unconfigured (see §Webhooks).
 The token is generated at serve start (or passed in by the embedding Tauri
 shell) and printed to the operator. `--open` launches the bare URL with no
 token in it (a URL is argv, and argv is world-readable); the dashboard shows
-a paste-token field when a mutation is attempted without one and stores the
+a paste-token field when an authenticated request is attempted without one and stores the
 pasted token in sessionStorage. Missing/wrong
 token → `401 {"error":"missing or invalid token"}`. Rationale: 127.0.0.1
 binding + CORS stop the network and the browser; the token stops other local
@@ -198,8 +201,7 @@ and stores it next to the mutation token with the same `0600` discipline:
 Pinned tokens must be non-empty visible ASCII without whitespace, and the read
 token must differ from the mutation token. The CLI rejects invalid values before
 binding, starting workers, printing credentials, or writing either token file.
-Wherever the read gate is armed (`--read-auth`, or any non-loopback bind),
-GET/HEAD `/api/...` and the WS upgrade accept EITHER token via
+With the default CLI read gate (and every non-loopback bind), GET/HEAD `/api/...` and the WS upgrade accept EITHER token via
 `x-kranz-token`, but `?token=` accepts ONLY the read token. Mutation tokens
 in query strings no longer authenticate as of v0.2.1. Mutating routes accept
 ONLY the mutation token

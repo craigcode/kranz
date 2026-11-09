@@ -1,5 +1,11 @@
 # M6 scoping — Workspace contract and provider seam
 
+Implementation update (2026-11-07): local bootstrap, readiness, and all data
+hooks now run through the mission's resolved gate sandbox. Requested containment
+fails closed; `enforce: off` remains the explicit environment-only posture.
+Container `disk.prune` host-shell hints are refused before provisioning. Destroy
+uses only the existing mission-owned Compose project/volume cleanup.
+
 Status: **accepted** 2026-07-25 — D-A…D-H accepted as proposed, with two
 implementation notes recorded below and one delivery re-sequence
 (`workspace-provider-pin-at-approval` ahead of `local-container-workspace`).

@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -23,7 +23,11 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal-budget vocabulary and v2 admission notes onto v0.5.0 main; role boundaries and mission lifecycle terms remain unchanged.
+
 Rechecked 2026-11-07 (UTC): Reconciled the typed terminal-budget vocabulary with upstream pane observation types. A read-only pane binding conveys no execution authority, and resource/terminal implementation does not establish R5 qualification.
+
+Rechecked 2026-11-07 against the AGENTS.md reference extraction and security invariant update. The containment guidance moved to its own knowledge note; vocabulary and lesson capture rules are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: undrafted `signal-proposal: unconsented` tickets and Slack `SignalProposalReady` cards extend intake and human consent without changing existing role or mission lifecycle vocabulary.
 

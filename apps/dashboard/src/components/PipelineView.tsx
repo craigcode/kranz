@@ -4,77 +4,20 @@
 // selected. Every ticket is a row; every mission with no originating ticket
 // ("kranz new") is also a row, so nothing in progress is hidden.
 
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { useKranzStore } from '../lib/store';
 import { RunQueueButton } from './RunQueueButton';
 import { api } from '../lib/api';
 import { renderMarkdown } from '../lib/markdown';
+import { buildRows, type Row } from '../lib/pipelineRows';
 import { pipelineStage, primaryAction, parseEstimateFromPlanMd } from '../lib/pipelineStage';
-import type { WorkItem, WorkItemMission } from '../lib/pipelineStage';
-import type { MissionSummary, TicketSummary } from '../lib/types';
 import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilter';
 import { missionHash, repoHash, ticketHash } from '../lib/routes';
 import { OutcomesPanel } from './OutcomesPanel';
 import { FlightSurgeonPanel } from './FlightSurgeonPanel';
 import { SignalsPanel } from './SignalsPanel';
 
-interface Row {
-  key: string;
-  item: WorkItem;
-  id: string;
-  title: string;
-  isBlocked: boolean;
-  blockedBy: string[];
-  isUnconsentedSignal?: boolean;
-  missionId?: string;
-  slug?: string;
-  missionCreatedAt?: string;
-}
-
-function toWorkItemMission(m: MissionSummary): WorkItemMission {
-  return { status: m.status as WorkItemMission['status'], merged: m.merged ?? null };
-}
-
-function buildRows(tickets: TicketSummary[], missions: MissionSummary[]): Row[] {
-  const missionsById = new Map(missions.map((m) => [m.id, m]));
-  const consumedMissionIds = new Set<string>();
-
-  const ticketRows: Row[] = tickets.map((t) => {
-    const mission = t.missionId !== null ? missionsById.get(t.missionId) : undefined;
-    if (mission !== undefined) consumedMissionIds.add(mission.id);
-    return {
-      key: `ticket-${t.slug}`,
-      item: {
-        kind: 'ticket',
-        ticket: { slug: t.slug, state: t.state },
-        mission: mission !== undefined ? toWorkItemMission(mission) : undefined,
-      },
-      id: t.slug,
-      title: t.title,
-      isBlocked: t.isBlocked,
-      blockedBy: t.blockedBy,
-      isUnconsentedSignal: t.signalProposal === 'unconsented',
-      missionId: t.missionId ?? undefined,
-      slug: t.slug,
-      missionCreatedAt: mission?.createdAt,
-    };
-  });
-
-  const missionRows: Row[] = missions
-    .filter((m) => m.status !== 'deleted' && !consumedMissionIds.has(m.id))
-    .map((m) => ({
-      key: `mission-${m.id}`,
-      item: { kind: 'mission', mission: toWorkItemMission(m) },
-      id: m.id,
-      title: m.goal,
-      isBlocked: false,
-      blockedBy: [],
-      missionId: m.id,
-      missionCreatedAt: m.createdAt,
-    }));
-
-  return [...ticketRows, ...missionRows];
-}
+const LazyBoardLens = lazy(() => import('./BoardLens'));
 
 /** Reviewable rows: the persisted plan + cost estimate, read inline off
  *  `GET /api/missions/:id/plan.md` — no navigation away from the pipeline. */
@@ -118,6 +61,72 @@ function ReviewablePlan({ missionId }: { missionId: string }) {
       )}
       {renderMarkdown(markdown)}
     </div>
+  );
+}
+
+/** Shared reviewable ticket row (plan + persisted cost estimate + Queue for run),
+ *  rendered both in the PipelineView list and beside the Trajectory Board (slice 6). */
+export function ReviewableTicketRow({
+  row: r,
+  onQueued,
+}: {
+  row: Row;
+  onQueued?: () => void;
+}) {
+  const approveTicket = useKranzStore((s) => s.approveTicket);
+  const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
+  const action = primaryAction('reviewable');
+  const busy = r.slug !== undefined && ticketBusySlug === r.slug;
+  const title = r.isBlocked ? `blocked by ${r.blockedBy.join(', ')}` : 'queue for run';
+  const showBlockedBadge = r.blockedBy.length > 0 && r.isBlocked;
+  const missionId =
+    r.item.kind === 'mission' || r.item.mission !== undefined ? r.missionId : undefined;
+
+  return (
+    <>
+      <div className="picker-item-header">
+        <div className="picker-row">
+          <span className="status-pill pill-reviewable">
+            <span className="status-dot" aria-hidden="true" />
+            reviewable
+          </span>
+          {missionId !== undefined ? (
+            <a className="mono picker-id" href={missionHash(missionId)}>
+              {r.id}
+            </a>
+          ) : (
+            <span className="mono picker-id">{r.id}</span>
+          )}
+          <span className="picker-goal">{r.title}</span>
+          {showBlockedBadge && (
+            <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
+              blocked by {r.blockedBy.join(', ')}
+            </span>
+          )}
+        </div>
+        {r.slug !== undefined && (
+          <button
+            type="button"
+            className="btn-small pipeline-primary-action"
+            disabled={r.isBlocked || ticketBusySlug !== null}
+            title={title}
+            onClick={() => {
+              void approveTicket(r.slug!, false).then(() => {
+                onQueued?.();
+              });
+            }}
+          >
+            {busy ? 'Queuing…' : 'Queue for run'}
+          </button>
+        )}
+        {r.slug !== undefined && action?.secondary !== undefined && (
+          <a className="btn-small pipeline-secondary-action" href={ticketHash(r.slug)}>
+            {action.secondary}
+          </a>
+        )}
+      </div>
+      {r.missionId !== undefined && <ReviewablePlan missionId={r.missionId} />}
+    </>
   );
 }
 
@@ -271,7 +280,13 @@ function IterateControl({ missionId, className }: { missionId: string; className
   );
 }
 
-export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Lens }) {
+export function PipelineView({
+  initialLens = 'actionable',
+  boardDemo = false,
+}: {
+  initialLens?: Lens;
+  boardDemo?: boolean;
+}) {
   const repoId = useKranzStore((s) => s.repoId);
   const tickets = useKranzStore((s) => s.tickets);
   const ticketsError = useKranzStore((s) => s.ticketsError);
@@ -285,9 +300,10 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
   const [lens, setLens] = useState<Lens>(initialLens);
 
   useEffect(() => {
+    if (boardDemo || initialLens === 'board') return;
     void loadTickets();
     void loadMissions();
-  }, [loadTickets, loadMissions]);
+  }, [boardDemo, initialLens, loadTickets, loadMissions]);
 
   useEffect(() => {
     setLens(initialLens);
@@ -437,6 +453,13 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
 
   const row = (r: Row) => {
     const stage = pipelineStage(r.item);
+    if (stage === 'reviewable' && r.slug !== undefined) {
+      return (
+        <li key={r.key} className="picker-item picker-item--stacked">
+          <ReviewableTicketRow row={r} />
+        </li>
+      );
+    }
     const showBlockedBadge =
       (stage === 'captured' || stage === 'reviewable') && r.blockedBy.length > 0 && r.isBlocked;
 
@@ -475,9 +498,11 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
     );
   };
 
+  const isBoard = lens === 'board';
+
   return (
-    <div className="picker">
-      <div className="picker-box">
+    <div className={'picker' + (isBoard ? ' picker--board' : '')}>
+      <div className={'picker-box' + (isBoard ? ' picker-box--board' : '')}>
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
           {repoId !== null && (
@@ -541,25 +566,33 @@ export function PipelineView({ initialLens = 'actionable' }: { initialLens?: Len
             </button>
           ))}
         </div>
-        <RunQueueButton />
-        {lens === 'actionable' && landedCount(rows) > 0 && (
-          <button
-            type="button"
-            className="lens-landed-hint"
-            onClick={() => setLens('all')}
-          >
-            Landed ({landedCount(rows)}) — view all
-          </button>
+        {!boardDemo && <RunQueueButton />}
+        {isBoard ? (
+          <Suspense fallback={<div className="dim picker-empty">Loading board…</div>}>
+            <LazyBoardLens demo={boardDemo && lens === 'board'} />
+          </Suspense>
+        ) : (
+          <>
+            {lens === 'actionable' && landedCount(rows) > 0 && (
+              <button
+                type="button"
+                className="lens-landed-hint"
+                onClick={() => setLens('all')}
+              >
+                Landed ({landedCount(rows)}) — view all
+              </button>
+            )}
+            {ticketsError === null && missionsError === null && rows.length === 0 && (
+              <div className="dim picker-empty" role="status">
+                No work items found. Create one with <code>kranz ticket new</code>.
+              </div>
+            )}
+            <ul className="picker-list">{visibleRows.map(row)}</ul>
+            <SignalsPanel />
+            <FlightSurgeonPanel />
+            <OutcomesPanel />
+          </>
         )}
-        {ticketsError === null && missionsError === null && rows.length === 0 && (
-          <div className="dim picker-empty" role="status">
-            No work items found. Create one with <code>kranz ticket new</code>.
-          </div>
-        )}
-        <ul className="picker-list">{visibleRows.map(row)}</ul>
-        <SignalsPanel />
-        <FlightSurgeonPanel />
-        <OutcomesPanel />
       </div>
     </div>
   );
