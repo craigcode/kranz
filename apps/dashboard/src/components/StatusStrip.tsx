@@ -3,6 +3,7 @@
 // feature-progress bar.
 
 import { useEffect, useState } from 'react';
+import { isMissionBlocked } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
 import { isApprovedIdle } from '../lib/startAffordance';
 import type { MissionStatus } from '../lib/types';
@@ -65,8 +66,9 @@ export function StatusStrip() {
   const done = features.filter((f) => f.status === 'complete').length;
   const pct = features.length > 0 ? (done / features.length) * 100 : 0;
 
+  const isBlocked = isMissionBlocked(state);
   let blockedReason: string | null = null;
-  if (status === 'blocked') {
+  if (isBlocked) {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.type === 'milestone.blocked') {
@@ -165,7 +167,7 @@ export function StatusStrip() {
           </button>
         ))}
 
-      {status === 'blocked' && (
+      {isBlocked && (
         <span className="strip-reason">
           {blockedReason ?? 'milestone blocked'}
           <span className="strip-hint"> — send a message to unblock</span>

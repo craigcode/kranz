@@ -12,9 +12,10 @@ import type { PrHandoff } from '../lib/types';
 interface Props {
   missionId: string;
   status: string;
+  onMerged?: () => void;
 }
 
-export function DeliveredPanel({ missionId, status }: Props) {
+export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   const [merged, setMerged] = useState<boolean | null>(null);
   const [reportMarkdown, setReportMarkdown] = useState<string | null>(null);
   const [diffStat, setDiffStat] = useState<string | null>(null);
@@ -69,12 +70,13 @@ export function DeliveredPanel({ missionId, status }: Props) {
       .merge(missionId)
       .then(() => {
         setMerged(true);
+        onMerged?.();
       })
       .catch((err: unknown) => {
         setError(err instanceof ApiError ? err.message : String(err));
       })
       .finally(() => setMerging(false));
-  }, [missionId]);
+  }, [missionId, onMerged]);
 
   const onCreatePr = useCallback(() => {
     setError(null);

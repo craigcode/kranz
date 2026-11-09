@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Lazy-loaded BoardLens, routes, and lensFilter shipped with visibility-aware GET-only polling.
 title: Trajectory board 3: a Board lens listing everything waiting on the operator
 priority: 3
 schedule: once

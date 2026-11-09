@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Pure flightPlan module and 14 unit tests shipped in apps/dashboard/src/lib/board/flightPlan.ts.
 title: Trajectory board 1: the flight plan as pure typed modules
 priority: 3
 schedule: once

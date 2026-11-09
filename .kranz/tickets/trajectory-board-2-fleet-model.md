@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Fleet model and shared pendingAsks predicates shipped in apps/dashboard/src/lib/board/fleet.ts and apps/dashboard/src/lib/pendingAsks.ts.
 title: Trajectory board 2: fleet model and one definition of a pending ask
 priority: 3
 schedule: once

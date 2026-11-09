@@ -10,17 +10,18 @@
 
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { pendingGrant } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
 
-export function GrantRequestPanel() {
+export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
   const state = useKranzStore((s) => s.state);
   const [busy, setBusy] = useState<'approve' | 'deny' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const mission = state?.mission ?? null;
-  const pending = state?.pendingGrantRequest;
+  const pending = pendingGrant(state);
 
-  if (mission === null || pending === undefined) return null;
+  if (mission === null || pending === null) return null;
 
   const blurb =
     pending.kind === 'touch-path'
@@ -40,6 +41,7 @@ export function GrantRequestPanel() {
       } else {
         await api.denyGrant(mission.id, pending.command);
       }
+      onActed?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

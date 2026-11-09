@@ -1,8 +1,8 @@
 # Trajectory board: a Board lens on the pipeline view (scoping)
 
-Status: scoped 2026-10-08; operator decisions `D-A`–`D-G` recorded 2026-11-06.
-Review this note before drafting any `trajectory-board-*` ticket. Reference
-prototype: [`trajectory-board-prototype/`](trajectory-board-prototype/README.md).
+Status: scoped 2026-10-08; operator decisions `D-A`–`D-G` recorded 2026-11-06;
+slices 1–4 and 6 implemented 2026-11-08 (reference prototype folder removed on completion).
+Review this note before drafting any `trajectory-board-*` ticket.
 
 ## Why
 

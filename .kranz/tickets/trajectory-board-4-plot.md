@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: 2D Canvas BoardPlot, plot layout helpers, and deterministic demo route (#/board/demo) shipped.
 title: Trajectory board 4: the 2D plot and a scripted demo route
 priority: 3
 schedule: once

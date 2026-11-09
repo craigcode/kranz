@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { hasAmbiguous, visible } from '../lib/presentation';
 import { api } from '../lib/api';
+import { pendingPermissions } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
 import { useNow } from '../lib/useNow';
 import type { LivePermission } from '../lib/types';
 
-function PermissionCard({ record }: { record: LivePermission }) {
+function PermissionCard({ record, onActed }: { record: LivePermission; onActed?: () => void }) {
   const [busy, setBusy] = useState(false);
   const [queued, setQueued] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -20,6 +21,7 @@ function PermissionCard({ record }: { record: LivePermission }) {
     try {
       await api.answerPermission(binding.missionId, proposal.id, bindingDigest, allow);
       setQueued(true);
+      onActed?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -54,10 +56,9 @@ function PermissionCard({ record }: { record: LivePermission }) {
   );
 }
 
-export function PermissionRequestPanel() {
-  const records = useKranzStore((s) => s.state?.permissions);
+export function PermissionRequestPanel({ onActed }: { onActed?: () => void } = {}) {
+  const state = useKranzStore((s) => s.state);
   const now = useNow();
-  return <>{Object.values(records ?? {})
-    .filter((r) => !r.resolution && !r.closed && Date.parse(r.request.proposal.deadline) > now)
-    .map((record) => <PermissionCard key={record.request.proposal.id} record={record} />)}</>;
+  return <>{pendingPermissions(state, now)
+    .map((record) => <PermissionCard key={record.request.proposal.id} record={record} onActed={onActed} />)}</>;
 }

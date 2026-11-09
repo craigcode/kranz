@@ -1,5 +1,6 @@
 ---
-state: open
+state: done
+state-note: Act-in-place beside the board shipped in BoardLens reusing existing ask-owner panels with zero new POST call sites.
 title: Trajectory board 6: answer an ask beside the board by reusing its owner
 priority: 3
 schedule: once

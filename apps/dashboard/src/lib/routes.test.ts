@@ -29,4 +29,28 @@ describe('multi-repository dashboard routes', () => {
       id: '%E0%A4%A',
     });
   });
+
+  it('trajectory board routes parse unscoped and repo-scoped hashes to the Board lens', () => {
+    expect(parseHash('#/board')).toEqual({ view: 'pipeline', repoId: null, lens: 'board' });
+    expect(parseHash('#/r/alpha/board')).toEqual({
+      view: 'pipeline',
+      repoId: 'alpha',
+      lens: 'board',
+    });
+  });
+
+  it('trajectory demo routes parse unscoped and repo-scoped hashes to the Board lens in demo mode', () => {
+    expect(parseHash('#/board/demo')).toEqual({
+      view: 'pipeline',
+      repoId: null,
+      lens: 'board',
+      boardDemo: true,
+    });
+    expect(parseHash('#/r/alpha/board/demo')).toEqual({
+      view: 'pipeline',
+      repoId: 'alpha',
+      lens: 'board',
+      boardDemo: true,
+    });
+  });
 });
