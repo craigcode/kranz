@@ -175,7 +175,7 @@ fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
 /// is killed). Synchronous and runtime-free so it is callable from inside the
 /// ambient tokio runtime; stdout and stderr are drained concurrently on reader
 /// threads so output exceeding the OS pipe buffer never deadlocks `try_wait`.
-#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn run_with_timeout(
     program: &std::path::Path,
     args: &[String],

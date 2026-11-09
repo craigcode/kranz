@@ -147,7 +147,6 @@ pub(crate) fn validate_env_map(env: &std::collections::HashMap<String, String>) 
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn validate_ambient_docker_env() -> Result<()> {
     for (raw_key, raw_val) in std::env::vars_os() {
         let key = raw_key.to_string_lossy();
