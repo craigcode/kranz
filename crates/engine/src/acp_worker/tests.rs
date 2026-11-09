@@ -261,13 +261,13 @@ fn acp_profile_private_sources_reject_links_permissions_and_unbounded_data() {
     assert!(private_credential(dir.path()).is_err());
 }
 
-#[test]
+#[tokio::test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn acp_profile_preparation_limits_seeding_and_removes_private_state() {
+async fn acp_profile_preparation_limits_seeding_and_removes_private_state() {
     let f = Fixture::new();
     let original = std::fs::read(&f.profile.credential_file).unwrap();
     let mut spec = f.spec();
-    let mut prepared = f.profile.prepare(&mut spec).unwrap();
+    let mut prepared = f.profile.prepare(&mut spec).await.unwrap();
     let home = spec.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
     assert_eq!(
         std::fs::read(home.join(".codex/auth.json")).unwrap(),
@@ -291,15 +291,15 @@ fn acp_profile_preparation_limits_seeding_and_removes_private_state() {
     assert!(!home.exists());
     assert_eq!(std::fs::read(&f.profile.credential_file).unwrap(), original);
     let mut spec = f.spec();
-    let prepared = f.profile.prepare(&mut spec).unwrap();
+    let prepared = f.profile.prepare(&mut spec).await.unwrap();
     let dropped_home = spec.sandbox.unwrap().inputs.tmpdir;
     drop(prepared);
     assert!(!dropped_home.exists());
 }
 
-#[test]
+#[tokio::test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
+async fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
     let f = Fixture::new();
     let mut missing = f.profile.clone();
     missing.credential_file = f._dir.path().join("absent");
@@ -343,6 +343,7 @@ fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
         };
         let error = missing
             .prepare(&mut spec)
+            .await
             .err()
             .expect("drift refused")
             .to_string();
@@ -356,6 +357,7 @@ fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
     private_write(&in_repo.credential_file, b"{}").unwrap();
     assert!(in_repo
         .prepare(&mut f.spec())
+        .await
         .err()
         .unwrap()
         .to_string()
@@ -371,13 +373,13 @@ fn acp_profile_runtime_refuses_drift_before_reading_credentials() {
         br#"{"tokens":{}}"#,
     ] {
         std::fs::write(&f.profile.credential_file, bytes).unwrap();
-        assert!(f.profile.prepare(&mut f.spec()).is_err());
+        assert!(f.profile.prepare(&mut f.spec()).await.is_err());
     }
 }
 
-#[test]
+#[tokio::test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn acp_profile_egress_grant_refusal_names_fixed_allowlist_without_reading_credentials() {
+async fn acp_profile_egress_grant_refusal_names_fixed_allowlist_without_reading_credentials() {
     let f = Fixture::new();
     let mut profile = f.profile.clone();
     profile.credential_file = f._dir.path().join("absent");
@@ -390,6 +392,7 @@ fn acp_profile_egress_grant_refusal_names_fixed_allowlist_without_reading_creden
         .push("sensitive-destination.invalid:443".into());
     let error = profile
         .prepare(&mut spec)
+        .await
         .err()
         .expect("grant must not widen profile")
         .to_string();
@@ -1031,9 +1034,9 @@ fn acp_profile_gate_checks_are_offline_without_changing_worker_access() {
     assert!(crate::command_exec::worker_gate_sandbox(&drift).is_err());
 }
 
-#[test]
+#[tokio::test]
 #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-fn acp_profile_claude_uses_only_explicit_oauth_and_private_empty_home() {
+async fn acp_profile_claude_uses_only_explicit_oauth_and_private_empty_home() {
     let f = Fixture::new();
     let mut p = f.profile.clone();
     p.id = CLAUDE.into();
@@ -1053,7 +1056,7 @@ fn acp_profile_claude_uses_only_explicit_oauth_and_private_empty_home() {
         .iter()
         .map(|s| (*s).into())
         .collect();
-    let mut prepared = p.prepare(&mut spec).unwrap();
+    let mut prepared = p.prepare(&mut spec).await.unwrap();
     assert_eq!(
         spec.env["CLAUDE_CODE_OAUTH_TOKEN"],
         "synthetic-claude-oauth-no-authority"
@@ -1072,7 +1075,7 @@ fn acp_profile_claude_uses_only_explicit_oauth_and_private_empty_home() {
         br#"{"credentialEnv":"ANTHROPIC_API_KEY","value":"synthetic-claude-oauth-no-authority"}"#,
     )
     .unwrap();
-    assert!(p.prepare(&mut spec).is_err());
+    assert!(p.prepare(&mut spec).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1137,6 +1140,7 @@ fn acp_profile_refuses_a_credential_split_over_text_frames() {
     let fixture_value = "synthetic-login-no-authority-12345";
     for kind in ["agent_message_chunk", "agent_thought_chunk"] {
         let mut profile = PreparedProfile {
+            admitted_host: None,
             home: None,
             secrets: vec![fixture_value.into()],
             stream_tails: Default::default(),
@@ -1272,17 +1276,172 @@ fn acp_profile_resource_overrides_preserve_config_authority_and_wire_shape() {
             }
         }
     }
-    for id in ["claude-acp-0.77.0-arm64-v2", "codex-acp-1.11.0-arm64-v2"] {
-        assert!(
-            profile(id).definition().is_err(),
-            "unqualified production revision: {id}"
-        );
+}
+
+#[test]
+fn acp_v2_admission_is_opt_in_and_only_accepts_the_exact_qualified_limits() {
+    for id in [CLAUDE_V2, CODEX_V2] {
+        let mut p = profile(id);
+        let definition = p.definition().unwrap();
+        assert_eq!(definition.image, RESOURCE_IMAGE);
+        assert_eq!(p.effective_resources().unwrap(), Some(RESOURCE_LIMITS));
+        for os in ["macos", "linux", "windows"] {
+            for arch in ["aarch64", "x86_64"] {
+                assert_eq!(
+                    p.validate_target(os, arch).is_ok(),
+                    os == "macos" && arch == "aarch64"
+                );
+            }
+        }
+        for (field, selected) in serde_json::to_value(RESOURCE_LIMITS)
+            .unwrap()
+            .as_object()
+            .unwrap()
+        {
+            let selected = selected.as_u64().unwrap();
+            for value in [0, selected - 1, selected, selected + 1, u32::MAX as u64] {
+                p.resources = Some(serde_json::from_value(json!({field:value})).unwrap());
+                let result = p.effective_resources();
+                if value == selected {
+                    assert_eq!(result.unwrap(), Some(RESOURCE_LIMITS));
+                } else {
+                    assert!(result.unwrap_err().to_string().contains(field));
+                }
+            }
+        }
+        let mut changed = definition;
+        changed.qualification = None;
+        assert_ne!(definition.sha256(), changed.sha256());
     }
 }
 
 #[test]
+fn acp_v2_admission_preserves_v1_definition_bytes() {
+    for id in [CLAUDE, CODEX] {
+        let definition = profile(id).definition().unwrap();
+        // Exact pre-v2 serialized field order and values, including null resources.
+        let old = if id == CLAUDE {
+            r#"{"program":"/usr/local/bin/node","args":["/opt/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"],"image":"sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743","egress":["api.anthropic.com:443","claude.ai:443"],"claude":true,"resources":null}"#
+        } else {
+            r#"{"program":"/opt/acp/node_modules/.bin/codex-acp","args":[],"image":"sha256:5d0f56837d3b506013d47da6f3294cf90f24b4e4dbaf2079828d75522167b743","egress":["chatgpt.com:443","auth.openai.com:443","api.openai.com:443"],"claude":false,"resources":null}"#
+        };
+        assert_eq!(serde_json::to_string(&definition).unwrap(), old);
+        assert_eq!(
+            definition.sha256(),
+            crate::standards_waiver::sha256_hex(old.as_bytes())
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[ignore = "requires the exact qualified local Colima host and installed v2 image; synthetic credentials only"]
+#[allow(clippy::await_holding_lock)]
+async fn acp_v2_admission_real_host_seeds_synthetic_credentials_and_removes_namespace() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    assert_eq!(
+        std::env::var("KRANZ_ACP_CONTAINER_TESTS").as_deref(),
+        Ok("1")
+    );
+    let _env = crate::agent_env::EnvTestGuard::engage_unsetting(
+        &[("DOCKER_CONTEXT", "colima")],
+        &["DOCKER_HOST"],
+    );
+    for id in [CODEX_V2, CLAUDE_V2] {
+        let mut f = Fixture::new();
+        f.profile.id = id.into();
+        if id == CLAUDE_V2 {
+            std::fs::write(&f.profile.credential_file, br#"{"credentialEnv":"CLAUDE_CODE_OAUTH_TOKEN","value":"synthetic-claude-oauth-no-authority"}"#).unwrap();
+        }
+        let mut spec = f.spec();
+        spec.sandbox.as_mut().unwrap().inputs.egress = f
+            .profile
+            .definition()
+            .unwrap()
+            .egress
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let mut missing = f.profile.clone();
+        missing.credential_file = f._dir.path().join("absent-credential");
+        std::env::set_var("DOCKER_HOST", "tcp://127.0.0.1:9");
+        let refused = missing.prepare(&mut spec).await.err().unwrap().to_string();
+        assert!(refused.contains("DOCKER_HOST"), "{refused}");
+        assert!(!refused.contains("credential source"));
+        std::env::remove_var("DOCKER_HOST");
+        let mut profile = f.profile.prepare(&mut spec).await.unwrap();
+        // Mutating ambient selection after admission must not redirect launch,
+        // observation or removal; all three retain the admitted client.
+        std::env::set_var("DOCKER_CONTEXT", "nonexistent-v2-context");
+        std::env::set_var("DOCKER_HOST", "tcp://127.0.0.1:9");
+        assert_eq!(profile.resources, Some(RESOURCE_LIMITS));
+        assert_eq!(profile.receipt["hostAdmission"]["endpointPinned"], true);
+        assert_eq!(profile.receipt["fullMissionAcceptanceProven"], false);
+        assert_eq!(profile.receipt["proofs"].as_array().unwrap().len(), 3);
+        // Exercise the production admission-to-container handoff with a local
+        // synthetic command. No provider adapter is started and network is off.
+        spec.sandbox.as_mut().unwrap().inputs.egress.clear();
+        let (mut container, mut command) = crate::acp_container::OwnedContainer::prepare_with_host(
+            &spec, Path::new("/usr/local/bin/python3"),
+            &["-I".into(), "-S".into(), "-c".into(), "import pathlib,time; pathlib.Path('v2-delivery').write_text('synthetic'); time.sleep(0.3); print('v2-admission')".into()],
+            profile.resources, profile.admitted_host.as_ref(),
+        ).await.unwrap();
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        container
+            .write_launch(child.stdin.as_mut().unwrap())
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let removed = container.remove().await;
+        removed.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "v2-admission"
+        );
+        let evidence = container.resource_evidence().unwrap();
+        assert!(evidence.namespace_cleanup_confirmed);
+        assert!(
+            evidence.unavailable.is_empty(),
+            "{:?}",
+            evidence.unavailable
+        );
+        assert_eq!(evidence.limits, RESOURCE_LIMITS);
+        assert!(evidence.sample.as_ref().unwrap().complete);
+        assert_eq!(
+            std::fs::read_to_string(f.workspace.join("v2-delivery")).unwrap(),
+            "synthetic"
+        );
+        assert!(!f.primary.join("v2-delivery").exists());
+        let home = spec.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
+        profile.close().unwrap();
+        assert!(!home.exists());
+        std::env::set_var("DOCKER_CONTEXT", "colima");
+        std::env::remove_var("DOCKER_HOST");
+        eprintln!(
+            "ACP-V2-ADMISSION-PROOF {}",
+            json!({"profile":profile.receipt,"resourceEvidence":evidence})
+        );
+    }
+}
+
+#[tokio::test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_writeback() {
+async fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_writeback() {
     let f = Fixture::new();
     let initial_bytes = std::fs::read(&f.profile.credential_file).unwrap();
     let scratch_dir = f._dir.path().join("scratch-check");
@@ -1295,7 +1454,7 @@ fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_writeback()
     assert!(!receipt_v1.writeback_enabled);
 
     let mut spec1 = f.spec();
-    let mut prepared1 = f.profile.prepare(&mut spec1).unwrap();
+    let mut prepared1 = f.profile.prepare(&mut spec1).await.unwrap();
     let home1 = spec1.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
     let worker_auth = home1.join(".codex/auth.json");
 
@@ -1337,7 +1496,7 @@ fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_writeback()
     assert_ne!(receipt_v1.credential_sha256, receipt_v2.credential_sha256);
 
     let mut spec2 = f.spec();
-    let mut prepared2 = f.profile.prepare(&mut spec2).unwrap();
+    let mut prepared2 = f.profile.prepare(&mut spec2).await.unwrap();
     let home2 = spec2.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
     assert_eq!(
         std::fs::read(home2.join(".codex/auth.json")).unwrap(),

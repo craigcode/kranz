@@ -483,7 +483,7 @@ pub struct AcpBackend {
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     resource_fixture: Option<crate::acp_worker::Resources>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    terminal_fixture_run: Option<String>,
+    terminal_fixture_run: Option<(String, crate::acp_terminal::Budgets)>,
 }
 
 impl AcpBackend {
@@ -530,13 +530,27 @@ impl AcpBackend {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn with_terminal_fixture(mut self, run_id: &str) -> Self {
-        self.terminal_fixture_run = Some(run_id.to_owned());
+        self.terminal_fixture_run =
+            Some((run_id.to_owned(), crate::acp_terminal::Budgets::default()));
         self
     }
 
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn with_resource_fixture(mut self, resources: crate::acp_worker::Resources) -> Self {
         self.resource_fixture = Some(resources);
+        self
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn with_terminal_budget_fixture(
+        mut self,
+        command_ms: u64,
+        retention_ms: u64,
+    ) -> Self {
+        self.terminal_fixture_run = Some((
+            "fixture-run".into(),
+            crate::acp_terminal::Budgets::fixture(command_ms, retention_ms),
+        ));
         self
     }
 
@@ -599,11 +613,10 @@ impl AgentBackend for AcpBackend {
                 "terminal fixture requires its own contained profile".into(),
             ));
         }
-        let profile_home = self
-            .profile
-            .as_ref()
-            .map(|profile| profile.prepare(&mut spec))
-            .transpose()?;
+        let profile_home = match &self.profile {
+            Some(profile) => Some(profile.prepare(&mut spec).await?),
+            None => None,
+        };
         let model = spec.model.clone();
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -611,11 +624,12 @@ impl AgentBackend for AcpBackend {
             let resources = profile_home.as_ref().and_then(|p| p.resources);
             #[cfg(test)]
             let resources = resources.or(self.resource_fixture);
-            let (container, command) = crate::acp_container::OwnedContainer::prepare(
+            let (container, command) = crate::acp_container::OwnedContainer::prepare_with_host(
                 &spec,
                 &self.program,
                 &self.args,
                 resources,
+                profile_home.as_ref().and_then(|p| p.admitted_host.as_ref()),
             )
             .await?;
             (Some(container), command)
@@ -1528,14 +1542,17 @@ impl AcpSession {
             }
         };
         let peer_id = serde_json::to_string(&id)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.terminals.in_flight(&peer_id) {
+            return Err(EngineError::Backend(
+                "duplicate in-flight ACP request".into(),
+            ));
+        }
         let pending_count = self.pending_permissions.len();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let collides_in_flight = self.terminals.in_flight_control_ids.contains(&peer_id);
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let collides_in_flight = false;
+        let pending_count = pending_count + self.terminals.pending();
         if pending_count >= crate::live_permission::MAX_PENDING
             || self.seen_permission_ids.len() >= 1024
-            || collides_in_flight
             || !self.seen_permission_ids.insert(peer_id)
             || self
                 .pending_permissions
@@ -1663,17 +1680,26 @@ impl AcpSession {
         sent
     }
 
-    async fn complete_terminal(&mut self, completion: TerminalCompletion) -> Result<()> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Ok(peer_id) = serde_json::to_string(&completion.id) {
-            self.terminals.in_flight_control_ids.remove(&peer_id);
+    async fn complete_terminal(&mut self, mut completion: TerminalCompletion) -> Result<()> {
+        if let Err(kranz_acp::terminal::Error::BudgetExceeded(budget)) = completion.result {
+            completion.receipt["kind"] = json!("terminalBudget");
+            completion.receipt["budget"] = json!(budget);
         }
-        let response = match &completion.result {
+        let mut response = match &completion.result {
             Ok(result) => json!({"jsonrpc":"2.0", "id":completion.id, "result":result}),
             Err(error) => json!({"jsonrpc":"2.0", "id":completion.id,
                 "error":{"code":-32000, "message":error.to_string()}}),
         };
+        if matches!(
+            completion.result,
+            Err(kranz_acp::terminal::Error::BudgetExceeded(_))
+        ) {
+            response["error"]["data"] = completion.receipt.clone();
+        }
         let sent = self.write_message(response).await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.terminals
+            .completed(&serde_json::to_string(&completion.id)?);
         if let Some(id) = completion.permission_id {
             let delivery = if sent.is_ok() {
                 crate::live_permission::Delivery::Sent

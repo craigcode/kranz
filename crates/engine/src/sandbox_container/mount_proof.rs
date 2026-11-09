@@ -29,6 +29,14 @@ exit "$result"
 "#;
 
 pub(super) fn prove(host_dir: &Path, image: &str) -> MountProof {
+    prove_with_client(host_dir, image, None)
+}
+
+pub(super) fn prove_with_client(
+    host_dir: &Path,
+    image: &str,
+    client: Option<DockerEvaluator>,
+) -> MountProof {
     // Declared mission/scratch parents may not exist until preflight. Preserve
     // the old probe's create_dir_all behavior before canonicalizing the root.
     if let Err(error) = std::fs::create_dir_all(host_dir) {
@@ -48,7 +56,10 @@ pub(super) fn prove(host_dir: &Path, image: &str) -> MountProof {
                     .build()
                     .map_err(|e| e.to_string())?;
                 runtime.block_on(async {
-                    let client = DockerEvaluator::new(&docker_path(host_dir)?)?;
+                    let client = match client {
+                        Some(client) => client,
+                        None => DockerEvaluator::new(&docker_path(host_dir)?)?,
+                    };
                     let mut helper = Helper::new(client, host_dir)?;
                     Ok(helper.prove(image, WALL, 85, &AtomicBool::new(false)).await)
                 })

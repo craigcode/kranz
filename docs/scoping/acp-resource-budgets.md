@@ -2,7 +2,11 @@
 
 Status: scoped 2026-09-30, reviewed 2026-10-04 against public `a07467c2`. The D-R
 recommendations below were proposed operator decisions. The operator approved
-R2 implementation on 2026-10-06; production values/admission still require R3.
+R2 implementation on 2026-10-06 and v2 admission on 2026-10-11. R3 now admits
+only the exact selected limits and macOS/Colima tuple in the
+[v2 review](../reviews/2026-10-11-acp-v2-admission.md). R4 was approved on
+2026-10-12; its fixture-only implementation is recorded in the
+[terminal-budget review](../reviews/2026-10-12-acp-terminal-budgets.md). R5 remains open.
 The initial scoping review made no runtime changes. R1/R2 implementation is
 restricted to test-only revisions; neither ran paid agent sessions.
 
@@ -84,9 +88,8 @@ blocks on an unpolled terminal and host memory stays at the byte limit. Keep it.
 
 Add resource fields to `Definition` and ship new profile ids
 (`claude-acp-0.77.0-arm64-v2`, `codex-acp-1.11.0-arm64-v2`) that carry them.
-R1 and R2 exercise test-only revisions. Production v2 ids remain unavailable
-until R3 proves useful work, enforcement, failure evidence and cleanup on the
-qualified host/adapter tuple. The `-v1` ids keep their current argv byte-for-byte and stay selectable until
+R1 and R2 exercise test-only revisions. R3 admits production v2 only for its
+reviewed host/adapter tuple and fixed selected limits. The `-v1` ids keep their current argv byte-for-byte and stay selectable until
 the operator retires them. Non-ACP container workers and gates are out of scope
 and keep the shared prologue unchanged.
 
@@ -107,7 +110,8 @@ contract ran.
 
 R1 covers memory, CPU, process count, open files and file size. R2 adds a
 per-tmpfs ceiling and a supervisor-enforced session deadline to the test-only
-revision. Production v2 remains unavailable pending R3. Override ranges have a minimum as well as a maximum: Docker requires
+revision. Production v2 uses the selected R3 limits as minimum, default and
+maximum. Test fixtures still exercise runtime floors: Docker requires
 at least 6 MiB of memory; the default 100 ms CPU period and Linux's 1 ms minimum
 quota require at least 10 millicores. Runtime-valid values are not necessarily
 large enough for an adapter. Qualification must verify the effective limits
@@ -309,27 +313,64 @@ No Keychain or alternate credential discovery is used. Timeout/failure consumes
 the attempt and requires an explicit cleanup inventory before another allowance.
 Adapter-internal request retries are not claimed to be disabled.
 
-Preparation and synthetic proof alone do not close R3. The remaining gates are
-separately authorized live measurements for each adapter, review of headroom and
-supported host/daemon tuples, and proof at the selected production limits.
-Only then may a reviewed change admit v2. R4/R5 terminal budgets and production
-terminal qualification remain separate. One small fixture is not evidence that
+Preparation and synthetic proof alone do not close R3. Both separately authorized
+live measurements subsequently passed (Codex on October 6, Claude on October 8).
+The [selected-limit review](../reviews/2026-10-10-acp-selected-resource-limits.md)
+records their original receipts, headroom decision, narrow host/workload scope
+and exact-limit proof. The initial candidate retains 2 GiB/2 CPUs/256 tasks,
+1,024 descriptors, 128 MiB per file/tmpfs and 600 seconds; broader overrides and
+the provisional 60-minute/four-hour session bounds are not qualified by it.
+The [v2 admission](../reviews/2026-10-11-acp-v2-admission.md) enforces that exact
+host tuple before credential use, pins its local Docker endpoint through worker
+cleanup, and accepts only those selected resource values. Its definition digest
+binds the host policy and original evidence hashes. V1 definitions and argv stay
+unchanged. This closes R3 within the declared narrow envelope. R4/R5 terminal
+budgets and production terminal qualification remain separate. One small fixture is not evidence that
 a large application build fits the same ceilings.
 
-## R4/R5 terminal budget implementation
+## R4 implementation
 
-- **Separate command lifetime, handle retention, `wait_for_exit` and host supervision deadlines:**
-  `acp_container::OwnedContainer::terminal_context` derives `command_seconds` from the container's `session_seconds` ceiling (capped at 1,800 seconds, or 30 seconds for unbounded fixtures). The guest terminal supervisor (`acp_container/terminal.py`) enforces `commandSeconds` and `retentionSeconds` (default 300 seconds) separately, raises child `oom_score_adj` best-effort (`+300`), reaps descendants on command-lifetime expiry, emits the exit receipt with `wallClockExpired`, and releases expired handles after `retentionSeconds` (`retentionExpired: true`).
-- **Separate consent and control request classes:**
-  `terminal/create` and `session/request_permission` share the 16-slot pending consent cap and 1,024-entry lifetime replay set. Terminal control requests (`output`, `wait_for_exit`, `kill`, `release`) use a separate 32-slot in-flight control budget (`MAX_IN_FLIGHT_CONTROL`), refuse duplicate request IDs while in flight, and enforce a per-terminal `output` poll rate limit (`MAX_OUTPUT_POLLS_PER_SEC = 10` per second) without consuming mission consent IDs.
-- **Pre-consent capacity check and `terminalBudget` classification:**
-  `Provider::check_create_capacity` evicts handles whose post-exit retention window expired cleanly and checks `MAX_TERMINALS` and `MAX_CREATIONS` before `handle_terminal` emits a consent proposal, so capacity exhaustion returns a recoverable error without burning human consent or a one-use authority. `ResourceEvidence::classify_with_terminal_budget` attributes confirmed terminal-budget failures to `FailureClass::TerminalBudget` with an operator-visible remediation message.
+The approved fixture uses a 600-second maximum command lifetime and separate
+300-second retention after exit, narrowed by the remaining terminal session
+window. These are code-owned limits; shorter durations are available only to
+synthetic tests. They do not admit the earlier proposed 30-minute command or
+60-minute/four-hour session. The qualified v2 session ceiling stays 600 seconds,
+and neither released profile advertises terminal capability.
+
+A command deadline kills and reaps the owned tree, drains output, and returns a
+`terminalBudget` error with `budget: commandLifetime` (or `sessionLifetime`) and
+the observed exit status. Normal exit stays a normal result. Retention expiry
+releases the driver, frees capacity after confirmed cleanup, and leaves a bounded
+status tombstone. A retained handle returns `budget: retention` after expiry.
+`wait_for_exit` and host capture use the command/retention envelope plus bounded
+cleanup supervision; create/kill/release still have eight-second RPC bounds.
+The guest's separate three-second reap and drain limits remain unchanged.
+
+Eight live handles, pending consent reservations and issued authorities share
+one capacity accounting transaction. The 32-creation limit also counts reserved
+future creations. Denial releases a reservation; approval transfers it to a
+one-use authority; create consumes it atomically into a live entry. Exhaustion
+is refused before proposing consent. Consent retains its 16 pending and 1,024
+lifetime identity limits. Controls have 32 in-flight slots, duplicate protection
+only while in flight, and ten output reads per terminal per one-second window.
+Recoverable limit errors carry typed data in the RPC error and audit receipt;
+uncertain cleanup still fails the namespace. Output tails keep their existing
+byte bounds and continuous drain. At most three asynchronous receipts per each
+of 32 creations fit the 96-entry queue.
+
+The trusted single-threaded guest supervisor requests `oom_score_adj=500` in
+the child before exec. A private pipe reports readback before untrusted code
+runs; unavailable readback is null. The synthetic proof checks child/descendant
+inheritance and an unchanged adapter hint. This preference is not proof of an
+OOM event or a guarantee that a terminal will be selected as victim. No new
+cgroup, sibling container, credential channel, resource profile, persisted event
+schema or production terminal admission is introduced.
 
 ## D-R: proposed decisions
 
 | Decision | Recommendation | Consequence |
 |---|---|---|
-| D-R1: How do limits reach existing profiles? | New `-v2` profile ids; `-v1` argv unchanged | No silent contract change; operators opt in by changing one config value |
+| D-R1: How do limits reach existing profiles? | New `-v2` profile ids; `-v1` argv unchanged | No silent contract change; operators opt in with the v2 ID and pinned resource image |
 | D-R2: Who can change a ceiling? | Operator only, in `~/.kranz/config.json`, within runtime-valid minimums and a hard maximum the profile declares; never repo config, plan or worker (`PatchClass::Never`) | Overrides land in the policy digest through config; the receipt records the effective value |
 | D-R3: How are defaults set? | Measured peak plus documented headroom from a qualification fixture, recorded as a receipt | Numbers are defensible; re-measure when an adapter or image changes |
 | D-R4: Shared memory pool | Keep one container cgroup; qualify `oom_score_adj` as a best-effort hint; the ceiling is the boundary | No per-terminal cgroup machinery; an adapter kill remains possible and requires evidence-based attribution |
@@ -350,9 +391,10 @@ Estimates are engineering days for one contributor including tests and review.
 | R5 Terminal qualification | R4 | Fixtures for a multi-minute build, delayed wait, unpolled output flood, each cap reached, cooperative cancel with a live terminal, cleanup after exhaustion | 3–4 |
 
 Total: **15–22 engineering days**, a planning estimate to revisit after R1.
-R1 and R2 add mechanisms on test-only revisions; R3 is required before any
-production v2 profile becomes selectable. R4 can start in
-parallel once R1's field shape is settled.
+R1 and R2 add mechanisms on test-only revisions; R3 now supplies narrow
+production admission. R4 now implements the terminal budget mechanisms on the
+synthetic fixture. R5 must qualify long builds, remaining caps and cancellation;
+real-adapter terminal enablement still needs its separate qualification.
 
 The measurement in R3 needs a live adapter session. That is a bounded,
 operator-authorized run with its own credential and budget approval. Every

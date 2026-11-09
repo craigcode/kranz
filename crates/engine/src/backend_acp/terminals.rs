@@ -1,40 +1,43 @@
 //! Consent and asynchronous terminal routing. Production admission remains closed.
 use super::*;
-use crate::acp_terminal::{Context, Provider};
-use kranz_acp::terminal::{self, Create, Error, Target, TerminalProvider};
+use crate::acp_terminal::{Budgets, Context, Provider};
+use kranz_acp::terminal::{self, Budget, Create, Error, Target, TerminalProvider};
+use std::collections::HashSet;
 
-pub(super) const MAX_IN_FLIGHT_CONTROL: usize = 32;
+const MAX_PENDING_CONTROL: usize = 32;
 
 #[derive(Default)]
 pub(super) struct Broker {
-    prepared: Option<(Context, String)>,
+    prepared: Option<(Context, String, Budgets)>,
     pub(super) provider: Option<Arc<Provider>>,
     tasks: tokio::task::JoinSet<TerminalCompletion>,
-    pub(super) in_flight_control_ids: std::collections::HashSet<String>,
     pub(super) cleanup_recorded: bool,
+    controls: HashSet<String>,
+    creating: HashSet<String>,
 }
 
 impl Broker {
     pub(super) fn prepare(
-        run: Option<String>,
+        run: Option<(String, Budgets)>,
         container: Option<&crate::acp_container::OwnedContainer>,
         spec: &SessionSpec,
     ) -> Result<Self> {
         let prepared = run
-            .map(|run| {
+            .map(|(run, budgets)| {
                 if run.trim().is_empty() || run.len() > 256 {
                     return Err(failure());
                 }
                 let context = container.ok_or_else(failure)?.terminal_context(spec)?;
-                Ok((context, run))
+                Ok((context, run, budgets))
             })
             .transpose()?;
         Ok(Self {
             prepared,
             provider: None,
             tasks: tokio::task::JoinSet::new(),
-            in_flight_control_ids: std::collections::HashSet::new(),
             cleanup_recorded: false,
+            controls: HashSet::new(),
+            creating: HashSet::new(),
         })
     }
 
@@ -43,12 +46,13 @@ impl Broker {
     }
 
     pub(super) fn bind(&mut self, engine: &str, peer: &str) {
-        if let Some((context, run)) = self.prepared.take() {
+        if let Some((context, run, budgets)) = self.prepared.take() {
             self.provider = Some(Arc::new(Provider::new(
                 context,
                 run,
                 engine.into(),
                 peer.into(),
+                budgets,
             )));
         }
     }
@@ -66,9 +70,31 @@ impl Broker {
         }
     }
 
+    pub(super) fn pending(&self) -> usize {
+        self.creating.len()
+    }
+
+    pub(super) fn in_flight(&self, id: &str) -> bool {
+        self.controls.contains(id) || self.creating.contains(id)
+    }
+
+    fn admit_control(&mut self, id: String) -> std::result::Result<(), Error> {
+        if self.controls.len() >= MAX_PENDING_CONTROL {
+            return Err(Error::BudgetExceeded(Budget::PendingControl));
+        }
+        if !self.controls.insert(id) {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    pub(super) fn completed(&mut self, id: &str) {
+        self.controls.remove(id);
+        self.creating.remove(id);
+    }
+
     pub(super) fn stop(&mut self) {
         self.tasks.abort_all();
-        self.in_flight_control_ids.clear();
         if let Some(provider) = &self.provider {
             provider.stop();
         }
@@ -108,22 +134,14 @@ impl AcpSession {
             ));
         }
         let peer_id = serde_json::to_string(&id)?;
-        if method == terminal::CREATE {
-            if self.pending_permissions.len() >= crate::live_permission::MAX_PENDING
-                || self.seen_permission_ids.len() >= 1024
-                || self.terminals.in_flight_control_ids.contains(&peer_id)
-                || !self.seen_permission_ids.insert(peer_id)
-            {
-                return Err(EngineError::Backend(
-                    "duplicate or excessive ACP client requests".into(),
-                ));
-            }
-        } else if self.terminals.in_flight_control_ids.len() >= MAX_IN_FLIGHT_CONTROL
-            || self.seen_permission_ids.contains(&peer_id)
-            || !self.terminals.in_flight_control_ids.insert(peer_id)
+        if self.terminals.in_flight(&peer_id)
+            || self
+                .pending_permissions
+                .values()
+                .any(|p| p.proposal.peer_request_id == id)
         {
             return Err(EngineError::Backend(
-                "duplicate or excessive ACP client requests".into(),
+                "duplicate in-flight ACP request".into(),
             ));
         }
         self.queue.push_back(AgentEvent::Other {
@@ -170,7 +188,22 @@ impl AcpSession {
         };
         match request {
             Ok(action) => {
-                if let Err(error) = provider.check_create_capacity() {
+                if self.seen_permission_ids.len() >= 1024
+                    || self.seen_permission_ids.contains(&peer_id)
+                {
+                    return Err(EngineError::Backend(
+                        "duplicate or excessive ACP consent requests".into(),
+                    ));
+                }
+                let proposal_id = format!("permission-{}", uuid::Uuid::new_v4());
+                let capacity = if self.pending_permissions.len() + self.terminals.pending()
+                    >= crate::live_permission::MAX_PENDING
+                {
+                    Err(Error::BudgetExceeded(Budget::PendingConsent))
+                } else {
+                    provider.reserve(&proposal_id)
+                };
+                if let Err(error) = capacity {
                     return self
                         .complete_terminal(TerminalCompletion {
                             id,
@@ -181,6 +214,7 @@ impl AcpSession {
                         })
                         .await;
                 }
+                self.seen_permission_ids.insert(peer_id);
                 let value = provider.action(&action).map_err(|_| failure())?;
                 let options = vec![
                     json!({"optionId":"execute-once","kind":"allow_once","name":"Execute this exact command"}),
@@ -194,7 +228,7 @@ impl AcpSession {
                         "terminal execution is prohibited by this session's tool policy".into()
                     });
                 let proposal = crate::live_permission::Proposal {
-                    id: format!("permission-{}", uuid::Uuid::new_v4()),
+                    id: proposal_id,
                     engine_session_id: self.session_id.clone(),
                     peer_session_id: provider.scope.peer_session_id.clone(),
                     peer_request_id: id,
@@ -226,10 +260,22 @@ impl AcpSession {
                 });
             }
             Err(target) => {
+                if let Err(error) = self.terminals.admit_control(peer_id) {
+                    return self
+                        .complete_terminal(TerminalCompletion {
+                            id,
+                            method: method.into(),
+                            result: Err(error),
+                            receipt: json!({"refusedBeforeExecution":true}),
+                            permission_id: None,
+                        })
+                        .await;
+                }
                 let method = method.to_owned();
                 self.terminals.tasks.spawn(async move {
                     let scope = provider.scope.clone();
                     let mut receipt = json!({"scope":scope,"terminalId":target.terminal_id});
+                    let terminal_id = target.terminal_id.clone();
                     let result =
                         match method.as_str() {
                             terminal::OUTPUT => provider
@@ -261,6 +307,16 @@ impl AcpSession {
                             }
                             _ => Err(Error::InvalidRequest),
                         };
+                    if matches!(
+                        result,
+                        Err(Error::BudgetExceeded(
+                            Budget::CommandLifetime | Budget::SessionLifetime
+                        ))
+                    ) {
+                        receipt["exitStatus"] = json!(provider.exit_status(&terminal_id));
+                        receipt["descendantsReaped"] = json!(true);
+                        receipt["outputDrained"] = json!(true);
+                    }
                     TerminalCompletion {
                         id,
                         method,
@@ -282,6 +338,9 @@ impl AcpSession {
     ) -> Result<()> {
         let provider = self.terminals.provider.clone().ok_or_else(failure)?;
         if !allow {
+            provider
+                .cancel_reservation(&proposal.id)
+                .map_err(|_| failure())?;
             return self
                 .complete_terminal(TerminalCompletion {
                     id: proposal.peer_request_id,
@@ -295,6 +354,9 @@ impl AcpSession {
         let authority = provider
             .authorize(&action, &proposal)
             .map_err(|_| failure())?;
+        self.terminals
+            .creating
+            .insert(serde_json::to_string(&proposal.peer_request_id)?);
         self.terminals.tasks.spawn(async move {
             let scope = provider.scope.clone();
             let result = provider.create(scope.clone(), action, authority).await;
@@ -333,5 +395,35 @@ impl AcpSession {
             }}),
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_control_ids_are_bounded_only_while_in_flight() {
+        let mut broker = Broker::default();
+        for _ in 0..2048 {
+            broker.admit_control("reused".into()).unwrap();
+            assert!(broker.in_flight("reused"));
+            assert_eq!(broker.pending(), 0);
+            assert_eq!(
+                broker.admit_control("reused".into()),
+                Err(Error::InvalidRequest)
+            );
+            broker.completed("reused");
+        }
+        for i in 0..MAX_PENDING_CONTROL {
+            broker.admit_control(i.to_string()).unwrap();
+        }
+        assert_eq!(
+            broker.admit_control("excess".into()),
+            Err(Error::BudgetExceeded(Budget::PendingControl))
+        );
+        assert_eq!(broker.pending(), 0);
+        broker.completed("0");
+        broker.admit_control("excess".into()).unwrap();
     }
 }

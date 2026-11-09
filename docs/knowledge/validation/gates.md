@@ -61,6 +61,10 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-09 (UTC): Merged the nine named terminal Docker proofs and ACP v2 admission checks onto v0.5.0 main alongside workspace gate sandboxing and GLib backport checks. Gate contracts and acceptance requirements remain unchanged.
+
+Rechecked 2026-11-07 (UTC): Reconciled the nine named terminal Docker proofs with upstream security and pane regressions. R5 remains open; recoverable terminal-budget receipts do not by themselves establish an attempt-level resource failure or real-adapter qualification.
+
 Rechecked 2026-11-07 against the security audit fixes: all six workspace command lanes use the existing gate sandbox, static dashboard paths use pinned no-follow directory handles, and ordinary serving authenticates reads. CI adds verified GLib source backports, optimized iterator and macro-diagnostic regressions, and a full Linux desktop check. Gate contracts and acceptance requirements remain unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: Ubuntu and macOS CI lanes run the non-vacuous `signal_injection_suite_test` gate proving nonced untrusted signal fences hold and `signal-proposal: unconsented` tickets refuse draft, approve, queue, and scheduling, while `commands.rs` adds `kranz signal` and `kranz draft --consent-signal`.
@@ -68,6 +72,8 @@ Rechecked 2026-11-02 (UTC) against the signal intake pipeline: Ubuntu and macOS 
 Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back: `contract_controls::readback` adds isolated model read-back and operator comparison disposition (`contract-readback:<assertion>`), and `test_capability` adds `KEYCHAIN` pre-flight coverage on `macos-14`.
 
 Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep: validator report parsing requires a schema-matching JSON object, bounded gate process-group cleanup holds the leader until group signaling, and merge twin cleanup refuses symlinks. Gate contracts are unchanged.
+
+Rechecked 2026-10-12 (UTC): R4 adds three named Docker terminal proofs for expiry/retention and the child OOM hint, capacity before consent, and repeated polling plus independent pending controls. CI requires all nine terminal cases without skip markers. R5 still owns multi-minute builds and the remaining cancellation/exhaustion qualification.
 
 Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 

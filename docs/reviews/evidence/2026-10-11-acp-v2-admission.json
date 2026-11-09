@@ -1,0 +1,328 @@
+{
+  "schemaVersion": 1,
+  "scope": "V2 admission and endpoint-pinned synthetic container lifecycle; no provider calls",
+  "baseCommit": "6f7af155401403b5b06b9213f0ec1f5efa34692b",
+  "command": "KRANZ_ACP_CONTAINER_TESTS=1 cargo test --workspace --locked --offline acp_worker::tests::acp_v2_admission_real_host_seeds_synthetic_credentials_and_removes_namespace -- --exact --ignored --nocapture",
+  "exitCode": 0,
+  "passedTests": 1,
+  "providerCalls": 0,
+  "realProviderCredentialsRead": false,
+  "ambientDockerSelectionChangedAfterAdmission": true,
+  "primaryFixtureUnchanged": true,
+  "privateCredentialHomesRemoved": true,
+  "records": [
+    {
+      "profile": {
+        "credentialSource": "operator-selected-file",
+        "definitionSha256": "e8e8b01b3200ed71968fbc838b10159ef9f4db6902b40860e299f21ed9942879",
+        "fullMissionAcceptanceProven": false,
+        "hostAdmission": {
+          "checked": {
+            "/colima/arch": "aarch64",
+            "/colima/cpu": 4,
+            "/colima/display_name": "colima",
+            "/colima/driver": "macOS Virtualization.Framework",
+            "/colima/kubernetes": false,
+            "/colima/memory": 6442450944,
+            "/colima/mount_type": "virtiofs",
+            "/colima/runtime": "docker",
+            "/colimaVersion": "colima version 0.10.3",
+            "/docker/Architecture": "aarch64",
+            "/docker/CgroupDriver": "cgroupfs",
+            "/docker/CgroupVersion": "2",
+            "/docker/ClientInfo/Arch": "arm64",
+            "/docker/ClientInfo/Os": "darwin",
+            "/docker/ClientInfo/Version": "29.7.2",
+            "/docker/CpuCfsPeriod": true,
+            "/docker/CpuCfsQuota": true,
+            "/docker/DefaultRuntime": "runc",
+            "/docker/Driver": "overlayfs",
+            "/docker/KernelVersion": "6.8.0-100-generic",
+            "/docker/MemTotal": 6198104064,
+            "/docker/MemoryLimit": true,
+            "/docker/NCPU": 4,
+            "/docker/Name": "colima",
+            "/docker/OSType": "linux",
+            "/docker/OperatingSystem": "Ubuntu 24.04.4 LTS",
+            "/docker/PidsLimit": true,
+            "/docker/RuncCommit/ID": "v1.3.4-0-gd6d73eb8",
+            "/docker/SecurityOptions": [
+              "name=apparmor",
+              "name=seccomp,profile=builtin",
+              "name=cgroupns"
+            ],
+            "/docker/ServerVersion": "29.2.1",
+            "/docker/SwapLimit": true,
+            "/macosBuild": "25G83",
+            "/macosVersion": "26.6.2"
+          },
+          "endpointPinned": true,
+          "policy": "current-colima-default-owned-unix-socket"
+        },
+        "hostArch": "aarch64",
+        "hostOs": "macos",
+        "profile": "codex-acp-1.11.0-arm64-v2",
+        "proofs": [
+          [
+            "docs/reviews/evidence/2026-10-10-acp-resource-codex.json",
+            "34737668eb6685e3f90e50ad778d33bcb3bfde49b89a7a115482bbb91c4a83ad"
+          ],
+          [
+            "docs/reviews/evidence/2026-10-10-acp-resource-claude.json",
+            "8be38783b876f800f87fb9ba655453976834746d4268da2460a9a0a81835deed"
+          ],
+          [
+            "docs/reviews/evidence/2026-10-10-acp-selected-limits.json",
+            "c0e04e7acd22a960723f4c720941bf5fdc794d933f1b20338b0b60480e219cac"
+          ]
+        ],
+        "resources": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "startupPolicy": "v1"
+      },
+      "resourceEvidence": {
+        "containerId": "5c9dd8179dc7568a18da013f706f34ca2055e43e3eb7dfbfd25a33c80ab6fc67",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-11T20:11:40.560784Z",
+        "observationStartedAt": "2026-10-11T20:11:39.446689Z",
+        "owner": "636c7489a2524ae0936080b27137e68c",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 433,
+          "owner": "636c7489a2524ae0936080b27137e68c",
+          "usage": {
+            "cpuUsageAtStartUsec": 56333,
+            "cpuUsageUsec": 91956,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 31997952,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      }
+    },
+    {
+      "profile": {
+        "credentialSource": "operator-selected-file",
+        "definitionSha256": "6bddb4fd669ca86f9dbfb3770a87aa1b88905ffd1587bc05b1ddb37dd048425f",
+        "fullMissionAcceptanceProven": false,
+        "hostAdmission": {
+          "checked": {
+            "/colima/arch": "aarch64",
+            "/colima/cpu": 4,
+            "/colima/display_name": "colima",
+            "/colima/driver": "macOS Virtualization.Framework",
+            "/colima/kubernetes": false,
+            "/colima/memory": 6442450944,
+            "/colima/mount_type": "virtiofs",
+            "/colima/runtime": "docker",
+            "/colimaVersion": "colima version 0.10.3",
+            "/docker/Architecture": "aarch64",
+            "/docker/CgroupDriver": "cgroupfs",
+            "/docker/CgroupVersion": "2",
+            "/docker/ClientInfo/Arch": "arm64",
+            "/docker/ClientInfo/Os": "darwin",
+            "/docker/ClientInfo/Version": "29.7.2",
+            "/docker/CpuCfsPeriod": true,
+            "/docker/CpuCfsQuota": true,
+            "/docker/DefaultRuntime": "runc",
+            "/docker/Driver": "overlayfs",
+            "/docker/KernelVersion": "6.8.0-100-generic",
+            "/docker/MemTotal": 6198104064,
+            "/docker/MemoryLimit": true,
+            "/docker/NCPU": 4,
+            "/docker/Name": "colima",
+            "/docker/OSType": "linux",
+            "/docker/OperatingSystem": "Ubuntu 24.04.4 LTS",
+            "/docker/PidsLimit": true,
+            "/docker/RuncCommit/ID": "v1.3.4-0-gd6d73eb8",
+            "/docker/SecurityOptions": [
+              "name=apparmor",
+              "name=seccomp,profile=builtin",
+              "name=cgroupns"
+            ],
+            "/docker/ServerVersion": "29.2.1",
+            "/docker/SwapLimit": true,
+            "/macosBuild": "25G83",
+            "/macosVersion": "26.6.2"
+          },
+          "endpointPinned": true,
+          "policy": "current-colima-default-owned-unix-socket"
+        },
+        "hostArch": "aarch64",
+        "hostOs": "macos",
+        "profile": "claude-acp-0.77.0-arm64-v2",
+        "proofs": [
+          [
+            "docs/reviews/evidence/2026-10-10-acp-resource-codex.json",
+            "34737668eb6685e3f90e50ad778d33bcb3bfde49b89a7a115482bbb91c4a83ad"
+          ],
+          [
+            "docs/reviews/evidence/2026-10-10-acp-resource-claude.json",
+            "8be38783b876f800f87fb9ba655453976834746d4268da2460a9a0a81835deed"
+          ],
+          [
+            "docs/reviews/evidence/2026-10-10-acp-selected-limits.json",
+            "c0e04e7acd22a960723f4c720941bf5fdc794d933f1b20338b0b60480e219cac"
+          ]
+        ],
+        "resources": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "startupPolicy": "v1"
+      },
+      "resourceEvidence": {
+        "containerId": "a431d9ebfa7a9d049f1376d75a68c907d1ffc07b408fb0b0ca1c1509285c4943",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-11T20:11:43.702305Z",
+        "observationStartedAt": "2026-10-11T20:11:42.632491Z",
+        "owner": "0217d7d6fa344285a4dc3efadc2707ca",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 426,
+          "owner": "0217d7d6fa344285a4dc3efadc2707ca",
+          "usage": {
+            "cpuUsageAtStartUsec": 51445,
+            "cpuUsageUsec": 100020,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 19095552,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      }
+    }
+  ],
+  "logSha256": "ca3d32a3b93a8ea72fbb6bdac9ddfb94ebef6f248ee61320c9edeed1899a906e",
+  "validation": {
+    "workspace": {
+      "passed": 3176,
+      "failed": 0,
+      "ignored": 16,
+      "exitCode": 0
+    },
+    "clippyExitCode": 0,
+    "formatExitCode": 0,
+    "buildExitCode": 0,
+    "containment": {
+      "passed": 36,
+      "failed": 0,
+      "skipMarkers": 0,
+      "exitCode": 0
+    },
+    "mountHelper": {
+      "passed": 12,
+      "failed": 0,
+      "skipMarkers": 0,
+      "exitCode": 0
+    },
+    "logSha256": {
+      "workspace": "6a2c339b8b9e0fe07e49eb28c1754df991e6c70809be417d138269eb64b680ee",
+      "clippy": "f9bc1370a0221952e397db6a0166e6b9cb64a5ac3c5305df1b5a08c95ace9141",
+      "format": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "build": "24a88e28a0ccaca538c1d58e3e162b2fc15ce9f5af274a0bcf5a931cb25f440b",
+      "containment": "f9cfa6eda9c0e4f54ef3fe30c005437e56bfff17d0f34a04740b1956da4807ea",
+      "mountHelper": "fc526037e4abc590dba9235f518554f27f48decf8a24927518ec518ec5fea393"
+    }
+  },
+  "postRunInventory": {
+    "containers": 0,
+    "kranzNetworks": 0,
+    "colimaRestored": "Stopped"
+  }
+}

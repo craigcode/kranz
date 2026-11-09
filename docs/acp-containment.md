@@ -1,9 +1,11 @@
 # ACP containment proof path
 
-Ordinary missions can opt into the two qualified ACP worker profiles below.
+Ordinary missions can opt into the explicit ACP worker profiles below.
 They fix the adapter command, Linux ARM64 image, credential channel, startup
-settings and configured egress. macOS/Linux ARM64 with Docker is the admitted
-host tuple; mount sharing and runtime ownership must also pass before dispatch.
+settings and configured egress. The original v1 profiles admit macOS/Linux ARM64
+with Docker. The resource-bounded v2 profiles require the exact macOS/Colima tuple
+in the admission section below. Mount sharing and runtime ownership must also pass
+before dispatch.
 The live evidence covers macOS with Colima and Ubuntu ARM64 inside its VM,
 not every host installation or workload. The [v0.3.0 integration record](reviews/2026-09-20-v030-integration.md)
 combines the S7 fixture, live-worker and independent implementation reviews.
@@ -67,25 +69,69 @@ not widen a qualified worker; the refusal names this fixed-allowlist boundary
 without printing the destination. A missing configured image fails without a pull;
 a rebuilt image with another ID needs its own qualification.
 
-A profile revision may declare container ceilings: memory (with no swap), CPU,
-process count, open files and maximum file size. The `-v1` profiles declare
-none, so their container argv is unchanged and an `acpProfile.resources`
-override on them is refused. On a revision that declares ceilings, the operator
-may set `memoryMib`, `cpuMillis`, `pids`, `nofile`, `fsizeMib`, `tmpfsMib`
-and `sessionSeconds` in
-`acpProfile.resources`, up to the revision's hard maximum. Minimums are 6 MiB
-for memory, 10 millicores for CPU, 64 MiB for tmpfs and 1 for the remaining fields. These runtime
-floors do not guarantee an adapter can work at the minimum. Absent fields keep
-the revision default. Profile and container receipts record the configured
-effective values; the profile receipt also carries a `definitionSha256` of the
-code-resident revision. Neither receipt alone proves resource enforcement. The test-only R2 revision
-also declares `tmpfsMib` and `sessionSeconds`, retains namespace-bound
-`resourceEvidence` on worker completion, and classifies only observed exhaustion.
-Its supervisor enforces the session deadline and preserves observations before
-container removal. The original v1 supervisor remains unchanged. See
-[ACP resource budgets](scoping/acp-resource-budgets.md); no released revision
-declares ceilings yet. Production revisions remain unavailable until useful-work
-and adversarial qualification passes; R1/R2 supply only a test fixture revision.
+## Resource-bounded v2 admission
+
+The operator may select `codex-acp-1.11.0-arm64-v2` or
+`claude-acp-0.77.0-arm64-v2`, together with image
+`sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c`.
+Use the corresponding provider's credential channel, startup policy and exact
+egress from the v1 example above. This is an explicit operator configuration
+change; there is no automatic migration or image pull. V1 definitions, receipt
+hashes and container arguments remain unchanged, and v1 resource overrides are
+still refused.
+
+| `acpProfile.resources` field | V2 minimum = default = maximum |
+|---|---:|
+| `memoryMib` | 2048, with no swap |
+| `cpuMillis` | 2000 |
+| `pids` | 256, including threads |
+| `nofile` | 1024 per process |
+| `fsizeMib` | 128 per file, not an aggregate disk quota |
+| `tmpfsMib` | 128 per writable tmpfs |
+| `sessionSeconds` | 600 |
+
+Omit `resources` to use these values. A repeated selected value is accepted;
+any different value is refused at configuration validation and again at session
+startup. Lower runtime-valid values, wider override ranges and the provisional
+60-minute/four-hour session proposal are unqualified. The useful-work evidence
+covers one fixed command that builds/tests a small dependency-free Rust library
+and checks/tests Node code, with zero downloads. It does not establish capacity
+for larger repositories, concurrent builds, longer sessions or a full governed
+mission. ACP terminal capability remains off for these production profiles.
+
+Before opening the selected credential file, v2 probes the host through bounded,
+environment-cleared control commands. Admission requires macOS 26.6.2 ARM64
+(build 25G83), Colima 0.10.3 default profile using VZ/virtiofs, four VM CPUs and
+6 GiB configured RAM, Docker client 29.7.2/server 29.2.1, Ubuntu 24.04.4 LTS,
+kernel `6.8.0-100-generic`, cgroup v2/cgroupfs and runc `v1.3.4-0-gd6d73eb8`.
+The policy also checks daemon memory (6,198,104,064 bytes), overlayfs, AppArmor,
+builtin seccomp, cgroup namespaces and the required resource accounting flags.
+Missing fields, changed versions and other hosts fail closed with a field-specific
+refusal. Native Linux resource admission is not established by a Linux VM guest.
+
+The current Docker context must be `colima`, pointing to the operator-owned
+mode-0600 Unix socket at `$HOME/.colima/default/docker.sock`, outside worker-writable
+roots. `DOCKER_CONTEXT` may be absent or `colima`. Unset `DOCKER_HOST`,
+`DOCKER_CONFIG`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` and
+`DOCKER_API_VERSION`; overrides are refused, including empty values. The engine
+checks Colima's reported socket and pins the canonical endpoint in the same
+Docker client used for worker mount proof, create, attach, inspection and removal. Later
+ambient environment or Docker context changes cannot redirect that client.
+These checks trust the operator's installed control programs and local daemon;
+they are runtime admission checks, not remote attestation or protection from a
+host administrator replacing the daemon after admission.
+
+The profile receipt's `definitionSha256` binds the limits, host policy and three
+reviewed evidence digests. `hostAdmission` retains only checked host fields and
+endpoint-pinning status, without the socket or credential source path. Existing
+container receipts and namespace-bound `resourceEvidence` retain effective
+limits, protected observations, honest exhaustion classification and cleanup.
+A CPU-throttled success remains successful; only observed exhaustion can name a
+resource failure. Historical measurement receipts retain their original
+`productionQualified: false` value. See the
+[v2 admission review](reviews/2026-10-11-acp-v2-admission.md),
+[selected-limit proof](reviews/2026-10-10-acp-selected-resource-limits.md) and
+[resource scope](scoping/acp-resource-budgets.md).
 
 On macOS, Docker must share the repository, mission worktrees, gate scratch and
 private worker home. `TMPDIR` controls ordinary worktree/gate temporary paths;

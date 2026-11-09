@@ -32,7 +32,9 @@ for line in sys.stdin:
         elif mode == "pids":
             children = []
             try:
-                for _ in range(128):
+                ceiling = int(Path("/sys/fs/cgroup/pids.max").read_text())
+                assert 1 <= ceiling <= 256
+                for _ in range(ceiling + 1):
                     child = os.fork()
                     if child == 0:
                         time.sleep(60)
@@ -74,14 +76,19 @@ for line in sys.stdin:
             print(json.dumps(forged), file=sys.stderr, flush=True)
             os._exit(137)
         elif mode == "cpu":
-            until = time.monotonic() + 3
-            while time.monotonic() < until:
-                pass
+            # Four runnable processes saturate both the small CI quota and the
+            # selected two-CPU quota. A single busy loop cannot prove the latter.
+            children = [subprocess.Popen([sys.executable, "-I", "-S", "-c",
+                        "import time; end=time.monotonic()+3\nwhile time.monotonic()<end: pass"])
+                        for _ in range(4)]
+            for child in children:
+                assert child.wait(timeout=30) == 0
         elif mode == "nofile":
-            assert resource.getrlimit(resource.RLIMIT_NOFILE) == (32, 32)
+            soft, ceiling = resource.getrlimit(resource.RLIMIT_NOFILE)
+            assert soft == ceiling and 1 <= ceiling <= 1024
             opened = []
             try:
-                for _ in range(64):
+                for _ in range(ceiling + 1):
                     opened.append(os.open("/dev/null", os.O_RDONLY))
             except OSError as error:
                 assert error.errno == errno.EMFILE
@@ -90,13 +97,15 @@ for line in sys.stdin:
             finally:
                 for fd in opened:
                     os.close(fd)
-            assert 0 < len(opened) < 32
+            assert 0 < len(opened) < ceiling
         elif mode == "fsize":
-            assert resource.getrlimit(resource.RLIMIT_FSIZE) == (1024 * 1024,) * 2
+            soft, ceiling = resource.getrlimit(resource.RLIMIT_FSIZE)
+            assert soft == ceiling and 1 <= ceiling <= 128 * 1024 * 1024
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
             fd = os.open("bounded-file", os.O_CREAT | os.O_WRONLY, 0o600)
             try:
-                assert os.write(fd, b"x" * 1024 * 1024) == 1024 * 1024
+                os.lseek(fd, ceiling - 1, os.SEEK_SET)
+                assert os.write(fd, b"x") == 1
                 try:
                     os.write(fd, b"x")
                 except OSError as error:
@@ -105,7 +114,7 @@ for line in sys.stdin:
                     raise AssertionError("file size ceiling did not refuse write")
             finally:
                 os.close(fd)
-            assert Path("bounded-file").stat().st_size == 1024 * 1024
+            assert Path("bounded-file").stat().st_size == ceiling
         elif mode == "usage":
             block = bytearray(24 * 1024 * 1024)
             for index in range(0, len(block), 4096):
@@ -137,11 +146,19 @@ for line in sys.stdin:
         elif mode == "tmpfs":
             shm = os.statvfs("/dev/shm")
             dev = os.statvfs("/dev")
-            assert shm.f_blocks * shm.f_frsize == 64 * 1024 * 1024
-            assert dev.f_blocks * dev.f_frsize <= 64 * 1024 * 1024
+            ceiling = shm.f_blocks * shm.f_frsize
+            assert ceiling == int(os.environ["FIXTURE_TMPFS_MIB"]) * 1024 * 1024
+            assert ceiling in (64 * 1024 * 1024, 128 * 1024 * 1024)
+            assert dev.f_blocks * dev.f_frsize <= ceiling
+            for mount in Path("/proc/self/mountinfo").read_text().splitlines():
+                fields = mount.split()
+                separator = fields.index("-")
+                if fields[separator + 1] == "tmpfs" and "rw" in fields[5].split(","):
+                    stats = os.statvfs(fields[4])
+                    assert stats.f_blocks * stats.f_frsize <= ceiling, fields[4]
             hit = False
             try:
-                for i in range(8):
+                for i in range(ceiling // (16 * 1024 * 1024) + 1):
                     with open("/dev/shm/fixture-" + str(i), "wb") as target:
                         for _ in range(16):
                             target.write(b"x" * 1024 * 1024)

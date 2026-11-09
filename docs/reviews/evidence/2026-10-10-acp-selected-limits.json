@@ -1,0 +1,771 @@
+{
+  "base": "97d3c234",
+  "kind": "Selected-limit qualification; assistant self-review",
+  "selectedLimitProofPassed": true,
+  "productionProfilesEnabled": false,
+  "providerInvocationsThisReview": 0,
+  "workloadScope": "Unchanged dependency-free Rust/Node fixture; no large-build or full-mission capacity claim",
+  "host": {
+    "os": "macOS 26.6.2",
+    "build": "25G83",
+    "architecture": "aarch64",
+    "vm": "Colima 0.10.3 VZ",
+    "clientVersion": "29.7.2",
+    "serverVersion": "29.2.1",
+    "guestOs": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.8.0-100-generic",
+    "cgroupVersion": 2,
+    "cgroupDriver": "cgroupfs",
+    "runcVersion": "1.3.4",
+    "vmCpuCount": 4,
+    "vmMemoryBytes": 6198104064
+  },
+  "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+  "selectedLimits": {
+    "memoryMib": 2048,
+    "cpuMillis": 2000,
+    "pids": 256,
+    "nofile": 1024,
+    "fsizeMib": 128,
+    "tmpfsMib": 128,
+    "sessionSeconds": 600
+  },
+  "selectedRunnerSha256": "3d0a8d5b0e198152a86a09c8800325332a72b64599b0c634dfc994ba0a0e445b",
+  "sourceFiles": [
+    {
+      "path": "crates/engine/src/acp_container/tests.rs",
+      "sha256": "497b077af5935806960322704ddf5e9a42a1bbe70df0567608dc8e85078bd537"
+    },
+    {
+      "path": "crates/engine/src/acp_container/resource_peer.py",
+      "sha256": "e1ce13a6bb03d00424b290c73ac6a0fdaf0c27f462028d9498a97f19701d384c"
+    },
+    {
+      "path": "crates/engine/src/acp_worker/tests/qualification.rs",
+      "sha256": "41f4026b0f2d07303551018c21bfc3e83401da04e192fe53e13d861d6358b24b"
+    },
+    {
+      "path": "crates/engine/src/acp_container/supervisor_resources.py",
+      "sha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe"
+    },
+    {
+      "path": "crates/engine/src/acp_container/qualification_workload.py",
+      "sha256": "67f2a9ab59ed6d3648040d3087cb81234f7d504023a101a538dd35205d4f0d7a"
+    },
+    {
+      "path": "crates/engine/src/acp_worker.rs",
+      "sha256": "3cefb77793599d290a327e0af4f63c17df9978c177bda39a941c553b9c45e104"
+    }
+  ],
+  "historicalMeasurements": [
+    {
+      "provider": "codex",
+      "path": "docs/reviews/evidence/2026-10-10-acp-resource-codex.json",
+      "sha256": "34737668eb6685e3f90e50ad778d33bcb3bfde49b89a7a115482bbb91c4a83ad"
+    },
+    {
+      "provider": "claude",
+      "path": "docs/reviews/evidence/2026-10-10-acp-resource-claude.json",
+      "sha256": "8be38783b876f800f87fb9ba655453976834746d4268da2460a9a0a81835deed"
+    }
+  ],
+  "selectedCases": [
+    {
+      "resourceEvidence": {
+        "containerId": "ee4ef179a231029fb252e0350b8f21ad688326e2b37354b081e7b633179d1e44",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:22.083726Z",
+        "observationStartedAt": "2026-10-10T22:41:20.118632Z",
+        "owner": "80e5f349783c434ab37653079205283b",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 1331,
+          "owner": "80e5f349783c434ab37653079205283b",
+          "usage": {
+            "cpuUsageAtStartUsec": 54731,
+            "cpuUsageUsec": 656391,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 358649856,
+            "pidsPeak": 19
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "workload"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "20fdaacf47e7a92896ac00bbc51856746dacb70d7605f34a61ad6ab74025f27c",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:24.202586Z",
+        "observationStartedAt": "2026-10-10T22:41:22.796210Z",
+        "owner": "e8b1623c432043b1833aaeb069a8852e",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 726,
+          "owner": "e8b1623c432043b1833aaeb069a8852e",
+          "usage": {
+            "cpuUsageAtStartUsec": 48618,
+            "cpuUsageUsec": 714906,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 54738944,
+            "pidsPeak": 8
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "usage"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "a93201c9d1dbfddf07123453609faa24018c0506208eb82cabe74eb26a556774",
+        "failure": "memory",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:26.252526Z",
+        "observationStartedAt": "2026-10-10T22:41:24.904584Z",
+        "owner": "cfec39c0a59840c49322527bcf1a31ab",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 1,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 723,
+          "owner": "cfec39c0a59840c49322527bcf1a31ab",
+          "usage": {
+            "cpuUsageAtStartUsec": 50985,
+            "cpuUsageUsec": 707513,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 2147483648,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 125,
+          "oomKilled": true,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "memory"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "c03bc5b06d80795da77b97190dbb60567b74cc4815e7bca2d9c8bebcc40d0c52",
+        "failure": "pids",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:28.021250Z",
+        "observationStartedAt": "2026-10-10T22:41:26.998529Z",
+        "owner": "fccb60a2d2f548c1b0bdaade327a5956",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 1,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 428,
+          "owner": "fccb60a2d2f548c1b0bdaade327a5956",
+          "usage": {
+            "cpuUsageAtStartUsec": 48331,
+            "cpuUsageUsec": 313106,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 195948544,
+            "pidsPeak": 256
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 42,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "pids"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "75de7959d324ae84b4c0c2acb9979cbeaa885f53b42dceedca1bfe6331c9621d",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:32.767575Z",
+        "observationStartedAt": "2026-10-10T22:41:28.875601Z",
+        "owner": "47983780bbf74b0e8eae1424c521e03e",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 6017482
+          },
+          "elapsedMs": 3240,
+          "owner": "47983780bbf74b0e8eae1424c521e03e",
+          "usage": {
+            "cpuUsageAtStartUsec": 52584,
+            "cpuUsageUsec": 6277071,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 32301056,
+            "pidsPeak": 9
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "cpu"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "ee294da32e669bbb4436e73312dea7e2b43f1a9b615e6c18ee3cc5cc616ac358",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:34.586615Z",
+        "observationStartedAt": "2026-10-10T22:41:33.783012Z",
+        "owner": "4fdc5295a4ed4afc8778533c46fb4b31",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 111,
+          "owner": "4fdc5295a4ed4afc8778533c46fb4b31",
+          "usage": {
+            "cpuUsageAtStartUsec": 51418,
+            "cpuUsageUsec": 105970,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 23703552,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "nofile"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "8a4d453115473fb90d8b332d290e701bd237863940332286d0f45a3a9048656d",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:36.151465Z",
+        "observationStartedAt": "2026-10-10T22:41:35.352560Z",
+        "owner": "2c009568c4ed4af7a3f98c076daa32b3",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 107,
+          "owner": "2c009568c4ed4af7a3f98c076daa32b3",
+          "usage": {
+            "cpuUsageAtStartUsec": 52488,
+            "cpuUsageUsec": 104914,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 23756800,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "fsize"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "f0ab86b15371ef843b7033d31cbb55dfd17cb19b1a9460dadbf54eb3cb82b97d",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:41:37.575876Z",
+        "observationStartedAt": "2026-10-10T22:41:36.868300Z",
+        "owner": "33d72cad3bad457d884e9ff123549d34",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 105,
+          "owner": "33d72cad3bad457d884e9ff123549d34",
+          "usage": {
+            "cpuUsageAtStartUsec": 53353,
+            "cpuUsageUsec": 118139,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 157474816,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": false
+        },
+        "state": {
+          "exitCode": 0,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "tmpfs"
+    },
+    {
+      "resourceEvidence": {
+        "containerId": "e240e0e06aeabfe7970f1cf0df4c1b123d02bbf96e926c7a427d3830c0276f71",
+        "failure": "wallClock",
+        "image": "sha256:8da749ff0a9b09d5d4baa41172992eb92ca1beb9e5ed464feb7e608c5984457c",
+        "limits": {
+          "cpuMillis": 2000,
+          "fsizeMib": 128,
+          "memoryMib": 2048,
+          "nofile": 1024,
+          "pids": 256,
+          "sessionSeconds": 600,
+          "tmpfsMib": 128
+        },
+        "namespaceCleanupConfirmed": true,
+        "observationFinishedAt": "2026-10-10T22:51:39.025092Z",
+        "observationStartedAt": "2026-10-10T22:41:38.335862Z",
+        "owner": "996f7b81320b49929fc85682e5b3454e",
+        "sample": {
+          "baseline": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "complete": true,
+          "current": {
+            "oomKill": 0,
+            "pidsMax": 0,
+            "throttledUsec": 0
+          },
+          "elapsedMs": 600046,
+          "owner": "996f7b81320b49929fc85682e5b3454e",
+          "usage": {
+            "cpuUsageAtStartUsec": 48804,
+            "cpuUsageUsec": 6347327,
+            "limits": {
+              "cpuPeriodUsec": 100000,
+              "cpuQuotaUsec": 200000,
+              "fsizeBytes": [
+                134217728,
+                134217728
+              ],
+              "memoryMaxBytes": 2147483648,
+              "nofile": [
+                1024,
+                1024
+              ],
+              "pidsMax": 256,
+              "swapMaxBytes": 0
+            },
+            "memoryPeakBytes": 23670784,
+            "pidsPeak": 6
+          },
+          "wallClockExpired": true
+        },
+        "state": {
+          "exitCode": 124,
+          "oomKilled": false,
+          "running": false
+        },
+        "supervisorSha256": "07d91f102a51fde11717939f51aaa25b5d8977b23762d08feb8a3365be161abe",
+        "unavailable": []
+      },
+      "selectedLimitCase": "wall"
+    }
+  ],
+  "containmentTestNames": [
+    "acp_container::tests::acp_containment_v1_abort_and_drop_remove_detached_children",
+    "acp_container::tests::acp_containment_v1_cleanup_failure_retains_recovery_evidence",
+    "acp_container::tests::acp_containment_v1_completion_preserves_report_and_removes_namespace",
+    "acp_container::tests::acp_containment_v1_create_uses_startup_budget_and_preserves_uncertain_state",
+    "acp_container::tests::acp_containment_v1_delayed_attach_status_cannot_hide_failure",
+    "acp_container::tests::acp_containment_v1_delayed_start_requires_a_live_owner",
+    "acp_container::tests::acp_containment_v1_engine_sigkill_expires_guest_lease",
+    "acp_container::tests::acp_containment_v1_filtered_egress_uses_existing_relay_and_records_denial",
+    "acp_container::tests::acp_containment_v1_hostile_io_and_worktree_delivery",
+    "acp_container::tests::acp_containment_v1_image_reference_requires_an_immutable_digest",
+    "acp_container::tests::acp_containment_v1_input_eof_supervisor_stops_lingering_peer",
+    "acp_container::tests::acp_containment_v1_launch_prelude_delivers_environment_without_consuming_acp",
+    "acp_container::tests::acp_containment_v1_launch_prelude_rejects_overflow_eof_and_expired_owner",
+    "acp_container::tests::acp_containment_v1_mcp_child_cannot_bypass_boundary",
+    "acp_container::tests::acp_containment_v1_name_collision_never_removes_an_unowned_container",
+    "acp_container::tests::acp_containment_v1_owner_process",
+    "acp_container::tests::acp_containment_v1_reaps_orphans_and_preserves_peer_exit",
+    "acp_container::tests::acp_containment_v1_removal_never_accepts_a_persisting_namespace",
+    "acp_container::tests::acp_containment_v1_removal_waits_for_confirmed_daemon_absence",
+    "acp_container::tests::acp_containment_v1_resource_abort_drop_and_owner_death_keep_cleanup_honest",
+    "acp_container::tests::acp_containment_v1_resource_ceilings_reach_the_namespace",
+    "acp_container::tests::acp_containment_v1_resource_descriptor_and_file_limits_are_enforced",
+    "acp_container::tests::acp_containment_v1_resource_exit_codes_and_forged_observations_stay_unattributed",
+    "acp_container::tests::acp_containment_v1_resource_failures_bind_memory_pids_and_wall_observations",
+    "acp_container::tests::acp_containment_v1_resource_failures_survive_runner_completion_and_replay",
+    "acp_container::tests::acp_containment_v1_resource_throttling_and_tmpfs_caps_preserve_honest_success",
+    "acp_container::tests::acp_containment_v1_resource_usage_and_kernel_limits_are_retained",
+    "acp_container::tests::acp_containment_v1_unqualified_inputs_are_refused_before_creation",
+    "acp_worker::tests::acp_containment_v1_profile_checker_failure_blocks_completed_worker",
+    "acp_worker::tests::acp_containment_v1_profile_credential_echo_fails_and_cleans_home",
+    "acp_worker::tests::acp_containment_v1_profile_defect_requires_repair_and_fresh_consent",
+    "acp_worker::tests::acp_containment_v1_profile_interrupt_rejects_late_consent",
+    "acp_worker::tests::acp_containment_v1_profile_ordinary_mission_delivers_with_one_call_consent",
+    "acp_worker::tests::acp_containment_v1_profile_policy_drift_refuses_merge",
+    "acp_worker::tests::acp_containment_v1_profile_resources_survive_dispatch_and_leave_receipts",
+    "acp_containment_v1_uncertified_sandbox_is_refused_before_peer_spawn"
+  ],
+  "workspaceTests": {
+    "passed": 3170,
+    "failed": 0,
+    "ignored": 15
+  },
+  "gates": [
+    {
+      "name": "limits",
+      "exitCode": 0,
+      "logSha256": "8e6070aea0b24d28a9556cb82275e77b141474db2d2fcc962fb278173210a636"
+    },
+    {
+      "name": "workspace",
+      "exitCode": 0,
+      "logSha256": "7bf59cb5fd35141d2f2a27e40c5e1807f5a48f8484bb31b7eb4027c223ea449f"
+    },
+    {
+      "name": "clippy",
+      "exitCode": 0,
+      "logSha256": "53bb1a85a5336252076b665fd771603eb81c60d33ca36636542113efe9091716"
+    },
+    {
+      "name": "build",
+      "exitCode": 0,
+      "logSha256": "3515698fc466fedadc475eb4dff467206bc1f0d86a4c1e491e9a339b5b968751"
+    },
+    {
+      "name": "containment",
+      "exitCode": 0,
+      "logSha256": "be45aa6561c1316177097e500b0e03c67ccc242feaf9593fab4470e42b88d9bb"
+    },
+    {
+      "name": "domain-lint",
+      "exitCode": 0,
+      "logSha256": "a112e1864b65a344b77464f787d8912bf12fe8ebf0130a39c5e97a69a2cbe689"
+    },
+    {
+      "name": "public-tree",
+      "exitCode": 0,
+      "logSha256": "12b8b3d9862ae0b4942b7d5362f00334bc96bb45eea353dad245a42b038ce6eb"
+    },
+    {
+      "name": "secret-scan",
+      "exitCode": 0,
+      "logSha256": "eb863bc8edeb5ea6fdc0f1e1964a9fdf3308fd99525256d2fb95f2cb42e40488"
+    }
+  ],
+  "formatCheck": {
+    "command": "cargo fmt --all --check",
+    "exitCode": 0
+  },
+  "buildEnvironment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "locked": true,
+    "offline": true,
+    "scratchOutsideCheckout": true
+  },
+  "remainingAdmissionRequirements": [
+    "Enforce the reviewed host support policy before credential use or spawn",
+    "Enforce exact initial override range",
+    "Bind these receipts to reviewed v2 definitions and pass release gates"
+  ],
+  "limitations": [
+    "Native Linux and other daemon/VM/architecture tuples are not qualified",
+    "No specific Claude model was identified",
+    "No descriptor, file-size or tmpfs high-water measurements",
+    "One observation per adapter; no variance or throughput claim",
+    "Longer sessions, wider overrides and ACP terminal RPCs remain unqualified"
+  ],
+  "initialBuildFailure": "Temporary build cache exhausted host disk; regenerated incremental artifacts were removed and all required gates then passed",
+  "afterProofInventory": {
+    "containers": 0,
+    "ownedEgressNetworks": 0,
+    "colimaRestoredToStopped": true
+  },
+  "finalEvidenceSecretScan": {
+    "exitCode": 0,
+    "logSha256": "59c49304c262716d2772d09b9f37a2c9e0ea7db2f293df35f076a8b10f033835"
+  }
+}

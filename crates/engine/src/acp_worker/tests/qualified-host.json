@@ -1,0 +1,47 @@
+{
+  "macosVersion": "26.6.2",
+  "macosBuild": "25G83",
+  "colimaVersion": "colima version 0.10.3",
+  "colima": {
+    "display_name": "colima",
+    "driver": "macOS Virtualization.Framework",
+    "arch": "aarch64",
+    "runtime": "docker",
+    "mount_type": "virtiofs",
+    "kubernetes": false,
+    "cpu": 4,
+    "memory": 6442450944
+  },
+  "docker": {
+    "ServerVersion": "29.2.1",
+    "KernelVersion": "6.8.0-100-generic",
+    "OperatingSystem": "Ubuntu 24.04.4 LTS",
+    "OSType": "linux",
+    "Architecture": "aarch64",
+    "CgroupVersion": "2",
+    "CgroupDriver": "cgroupfs",
+    "DefaultRuntime": "runc",
+    "RuncCommit": {
+      "ID": "v1.3.4-0-gd6d73eb8"
+    },
+    "NCPU": 4,
+    "MemTotal": 6198104064,
+    "Driver": "overlayfs",
+    "Name": "colima",
+    "MemoryLimit": true,
+    "SwapLimit": true,
+    "CpuCfsPeriod": true,
+    "CpuCfsQuota": true,
+    "PidsLimit": true,
+    "SecurityOptions": [
+      "name=apparmor",
+      "name=seccomp,profile=builtin",
+      "name=cgroupns"
+    ],
+    "ClientInfo": {
+      "Version": "29.7.2",
+      "Os": "darwin",
+      "Arch": "arm64"
+    }
+  }
+}

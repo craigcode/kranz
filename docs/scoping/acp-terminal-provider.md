@@ -4,7 +4,8 @@ This starts the third slice of the [shared ACP stream](shared-acp-client.md).
 The shared client extraction is PR #82; the implementing ticket is
 [acp-contained-terminal-provider](../../.kranz/tickets/acp-contained-terminal-provider.md).
 The contract now has a contained synthetic implementation and adversarial tests.
-Only a private test constructor enables it. Released profiles still advertise
+An explicit fixture constructor enables it for synthetic tests and the contained
+compatibility probe. It refuses released worker profiles, which still advertise
 `terminal: false`; this does not qualify Sgian or a real agent adapter.
 
 ## Wire boundary

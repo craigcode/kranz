@@ -15,21 +15,7 @@ import sys
 import time
 
 MAX_REQUEST = 32768
-WALL_SECONDS = 30
-RETENTION_SECONDS = 300
 CLEANUP_SECONDS = 3
-OOM_SCORE_ADJ = 300
-
-
-def set_oom_score_adj():
-    try:
-        fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY | os.O_CLOEXEC)
-        try:
-            os.write(fd, (str(OOM_SCORE_ADJ) + "\n").encode("ascii"))
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
 
 
 def send(value):
@@ -121,12 +107,16 @@ def main():
                 raise EOFError("launch")
             data.extend(byte)
     launch = json.loads(data)
-    wall_seconds = int(launch.get("commandSeconds", WALL_SECONDS))
-    retention_seconds = int(launch.get("retentionSeconds", RETENTION_SECONDS))
-    if not (1 <= wall_seconds <= 14400) or not (1 <= retention_seconds <= 3600):
-        raise ValueError("budget range")
     workspace = launch["workspace"]
     action = launch["action"]
+    budgets = launch["budgets"]
+    command_ms = budgets["commandMs"]
+    retention_ms = budgets["retentionMs"]
+    session_ms = launch["sessionRemainingMs"]
+    for value, maximum in [(command_ms, 600000), (retention_ms, 300000), (session_ms, 600000)]:
+        if type(value) is not int or not 0 < value <= maximum:
+            raise ValueError("budget")
+    session_deadline = time.monotonic() + session_ms / 1000
     # The initial fixture contract accepts only the bound mount root. Nested
     # cwd support needs a separate pinned-directory admission path.
     if action["cwd"] != workspace:
@@ -145,36 +135,73 @@ def main():
         if item["name"] not in ("LANG", "LC_ALL", "TERM", "NO_COLOR", "CI"):
             raise ValueError("environment policy")
         env[item["name"]] = item["value"]
+    # This supervisor is single-threaded. Set the hint in the child before
+    # untrusted code runs and read it back through a private, close-before-exec
+    # pipe. Failure leaves an explicit unavailable observation, not an OOM claim.
+    hint_read, hint_write = os.pipe()
+
+    def child_hint():
+        observed = None
+        hint_fd = None
+        try:
+            # Fork inherits the non-dumpable supervisor posture, which makes
+            # procfs ownership root-only. Only this command child temporarily
+            # uses the ordinary exec posture to open its own hint file. Restore
+            # protection before readback; the supervisor itself stays protected.
+            if libc.prctl(4, 1, 0, 0, 0) != 0:
+                raise OSError("child procfs access")
+            try:
+                hint_fd = os.open("/proc/self/oom_score_adj", os.O_RDWR | os.O_CLOEXEC)
+            finally:
+                if libc.prctl(4, 0, 0, 0, 0) != 0:
+                    os._exit(125)
+            os.write(hint_fd, b"500")
+            os.lseek(hint_fd, 0, os.SEEK_SET)
+            observed = int(os.read(hint_fd, 32))
+        except (OSError, ValueError):
+            pass
+        finally:
+            if hint_fd is not None:
+                os.close(hint_fd)
+        os.write(hint_write, json.dumps(observed).encode("ascii"))
+        os.close(hint_write)
+
     peer = subprocess.Popen([executable, *action["args"]],
                             executable="/proc/self/fd/" + str(program),
                             cwd="/proc/self/fd/" + str(cwd), env=env,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, close_fds=True,
-                            pass_fds=(cwd, program), start_new_session=True,
-                            preexec_fn=set_oom_score_adj)
+                            pass_fds=(cwd, program, hint_write), start_new_session=True,
+                            preexec_fn=child_hint)
+    os.close(hint_write)
+    observed_hint = json.loads(os.read(hint_read, 32))
+    os.close(hint_read)
     os.close(program)
     os.close(cwd)
-    send({"event": "started"})
+    send({"event": "started", "oomScoreAdj": {"requested": 500, "observed": observed_hint}})
     os.set_blocking(peer.stdout.fileno(), False)
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     output_eof = False
     exit_sent = False
     releasing = False
-    wall_expired = False
     control = bytearray()
-    deadline = time.monotonic() + wall_seconds
-    drain_deadline = None
+    command_deadline = min(session_deadline, time.monotonic() + command_ms / 1000)
     retention_deadline = None
+    budget = None
+    retention_expired = False
+    drain_deadline = None
     while True:
         reap(peer)
         if peer.returncode is not None and drain_deadline is None:
             stop_children(peer)
             drain_deadline = time.monotonic() + CLEANUP_SECONDS
-        if peer.returncode is None and time.monotonic() >= deadline:
-            wall_expired = True
+        if peer.returncode is None and time.monotonic() >= command_deadline:
+            budget = "sessionLifetime" if time.monotonic() >= session_deadline else "commandLifetime"
             stop_children(peer)
-            if drain_deadline is None:
-                drain_deadline = time.monotonic() + CLEANUP_SECONDS
+            drain_deadline = time.monotonic() + CLEANUP_SECONDS
+        if exit_sent and time.monotonic() >= retention_deadline:
+            retention_expired = True
+            releasing = True
         if drain_deadline is not None and not output_eof and time.monotonic() >= drain_deadline:
             raise TimeoutError("output drain")
         readers = [0] + ([] if output_eof else [peer.stdout.fileno()])
@@ -210,15 +237,11 @@ def main():
             send({"event": "exit", "status": {
                 "exitCode": code if code >= 0 else None,
                 "signal": signal.Signals(-code).name if code < 0 else None},
-                "descendantsReaped": True, "outputDrained": True,
-                "wallClockExpired": wall_expired})
+                "descendantsReaped": True, "outputDrained": True, "budget": budget})
             exit_sent = True
-            retention_deadline = time.monotonic() + retention_seconds
+            retention_deadline = min(session_deadline, time.monotonic() + retention_ms / 1000)
         if releasing and exit_sent:
-            send({"event": "released"})
-            return
-        if exit_sent and retention_deadline is not None and time.monotonic() >= retention_deadline:
-            send({"event": "released", "retentionExpired": True})
+            send({"event": "released", "retentionExpired": retention_expired})
             return
 
 

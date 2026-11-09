@@ -56,6 +56,85 @@ def run():
             send(dict(id=number, method="terminal/create", params=params))
             assert "error" in response(number)
         assert not os.path.exists("unapproved")
+    elif mode == "budget-expiry":
+        adapter_hint = int(open("/proc/self/oom_score_adj").read())
+        create(100, r'''
+import os, time
+assert int(open("/proc/self/oom_score_adj").read()) == 500
+if os.fork() == 0:
+    os.setsid()
+    assert int(open("/proc/self/oom_score_adj").read()) == 500
+    open("descendant-pid", "w").write(str(os.getpid()))
+    while True:
+        open("heartbeat", "w").write(str(time.monotonic()))
+        time.sleep(0.02)
+print("ready", flush=True)
+time.sleep(120)
+''')
+        handle = response(100)["result"]["terminalId"]
+        target(101, "wait_for_exit", handle)
+        error = response(101)["error"]["data"]
+        assert error["kind"] == "terminalBudget" and error["budget"] == "commandLifetime", error
+        assert error["exitStatus"]["signal"] == "SIGKILL", error
+        assert error["descendantsReaped"] and error["outputDrained"], error
+        assert int(open("/proc/self/oom_score_adj").read()) == adapter_hint
+        assert not os.path.exists("/proc/" + open("descendant-pid").read())
+        target(102, "output", handle)
+        assert response(102)["result"]["output"] == "ready\n"
+        beat = open("heartbeat").read()
+        time.sleep(2)
+        assert open("heartbeat").read() == beat
+        target(103, "output", handle)
+        assert response(103)["error"]["data"]["budget"] == "retention"
+        create(104, 'print("done")')
+        handle = response(104)["result"]["terminalId"]
+        target(105, "wait_for_exit", handle)
+        assert response(105)["result"]["exitCode"] == 0
+        target(106, "release", handle)
+        assert response(106)["result"] == {}
+    elif mode == "budget-capacity":
+        for number in range(100, 109):
+            create(number, 'open("unapproved", "w").write("bad")')
+        assert response(108)["error"]["data"]["budget"] == "capacity"
+        denied = [receive() for _ in range(8)]
+        assert {value["id"] for value in denied} == set(range(100, 108))
+        assert all("error" in value for value in denied)
+        assert not os.path.exists("unapproved")
+        create(200, 'print("done")')
+        handle = response(200)["result"]["terminalId"]
+        target(201, "wait_for_exit", handle)
+        assert response(201)["result"]["exitCode"] == 0
+        target(202, "release", handle)
+        assert response(202)["result"] == {}
+    elif mode == "budget-controls":
+        create(100, 'import time; print("ready", flush=True); time.sleep(120)')
+        handle = response(100)["result"]["terminalId"]
+        refused = 0
+        # Distinct polls cannot spend the 1,024 consent identity slots,
+        # including recoverable rate-limit refusals. Subsequent waits and the
+        # next create reuse some of these completed control IDs.
+        for number in range(101, 1201):
+            target(number, "output", handle)
+            value = response(number)
+            if "error" in value:
+                assert value["error"]["data"]["budget"] == "outputRate", value
+                refused += 1
+        assert refused > 0
+        for number in range(1000, 1033):
+            target(number, "wait_for_exit", handle)
+        assert response(1032)["error"]["data"]["budget"] == "pendingControl"
+        # All 32 control slots are full, but human consent and create still work.
+        create(200, 'print("done")')
+        second = response(200)["result"]["terminalId"]
+        values = [receive() for _ in range(32)]
+        assert {value["id"] for value in values} == set(range(1000, 1032))
+        assert all(value["error"]["data"]["budget"] == "commandLifetime" for value in values)
+        target(201, "release", handle)
+        assert response(201)["result"] == {}
+        # Its retention may have expired while the first command was running.
+        target(202, "release", second)
+        value = response(202)
+        assert value.get("result") == {} or value["error"]["data"]["budget"] == "retention", value
     else:
         script = r'''
 import os, time

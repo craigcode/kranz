@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -23,6 +23,10 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal-budget vocabulary and v2 admission notes onto v0.5.0 main; role boundaries and mission lifecycle terms remain unchanged.
+
+Rechecked 2026-11-07 (UTC): Reconciled the typed terminal-budget vocabulary with upstream pane observation types. A read-only pane binding conveys no execution authority, and resource/terminal implementation does not establish R5 qualification.
+
 Rechecked 2026-11-07 against the AGENTS.md reference extraction and security invariant update. The containment guidance moved to its own knowledge note; vocabulary and lesson capture rules are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: undrafted `signal-proposal: unconsented` tickets and Slack `SignalProposalReady` cards extend intake and human consent without changing existing role or mission lifecycle vocabulary.
@@ -30,6 +34,8 @@ Rechecked 2026-11-02 (UTC) against the signal intake pipeline: undrafted `signal
 Rechecked 2026-10-22 (UTC) against P2/P3 engine hardening and contract read-back; no vocabulary or role boundary changed.
 
 Rechecked 2026-10-18 (UTC) against the security and correctness hardening sweep; no vocabulary or role boundary changed.
+
+Rechecked 2026-10-12 (UTC): R4 adds named terminal-budget errors and separates consent accounting from terminal controls. The synthetic provider retains exact authority and contained execution; released profiles keep terminal capability disabled. V2 worker admission remains limited to the previously qualified host and fixed resources.
 
 Rechecked 2026-10-11 (UTC) against the hosted stack headroom change: stream read buffers moved to the heap and large stage futures are boxed where they are awaited. Memory placement only; no stage, gate, permission or invariant behavior changed.
 
@@ -154,8 +160,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   refused. Mission egress grants cannot widen its fixed allowlist. Cache and
   relay access assume a trusted host/daemon; a version prerequisite alone is
   not profile qualification. A revision may declare resource ceilings;
-  `acpProfile.resources` overrides stay within them. The resource fixture also
-  bounds each tmpfs and total session time; production v2 remains unavailable. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
+  `acpProfile.resources` overrides stay within them. V2 fixes each tmpfs
+  and total session time to the selected values, admitting only the reviewed
+  macOS/Colima tuple; broader hosts and override ranges remain unqualified. See [profile setup](../acp-containment.md#qualified-ordinary-workers).
 - **Resource evidence** — optional `resourceEvidence` on worker completion and
   folded runs: namespace identity, effective ceilings, observation interval,
   protected supervisor counters, matched Docker state and cleanup confirmation.

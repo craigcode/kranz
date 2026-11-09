@@ -1215,10 +1215,6 @@ async fn resource_case(
     crate::acp_resources::ResourceEvidence,
     SessionExit,
 ) {
-    let root = fixture();
-    let name = name();
-    let peer = root.path().join("workspace/resource-peer.py");
-    std::fs::write(&peer, include_str!("resource_peer.py")).unwrap();
     let mut limits = fixture_resources();
     limits.session_seconds = if matches!(mode, "wall" | "startup-wall") {
         2
@@ -1237,13 +1233,32 @@ async fn resource_case(
     if mode == "workload" {
         limits = crate::acp_worker::RESOURCE_CANDIDATE_LIMITS;
     }
+    resource_case_at(mode, limits, if mode == "workload" { 300 } else { 45 }).await
+}
+
+async fn resource_case_at(
+    mode: &str,
+    limits: crate::acp_worker::Resources,
+    timeout_seconds: u64,
+) -> (
+    tempfile::TempDir,
+    crate::acp_resources::ResourceEvidence,
+    SessionExit,
+) {
+    let root = fixture();
+    let name = name();
+    let peer = root.path().join("workspace/resource-peer.py");
+    std::fs::write(&peer, include_str!("resource_peer.py")).unwrap();
     let backend = AcpBackend::new("/usr/local/bin/python3", vec![peer.display().to_string()])
         .with_resource_fixture(limits);
-    let mut session = backend.start(spec(root.path(), &name, mode)).await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(if mode == "workload" { 300 } else { 45 }),
-        async { while session.next_event().await.unwrap().is_some() {} },
-    )
+    let mut session_spec = spec(root.path(), &name, mode);
+    session_spec
+        .env
+        .insert("FIXTURE_TMPFS_MIB".into(), limits.tmpfs_mib.to_string());
+    let mut session = backend.start(session_spec).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(timeout_seconds), async {
+        while session.next_event().await.unwrap().is_some() {}
+    })
     .await
     .expect("resource fixture deadline");
     let exit = session.exit_status().unwrap();
@@ -1591,6 +1606,94 @@ async fn acp_containment_v1_resource_abort_drop_and_owner_death_keep_cleanup_hon
     remove(&client, owner, true, true).await.unwrap();
     absent(root.path(), &name).await;
     std::fs::remove_dir_all(ledger).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "installed R3 image; full 600-second deadline and selected-limit exhaustion; no provider call"]
+async fn acp_resource_qualification_selected_limits() {
+    use crate::acp_resources::FailureClass;
+    use crate::acp_worker::{RESOURCE_CANDIDATE_IMAGE, RESOURCE_CANDIDATE_LIMITS};
+    assert!(enabled(), "explicit container opt-in required");
+    assert_eq!(
+        std::env::var("KRANZ_ACP_PROOF_IMAGE").unwrap(),
+        RESOURCE_CANDIDATE_IMAGE
+    );
+    let limits = RESOURCE_CANDIDATE_LIMITS;
+    for (mode, failure) in [
+        ("workload", None),
+        ("usage", None),
+        ("memory", Some(FailureClass::Memory)),
+        ("pids", Some(FailureClass::Pids)),
+        ("cpu", None),
+        ("nofile", None),
+        ("fsize", None),
+        ("tmpfs", None),
+        ("wall", Some(FailureClass::WallClock)),
+    ] {
+        let (root, evidence, exit) =
+            resource_case_at(mode, limits, u64::from(limits.session_seconds) + 60).await;
+        println!(
+            "{}",
+            serde_json::json!({"selectedLimitCase":mode,"resourceEvidence":evidence})
+        );
+        assert_eq!(evidence.image, RESOURCE_CANDIDATE_IMAGE);
+        assert_eq!(evidence.limits, limits);
+        assert_eq!(evidence.failure, failure, "{mode}: {exit:?}");
+        assert_eq!(matches!(exit, SessionExit::Completed), failure.is_none());
+        let sample = evidence.sample.as_ref().unwrap();
+        let usage = sample.usage.as_ref().unwrap();
+        let observed = &usage.limits;
+        assert_eq!(
+            observed.memory_max_bytes,
+            Some(u64::from(limits.memory_mib) * 1024 * 1024)
+        );
+        assert_eq!(observed.swap_max_bytes, Some(0));
+        assert_eq!(observed.pids_max, Some(u64::from(limits.pids)));
+        assert_eq!(observed.cpu_period_usec, Some(100_000));
+        assert_eq!(
+            observed.cpu_quota_usec,
+            Some(u64::from(limits.cpu_millis) * 100)
+        );
+        assert_eq!(observed.nofile, Some([u64::from(limits.nofile); 2]));
+        assert_eq!(
+            observed.fsize_bytes,
+            Some([u64::from(limits.fsize_mib) * 1024 * 1024; 2])
+        );
+        if failure.is_none() {
+            assert!(sample.complete);
+            assert!(!sample.wall_clock_expired);
+            assert!(usage.memory_peak_bytes.unwrap() > 0);
+            assert!(usage.pids_peak.unwrap() > 0);
+            assert!(usage.cpu_usage_usec.unwrap() > usage.cpu_usage_at_start_usec.unwrap());
+            assert_eq!(sample.current.oom_kill, Some(0));
+            assert_eq!(sample.current.pids_max, Some(0));
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("workspace/delivered.txt")).unwrap(),
+                "resource fixture delivery"
+            );
+        }
+        if mode == "workload" {
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    root.path()
+                        .join("workspace/qualification-output/receipt.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["passed"], true);
+            assert_eq!(receipt["rustTests"], 2);
+            assert_eq!(receipt["nodeTests"], 2);
+            assert_eq!(receipt["dependencyDownloads"], 0);
+        } else if mode == "cpu" {
+            assert!(
+                sample.current.throttled_usec.unwrap() > sample.baseline.throttled_usec.unwrap()
+            );
+        } else if mode == "wall" {
+            assert!(sample.complete && sample.wall_clock_expired);
+            assert!(sample.elapsed_ms >= u64::from(limits.session_seconds) * 1000);
+        }
+    }
 }
 
 #[tokio::test]
