@@ -163,4 +163,20 @@ describe('StatusStrip pause/resume errors', () => {
     const alert = await screen.findByText('resume refused');
     expect(alert.getAttribute('role')).toBe('alert');
   });
+
+  it('disarms confirm abandon when switching missions (KRZ-H7)', () => {
+    useKranzStore.setState({ state: makeState('running', { r1: makeWorkerRun('r1') }) });
+    const { rerender } = render(<StatusStrip />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'abandon' }));
+    expect(screen.getByRole('button', { name: 'confirm abandon' })).toBeTruthy();
+
+    const otherMissionState = makeState('running', { r2: makeWorkerRun('r2') });
+    otherMissionState.mission = { ...otherMissionState.mission, id: 'm-other' };
+    useKranzStore.setState({ missionId: 'm-other', state: otherMissionState });
+    rerender(<StatusStrip />);
+
+    expect(screen.queryByRole('button', { name: 'confirm abandon' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'abandon' })).toBeTruthy();
+  });
 });

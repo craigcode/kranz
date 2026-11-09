@@ -1860,3 +1860,403 @@ esac
         "unconfirmed removal ledger must be retained"
     );
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn acp_recovery_ledger_pins_recorded_endpoint_and_rejects_malformed_endpoint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let docker = root.path().join("fake-docker");
+
+    let pinned_owner = "1".repeat(32);
+    let empty_ep_owner = "2".repeat(32);
+    let badtype_ep_owner = "3".repeat(32);
+    let expected_ep = "unix:///pinned/colima/docker.sock";
+
+    std::fs::write(
+        &docker,
+        format!(
+            r#"#!/bin/sh
+if [ "${{DOCKER_HOST:-}}" != "{expected_ep}" ]; then
+    echo "unpinned DOCKER_HOST=${{DOCKER_HOST:-}}" >&2
+    exit 91
+fi
+if [ -n "${{DOCKER_CONTEXT:-}}" ] || [ -n "${{DOCKER_CONFIG:-}}" ] || [ -n "${{SSH_AUTH_SOCK:-}}" ] || [ -n "${{DOCKER_TLS_VERIFY:-}}" ] || [ -n "${{DOCKER_CERT_PATH:-}}" ]; then
+    echo "leaked ambient docker/ssh env" >&2
+    exit 92
+fi
+case "$1" in
+    container)
+        case "$*" in
+            *"label=com.kranz.acp-owner={pinned_owner}"*)
+                if [ ! -e "$0.pinned-removed" ]; then
+                    printf '%064d\n' 9
+                fi
+                ;;
+            *)
+                exit 93
+                ;;
+        esac
+        ;;
+    rm)
+        touch "$0.pinned-removed"
+        ;;
+    *)
+        exit 94
+        ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let _env = crate::agent_env::EnvTestGuard::engage(&[
+        ("DOCKER_CONTEXT", "wrong-ambient-context"),
+        ("DOCKER_CONFIG", "/wrong/docker-config"),
+        ("SSH_AUTH_SOCK", "/wrong/ssh-agent.sock"),
+        ("DOCKER_TLS_VERIFY", "1"),
+        ("DOCKER_CERT_PATH", "/wrong/certs"),
+    ]);
+
+    let write_ledger = |suffix: &str, value: serde_json::Value| -> PathBuf {
+        let dir = scratch.join(format!("kranz-acp-owned-{suffix}"));
+        std::fs::create_dir(&dir).unwrap();
+        private_write(
+            &dir.join("container.json"),
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        // Also verify dead-owner ledger cleanup handles a guest/locked 0000 subdir.
+        let sub = dir.join("locked-sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("note"), "x").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        dir
+    };
+
+    let pinned_dir = write_ledger(
+        "pinned",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-pinned",
+            "owner": pinned_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "endpoint": expected_ep,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-crashed-owner-identity",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+    let empty_ep_dir = write_ledger(
+        "empty-ep",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-empty-ep",
+            "owner": empty_ep_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "endpoint": "   ",
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-crashed-owner-identity",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+    let badtype_ep_dir = write_ledger(
+        "badtype-ep",
+        serde_json::json!({
+            "version": 1,
+            "name": "kranz-acp-badtype-ep",
+            "owner": badtype_ep_owner,
+            "image": IMAGE,
+            "docker": docker,
+            "endpoint": 42,
+            "ownerPid": std::process::id(),
+            "supervisorSha256": "0".repeat(64),
+            "ownerIdentity": "stale-crashed-owner-identity",
+            "cleanupConfirmed": false,
+            "creationFinished": true,
+        }),
+    );
+
+    let report = recover_dead_owner_ledgers(&scratch, &docker).await.unwrap();
+    assert_eq!(report.inspected, 3);
+    assert_eq!(report.removed, vec![pinned_owner]);
+    assert_eq!(report.unconfirmed.len(), 2);
+    assert!(report.unconfirmed.contains(&empty_ep_owner));
+    assert!(report.unconfirmed.contains(&badtype_ep_owner));
+    assert!(
+        !pinned_dir.exists(),
+        "pinned dead-owner ledger must be reaped"
+    );
+    assert!(
+        empty_ep_dir.exists(),
+        "blank endpoint ledger must remain unconfirmed"
+    );
+    assert!(
+        badtype_ep_dir.exists(),
+        "non-string endpoint ledger must remain unconfirmed"
+    );
+    // Clean up retained test dirs after restoring permissions.
+    crate::sandbox_container::remove_owned_tree_nofollow(&empty_ep_dir).unwrap();
+    crate::sandbox_container::remove_owned_tree_nofollow(&badtype_ep_dir).unwrap();
+}
+
+#[test]
+fn acp_trusted_control_program_rejects_writable_roots_symlinks_nonexec_and_formats_label() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let session_cwd = primary.join("worktree");
+    let mission_dir = primary.join(".kranz/missions/m-1");
+    let tmpdir = dir.path().join("scratch-home");
+    let extra = dir.path().join("extra-write");
+    let outside_bin = dir.path().join("outside-bin");
+    let trusted_first = dir.path().join("trusted-first");
+    let trusted_second = dir.path().join("trusted-second");
+    for p in [
+        &session_cwd,
+        &mission_dir,
+        &tmpdir,
+        &extra,
+        &outside_bin,
+        &trusted_first,
+        &trusted_second,
+    ] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+
+    let outside_exec = outside_bin.join("real-bin");
+    std::fs::write(&outside_exec, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&outside_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let inputs = SandboxInputs {
+        enforce: SandboxEnforce::FsNet,
+        session_cwd: session_cwd.clone(),
+        mission_dir,
+        tmpdir: tmpdir.clone(),
+        extra_write: vec![extra.clone()],
+        egress: vec![],
+        validator_read_deny_roots: vec![],
+    };
+
+    // 1. PATH root inside forbidden writable/repo roots is refused BEFORE canonicalize(),
+    //    even if its executable is a symlink to `outside_exec` outside all forbidden roots.
+    for forbidden_root in [&session_cwd, &primary, &tmpdir, &extra] {
+        let bin = forbidden_root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("docker");
+        let _ = std::fs::remove_file(&link);
+        symlink(&outside_exec, &link).unwrap();
+        let path_env = std::env::join_paths([&bin, &outside_bin]).unwrap();
+        let err = trusted_control_program_from_env(&inputs, "docker", Some(&path_env))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Docker control executable is worker-writable"),
+            "root {}: {err}",
+            forbidden_root.display()
+        );
+    }
+
+    // 2. PATH root in a trusted directory whose symlink target resolves inside a
+    //    forbidden root AFTER canonicalize() is refused with dynamic program label.
+    let writable_target = extra.join("injected-ctl");
+    std::fs::write(&writable_target, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&writable_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&writable_target, trusted_first.join("custom-ctl")).unwrap();
+    let path_symlink = std::env::join_paths([&trusted_first]).unwrap();
+    let err = trusted_control_program_from_env(&inputs, "custom-ctl", Some(&path_symlink))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("custom-ctl control executable is worker-writable"),
+        "{err}"
+    );
+    assert!(!err.contains("Colima"), "{err}");
+
+    // 3. Non-executable (0644) file earlier on PATH is skipped in favor of 0755 later on PATH;
+    //    missing/non-exec alone formats dynamic program label.
+    std::fs::remove_file(trusted_first.join("custom-ctl")).unwrap();
+    let non_exec = trusted_first.join("custom-ctl");
+    std::fs::write(&non_exec, "not executable").unwrap();
+    std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let valid_exec = trusted_second.join("custom-ctl");
+    std::fs::write(&valid_exec, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&valid_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_non_exec_only = std::env::join_paths([&trusted_first]).unwrap();
+    let unavail =
+        trusted_control_program_from_env(&inputs, "custom-ctl", Some(&path_non_exec_only))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        unavail.contains("trusted custom-ctl executable unavailable"),
+        "{unavail}"
+    );
+
+    let path_both = std::env::join_paths([&trusted_first, &trusted_second]).unwrap();
+    let resolved =
+        trusted_control_program_from_env(&inputs, "custom-ctl", Some(&path_both)).unwrap();
+    assert_eq!(resolved, valid_exec.canonicalize().unwrap());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn acp_container_refuses_colon_mount_paths_and_deduplicates_session_proven_roots() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for bad in [
+        "/tmp/with:colon",
+        "/tmp/with,comma",
+        "/tmp/with\nnewline",
+        "/tmp/with\rcr",
+    ] {
+        assert!(mount_path(Path::new(bad)).is_err(), "{bad:?}");
+    }
+
+    let root = fixture();
+    let colon_extra = root.path().join("extra:colon");
+    std::fs::create_dir_all(&colon_extra).unwrap();
+    let mut bad_spec = spec(root.path(), &name(), "idle");
+    bad_spec
+        .sandbox
+        .as_mut()
+        .unwrap()
+        .inputs
+        .extra_write
+        .push(colon_extra);
+    let err = OwnedContainer::prepare(&bad_spec, Path::new("/usr/local/bin/python3"), &[], None)
+        .await
+        .err()
+        .expect("colon mount path must fail closed")
+        .to_string();
+    assert!(
+        err.contains("delimiter") || err.contains("invalid host mount path"),
+        "{err}"
+    );
+
+    // Prove duplicate mount roots only spawn one mount-proof container, and bind to session_id.
+    let bin_dir = root.path().join("fake-docker-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fake_docker = bin_dir.join("docker");
+    let creates_log = root.path().join("mount-proof-creates.log");
+    let fake_image_id = format!("sha256:{}", "a".repeat(64));
+    let fake_container_id = "b".repeat(64);
+    std::fs::write(
+        &fake_docker,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+    image)
+        printf '[{{"Id":"{fake_image_id}","Os":"linux","Config":{{"Volumes":null}}}}]\n'
+        ;;
+    create)
+        printf 'create\n' >> '{creates}'
+        prev=""
+        mount_src=""
+        for arg in "$@"; do
+            if [ "$prev" = "-v" ]; then
+                mount_src="${{arg%:*}}"
+            fi
+            prev="$arg"
+        done
+        printf '%s' "$mount_src" > "$0.mount_src"
+        # Extract guest sentinel from payload script (`> /kranz-mount-proof/guest.txt`)
+        for arg in "$@"; do
+            case "$arg" in
+                *"guest.txt"*)
+                    sentinel=$(printf '%s' "$arg" | sed -n 's/.*printf %s \([0-9a-f]*\) > .*/\1/p')
+                    printf '%s' "$sentinel" > "$0.sentinel"
+                    ;;
+            esac
+        done
+        printf '{fake_container_id}\n'
+        ;;
+    start)
+        mount_src=$(cat "$0.mount_src")
+        sentinel=$(cat "$0.sentinel")
+        cat "$mount_src/host.txt"
+        printf '%s' "$sentinel" > "$mount_src/guest.txt"
+        touch "$0.started"
+        ;;
+    container)
+        ;;
+    rm)
+        ;;
+    *)
+        exit 95
+        ;;
+esac
+"#,
+            creates = creates_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_val = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _env = crate::agent_env::EnvTestGuard::engage(&[("PATH", &path_val)]);
+
+    let ws = root.path().join("workspace");
+    let mission_dir = ws.join(".kranz/missions/m-fixture");
+    let role_sandbox = crate::types::SandboxConfig {
+        provider: crate::types::SandboxProvider::Container,
+        enforce: SandboxEnforce::FsNet,
+        image: Some(IMAGE.into()),
+        extra_write: vec![],
+        egress: vec![],
+    };
+    let dup_roots = vec![ws.clone(), ws.join(".")];
+    let proof = crate::acp_worker::admit_or_prove_session_mounts(
+        &role_sandbox,
+        &ws,
+        &mission_dir,
+        ContainerRuntime::Docker,
+        &dup_roots,
+    );
+    assert_eq!(proof, crate::sandbox_container::MountProof::Proven);
+    let creates = std::fs::read_to_string(&creates_log).unwrap();
+    assert_eq!(
+        creates.lines().count(),
+        1,
+        "duplicate mount roots must only execute one mount-proof container"
+    );
+
+    let session_spec = spec(root.path(), &name(), "idle");
+    let _guard = crate::acp_worker::prepare_session_admission(&session_spec)
+        .await
+        .unwrap();
+    let taken = crate::acp_worker::take_session_proven_roots(
+        &session_spec.session_id,
+        &session_spec
+            .sandbox
+            .as_ref()
+            .unwrap()
+            .container
+            .as_ref()
+            .unwrap()
+            .image,
+        false,
+    );
+    assert_eq!(taken, vec![ws.canonicalize().unwrap()]);
+    assert!(
+        crate::acp_worker::take_session_proven_roots(&session_spec.session_id, IMAGE, false)
+            .is_empty(),
+        "proven roots are consumed once per session"
+    );
+}

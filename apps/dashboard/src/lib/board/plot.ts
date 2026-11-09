@@ -96,6 +96,7 @@ export interface BoardFrame {
   view: BoardView;
   crafts: DrawnCraft[];
   flags: Point2[];
+  slots: Map<string, number>;
   wall: number;
   still: boolean;
 }
@@ -122,13 +123,14 @@ export interface PlacedLabel {
 
 /** Computes the board layout ('wide' or 'tall'), geometry, and pixel fit for a viewport. */
 export function fitBoard(w: number, h: number, dpr = 1): { view: BoardView; G: BoardGeom } {
-  const safeW = Math.max(1, w || 800);
-  const safeH = Math.max(1, h || 500);
+  const safeW = Number.isFinite(w) && w > 0 ? w : 800;
+  const safeH = Number.isFinite(h) && h > 0 ? h : 500;
   const layout: BoardLayout = safeW / safeH < 0.95 ? 'tall' : 'wide';
   const G = makeGeom(layout);
   const b = G.bounds;
-  const k = Math.min((safeW - 20) / (b.x1 - b.x0), (safeH - 20) / (b.y1 - b.y0));
-  const clampedDpr = Math.min(Math.max(1, dpr || 1), 2);
+  const k = Math.max(0.05, Math.min((safeW - 20) / (b.x1 - b.x0), (safeH - 20) / (b.y1 - b.y0)));
+  const safeDpr = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const clampedDpr = Math.min(Math.max(1, safeDpr), 2);
   const view: BoardView = {
     w: safeW,
     h: safeH,
@@ -244,7 +246,7 @@ export function placeLabels(
       let s = 0;
       for (const p of placed) {
         const ov = boxOverlap(r, p);
-        if (ov > 0) s += 10_000 + ov * 10;
+        if (ov > 0) s += 1_000_000 + ov * 100;
       }
       for (const o of list) {
         if (o.key !== it.key) {
@@ -332,7 +334,12 @@ export function prepareBoardFrame(
   G: BoardGeom,
   nowMs: number,
   selectedKey: string | null = null,
-  opts?: { wallSec?: number; still?: boolean; extraObstacles?: ChipBox[] },
+  opts?: {
+    wallSec?: number;
+    still?: boolean;
+    extraObstacles?: ChipBox[];
+    prevSlots?: ReadonlyMap<string, number>;
+  },
 ): BoardFrame {
   const tSec = nowMs / 1000;
   const wall = opts?.wallSec ?? tSec;
@@ -344,9 +351,9 @@ export function prepareBoardFrame(
   for (const fc of model.crafts) {
     const tl = timeline(G, fc.craft);
 
-    if (fc.stage === 'landed' && fc.craft.site != null && fc.craft.site >= 0 && fc.craft.site < G.sites.length) {
+    if (fc.stage === 'landed' && fc.craft.site != null) {
       if (tl.touch == null || tSec >= tl.touch) {
-        landedSites.add(fc.craft.site);
+        landedSites.add(mod(fc.craft.site, G.sites.length));
       }
     }
 
@@ -418,14 +425,19 @@ export function prepareBoardFrame(
       w,
       h,
       rank: cr.wait ? 0 : cr.selected ? 1 : 2,
+      prevSlot: opts?.prevSlots?.get(cr.key),
     });
   }
 
   const obstacles = boardObstacleBoxes(view, G, opts?.extraObstacles);
   const placed = placeLabels(labelInputs, obstacles, view);
+  const slots = new Map<string, number>();
   for (const cr of crafts) {
     const p = placed.get(cr.key);
-    if (p) cr.chip = p.chip;
+    if (p) {
+      cr.chip = p.chip;
+      slots.set(cr.key, p.slot);
+    }
   }
 
   return {
@@ -433,6 +445,7 @@ export function prepareBoardFrame(
     view,
     crafts,
     flags,
+    slots,
     wall,
     still,
   };
@@ -632,8 +645,12 @@ export function createBoardPlotter(
     setView(view: BoardView): void {
       V = { ...view };
       if (canvas) {
-        canvas.width = Math.max(1, Math.round(view.w * view.dpr));
-        canvas.height = Math.max(1, Math.round(view.h * view.dpr));
+        const nextW = Math.max(1, Math.round(view.w * view.dpr));
+        const nextH = Math.max(1, Math.round(view.h * view.dpr));
+        if (canvas.width !== nextW || canvas.height !== nextH) {
+          canvas.width = nextW;
+          canvas.height = nextH;
+        }
       }
     },
 

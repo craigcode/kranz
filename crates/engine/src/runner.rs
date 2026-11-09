@@ -415,6 +415,8 @@ pub async fn run_session_to(
 
     log.flush_progress(&run_meta.run_id, &spec.cwd).await?;
 
+    let acp_session_admission = crate::acp_worker::prepare_session_admission(&spec).await?;
+
     // Egress proxy (3.3a): an fs+net session whose sandbox routes through the
     // filtering proxy gets its env pointed at the proxy BEFORE spawn. A proxy
     // that cannot start fails the run closed here — the session never
@@ -430,6 +432,7 @@ pub async fn run_session_to(
     let hook_gate_session_id = spec.session_id.clone();
     let permission_cwd = spec.cwd.clone();
     let mut session = backend.start(spec).await?;
+    drop(acp_session_admission);
     let permission_responder = session.permission_responder();
     let session_id = session.session_id();
 

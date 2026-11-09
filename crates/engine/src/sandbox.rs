@@ -241,13 +241,14 @@ pub(crate) fn session_mount_proof(
         .iter()
         .map(|raw| expand_tilde(raw))
         .collect();
-    Some(crate::sandbox_container::prove_mount_roots(
+    let roots =
+        crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write);
+    Some(crate::acp_worker::admit_or_prove_session_mounts(
+        role_sandbox,
+        session_cwd,
+        mission_dir,
         runtime,
-        &crate::sandbox_container::declared_mount_roots(session_cwd, mission_dir, &extra_write),
-        role_sandbox
-            .image
-            .as_deref()
-            .unwrap_or(crate::sandbox_container::DEFAULT_IMAGE),
+        &roots,
     ))
 }
 
@@ -377,10 +378,20 @@ fn resolve_container_target(
             )),
         );
     }
+    let inputs = build_inputs(role_sandbox, session_cwd, mission_dir);
+    if let Err(reason) = crate::sandbox_container::validate_sandbox_container_inputs(&inputs) {
+        return (
+            None,
+            Some(format!(
+                "sandbox provider:container with enforce:{} refused: {reason}",
+                enforce_label(role_sandbox.enforce)
+            )),
+        );
+    }
     (
         Some(ResolvedSandbox {
             backend: SandboxBackend::Container,
-            inputs: build_inputs(role_sandbox, session_cwd, mission_dir),
+            inputs,
             container: Some(crate::sandbox_container::ContainerSpec {
                 runtime,
                 image: role_sandbox

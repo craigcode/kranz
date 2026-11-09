@@ -504,6 +504,60 @@ describe('PipelineView', () => {
     expect(await screen.findByText('fix-a')).toBeTruthy();
     expect(screen.queryByText('Ticketless mission work')).toBeNull();
   });
+
+  it('escapes BiDi and zero-width characters in ReviewableTicketRow titles and plan markdown (KRZ-M11)', async () => {
+    vi.mocked(api.tickets).mockResolvedValueOnce([
+      makeTicket({
+        slug: 'fix-bidi',
+        title: 'Safe \u202etitle',
+        state: 'review',
+        missionId: 'm-bidi',
+      }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValueOnce([
+      makeMission({ id: 'm-bidi', goal: 'Safe title', status: 'planning' }),
+    ]);
+    vi.mocked(api.planMd).mockResolvedValueOnce({
+      markdown: '# Plan\r\n\r\nStep 1: run \u200bcheck\r\n',
+    });
+
+    render(<PipelineView />);
+
+    expect(await screen.findByText('Safe \\u202etitle')).toBeTruthy();
+    expect(await screen.findByText('Step 1: run \\u200bcheck')).toBeTruthy();
+  });
+
+  it('loads tickets and missions when switching from initialLens="board" to Actionable (KRZ-M12)', async () => {
+    vi.mocked(api.tickets).mockResolvedValue([
+      makeTicket({ slug: 'fix-after-board', title: 'Loaded after board', state: 'new' }),
+    ]);
+    vi.mocked(api.missions).mockResolvedValue([]);
+
+    render(<PipelineView initialLens="board" />);
+    expect(api.tickets).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Actionable' }));
+
+    expect(await screen.findByText('fix-after-board')).toBeTruthy();
+    expect(api.tickets).toHaveBeenCalled();
+    expect(api.missions).toHaveBeenCalled();
+  });
+
+  it('does not fire live panel requests while boardDemo is active and updates hash to exit #/board/demo on non-Board tab click (KRZ-M12)', () => {
+    window.location.hash = '#/board/demo';
+    vi.mocked(api.signals).mockClear();
+
+    render(<PipelineView initialLens="board" boardDemo={true} />);
+
+    expect(api.tickets).not.toHaveBeenCalled();
+    expect(api.missions).not.toHaveBeenCalled();
+    expect(api.signals).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Backlog' }));
+    expect(window.location.hash).toBe('#/backlog');
+    // While boardDemo prop is still true (prior to App hashchange rerender), live side panels stay gated
+    expect(api.signals).not.toHaveBeenCalled();
+  });
 });
 
 describe('App routes', () => {

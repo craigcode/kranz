@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { DEMO_STEP_COUNT, DEMO_STEP_MS, demoSnapshotAt } from './demo';
+import { DEMO_LOOP_MS, DEMO_STEP_COUNT, DEMO_STEP_MS, demoSnapshotAt } from './demo';
 import { buildFleetModel, type BoardAskKind, type FleetModel } from './fleet';
+import { makeGeom, poseAt, PROFILE, timeline } from './flightPlan';
 import type { PipelineStage } from '../pipelineStage';
 
 const BASE_MS = Date.parse('2026-10-08T12:00:00Z');
@@ -97,6 +98,28 @@ describe('demo — deterministic trajectory board demo script', () => {
 
       expect(sawFailureTransition).toBe(true);
       expect(sawAbandonTransition).toBe(true);
+
+      // Verify Traveller A completes landing + surface stay + flag lift and Traveller B
+      // completes free-return splashdown before the demo loop resets.
+      const finalModel = run1[run1.length - 1];
+      const loopEndSec = (BASE_MS + DEMO_LOOP_MS - 1) / 1000;
+      const travellerA = finalModel.crafts.find((c) => c.id === 'board-lens');
+      const travellerB = finalModel.crafts.find((c) => c.id === 'board-sound');
+      expect(travellerA?.stage).toBe('landed');
+      expect(travellerB?.stage).toBe('failed');
+
+      for (const layout of ['wide', 'tall'] as const) {
+        const G = makeGeom(layout);
+        const tlA = timeline(G, travellerA!.craft);
+        expect(tlA.touch).not.toBeNull();
+        expect((tlA.touch as number) + PROFILE.STAY + PROFILE.LIFT).toBeLessThanOrEqual(loopEndSec);
+        expect(poseAt(G, travellerA!.craft, tlA, tlA.touch as number)?.phase).toBe('landed');
+
+        const tlB = timeline(G, travellerB!.craft);
+        expect(tlB.splash).not.toBeNull();
+        expect(tlB.splash as number).toBeLessThanOrEqual(loopEndSec);
+        expect(poseAt(G, travellerB!.craft, tlB, loopEndSec)?.phase).toBe('splash');
+      }
     } finally {
       fetchSpy.mockRestore();
     }

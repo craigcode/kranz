@@ -28,26 +28,34 @@ use crate::sandbox::SandboxBackend;
 use crate::sandbox_container::ContainerRuntime;
 use crate::types::SandboxEnforce;
 use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const RELAY_HOST: &str = "kranz-egress";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const RELAY_PORT: u16 = 3128;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const RESOURCE_LABEL: &str = "com.kranz.egress-boundary";
 const OWNER_PID_LABEL: &str = "com.kranz.owner-pid";
 const OWNER_TOKEN_LABEL: &str = "com.kranz.owner-token";
 const BOUNDARY_ID_LABEL: &str = "com.kranz.boundary-id";
 const CREDENTIAL_DIR_LABEL: &str = "com.kranz.credential-dir";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Pinned multi-architecture manifest. The relay is trusted enforcement code,
 /// not a worker-selected image, so its bytes must not float with a tag.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const RELAY_IMAGE: &str =
     "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d";
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const RELAY_SCRIPT: &str = r#"import asyncio
 import socket
 import sys
@@ -105,9 +113,16 @@ async def main():
 asyncio.run(main())
 "#;
 
-/// All resources for one live container egress boundary.
-pub struct ContainerEgressBoundary {
-    runtime: ContainerRuntime,
+#[derive(Debug)]
+struct ControlOutput {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct ContainerEgressInner {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    client: crate::gate_evaluation::subprocess::DockerEvaluator,
     network: String,
     relay: String,
     loader: String,
@@ -118,15 +133,20 @@ pub struct ContainerEgressBoundary {
     active: bool,
 }
 
+/// All resources for one live container egress boundary.
+pub struct ContainerEgressBoundary {
+    inner: Box<ContainerEgressInner>,
+}
+
 impl std::fmt::Debug for ContainerEgressBoundary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerEgressBoundary")
-            .field("network", &self.network)
-            .field("relay", &self.relay)
-            .field("loader", &self.loader)
-            .field("worker", &self.worker)
-            .field("credential_volume", &self.credential_volume)
-            .field("credential_dir", &self.credential_dir)
+            .field("network", &self.inner.network)
+            .field("relay", &self.inner.relay)
+            .field("loader", &self.inner.loader)
+            .field("worker", &self.inner.worker)
+            .field("credential_volume", &self.inner.credential_volume)
+            .field("credential_dir", &self.inner.credential_dir)
             .finish_non_exhaustive()
     }
 }
@@ -162,254 +182,298 @@ impl ContainerEgressBoundary {
             )));
         }
 
-        // Older internal-network resolvers could forward DNS through the host
-        // despite the missing guest route (CVE-2024-29018). This conservative
-        // support floor does not qualify every newer runtime or older backport.
-        let version = docker_checked(
-            runtime,
-            &[
-                "version".into(),
-                "--format".into(),
-                "{{.Server.Version}}".into(),
-            ],
-            "verify internal-network DNS prerequisite",
-        )?;
-        if !supported_dns_version(&String::from_utf8_lossy(&version.stdout)) {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (
+                allowlist,
+                paths,
+                HTTPS_PROXY_ENV,
+                HTTP_PROXY_ENV,
+                NO_PROXY_ENV,
+                NO_PROXY_VALUE,
+            );
             return Err(EngineError::Backend(
-                "container egress requires a stable Docker daemon version >= 25.0.5 for internal-network DNS isolation; older, prerelease and unrecognized versions are unsupported".into(),
+                "container per-host egress is supported only on macOS and Linux".to_string(),
             ));
         }
 
-        recover_stale_boundaries(runtime)?;
-        let owner_pid = std::process::id().to_string();
-        let owner_identity = owner_identity_hash(std::process::id() as i32).ok_or_else(|| {
-            EngineError::Backend(
-                "cannot obtain an immutable process identity for container egress cleanup"
-                    .to_string(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let client = crate::acp_worker::docker_client_for_egress(spec).await?;
+
+            // Older internal-network resolvers could forward DNS through the host
+            // despite the missing guest route (CVE-2024-29018). This conservative
+            // support floor does not qualify every newer runtime or older backport.
+            let version = docker_checked(
+                &client,
+                &[
+                    "version".into(),
+                    "--format".into(),
+                    "{{.Server.Version}}".into(),
+                ],
+                "verify internal-network DNS prerequisite",
+            )?;
+            if !supported_dns_version(&String::from_utf8_lossy(&version.stdout)) {
+                return Err(EngineError::Backend(
+                    "container egress requires a stable Docker daemon version >= 25.0.5 for internal-network DNS isolation; older, prerelease and unrecognized versions are unsupported".into(),
+                ));
+            }
+
+            recover_stale_boundaries(&client)?;
+            let owner_pid = std::process::id().to_string();
+            let owner_identity =
+                owner_identity_hash(std::process::id() as i32).ok_or_else(|| {
+                    EngineError::Backend(
+                        "cannot obtain an immutable process identity for container egress cleanup"
+                            .to_string(),
+                    )
+                })?;
+
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let network = format!("kranz-egress-{id}");
+            let relay = format!("kranz-egress-relay-{id}");
+            let loader = format!("kranz-egress-loader-{id}");
+            let worker = format!("kranz-egress-worker-{id}");
+            let credential_volume = format!("kranz-egress-secret-{id}");
+            let credential_dir = credential_root()?.join(format!("kranz-container-egress-{id}"));
+            let relay_authority = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let proxy = EgressProxy::start_authenticated_bound(
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                allowlist,
+                paths.egress_denials_file(),
+                relay_authority.clone(),
             )
-        })?;
+            .await?;
+            let boundary = Self {
+                inner: Box::new(ContainerEgressInner {
+                    client,
+                    network,
+                    relay,
+                    loader,
+                    worker,
+                    credential_volume,
+                    credential_dir,
+                    proxy: Some(proxy),
+                    active: true,
+                }),
+            };
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let network = format!("kranz-egress-{id}");
-        let relay = format!("kranz-egress-relay-{id}");
-        let loader = format!("kranz-egress-loader-{id}");
-        let worker = format!("kranz-egress-worker-{id}");
-        let credential_volume = format!("kranz-egress-secret-{id}");
-        let credential_dir = credential_root()?.join(format!("kranz-container-egress-{id}"));
-        let relay_authority = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let proxy = EgressProxy::start_authenticated_bound(
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            allowlist,
-            paths.egress_denials_file(),
-            relay_authority.clone(),
-        )
-        .await?;
-        let boundary = Self {
-            runtime,
-            network,
-            relay,
-            loader,
-            worker,
-            credential_volume,
-            credential_dir,
-            proxy: Some(proxy),
-            active: true,
-        };
-
-        let labels = [
-            (RESOURCE_LABEL, "true".to_string()),
-            (OWNER_PID_LABEL, owner_pid),
-            (OWNER_TOKEN_LABEL, owner_identity),
-            (BOUNDARY_ID_LABEL, id),
-            (
-                CREDENTIAL_DIR_LABEL,
-                boundary.credential_dir.display().to_string(),
-            ),
-        ];
-        let mut create = vec![
-            "network".to_string(),
-            "create".to_string(),
-            "--internal".to_string(),
-        ];
-        push_labels(&mut create, &labels);
-        create.push(boundary.network.clone());
-        docker_checked(runtime, &create, "create internal egress network")?;
-
-        let mut create_volume = vec!["volume".to_string(), "create".to_string()];
-        push_labels(&mut create_volume, &labels);
-        create_volume.push(boundary.credential_volume.clone());
-        docker_checked(
-            runtime,
-            &create_volume,
-            "create private relay credential volume",
-        )?;
-
-        create_secure_credential_dir(&boundary.credential_dir)?;
-        write_private(
-            &boundary.credential_dir.join("authority"),
-            relay_authority.as_bytes(),
-        )?;
-        write_private(
-            &boundary.credential_dir.join("relay.py"),
-            RELAY_SCRIPT.as_bytes(),
-        )?;
-        let credential_owner = credential_owner(&boundary.credential_dir)?;
-
-        // Attach the private volume to a STOPPED, networkless loader and use
-        // Docker's local copy API. No image code runs and the 0700/0600 host
-        // source is never bind-mounted, avoiding both user-namespace mapping
-        // failures and overlap with an unusually broad worker mount.
-        let mut create_loader = vec![
-            "create".to_string(),
-            "--name".to_string(),
-            boundary.loader.clone(),
-            "--network".to_string(),
-            "none".to_string(),
-            "--read-only".to_string(),
-            "--user".to_string(),
-            credential_owner.clone(),
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
-            "--security-opt".to_string(),
-            "no-new-privileges".to_string(),
-            "--mount".to_string(),
-            format!(
-                "type=volume,src={},dst=/opt/kranz",
-                boundary.credential_volume
-            ),
-        ];
-        push_labels(&mut create_loader, &labels);
-        create_loader.extend([
-            RELAY_IMAGE.to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            "true".to_string(),
-        ]);
-        docker_checked(runtime, &create_loader, "create stopped credential loader")?;
-        let credential_source = format!("{}/.", canonical_display(&boundary.credential_dir)?);
-        let credential_target = format!("{}:/opt/kranz", boundary.loader);
-        docker_checked(
-            runtime,
-            &["cp".to_string(), credential_source, credential_target],
-            "copy private enforcement files into the relay volume",
-        )?;
-        docker_checked(
-            runtime,
-            &["rm".to_string(), boundary.loader.clone()],
-            "remove stopped credential loader before worker spawn",
-        )?;
-        std::fs::remove_dir_all(&boundary.credential_dir).map_err(|error| {
-            EngineError::Backend(format!(
-                "remove copied container egress credentials {} before worker spawn: {error}",
-                boundary.credential_dir.display()
-            ))
-        })?;
-
-        // Create the relay stopped so both networks are attached before its
-        // listener can accept a worker connection.
-        let mut create_relay = vec![
-            "create".to_string(),
-            "--name".to_string(),
-            boundary.relay.clone(),
-            "--network".to_string(),
-            boundary.network.clone(),
-            "--network-alias".to_string(),
-            RELAY_HOST.to_string(),
-            "--add-host".to_string(),
-            "host.docker.internal:host-gateway".to_string(),
-            "--read-only".to_string(),
-            "--user".to_string(),
-            credential_owner,
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
-            "--security-opt".to_string(),
-            "no-new-privileges".to_string(),
-            "--pids-limit".to_string(),
-            "64".to_string(),
-            "--tmpfs".to_string(),
-            "/tmp:rw,noexec,nosuid,size=1m".to_string(),
-            "-e".to_string(),
-            "PYTHONDONTWRITEBYTECODE=1".to_string(),
-            "--mount".to_string(),
-            format!(
-                "type=volume,src={},dst=/opt/kranz,readonly",
-                boundary.credential_volume
-            ),
-        ];
-        push_labels(&mut create_relay, &labels);
-        create_relay.extend([
-            RELAY_IMAGE.to_string(),
-            "python".to_string(),
-            "/opt/kranz/relay.py".to_string(),
-            "host.docker.internal".to_string(),
-            boundary.proxy_port().to_string(),
-            "/opt/kranz/authority".to_string(),
-        ]);
-        docker_checked(runtime, &create_relay, "create trusted egress relay")?;
-        if let Err(error) = docker_checked(
-            runtime,
-            &[
+            let labels = [
+                (RESOURCE_LABEL, "true".to_string()),
+                (OWNER_PID_LABEL, owner_pid),
+                (OWNER_TOKEN_LABEL, owner_identity),
+                (BOUNDARY_ID_LABEL, id),
+                (
+                    CREDENTIAL_DIR_LABEL,
+                    boundary.inner.credential_dir.display().to_string(),
+                ),
+            ];
+            let mut create = vec![
                 "network".to_string(),
-                "connect".to_string(),
-                "bridge".to_string(),
-                boundary.relay.clone(),
-            ],
-            "attach trusted egress relay to the external bridge",
-        ) {
-            let logs = docker_output(runtime, &["logs".to_string(), boundary.relay.clone()])
+                "create".to_string(),
+                "--internal".to_string(),
+            ];
+            push_labels(&mut create, &labels);
+            create.push(boundary.inner.network.clone());
+            docker_checked(
+                &boundary.inner.client,
+                &create,
+                "create internal egress network",
+            )?;
+
+            let mut create_volume = vec!["volume".to_string(), "create".to_string()];
+            push_labels(&mut create_volume, &labels);
+            create_volume.push(boundary.inner.credential_volume.clone());
+            docker_checked(
+                &boundary.inner.client,
+                &create_volume,
+                "create private relay credential volume",
+            )?;
+
+            create_secure_credential_dir(&boundary.inner.credential_dir)?;
+            write_private(
+                &boundary.inner.credential_dir.join("authority"),
+                relay_authority.as_bytes(),
+            )?;
+            write_private(
+                &boundary.inner.credential_dir.join("relay.py"),
+                RELAY_SCRIPT.as_bytes(),
+            )?;
+            let credential_owner = credential_owner(&boundary.inner.credential_dir)?;
+
+            // Attach the private volume to a STOPPED, networkless loader and use
+            // Docker's local copy API. No image code runs and the 0700/0600 host
+            // source is never bind-mounted, avoiding both user-namespace mapping
+            // failures and overlap with an unusually broad worker mount.
+            let mut create_loader = vec![
+                "create".to_string(),
+                "--name".to_string(),
+                boundary.inner.loader.clone(),
+                "--network".to_string(),
+                "none".to_string(),
+                "--read-only".to_string(),
+                "--user".to_string(),
+                credential_owner.clone(),
+                "--cap-drop".to_string(),
+                "ALL".to_string(),
+                "--security-opt".to_string(),
+                "no-new-privileges".to_string(),
+                "--mount".to_string(),
+                format!(
+                    "type=volume,src={},dst=/opt/kranz",
+                    boundary.inner.credential_volume
+                ),
+            ];
+            push_labels(&mut create_loader, &labels);
+            create_loader.extend([
+                RELAY_IMAGE.to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "true".to_string(),
+            ]);
+            docker_checked(
+                &boundary.inner.client,
+                &create_loader,
+                "create stopped credential loader",
+            )?;
+            let credential_source =
+                format!("{}/.", canonical_display(&boundary.inner.credential_dir)?);
+            let credential_target = format!("{}:/opt/kranz", boundary.inner.loader);
+            docker_checked(
+                &boundary.inner.client,
+                &["cp".to_string(), credential_source, credential_target],
+                "copy private enforcement files into the relay volume",
+            )?;
+            docker_checked(
+                &boundary.inner.client,
+                &["rm".to_string(), boundary.inner.loader.clone()],
+                "remove stopped credential loader before worker spawn",
+            )?;
+            crate::sandbox_container::remove_owned_tree_nofollow(&boundary.inner.credential_dir)
+                .map_err(|error| {
+                    EngineError::Backend(format!(
+                        "remove copied container egress credentials {} before worker spawn: {error}",
+                        boundary.inner.credential_dir.display()
+                    ))
+                })?;
+
+            // Create the relay stopped so both networks are attached before its
+            // listener can accept a worker connection.
+            let mut create_relay = vec![
+                "create".to_string(),
+                "--name".to_string(),
+                boundary.inner.relay.clone(),
+                "--network".to_string(),
+                boundary.inner.network.clone(),
+                "--network-alias".to_string(),
+                RELAY_HOST.to_string(),
+                "--add-host".to_string(),
+                "host.docker.internal:host-gateway".to_string(),
+                "--read-only".to_string(),
+                "--user".to_string(),
+                credential_owner,
+                "--cap-drop".to_string(),
+                "ALL".to_string(),
+                "--security-opt".to_string(),
+                "no-new-privileges".to_string(),
+                "--pids-limit".to_string(),
+                "64".to_string(),
+                "--tmpfs".to_string(),
+                "/tmp:rw,noexec,nosuid,size=1m".to_string(),
+                "-e".to_string(),
+                "PYTHONDONTWRITEBYTECODE=1".to_string(),
+                "--mount".to_string(),
+                format!(
+                    "type=volume,src={},dst=/opt/kranz,readonly",
+                    boundary.inner.credential_volume
+                ),
+            ];
+            push_labels(&mut create_relay, &labels);
+            create_relay.extend([
+                RELAY_IMAGE.to_string(),
+                "python".to_string(),
+                "/opt/kranz/relay.py".to_string(),
+                "host.docker.internal".to_string(),
+                boundary.proxy_port().to_string(),
+                "/opt/kranz/authority".to_string(),
+            ]);
+            docker_checked(
+                &boundary.inner.client,
+                &create_relay,
+                "create trusted egress relay",
+            )?;
+            if let Err(error) = docker_checked(
+                &boundary.inner.client,
+                &[
+                    "network".to_string(),
+                    "connect".to_string(),
+                    "bridge".to_string(),
+                    boundary.inner.relay.clone(),
+                ],
+                "attach trusted egress relay to the external bridge",
+            ) {
+                let logs = docker_output(
+                    &boundary.inner.client,
+                    &["logs".to_string(), boundary.inner.relay.clone()],
+                )
                 .map(|output| output_text(&output))
                 .unwrap_or_else(|log_error| format!("logs unavailable: {log_error}"));
-            return Err(EngineError::Backend(format!("{error}; relay logs: {logs}")));
+                return Err(EngineError::Backend(format!("{error}; relay logs: {logs}")));
+            }
+            docker_checked(
+                &boundary.inner.client,
+                &["start".to_string(), boundary.inner.relay.clone()],
+                "start trusted egress relay",
+            )?;
+            boundary.wait_ready()?;
+
+            let sandbox = spec.sandbox.as_mut().expect("validated sandbox");
+            let container = sandbox
+                .container
+                .as_mut()
+                .expect("validated container spec");
+            container.network = Some(boundary.inner.network.clone());
+            container.name = Some(boundary.inner.worker.clone());
+            let url = format!("http://{RELAY_HOST}:{RELAY_PORT}");
+            spec.env.insert(HTTPS_PROXY_ENV.to_string(), url.clone());
+            spec.env.insert(HTTP_PROXY_ENV.to_string(), url);
+            spec.env
+                .insert(NO_PROXY_ENV.to_string(), NO_PROXY_VALUE.to_string());
+
+            Ok(boundary)
         }
-        docker_checked(
-            runtime,
-            &["start".to_string(), boundary.relay.clone()],
-            "start trusted egress relay",
-        )?;
-        boundary.wait_ready()?;
-
-        let sandbox = spec.sandbox.as_mut().expect("validated sandbox");
-        let container = sandbox
-            .container
-            .as_mut()
-            .expect("validated container spec");
-        container.network = Some(boundary.network.clone());
-        container.name = Some(boundary.worker.clone());
-        let url = format!("http://{RELAY_HOST}:{RELAY_PORT}");
-        spec.env.insert(HTTPS_PROXY_ENV.to_string(), url.clone());
-        spec.env.insert(HTTP_PROXY_ENV.to_string(), url);
-        spec.env
-            .insert(NO_PROXY_ENV.to_string(), NO_PROXY_VALUE.to_string());
-
-        Ok(boundary)
     }
 
     pub fn proxy_port(&self) -> u16 {
-        self.proxy.as_ref().expect("live proxy").port()
+        self.inner.proxy.as_ref().expect("live proxy").port()
     }
 
     /// Stop the authenticated proxy and verify that every Docker/filesystem
     /// resource has gone away. A cleanup failure fails the run visibly; Drop
     /// retries once more as a best-effort fallback.
     pub async fn shutdown(mut self) -> Result<Vec<EgressDenial>> {
-        let denials = match self.proxy.take() {
+        let denials = match self.inner.proxy.take() {
             Some(proxy) => proxy.shutdown().await,
             None => Vec::new(),
         };
         self.cleanup_resources()?;
-        self.active = false;
+        self.inner.active = false;
         Ok(denials)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn wait_ready(&self) -> Result<()> {
         let start = Instant::now();
         while start.elapsed() < READY_TIMEOUT {
-            let output = docker_output(self.runtime, &["logs".to_string(), self.relay.clone()])?;
-            if output.status.success()
+            let output = docker_output(
+                &self.inner.client,
+                &["logs".to_string(), self.inner.relay.clone()],
+            )?;
+            if output.code == Some(0)
                 && String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .any(|line| line.trim() == "READY")
@@ -417,18 +481,18 @@ impl ContainerEgressBoundary {
                 return Ok(());
             }
             let state = docker_output(
-                self.runtime,
+                &self.inner.client,
                 &[
                     "inspect".to_string(),
                     "--format".to_string(),
                     "{{.State.Running}}".to_string(),
-                    self.relay.clone(),
+                    self.inner.relay.clone(),
                 ],
             )?;
-            if !state.status.success() || String::from_utf8_lossy(&state.stdout).trim() != "true" {
+            if state.code != Some(0) || String::from_utf8_lossy(&state.stdout).trim() != "true" {
                 return Err(EngineError::Backend(format!(
                     "trusted container egress relay {} exited before readiness: {}",
-                    self.relay,
+                    self.inner.relay,
                     output_text(&output)
                 )));
             }
@@ -436,82 +500,98 @@ impl ContainerEgressBoundary {
         }
         Err(EngineError::Backend(format!(
             "trusted container egress relay {} did not become ready within {}s",
-            self.relay,
+            self.inner.relay,
             READY_TIMEOUT.as_secs()
         )))
     }
 
     fn cleanup_resources(&mut self) -> Result<()> {
-        let mut failures = Vec::new();
-        if let Err(error) = docker_remove_if_present(
-            self.runtime,
-            &["rm".to_string(), "-f".to_string(), self.worker.clone()],
-        ) {
-            failures.push(error.to_string());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Ok(())
         }
-        if let Err(error) = docker_remove_if_present(
-            self.runtime,
-            &["rm".to_string(), "-f".to_string(), self.relay.clone()],
-        ) {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = docker_remove_if_present(
-            self.runtime,
-            &["rm".to_string(), "-f".to_string(), self.loader.clone()],
-        ) {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = docker_remove_if_present(
-            self.runtime,
-            &[
-                "volume".to_string(),
-                "rm".to_string(),
-                self.credential_volume.clone(),
-            ],
-        ) {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = docker_remove_if_present(
-            self.runtime,
-            &[
-                "network".to_string(),
-                "rm".to_string(),
-                self.network.clone(),
-            ],
-        ) {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = std::fs::remove_dir_all(&self.credential_dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut failures = Vec::new();
+            if let Err(error) = docker_remove_if_present(
+                &self.inner.client,
+                &[
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    self.inner.worker.clone(),
+                ],
+            ) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = docker_remove_if_present(
+                &self.inner.client,
+                &["rm".to_string(), "-f".to_string(), self.inner.relay.clone()],
+            ) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = docker_remove_if_present(
+                &self.inner.client,
+                &[
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    self.inner.loader.clone(),
+                ],
+            ) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = docker_remove_if_present(
+                &self.inner.client,
+                &[
+                    "volume".to_string(),
+                    "rm".to_string(),
+                    self.inner.credential_volume.clone(),
+                ],
+            ) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = docker_remove_if_present(
+                &self.inner.client,
+                &[
+                    "network".to_string(),
+                    "rm".to_string(),
+                    self.inner.network.clone(),
+                ],
+            ) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) =
+                crate::sandbox_container::remove_owned_tree_nofollow(&self.inner.credential_dir)
+            {
                 failures.push(format!(
                     "remove credential dir {}: {error}",
-                    self.credential_dir.display()
+                    self.inner.credential_dir.display()
                 ));
             }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(EngineError::Backend(format!(
-                "container egress teardown incomplete: {}",
-                failures.join("; ")
-            )))
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(EngineError::Backend(format!(
+                    "container egress teardown incomplete: {}",
+                    failures.join("; ")
+                )))
+            }
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     fn resource_names(&self) -> (&str, &str, &str, &str, &str, &Path) {
         (
-            &self.network,
-            &self.relay,
-            &self.loader,
-            &self.worker,
-            &self.credential_volume,
-            &self.credential_dir,
+            &self.inner.network,
+            &self.inner.relay,
+            &self.inner.loader,
+            &self.inner.worker,
+            &self.inner.credential_volume,
+            &self.inner.credential_dir,
         )
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn supported_dns_version(value: &str) -> bool {
     let fields: Vec<_> = value.trim().split('.').collect();
     if fields.len() != 3
@@ -527,16 +607,17 @@ fn supported_dns_version(value: &str) -> bool {
 
 impl Drop for ContainerEgressBoundary {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.inner.active {
             return;
         }
-        self.proxy.take();
+        self.inner.proxy.take();
         if let Err(error) = self.cleanup_resources() {
             tracing::warn!(error = %error, "best-effort container egress teardown incomplete");
         }
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn push_labels(args: &mut Vec<String>, labels: &[(&str, String)]) {
     for (key, value) in labels {
         args.push("--label".to_string());
@@ -544,6 +625,7 @@ fn push_labels(args: &mut Vec<String>, labels: &[(&str, String)]) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn create_secure_credential_dir(path: &Path) -> Result<()> {
     let root = credential_root()?;
     std::fs::create_dir_all(&root).map_err(|error| {
@@ -571,6 +653,7 @@ fn create_secure_credential_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn credential_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         EngineError::Backend(
@@ -580,6 +663,7 @@ fn credential_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".kranz").join("container-egress"))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -597,6 +681,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn canonical_display(path: &Path) -> Result<String> {
     path.canonicalize()
         .map(|path| path.display().to_string())
@@ -633,20 +718,35 @@ pub(crate) fn mount_owner(path: &Path) -> Option<String> {
     credential_owner(path).ok()
 }
 
-fn docker_output(runtime: ContainerRuntime, args: &[String]) -> Result<Output> {
-    crate::command_exec::run_with_timeout(Path::new(runtime.binary()), args, COMMAND_TIMEOUT)
-        .ok_or_else(|| {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn docker_output(
+    client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+    args: &[String],
+) -> Result<ControlOutput> {
+    let out = client
+        .control_blocking(args, COMMAND_TIMEOUT)
+        .map_err(|err| {
             EngineError::Backend(format!(
-                "{} {} failed to spawn or timed out",
-                runtime.binary(),
+                "{} {} failed to spawn or timed out: {err}",
+                client.program().display(),
                 args.join(" ")
             ))
-        })
+        })?;
+    Ok(ControlOutput {
+        code: out.code,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
 }
 
-fn docker_checked(runtime: ContainerRuntime, args: &[String], action: &str) -> Result<Output> {
-    let output = docker_output(runtime, args)?;
-    if output.status.success() {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn docker_checked(
+    client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+    args: &[String],
+    action: &str,
+) -> Result<ControlOutput> {
+    let output = docker_output(client, args)?;
+    if output.code == Some(0) {
         Ok(output)
     } else {
         Err(EngineError::Backend(format!(
@@ -656,9 +756,13 @@ fn docker_checked(runtime: ContainerRuntime, args: &[String], action: &str) -> R
     }
 }
 
-fn docker_remove_if_present(runtime: ContainerRuntime, args: &[String]) -> Result<()> {
-    let output = docker_output(runtime, args)?;
-    if output.status.success() {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn docker_remove_if_present(
+    client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+    args: &[String],
+) -> Result<()> {
+    let output = docker_output(client, args)?;
+    if output.code == Some(0) {
         return Ok(());
     }
     let message = output_text(&output);
@@ -668,13 +772,14 @@ fn docker_remove_if_present(runtime: ContainerRuntime, args: &[String]) -> Resul
     } else {
         Err(EngineError::Backend(format!(
             "{} {}: {message}",
-            runtime.binary(),
+            client.program().display(),
             args.join(" ")
         )))
     }
 }
 
-fn output_text(output: &Output) -> String {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn output_text(output: &ControlOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let text = if stderr.trim().is_empty() {
@@ -695,10 +800,11 @@ pub(crate) fn owner_identity_hash(pid: i32) -> Option<String> {
 // A sibling can remove its network after the recovery inventory is taken.
 // Only a successful fresh inventory can turn an inspection error into absence;
 // other daemon failures must still prevent a new boundary from starting.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn inspect_recovery_network(
     network: &str,
-    mut docker: impl FnMut(&[String], &str) -> Result<Output>,
-) -> Result<Option<Output>> {
+    mut docker: impl FnMut(&[String], &str) -> Result<ControlOutput>,
+) -> Result<Option<ControlOutput>> {
     if network.len() != 64 || !network.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(EngineError::Backend(
             "invalid container network identity".to_string(),
@@ -750,9 +856,12 @@ fn inspect_recovery_network(
     }
 }
 
-fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recover_stale_boundaries(
+    client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+) -> Result<()> {
     let list = docker_checked(
-        runtime,
+        client,
         &[
             "network".to_string(),
             "ls".to_string(),
@@ -769,9 +878,8 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Some(inspect) = inspect_recovery_network(network, |args, action| {
-            docker_checked(runtime, args, action)
-        })?
+        let Some(inspect) =
+            inspect_recovery_network(network, |args, action| docker_checked(client, args, action))?
         else {
             continue;
         };
@@ -789,7 +897,7 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
         }
         if !id.is_empty() {
             docker_remove_if_present(
-                runtime,
+                client,
                 &[
                     "rm".to_string(),
                     "-f".to_string(),
@@ -797,7 +905,7 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
                 ],
             )?;
             docker_remove_if_present(
-                runtime,
+                client,
                 &[
                     "rm".to_string(),
                     "-f".to_string(),
@@ -805,7 +913,7 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
                 ],
             )?;
             docker_remove_if_present(
-                runtime,
+                client,
                 &[
                     "rm".to_string(),
                     "-f".to_string(),
@@ -814,12 +922,12 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
             )?;
         }
         docker_remove_if_present(
-            runtime,
+            client,
             &["network".to_string(), "rm".to_string(), network.to_string()],
         )?;
         if !id.is_empty() {
             docker_remove_if_present(
-                runtime,
+                client,
                 &[
                     "volume".to_string(),
                     "rm".to_string(),
@@ -832,6 +940,7 @@ fn recover_stale_boundaries(runtime: ContainerRuntime) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn remove_recovered_credential_dir(raw: &str) -> Result<()> {
     if raw.is_empty() {
         return Ok(());
@@ -851,14 +960,12 @@ fn remove_recovered_credential_dir(raw: &str) -> Result<()> {
             "refusing to remove malformed recovered credential path {raw:?}"
         )));
     }
-    match std::fs::remove_dir_all(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(EngineError::Backend(format!(
+    crate::sandbox_container::remove_owned_tree_nofollow(&path).map_err(|error| {
+        EngineError::Backend(format!(
             "remove recovered credential dir {}: {error}",
             path.display()
-        ))),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -884,17 +991,16 @@ mod tests {
             assert!(!supported_dns_version(version), "{version}");
         }
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::backend::{PromptMode, SessionSpec};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::sandbox::{ResolvedSandbox, SandboxInputs};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::collections::HashMap;
 
-    fn successful_output(stdout: &[u8]) -> Output {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
+    fn successful_output(stdout: &[u8]) -> ControlOutput {
+        ControlOutput {
+            code: Some(0),
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         }
@@ -992,6 +1098,7 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn session_spec(root: &Path, allowed_port: u16) -> SessionSpec {
         SessionSpec {
             cwd: root.to_path_buf(),
@@ -1033,21 +1140,44 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_docker_client() -> Result<crate::gate_evaluation::subprocess::DockerEvaluator> {
+        let dummy = SandboxInputs {
+            enforce: SandboxEnforce::FsNet,
+            session_cwd: PathBuf::from("/nonexistent-kranz-egress-test-cwd"),
+            mission_dir: PathBuf::from("/nonexistent-kranz-egress-test-mission"),
+            tmpdir: PathBuf::from("/nonexistent-kranz-egress-test-tmp"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let docker = crate::acp_container::trusted_control_program(&dummy, "docker")?;
+        crate::gate_evaluation::subprocess::DockerEvaluator::new(&docker)
+            .map_err(EngineError::Backend)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn docker_available() -> bool {
         crate::sandbox_container::detect() == Some(ContainerRuntime::Docker)
-            && docker_output(ContainerRuntime::Docker, &["info".to_string()])
-                .is_ok_and(|output| output.status.success())
+            && test_docker_client()
+                .and_then(|client| docker_output(&client, &["info".to_string()]))
+                .is_ok_and(|output| output.code == Some(0))
     }
 
-    fn inspect_exists(kind: &str, name: &str) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn inspect_exists(
+        client: &crate::gate_evaluation::subprocess::DockerEvaluator,
+        kind: &str,
+        name: &str,
+    ) -> bool {
         docker_output(
-            ContainerRuntime::Docker,
+            client,
             &[kind.to_string(), "inspect".to_string(), name.to_string()],
         )
-        .is_ok_and(|output| output.status.success())
+        .is_ok_and(|output| output.code == Some(0))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn prove_direct_socket_denial(
         cwd: &Path,
         network: &str,
@@ -1167,6 +1297,7 @@ mod tests {
     /// variables cannot recover a direct route, and explicit + Drop teardown
     /// remove the network, relay, and credential. CI invokes this exact
     /// ignored test with an anti-vacuity assertion.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a live Docker daemon and pulled pinned relay image"]
     async fn container_per_host_egress_live_proof() {
@@ -1174,14 +1305,15 @@ mod tests {
             docker_available(),
             "Docker daemon unavailable for required live proof"
         );
+        let client = test_docker_client().unwrap();
         docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &["pull".to_string(), RELAY_IMAGE.to_string()],
             "pull pinned relay image",
         )
         .unwrap();
         docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "pull".to_string(),
                 crate::sandbox_container::DEFAULT_IMAGE.to_string(),
@@ -1195,7 +1327,7 @@ mod tests {
         let raced_name = format!("kranz-egress-race-{}", uuid::Uuid::new_v4().simple());
         let create_network = || {
             let output = docker_checked(
-                ContainerRuntime::Docker,
+                &client,
                 &["network".into(), "create".into(), raced_name.clone()],
                 "create recovery race network",
             )
@@ -1204,7 +1336,7 @@ mod tests {
         };
         let vanished_id = create_network();
         docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &["network".into(), "rm".into(), vanished_id.clone()],
             "remove inventoried recovery network",
         )
@@ -1212,17 +1344,17 @@ mod tests {
         let replacement_id = create_network();
         assert_ne!(vanished_id, replacement_id);
         assert!(inspect_recovery_network(&vanished_id, |args, action| {
-            docker_checked(ContainerRuntime::Docker, args, action)
+            docker_checked(&client, args, action)
         })
         .unwrap()
         .is_none());
         assert!(inspect_recovery_network(&replacement_id, |args, action| {
-            docker_checked(ContainerRuntime::Docker, args, action)
+            docker_checked(&client, args, action)
         })
         .unwrap()
         .is_some());
         docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &["network".into(), "rm".into(), replacement_id],
             "remove replacement recovery network",
         )
@@ -1266,7 +1398,7 @@ mod tests {
             "printf 'CONNECT 127.0.0.1:{allowed_port} HTTP/1.1\\r\\nHost: 127.0.0.1:{allowed_port}\\r\\n\\r\\nping' | nc -w 5 {RELAY_HOST} {RELAY_PORT}"
         );
         let allowed_output = docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "run".to_string(),
                 "--rm".to_string(),
@@ -1290,7 +1422,7 @@ mod tests {
         // (resolved from `kranz-egress`), so an unrelated peer on the default
         // `bridge` network cannot connect to the relay's bridge IP.
         let relay_ip = docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "inspect".into(),
                 "--format".into(),
@@ -1305,7 +1437,7 @@ mod tests {
             .trim()
             .to_string();
         let bridge_probe = docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "run".into(),
                 "--rm".into(),
@@ -1334,7 +1466,7 @@ mod tests {
         allowed_task.await.unwrap();
 
         let dns_control = docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "run".into(),
                 "--rm".into(),
@@ -1350,7 +1482,7 @@ mod tests {
         )
         .unwrap();
         assert!(String::from_utf8_lossy(&dns_control.stdout).contains("DNS-POSITIVE"));
-        let dns_denial = docker_checked(ContainerRuntime::Docker,
+        let dns_denial = docker_checked(&client,
             &["run".into(), "--rm".into(), "--network".into(), network.clone(), RELAY_IMAGE.into(),
                 "python".into(), "-c".into(), "import socket\ntry:\n socket.getaddrinfo('example.com',443)\nexcept socket.gaierror:\n print('DNS-DENIED')\nelse:\n raise SystemExit('external DNS unexpectedly resolved')".into()],
             "prove internal-network resolver refuses external DNS").unwrap();
@@ -1360,7 +1492,7 @@ mod tests {
         );
 
         let denied_output = docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "run".to_string(),
                 "--rm".to_string(),
@@ -1382,7 +1514,7 @@ mod tests {
             String::from_utf8_lossy(&denied_output.stdout)
         );
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         prove_direct_socket_denial(root.path(), &network)
             .await
             .unwrap();
@@ -1395,11 +1527,11 @@ mod tests {
                 port: 443,
             }]
         );
-        assert!(!inspect_exists("network", &network));
-        assert!(!inspect_exists("container", &relay));
-        assert!(!inspect_exists("container", &loader));
-        assert!(!inspect_exists("container", &worker));
-        assert!(!inspect_exists("volume", &credential_volume));
+        assert!(!inspect_exists(&client, "network", &network));
+        assert!(!inspect_exists(&client, "container", &relay));
+        assert!(!inspect_exists(&client, "container", &loader));
+        assert!(!inspect_exists(&client, "container", &worker));
+        assert!(!inspect_exists(&client, "volume", &credential_volume));
         assert!(!credential_dir.exists());
 
         // Dropping without explicit shutdown models backend failure, timeout,
@@ -1423,7 +1555,7 @@ mod tests {
         let dropped_volume = dropped_volume.to_string();
         let dropped_dir = dropped_dir.to_path_buf();
         docker_checked(
-            ContainerRuntime::Docker,
+            &client,
             &[
                 "run".to_string(),
                 "-d".to_string(),
@@ -1440,11 +1572,11 @@ mod tests {
         )
         .unwrap();
         drop(dropped);
-        assert!(!inspect_exists("network", &dropped_network));
-        assert!(!inspect_exists("container", &dropped_relay));
-        assert!(!inspect_exists("container", &dropped_loader));
-        assert!(!inspect_exists("container", &dropped_worker));
-        assert!(!inspect_exists("volume", &dropped_volume));
+        assert!(!inspect_exists(&client, "network", &dropped_network));
+        assert!(!inspect_exists(&client, "container", &dropped_relay));
+        assert!(!inspect_exists(&client, "container", &dropped_loader));
+        assert!(!inspect_exists(&client, "container", &dropped_worker));
+        assert!(!inspect_exists(&client, "volume", &dropped_volume));
         assert!(!dropped_dir.exists());
 
         // A kill-9 cannot run Drop. Seed the exact labeled shape under a
@@ -1474,21 +1606,11 @@ mod tests {
         ];
         push_labels(&mut create, &stale_labels);
         create.push(stale_network.clone());
-        docker_checked(
-            ContainerRuntime::Docker,
-            &create,
-            "seed stale internal network",
-        )
-        .unwrap();
+        docker_checked(&client, &create, "seed stale internal network").unwrap();
         let mut create_volume = vec!["volume".to_string(), "create".to_string()];
         push_labels(&mut create_volume, &stale_labels);
         create_volume.push(stale_volume.clone());
-        docker_checked(
-            ContainerRuntime::Docker,
-            &create_volume,
-            "seed stale credential volume",
-        )
-        .unwrap();
+        docker_checked(&client, &create_volume, "seed stale credential volume").unwrap();
         let mut run = vec![
             "run".to_string(),
             "-d".to_string(),
@@ -1503,7 +1625,7 @@ mod tests {
             "sleep".to_string(),
             "600".to_string(),
         ]);
-        docker_checked(ContainerRuntime::Docker, &run, "seed stale relay").unwrap();
+        docker_checked(&client, &run, "seed stale relay").unwrap();
         let mut create_loader = vec![
             "create".to_string(),
             "--name".to_string(),
@@ -1518,17 +1640,12 @@ mod tests {
             crate::sandbox_container::DEFAULT_IMAGE.to_string(),
             "true".to_string(),
         ]);
-        docker_checked(
-            ContainerRuntime::Docker,
-            &create_loader,
-            "seed stale credential loader",
-        )
-        .unwrap();
-        recover_stale_boundaries(ContainerRuntime::Docker).unwrap();
-        assert!(!inspect_exists("network", &stale_network));
-        assert!(!inspect_exists("container", &stale_relay));
-        assert!(!inspect_exists("container", &stale_loader));
-        assert!(!inspect_exists("volume", &stale_volume));
+        docker_checked(&client, &create_loader, "seed stale credential loader").unwrap();
+        recover_stale_boundaries(&client).unwrap();
+        assert!(!inspect_exists(&client, "network", &stale_network));
+        assert!(!inspect_exists(&client, "container", &stale_relay));
+        assert!(!inspect_exists(&client, "container", &stale_loader));
+        assert!(!inspect_exists(&client, "volume", &stale_volume));
         assert!(!stale_dir.exists());
     }
 
@@ -1537,5 +1654,110 @@ mod tests {
         assert!(RELAY_SCRIPT.contains("BIND_HOST = socket.gethostbyname(\"kranz-egress\")"));
         assert!(RELAY_SCRIPT.contains("asyncio.start_server(relay, BIND_HOST, 3128)"));
         assert!(!RELAY_SCRIPT.contains("0.0.0.0"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_egress_v2_refuses_pre_admission_before_spawning_docker() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let marker = bin.path().join("docker-invoked");
+        let fake_docker = bin.path().join("docker");
+        std::fs::write(
+            &fake_docker,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf '28.0.0\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let path_val = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = crate::agent_env::EnvTestGuard::engage(&[
+            ("PATH", &path_val),
+            ("DOCKER_HOST", "tcp://127.0.0.1:2375"),
+        ]);
+
+        let mut spec = session_spec(root.path(), 8443);
+        spec.sandbox
+            .as_mut()
+            .unwrap()
+            .container
+            .as_mut()
+            .unwrap()
+            .image = crate::acp_worker::RESOURCE_IMAGE.to_string();
+        let paths = MissionPaths::new(root.path(), "m-egress-v2-preadmission");
+        let err = ContainerEgressBoundary::start(&mut spec, &paths)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ACP worker profile refused") && err.contains("DOCKER_HOST"),
+            "expected ACP v2 host admission refusal before docker spawn, got: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "docker must never be spawned before ACP v2 host admission succeeds"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn container_egress_clears_ambient_env_and_refuses_worker_writable_docker() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let env_dump = bin.path().join("docker-env.txt");
+        let fake_docker = bin.path().join("docker");
+        std::fs::write(
+            &fake_docker,
+            format!(
+                "#!/bin/sh\nenv > '{}'\nprintf '24.0.0\\n'\n",
+                env_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let path_val = format!("{}:{orig_path}", bin.path().display());
+        let _env = crate::agent_env::EnvTestGuard::engage(&[
+            ("PATH", &path_val),
+            ("ANTHROPIC_API_KEY", "sk-ambient-secret-must-not-leak"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-ambient-secret-must-not-leak"),
+        ]);
+
+        let mut spec = session_spec(root.path(), 8443);
+        let paths = MissionPaths::new(root.path(), "m-egress-env-clear");
+        // Fails at version floor (24.0.0 < 25.0.5) right after invoking fake_docker once.
+        let err = ContainerEgressBoundary::start(&mut spec, &paths)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(">= 25.0.5"), "{err}");
+        let recorded_env = std::fs::read_to_string(&env_dump).unwrap();
+        assert!(!recorded_env.contains("sk-ambient-secret-must-not-leak"));
+        assert!(!recorded_env.contains("aws-ambient-secret-must-not-leak"));
+
+        // Putting `docker` inside worker-writable `session_cwd` on PATH must fail closed.
+        let writable_bin = root.path().join("bin");
+        std::fs::create_dir_all(&writable_bin).unwrap();
+        let writable_docker = writable_bin.join("docker");
+        std::fs::write(&writable_docker, "#!/bin/sh\nprintf '28.0.0\\n'\n").unwrap();
+        std::fs::set_permissions(&writable_docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("PATH", format!("{}:{orig_path}", writable_bin.display()));
+        let refused = ContainerEgressBoundary::start(&mut spec, &paths)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("worker-writable"), "{refused}");
     }
 }

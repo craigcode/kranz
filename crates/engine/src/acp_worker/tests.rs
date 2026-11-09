@@ -1507,3 +1507,270 @@ async fn acp_profile_credential_renewal_rotates_out_of_band_without_worker_write
     assert!(!prepared2.contains_secret("worker-rotated-access-token-99999"));
     prepared2.close().unwrap();
 }
+
+#[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn acp_profile_close_and_drop_unlink_credentials_despite_guest_chmod_without_following_symlinks(
+) {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    let f = Fixture::new();
+    let outside_dir = f._dir.path().join("outside-target");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_sentinel = outside_dir.join("sentinel.txt");
+    std::fs::write(&outside_sentinel, "outside-untouched").unwrap();
+    std::fs::set_permissions(&outside_sentinel, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // 1. Explicit `PreparedProfile::close()` with 0500 credential dirs, 0400
+    //    credential files, a non-empty 0000 guest subdir, and escape symlinks.
+    let mut spec1 = f.spec();
+    let mut prepared1 = f.profile.prepare(&mut spec1).await.unwrap();
+    let home1 = spec1.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
+    let home1_root = home1.parent().unwrap().to_path_buf();
+
+    let claude_dir = home1.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let claude_creds = claude_dir.join(".credentials.json");
+    private_write(&claude_creds, br#"{"oauth":"synthetic-claude-token-0000"}"#).unwrap();
+    std::fs::set_permissions(&claude_creds, std::fs::Permissions::from_mode(0o400)).unwrap();
+    symlink(&outside_sentinel, claude_dir.join("escape-link")).unwrap();
+    std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let codex_dir = home1.join(".codex");
+    std::fs::set_permissions(
+        codex_dir.join("auth.json"),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let locked_dir = home1.join("guest-locked/nested");
+    std::fs::create_dir_all(&locked_dir).unwrap();
+    std::fs::write(locked_dir.join("pinned.txt"), "guest-bytes").unwrap();
+    symlink(&outside_dir, home1.join("escape-dir")).unwrap();
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(
+        home1.join("guest-locked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    prepared1.close().unwrap();
+    assert!(!home1.exists(), "inner home must be removed");
+    assert!(
+        !home1_root.exists(),
+        "kranz-acp-profile-* wrapper must be removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_sentinel).unwrap(),
+        "outside-untouched"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&outside_sentinel).unwrap().mode() & 0o777,
+        0o644
+    );
+
+    // 2. Implicit `Drop` on `PreparedProfile` with the same hostile permissions.
+    let mut spec2 = f.spec();
+    let prepared2 = f.profile.prepare(&mut spec2).await.unwrap();
+    let home2 = spec2.sandbox.as_ref().unwrap().inputs.tmpdir.clone();
+    let home2_root = home2.parent().unwrap().to_path_buf();
+    let claude_dir2 = home2.join(".claude");
+    std::fs::create_dir_all(&claude_dir2).unwrap();
+    private_write(&claude_dir2.join(".credentials.json"), b"secret").unwrap();
+    std::fs::set_permissions(&claude_dir2, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::set_permissions(home2.join(".codex"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let locked_dir2 = home2.join("locked-drop");
+    std::fs::create_dir_all(&locked_dir2).unwrap();
+    std::fs::write(locked_dir2.join("file.txt"), "x").unwrap();
+    symlink(&outside_sentinel, home2.join("escape-file")).unwrap();
+    std::fs::set_permissions(&locked_dir2, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    drop(prepared2);
+    assert!(!home2.exists(), "Drop must remove inner home");
+    assert!(!home2_root.exists(), "Drop must remove wrapper dir");
+    assert_eq!(
+        std::fs::read_to_string(&outside_sentinel).unwrap(),
+        "outside-untouched"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn acp_profile_credential_validation_deduplicates_extra_write_and_inode_swap_checks() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let scratch_dir = f._dir.path().join("scratch-cred");
+    let extra_dir = f._dir.path().join("extra-writable");
+    std::fs::create_dir_all(&scratch_dir).unwrap();
+    std::fs::create_dir_all(&extra_dir).unwrap();
+
+    let extra_cred = extra_dir.join("auth.json");
+    private_write(
+        &extra_cred,
+        &serde_json::to_vec(&json!({
+            "tokens": { "access_token": "a".repeat(20) }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Symlinked parent directory outside `extra_dir` resolving inside `extra_dir`.
+    let alias_parent = f._dir.path().join("alias-to-extra");
+    symlink(&extra_dir, &alias_parent).unwrap();
+    let aliased_cred = alias_parent.join("auth.json");
+
+    for id in ["fixture-acp-worker-v1", "fixture-acp-worker-v2"] {
+        for candidate in [&extra_cred, &aliased_cred] {
+            let p = AcpWorkerProfile {
+                id: id.into(),
+                credential_file: candidate.clone(),
+                resources: None,
+            };
+            let err = p
+                .verify_credential_source_with_extra_write(
+                    &f.primary,
+                    &f.workspace,
+                    &scratch_dir,
+                    std::slice::from_ref(&extra_dir),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("outside repository and worker-writable roots"),
+                "{id} / {}: {err}",
+                candidate.display()
+            );
+        }
+    }
+
+    // Intermediate inode mismatch between `original_path` and `source` fails closed.
+    let file_a = f._dir.path().join("cred-a.json");
+    let file_b = f._dir.path().join("cred-b.json");
+    private_write(&file_a, b"{}").unwrap();
+    private_write(&file_b, b"{}").unwrap();
+    let mismatch_err = private_credential_verified(&file_a, &file_b.canonicalize().unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        mismatch_err.contains("cannot open credential source"),
+        "{mismatch_err}"
+    );
+}
+
+#[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::await_holding_lock)]
+async fn acp_v2_pre_admission_runs_before_any_docker_spawn_and_preserves_v1_golden_argv() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let bin_dir = f._dir.path().join("poisoned-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let marker = f._dir.path().join("docker-spawned.marker");
+    let fake_docker = bin_dir.join("docker");
+    std::fs::write(
+        &fake_docker,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_val = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _env = crate::agent_env::EnvTestGuard::engage_unsetting(
+        &[
+            ("PATH", &path_val),
+            ("DOCKER_HOST", "tcp://127.0.0.1:2375"),
+            ("DOCKER_CONFIG", "/tmp/poisoned-docker-config"),
+        ],
+        &["DOCKER_CONTEXT"],
+    );
+
+    let role_sandbox = SandboxConfig {
+        provider: SandboxProvider::Container,
+        enforce: SandboxEnforce::FsNet,
+        image: Some(RESOURCE_IMAGE.into()),
+        extra_write: vec![],
+        egress: vec!["api.openai.com:443".into()],
+    };
+    let mission_dir = f.primary.join(".kranz/missions/m-profile");
+    let proof = admit_or_prove_session_mounts(
+        &role_sandbox,
+        &f.workspace,
+        &mission_dir,
+        crate::sandbox_container::ContainerRuntime::Docker,
+        std::slice::from_ref(&f.workspace),
+    );
+    match proof {
+        crate::sandbox_container::MountProof::Failed(why) => {
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                assert!(why.contains("DOCKER_HOST"), "{why}");
+            }
+        }
+        other => panic!("expected pre-admission MountProof::Failed, got {other:?}"),
+    }
+    assert!(
+        !marker.exists(),
+        "v2 mount proof must fail pre-admission BEFORE spawning any docker binary"
+    );
+
+    let mut v2_spec = f.spec();
+    v2_spec
+        .sandbox
+        .as_mut()
+        .unwrap()
+        .container
+        .as_mut()
+        .unwrap()
+        .image = RESOURCE_IMAGE.into();
+    let session_err = prepare_session_admission(&v2_spec)
+        .await
+        .err()
+        .expect("v2 session admission must fail before docker spawn")
+        .to_string();
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert!(session_err.contains("DOCKER_HOST"), "{session_err}");
+    }
+    assert!(
+        !marker.exists(),
+        "prepare_session_admission must refuse BEFORE spawning docker"
+    );
+
+    // Golden -v1 container_run_args check: valid paths keep exact -v and --tmpfs shapes.
+    std::fs::create_dir_all(f.workspace.join(".kranz")).unwrap();
+    let v1_spec = f.spec();
+    let v1_sandbox = v1_spec.sandbox.as_ref().unwrap();
+    let v1_container = v1_sandbox.container.as_ref().unwrap();
+    let argv = crate::sandbox_container::container_run_args(
+        &v1_sandbox.inputs,
+        v1_container,
+        Path::new("/usr/local/bin/node"),
+        &["/opt/acp/index.js".into()],
+        None,
+    );
+    let expected_mask = format!(
+        "{}:ro,noexec,nosuid,nodev,mode=755",
+        f.workspace.join(".kranz").canonicalize().unwrap().display()
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--tmpfs" && w[1] == expected_mask),
+        "{argv:?}"
+    );
+    assert!(argv
+        .windows(2)
+        .any(|w| w[0] == "-v" && w[1].ends_with(":ro")));
+    assert_eq!(
+        &argv[argv.len() - 3..],
+        &[
+            v1_container.image.as_str(),
+            "/usr/local/bin/node",
+            "/opt/acp/index.js"
+        ]
+    );
+}

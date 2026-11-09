@@ -237,13 +237,116 @@ pub enum MountProof {
     Failed(String),
 }
 
+/// Base scratch root for container-owned private ledgers and worker homes.
+pub(crate) fn scratch_root_base() -> PathBuf {
+    crate::backend_claude::scratch_root_base()
+}
+
+/// Recursively removes an engine-owned scratch directory without ever following
+/// symlinks (`std::fs::symlink_metadata`), repairing `0700` on engine-owned
+/// directories and `0600` on engine-owned regular files first so a same-UID
+/// guest `chmod 0000` cannot pin credentials on host disk or mask gate outcomes.
+/// `ErrorKind::NotFound` is treated as `Ok(())`.
+pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+    }
+    if file_type.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() == euid && (meta.mode() & 0o700) != 0o700 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            remove_owned_tree_nofollow(&entry.path())?;
+        }
+        return match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+    }
+    #[cfg(unix)]
+    if file_type.is_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() == euid && (meta.mode() & 0o600) != 0o600 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    if meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Canonical deduplication key for a mount root. Resolves existing paths via
+/// `canonicalize()`, or resolves the deepest existing ancestor and appends the
+/// non-existent tail so `/tmp/foo` and `/private/tmp/foo` deduplicate before
+/// directory creation.
+pub(crate) fn canonical_mount_root_key(root: &Path) -> PathBuf {
+    if let Ok(canon) = root.canonicalize() {
+        return canon;
+    }
+    let abs = crate::sandbox::absolutize(root);
+    let mut tail = Vec::new();
+    let mut current = abs.as_path();
+    while let Some(parent) = current.parent() {
+        if let Some(name) = current.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(canon_parent) = parent.canonicalize() {
+            let mut joined = canon_parent;
+            for component in tail.into_iter().rev() {
+                joined.push(component);
+            }
+            return joined;
+        }
+        current = parent;
+    }
+    abs
+}
+
 /// The probe argv: mount `host_dir` rw, read the host's sentinel from inside,
 /// and write the guest's sentinel back out. One container run proves both
 /// directions, because a mount can be visible one way and stale the other.
 /// This renders the sentinel command; use [`prove_bind_mount`] for owned,
 /// bounded execution and confirmed daemon cleanup.
 pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> Vec<String> {
-    vec![
+    try_mount_proof_argv(host_dir, image, guest_sentinel)
+        .expect("mount proof host_dir must not contain ':', '\\n', or '\\r'")
+}
+
+pub(crate) fn try_mount_proof_argv(
+    host_dir: &Path,
+    image: &str,
+    guest_sentinel: &str,
+) -> std::result::Result<Vec<String>, String> {
+    validate_container_mount_path(host_dir)?;
+    validate_container_mount_path(Path::new(MOUNT_PROOF_GUEST_DIR))?;
+    Ok(vec![
         "run".to_string(),
         "--rm".to_string(),
         "-v".to_string(),
@@ -252,7 +355,7 @@ pub fn mount_proof_argv(host_dir: &Path, image: &str, guest_sentinel: &str) -> V
         "sh".to_string(),
         "-c".to_string(),
         mount_proof_script(guest_sentinel),
-    ]
+    ])
 }
 
 fn mount_proof_script(guest_sentinel: &str) -> String {
@@ -343,12 +446,25 @@ pub fn cached_bind_mount_proof(
 pub fn prove_mount_roots(runtime: ContainerRuntime, roots: &[PathBuf], image: &str) -> MountProof {
     let mut seen = Vec::new();
     for root in roots {
-        if root.as_os_str().is_empty() || seen.iter().any(|prior| prior == root) {
+        if root.as_os_str().is_empty() {
             continue;
         }
-        seen.push(root.clone());
+        let key = canonical_mount_root_key(root);
+        if seen.iter().any(|prior| prior == &key || prior == root) {
+            continue;
+        }
+        seen.push(key.clone());
+        if root != &key {
+            seen.push(root.clone());
+        }
         match cached_bind_mount_proof(runtime, root, image) {
-            MountProof::Proven => {}
+            MountProof::Proven => {
+                if let Ok(canon) = root.canonicalize() {
+                    if !seen.iter().any(|prior| prior == &canon) {
+                        seen.push(canon);
+                    }
+                }
+            }
             failed => return failed,
         }
     }
@@ -365,12 +481,25 @@ pub(crate) fn prove_mount_roots_with_client(
 ) -> MountProof {
     let mut seen = Vec::new();
     for root in roots {
-        if root.as_os_str().is_empty() || seen.iter().any(|prior| prior == root) {
+        if root.as_os_str().is_empty() {
             continue;
         }
-        seen.push(root.clone());
+        let key = canonical_mount_root_key(root);
+        if seen.iter().any(|prior| prior == &key || prior == root) {
+            continue;
+        }
+        seen.push(key.clone());
+        if root != &key {
+            seen.push(root.clone());
+        }
         match mount_proof::prove_with_client(root, image, Some(client.clone())) {
-            MountProof::Proven => {}
+            MountProof::Proven => {
+                if let Ok(canon) = root.canonicalize() {
+                    if !seen.iter().any(|prior| prior == &canon) {
+                        seen.push(canon);
+                    }
+                }
+            }
             failed => return failed,
         }
     }
@@ -508,6 +637,91 @@ fn container_host_path(path: &Path) -> String {
     rendered.into_owned()
 }
 
+fn rendered_has_colon(rendered: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(rendered);
+        let bytes = stripped.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return stripped[2..].contains(':');
+        }
+        return stripped.contains(':');
+    }
+    #[cfg(not(windows))]
+    {
+        rendered.contains(':')
+    }
+}
+
+fn validate_rendered_mount_path(rendered: &str, display: &Path) -> std::result::Result<(), String> {
+    if rendered_has_colon(rendered) || rendered.contains(['\n', '\r']) {
+        return Err(format!(
+            "container mount path {} contains forbidden delimiter (':', '\\n', or '\\r')",
+            display.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects non-UTF-8 paths and paths containing `:`, `\n`, or `\r` before
+/// constructing `-v host:guest[:ro]` volume arguments.
+pub(crate) fn validate_container_mount_path(path: &Path) -> std::result::Result<(), String> {
+    let Some(raw) = path.to_str() else {
+        return Err(format!(
+            "container mount path {} is not valid UTF-8",
+            path.display()
+        ));
+    };
+    validate_rendered_mount_path(raw, path)?;
+    let rendered = container_host_path(path);
+    validate_rendered_mount_path(&rendered, path)
+}
+
+/// Rejects `:`, `,`, `\n`, and `\r` before constructing `--tmpfs` or `--mount`
+/// option strings.
+pub(crate) fn validate_container_tmpfs_path(path: &Path) -> std::result::Result<(), String> {
+    validate_container_mount_path(path)?;
+    let raw = path.to_str().unwrap_or_default();
+    let rendered = container_host_path(path);
+    if raw.contains(',') || rendered.contains(',') {
+        return Err(format!(
+            "container tmpfs/mount path {} contains forbidden option delimiter ','",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-closed validation of all sandbox mount and authority-mask paths before
+/// resolving or spawning a container session or gate.
+pub(crate) fn validate_sandbox_container_inputs(
+    inputs: &SandboxInputs,
+) -> std::result::Result<(), String> {
+    validate_container_mount_path(&inputs.session_cwd)?;
+    validate_container_mount_path(&inputs.mission_dir)?;
+    validate_container_mount_path(&inputs.tmpdir)?;
+    for extra in &inputs.extra_write {
+        validate_container_mount_path(extra)?;
+    }
+    for root in declared_mount_roots(
+        &inputs.session_cwd,
+        &inputs.mission_dir,
+        &inputs.extra_write,
+    ) {
+        validate_container_mount_path(&root)?;
+    }
+    for node in crate::sandbox::git_metadata_mount_nodes(inputs) {
+        validate_container_mount_path(&node)?;
+    }
+    for mask in crate::sandbox::authority_directory_masks(inputs) {
+        validate_container_tmpfs_path(&mask.path)?;
+        for entry in &mask.visible_entries {
+            validate_container_mount_path(entry)?;
+        }
+    }
+    Ok(())
+}
+
 /// Process-count bound for a worker/gate container. Generous next to the
 /// relay's 64 (a `cargo build -j` or an `npm ci` legitimately forks wide)
 /// but finite: without it a fork bomb inside the container takes the HOST
@@ -579,7 +793,16 @@ fn run_prologue(inputs: &SandboxInputs) -> Vec<String> {
 /// temp root, which would expose sibling missions' worktrees), and each
 /// `extra_write` entry (rw). Deduplicated, `session_cwd` first so it is the
 /// working directory's own mount; nested mounts stack deepest-last.
+#[cfg(test)]
 fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
+    try_push_policy_mounts(out, inputs)
+        .expect("policy mount path contains forbidden container delimiter")
+}
+
+fn try_push_policy_mounts(
+    out: &mut Vec<String>,
+    inputs: &SandboxInputs,
+) -> std::result::Result<(), String> {
     let mut mounts: Vec<(String, bool)> = Vec::new();
     let mut mounted_paths: Vec<PathBuf> = Vec::new();
     let denied_dirs: Vec<_> = crate::sandbox::authority_read_deny_dirs(inputs)
@@ -590,22 +813,28 @@ fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
         .iter()
         .map(|path| crate::sandbox::absolutize(path))
         .collect();
-    let mut add_mount = |path: &Path, ro: bool, mounted_paths: &mut Vec<PathBuf>| {
-        let path = crate::sandbox::absolutize(path);
+    let mut add_mount = |raw_path: &Path,
+                         ro: bool,
+                         mounted_paths: &mut Vec<PathBuf>|
+     -> std::result::Result<(), String> {
+        let path = crate::sandbox::absolutize(raw_path);
         // Docker's nested binds win over an enclosing tmpfs. extraWrite
         // must never reopen the operator authority directory.
         if denied_dirs.iter().any(|dir| path.starts_with(dir))
             || denied_files.iter().any(|file| path.starts_with(file))
         {
-            return;
+            return Ok(());
         }
+        validate_container_mount_path(raw_path)?;
+        validate_container_mount_path(&path)?;
         let host = container_host_path(&path);
         if !mounts.iter().any(|(existing, _)| existing == &host) {
             mounts.push((host, ro));
             mounted_paths.push(path);
         }
+        Ok(())
     };
-    add_mount(&inputs.session_cwd, false, &mut mounted_paths);
+    add_mount(&inputs.session_cwd, false, &mut mounted_paths)?;
     if let Some(missions) = inputs
         .mission_dir
         .parent()
@@ -613,10 +842,10 @@ fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
     {
         // Checkout-mode workers must not write other missions' inboxes or
         // audit logs through the broad session mount.
-        add_mount(missions, true, &mut mounted_paths);
+        add_mount(missions, true, &mut mounted_paths)?;
     }
-    add_mount(&inputs.mission_dir, true, &mut mounted_paths);
-    add_mount(&inputs.tmpdir, false, &mut mounted_paths);
+    add_mount(&inputs.mission_dir, true, &mut mounted_paths)?;
+    add_mount(&inputs.tmpdir, false, &mut mounted_paths)?;
     for extra in &inputs.extra_write {
         if inputs
             .mission_dir
@@ -628,7 +857,7 @@ fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
         {
             continue;
         }
-        add_mount(extra, false, &mut mounted_paths);
+        add_mount(extra, false, &mut mounted_paths)?;
     }
     // Worktree mode (2026-09-01 adversarial audit, M8): `<worktree>/.git` is
     // a gitlink pointing to `<repo>/.git/worktrees/<wt>` (whose `commondir`
@@ -640,17 +869,18 @@ fn push_policy_mounts(out: &mut Vec<String>, inputs: &SandboxInputs) {
             .iter()
             .any(|existing| git_dir.starts_with(existing))
         {
-            add_mount(&git_dir, true, &mut mounted_paths);
+            add_mount(&git_dir, true, &mut mounted_paths)?;
         }
     }
     for (host, ro) in mounts {
         out.push("-v".to_string());
         out.push(mount_arg(&host, ro));
     }
+    Ok(())
 }
 
 /// Whether `path` lies under one of the WRITABLE mounts
-/// [`push_policy_mounts`] declares (`session_cwd`, the scratch `tmpdir`, each
+/// `try_push_policy_mounts` declares (`session_cwd`, the scratch `tmpdir`, each
 /// `extra_write`). Only those can carry a host write out of the container, so
 /// only those need a write-deny bind stacked over them — and binding anything
 /// else would newly EXPOSE a path the container could not otherwise reach
@@ -666,12 +896,22 @@ fn under_writable_mount(path: &Path, inputs: &SandboxInputs) -> bool {
 /// Replace mounted authority directories with private read-only views that
 /// exclude credentials, including files created or replaced after launch.
 /// Keep engine-owned policy and Git metadata readable but immutable.
+#[cfg(test)]
 fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
+    try_push_authority_masks(out, inputs)
+        .expect("authority mask path contains forbidden container delimiter")
+}
+
+fn try_push_authority_masks(
+    out: &mut Vec<String>,
+    inputs: &SandboxInputs,
+) -> std::result::Result<(), String> {
     // Pin writable metadata directory nodes before authority views. A
     // worktree parent can cover its session's .kranz directory; later masks
     // must remain the last word there. Preserve any explicit policy mount,
     // including read-only mounts, and never duplicate a Docker destination.
     for node in crate::sandbox::git_metadata_mount_nodes(inputs) {
+        validate_container_mount_path(&node)?;
         let node = container_host_path(&node);
         if !out.windows(2).any(|pair| {
             pair[0] == "-v"
@@ -716,6 +956,7 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
     }
     *out = filtered;
     for mask in &masks {
+        validate_container_tmpfs_path(&mask.path)?;
         out.push("--tmpfs".to_string());
         out.push(format!(
             "{}:ro,noexec,nosuid,nodev,mode=755",
@@ -727,6 +968,7 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
             if masked_paths.contains(path) {
                 continue;
             }
+            validate_container_mount_path(path)?;
             let path = container_host_path(path);
             // Keep an existing narrower policy mount (e.g. missions ro or
             // session scratch rw); all other visible entries are read-only.
@@ -761,6 +1003,7 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
         {
             continue;
         }
+        validate_container_mount_path(path)?;
         let host = container_host_path(path);
         if !out
             .windows(2)
@@ -769,6 +1012,7 @@ fn push_authority_masks(out: &mut Vec<String>, inputs: &SandboxInputs) {
             out.extend(["-v".to_string(), mount_arg(&host, true)]);
         }
     }
+    Ok(())
 }
 
 /// The working directory (the session/gate cwd itself) plus the scratch
@@ -866,7 +1110,16 @@ pub fn validate_isolated_cache_dir(root: &Path) -> std::result::Result<PathBuf, 
 /// the operator's later builds — the same class as a shared target/, so
 /// ro it is: a cache MISS (uncached crate) fails visibly inside the
 /// container rather than writing through to the operator's cache.
+#[cfg(test)]
 fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
+    try_push_toolchain_caches(out, mode)
+        .expect("toolchain cache path contains forbidden container delimiter")
+}
+
+fn try_push_toolchain_caches(
+    out: &mut Vec<String>,
+    mode: ToolchainMount,
+) -> std::result::Result<(), String> {
     let global = crate::sandbox::global_authority_dir();
     let isolated_override = std::env::var_os(ISOLATED_CACHE_DIR_ENV)
         .filter(|v| !v.is_empty())
@@ -876,7 +1129,7 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
             Ok(valid) => Some(valid),
             // Fail closed on an invalid isolated cache root: mount no operator
             // or isolated toolchain caches rather than falling back to $HOME.
-            Err(_) => return,
+            Err(_) => return Ok(()),
         },
         None => None,
     };
@@ -926,6 +1179,7 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
                 for leaf in leaves {
                     let dir = host.join(leaf);
                     if dir.is_dir() {
+                        validate_container_mount_path(&dir)?;
                         let mounted = container_host_path(&dir);
                         out.push("-v".to_string());
                         out.push(mount_arg(&mounted, true));
@@ -933,12 +1187,14 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
                     }
                 }
                 if mode == ToolchainMount::Session && mounted_any {
+                    validate_container_mount_path(&host)?;
                     out.push("-e".to_string());
                     out.push(format!("CARGO_HOME={}", container_host_path(&host)));
                 }
                 continue;
             }
             if host.is_dir() {
+                validate_container_mount_path(&host)?;
                 let mounted = container_host_path(&host);
                 out.push("-v".to_string());
                 out.push(mount_arg(&mounted, true));
@@ -947,6 +1203,7 @@ fn push_toolchain_caches(out: &mut Vec<String>, mode: ToolchainMount) {
             }
         }
     }
+    Ok(())
 }
 
 /// The network posture: `fs+net` with an empty egress list maps to
@@ -988,15 +1245,27 @@ pub fn container_run_args(
     args: &[String],
     proxy_url: Option<&str>,
 ) -> Vec<String> {
+    try_container_run_args(inputs, spec, binary, args, proxy_url)
+        .expect("container run arguments contain a forbidden mount path delimiter")
+}
+
+pub(crate) fn try_container_run_args(
+    inputs: &SandboxInputs,
+    spec: &ContainerSpec,
+    binary: &Path,
+    args: &[String],
+    proxy_url: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+    validate_sandbox_container_inputs(inputs)?;
     let mut out = run_prologue(inputs);
     if let Some(name) = &spec.name {
         out.push("--name".to_string());
         out.push(name.clone());
     }
-    push_policy_mounts(&mut out, inputs);
+    try_push_policy_mounts(&mut out, inputs)?;
     push_workdir_and_scratch_env(&mut out, inputs);
-    push_toolchain_caches(&mut out, ToolchainMount::Session);
-    push_authority_masks(&mut out, inputs);
+    try_push_toolchain_caches(&mut out, ToolchainMount::Session)?;
+    try_push_authority_masks(&mut out, inputs)?;
     if inputs.enforce == crate::types::SandboxEnforce::FsNet && !inputs.egress.is_empty() {
         if let (Some(network), Some(_)) = (&spec.network, proxy_url) {
             out.push("--network".to_string());
@@ -1014,7 +1283,7 @@ pub fn container_run_args(
     out.push(spec.image.clone());
     out.push(binary.display().to_string());
     out.extend(args.iter().cloned());
-    out
+    Ok(out)
 }
 
 /// Env vars the gate builder itself emits (the scratch block's HOME/TMPDIR,
@@ -1074,13 +1343,25 @@ pub fn container_gate_run_args(
     env: &std::collections::HashMap<String, String>,
     container_name: &str,
 ) -> Vec<String> {
+    try_container_gate_run_args(inputs, spec, command, env, container_name)
+        .expect("container gate run arguments contain a forbidden mount path delimiter")
+}
+
+pub(crate) fn try_container_gate_run_args(
+    inputs: &SandboxInputs,
+    spec: &ContainerSpec,
+    command: &str,
+    env: &std::collections::HashMap<String, String>,
+    container_name: &str,
+) -> std::result::Result<Vec<String>, String> {
+    validate_sandbox_container_inputs(inputs)?;
     let mut out = run_prologue(inputs);
     out.push("--name".to_string());
     out.push(container_name.to_string());
-    push_policy_mounts(&mut out, inputs);
+    try_push_policy_mounts(&mut out, inputs)?;
     push_workdir_and_scratch_env(&mut out, inputs);
-    push_toolchain_caches(&mut out, ToolchainMount::Gate);
-    push_authority_masks(&mut out, inputs);
+    try_push_toolchain_caches(&mut out, ToolchainMount::Gate)?;
+    try_push_authority_masks(&mut out, inputs)?;
     push_network(&mut out, inputs, None);
     let mut forwarded: Vec<(&String, &String)> = env.iter().collect();
     forwarded.sort_by_key(|(key, _)| *key);
@@ -1095,7 +1376,7 @@ pub fn container_gate_run_args(
     out.push("sh".to_string());
     out.push("-c".to_string());
     out.push(command.to_string());
-    out
+    Ok(out)
 }
 
 #[cfg(all(test, unix))]
@@ -2602,6 +2883,100 @@ mod git_mount_tests {
                 .iter()
                 .any(|arg| arg.contains(&real_git_host) || arg.contains(&symlink_git_host)),
             "symlinked gitdir target must not be mounted: {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_mount_and_tmpfs_paths_refuse_colon_newline_and_comma_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::sandbox::absolutize(dir.path());
+        let colon_cwd = base.join("work:ro");
+        let newline_scratch = base.join("scratch\ninject");
+        let cr_extra = base.join("extra\rinject");
+        let comma_auth = base.join("repo,rw/.kranz");
+        std::fs::create_dir_all(&colon_cwd).unwrap();
+        std::fs::create_dir_all(base.join("mission")).unwrap();
+        std::fs::create_dir_all(base.join("scratch")).unwrap();
+
+        assert!(validate_container_mount_path(&colon_cwd).is_err());
+        assert!(validate_container_mount_path(&newline_scratch).is_err());
+        assert!(validate_container_mount_path(&cr_extra).is_err());
+        assert!(validate_container_tmpfs_path(&comma_auth).is_err());
+        assert!(try_mount_proof_argv(&colon_cwd, DEFAULT_IMAGE, "sentinel").is_err());
+
+        let spec = ContainerSpec {
+            runtime: ContainerRuntime::Docker,
+            image: DEFAULT_IMAGE.to_string(),
+            network: None,
+            name: None,
+        };
+        let inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::Fs,
+            session_cwd: colon_cwd,
+            mission_dir: base.join("mission"),
+            tmpdir: base.join("scratch"),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+        let err =
+            try_container_run_args(&inputs, &spec, Path::new("claude"), &[], None).unwrap_err();
+        assert!(err.contains("forbidden delimiter"), "unexpected: {err}");
+        let gate_err = try_container_gate_run_args(
+            &inputs,
+            &spec,
+            "true",
+            &std::collections::HashMap::new(),
+            "kranz-gate-colon",
+        )
+        .unwrap_err();
+        assert!(
+            gate_err.contains("forbidden delimiter"),
+            "unexpected: {gate_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_owned_tree_nofollow_repairs_zero_mode_dirs_and_never_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("keep.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let scratch = dir.path().join("scratch");
+        let locked = scratch.join("locked-dir");
+        std::fs::create_dir_all(&locked).unwrap();
+        let inner = locked.join("secret.txt");
+        std::fs::write(&inner, "token").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::os::unix::fs::symlink(&outside, scratch.join("escape-link")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        remove_owned_tree_nofollow(&scratch).unwrap();
+        assert!(!scratch.exists());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        // Missing path must succeed idempotently.
+        remove_owned_tree_nofollow(&scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_mount_root_key_deduplicates_symlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            canonical_mount_root_key(&real.join("child")),
+            canonical_mount_root_key(&alias.join("child"))
         );
     }
 }

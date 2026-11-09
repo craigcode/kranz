@@ -9,7 +9,7 @@ pipeline exists.
 
 The historical v0.1.0 GitHub release is a private preview. It is 1,000+ commits
 behind the current source and predates substantial security hardening. Never
-reuse that tag or publish current source as 0.1.0. v0.2.2 provides matching
+reuse that tag or publish current source as 0.1.0. v0.5.0 provides matching
 GitHub binaries and registry packages. Choose a new version for every
 subsequent release; never replace an existing tag or archive.
 
@@ -23,8 +23,7 @@ Complete `docs/public-readiness.md`. In particular:
   or visibly marked unsupported on an approved in-place route;
 - the repository is public and an anonymous clone has been verified;
 - existing crates.io names are controlled by the expected owners, and any new
-  name is available for the operator-approved first publication (currently
-  `kranz-acp`);
+  name is available for the operator-approved first publication;
 - the `release` GitHub environment requires owner approval;
 - the repository Actions variable `KRANZ_PUBLIC_RELEASE_ENABLED` is `true`;
   and
@@ -32,8 +31,8 @@ Complete `docs/public-readiness.md`. In particular:
 
 The normal release checks require the existing secret scanner and committed
 domain policy. An additional confidentiality word list is optional; the owner
-selected no additional list for v0.2.1 and v0.2.2, and the v0.2.3 patch retains
-that policy. No new secret is needed for that choice.
+selected no additional list through v0.5.0. No new secret is needed for that
+choice.
 
 If additional confidential names or phrases must be blocked, supply one
 case-sensitive UTF-8 literal per line
@@ -127,7 +126,7 @@ Cargo removes workspace `path` dependencies when packaging. For a single
 dependent crate, its sibling version must already be visible in the target
 registry. Current Cargo also supports a workspace-wide dry run, staging the
 selected packages together so unpublished siblings can be verified before
-upload. This path was exercised with Cargo 1.97.1 for v0.2.3; the application's
+upload. This path was exercised with Cargo 1.97.1 through v0.5.0; the application's
 Rust 1.88 build floor does not imply every older Cargo has the same publishing
 options. See the [Cargo publish reference](https://doc.rust-lang.org/cargo/commands/cargo-publish.html).
 
@@ -238,21 +237,28 @@ on crates.io after every step.
 
 ## 6. Optional follow-on: render and publish the Homebrew formula
 
-Do this only after the v0.2.0 Cargo and GitHub installations are proven. A
+Do this only after the v0.5.0 Cargo and GitHub installations are proven. A
 Homebrew failure does not invalidate those published artifacts and does not
-block closing the first public release.
+block closing the release.
 
 Download GitHub's tagged source tarball, compute its SHA-256 digest, and render
-`packaging/homebrew/kranz.rb.in` into the `craigcode/homebrew-kranz` tap by
-replacing `VERSION` and `SHA256`. Review the resulting diff; the committed file
-in this repository remains a template, not an installable all-zero formula.
+`packaging/homebrew/kranz.rb.in` into a `Formula/kranz.rb` candidate for the
+`craigcode/homebrew-kranz` tap by replacing `VERSION` and `SHA256`. Review the
+resulting diff; the committed file in this repository remains a template, not an
+installable all-zero formula.
 
-Test the rendered formula before pushing the tap:
+Test the rendered formula in a local tap before pushing the tap (Homebrew 7
+refuses bare `./Formula/kranz.rb` path installs):
 
 ```sh
-brew install --build-from-source ./Formula/kranz.rb
-brew test kranz
+brew tap-new --no-git craigcode/kranz
+cp ./Formula/kranz.rb "$(brew --repo craigcode/kranz)/Formula/kranz.rb"
+brew audit --strict craigcode/kranz/kranz
+brew install --build-from-source craigcode/kranz/kranz
+brew test craigcode/kranz/kranz
 kranz --version
+brew uninstall kranz
+brew untap craigcode/kranz
 ```
 
 Finally verify a clean `brew tap craigcode/kranz && brew install kranz` and a
@@ -263,6 +269,3 @@ clean `cargo install kranz --locked` without a Kranz source checkout.
 - Update the changelog comparison links if adopted.
 - Record clean-install evidence and artifact digests in the release notes.
 - Verify GitHub still reports every required security and branch rule.
-- Mark the M4 operator-release ticket done after GitHub, crates.io, and
-  clean-host smoke tests all agree on the same version. Track Homebrew as a
-  separate post-v0.2.0 distribution follow-on.

@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
 import { BoardLens } from './BoardLens';
@@ -269,9 +270,17 @@ describe('BoardLens — slice 3 list, counts, escaping, and polling', () => {
       'failed',
     ]);
 
+    const nonActableKinds = new Set(['needs-you', 'wrong-plan', 'failed']);
     items.forEach((item, idx) => {
-      const link = item.querySelector('a.trajectory-board-ask-link');
-      expect(link?.getAttribute('href')).toBe(expectedModel.asks[idx].href);
+      const expected = expectedModel.asks[idx];
+      if (nonActableKinds.has(expected.kind)) {
+        const link = item.querySelector('a.trajectory-board-ask-link');
+        expect(link?.getAttribute('href')).toBe(expected.href);
+      } else {
+        const btn = item.querySelector('button.trajectory-board-ask-link');
+        expect(btn).not.toBeNull();
+        expect(btn?.getAttribute('aria-expanded')).toBe('false');
+      }
     });
   });
 
@@ -428,7 +437,9 @@ describe('BoardLens — slice 4 jsdom degradation and DEMO route marker', () => 
 describe('trajectory act in place — slice 6 reusing existing panels', () => {
   it('connects the mission and renders the owning panel beside the board for each in-flight ask kind', async () => {
     const futureMs = Date.now() + 300_000;
-    const connectSpy = vi.fn();
+    const connectSpy = vi.fn((id: string) => {
+      useKranzStore.setState({ missionId: id, state: null, lastSeq: null });
+    });
 
     const missions = [
       makeMission({ id: 'm-perm', status: 'running', createdAt: '2026-10-08T10:00:00Z' }),
@@ -511,7 +522,339 @@ describe('trajectory act in place — slice 6 reusing existing panels', () => {
       const actCol = container.querySelector('.trajectory-board-act') as HTMLElement;
       expect(actCol).not.toBeNull();
       expect(actCol.textContent).toContain(c.heading);
+      const openLink = actCol.querySelector('a.trajectory-board-open-mission');
+      expect(openLink?.getAttribute('href')).toBe(`#/m/${c.missionId}`);
+      if (c.kind !== 'revision') {
+        expect(actCol.querySelector('.panel-revision')).toBeNull();
+      } else {
+        expect(actCol.querySelector('.panel-revision')).not.toBeNull();
+      }
     }
+
+    // Close via button and via Escape key
+    fireEvent.click(container.querySelector('button.trajectory-board-act-close')!);
+    expect(container.querySelector('.trajectory-board-act')).toBeNull();
+
+    fireEvent.click(
+      container.querySelector('.trajectory-board-ask-item[data-ask-kind="grant"]')!,
+    );
+    expect(container.querySelector('.trajectory-board-act')).not.toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(container.querySelector('.trajectory-board-act')).toBeNull();
+  });
+
+  it('prevents cross-mission panel bleed during rapid/polled transitions and never rewinds lastSeq (KRZ-H6)', async () => {
+    const missions = [
+      makeMission({ id: 'm-a', status: 'running', createdAt: '2026-10-08T10:00:00Z' }),
+      makeMission({ id: 'm-b', status: 'running', createdAt: '2026-10-08T10:01:00Z' }),
+    ];
+    const stateA = {
+      ...makeState('m-a', {
+        pendingGrantRequest: {
+          milestoneId: 'ms-a',
+          kind: 'command',
+          command: 'secret-cmd-mission-a',
+        },
+      }),
+      lastSeq: 10,
+    };
+    const stateB = {
+      ...makeState('m-b', {
+        pendingGrantRequest: {
+          milestoneId: 'ms-b',
+          kind: 'command',
+          command: 'cmd-mission-b',
+        },
+      }),
+      lastSeq: 5,
+    };
+
+    // Simulate connectMission lagging for m-b (store still holds m-a state while user clicks m-b)
+    let lagConnectForB = true;
+    const connectSpy = vi.fn((id: string) => {
+      if (id === 'm-b' && lagConnectForB) return;
+      if (useKranzStore.getState().missionId === id && useKranzStore.getState().state !== null) {
+        return;
+      }
+      useKranzStore.setState({ missionId: id, state: null, lastSeq: null });
+    });
+
+    vi.spyOn(api, 'tickets').mockResolvedValue([]);
+    vi.spyOn(api, 'missions').mockResolvedValue(missions);
+    vi.spyOn(api, 'missionState').mockImplementation(async (id) =>
+      id === 'm-a' ? stateA : stateB,
+    );
+
+    useKranzStore.setState({
+      tickets: [],
+      missions,
+      connectMission: connectSpy,
+    });
+
+    const { container } = render(<BoardLens />);
+    await waitFor(() => expect(api.missionState).toHaveBeenCalledWith('m-b'));
+
+    const items = container.querySelectorAll('.trajectory-board-ask-item[data-ask-kind="grant"]');
+    expect(items).toHaveLength(2);
+
+    // 1) Select Mission A -> renders Mission A's grant panel
+    fireEvent.click(items[0]);
+    expect(container.querySelector('.trajectory-board-act')?.textContent).toContain(
+      'secret-cmd-mission-a',
+    );
+
+    // Advance live WS seq on Mission A to 42; re-clicking Mission A must NOT rewind lastSeq to 10!
+    useKranzStore.setState({
+      state: { ...stateA, lastSeq: 42 },
+      lastSeq: 42,
+    });
+    fireEvent.click(items[0]);
+    expect(useKranzStore.getState().lastSeq).toBe(42);
+    expect(useKranzStore.getState().state?.lastSeq).toBe(42);
+
+    // 2) Rapidly click Mission B while store still holds Mission A -> Mission A's panel MUST NOT render!
+    fireEvent.click(items[1]);
+    expect(connectSpy).toHaveBeenCalledWith('m-b');
+    const actWhileSwitching = container.querySelector('.trajectory-board-act') as HTMLElement;
+    expect(actWhileSwitching.textContent).toContain('Connecting to mission…');
+    expect(actWhileSwitching.textContent).not.toContain('secret-cmd-mission-a');
+    expect(actWhileSwitching.querySelector('button[class*="strip-btn"]')).toBeNull();
+
+    // Once Mission B finishes connecting, Mission B's panel renders cleanly
+    lagConnectForB = false;
+    act(() => {
+      useKranzStore.setState({ missionId: 'm-b', state: stateB, lastSeq: stateB.lastSeq });
+    });
+    expect(container.querySelector('.trajectory-board-act')?.textContent).toContain(
+      'cmd-mission-b',
+    );
+    expect(container.querySelector('.trajectory-board-act')?.textContent).not.toContain(
+      'secret-cmd-mission-a',
+    );
+  });
+
+  it('calls connectMission via effect when polled state transitions selected craft to a new in-flight ask (KRZ-H6)', async () => {
+    const connectSpy = vi.fn((id: string) => {
+      useKranzStore.setState({ missionId: id, state: null, lastSeq: null });
+    });
+    const missions = [
+      makeMission({ id: 'm-polled', status: 'running', createdAt: '2026-10-08T10:00:00Z' }),
+    ];
+    let currentPolledState = makeState('m-polled');
+    vi.spyOn(api, 'tickets').mockResolvedValue([]);
+    vi.spyOn(api, 'missions').mockResolvedValue(missions);
+    vi.spyOn(api, 'missionState').mockImplementation(async () => currentPolledState);
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () =>
+        ({
+          fillStyle: '#000',
+          strokeStyle: '#000',
+          lineWidth: 1,
+          lineCap: 'butt',
+          lineJoin: 'miter',
+          globalAlpha: 1,
+          globalCompositeOperation: 'source-over',
+          setTransform() {},
+          clearRect() {},
+          beginPath() {},
+          closePath() {},
+          moveTo() {},
+          lineTo() {},
+          arc() {},
+          ellipse() {},
+          fill() {},
+          stroke() {},
+          fillRect() {},
+          setLineDash() {},
+          createRadialGradient: () => ({ addColorStop() {} }),
+          drawImage() {},
+          save() {},
+          restore() {},
+          translate() {},
+          rotate() {},
+        }) as unknown as RenderingContext,
+    );
+
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+
+    useKranzStore.setState({ tickets: [], missions, connectMission: connectSpy });
+    render(<BoardLens />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    // Select craft m-polled on the plot before it has any ask
+    fireEvent.click(screen.getByText('m-polled').closest('button')!);
+    expect(connectSpy).not.toHaveBeenCalled();
+
+    // Next 5s state poll surfaces a parked grant on m-polled -> effect connects m-polled automatically
+    currentPolledState = makeState('m-polled', {
+      pendingGrantRequest: { milestoneId: 'ms-1', kind: 'command', command: 'echo ok' },
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(connectSpy).toHaveBeenCalledWith('m-polled');
+    expect(screen.getByText('echo ok')).toBeTruthy();
+  });
+
+  it('advances nowMs during list refreshes even when zero missions are running (KRZ-H9)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () =>
+        ({
+          fillStyle: '#000',
+          strokeStyle: '#000',
+          lineWidth: 1,
+          lineCap: 'butt',
+          lineJoin: 'miter',
+          globalAlpha: 1,
+          globalCompositeOperation: 'source-over',
+          setTransform() {},
+          clearRect() {},
+          beginPath() {},
+          closePath() {},
+          moveTo() {},
+          lineTo() {},
+          arc() {},
+          ellipse() {},
+          fill() {},
+          stroke() {},
+          fillRect() {},
+          setLineDash() {},
+          createRadialGradient: () => ({ addColorStop() {} }),
+          drawImage() {},
+          save() {},
+          restore() {},
+          translate() {},
+          rotate() {},
+        }) as unknown as RenderingContext,
+    );
+
+    // Zero running missions; one delivered mission that merges on the first 10s poll
+    let currentMissions = [
+      makeMission({
+        id: 'm-landed-fresh',
+        status: 'complete',
+        merged: false,
+        createdAt: new Date(NOW_MS - 60_000).toISOString(),
+      }),
+    ];
+    const loadMissionsSpy = vi.fn(async () => {
+      useKranzStore.setState({ missions: currentMissions });
+    });
+    useKranzStore.setState({
+      tickets: [],
+      missions: currentMissions,
+      loadTickets: vi.fn().mockResolvedValue(undefined),
+      loadMissions: loadMissionsSpy,
+    });
+
+    const { container } = render(<BoardLens />);
+    // At mount (t = 0), m-landed-fresh is delivered and visible on the board
+    expect(
+      container.querySelector('.trajectory-board-chip[data-craft-key="mission-m-landed-fresh"]'),
+    ).not.toBeNull();
+
+    // Mark m-landed-fresh as merged before the 10s list poll; zero running missions throughout!
+    currentMissions = [
+      makeMission({
+        id: 'm-landed-fresh',
+        status: 'complete',
+        merged: true,
+        createdAt: new Date(NOW_MS - 60_000).toISOString(),
+      }),
+    ];
+
+    // Advance 100s across 10 list-poll ticks with zero running missions -> nowMs advances, craft finishes lift
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100_000);
+    });
+    expect(
+      container.querySelector('.trajectory-board-chip[data-craft-key="mission-m-landed-fresh"]'),
+    ).toBeNull();
+  });
+
+  it('isolates demo mode asks from live navigation and mutations, and preserves transitions under StrictMode (KRZ-M12, KRZ-M13, KRZ-L8)', () => {
+    window.location.hash = '#/board/demo';
+    const connectSpy = vi.fn();
+    useKranzStore.setState({ connectMission: connectSpy });
+
+    const { container, unmount } = render(<BoardLens demo={true} />);
+    expect(container.querySelectorAll('a.trajectory-board-ask-link')).toHaveLength(0);
+    const demoButtons = container.querySelectorAll('button.trajectory-board-ask-link');
+    expect(demoButtons.length).toBeGreaterThan(0);
+    expect(demoButtons[0].getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(demoButtons[0]);
+    expect(demoButtons[0].getAttribute('aria-expanded')).toBe('true');
+    expect(window.location.hash).toBe('#/board/demo');
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(container.querySelector('.trajectory-board-act')).toBeNull();
+    unmount();
+
+    // Verify StrictMode double-render does not wipe model.transitions
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () =>
+        ({
+          fillStyle: '#000',
+          strokeStyle: '#000',
+          lineWidth: 1,
+          lineCap: 'butt',
+          lineJoin: 'miter',
+          globalAlpha: 1,
+          globalCompositeOperation: 'source-over',
+          setTransform() {},
+          clearRect() {},
+          beginPath() {},
+          closePath() {},
+          moveTo() {},
+          lineTo() {},
+          arc() {},
+          ellipse() {},
+          fill() {},
+          stroke() {},
+          fillRect() {},
+          setLineDash() {},
+          createRadialGradient: () => ({ addColorStop() {} }),
+          drawImage() {},
+          save() {},
+          restore() {},
+          translate() {},
+          rotate() {},
+        }) as unknown as RenderingContext,
+    );
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => 1);
+    vi.spyOn(api, 'tickets').mockResolvedValue([]);
+    vi.spyOn(api, 'missions').mockResolvedValue([]);
+
+    useKranzStore.setState({
+      tickets: [],
+      missions: [makeMission({ id: 'm-strict', status: 'complete', merged: false })],
+      loadTickets: vi.fn().mockResolvedValue(undefined),
+      loadMissions: vi.fn().mockResolvedValue(undefined),
+    });
+
+    render(
+      <StrictMode>
+        <BoardLens />
+      </StrictMode>,
+    );
+    // Stationary delivered craft -> zero rAF scheduled initially
+    expect(rafSpy).not.toHaveBeenCalled();
+
+    // Single-step transition delivered -> landed (running count remains 0, so rAF ONLY fires if transitions survived StrictMode!)
+    act(() => {
+      useKranzStore.setState({
+        missions: [makeMission({ id: 'm-strict', status: 'complete', merged: true })],
+      });
+    });
+    expect(rafSpy).toHaveBeenCalledTimes(1);
   });
 
   it('renders ReviewableTicketRow (plan, estimate, Queue for run) for a reviewable ticket and calls approveTicket', async () => {

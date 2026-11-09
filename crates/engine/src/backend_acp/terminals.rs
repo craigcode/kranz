@@ -5,6 +5,7 @@ use kranz_acp::terminal::{self, Budget, Create, Error, Target, TerminalProvider}
 use std::collections::HashSet;
 
 const MAX_PENDING_CONTROL: usize = 32;
+pub(super) const MAX_REFUSED_TERMINAL_TRANSCRIPT: usize = 256;
 
 #[derive(Default)]
 pub(super) struct Broker {
@@ -12,6 +13,10 @@ pub(super) struct Broker {
     pub(super) provider: Option<Arc<Provider>>,
     tasks: tokio::task::JoinSet<TerminalCompletion>,
     pub(super) cleanup_recorded: bool,
+    pub(super) saw_budget_hit: bool,
+    pub(super) refused_terminal_requests: usize,
+    pub(super) suppressed_terminal_refusals: usize,
+    seen_refusal_errors: HashSet<Error>,
     controls: HashSet<String>,
     creating: HashSet<String>,
 }
@@ -36,6 +41,10 @@ impl Broker {
             provider: None,
             tasks: tokio::task::JoinSet::new(),
             cleanup_recorded: false,
+            saw_budget_hit: false,
+            refused_terminal_requests: 0,
+            suppressed_terminal_refusals: 0,
+            seen_refusal_errors: HashSet::new(),
             controls: HashSet::new(),
             creating: HashSet::new(),
         })
@@ -93,6 +102,40 @@ impl Broker {
         self.creating.remove(id);
     }
 
+    pub(super) fn observe_receipt(&mut self, raw: &Value) {
+        if raw
+            .get("terminalExited")
+            .and_then(|e| e.get("budget"))
+            .is_some_and(|b| !b.is_null())
+        {
+            self.saw_budget_hit = true;
+        }
+    }
+
+    pub(super) fn should_emit_requested(&self) -> bool {
+        self.refused_terminal_requests < MAX_REFUSED_TERMINAL_TRANSCRIPT
+    }
+
+    pub(super) fn record_completion(&mut self, result: &std::result::Result<Value, Error>) -> bool {
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                if matches!(error, Error::BudgetExceeded(_)) {
+                    self.saw_budget_hit = true;
+                }
+                self.refused_terminal_requests = self.refused_terminal_requests.saturating_add(1);
+                let first_of_kind = self.seen_refusal_errors.insert(*error);
+                let emit = self.refused_terminal_requests <= MAX_REFUSED_TERMINAL_TRANSCRIPT
+                    || first_of_kind;
+                if !emit {
+                    self.suppressed_terminal_refusals =
+                        self.suppressed_terminal_refusals.saturating_add(1);
+                }
+                emit
+            }
+        }
+    }
+
     pub(super) fn stop(&mut self) {
         self.tasks.abort_all();
         if let Some(provider) = &self.provider {
@@ -144,22 +187,26 @@ impl AcpSession {
                 "duplicate in-flight ACP request".into(),
             ));
         }
-        self.queue.push_back(AgentEvent::Other {
-            raw: json!({"terminalRequested": {
-                "method":method,"requestId":id,"scope":provider.scope,
-                "requestDigest":crate::live_permission::digest(&params)?,
-            }}),
-        });
+        let make_requested = |params: &Value| -> Result<AgentEvent> {
+            Ok(AgentEvent::Other {
+                raw: json!({"terminalRequested": {
+                    "method":method,"requestId":id,"scope":provider.scope,
+                    "requestDigest":crate::live_permission::digest(params)?,
+                }}),
+            })
+        };
         let parsed = if method == terminal::CREATE {
-            serde_json::from_value::<Create>(params)
+            serde_json::from_value::<Create>(params.clone())
                 .map_err(|_| Error::InvalidRequest)
-                .and_then(|action| provider.normalize(action))
-                .map(Ok)
+                .and_then(|action| {
+                    provider.normalize(action.clone())?;
+                    Ok(Ok(action))
+                })
         } else if matches!(
             method,
             terminal::OUTPUT | terminal::WAIT_FOR_EXIT | terminal::KILL | terminal::RELEASE
         ) {
-            serde_json::from_value::<Target>(params)
+            serde_json::from_value::<Target>(params.clone())
                 .map_err(|_| Error::InvalidRequest)
                 .and_then(|target| {
                     target.validate()?;
@@ -175,6 +222,9 @@ impl AcpSession {
         let request = match parsed {
             Ok(request) => request,
             Err(error) => {
+                if self.terminals.should_emit_requested() {
+                    self.queue.push_back(make_requested(&params)?);
+                }
                 return self
                     .complete_terminal(TerminalCompletion {
                         id,
@@ -183,7 +233,7 @@ impl AcpSession {
                         receipt: json!({"refusedBeforeExecution":true}),
                         permission_id: None,
                     })
-                    .await
+                    .await;
             }
         };
         match request {
@@ -204,6 +254,9 @@ impl AcpSession {
                     provider.reserve(&proposal_id)
                 };
                 if let Err(error) = capacity {
+                    if self.terminals.should_emit_requested() {
+                        self.queue.push_back(make_requested(&params)?);
+                    }
                     return self
                         .complete_terminal(TerminalCompletion {
                             id,
@@ -214,6 +267,7 @@ impl AcpSession {
                         })
                         .await;
                 }
+                self.queue.push_back(make_requested(&params)?);
                 self.seen_permission_ids.insert(peer_id);
                 let value = provider.action(&action).map_err(|_| failure())?;
                 let options = vec![
@@ -260,6 +314,9 @@ impl AcpSession {
                 });
             }
             Err(target) => {
+                if self.terminals.should_emit_requested() {
+                    self.queue.push_back(make_requested(&params)?);
+                }
                 if let Err(error) = self.terminals.admit_control(peer_id) {
                     return self
                         .complete_terminal(TerminalCompletion {
@@ -387,11 +444,14 @@ impl AcpSession {
             .map_err(|_| failure())?
             .map_err(|_| failure())?;
         for raw in provider.drain_receipts().map_err(|_| failure())? {
+            self.terminals.observe_receipt(&raw);
             self.queue.push_back(AgentEvent::Other { raw });
         }
         self.queue.push_back(AgentEvent::Other {
             raw: json!({"terminalSessionCleanup": {
                 "scope":provider.scope,"receipts":receipts,"confirmed":true,
+                "refusedRequests":self.terminals.refused_terminal_requests,
+                "suppressedRefusals":self.terminals.suppressed_terminal_refusals,
             }}),
         });
         Ok(())
@@ -425,5 +485,279 @@ mod tests {
         assert_eq!(broker.pending(), 0);
         broker.completed("0");
         broker.admit_control("excess".into()).unwrap();
+    }
+
+    async fn test_session_with_provider(sink: &std::path::Path) -> (AcpSession, Arc<Provider>) {
+        let provider = Arc::new(Provider::new(
+            Context {
+                client: crate::gate_evaluation::subprocess::DockerEvaluator::new(
+                    std::path::Path::new("/usr/bin/false"),
+                )
+                .unwrap(),
+                container_id: "a".repeat(64),
+                image: crate::acp_terminal::FIXTURE_IMAGE.into(),
+                workspace: "/workspace".into(),
+                scratch: "/scratch".into(),
+                alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
+            "run-fixture".into(),
+            "sess-1".into(),
+            "peer-1".into(),
+            Budgets::default(),
+        ));
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args(["-c", "cat > \"$1\"", "sh"])
+            .arg(sink)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_task = {
+            let buf = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                let tail = drain_to_tail(stderr, STDERR_TAIL_CAP).await;
+                *buf.lock().unwrap() = tail;
+            })
+        };
+        let (permission_responder, permission_answers) =
+            crate::live_permission::PermissionResponder::channel();
+        let mut broker = Broker::default();
+        broker.provider = Some(Arc::clone(&provider));
+        let session = AcpSession {
+            terminals: broker,
+            session_id: "sess-1".into(),
+            protocol: Client::with_terminal_support(),
+            model: "fixture".into(),
+            spec: SessionSpec {
+                cwd: PathBuf::from("."),
+                prompt: PromptMode::SingleShot("test".into()),
+                append_system_prompt: None,
+                model: "fixture".into(),
+                effort: "high".into(),
+                session_id: "sess-1".into(),
+                resume: None,
+                permission_mode: None,
+                allowed_tools: vec![],
+                disallowed_tools: vec![],
+                tools: vec![],
+                writable: true,
+                settings_json: None,
+                json_schema: None,
+                max_budget_usd: None,
+                max_turns: None,
+                env: Default::default(),
+                sandbox: None,
+                hook_status: None,
+            },
+            child,
+            container: None,
+            profile_home: None,
+            stdin: Some(stdin),
+            child_status: None,
+            cleanup_failure: None,
+            drain_deadline: None,
+            lines: BoundedLines::new_strict(stdout),
+            stderr_buf,
+            stderr_task: Some(stderr_task),
+            queue: VecDeque::new(),
+            tool_calls: HashMap::new(),
+            permission_responder,
+            permission_answers,
+            deferred_permission_answer: None,
+            pending_permissions: HashMap::new(),
+            seen_permission_ids: std::collections::HashSet::new(),
+            message_text: String::new(),
+            message_id: None,
+            last_usage: None,
+            previous_cost_total: None,
+            handshake_bytes: 0,
+            handshake_complete: true,
+            saw_result: false,
+            exit: None,
+            test_resource_evidence: None,
+        };
+        (session, provider)
+    }
+
+    fn base_resource_evidence() -> crate::acp_resources::ResourceEvidence {
+        let now = chrono::Utc::now();
+        let counters = crate::acp_resources::Counters {
+            oom_kill: Some(0),
+            pids_max: Some(0),
+            throttled_usec: Some(0),
+        };
+        crate::acp_resources::ResourceEvidence {
+            container_id: "a".repeat(64),
+            image: crate::acp_terminal::FIXTURE_IMAGE.into(),
+            supervisor_sha256: "b".repeat(64),
+            owner: "c".repeat(32),
+            limits: crate::acp_worker::Resources {
+                memory_mib: 256,
+                cpu_millis: 1_000,
+                pids: 64,
+                nofile: 256,
+                fsize_mib: 64,
+                tmpfs_mib: 64,
+                session_seconds: 600,
+            },
+            observation_started_at: now,
+            observation_finished_at: now,
+            state: Some(crate::acp_resources::ContainerState {
+                running: false,
+                oom_killed: false,
+                exit_code: 0,
+            }),
+            sample: Some(crate::acp_resources::Sample {
+                owner: "c".repeat(32),
+                elapsed_ms: 100,
+                complete: true,
+                wall_clock_expired: false,
+                baseline: counters.clone(),
+                current: counters,
+                usage: None,
+            }),
+            unavailable: vec![],
+            namespace_cleanup_confirmed: true,
+            failure: None,
+            terminal_budget_hit: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_rapid_output_rate_refusals_bound_transcript_while_returning_rpc_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dir.path().join("responses.ndjson");
+        let (mut session, provider) = test_session_with_provider(&sink).await;
+        provider.insert_test_active_handle("terminal-live");
+
+        // 10 allowed reads + 2,000 rapid OutputRate refusals = 2,010 requests.
+        let total_requests = 2_010u64;
+        for req_id in 1..=total_requests {
+            session
+                .handle_terminal(
+                    json!(req_id),
+                    terminal::OUTPUT,
+                    json!({"sessionId":"peer-1","terminalId":"terminal-live"}),
+                )
+                .await
+                .unwrap();
+            let completion = session.terminals.next().await.unwrap();
+            session.handle_frame(completion).await.unwrap();
+        }
+        assert_eq!(session.terminals.refused_terminal_requests, 2_000);
+        assert_eq!(
+            session.terminals.suppressed_terminal_refusals,
+            2_000 - MAX_REFUSED_TERMINAL_TRANSCRIPT
+        );
+        // Transcript stays O(MAX_REFUSED_TERMINAL_TRANSCRIPT), far below 4,020 events.
+        assert!(
+            session.queue.len() <= 2 * (10 + MAX_REFUSED_TERMINAL_TRANSCRIPT),
+            "unexpectedly large transcript queue len: {}",
+            session.queue.len()
+        );
+
+        // Close stdin and verify every single JSON-RPC response was still delivered.
+        session.stdin.take();
+        let _ = session.child.wait().await;
+        let wire = std::fs::read_to_string(&sink).unwrap();
+        let lines: Vec<Value> = wire
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), total_requests as usize);
+        let rpc_refusals = lines
+            .iter()
+            .filter(|v| v["error"]["data"]["budget"] == "outputRate")
+            .count();
+        assert_eq!(rpc_refusals, 2_000);
+    }
+
+    #[tokio::test]
+    async fn terminal_budget_hit_wires_into_session_resource_evidence_and_exit_status() {
+        use crate::acp_resources::FailureClass;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dir.path().join("responses.ndjson");
+        let (mut session, provider) = test_session_with_provider(&sink).await;
+        session.test_resource_evidence = Some(base_resource_evidence());
+        provider.insert_test_active_handle("terminal-live");
+
+        // Trigger OutputRate budget hit via complete_terminal.
+        for req_id in 1..=11u64 {
+            session
+                .handle_terminal(
+                    json!(req_id),
+                    terminal::OUTPUT,
+                    json!({"sessionId":"peer-1","terminalId":"terminal-live"}),
+                )
+                .await
+                .unwrap();
+            let completion = session.terminals.next().await.unwrap();
+            session.handle_frame(completion).await.unwrap();
+        }
+        assert!(session.terminals.saw_budget_hit);
+
+        // (a) Recoverable terminal budget hit + successful session => failure == None.
+        session.exit = Some(SessionExit::Completed);
+        assert_eq!(session.exit_status(), Some(SessionExit::Completed));
+        let mut passing_evidence = session.resource_evidence().unwrap();
+        passing_evidence.classify(false);
+        assert_eq!(passing_evidence.failure, None);
+
+        // (b) Terminal budget hit + failed session => FailureClass::TerminalBudget.
+        session.exit = Some(SessionExit::Failed("adapter aborted turn".into()));
+        match session.exit_status() {
+            Some(SessionExit::Failed(msg)) => {
+                assert!(
+                    msg.contains("ACP terminal budget exhaustion observed"),
+                    "{msg}"
+                );
+                assert!(
+                    msg.contains("Session failure: adapter aborted turn"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected Failed exit_status, got {other:?}"),
+        }
+        let mut failing_evidence = session.resource_evidence().unwrap();
+        failing_evidence.classify(true);
+        assert_eq!(failing_evidence.failure, Some(FailureClass::TerminalBudget));
+
+        session.kill_child().await;
+
+        // Also verify receipt-driven attribution (`terminalExited` with non-null vs null `budget`).
+        let sink2 = dir.path().join("responses2.ndjson");
+        let (mut session2, _) = test_session_with_provider(&sink2).await;
+        session2.test_resource_evidence = Some(base_resource_evidence());
+        session2
+            .handle_frame(Input::TerminalReceipt(
+                json!({"terminalExited": {"budget": null}}),
+            ))
+            .await
+            .unwrap();
+        assert!(!session2.terminals.saw_budget_hit);
+        session2.exit = Some(SessionExit::Failed("non-budget error".into()));
+        let mut non_budget_ev = session2.resource_evidence().unwrap();
+        non_budget_ev.classify(true);
+        assert_eq!(non_budget_ev.failure, Some(FailureClass::Other));
+
+        session2
+            .handle_frame(Input::TerminalReceipt(
+                json!({"terminalExited": {"budget": "commandLifetime"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(session2.terminals.saw_budget_hit);
+        let mut exited_budget_ev = session2.resource_evidence().unwrap();
+        exited_budget_ev.classify(true);
+        assert_eq!(exited_budget_ev.failure, Some(FailureClass::TerminalBudget));
+        session2.kill_child().await;
     }
 }

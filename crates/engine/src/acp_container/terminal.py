@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-MAX_REQUEST = 32768
+MAX_REQUEST = 32768 + 4096
 CLEANUP_SECONDS = 3
 
 
@@ -50,9 +50,15 @@ def reap(peer):
 def stop_children(peer):
     deadline = time.monotonic() + CLEANUP_SECONDS
     while time.monotonic() < deadline:
+        peer_was_reaped = peer.returncode is not None
         if reap(peer):
             return
-        for pid in children():
+        before = set(children())
+        try:
+            os.killpg(peer.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for pid in before:
             try:
                 fd = os.pidfd_open(pid)
                 try:
@@ -64,7 +70,12 @@ def stop_children(peer):
                     os.close(fd)
             except ProcessLookupError:
                 pass
-        time.sleep(0.01)
+        if reap(peer):
+            return
+        after = set(children())
+        peer_reaped_now = (not peer_was_reaped) and (peer.returncode is not None)
+        if not peer_reaped_now and after == before:
+            time.sleep(0.01)
     raise TimeoutError("descendant cleanup")
 
 
@@ -99,7 +110,7 @@ def main():
     deadline = time.monotonic() + 5
     data = bytearray()
     while not data.endswith(b"\n"):
-        if len(data) > MAX_REQUEST or time.monotonic() >= deadline:
+        if len(data) >= MAX_REQUEST or time.monotonic() >= deadline:
             raise ValueError("launch bound")
         if select.select([0], [], [], 0.05)[0]:
             byte = os.read(0, 1)
@@ -141,6 +152,12 @@ def main():
     hint_read, hint_write = os.pipe()
 
     def child_hint():
+        try:
+            os.fchdir(cwd)
+            os.close(cwd)
+            os.set_inheritable(program, False)
+        except BaseException:
+            os._exit(125)
         observed = None
         hint_fd = None
         try:
@@ -168,10 +185,10 @@ def main():
 
     peer = subprocess.Popen([executable, *action["args"]],
                             executable="/proc/self/fd/" + str(program),
-                            cwd="/proc/self/fd/" + str(cwd), env=env,
+                            cwd=None, env=env,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, close_fds=True,
-                            pass_fds=(cwd, program, hint_write), start_new_session=True,
+                            pass_fds=(program, hint_write), start_new_session=True,
                             preexec_fn=child_hint)
     os.close(hint_write)
     observed_hint = json.loads(os.read(hint_read, 32))
@@ -189,19 +206,26 @@ def main():
     retention_deadline = None
     budget = None
     retention_expired = False
+    expired_budget = None
     drain_deadline = None
     while True:
         reap(peer)
         if peer.returncode is not None and drain_deadline is None:
             stop_children(peer)
             drain_deadline = time.monotonic() + CLEANUP_SECONDS
-        if peer.returncode is None and time.monotonic() >= command_deadline:
-            budget = "sessionLifetime" if time.monotonic() >= session_deadline else "commandLifetime"
+        now = time.monotonic()
+        if peer.returncode is None and now >= command_deadline:
+            budget = "sessionLifetime" if now >= session_deadline else "commandLifetime"
             stop_children(peer)
             drain_deadline = time.monotonic() + CLEANUP_SECONDS
-        if exit_sent and time.monotonic() >= retention_deadline:
+        now = time.monotonic()
+        if exit_sent and not retention_expired and now >= retention_deadline:
             retention_expired = True
+            expired_budget = "sessionLifetime" if now >= session_deadline else "retention"
             releasing = True
+        if releasing and exit_sent:
+            send({"event": "released", "retentionExpired": retention_expired, "budget": expired_budget})
+            return
         if drain_deadline is not None and not output_eof and time.monotonic() >= drain_deadline:
             raise TimeoutError("output drain")
         readers = [0] + ([] if output_eof else [peer.stdout.fileno()])
@@ -241,7 +265,7 @@ def main():
             exit_sent = True
             retention_deadline = min(session_deadline, time.monotonic() + retention_ms / 1000)
         if releasing and exit_sent:
-            send({"event": "released", "retentionExpired": retention_expired})
+            send({"event": "released", "retentionExpired": retention_expired, "budget": expired_budget})
             return
 
 

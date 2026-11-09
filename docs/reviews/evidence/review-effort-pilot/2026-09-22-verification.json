@@ -223,7 +223,7 @@
     {
       "step": "domain",
       "command": [
-        "/Users/craigmartin/Data/kranz-pilot-build/debug/kranz",
+        "<CARGO_TARGET_DIR>/debug/kranz",
         "domain-lint"
       ],
       "exitCode": 0,

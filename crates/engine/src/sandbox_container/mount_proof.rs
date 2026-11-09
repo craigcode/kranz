@@ -32,18 +32,57 @@ pub(super) fn prove(host_dir: &Path, image: &str) -> MountProof {
     prove_with_client(host_dir, image, None)
 }
 
+fn ensure_dir_mode_0700(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(path)
+}
+
+fn lexical_absolutize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub(super) fn prove_with_client(
     host_dir: &Path,
     image: &str,
     client: Option<DockerEvaluator>,
 ) -> MountProof {
-    // Declared mission/scratch parents may not exist until preflight. Preserve
-    // the old probe's create_dir_all behavior before canonicalizing the root.
-    if let Err(error) = std::fs::create_dir_all(host_dir) {
+    if let Err(reason) = super::validate_container_mount_path(host_dir) {
+        return MountProof::Failed(reason);
+    }
+    // Declared mission/scratch parents may not exist until preflight. Create any
+    // missing directory with mode 0700 rather than inheriting process umask.
+    if let Err(error) = ensure_dir_mode_0700(host_dir) {
         return MountProof::Failed(format!(
             "could not create mount proof root {}: {error}",
             host_dir.display()
         ));
+    }
+    if let Err(reason) = super::validate_container_mount_path(host_dir) {
+        return MountProof::Failed(reason);
     }
     // Resolution also runs inside Tokio and spawn_blocking. Keep the bounded
     // control runtime on its own thread; dropping a caller does not detach an
@@ -60,6 +99,8 @@ pub(super) fn prove_with_client(
                         Some(client) => client,
                         None => DockerEvaluator::new(&docker_path(host_dir)?)?,
                     };
+                    let scratch_base = super::scratch_root_base();
+                    let _ = reap_dead_owner_ledgers(&scratch_base, &client, WALL).await;
                     let mut helper = Helper::new(client, host_dir)?;
                     Ok(helper.prove(image, WALL, 85, &AtomicBool::new(false)).await)
                 })
@@ -71,18 +112,42 @@ pub(super) fn prove_with_client(
 }
 
 fn docker_path(host_dir: &Path) -> Result<PathBuf, String> {
-    let host_dir = host_dir.canonicalize().map_err(|e| e.to_string())?;
-    for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .filter(|p| p.is_absolute())
-    {
-        if let Ok(path) = root.join("docker").canonicalize() {
-            if path.is_file() {
-                if path.starts_with(&host_dir) {
+    docker_path_from_env(host_dir, std::env::var_os("PATH").as_deref())
+}
+
+fn docker_path_from_env(
+    host_dir: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let host_lex = lexical_absolutize(host_dir);
+    let host_canon = host_dir.canonicalize().map_err(|e| e.to_string())?;
+    for root in std::env::split_paths(&path_var.unwrap_or_default()).filter(|p| p.is_absolute()) {
+        let root_lex = lexical_absolutize(&root);
+        let entry = root.join("docker");
+        // Check `root` (absolutized) against `host_dir` BEFORE `canonicalize()`
+        // so a symlink inside the tested write root pointing outside cannot
+        // hijack control-plane binary selection. If `host_dir` is an ancestor
+        // such as `$HOME` and a benign PATH dir (`~/.cargo/bin`) contains no
+        // `docker` entry at all, skip without traversing `canonicalize()`.
+        if root_lex.starts_with(&host_lex) || root_lex.starts_with(&host_canon) {
+            match std::fs::symlink_metadata(&entry) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => {
                     return Err(
                         "mount proof Docker executable is inside the tested write root".into(),
                     );
                 }
-                return Ok(path);
+            }
+        }
+        if let Ok(candidate) = entry.canonicalize() {
+            if candidate.starts_with(&host_canon) || candidate.starts_with(&host_lex) {
+                return Err("mount proof Docker executable is inside the tested write root".into());
+            }
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
+                    return Ok(candidate);
+                }
             }
         }
     }
@@ -103,15 +168,23 @@ struct Helper {
 
 impl Helper {
     fn new(client: DockerEvaluator, root: &Path) -> Result<Self, String> {
+        super::validate_container_mount_path(root)?;
         let probe = tempfile::Builder::new()
             .prefix("kranz-mount-proof-")
             .tempdir_in(root)
             .map_err(|e| e.to_string())?;
-        // This directory is never mounted. A broken tested mount must not
-        // make the daemon ownership record disappear or become guest-writable.
+        // Store recovery ledgers under the private container scratch base; this
+        // directory is never mounted into the helper or worker container.
+        let ledger_base = super::scratch_root_base();
+        ensure_dir_mode_0700(&ledger_base).map_err(|e| {
+            format!(
+                "could not create private mount ledger base {}: {e}",
+                ledger_base.display()
+            )
+        })?;
         let ledger = tempfile::Builder::new()
-            .prefix("kranz-mount-owner-")
-            .tempdir()
+            .prefix("kranz-mount-ledger-")
+            .tempdir_in(&ledger_base)
             .map_err(|e| e.to_string())?;
         let owner = uuid::Uuid::new_v4().simple().to_string();
         Ok(Self {
@@ -224,6 +297,8 @@ impl Helper {
             return Err("mount proof requires a Linux image without anonymous volumes".into());
         }
         let probe = self.probe.as_ref().expect("owned probe").path();
+        super::validate_container_mount_path(probe)?;
+        super::validate_container_mount_path(Path::new(super::MOUNT_PROOF_GUEST_DIR))?;
         std::fs::write(probe.join("host.txt"), host).map_err(|e| e.to_string())?;
         let payload = super::mount_proof_script(guest);
         // Build a create/start pair so successful creation has an immutable ID
@@ -281,9 +356,13 @@ impl Helper {
             guest_seconds.to_string(),
             payload,
         ]);
+        let owner_pid = std::process::id();
+        let owner_identity = crate::event_log::process_identity_token(owner_pid as i32);
         let evidence = serde_json::json!({
             "schema":1, "ownerLabel":OWNER_LABEL, "owner":self.owner, "name":self.name,
-            "hostPid":std::process::id(), "imageId":image_id,
+            "hostPid":owner_pid, "ownerPid":owner_pid, "ownerIdentity":owner_identity,
+            "docker":self.client.program(), "endpoint":self.client.pinned_endpoint(),
+            "imageId":image_id,
             "probe":probe, "creation":"intent-recorded-before-spawn",
             "cleanupConfirmed":false, "guestDeadlineSeconds":guest_seconds,
             "recovery":"Using the same Docker endpoint, list all containers with this owner label, inspect their full IDs and label, remove only those IDs, then verify an empty successful inventory. Interrupted create can finish late: an empty early inventory is not confirmation. Never delete by name."
@@ -411,7 +490,16 @@ impl Helper {
 
 impl Drop for Helper {
     fn drop(&mut self) {
-        if !self.creation_started || self.ledger.is_none() {
+        if !self.creation_started {
+            if let Some(probe) = self.probe.take() {
+                let _ = super::remove_owned_tree_nofollow(&probe.keep());
+            }
+            if let Some(ledger) = self.ledger.take() {
+                let _ = super::remove_owned_tree_nofollow(&ledger.keep());
+            }
+            return;
+        }
+        if self.ledger.is_none() {
             return;
         }
         let mut cleanup = Self {
@@ -431,20 +519,189 @@ impl Drop for Helper {
         let probe = cleanup.probe.take().expect("owned probe").keep();
         cleanup.creation_started = false;
         let recovery = ledger.clone();
-        if let Err(error) = std::thread::Builder::new().name("mount-proof-cleanup".into()).spawn(move || {
-            cleanup.creation_started = true;
-            let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
-                .map_err(|e| e.to_string()).and_then(|runtime| runtime.block_on(cleanup.cleanup()));
-            if result.is_ok() {
-                let _ = std::fs::remove_dir_all(probe);
-                let _ = std::fs::remove_dir_all(ledger);
-            } else {
-                tracing::error!(?result, ledger = %ledger.display(), "mount helper cleanup unconfirmed after cancellation");
-            }
-        }) {
+        if let Err(error) = std::thread::Builder::new()
+            .name("mount-proof-cleanup".into())
+            .spawn(move || {
+                cleanup.creation_started = true;
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|runtime| runtime.block_on(cleanup.cleanup()));
+                if result.is_ok() {
+                    let _ = super::remove_owned_tree_nofollow(&probe);
+                    let _ = super::remove_owned_tree_nofollow(&ledger);
+                } else {
+                    tracing::error!(
+                        ?result,
+                        ledger = %ledger.display(),
+                        "mount helper cleanup unconfirmed after cancellation"
+                    );
+                }
+            })
+        {
             tracing::error!(%error, ledger = %recovery.display(), "mount helper cleanup thread unavailable");
         }
     }
+}
+
+fn owner_pid_is_provably_dead(owner_pid: u32, owner_identity: Option<&str>) -> bool {
+    let Ok(pid_i32) = i32::try_from(owner_pid) else {
+        return false;
+    };
+    if pid_i32 <= 0 {
+        return false;
+    }
+    if let Some(expected) = owner_identity.filter(|s| !s.trim().is_empty()) {
+        match crate::event_log::process_identity_token(pid_i32) {
+            Some(live) if live == expected => return false,
+            Some(_) => return true,
+            None => {}
+        }
+    }
+    let rc = unsafe { libc::kill(pid_i32, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+pub(super) async fn reap_dead_owner_ledgers(
+    scratch_base: &Path,
+    client: &DockerEvaluator,
+    min_age: Duration,
+) -> usize {
+    use std::io::Read;
+    let Ok(entries) = std::fs::read_dir(scratch_base) else {
+        return 0;
+    };
+    let expected_docker = client
+        .program()
+        .canonicalize()
+        .unwrap_or_else(|_| client.program().to_path_buf());
+    let mut reaped = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("kranz-mount-ledger-")
+            && !name_str.starts_with("kranz-mount-owner-")
+        {
+            continue;
+        }
+        let ledger_dir = entry.path();
+        let Ok(dir_meta) = std::fs::symlink_metadata(&ledger_dir) else {
+            continue;
+        };
+        if !dir_meta.file_type().is_dir() {
+            continue;
+        }
+        let record_path = ledger_dir.join("owner.json");
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&record_path)
+        else {
+            continue;
+        };
+        let Ok(file_meta) = file.metadata() else {
+            continue;
+        };
+        if !file_meta.is_file() || file_meta.len() > 64 * 1024 {
+            continue;
+        }
+        if !min_age.is_zero()
+            && !file_meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= min_age)
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.take(64 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(record) = crate::strict_json::parse(&bytes) else {
+            continue;
+        };
+        let Some(owner) = record.get("owner").and_then(|v| v.as_str()).filter(|s| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }) else {
+            continue;
+        };
+        let owner_pid = record
+            .get("ownerPid")
+            .or_else(|| record.get("hostPid"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|pid| *pid > 0);
+        let Some(owner_pid) = owner_pid else {
+            continue;
+        };
+        let owner_identity = record.get("ownerIdentity").and_then(|v| v.as_str());
+        if !owner_pid_is_provably_dead(owner_pid, owner_identity) {
+            continue;
+        }
+        if let Some(recorded_docker) = record
+            .get("docker")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+        {
+            let recorded_canon = recorded_docker
+                .canonicalize()
+                .unwrap_or_else(|_| recorded_docker.clone());
+            if recorded_canon != expected_docker && recorded_docker != client.program() {
+                continue;
+            }
+        }
+        let mut ledger_client = client.clone();
+        match record.get("endpoint") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(ep)) if !ep.trim().is_empty() => {
+                ledger_client.pin_local_endpoint(ep);
+            }
+            Some(_) => continue,
+        }
+        let Ok(ids) = owned_ids(&ledger_client, owner).await else {
+            continue;
+        };
+        let mut rm_ok = true;
+        for id in ids {
+            if ledger_client
+                .control(&["rm".into(), "--force".into(), id])
+                .await
+                .is_err()
+            {
+                rm_ok = false;
+                break;
+            }
+        }
+        if !rm_ok {
+            continue;
+        }
+        let Ok(remaining) = owned_ids(&ledger_client, owner).await else {
+            continue;
+        };
+        if !remaining.is_empty() {
+            continue;
+        }
+        if let Some(probe_str) = record.get("probe").and_then(|v| v.as_str()) {
+            let probe_path = Path::new(probe_str);
+            if probe_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("kranz-mount-proof-"))
+            {
+                let _ = super::remove_owned_tree_nofollow(probe_path);
+            }
+        }
+        if super::remove_owned_tree_nofollow(&ledger_dir).is_ok() {
+            reaped += 1;
+        }
+    }
+    reaped
 }
 
 fn full_id(id: &str) -> bool {
@@ -480,3 +737,175 @@ async fn owned_ids(client: &DockerEvaluator, owner: &str) -> Result<Vec<String>,
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod containment_remediation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn mount_proof_creates_missing_host_dir_mode_0700_and_refuses_colon_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let colon_dir = dir.path().join("bad:mount");
+        let colon_proof = prove_with_client(&colon_dir, "alpine:3", None);
+        assert!(
+            matches!(colon_proof, MountProof::Failed(ref why) if why.contains("forbidden delimiter")),
+            "{colon_proof:?}"
+        );
+        assert!(
+            !colon_dir.exists(),
+            "colon path must be refused before creating host_dir"
+        );
+
+        let fake_bin = dir.path().join("fake-docker");
+        std::fs::write(&fake_bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = DockerEvaluator::new(&fake_bin).unwrap();
+        let missing = dir.path().join("missing-parent/missing-leaf");
+        let _ = prove_with_client(&missing, "alpine@sha256:0000", Some(client));
+        assert!(missing.is_dir());
+        assert_eq!(
+            std::fs::symlink_metadata(&missing)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(missing.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn mount_proof_docker_path_checks_root_before_canonicalize_and_skips_non_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_root = dir.path().join("worktree");
+        let write_bin = write_root.join("bin");
+        let trusted_bin = dir.path().join("trusted-bin");
+        let non_exec_bin = dir.path().join("non-exec-bin");
+        std::fs::create_dir_all(&write_bin).unwrap();
+        std::fs::create_dir_all(&trusted_bin).unwrap();
+        std::fs::create_dir_all(&non_exec_bin).unwrap();
+
+        let real_docker = trusted_bin.join("docker");
+        std::fs::write(&real_docker, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&real_docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Non-executable candidate earlier on PATH must be skipped.
+        let non_exec_docker = non_exec_bin.join("docker");
+        std::fs::write(&non_exec_docker, "not executable").unwrap();
+        std::fs::set_permissions(&non_exec_docker, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let path_ok = std::env::join_paths([&non_exec_bin, &trusted_bin]).unwrap();
+        assert_eq!(
+            docker_path_from_env(&write_root, Some(&path_ok)).unwrap(),
+            real_docker.canonicalize().unwrap()
+        );
+
+        // Symlink inside `write_root` pointing to `real_docker` outside `write_root`
+        // MUST be rejected BEFORE `canonicalize()`!
+        std::os::unix::fs::symlink(&real_docker, write_bin.join("docker")).unwrap();
+        let path_poisoned = std::env::join_paths([&write_bin, &trusted_bin]).unwrap();
+        let err = docker_path_from_env(&write_root, Some(&path_poisoned)).unwrap_err();
+        assert!(err.contains("inside the tested write root"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_proof_reaps_dead_owner_ledger_and_locked_probe_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        let host_root = dir.path().join("host");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&host_root).unwrap();
+
+        let id = "d".repeat(64);
+        let removed_marker = dir.path().join("reaped-container");
+        let fake_bin = dir.path().join("fake-docker");
+        std::fs::write(
+            &fake_bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = container ] && [ \"$2\" = ls ]; then\n  [ -e '{}' ] || echo '{id}'\n  exit 0\nfi\nif [ \"$1\" = rm ] && [ \"$2\" = --force ] && [ \"$3\" = '{id}' ]; then\n  touch '{}'\n  exit 0\nfi\nexit 1\n",
+                removed_marker.display(),
+                removed_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = DockerEvaluator::new(&fake_bin).unwrap();
+
+        // Spawn a short-lived child to get a provably dead PID + mismatched/dead identity.
+        let mut child = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        let probe_dir = tempfile::Builder::new()
+            .prefix("kranz-mount-proof-")
+            .tempdir_in(&host_root)
+            .unwrap()
+            .keep();
+        let locked_sub = probe_dir.join("guest-locked");
+        std::fs::create_dir_all(&locked_sub).unwrap();
+        std::fs::write(locked_sub.join("data"), "x").unwrap();
+        std::fs::set_permissions(&locked_sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let dead_ledger = tempfile::Builder::new()
+            .prefix("kranz-mount-ledger-")
+            .tempdir_in(&scratch)
+            .unwrap()
+            .keep();
+        let owner = "0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            dead_ledger.join("owner.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "ownerLabel": OWNER_LABEL,
+                "owner": owner,
+                "ownerPid": dead_pid,
+                "ownerIdentity": "dead-identity-token-never-matches",
+                "docker": client.program(),
+                "probe": probe_dir,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Live current-process ledger must NOT be reaped.
+        let live_ledger = tempfile::Builder::new()
+            .prefix("kranz-mount-ledger-")
+            .tempdir_in(&scratch)
+            .unwrap()
+            .keep();
+        let live_pid = std::process::id();
+        std::fs::write(
+            live_ledger.join("owner.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "ownerLabel": OWNER_LABEL,
+                "owner": "fedcba9876543210fedcba9876543210",
+                "ownerPid": live_pid,
+                "ownerIdentity": crate::event_log::process_identity_token(live_pid as i32),
+                "docker": client.program(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reaped = reap_dead_owner_ledgers(&scratch, &client, Duration::ZERO).await;
+        assert_eq!(reaped, 1);
+        assert!(removed_marker.exists());
+        assert!(!dead_ledger.exists());
+        assert!(!probe_dir.exists());
+        assert!(live_ledger.exists());
+        super::super::remove_owned_tree_nofollow(&live_ledger).unwrap();
+    }
+}

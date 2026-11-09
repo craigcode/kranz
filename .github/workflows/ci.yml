@@ -40,6 +40,10 @@ jobs:
         run: scripts/audit-public-tree.sh
       - name: Prove required operator-marker audits fail closed
         run: python3 scripts/test-audit-operator-markers.py
+      - name: Verify GitHub Actions SHA pinning and allowlist
+        run: |
+          python3 scripts/check-actions-allowlist.py --self-test
+          python3 scripts/check-actions-allowlist.py
       - name: Install pinned Gitleaks
         env:
           GITLEAKS_VERSION: 8.29.1
@@ -535,21 +539,26 @@ jobs:
           # These are lifecycle proofs, not a daemon throughput benchmark.
           # Keep unrelated fixtures from competing for bounded inspection and
           # cleanup; deliberate concurrency remains inside its own proofs.
-          cargo test --workspace gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
+          cargo test --workspace --locked gate_subprocess_v1 -- --nocapture --test-threads=1 >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          grep -qE 'test result: ok\. 8 passed' "$log"
+          for proof in bounds_blocked_stdin_and_parallel_streams delivers_eof_and_retains_exit_and_both_streams notify_wakes_cancellation_immediately zero_wall_times_out_before_spawn; do
+            grep -q "test command_exec::evaluator_io::tests::gate_subprocess_v1_io_${proof} ... ok" "$log"
+          done
+          for proof in cleanup_repairs_zero_mode_guest_build_dir_and_tolerates_missing_dirs container_guard_removes_by_owner_label_and_joins_drop create_args_adds_owner_label_and_refuses_colon_mount_root; do
+            grep -q "test gate_evaluation::subprocess::endpoint_tests::gate_subprocess_v1_${proof} ... ok" "$log"
+          done
           for proof in accepts_synthetic_checker_and_denies_host_access refuses_untrusted_terminal_claims_and_artifacts timeout_and_cancel_kill_session_escaped_children drop_removes_namespace_and_default_retention_scrubs creation_uses_evaluation_budget_and_cleans_on_interrupt; do
             grep -q "test container::gate_subprocess_v1_container_${proof} ... ok" "$log"
           done
           for proof in records_real_checks_and_requires_fresh_consent refuses_base_drift_after_a_passing_checker; do
             grep -q "test gate_subprocess_v1_approval_${proof} ... ok" "$log"
           done
-          for proof in mission_stages_and_merge_bind_real_deliverables stage_failure_never_completes_or_consumes interrupted_stage_closes_without_replaying_effects merge_rejects_a_base_advance_after_pass revision_approval_uses_fresh_plan_consent config_cannot_remove_approved_evaluators; do
+          for proof in mission_stages_and_merge_bind_real_deliverables stage_failure_never_completes_or_consumes interrupted_stage_closes_without_replaying_effects merge_rejects_a_base_advance_after_pass revision_approval_uses_fresh_plan_consent config_cannot_remove_approved_evaluators pack_schema_and_mission_load_fail_closed pins_script_bytes_at_approved_git_ref rejects_incomplete_or_forged_authority_evidence; do
             grep -q "test gate_subprocess_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-EXTERNAL-EVALUATOR' "$log"; then
@@ -561,19 +570,20 @@ jobs:
         run: |
           log="$RUNNER_TEMP/kranz-acp-containment-proof.log"
           set +e
-          cargo test --workspace acp_containment_v1 -- --nocapture >"$log" 2>&1
+          cargo test --workspace --locked acp_containment_v1 -- --nocapture >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in launch_prelude_delivers_environment_without_consuming_acp launch_prelude_rejects_overflow_eof_and_expired_owner create_uses_startup_budget_and_preserves_uncertain_state abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace reaps_orphans_and_preserves_peer_exit delayed_attach_status_cannot_hide_failure input_eof_supervisor_stops_lingering_peer engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery mcp_child_cannot_bypass_boundary filtered_egress_uses_existing_relay_and_records_denial resource_ceilings_reach_the_namespace resource_failures_bind_memory_pids_and_wall_observations resource_exit_codes_and_forged_observations_stay_unattributed resource_throttling_and_tmpfs_caps_preserve_honest_success resource_failures_survive_runner_completion_and_replay resource_abort_drop_and_owner_death_keep_cleanup_honest resource_descriptor_and_file_limits_are_enforced resource_usage_and_kernel_limits_are_retained; do
+          for proof in launch_prelude_delivers_environment_without_consuming_acp launch_prelude_rejects_overflow_eof_and_expired_owner create_uses_startup_budget_and_preserves_uncertain_state abort_and_drop_remove_detached_children completion_preserves_report_and_removes_namespace reaps_orphans_and_preserves_peer_exit delayed_attach_status_cannot_hide_failure input_eof_supervisor_stops_lingering_peer engine_sigkill_expires_guest_lease delayed_start_requires_a_live_owner cleanup_failure_retains_recovery_evidence name_collision_never_removes_an_unowned_container hostile_io_and_worktree_delivery image_reference_requires_an_immutable_digest mcp_child_cannot_bypass_boundary owner_process removal_never_accepts_a_persisting_namespace removal_waits_for_confirmed_daemon_absence unqualified_inputs_are_refused_before_creation filtered_egress_uses_existing_relay_and_records_denial resource_ceilings_reach_the_namespace resource_failures_bind_memory_pids_and_wall_observations resource_exit_codes_and_forged_observations_stay_unattributed resource_throttling_and_tmpfs_caps_preserve_honest_success resource_failures_survive_runner_completion_and_replay resource_abort_drop_and_owner_death_keep_cleanup_honest resource_descriptor_and_file_limits_are_enforced resource_usage_and_kernel_limits_are_retained; do
             grep -q "test acp_container::tests::acp_containment_v1_${proof} ... ok" "$log"
           done
           for proof in ordinary_mission_delivers_with_one_call_consent resources_survive_dispatch_and_leave_receipts defect_requires_repair_and_fresh_consent interrupt_rejects_late_consent policy_drift_refuses_merge checker_failure_blocks_completed_worker credential_echo_fails_and_cleans_home; do
             grep -q "test acp_worker::tests::acp_containment_v1_profile_${proof} ... ok" "$log"
           done
+          grep -q "test acp_containment_v1_uncertified_sandbox_is_refused_before_peer_spawn ... ok" "$log"
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
             exit 1
           fi
@@ -590,7 +600,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in consent_concurrency_bounds_and_descendants paths_and_environment_fail_before_consent peer_provider_death_and_drop_stop_namespace pending_consent_and_late_create_cannot_complete engine_death_expires_terminal_namespace default_capability_refuses_execution budget_expiry_retention_and_oom_hint capacity_reserved_before_consent control_polling_and_pending_limits_recover; do
+          for proof in consent_concurrency_bounds_and_descendants paths_and_environment_fail_before_consent peer_provider_death_and_drop_stop_namespace pending_consent_and_late_create_cannot_complete engine_death_expires_terminal_namespace default_capability_refuses_execution budget_expiry_retention_and_oom_hint capacity_reserved_before_consent control_polling_and_pending_limits_recover python_driver_fd_cloexec_killpg_and_launch_invariants; do
             grep -q "test acp_container::tests::terminals::acp_terminal_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-ACP-CONTAINMENT' "$log"; then
@@ -620,14 +630,14 @@ jobs:
         run: |
           log="$RUNNER_TEMP/kranz-mount-helper-proof.log"
           set +e
-          cargo test --workspace mount_helper_v1 -- --nocapture >"$log" 2>&1
+          cargo test --workspace --locked mount_helper_v1 -- --nocapture >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          for proof in real_round_trip_and_concurrent_helpers real_timeout_and_guest_watchdog_remove_blocked_writer real_cancellation_and_dropped_future_cleanup real_name_collision_preserves_unrelated_container real_engine_death_bounds_guest_and_retains_intent real_interrupted_creation_removes_the_daemon_object real_unavailable_inventory_fails_with_private_recovery; do
+          for proof in deletes_only_the_created_id_and_waits_for_absence deletion_acknowledgement_is_not_absence inventory_errors_and_uncertain_creation_retain_evidence missing_configured_image_never_pulls real_round_trip_and_concurrent_helpers real_timeout_and_guest_watchdog_remove_blocked_writer real_cancellation_and_dropped_future_cleanup real_name_collision_preserves_unrelated_container real_engine_death_bounds_guest_and_retains_intent real_interrupted_creation_removes_the_daemon_object real_unavailable_inventory_fails_with_private_recovery unsupported_runtime_refuses_before_creating_probe; do
             grep -q "test sandbox_container::mount_proof::tests::mount_helper_v1_${proof} ... ok" "$log"
           done
           if grep -q 'SKIP-MOUNT-HELPER' "$log"; then
@@ -635,8 +645,8 @@ jobs:
           fi
       - name: Check the bounded ACP probe without a provider
         run: |
-          cargo test --workspace --example acp_compat_probe
-          cargo build --workspace --example acp_compat_probe
+          cargo test --workspace --locked --example acp_compat_probe
+          cargo build --workspace --locked --example acp_compat_probe
           python3 scripts/check-acp-probe.py "$PWD/target/debug/examples/acp_compat_probe" python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d
       - name: Check bounded tool-use probe with contained synthetic peers
         run: |

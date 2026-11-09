@@ -121,4 +121,32 @@ describe('GrantRequestPanel', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toBe('no pending grant request');
   });
+
+  it('escapes BiDi/zero-width characters, shows a warning banner, and disables Approve grant while keeping Deny enabled (KRZ-M11)', async () => {
+    const trojanCommand = 'cargo test \u202eevil\u202c --all';
+    useKranzStore.setState({
+      state: missionState({
+        milestoneId: 'ms-\u200b1',
+        command: trojanCommand,
+      }),
+    });
+    render(<GrantRequestPanel />);
+
+    expect(screen.getByText('ms-\\u200b1')).toBeTruthy();
+    expect(screen.getByText('cargo test \\u202eevil\\u202c --all')).toBeTruthy();
+    expect(
+      screen.getByRole('status').textContent,
+    ).toContain('Blocked: invisible or control characters make this request unsafe to approve.');
+
+    const approveBtn = screen.getByRole('button', { name: 'Approve grant' }) as HTMLButtonElement;
+    const denyBtn = screen.getByRole('button', { name: 'Deny' }) as HTMLButtonElement;
+    expect(approveBtn.disabled).toBe(true);
+    expect(denyBtn.disabled).toBe(false);
+
+    fireEvent.click(approveBtn);
+    expect(api.approveGrant).not.toHaveBeenCalled();
+
+    fireEvent.click(denyBtn);
+    await waitFor(() => expect(api.denyGrant).toHaveBeenCalledWith('m-1', trojanCommand));
+  });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { buildFleetModel } from './fleet';
 import {
   bez,
   clock,
@@ -314,5 +315,60 @@ describe('flightPlan touchdown, free return, afloat, and null cases', () => {
     expect(tr.length).toBe(24);
     expect(clock(65)).toBe('1:05');
     expect(clock(3661)).toBe('1:01:01');
+  });
+
+  it('normalizes negative and overflow pad/site indices modulo geometry bounds and wraps fleet slot cursors cleanly', () => {
+    const G = makeGeom('wide');
+    const negCraft = makeCraft({
+      createdAt: 0,
+      padAt: 0,
+      assembledAt: 4_000,
+      startedAt: 10_000,
+      completedAt: 28_000,
+      mergedAt: 60_000,
+      pad: -1,
+      lane: 0,
+      site: -2,
+    });
+    const overCraft = makeCraft({
+      ...negCraft,
+      pad: G.pads.length * 3 - 1,
+      site: G.sites.length * 2 - 2,
+    });
+
+    const tlNeg = timeline(G, negCraft);
+    const tlOver = timeline(G, overCraft);
+    expect(tlNeg).toEqual(tlOver);
+
+    for (const sec of [2, 12, tlNeg.touch as number]) {
+      const pNeg = poseAt(G, negCraft, tlNeg, sec);
+      const pOver = poseAt(G, overCraft, tlOver, sec);
+      expect(pNeg).not.toBeNull();
+      expect(pNeg).toEqual(pOver);
+    }
+
+    const nowMs = Date.parse('2026-10-08T12:00:00Z');
+    const manyMissions = Array.from({ length: G.sites.length + G.pads.length + G.N }, (_, i) => ({
+      id: `m-${i}`,
+      status: i % 3 === 0 ? 'planning' : i % 3 === 1 ? 'running' : 'complete',
+      merged: i % 3 === 2 ? true : undefined,
+      goal: `Mission ${i}`,
+      createdAt: new Date(nowMs - (100 - i) * 1_000).toISOString(),
+    }));
+    const fleet = buildFleetModel([], manyMissions, new Map(), nowMs);
+    for (const fc of fleet.crafts) {
+      if (fc.craft.pad !== null) {
+        expect(fc.craft.pad).toBeGreaterThanOrEqual(0);
+        expect(fc.craft.pad).toBeLessThan(G.pads.length);
+      }
+      if (fc.craft.lane !== null) {
+        expect(fc.craft.lane).toBeGreaterThanOrEqual(0);
+        expect(fc.craft.lane).toBeLessThan(G.N);
+      }
+      if (fc.craft.site !== null) {
+        expect(fc.craft.site).toBeGreaterThanOrEqual(0);
+        expect(fc.craft.site).toBeLessThan(G.sites.length);
+      }
+    }
   });
 });

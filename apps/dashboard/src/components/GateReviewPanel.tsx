@@ -1,4 +1,5 @@
 import { pendingGateReviews } from '../lib/pendingAsks';
+import { visible } from '../lib/presentation';
 import { useKranzStore } from '../lib/store';
 import { useNow } from '../lib/useNow';
 
@@ -14,13 +15,13 @@ export function GateReviewPanel() {
     return <section className="panel panel-grant" key={request.attemptId}>
       <div className="section-label">Gate review needed</div>
       <div className="revision-body">
-        <p><strong>{request.gateId}</strong> · {request.stage}</p>
+        <p><strong>{visible(request.gateId)}</strong> · {visible(request.stage)}</p>
         <p>{record.resolution?.disposition === 'require-human' ? 'The evaluator requested human review.' : 'This check blocks progress.'}</p>
-        {detail && <pre className="revision-diff">{detail}</pre>}
+        {detail && <pre className="revision-diff">{visible(detail)}</pre>}
         <p>Inspect the evidence and correct the cause before retrying this stage. Required checks and consent still apply.</p>
         {expired && <p role="status">This attempt expired. Retry to collect fresh evidence.</p>}
         <details><summary>Evidence binding</summary>
-          <pre className="revision-diff">{JSON.stringify({ attempt: request.attemptId, subject: request.subject, binding: request.binding }, null, 2)}</pre>
+          <pre className="revision-diff">{visible(JSON.stringify({ attempt: request.attemptId, subject: request.subject, binding: request.binding }, null, 2))}</pre>
         </details>
       </div>
     </section>;

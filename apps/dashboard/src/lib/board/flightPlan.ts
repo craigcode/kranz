@@ -253,7 +253,7 @@ export function makeGeom(layout: BoardLayout = 'wide'): BoardGeom {
   };
 
   const ascent = (pad: number, lane: number): { thJ: number; c: Bezier4 } => {
-    const th = pads[pad].th;
+    const th = pads[mod(pad, pads.length)].th;
     const r = rE(lane);
     const thJ = th + sE * joinLead;
     const p0: Point2 = [E.x + Math.cos(th) * E.R, E.y + Math.sin(th) * E.R];
@@ -294,7 +294,7 @@ export function makeGeom(layout: BoardLayout = 'wide'): BoardGeom {
 
   const descent = (lane: number, site: number): Bezier4 => {
     const r = rM(lane);
-    const s = sites[site];
+    const s = sites[mod(site, sites.length)];
     const a0 = s.th - sM * leadDeo;
     const p0: Point2 = [M.x + Math.cos(a0) * r, M.y + Math.sin(a0) * r];
     const t0 = tan(a0, sM);
@@ -415,7 +415,7 @@ export function timeline(G: BoardGeom, c: FlightCraft): CraftTimeline {
   };
   if (tl.launch == null || c.lane == null) return tl;
   tl.join = tl.launch + ASCENT;
-  const padIndex = c.pad == null ? 0 : c.pad;
+  const padIndex = mod(c.pad ?? 0, G.pads.length);
   const thJ = G.pads[padIndex].th + G.sE * G.joinLead;
   tl.thJ = thJ;
   const wE = G.wE(c.lane);
@@ -437,10 +437,11 @@ export function timeline(G: BoardGeom, c: FlightCraft): CraftTimeline {
   tl.arrive = tl.depart + G.coast;
   const mergedSec = s(c.mergedAt);
   if (mergedSec == null || c.site == null) return tl;
+  const siteIndex = mod(c.site, G.sites.length);
   const wM = G.wM(c.lane);
   const t1 = Math.max(mergedSec + 2.0, tl.arrive + 2.0); // room to turn engine-first
   tl.deorbit =
-    t1 + mod(G.sM * (G.sites[c.site].th - G.sM * G.leadDeo - (G.thA + G.sM * wM * (t1 - tl.arrive))), TAU) / wM;
+    t1 + mod(G.sM * (G.sites[siteIndex].th - G.sM * G.leadDeo - (G.thA + G.sM * wM * (t1 - tl.arrive))), TAU) / wM;
   tl.touch = tl.deorbit + DESCENT;
   return tl;
 }
@@ -507,7 +508,7 @@ export function poseAt(G: BoardGeom, c: FlightCraft, tl: CraftTimeline, t: numbe
   if (!flying) {
     if (c.pad == null || tl.padAt == null || t < tl.padAt) return null;
     const padAt = tl.padAt;
-    const pad = G.pads[c.pad];
+    const pad = G.pads[mod(c.pad, G.pads.length)];
     const g = G.surface(E, pad.th, pad.z, 0.05);
     o.x = g.pos[0];
     o.y = g.pos[1];
@@ -539,7 +540,7 @@ export function poseAt(G: BoardGeom, c: FlightCraft, tl: CraftTimeline, t: numbe
   if (t < join) {
     const u = (t - launch) / ASCENT;
     const s = u * u;
-    const pi = c.pad == null ? 0 : c.pad;
+    const pi = mod(c.pad ?? 0, G.pads.length);
     const a = G.ascent(pi, ln);
     along(a.c, s);
     o.z = G.pads[pi].z * (1 - smooth(u * 2.5));
@@ -671,12 +672,13 @@ export function poseAt(G: BoardGeom, c: FlightCraft, tl: CraftTimeline, t: numbe
     o.roll = (t - tl.arrive) * 0.3;
     o.phase = 'lunar-orbit';
   } else if (tl.arrive != null && tl.deorbit != null && tl.touch != null && c.site != null) {
-    const site = G.sites[c.site];
+    const siteIndex = mod(c.site, G.sites.length);
+    const site = G.sites[siteIndex];
     const g = G.surface(M, site.th, site.z, 0.05);
     if (t < tl.touch) {
       const u = (t - tl.deorbit) / DESCENT;
       const s = 1 - (1 - u) * (1 - u);
-      const c4 = G.descent(ln, c.site);
+      const c4 = G.descent(ln, siteIndex);
       const p = bez(c4, s);
       const d = bezTan(c4, Math.min(s, 0.9999));
       const settle = smooth((u - 0.5) / 0.5);
