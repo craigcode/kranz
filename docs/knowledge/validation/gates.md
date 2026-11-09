@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
