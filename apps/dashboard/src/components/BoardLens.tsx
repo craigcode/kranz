@@ -46,6 +46,21 @@ function canActInPlace(ask: BoardAsk): boolean {
   return false;
 }
 
+function seedStoreMissionState(id: string, known: MissionState | undefined): void {
+  if (known === undefined) return;
+  const snap = useKranzStore.getState();
+  if (snap.missionId !== id) return;
+  const cur = snap.state;
+  const curSeq = snap.lastSeq ?? cur?.lastSeq ?? -Infinity;
+  if (
+    cur === null ||
+    cur.mission.id !== id ||
+    (known.lastSeq >= cur.lastSeq && known.lastSeq >= curSeq)
+  ) {
+    useKranzStore.setState({ state: known, lastSeq: known.lastSeq });
+  }
+}
+
 export function BoardLens({ demo = false }: BoardLensProps) {
   const repoId = useKranzStore((s) => s.repoId);
   const tickets = useKranzStore((s) => s.tickets);
@@ -65,10 +80,13 @@ export function BoardLens({ demo = false }: BoardLensProps) {
   const [selectedCraftKey, setSelectedCraftKey] = useState<string | null>(null);
   const [selectedAskId, setSelectedAskId] = useState<string | null>(null);
 
+  const scopeKey = `${repoId ?? ''}:${demo}`;
   const genRef = useRef<number>(0);
   const lastListFetchRef = useRef<number>(-Infinity);
   const lastStateFetchRef = useRef<Map<string, number>>(new Map());
-  const prevModelRef = useRef<FleetModel | null>(null);
+  const prevModelRef = useRef<{ scopeKey: string; model: FleetModel } | null>(null);
+  const missionStatesRef = useRef<ReadonlyMap<string, MissionState>>(missionStates);
+  missionStatesRef.current = missionStates;
 
   // Compute current running mission IDs from the store's rows
   const runningMissionIds = useMemo(() => {
@@ -91,7 +109,6 @@ export function BoardLens({ demo = false }: BoardLensProps) {
     genRef.current += 1;
     lastListFetchRef.current = -Infinity;
     lastStateFetchRef.current.clear();
-    prevModelRef.current = null;
     setMissionStates(new Map());
     setStatePollError(null);
     setSelectedCraftKey(null);
@@ -160,12 +177,7 @@ export function BoardLens({ demo = false }: BoardLensProps) {
               next.set(id, st);
               return next;
             });
-            if (useKranzStore.getState().missionId === id) {
-              const cur = useKranzStore.getState().state;
-              if (cur === null || st.lastSeq >= cur.lastSeq) {
-                useKranzStore.setState({ state: st, lastSeq: st.lastSeq });
-              }
-            }
+            seedStoreMissionState(id, st);
             setStatePollError(null);
             setNowMs(Date.now());
           })
@@ -184,9 +196,14 @@ export function BoardLens({ demo = false }: BoardLensProps) {
       if (typeof document !== 'undefined' && document.hidden) return;
       const now = Date.now();
       if (!force && now - lastListFetchRef.current < LIST_POLL_MS) return;
+      const gen = genRef.current;
       lastListFetchRef.current = now;
-      void loadTickets();
-      void loadMissions();
+      setNowMs(now);
+      void Promise.all([loadTickets(), loadMissions()]).finally(() => {
+        if (genRef.current === gen) {
+          setNowMs(Date.now());
+        }
+      });
     },
     [demo, loadTickets, loadMissions],
   );
@@ -194,9 +211,15 @@ export function BoardLens({ demo = false }: BoardLensProps) {
   // Immediate refresh after an in-place act completes (slice 6)
   const refreshAfterAct = useCallback(() => {
     if (demo) return;
-    lastListFetchRef.current = Date.now();
-    void loadTickets();
-    void loadMissions();
+    const gen = genRef.current;
+    const now = Date.now();
+    lastListFetchRef.current = now;
+    setNowMs(now);
+    void Promise.all([loadTickets(), loadMissions()]).finally(() => {
+      if (genRef.current === gen) {
+        setNowMs(Date.now());
+      }
+    });
     fetchRunningStates(true);
   }, [demo, loadTickets, loadMissions, fetchRunningStates]);
 
@@ -248,33 +271,34 @@ export function BoardLens({ demo = false }: BoardLensProps) {
     };
   }, [demo, repoId, refreshLists, fetchRunningStates]);
 
-  // Build the FleetModel (preserving single-step transitions across updates)
+  // Build the FleetModel purely; commit prevModelRef inside useEffect so StrictMode never wipes transitions
   const currentHash = typeof window !== 'undefined' ? window.location.hash : undefined;
   const model = useMemo(() => {
+    const prev = prevModelRef.current?.scopeKey === scopeKey ? prevModelRef.current.model : null;
     if (demo) {
       const snap = demoSnapshotAt(demoStep, nowMs);
-      const next = buildFleetModel(
+      return buildFleetModel(
         snap.tickets,
         snap.missions,
         snap.missionStates,
         snap.nowMs,
-        prevModelRef.current,
+        prev,
         currentHash,
       );
-      prevModelRef.current = next;
-      return next;
     }
-    const next = buildFleetModel(
+    return buildFleetModel(
       tickets,
       missions,
       missionStates,
       nowMs,
-      prevModelRef.current,
+      prev,
       currentHash,
     );
-    prevModelRef.current = next;
-    return next;
-  }, [demo, demoStep, tickets, missions, missionStates, nowMs, currentHash]);
+  }, [scopeKey, demo, demoStep, tickets, missions, missionStates, nowMs, currentHash]);
+
+  useEffect(() => {
+    prevModelRef.current = { scopeKey, model };
+  }, [scopeKey, model]);
 
   // Resolve the currently selected ask
   const selectedAsk: BoardAsk | null = useMemo(() => {
@@ -291,16 +315,60 @@ export function BoardLens({ demo = false }: BoardLensProps) {
 
   const activeCraftKey = selectedAsk?.craftKey ?? selectedCraftKey;
 
+  const clearSelection = useCallback(() => {
+    setSelectedAskId(null);
+    setSelectedCraftKey(null);
+  }, []);
+
+  const selectedAskMissionId = selectedAsk?.missionId;
+  const selectedAskKind = selectedAsk?.kind;
+
+  // Synchronize connected mission whenever selectedAsk resolves to an in-flight mission ask
+  useEffect(() => {
+    if (
+      !demo &&
+      selectedAskKind !== undefined &&
+      isInFlightAskKind(selectedAskKind) &&
+      selectedAskMissionId !== undefined
+    ) {
+      connectMission(selectedAskMissionId);
+      seedStoreMissionState(selectedAskMissionId, missionStatesRef.current.get(selectedAskMissionId));
+    }
+  }, [demo, selectedAskMissionId, selectedAskKind, connectMission]);
+
+  // Seed store state if polled missionStates arrives while WS snapshot is still in flight
+  useEffect(() => {
+    if (
+      !demo &&
+      selectedAsk &&
+      isInFlightAskKind(selectedAsk.kind) &&
+      selectedAsk.missionId !== undefined &&
+      connectedMissionId === selectedAsk.missionId &&
+      connectedState === null
+    ) {
+      seedStoreMissionState(selectedAsk.missionId, missionStates.get(selectedAsk.missionId));
+    }
+  }, [demo, selectedAsk, connectedMissionId, connectedState, missionStates]);
+
+  // Close drawer / clear selection on Escape
+  useEffect(() => {
+    if (selectedAsk === null && selectedCraftKey === null) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        clearSelection();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedAsk, selectedCraftKey, clearSelection]);
+
   const selectAsk = useCallback(
     (ask: BoardAsk) => {
       setSelectedAskId(ask.id);
       setSelectedCraftKey(ask.craftKey);
       if (!demo && isInFlightAskKind(ask.kind) && ask.missionId !== undefined) {
         connectMission(ask.missionId);
-        const known = missionStates.get(ask.missionId);
-        if (known !== undefined) {
-          useKranzStore.setState({ state: known, lastSeq: known.lastSeq });
-        }
+        seedStoreMissionState(ask.missionId, missionStates.get(ask.missionId));
       }
     },
     [demo, connectMission, missionStates],
@@ -317,16 +385,19 @@ export function BoardLens({ demo = false }: BoardLensProps) {
       setSelectedAskId(ask ? ask.id : null);
       if (ask && !demo && isInFlightAskKind(ask.kind) && ask.missionId !== undefined) {
         connectMission(ask.missionId);
-        const known = missionStates.get(ask.missionId);
-        if (known !== undefined) {
-          useKranzStore.setState({ state: known, lastSeq: known.lastSeq });
-        }
+        seedStoreMissionState(ask.missionId, missionStates.get(ask.missionId));
       }
     },
     [model.asks, demo, connectMission, missionStates],
   );
 
   const showActColumn = !demo && selectedAsk !== null && canActInPlace(selectedAsk);
+  const inFlightReady =
+    selectedAsk !== null &&
+    selectedAsk.missionId !== undefined &&
+    connectedMissionId === selectedAsk.missionId &&
+    connectedState !== null &&
+    connectedState.mission.id === selectedAsk.missionId;
 
   return (
     <div className="trajectory-board-lens">
@@ -416,18 +487,33 @@ export function BoardLens({ demo = false }: BoardLensProps) {
                           {visible(ask.detail)}
                         </span>
                       </div>
-                      <a
-                        className="btn-small pipeline-primary-action trajectory-board-ask-link"
-                        href={ask.href}
-                        onClick={(ev) => {
-                          if (actable) {
-                            ev.preventDefault();
-                            selectAsk(ask);
-                          }
-                        }}
-                      >
-                        {visible(ask.kindLabel)}
-                      </a>
+                      {actable || demo ? (
+                        <button
+                          type="button"
+                          className="btn-small pipeline-primary-action trajectory-board-ask-link"
+                          aria-expanded={isSelected}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            if (selectedAsk?.id === ask.id) {
+                              clearSelection();
+                            } else {
+                              selectAsk(ask);
+                            }
+                          }}
+                        >
+                          {visible(ask.kindLabel)}
+                        </button>
+                      ) : (
+                        <a
+                          className="btn-small pipeline-primary-action trajectory-board-ask-link"
+                          href={ask.href}
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                          }}
+                        >
+                          {visible(ask.kindLabel)}
+                        </a>
+                      )}
                     </li>
                   );
                 })}
@@ -436,16 +522,49 @@ export function BoardLens({ demo = false }: BoardLensProps) {
           </section>
 
           {showActColumn && selectedAsk !== null && (
-            <aside className="trajectory-board-act" aria-label="Answer ask">
-              {isInFlightAskKind(selectedAsk.kind) && selectedAsk.missionId !== undefined && (
-                <div className="trajectory-board-act-panels">
-                  {selectedAsk.kind === 'blocked' && <StatusStrip />}
-                  <PermissionRequestPanel onActed={refreshAfterAct} />
-                  <GrantRequestPanel onActed={refreshAfterAct} />
-                  <GateReviewPanel />
-                  <RevisionPanel onActed={refreshAfterAct} />
-                  <QuestionRequestPanel onActed={refreshAfterAct} />
+            <aside
+              key={selectedAsk.missionId ?? selectedAsk.id}
+              className="trajectory-board-act"
+              aria-label="Answer ask"
+            >
+              <div className="trajectory-board-act-header">
+                <span className="mono picker-id">{visible(selectedAsk.workItemId)}</span>
+                <div className="trajectory-board-act-header-actions">
+                  {!demo && (
+                    <a className="btn-small trajectory-board-open-mission" href={selectedAsk.href}>
+                      Open mission
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-small trajectory-board-act-close"
+                    aria-label="Close"
+                    onClick={clearSelection}
+                  >
+                    Close
+                  </button>
                 </div>
+              </div>
+              {isInFlightAskKind(selectedAsk.kind) && selectedAsk.missionId !== undefined && (
+                inFlightReady ? (
+                  <div
+                    key={selectedAsk.missionId ?? selectedAsk.id}
+                    className="trajectory-board-act-panels"
+                  >
+                    {selectedAsk.kind === 'blocked' && <StatusStrip />}
+                    <PermissionRequestPanel onActed={refreshAfterAct} />
+                    <GrantRequestPanel onActed={refreshAfterAct} />
+                    <GateReviewPanel />
+                    {selectedAsk.kind === 'revision' && (
+                      <RevisionPanel onActed={refreshAfterAct} />
+                    )}
+                    <QuestionRequestPanel onActed={refreshAfterAct} />
+                  </div>
+                ) : (
+                  <div className="dim picker-empty" role="status">
+                    Connecting to mission…
+                  </div>
+                )
               )}
               {selectedAsk.kind === 'reviewable' && selectedAsk.slug !== undefined && (
                 <div className="picker-item picker-item--stacked">

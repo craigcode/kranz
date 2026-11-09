@@ -69,6 +69,19 @@ pub struct ContainerState {
     pub exit_code: i64,
 }
 
+/// Runtime-only classification input excluded from serialized contract payloads
+/// and equality comparisons so round-tripped `ResourceEvidence` remains equal.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct TransientFlag(pub bool);
+
+impl PartialEq for TransientFlag {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TransientFlag {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceEvidence {
@@ -86,6 +99,8 @@ pub struct ResourceEvidence {
     pub namespace_cleanup_confirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureClass>,
+    #[serde(skip)]
+    pub(crate) terminal_budget_hit: TransientFlag,
 }
 
 fn increased(before: Option<u64>, after: Option<u64>) -> bool {
@@ -110,7 +125,7 @@ impl ResourceEvidence {
     }
 
     pub(crate) fn classify(&mut self, failed: bool) {
-        self.classify_with_terminal_budget(failed, false);
+        self.classify_with_terminal_budget(failed, self.terminal_budget_hit.0);
     }
 
     pub(crate) fn classify_with_terminal_budget(
@@ -118,7 +133,7 @@ impl ResourceEvidence {
         failed: bool,
         terminal_budget_hit: bool,
     ) {
-        self.failure = if failed || self.requires_failure() || terminal_budget_hit {
+        self.failure = if failed || self.requires_failure() {
             let pids = self
                 .sample
                 .as_ref()
@@ -198,6 +213,7 @@ mod tests {
             unavailable: vec![],
             namespace_cleanup_confirmed: true,
             failure: None,
+            terminal_budget_hit: Default::default(),
         }
     }
 
@@ -296,5 +312,52 @@ mod tests {
         let decoded: Sample = serde_json::from_value(new.clone()).unwrap();
         assert!(decoded.usage.as_ref().unwrap().memory_peak_bytes.is_none());
         assert_eq!(serde_json::to_value(decoded).unwrap(), new);
+    }
+
+    #[test]
+    fn acp_resource_terminal_budget_preserves_recoverable_success_and_classifies_failed_run() {
+        use crate::events::EventKind;
+
+        let mut recoverable = evidence();
+        recoverable.terminal_budget_hit = TransientFlag(true);
+        recoverable.classify(false);
+        assert_eq!(
+            recoverable.failure, None,
+            "recoverable terminal budget hit on a passing run must not manufacture failure"
+        );
+        assert!(recoverable.failure_message().is_none());
+
+        let mut exhausted = evidence();
+        exhausted.terminal_budget_hit = TransientFlag(true);
+        exhausted.classify(true);
+        assert_eq!(exhausted.failure, Some(FailureClass::TerminalBudget));
+        assert!(exhausted
+            .failure_message()
+            .unwrap()
+            .contains("ACP terminal budget exhaustion observed"));
+
+        // Concurrent pids exhaustion + terminal budget hit remains ambiguous (Other).
+        let mut ambiguous = evidence();
+        ambiguous.terminal_budget_hit = TransientFlag(true);
+        ambiguous.sample.as_mut().unwrap().current.pids_max = Some(1);
+        ambiguous.classify(true);
+        assert_eq!(ambiguous.failure, Some(FailureClass::Other));
+
+        // Transient flag is never serialized onto the event contract and preserves equality.
+        let encoded = serde_json::to_value(&exhausted).unwrap();
+        assert!(encoded.get("terminalBudgetHit").is_none());
+        let event = EventKind::WorkerCompleted {
+            resource_evidence: Some(Box::new(exhausted.clone())),
+            run_id: "r-terminal-budget".into(),
+            result: crate::types::RunResult::Fail,
+            tokens: Default::default(),
+            cost_usd: None,
+            report: None,
+        };
+        let decoded: EventKind =
+            serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, EventKind::WorkerCompleted { resource_evidence: Some(actual), .. } if *actual == exhausted && actual.failure == Some(FailureClass::TerminalBudget))
+        );
     }
 }

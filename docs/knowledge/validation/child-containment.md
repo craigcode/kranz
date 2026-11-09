@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-07
+last_verified: 2026-11-09
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -27,8 +27,10 @@ summary and points here.
 prompt-injectable child spawns `env_clear`d (`agent_env.rs`) — never
 reintroduce ambient inheritance; the sanctioned credential channels are
 `contractEnvPassthrough` (contract commands) and the workspace contract's
-`secrets` (bootstrap/data hooks). Enforced sandboxes are honored by the native claude backend and the two
-explicit ACP worker profiles (docs/acp-containment.md). ACP profiles pin
+`secrets` (bootstrap/data hooks). Enforced sandboxes are honored by the native claude backend and the
+explicit qualified ACP worker profiles (docs/acp-containment.md; `-v2`
+profiles additionally verify and pin the admitted local Docker host before
+session mount proofs or `env_clear`d container-egress provisioning). ACP profiles pin
 image, startup and selected file credentials; generic ACP commands and all
 other unsupported pairs remain refused. Do not widen without proof. `serve.token` is mutation authority, `serve.read.token`
 reads only; both must stay unreadable inside sandboxes

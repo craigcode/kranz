@@ -2733,6 +2733,22 @@ button {
   min-width: 0;
 }
 
+.trajectory-board-act-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+
+.trajectory-board-act-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 @media (max-width: 860px) {
   .trajectory-board-columns:has(.trajectory-board-act) {
     grid-template-columns: minmax(0, 1fr);

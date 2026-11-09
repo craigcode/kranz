@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 
@@ -83,15 +82,20 @@ for artifact in manifest['artifacts']:
     data = Path(content['path']).read_bytes()
     assert digest(data) == content['digest']
     inventory.append(dict(path=content['path'], digest=digest(data), bytes=len(data)))
+def probe_network():
+    with socket.create_connection(('1.1.1.1', 443), timeout=.1):
+        pass
 denials = {}
 for name, action in [
     ('input-write', lambda: Path(p['evidence']['path']).write_text('tampered')),
     ('checker-write', lambda: Path(__file__).write_text('tampered')),
     ('root-write', lambda: Path('/outside-output').write_text('tampered')),
-    ('network', lambda: socket.create_connection(('1.1.1.1', 443), timeout=.1)),
+    ('network', probe_network),
 ]:
     try:
         action()
+        denials[name] = False
+    except TimeoutError:
         denials[name] = False
     except OSError:
         denials[name] = True
@@ -182,7 +186,7 @@ enforcement='blocking'
             dict(input=' Mixed KEY = Keep Case\n', expected={'mixed key':'Keep Case'})]
         check_files = {'check.py': Y_CHECK, 'corpus.json': json.dumps(corpus, indent=2) + '\n'}
         goal = 'Replace the legacy parser, preserve its characterized behavior, route app.run to the replacement, and remove the legacy implementation.'
-        command = f'{shlex.quote(sys.executable)} -B check.py'
+        command = 'python3 -B check.py'
         answer = 'Request repair: new parser passes parity, but app.run still imports legacy and legacy.py remains. No cutover has occurred. Parity is necessary but insufficient; separately verify entrypoint routing and removal.'
     files(primary, common | initial)
     git(primary, 'add', '.')
@@ -218,6 +222,8 @@ enforcement='blocking'
 
 
 if __name__ == '__main__':
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        raise SystemExit('usage: python3 scripts/review-effort-pilot.py NEW_ABSOLUTE_DIRECTORY')
     root = Path(sys.argv[1])
     if not root.is_absolute() or root.exists():
         raise SystemExit('a new absolute directory is required')

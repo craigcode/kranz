@@ -132,6 +132,8 @@ impl OwnedContainer {
         {
             return Err(error("session working directory differs from sandbox"));
         }
+        crate::sandbox_container::validate_sandbox_container_inputs(&resolved.inputs)
+            .map_err(error)?;
         let filtered_network = resolved.inputs.enforce == crate::types::SandboxEnforce::FsNet
             && !resolved.inputs.egress.is_empty();
         if filtered_network
@@ -238,11 +240,23 @@ impl OwnedContainer {
             }
         }
         std::fs::create_dir_all(&resolved.inputs.tmpdir).map_err(error)?;
-        let roots = crate::sandbox_container::declared_mount_roots(
+        let declared_roots = crate::sandbox_container::declared_mount_roots(
             &resolved.inputs.session_cwd,
             &resolved.inputs.mission_dir,
             &resolved.inputs.extra_write,
         );
+        let already_proven = crate::acp_worker::take_session_proven_roots(
+            &spec.session_id,
+            &container.image,
+            admitted_host.is_some(),
+        );
+        let roots: Vec<PathBuf> = declared_roots
+            .into_iter()
+            .filter(|r| {
+                let key = crate::sandbox_container::canonical_mount_root_key(r);
+                !already_proven.contains(&key)
+            })
+            .collect();
         let runtime = container.runtime;
         let pin = container.image.clone();
         let proof_root = canonical.clone();
@@ -328,6 +342,7 @@ impl OwnedContainer {
             &canonical.join("container.json"),
             &serde_json::to_vec(&serde_json::json!({
                 "version":1, "name":name, "owner":owner, "image":container.image, "docker":docker,
+                "endpoint":client.pinned_endpoint(),
                 "ownerPid":std::process::id(), "supervisorSha256":crate::standards_waiver::sha256_hex(supervisor.as_bytes()),
                 "ownerIdentity":crate::event_log::process_identity_token(std::process::id() as i32),
                 "cleanupConfirmed":false,
@@ -354,7 +369,7 @@ impl OwnedContainer {
         };
         let mut container = container.clone();
         container.name = Some(name.clone());
-        let mut create = crate::sandbox_container::container_run_args(
+        let mut create = crate::sandbox_container::try_container_run_args(
             &resolved.inputs,
             &container,
             Path::new("-I"),
@@ -367,7 +382,8 @@ impl OwnedContainer {
             spec.env
                 .get(crate::egress_proxy::HTTPS_PROXY_ENV)
                 .map(String::as_str),
-        );
+        )
+        .map_err(error)?;
         create[0] = "create".into();
         let image_index = create.len() - 6;
         create.splice(
@@ -573,7 +589,8 @@ impl OwnedContainer {
                 evidence.namespace_cleanup_confirmed = true;
             }
             if let Some(root) = self.root.take() {
-                root.close().map_err(error)?;
+                let path = root.keep();
+                crate::sandbox_container::remove_owned_tree_nofollow(&path).map_err(error)?;
             }
         }
         result.map_err(|why| {
@@ -635,6 +652,7 @@ impl OwnedContainer {
             unavailable,
             namespace_cleanup_confirmed: false,
             failure: None,
+            terminal_budget_hit: Default::default(),
         });
     }
 }
@@ -679,6 +697,8 @@ impl Drop for OwnedContainer {
             return;
         };
         if self.removed || !self.creation_started {
+            let path = root.keep();
+            let _ = crate::sandbox_container::remove_owned_tree_nofollow(&path);
             return;
         }
         let client = self.client.clone();
@@ -692,7 +712,7 @@ impl Drop for OwnedContainer {
         if let Err(error) = std::thread::Builder::new().name("acp-container-cleanup".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
             if matches!(runtime, Ok(runtime) if runtime.block_on(remove(&client, &owner, true, finished)).is_ok()) {
-                let _ = std::fs::remove_dir_all(path);
+                let _ = crate::sandbox_container::remove_owned_tree_nofollow(&path);
             } else {
                 tracing::error!(container = %name, ledger = %path.display(), "ACP namespace cleanup is unconfirmed");
             }
@@ -783,7 +803,7 @@ fn pinned_image(image: &str) -> bool {
 
 fn mount_path(path: &Path) -> Result<&str> {
     path.to_str()
-        .filter(|s| !s.contains([',', '\n', '\r']))
+        .filter(|s| !s.is_empty() && !s.contains([':', ',', '\n', '\r']))
         .ok_or_else(|| error("invalid host mount path"))
 }
 
@@ -802,23 +822,68 @@ fn trusted_docker(inputs: &SandboxInputs) -> Result<PathBuf> {
 }
 
 pub(crate) fn trusted_control_program(inputs: &SandboxInputs, program: &str) -> Result<PathBuf> {
-    let label = if program == "docker" {
-        "Docker"
-    } else {
-        "Colima"
+    trusted_control_program_from_env(inputs, program, std::env::var_os("PATH").as_deref())
+}
+
+pub(crate) fn trusted_control_program_from_env(
+    inputs: &SandboxInputs,
+    program: &str,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let label = match program {
+        "docker" => "Docker",
+        "colima" => "Colima",
+        other => other,
     };
-    for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .filter(|p| p.is_absolute())
+    if program.is_empty()
+        || Path::new(program)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
+        return Err(error(format!("trusted {label} executable unavailable")));
+    }
+    let primary = inputs
+        .mission_dir
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == ".kranz"))
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty());
+    let in_forbidden = |target: &Path| -> bool {
+        let abs_target = crate::sandbox::absolutize(target);
+        std::iter::once(inputs.session_cwd.as_path())
+            .chain(std::iter::once(inputs.tmpdir.as_path()))
+            .chain(inputs.extra_write.iter().map(PathBuf::as_path))
+            .chain(primary)
+            .any(|forbidden| {
+                let abs_forbidden = crate::sandbox::absolutize(forbidden);
+                abs_target.starts_with(&abs_forbidden)
+                    || target.starts_with(&abs_forbidden)
+                    || forbidden.canonicalize().ok().is_some_and(|canon| {
+                        abs_target.starts_with(&canon) || target.starts_with(&canon)
+                    })
+            })
+    };
+    for root in std::env::split_paths(&path_env.unwrap_or_default()).filter(|p| p.is_absolute()) {
+        if in_forbidden(&root) {
+            return Err(error(format!(
+                "{label} control executable is worker-writable"
+            )));
+        }
         if let Ok(candidate) = root.join(program).canonicalize() {
-            if !candidate.is_file() {
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if !meta.is_file() {
                 continue;
             }
-            if std::iter::once(&inputs.session_cwd)
-                .chain(std::iter::once(&inputs.tmpdir))
-                .chain(&inputs.extra_write)
-                .any(|root| candidate.starts_with(crate::sandbox::absolutize(root)))
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            if in_forbidden(&candidate) {
                 return Err(error(format!(
                     "{label} control executable is worker-writable"
                 )));
@@ -941,6 +1006,18 @@ pub async fn recover_dead_owner_ledgers(
             report.unconfirmed.push(owner.to_owned());
             continue;
         }
+        let ledger_client = match record.get("endpoint") {
+            None | Some(serde_json::Value::Null) => client.clone(),
+            Some(serde_json::Value::String(ep)) if !ep.trim().is_empty() => {
+                let mut pinned = client.clone();
+                pinned.pin_local_endpoint(ep);
+                pinned
+            }
+            Some(_) => {
+                report.unconfirmed.push(owner.to_owned());
+                continue;
+            }
+        };
         let creation_finished = match record.get("creationFinished").and_then(|v| v.as_bool()) {
             Some(true) => true,
             Some(false) => file_meta
@@ -950,10 +1027,10 @@ pub async fn recover_dead_owner_ledgers(
                 .is_some_and(|age| age > CREATE_TIMEOUT),
             None => true,
         };
-        if remove(&client, owner, true, creation_finished)
+        if remove(&ledger_client, owner, true, creation_finished)
             .await
             .is_ok()
-            && std::fs::remove_dir_all(&ledger_dir).is_ok()
+            && crate::sandbox_container::remove_owned_tree_nofollow(&ledger_dir).is_ok()
         {
             report.removed.push(owner.to_owned());
         } else {

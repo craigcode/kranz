@@ -154,7 +154,7 @@ pub struct CleanupReceipt {
 }
 
 /// Recoverable terminal limits, distinct from uncertain containment cleanup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Budget {
     Capacity,
@@ -271,7 +271,7 @@ impl PaneObservation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Error {
     BudgetExceeded(Budget),
     InvalidRequest,
@@ -426,6 +426,26 @@ mod tests {
             json!({"sessionId":"s","command":"x","outputByteLimit":-1})
         )
         .is_err());
+
+        // Exact MAX_REQUEST_BYTES boundary is schema-valid; one byte over fails.
+        let mut boundary = Create {
+            session_id: "peer".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), String::new()],
+            env: vec![],
+            cwd: None,
+            output_byte_limit: None,
+            meta: None,
+        };
+        let empty_len = serde_json::to_vec(&boundary).unwrap().len();
+        boundary.args[1] = "a".repeat(MAX_REQUEST_BYTES - empty_len);
+        assert_eq!(
+            serde_json::to_vec(&boundary).unwrap().len(),
+            MAX_REQUEST_BYTES
+        );
+        assert_eq!(boundary.validate(), Ok(DEFAULT_OUTPUT_BYTES));
+        boundary.args[1].push('a');
+        assert_eq!(boundary.validate(), Err(Error::InvalidRequest));
     }
 
     #[test]

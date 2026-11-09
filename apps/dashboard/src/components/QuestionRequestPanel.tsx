@@ -14,6 +14,7 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
 import { pendingQuestions } from '../lib/pendingAsks';
+import { visible } from '../lib/presentation';
 import { useKranzStore } from '../lib/store';
 import type { PendingQuestion } from '../lib/types';
 
@@ -51,21 +52,21 @@ export function QuestionRequestPanel({ onActed }: { onActed?: () => void } = {})
       {questions.map((q) => (
         <div className="revision-body" key={q.questionId}>
           <div className="dim">
-            {q.questionId}
-            {q.featureId !== undefined ? ` · ${q.featureId}` : ''} — a worker asked:
+            {visible(q.questionId)}
+            {q.featureId !== undefined ? ` · ${visible(q.featureId)}` : ''} — a worker asked:
           </div>
-          <pre className="revision-diff">{q.text}</pre>
+          <pre className="revision-diff">{visible(q.text)}</pre>
           {q.options !== undefined && q.options.length > 0 && (
             <div className="revision-actions">
               {q.options.map((option, index) => (
                 <button
                   type="button"
                   className="strip-btn"
-                  key={option}
+                  key={`${index}-${option}`}
                   disabled={busy !== null}
                   onClick={() => void answer(q, option, index)}
                 >
-                  {busy === q.questionId ? 'Answering...' : option}
+                  {busy === q.questionId ? 'Answering...' : visible(option)}
                 </button>
               ))}
             </div>
@@ -94,7 +95,7 @@ export function QuestionRequestPanel({ onActed }: { onActed?: () => void } = {})
       ))}
       {error !== null && (
         <div className="picker-error revision-error" role="alert">
-          {error}
+          {visible(error)}
         </div>
       )}
     </section>

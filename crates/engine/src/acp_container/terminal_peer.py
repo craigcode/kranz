@@ -60,6 +60,16 @@ def run():
         adapter_hint = int(open("/proc/self/oom_score_adj").read())
         create(100, r'''
 import os, time
+fds = {int(n) for n in os.listdir("/proc/self/fd")}
+extra = fds - {0, 1, 2}
+assert len(extra) == 1, fds
+for fd in extra:
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"leaked fd {fd}")
 assert int(open("/proc/self/oom_score_adj").read()) == 500
 if os.fork() == 0:
     os.setsid()
@@ -82,7 +92,7 @@ time.sleep(120)
         target(102, "output", handle)
         assert response(102)["result"]["output"] == "ready\n"
         beat = open("heartbeat").read()
-        time.sleep(2)
+        time.sleep(3)
         assert open("heartbeat").read() == beat
         target(103, "output", handle)
         assert response(103)["error"]["data"]["budget"] == "retention"
@@ -131,10 +141,9 @@ time.sleep(120)
         assert all(value["error"]["data"]["budget"] == "commandLifetime" for value in values)
         target(201, "release", handle)
         assert response(201)["result"] == {}
-        # Its retention may have expired while the first command was running.
+        # Retention (60s) exceeds the first command's lifetime (15s), so release succeeds deterministically.
         target(202, "release", second)
-        value = response(202)
-        assert value.get("result") == {} or value["error"]["data"]["budget"] == "retention", value
+        assert response(202)["result"] == {}
     else:
         script = r'''
 import os, time
@@ -206,7 +215,22 @@ time.sleep(120)
         assert "error" in response(108)
         send(dict(id=109, method="terminal/output", params=dict(sessionId="foreign", terminalId=handle)))
         assert "error" in response(109)
-        create(110, 'import os; assert "FIXTURE_MODE" not in os.environ; print("done")')
+        create(110, r'''
+import os
+assert "FIXTURE_MODE" not in os.environ
+assert os.path.exists("terminal_peer.py")
+fds = {int(n) for n in os.listdir("/proc/self/fd")}
+extra = fds - {0, 1, 2}
+assert len(extra) == 1, fds
+for fd in extra:
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"leaked fd {fd}")
+print("done")
+''')
         second = response(110)["result"]["terminalId"]
         target(111, "wait_for_exit", second)
         assert response(111)["result"]["exitCode"] == 0

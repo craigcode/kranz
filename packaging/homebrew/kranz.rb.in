@@ -7,7 +7,6 @@ class Kranz < Formula
   desc "Git-native mission control for governed AI coding-agent work"
   homepage "https://github.com/craigcode/kranz"
   url "https://github.com/craigcode/kranz/archive/refs/tags/vVERSION.tar.gz"
-  version "VERSION"
   sha256 "SHA256"
   license "MIT"
 
@@ -19,5 +18,6 @@ class Kranz < Formula
 
   test do
     assert_match "kranz", shell_output("#{bin}/kranz --help")
+    assert_match version.to_s, shell_output("#{bin}/kranz --version")
   end
 end

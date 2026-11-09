@@ -12,15 +12,59 @@ import {
   prepareBoardFrame,
   type BoardColors,
   type BoardPlotter,
+  type BoardView,
   type DrawnCraft,
   type PlotContext2D,
 } from '../lib/board/plot';
+import type { BoardGeom } from '../lib/board/flightPlan';
 import { visible } from '../lib/presentation';
 
 export interface BoardPlotProps {
   model: FleetModel;
   selectedKey: string | null;
   onSelectCraft: (craftKey: string | null) => void;
+}
+
+const MAX_TRANSITION_MS = 75_000;
+
+function hasActiveMotion(model: FleetModel, currentMs: number, transitionEndMs: number): boolean {
+  if (model.crafts.some((c) => c.stage === 'running')) return true;
+  if (model.transitions.length > 0) return true;
+  return currentMs < transitionEndMs;
+}
+
+function chipTone(cr: DrawnCraft): string {
+  if (cr.wait) return 'wait';
+  if (cr.pose.dead) return 'dead';
+  if (cr.pose.phase === 'landed') return 'landed';
+  return '';
+}
+
+function sameRenderedChips(prev: DrawnCraft[], next: DrawnCraft[]): boolean {
+  if (prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i++) {
+    const a = prev[i];
+    const b = next[i];
+    if (
+      a.key !== b.key ||
+      a.selected !== b.selected ||
+      a.label !== b.label ||
+      a.chipPhrase !== b.chipPhrase ||
+      chipTone(a) !== chipTone(b)
+    ) {
+      return false;
+    }
+    if ((a.chip === null) !== (b.chip === null)) return false;
+    if (
+      a.chip !== null &&
+      b.chip !== null &&
+      (Math.round(a.chip.x) !== Math.round(b.chip.x) ||
+        Math.round(a.chip.y) !== Math.round(b.chip.y))
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function acquireContext2D(canvas: HTMLCanvasElement): PlotContext2D | null {
@@ -78,10 +122,18 @@ export function BoardPlot({ model, selectedKey, onSelectCraft }: BoardPlotProps)
   const plotterRef = useRef<BoardPlotter | null>(null);
   const drawnRef = useRef<DrawnCraft[]>([]);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 800, h: 500 });
+  const prevSlotsRef = useRef<Map<string, number>>(new Map());
+  const modelRef = useRef<FleetModel>(model);
+  const selectedKeyRef = useRef<string | null>(selectedKey);
+  const anchorRef = useRef<{ modelNowMs: number; perfMs: number }>({
+    modelNowMs: model.nowMs,
+    perfMs: typeof performance !== 'undefined' ? performance.now() : 0,
+  });
+  const transitionEndMsRef = useRef<number>(-Infinity);
+  const syncRef = useRef<(() => void) | null>(null);
 
   const [supported, setSupported] = useState<boolean | null>(null);
   const [drawnCrafts, setDrawnCrafts] = useState<DrawnCraft[]>([]);
-  const [viewportVersion, setViewportVersion] = useState(0);
 
   // Probe 2D canvas support on mount
   useEffect(() => {
@@ -101,111 +153,159 @@ export function BoardPlot({ model, selectedKey, onSelectCraft }: BoardPlotProps)
     };
   }, []);
 
-  // Observe stage resize when supported
+  // Mount ResizeObserver, visibilitychange listener, and frame controller once when supported
   useEffect(() => {
     if (supported !== true) return;
     const el = stageRef.current;
-    if (!el) return;
+    const plotter = plotterRef.current;
+    if (!el || !plotter) return;
+
+    let mounted = true;
+    let rafId = 0;
+    let cachedFit: { w: number; h: number; dpr: number; view: BoardView; G: BoardGeom } | null =
+      null;
+
+    const ensureView = () => {
+      const { w, h } = sizeRef.current;
+      const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+      if (!cachedFit || cachedFit.w !== w || cachedFit.h !== h || cachedFit.dpr !== dpr) {
+        const { view, G } = fitBoard(w, h, dpr);
+        plotter.setColors(readPlotColors(stageRef.current));
+        plotter.setView(view);
+        cachedFit = { w, h, dpr, view, G };
+      }
+      return cachedFit;
+    };
+
+    const stopLoop = () => {
+      if (rafId !== 0 && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+      }
+      rafId = 0;
+    };
+
+    const drawFrame = (elapsedMs: number, still: boolean): number => {
+      const { view, G } = ensureView();
+      const curModel = modelRef.current;
+      const curSelected = selectedKeyRef.current;
+      const baseModelMs = anchorRef.current.modelNowMs;
+      const currentMs = still ? baseModelMs : baseModelMs + elapsedMs;
+      const wallSec = (baseModelMs + elapsedMs) / 1000;
+      const frame = prepareBoardFrame(curModel, view, G, currentMs, curSelected, {
+        wallSec,
+        still,
+        extraObstacles: [{ x: 14, y: 12, w: 170, h: 20 }],
+        prevSlots: prevSlotsRef.current,
+      });
+      prevSlotsRef.current = frame.slots;
+      plotter.draw(frame);
+      drawnRef.current = frame.crafts;
+      setDrawnCrafts((prev) => (sameRenderedChips(prev, frame.crafts) ? prev : frame.crafts));
+      return currentMs;
+    };
+
+    const tick = (nowPerf: number) => {
+      rafId = 0;
+      if (!mounted) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const still = readReducedMotion();
+      const elapsed = Math.max(0, nowPerf - anchorRef.current.perfMs);
+      const currentMs = drawFrame(elapsed, still);
+      if (
+        !still &&
+        typeof requestAnimationFrame === 'function' &&
+        hasActiveMotion(modelRef.current, currentMs, transitionEndMsRef.current)
+      ) {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    const sync = () => {
+      if (!mounted) return;
+      const still = readReducedMotion();
+      const currentMs = drawFrame(0, still);
+      const canAnimate =
+        !still &&
+        typeof requestAnimationFrame === 'function' &&
+        !(typeof document !== 'undefined' && document.hidden) &&
+        hasActiveMotion(modelRef.current, currentMs, transitionEndMsRef.current);
+      if (canAnimate) {
+        if (rafId === 0) {
+          rafId = requestAnimationFrame(tick);
+        }
+      } else {
+        stopLoop();
+      }
+    };
+
+    syncRef.current = sync;
 
     const measure = () => {
       const w = el.clientWidth || 800;
       const h = el.clientHeight || 500;
       if (w !== sizeRef.current.w || h !== sizeRef.current.h) {
         sizeRef.current = { w, h };
-        setViewportVersion((v) => v + 1);
+        sync();
       }
     };
-    measure();
+    sizeRef.current = { w: el.clientWidth || 800, h: el.clientHeight || 500 };
+    sync();
 
-    if (typeof ResizeObserver !== 'undefined') {
-      const ro = new ResizeObserver(measure);
-      ro.observe(el);
-      return () => ro.disconnect();
-    }
-    return undefined;
-  }, [supported]);
-
-  // Render frame and manage animation loop (paused when document.hidden or prefers-reduced-motion)
-  useEffect(() => {
-    if (supported !== true) return;
-    const plotter = plotterRef.current;
-    if (!plotter) return;
-
-    const still = readReducedMotion();
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
-    const { w, h } = sizeRef.current;
-    const { view, G } = fitBoard(w, h, dpr);
-    plotter.setColors(readPlotColors(stageRef.current));
-    plotter.setView(view);
-
-    const baseWallMs = typeof performance !== 'undefined' ? performance.now() : 0;
-    const baseModelMs = model.nowMs;
-
-    const drawAt = (elapsedMs: number) => {
-      const currentMs = still ? baseModelMs : baseModelMs + elapsedMs;
-      const wallSec = (baseModelMs + elapsedMs) / 1000;
-      const frame = prepareBoardFrame(model, view, G, currentMs, selectedKey, {
-        wallSec,
-        still,
-        extraObstacles: [{ x: 14, y: 12, w: 170, h: 20 }],
-      });
-      plotter.draw(frame);
-      drawnRef.current = frame.crafts;
-      setDrawnCrafts(frame.crafts);
-    };
-
-    // Always draw once immediately for the current model/selection/size
-    drawAt(0);
-
-    if (still || typeof requestAnimationFrame !== 'function') {
-      return undefined;
-    }
-
-    let rafId = 0;
-    let active = true;
-
-    const tick = (nowPerf: number) => {
-      if (!active) return;
-      if (typeof document !== 'undefined' && document.hidden) {
-        rafId = 0;
-        return;
-      }
-      drawAt(Math.max(0, nowPerf - baseWallMs));
-      rafId = requestAnimationFrame(tick);
-    };
-
-    const startLoop = () => {
-      if (!active || rafId !== 0) return;
-      if (typeof document !== 'undefined' && document.hidden) return;
-      rafId = requestAnimationFrame(tick);
-    };
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    ro?.observe(el);
 
     const onVisibility = () => {
       if (typeof document !== 'undefined' && document.hidden) {
-        if (rafId !== 0 && typeof cancelAnimationFrame === 'function') {
-          cancelAnimationFrame(rafId);
-          rafId = 0;
-        }
+        stopLoop();
       } else {
-        startLoop();
+        anchorRef.current = {
+          modelNowMs: modelRef.current.nowMs,
+          perfMs: typeof performance !== 'undefined' ? performance.now() : 0,
+        };
+        sync();
       }
     };
 
-    startLoop();
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', onVisibility);
     }
 
     return () => {
-      active = false;
-      if (rafId !== 0 && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(rafId);
-      }
+      mounted = false;
+      syncRef.current = null;
+      stopLoop();
+      ro?.disconnect();
       if (typeof document !== 'undefined') {
         document.removeEventListener('visibilitychange', onVisibility);
       }
     };
-  }, [supported, model, selectedKey, viewportVersion]);
+  }, [supported]);
+
+  // Synchronize latest model and selection via refs and trigger a single redraw
+  useEffect(() => {
+    const prevModel = modelRef.current;
+    modelRef.current = model;
+    selectedKeyRef.current = selectedKey;
+    if (model !== prevModel) {
+      if (model.crafts.length === 0 || model.nowMs + 1_000 < prevModel.nowMs) {
+        transitionEndMsRef.current = -Infinity;
+        prevSlotsRef.current = new Map();
+      }
+      anchorRef.current = {
+        modelNowMs: model.nowMs,
+        perfMs: typeof performance !== 'undefined' ? performance.now() : 0,
+      };
+    }
+    if (model.transitions.length > 0) {
+      for (const tr of model.transitions) {
+        transitionEndMsRef.current = Math.max(
+          transitionEndMsRef.current,
+          tr.at + MAX_TRANSITION_MS,
+        );
+      }
+    }
+    syncRef.current?.();
+  }, [supported, model, selectedKey]);
 
   if (supported === false) {
     return null;

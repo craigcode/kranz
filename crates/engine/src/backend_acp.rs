@@ -755,6 +755,8 @@ impl AgentBackend for AcpBackend {
             handshake_complete: false,
             saw_result: false,
             exit: None,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            test_resource_evidence: None,
         };
 
         // The handshake is eager: a non-ACP executable (or a hung peer)
@@ -864,6 +866,8 @@ pub struct AcpSession {
     handshake_complete: bool,
     saw_result: bool,
     exit: Option<SessionExit>,
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    test_resource_evidence: Option<crate::acp_resources::ResourceEvidence>,
 }
 
 #[cfg(unix)]
@@ -1195,6 +1199,7 @@ impl AcpSession {
             Input::Terminal(completion) => return self.complete_terminal(completion).await,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             Input::TerminalReceipt(raw) => {
+                self.terminals.observe_receipt(&raw);
                 self.queue.push_back(AgentEvent::Other { raw });
                 return Ok(());
             }
@@ -1698,8 +1703,13 @@ impl AcpSession {
         }
         let sent = self.write_message(response).await;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        self.terminals
-            .completed(&serde_json::to_string(&completion.id)?);
+        let emit_receipt = {
+            self.terminals
+                .completed(&serde_json::to_string(&completion.id)?);
+            self.terminals.record_completion(&completion.result)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let emit_receipt = true;
         if let Some(id) = completion.permission_id {
             let delivery = if sent.is_ok() {
                 crate::live_permission::Delivery::Sent
@@ -1712,12 +1722,14 @@ impl AcpSession {
                 raw: json!({"permissionResponse":id,"delivery":delivery}),
             });
         }
-        self.queue.push_back(AgentEvent::Other {
-            raw: json!({"terminalReceipt": {
-                "method":completion.method, "requestId":completion.id,
-                "succeeded":completion.result.is_ok(), "evidence":completion.receipt,
-            }}),
-        });
+        if emit_receipt {
+            self.queue.push_back(AgentEvent::Other {
+                raw: json!({"terminalReceipt": {
+                    "method":completion.method, "requestId":completion.id,
+                    "succeeded":completion.result.is_ok(), "evidence":completion.receipt,
+                }}),
+            });
+        }
         sent
     }
 
@@ -1828,11 +1840,12 @@ impl AcpSession {
             }
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(provider) = &self.terminals.provider {
+        if let Some(provider) = self.terminals.provider.clone() {
             if !self.terminals.cleanup_recorded {
                 self.terminals.cleanup_recorded = true;
                 if let Ok(receipts) = provider.drain_receipts() {
                     for raw in receipts {
+                        self.terminals.observe_receipt(&raw);
                         self.queue.push_back(AgentEvent::Other { raw });
                     }
                 }
@@ -1840,6 +1853,8 @@ impl AcpSession {
                     raw: json!({"terminalNamespaceCleanup": {
                         "scope":provider.scope, "confirmed":self.cleanup_failure.is_none(),
                         "cause":self.cleanup_failure,
+                        "refusedRequests":self.terminals.refused_terminal_requests,
+                        "suppressedRefusals":self.terminals.suppressed_terminal_refusals,
                     }}),
                 });
             }
@@ -2063,7 +2078,8 @@ impl AgentSession for AcpSession {
         let exit = self.exit.clone();
         if exit.is_some() {
             if let Some(mut evidence) = self.resource_evidence() {
-                if evidence.requires_failure() {
+                let failed = matches!(exit, Some(SessionExit::Failed(_)));
+                if evidence.requires_failure() || (failed && evidence.terminal_budget_hit.0) {
                     evidence.classify(true);
                     let mut message = evidence.failure_message().expect("classified failure");
                     if let Some(SessionExit::Failed(cause)) = &exit {
@@ -2079,7 +2095,13 @@ impl AgentSession for AcpSession {
     fn resource_evidence(&self) -> Option<crate::acp_resources::ResourceEvidence> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.container.as_ref().and_then(|c| c.resource_evidence())
+            let evidence = self.container.as_ref().and_then(|c| c.resource_evidence());
+            #[cfg(test)]
+            let evidence = evidence.or_else(|| self.test_resource_evidence.clone());
+            let mut evidence = evidence?;
+            evidence.terminal_budget_hit =
+                crate::acp_resources::TransientFlag(self.terminals.saw_budget_hit);
+            Some(evidence)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {

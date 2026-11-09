@@ -4,9 +4,10 @@
 // the report + diff-stat inline, an UNMERGED badge, the gated Merge button,
 // and optional PR handoff (copyable push / gh create — never auto-push).
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../lib/api';
 import { renderMarkdown } from '../lib/markdown';
+import { visible } from '../lib/presentation';
 import type { PrHandoff } from '../lib/types';
 
 interface Props {
@@ -14,6 +15,8 @@ interface Props {
   status: string;
   onMerged?: () => void;
 }
+
+const SAFE_PR_URL_RE = /^https?:\/\//i;
 
 export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   const [merged, setMerged] = useState<boolean | null>(null);
@@ -24,22 +27,39 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   const [creatingPr, setCreatingPr] = useState(false);
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const activeRef = useRef({ mounted: true, missionId, status });
+  activeRef.current.missionId = missionId;
+  activeRef.current.status = status;
+
+  useEffect(() => {
+    activeRef.current.mounted = true;
+    return () => {
+      activeRef.current.mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     setMerged(null);
     setReportMarkdown(null);
     setDiffStat(null);
     setPrHandoff(null);
+    setMerging(false);
+    setCreatingPr(false);
     setPrUrl(null);
     setError(null);
     if (status !== 'complete') return;
 
     let cancelled = false;
-    void api.missions().then((missions) => {
-      if (cancelled) return;
-      const row = missions.find((m) => m.id === missionId);
-      setMerged(row?.merged ?? null);
-    });
+    void api
+      .missions()
+      .then((missions) => {
+        if (cancelled) return;
+        const row = missions.find((m) => m.id === missionId);
+        setMerged(row?.merged ?? null);
+      })
+      .catch(() => {
+        /* mission list probe failed; avoid unhandled rejection */
+      });
     void api
       .reportMd(missionId)
       .then((r) => !cancelled && setReportMarkdown(r.markdown))
@@ -64,30 +84,50 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   }, [missionId, status]);
 
   const onMerge = useCallback(() => {
+    const reqMissionId = missionId;
+    const isCurrent = () =>
+      activeRef.current.mounted &&
+      activeRef.current.missionId === reqMissionId &&
+      activeRef.current.status === 'complete';
     setError(null);
     setMerging(true);
     api
-      .merge(missionId)
+      .merge(reqMissionId)
       .then(() => {
+        if (!isCurrent()) return;
         setMerged(true);
         onMerged?.();
       })
       .catch((err: unknown) => {
+        if (!isCurrent()) return;
         setError(err instanceof ApiError ? err.message : String(err));
       })
-      .finally(() => setMerging(false));
+      .finally(() => {
+        if (isCurrent()) setMerging(false);
+      });
   }, [missionId, onMerged]);
 
   const onCreatePr = useCallback(() => {
+    const reqMissionId = missionId;
+    const isCurrent = () =>
+      activeRef.current.mounted &&
+      activeRef.current.missionId === reqMissionId &&
+      activeRef.current.status === 'complete';
     setError(null);
     setCreatingPr(true);
     api
-      .createPr(missionId)
-      .then((r) => setPrUrl(r.url))
+      .createPr(reqMissionId)
+      .then((r) => {
+        if (!isCurrent()) return;
+        setPrUrl(r.url);
+      })
       .catch((err: unknown) => {
+        if (!isCurrent()) return;
         setError(err instanceof ApiError ? err.message : String(err));
       })
-      .finally(() => setCreatingPr(false));
+      .finally(() => {
+        if (isCurrent()) setCreatingPr(false);
+      });
   }, [missionId]);
 
   const copyCommand = useCallback(async (command: string) => {
@@ -142,9 +182,13 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
               </button>
               {prUrl !== null && (
                 <p className="delivered-pr-url">
-                  <a href={prUrl} target="_blank" rel="noreferrer">
-                    {prUrl}
-                  </a>
+                  {SAFE_PR_URL_RE.test(prUrl) ? (
+                    <a href={prUrl} target="_blank" rel="noreferrer">
+                      {visible(prUrl)}
+                    </a>
+                  ) : (
+                    <span>{visible(prUrl)}</span>
+                  )}
                 </p>
               )}
             </>

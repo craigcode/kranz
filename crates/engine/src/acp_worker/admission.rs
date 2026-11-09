@@ -89,6 +89,7 @@ pub(crate) const POLICY: Policy = Policy {
     ],
 };
 
+#[derive(Clone)]
 pub(crate) struct AdmittedHost {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub docker: PathBuf,
@@ -118,11 +119,7 @@ fn validate_host(observed: &Value, policy: Policy) -> Result<Value> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn validate_selection(
-    env: &std::collections::HashMap<String, String>,
-    context: &Value,
-    endpoint: &str,
-) -> Result<()> {
+pub(crate) fn validate_env_map(env: &std::collections::HashMap<String, String>) -> Result<()> {
     for key in [
         "DOCKER_HOST",
         "DOCKER_CONFIG",
@@ -137,8 +134,48 @@ fn validate_selection(
             )));
         }
     }
-    if env.get("DOCKER_CONTEXT").is_some_and(|v| v != "colima")
-        || context.as_array().map(Vec::len) != Some(1)
+    if let Some(tls_key) = env.keys().find(|key| key.starts_with("DOCKER_TLS")) {
+        return Err(refusal(&format!(
+            "v2 requires the default Colima context without {tls_key}"
+        )));
+    }
+    if env.get("DOCKER_CONTEXT").is_some_and(|v| v != "colima") {
+        return Err(refusal(
+            "v2 requires the current default Colima local Unix endpoint",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ambient_docker_env() -> Result<()> {
+    for (raw_key, raw_val) in std::env::vars_os() {
+        let key = raw_key.to_string_lossy();
+        if matches!(
+            key.as_ref(),
+            "DOCKER_HOST" | "DOCKER_CONFIG" | "DOCKER_CERT_PATH" | "DOCKER_API_VERSION"
+        ) || key.starts_with("DOCKER_TLS")
+        {
+            return Err(refusal(&format!(
+                "v2 requires the default Colima context without {key}"
+            )));
+        }
+        if key == "DOCKER_CONTEXT" && raw_val.to_str() != Some("colima") {
+            return Err(refusal(
+                "v2 requires the current default Colima local Unix endpoint",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_selection(
+    env: &std::collections::HashMap<String, String>,
+    context: &Value,
+    endpoint: &str,
+) -> Result<()> {
+    validate_env_map(env)?;
+    if context.as_array().map(Vec::len) != Some(1)
         || context.pointer("/0/Name").and_then(Value::as_str) != Some("colima")
         || context
             .pointer("/0/Endpoints/docker/Host")
@@ -156,8 +193,81 @@ fn validate_selection(
     Ok(())
 }
 
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn verify_colima_socket(
+    home: &std::path::Path,
+    inputs: &SandboxInputs,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let euid = unsafe { libc::geteuid() };
+    let colima_dir = home.join(".colima");
+    let default_dir = colima_dir.join("default");
+    for parent in [&colima_dir, &default_dir] {
+        let meta = std::fs::symlink_metadata(parent)
+            .map_err(|_| refusal("v2 default Colima socket parent is unavailable"))?;
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_dir()
+            || meta.uid() != euid
+            || (meta.mode() & 0o022) != 0
+        {
+            return Err(refusal(
+                "v2 requires operator-owned non-symlink .colima directories without group/world write",
+            ));
+        }
+    }
+    let socket = default_dir.join("docker.sock");
+    let before = std::fs::symlink_metadata(&socket)
+        .map_err(|_| refusal("v2 default Colima socket is unavailable"))?;
+    if before.file_type().is_symlink()
+        || !before.file_type().is_socket()
+        || before.uid() != euid
+        || (before.mode() & 0o077) != 0
+    {
+        return Err(refusal(
+            "v2 requires an operator-owned socket outside worker-writable roots",
+        ));
+    }
+    let socket_path = socket
+        .canonicalize()
+        .map_err(|_| refusal("v2 default Colima socket is unavailable"))?;
+    let after = std::fs::symlink_metadata(&socket_path)
+        .map_err(|_| refusal("v2 default Colima socket is unavailable"))?;
+    if after.file_type().is_symlink()
+        || !after.file_type().is_socket()
+        || after.uid() != euid
+        || (after.mode() & 0o077) != 0
+        || (before.dev(), before.ino()) != (after.dev(), after.ino())
+    {
+        return Err(refusal(
+            "v2 requires an operator-owned socket outside worker-writable roots",
+        ));
+    }
+    let primary = inputs
+        .mission_dir
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|n| n.to_str()) == Some(".kranz"))
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf);
+    let socket_abs = crate::sandbox::absolutize(&socket);
+    if std::iter::once(&inputs.session_cwd)
+        .chain(std::iter::once(&inputs.tmpdir))
+        .chain(&inputs.extra_write)
+        .chain(primary.iter())
+        .any(|root| {
+            let root_abs = crate::sandbox::absolutize(root);
+            socket_path.starts_with(&root_abs) || socket_abs.starts_with(&root_abs)
+        })
+    {
+        return Err(refusal(
+            "v2 requires an operator-owned socket outside worker-writable roots",
+        ));
+    }
+    Ok((socket, socket_path))
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) async fn probe(_inputs: &SandboxInputs, _policy: Policy) -> Result<AdmittedHost> {
+    validate_ambient_docker_env()?;
     Err(refusal(
         "v2 host admission requires the qualified macOS ARM64 Colima host",
     ))
@@ -167,7 +277,6 @@ pub(crate) async fn probe(_inputs: &SandboxInputs, _policy: Policy) -> Result<Ad
 pub(crate) async fn probe(inputs: &SandboxInputs, policy: Policy) -> Result<AdmittedHost> {
     use crate::command_exec::evaluator_io;
     use std::collections::HashMap;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -208,34 +317,21 @@ pub(crate) async fn probe(inputs: &SandboxInputs, policy: Policy) -> Result<Admi
             .ok_or_else(|| refusal("v2 host probe returned invalid text"))
     }
 
+    // Refuse banned Docker selection environment variables BEFORE locating or
+    // spawning `docker context inspect`.
+    validate_ambient_docker_env()?;
     let docker = crate::acp_container::trusted_control_program(inputs, "docker")?;
     let colima = crate::acp_container::trusted_control_program(inputs, "colima")?;
     let mut client =
         DockerEvaluator::new(&docker).map_err(|_| refusal("v2 Docker client is unavailable"))?;
     let env = client.environment();
+    validate_env_map(env)?;
     let home = env
         .get("HOME")
         .map(Path::new)
         .filter(|p| p.is_absolute())
         .ok_or_else(|| refusal("v2 requires an absolute operator HOME"))?;
-    let socket = home.join(".colima/default/docker.sock");
-    let metadata = std::fs::symlink_metadata(&socket)
-        .map_err(|_| refusal("v2 default Colima socket is unavailable"))?;
-    let socket_path = socket
-        .canonicalize()
-        .map_err(|_| refusal("v2 default Colima socket is unavailable"))?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || std::iter::once(&inputs.session_cwd)
-            .chain(std::iter::once(&inputs.tmpdir))
-            .chain(&inputs.extra_write)
-            .any(|root| socket_path.starts_with(crate::sandbox::absolutize(root)))
-    {
-        return Err(refusal(
-            "v2 requires an operator-owned socket outside worker-writable roots",
-        ));
-    }
+    let (socket, socket_path) = verify_colima_socket(home, inputs)?;
     let endpoint = format!("unix://{}", socket.display());
     // Context inspection is local configuration only. No daemon request is
     // made until the endpoint has been checked and pinned.
@@ -385,5 +481,97 @@ mod tests {
             )),
             POLICY.supervisor_sha256
         );
+    }
+
+    #[test]
+    fn acp_v2_admission_validate_env_map_refuses_arbitrary_docker_tls_prefix() {
+        assert!(validate_env_map(&std::collections::HashMap::from([(
+            "DOCKER_TLS_CA".into(),
+            "1".into()
+        )]))
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_v2_admission_verifies_colima_parent_dirs_and_socket_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        if std::env::var_os("KRANZ_TEST_BIND_RELATIVE_SOCK").is_some() {
+            let _ = UnixListener::bind("docker.sock").unwrap();
+            return;
+        }
+
+        let base = tempfile::Builder::new().prefix("k").tempdir().unwrap();
+        let home = base.path().join("h");
+        let colima = home.join(".colima");
+        let default = colima.join("default");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::set_permissions(&colima, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let sock_path = default.join("docker.sock");
+        let _listener = match UnixListener::bind(&sock_path) {
+            Ok(listener) => Some(listener),
+            Err(_) => {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .current_dir(&default)
+                    .env("KRANZ_TEST_BIND_RELATIVE_SOCK", "1")
+                    .args([
+                        "--exact",
+                        "acp_worker::admission::tests::acp_v2_admission_verifies_colima_parent_dirs_and_socket_permissions",
+                        "--nocapture",
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(
+                    status.success(),
+                    "relative UnixListener::bind helper failed"
+                );
+                None
+            }
+        };
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let work = base.path().join("w");
+        let mission = base.path().join("p/.kranz/missions/m-1");
+        let tmp = base.path().join("t");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&mission).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let inputs = SandboxInputs {
+            enforce: crate::types::SandboxEnforce::FsNet,
+            session_cwd: work.clone(),
+            mission_dir: mission.clone(),
+            tmpdir: tmp.clone(),
+            extra_write: Vec::new(),
+            egress: Vec::new(),
+            validator_read_deny_roots: Vec::new(),
+        };
+
+        let (_, canon) = verify_colima_socket(&home, &inputs).unwrap();
+        assert_eq!(canon, sock_path.canonicalize().unwrap());
+
+        // Group-writable `.colima` or `.colima/default` must be refused.
+        std::fs::set_permissions(&colima, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(verify_colima_socket(&home, &inputs).is_err());
+        std::fs::set_permissions(&colima, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(verify_colima_socket(&home, &inputs).is_err());
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Socket inside `extra_write` or `primary` must be refused.
+        let mut inside_extra = inputs.clone();
+        inside_extra.extra_write = vec![home.clone()];
+        assert!(verify_colima_socket(&home, &inside_extra).is_err());
+
+        // Symlinked `.colima` directory must be refused.
+        let sym_home = base.path().join("sh");
+        std::fs::create_dir_all(&sym_home).unwrap();
+        std::os::unix::fs::symlink(&colima, sym_home.join(".colima")).unwrap();
+        assert!(verify_colima_socket(&sym_home, &inputs).is_err());
     }
 }

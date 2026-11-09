@@ -155,4 +155,64 @@ describe('DeliveredPanel', () => {
     expect(api.createPr).toHaveBeenCalledWith('m-1');
     expect(await screen.findByText('https://github.com/o/r/pull/1')).toBeTruthy();
   });
+
+  it('guards against rejected missions(), unsafe non-http(s) PR URLs, and stale async completions across mission switches (KRZ-M13)', async () => {
+    // 1) Rejected api.missions() does not cause unhandled rejection
+    vi.mocked(api.missions).mockRejectedValueOnce(new Error('offline'));
+    const { unmount: unmountOffline } = render(<DeliveredPanel missionId="m-1" status="complete" />);
+    await waitFor(() => expect(api.missions).toHaveBeenCalledTimes(1));
+    unmountOffline();
+
+    // 2) Non-http(s) PR URL renders as inert <span> instead of <a href="javascript:...">
+    vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
+    vi.mocked(api.prHandoff).mockResolvedValueOnce({
+      kind: 'readyToCreate',
+      command: 'gh pr create',
+      title: 'x',
+      body: 'y',
+      remote: 'origin',
+      branch: 'kranz/mission-m-1',
+      base: 'main',
+    });
+    vi.mocked(api.createPr).mockResolvedValueOnce({ url: 'javascript:alert(1)' });
+
+    const { container, unmount: unmountUnsafe } = render(
+      <DeliveredPanel missionId="m-1" status="complete" />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Create PR' }));
+    expect(await screen.findByText('javascript:alert(1)')).toBeTruthy();
+    expect(container.querySelector('.delivered-pr-url a')).toBeNull();
+    expect(container.querySelector('.delivered-pr-url span')?.textContent).toBe(
+      'javascript:alert(1)',
+    );
+    unmountUnsafe();
+
+    // 3) Stale merge completion from m-1 must not mark m-2 as merged after switching missionId
+    let resolveMergeM1!: (value: { merged: boolean; commit: string }) => void;
+    vi.mocked(api.merge).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveMergeM1 = resolve;
+        }),
+    );
+    vi.mocked(api.missions).mockResolvedValue([
+      makeSummary({ id: 'm-1', merged: false }),
+      makeSummary({ id: 'm-2', merged: false }),
+    ]);
+
+    const { rerender } = render(<DeliveredPanel missionId="m-1" status="complete" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+    expect(screen.getByRole('button', { name: 'Merging…' })).toBeTruthy();
+
+    // Switch to m-2 before m-1's merge resolves
+    rerender(<DeliveredPanel missionId="m-2" status="complete" />);
+    expect(await screen.findByRole('button', { name: 'Merge' })).toBeTruthy();
+
+    resolveMergeM1({ merged: true, commit: 'deadbeef' });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // m-2 remains unmerged with its Merge button intact!
+    expect(screen.getByRole('button', { name: 'Merge' })).toBeTruthy();
+    expect(screen.getByText('UNMERGED')).toBeTruthy();
+  });
 });

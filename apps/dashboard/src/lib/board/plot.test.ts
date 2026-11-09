@@ -59,9 +59,15 @@ function createRecordingContext(): RecordingContext {
       currentOps.push(`lineTo(${x.toFixed(1)},${y.toFixed(1)})`);
     },
     arc(_x, _y, r) {
+      if (!Number.isFinite(r) || r < 0) {
+        throw new RangeError(`IndexSizeError: invalid arc radius ${r}`);
+      }
       currentOps.push(`arc(${r.toFixed(1)})`);
     },
-    ellipse() {
+    ellipse(_x, _y, rx, ry) {
+      if (!Number.isFinite(rx) || rx < 0 || !Number.isFinite(ry) || ry < 0) {
+        throw new RangeError(`IndexSizeError: invalid ellipse radii ${rx}, ${ry}`);
+      }
       currentOps.push('ellipse');
     },
     fill() {},
@@ -82,7 +88,10 @@ function createRecordingContext(): RecordingContext {
       });
     },
     setLineDash() {},
-    createRadialGradient() {
+    createRadialGradient(_x0, _y0, r0, _x1, _y1, r1) {
+      if (!Number.isFinite(r0) || r0 < 0 || !Number.isFinite(r1) || r1 < 0) {
+        throw new RangeError(`IndexSizeError: invalid gradient radii ${r0}, ${r1}`);
+      }
       return { addColorStop() {} } as unknown as CanvasGradient;
     },
     drawImage() {},
@@ -325,6 +334,113 @@ describe('plot — pure hitTestCraft and placeLabels', () => {
       }
       for (const obs of obstacles) {
         expect(boxOverlap(placed[i].chip, obs)).toBe(0);
+      }
+    }
+  });
+
+  it('sanitizes tiny, zero, negative, and non-finite fitBoard dimensions and draws at 10x10 without IndexSizeError', () => {
+    for (const [w, h, dpr] of [
+      [10, 10, 1],
+      [0, 0, 1],
+      [-40, -20, -2],
+      [Number.NaN, Number.POSITIVE_INFINITY, Number.NaN],
+    ] as const) {
+      const { view, G } = fitBoard(w, h, dpr);
+      expect(Number.isFinite(view.w) && view.w > 0).toBe(true);
+      expect(Number.isFinite(view.h) && view.h > 0).toBe(true);
+      expect(Number.isFinite(view.dpr) && view.dpr > 0).toBe(true);
+      expect(Number.isFinite(view.k) && view.k >= 0.05).toBe(true);
+
+      const missions: MissionSummary[] = [
+        { id: 'm-run', status: 'running', goal: 'Orbiting', createdAt: '2026-10-08T10:10:00Z' },
+        {
+          id: 'm-del',
+          status: 'complete',
+          merged: false,
+          goal: 'Delivered',
+          createdAt: '2026-10-08T10:20:00Z',
+        },
+        {
+          id: 'm-land',
+          status: 'complete',
+          merged: true,
+          goal: 'Landed',
+          createdAt: '2026-10-08T09:00:00Z',
+        },
+      ];
+      const model = buildFleetModel([], missions, new Map(), NOW_MS);
+      const frame = prepareBoardFrame(model, view, G, NOW_MS);
+      const rec = createRecordingContext();
+      const plotter = createBoardPlotter(rec.ctx, { width: 10, height: 10 }, createFakeLayer);
+      plotter.setView(view);
+      expect(() => plotter.draw(frame)).not.toThrow();
+    }
+  });
+
+  it('only assigns canvas.width and canvas.height when dimensions actually change', () => {
+    let widthWrites = 0;
+    let heightWrites = 0;
+    let curW = 800;
+    let curH = 500;
+    const canvas = {
+      get width() {
+        return curW;
+      },
+      set width(v: number) {
+        widthWrites += 1;
+        curW = v;
+      },
+      get height() {
+        return curH;
+      },
+      set height(v: number) {
+        heightWrites += 1;
+        curH = v;
+      },
+    };
+
+    const rec = createRecordingContext();
+    const plotter = createBoardPlotter(rec.ctx, canvas, createFakeLayer);
+    const fitSame = fitBoard(800, 500, 1);
+    plotter.setView(fitSame.view);
+    expect(widthWrites).toBe(0);
+    expect(heightWrites).toBe(0);
+
+    const fitNext = fitBoard(900, 520, 2);
+    plotter.setView(fitNext.view);
+    expect(widthWrites).toBe(1);
+    expect(heightWrites).toBe(1);
+
+    plotter.setView(fitNext.view);
+    expect(widthWrites).toBe(1);
+    expect(heightWrites).toBe(1);
+  });
+
+  it('preserves prevSlots hysteresis across prepareBoardFrame calls and never overlaps labels on short viewports', () => {
+    const missions: MissionSummary[] = Array.from({ length: 6 }, (_, i) => ({
+      id: `m-${i}`,
+      status: 'running',
+      goal: `Mission ${i}`,
+      createdAt: `2026-10-08T10:0${i}:00Z`,
+    }));
+    const model = buildFleetModel([], missions, new Map(), NOW_MS);
+    const { view, G } = fitBoard(800, 150, 1);
+
+    const frame1 = prepareBoardFrame(model, view, G, NOW_MS);
+    expect(frame1.slots.size).toBe(frame1.crafts.length);
+
+    const frame2 = prepareBoardFrame(model, view, G, NOW_MS + 50, null, {
+      prevSlots: frame1.slots,
+    });
+    expect([...frame2.slots.entries()]).toEqual([...frame1.slots.entries()]);
+
+    for (let i = 0; i < frame2.crafts.length; i++) {
+      for (let j = i + 1; j < frame2.crafts.length; j++) {
+        const a = frame2.crafts[i].chip;
+        const b = frame2.crafts[j].chip;
+        if (a && b) {
+          expect(boxOverlap(a, b)).toBe(0);
+        }
       }
     }
   });

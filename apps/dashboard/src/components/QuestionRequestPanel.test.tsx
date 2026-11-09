@@ -118,4 +118,37 @@ describe('QuestionRequestPanel', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toBe("no open question 'q-1'");
   });
+
+  it('escapes BiDi/zero-width characters via visible() and keys duplicate options by index without warning (KRZ-M11)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const biDiOption = 'allow\u202e-admin';
+      useKranzStore.setState({
+        state: missionState([
+          {
+            questionId: 'q-\u200b1',
+            role: 'worker',
+            text: 'Run \u202esafe\u202c migration?',
+            options: [biDiOption, 'same-label', 'same-label'],
+            featureId: 'f-\u200b9',
+          },
+        ]),
+      });
+
+      render(<QuestionRequestPanel />);
+
+      expect(errSpy).not.toHaveBeenCalled();
+      expect(screen.getByText(/q-\\u200b1 · f-\\u200b9/)).toBeTruthy();
+      expect(screen.getByText('Run \\u202esafe\\u202c migration?')).toBeTruthy();
+
+      const optionBtn = screen.getByRole('button', { name: 'allow\\u202e-admin' });
+      fireEvent.click(optionBtn);
+
+      await waitFor(() =>
+        expect(api.answerQuestion).toHaveBeenCalledWith('m-1', 'q-\u200b1', biDiOption, 0),
+      );
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
 });

@@ -390,14 +390,16 @@ export function buildFleetModel(
       usedPads.add(prevPad);
     }
   }
+  let nextPad = 0;
   for (const e of eligibleGround) {
     if (padByKey.has(e.row.key)) continue;
-    for (let p = 0; p < PAD_CAPACITY; p++) {
-      if (!usedPads.has(p)) {
-        padByKey.set(e.row.key, p);
-        usedPads.add(p);
-        break;
-      }
+    while (nextPad < PAD_CAPACITY && usedPads.has(nextPad)) {
+      nextPad += 1;
+    }
+    if (nextPad < PAD_CAPACITY) {
+      padByKey.set(e.row.key, nextPad);
+      usedPads.add(nextPad);
+      nextPad += 1;
     }
   }
 
@@ -423,11 +425,13 @@ export function buildFleetModel(
       }
     }
   }
+  let nextSlot = 0;
   for (const e of orbitalEntries) {
     if (laneSlotByKey.has(e.row.key)) continue;
-    for (let slotIndex = 0; ; slotIndex++) {
-      const lane = slotIndex % LANE_CAPACITY;
-      const angleSlot = Math.floor(slotIndex / LANE_CAPACITY);
+    for (;;) {
+      const lane = nextSlot % LANE_CAPACITY;
+      const angleSlot = Math.floor(nextSlot / LANE_CAPACITY);
+      nextSlot += 1;
       const slotKey = `${lane}:${angleSlot}`;
       if (!usedLaneSlots.has(slotKey)) {
         laneSlotByKey.set(e.row.key, { lane, angleSlot });
@@ -456,14 +460,16 @@ export function buildFleetModel(
       usedSites.add(prevSite);
     }
   }
+  let nextSite = 0;
   for (const e of eligibleLanded) {
     if (siteByKey.has(e.row.key)) continue;
-    for (let s = 0; s < SITE_CAPACITY; s++) {
-      if (!usedSites.has(s)) {
-        siteByKey.set(e.row.key, s);
-        usedSites.add(s);
-        break;
-      }
+    while (nextSite < SITE_CAPACITY && usedSites.has(nextSite)) {
+      nextSite += 1;
+    }
+    if (nextSite < SITE_CAPACITY) {
+      siteByKey.set(e.row.key, nextSite);
+      usedSites.add(nextSite);
+      nextSite += 1;
     }
   }
 

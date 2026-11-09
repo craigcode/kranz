@@ -16,9 +16,9 @@ async fn terminal_session(root: &Path, name: &str, mode: &str) -> Box<dyn AgentS
     let backend = if mode == "disabled" {
         backend
     } else if mode == "budget-expiry" {
-        backend.with_terminal_budget_fixture(1500, 1200)
+        backend.with_terminal_budget_fixture(1500, 2500)
     } else if mode == "budget-controls" {
-        backend.with_terminal_budget_fixture(15000, 5000)
+        backend.with_terminal_budget_fixture(15000, 60000)
     } else {
         backend.with_terminal_fixture("fixture-run")
     };
@@ -451,4 +451,135 @@ async fn acp_terminal_v1_control_polling_and_pending_limits_recover() {
         session.exit_status()
     );
     absent(root.path(), &name).await;
+}
+
+#[test]
+fn acp_terminal_v1_python_driver_fd_cloexec_killpg_and_launch_invariants() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver_path = dir.path().join("terminal.py");
+    let peer_path = dir.path().join("terminal_peer.py");
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::write(&driver_path, include_str!("../terminal.py")).unwrap();
+    std::fs::write(&peer_path, include_str!("../terminal_peer.py")).unwrap();
+
+    let script = r#"
+import ast, json, os, signal, subprocess, sys, types
+
+driver_src = open(sys.argv[1]).read()
+peer_src = open(sys.argv[2]).read()
+work_dir = os.path.realpath(sys.argv[3])
+
+compile(driver_src, "terminal.py", "exec")
+compile(peer_src, "terminal_peer.py", "exec")
+
+# Load helper functions/constants from terminal.py without running main().
+tree = ast.parse(driver_src, "terminal.py")
+tree.body = [n for n in tree.body if not isinstance(n, ast.Try)]
+mod = types.ModuleType("terminal_driver")
+exec(compile(tree, "terminal.py", "exec"), mod.__dict__)
+
+assert mod.MAX_REQUEST == 32768 + 4096, mod.MAX_REQUEST
+
+# 1. Verify stop_children sends killpg, signals pidfds, tolerates PermissionError,
+# and only sleeps when neither peer reaping nor children() changes.
+sleeps = []
+killpgs = []
+pidfd_sigs = []
+state = {"pass": 0}
+
+class FakePeer:
+    pid = 4242
+    returncode = None
+
+peer = FakePeer()
+
+def fake_reap(p):
+    state["pass"] += 1
+    if state["pass"] == 3:
+        p.returncode = -9
+        return False
+    if state["pass"] >= 5:
+        return True
+    return False
+
+def fake_children():
+    # Pass 1 before=after={100,101} -> sleeps once; Pass 2 peer reaps & children drain -> no sleep; Pass 3 finishes.
+    if state["pass"] <= 3:
+        return [100, 101]
+    return []
+
+def fake_killpg(pgid, sig):
+    killpgs.append((pgid, sig))
+    raise PermissionError("simulated")
+
+mod.reap = fake_reap
+mod.children = fake_children
+mod.os.killpg = fake_killpg
+mod.os.pidfd_open = lambda pid: os.dup(0)
+mod.signal.pidfd_send_signal = lambda fd, sig: pidfd_sigs.append(sig)
+mod.time.sleep = lambda dt: sleeps.append(dt)
+
+mod.stop_children(peer)
+assert killpgs == [(4242, signal.SIGKILL), (4242, signal.SIGKILL)], killpgs
+assert len(pidfd_sigs) == 4, pidfd_sigs
+assert sleeps == [0.01], sleeps
+
+# 2. Verify the exact preexec fchdir + close(cwd) + set_inheritable(program, False)
+# posture leaves ONLY {0, 1, 2} open across execve (plus listdir's closed dirfd).
+cwd_fd = mod.open_directory(work_dir)
+prog_fd = os.open(os.path.realpath(sys.executable), os.O_RDONLY | os.O_CLOEXEC)
+hint_r, hint_w = os.pipe()
+
+def child_preexec():
+    os.fchdir(cwd_fd)
+    os.close(cwd_fd)
+    os.set_inheritable(prog_fd, False)
+    os.write(hint_w, b"500")
+    os.close(hint_w)
+
+fd_dir = "/proc/self/fd" if os.path.exists("/proc/self/fd") else "/dev/fd"
+child = subprocess.Popen(
+    [sys.executable, "-I", "-S", "-c", f"""
+import json, os
+fds = {{int(n) for n in os.listdir({fd_dir!r})}}
+still_open = []
+for fd in sorted(fds):
+    try:
+        os.fstat(fd)
+        still_open.append(fd)
+    except OSError:
+        pass
+print(json.dumps({{"cwd": os.path.realpath(os.getcwd()), "extra": len(fds - {{0, 1, 2}}), "open": still_open}}))
+"""],
+    cwd=None,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    close_fds=True,
+    pass_fds=(prog_fd, hint_w),
+    start_new_session=True,
+    preexec_fn=child_preexec,
+)
+os.close(hint_w)
+assert os.read(hint_r, 16) == b"500"
+os.close(hint_r)
+os.close(prog_fd)
+os.close(cwd_fd)
+out, _ = child.communicate(timeout=5)
+assert child.returncode == 0, out
+report = json.loads(out.decode())
+assert report["cwd"] == work_dir, report
+assert report["extra"] == 1, report
+assert report["open"] == [0, 1, 2], report
+"#;
+
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(&driver_path)
+        .arg(&peer_path)
+        .arg(&work_dir)
+        .status()
+        .expect("python3 required for terminal driver invariant test");
+    assert!(status.success());
 }

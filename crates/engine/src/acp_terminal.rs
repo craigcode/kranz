@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Notify};
 
@@ -22,7 +22,8 @@ pub(crate) const FIXTURE_IMAGE: &str =
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_TERMINALS: usize = 8;
 const MAX_CREATIONS: usize = 32;
-const MAX_OUTPUT_PER_SECOND: usize = 10;
+const MAX_OUTPUT_READS_PER_SECOND: usize = 10;
+pub(crate) const MAX_LAUNCH_BYTES: usize = kranz_acp::terminal::MAX_REQUEST_BYTES + 4096;
 
 /// Code-owned fixture policy, never deserialized from peer or repository input.
 /// The selected resource profile still has a 600-second session ceiling.
@@ -63,11 +64,13 @@ pub(crate) struct Context {
     pub(crate) alive: Arc<AtomicBool>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Authority {
     nonce: String,
     scope: Scope,
     digest: String,
     deadline: chrono::DateTime<chrono::Utc>,
+    expires_at: tokio::time::Instant,
     action_digest: String,
 }
 
@@ -81,8 +84,8 @@ struct State {
     failed: bool,
     budget: Option<Budget>,
     retention_expired: bool,
-    output_window: Instant,
-    output_count: usize,
+    expired_budget: Option<Budget>,
+    output_reads: VecDeque<tokio::time::Instant>,
 }
 
 struct Entry {
@@ -98,7 +101,7 @@ struct Registry {
     entries: HashMap<String, Arc<Entry>>,
     authorities: HashSet<String>,
     reservations: HashSet<String>,
-    retired: HashMap<String, (ExitStatus, bool)>,
+    retired: HashMap<String, (ExitStatus, Option<Budget>)>,
     creations: usize,
 }
 
@@ -125,7 +128,7 @@ pub(crate) struct Provider {
     pub(crate) scope: Scope,
     registry: Arc<Mutex<Registry>>,
     budgets: Budgets,
-    session_deadline: Instant,
+    session_deadline: tokio::time::Instant,
     failed: Arc<AtomicBool>,
     failure: Arc<Notify>,
     receipts: Receipts,
@@ -149,11 +152,33 @@ impl Provider {
             },
             registry: Arc::new(Mutex::new(Registry::default())),
             budgets,
-            session_deadline: Instant::now() + Duration::from_secs(600),
+            session_deadline: tokio::time::Instant::now() + Duration::from_secs(600),
             failed: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(Notify::new()),
             receipts: Receipts::default(),
         }
+    }
+
+    fn remaining_session_ms(&self) -> u64 {
+        self.session_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis() as u64
+    }
+
+    pub(crate) fn encode_launch(&self, action: &Create, session_ms: u64) -> Result<Vec<u8>, Error> {
+        let mut launch = serde_json::to_vec(&json!({
+            "workspace": self.context.workspace,
+            "scratch": self.context.scratch,
+            "action": action,
+            "budgets": self.budgets,
+            "sessionRemainingMs": session_ms,
+        }))
+        .map_err(|_| Error::InvalidRequest)?;
+        launch.push(b'\n');
+        if launch.len() > MAX_LAUNCH_BYTES {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(launch)
     }
 
     fn check_scope(&self, scope: &Scope) -> Result<(), Error> {
@@ -217,7 +242,7 @@ impl Provider {
     /// occupy capacity until denial or the atomic transition to a live entry.
     pub(crate) fn reserve(&self, proposal: &str) -> Result<(), Error> {
         self.check_scope(&self.scope)?;
-        if Instant::now() >= self.session_deadline {
+        if self.remaining_session_ms() == 0 {
             return Err(Error::BudgetExceeded(Budget::SessionLifetime));
         }
         let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
@@ -259,54 +284,69 @@ impl Provider {
         action: &Create,
         proposal: &Proposal,
     ) -> Result<Authority, Error> {
+        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
+        // Burn the reservation first so expired or mismatched proposals never
+        // leak a reserved capacity slot.
+        let reserved = registry.reservations.remove(&proposal.id);
         self.check_scope(&self.scope)?;
-        if proposal.validate().is_err()
+        let now = chrono::Utc::now();
+        if !reserved
+            || proposal.validate().is_err()
             || proposal.prohibition.is_some()
             || proposal.option(true).is_none()
             || proposal.engine_session_id != self.scope.engine_session_id
             || proposal.peer_session_id != self.scope.peer_session_id
-            || chrono::Utc::now() >= proposal.deadline
+            || now >= proposal.deadline
             || proposal.action != self.action(action)?
         {
             return Err(Error::NotAuthorized);
         }
-        let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
-        if !registry.reservations.remove(&proposal.id) {
+        let max_ttl = (proposal.deadline - proposal.observed_at)
+            .to_std()
+            .unwrap_or_default();
+        let ttl = (proposal.deadline - now)
+            .to_std()
+            .unwrap_or_default()
+            .min(max_ttl);
+        if ttl.is_zero() {
             return Err(Error::NotAuthorized);
         }
+        let expires_at = tokio::time::Instant::now() + ttl;
+        let normalized = self.normalize(action.clone())?;
+        let digest = digest(&normalized).map_err(|_| Error::InvalidRequest)?;
         let nonce = uuid::Uuid::new_v4().to_string();
         registry.authorities.insert(nonce.clone());
         Ok(Authority {
             nonce,
             deadline: proposal.deadline,
+            expires_at,
             action_digest: proposal.action_digest.clone(),
             scope: self.scope.clone(),
-            digest: digest(&self.normalize(action.clone())?).map_err(|_| Error::InvalidRequest)?,
+            digest,
         })
     }
 
     fn entry(&self, scope: &Scope, id: &str) -> Result<Arc<Entry>, Error> {
         self.check_scope(scope)?;
         let registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
-        if registry
-            .retired
-            .get(id)
-            .is_some_and(|(_, expired)| *expired)
-        {
-            return Err(Error::BudgetExceeded(Budget::Retention));
+        if let Some((_, Some(budget))) = registry.retired.get(id) {
+            return Err(Error::BudgetExceeded(*budget));
         }
         let entry = registry
             .entries
             .get(id)
             .cloned()
             .ok_or(Error::InvalidHandle)?;
-        if entry
-            .state
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .releasing
         {
-            return Err(Error::InvalidHandle);
+            let state = entry.state.lock().map_err(|_| Error::Unavailable)?;
+            if state.retention_expired {
+                return Err(Error::BudgetExceeded(
+                    state.expired_budget.unwrap_or(Budget::Retention),
+                ));
+            }
+            if state.releasing {
+                return Err(Error::InvalidHandle);
+            }
         }
         Ok(entry)
     }
@@ -360,9 +400,9 @@ impl Provider {
             .collect())
     }
 
-    pub(crate) async fn close(&self) -> Result<Vec<CleanupReceipt>, Error> {
+    pub(crate) async fn close(self: &Arc<Self>) -> Result<Vec<CleanupReceipt>, Error> {
         self.check_scope(&self.scope)?;
-        let ids: Vec<_> = self
+        let mut ids: Vec<_> = self
             .registry
             .lock()
             .map_err(|_| Error::Unavailable)?
@@ -370,17 +410,55 @@ impl Provider {
             .keys()
             .cloned()
             .collect();
-        let mut receipts = Vec::new();
-        // At most eight handles. Each release is bounded; the outer session
-        // applies a shared close deadline and tears down the namespace on error.
-        for id in ids {
-            match self.release(self.scope.clone(), id).await {
-                Ok(receipt) => receipts.push(receipt),
-                Err(Error::BudgetExceeded(Budget::Retention)) => {}
+        ids.sort();
+        // Release all live handles concurrently (at most eight) so cumulative
+        // drain latencies stay well within the outer session close deadline.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, id) in ids.into_iter().enumerate() {
+            let provider = Arc::clone(self);
+            let scope = self.scope.clone();
+            tasks.spawn(async move { (index, provider.release(scope, id).await) });
+        }
+        let mut indexed = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (index, outcome) = joined.map_err(|_| Error::Unavailable)?;
+            match outcome {
+                Ok(receipt) => indexed.push((index, receipt)),
+                Err(Error::BudgetExceeded(Budget::Retention | Budget::SessionLifetime)) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(receipts)
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, receipt)| receipt).collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_test_active_handle(&self, id: &str) {
+        let (changed, _) = watch::channel(());
+        let entry = Arc::new(Entry {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+            state: Mutex::new(State {
+                tail: OutputTail::new(64).unwrap(),
+                started: true,
+                exit: None,
+                released: false,
+                releasing: false,
+                driver_ok: false,
+                failed: false,
+                budget: None,
+                retention_expired: false,
+                expired_budget: None,
+                output_reads: VecDeque::with_capacity(MAX_OUTPUT_READS_PER_SECOND),
+            }),
+            stdin: tokio::sync::Mutex::new(None),
+            changed,
+            abort: Mutex::new(None),
+        });
+        self.registry
+            .lock()
+            .unwrap()
+            .entries
+            .insert(id.to_owned(), entry);
     }
 }
 
@@ -430,7 +508,7 @@ impl TerminalProvider for Provider {
         action: Create,
         authority: Authority,
     ) -> Result<String, Error> {
-        let (action, id, entry, session_ms) = {
+        let (launch, id, entry, session_ms) = {
             let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
             // Burn authority even on invalid input, without releasing capacity
             // between consuming it and inserting the live entry.
@@ -441,18 +519,22 @@ impl TerminalProvider for Provider {
             }
             let action = self.normalize(action)?;
             if chrono::Utc::now() >= authority.deadline
+                || tokio::time::Instant::now() >= authority.expires_at
                 || authority.scope != scope
                 || authority.digest != digest(&action).map_err(|_| Error::InvalidRequest)?
             {
                 return Err(Error::NotAuthorized);
             }
-            let session_ms = self
-                .session_deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64;
+            let session_ms = self.remaining_session_ms();
             if session_ms == 0 {
                 return Err(Error::BudgetExceeded(Budget::SessionLifetime));
             }
+            let limit = action
+                .output_byte_limit
+                .unwrap_or(kranz_acp::terminal::DEFAULT_OUTPUT_BYTES as u64)
+                as usize;
+            let tail = OutputTail::new(limit)?;
+            let launch = self.encode_launch(&action, session_ms)?;
             let id = format!("terminal-{}", uuid::Uuid::new_v4());
             let (changed, _) = watch::channel(());
             // Includes launch, guest cleanup/drain and Docker control reaping.
@@ -464,7 +546,7 @@ impl TerminalProvider for Provider {
             let entry = Arc::new(Entry {
                 deadline,
                 state: Mutex::new(State {
-                    tail: OutputTail::new(action.validate()?)?,
+                    tail,
                     started: false,
                     exit: None,
                     released: false,
@@ -473,8 +555,8 @@ impl TerminalProvider for Provider {
                     failed: false,
                     budget: None,
                     retention_expired: false,
-                    output_window: Instant::now(),
-                    output_count: 0,
+                    expired_budget: None,
+                    output_reads: VecDeque::with_capacity(MAX_OUTPUT_READS_PER_SECOND),
                 }),
                 stdin: tokio::sync::Mutex::new(None),
                 changed,
@@ -482,7 +564,7 @@ impl TerminalProvider for Provider {
             });
             registry.creations += 1;
             registry.entries.insert(id.clone(), entry.clone());
-            (action, id, entry, session_ms)
+            (launch, id, entry, session_ms)
         };
         let started = async {
             let mut command = self.context.client.attached_command(&[
@@ -506,19 +588,8 @@ impl TerminalProvider for Provider {
                 crate::command_exec::ControlChild(command.spawn().map_err(|_| Error::Unavailable)?);
             let mut stdin = child.0.stdin.take().ok_or(Error::Unavailable)?;
             let stdout = child.0.stdout.take().ok_or(Error::Unavailable)?;
-            let launch = serde_json::to_vec(&json!({"workspace":self.context.workspace,
-                "scratch":self.context.scratch, "action":action, "budgets":self.budgets,
-                "sessionRemainingMs":session_ms}))
-            .map_err(|_| Error::InvalidRequest)?;
-            if launch.len() > kranz_acp::terminal::MAX_REQUEST_BYTES {
-                return Err(Error::InvalidRequest);
-            }
             stdin
                 .write_all(&launch)
-                .await
-                .map_err(|_| Error::Unavailable)?;
-            stdin
-                .write_all(b"\n")
                 .await
                 .map_err(|_| Error::Unavailable)?;
             stdin.flush().await.map_err(|_| Error::Unavailable)?;
@@ -552,7 +623,13 @@ impl TerminalProvider for Provider {
                             if state.retention_expired {
                                 if let Some(exit) = &state.exit {
                                     registry.entries.remove(&handle);
-                                    registry.retired.insert(handle, (exit.clone(), true));
+                                    registry.retired.insert(
+                                        handle,
+                                        (
+                                            exit.clone(),
+                                            Some(state.expired_budget.unwrap_or(Budget::Retention)),
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -582,16 +659,22 @@ impl TerminalProvider for Provider {
             return Err(Error::CleanupUnconfirmed);
         }
         if state.retention_expired {
-            return Err(Error::BudgetExceeded(Budget::Retention));
+            return Err(Error::BudgetExceeded(
+                state.expired_budget.unwrap_or(Budget::Retention),
+            ));
         }
-        if state.output_window.elapsed() >= Duration::from_secs(1) {
-            state.output_window = Instant::now();
-            state.output_count = 0;
+        let now = tokio::time::Instant::now();
+        while state
+            .output_reads
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(1))
+        {
+            state.output_reads.pop_front();
         }
-        if state.output_count >= MAX_OUTPUT_PER_SECOND {
+        if state.output_reads.len() >= MAX_OUTPUT_READS_PER_SECOND {
             return Err(Error::BudgetExceeded(Budget::OutputRate));
         }
-        state.output_count += 1;
+        state.output_reads.push_back(now);
         Ok(state.tail.snapshot(state.exit.clone()))
     }
 
@@ -600,6 +683,11 @@ impl TerminalProvider for Provider {
         tokio::time::timeout_at(
             entry.deadline,
             wait_state(&entry, |s| {
+                if s.retention_expired {
+                    return Some(Err(Error::BudgetExceeded(
+                        s.expired_budget.unwrap_or(Budget::Retention),
+                    )));
+                }
                 s.exit.clone().map(|exit| {
                     s.budget
                         .map_or(Ok(exit), |budget| Err(Error::BudgetExceeded(budget)))
@@ -615,6 +703,17 @@ impl TerminalProvider for Provider {
 
     async fn kill(&self, scope: Scope, id: String) -> Result<CleanupReceipt, Error> {
         let entry = self.entry(&scope, &id)?;
+        {
+            let state = entry.state.lock().map_err(|_| Error::Unavailable)?;
+            if state.retention_expired {
+                return Err(Error::BudgetExceeded(
+                    state.expired_budget.unwrap_or(Budget::Retention),
+                ));
+            }
+            if state.released {
+                return Err(Error::InvalidHandle);
+            }
+        }
         let result = tokio::time::timeout(OPERATION_TIMEOUT, async {
             // A natural exit or retention expiry can race the control write.
             // The receipt, not pipe writability, decides whether cleanup worked.
@@ -643,12 +742,8 @@ impl TerminalProvider for Provider {
         self.check_scope(&scope)?;
         let entry = {
             let registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
-            if registry
-                .retired
-                .get(&id)
-                .is_some_and(|(_, expired)| *expired)
-            {
-                return Err(Error::BudgetExceeded(Budget::Retention));
+            if let Some((_, Some(budget))) = registry.retired.get(&id) {
+                return Err(Error::BudgetExceeded(*budget));
             }
             let entry = registry
                 .entries
@@ -657,7 +752,12 @@ impl TerminalProvider for Provider {
                 .ok_or(Error::InvalidHandle)?;
             {
                 let mut state = entry.state.lock().map_err(|_| Error::Unavailable)?;
-                if state.releasing {
+                if state.retention_expired {
+                    return Err(Error::BudgetExceeded(
+                        state.expired_budget.unwrap_or(Budget::Retention),
+                    ));
+                }
+                if state.releasing || state.released {
                     return Err(Error::InvalidHandle);
                 }
                 state.releasing = true;
@@ -684,12 +784,13 @@ impl TerminalProvider for Provider {
         .map_err(|_| Error::CleanupUnconfirmed)
         .and_then(|v| v);
         if let Ok(receipt) = &result {
+            let expired = entry.state.lock().ok().and_then(|s| s.expired_budget);
             let mut registry = self.registry.lock().map_err(|_| Error::Unavailable)?;
             registry.entries.remove(&id);
             registry
                 .retired
                 .entry(id)
-                .or_insert((receipt.exit_status.clone(), false));
+                .or_insert((receipt.exit_status.clone(), expired));
         } else {
             self.fail();
             if let Some(abort) = entry.abort.lock().map_err(|_| Error::Unavailable)?.take() {
@@ -761,7 +862,14 @@ async fn capture_driver(
                     state.retention_expired = value["retentionExpired"]
                         .as_bool()
                         .ok_or(Error::InvalidRequest)?;
-                    state.released = true
+                    state.expired_budget = match (state.retention_expired, value["budget"].as_str())
+                    {
+                        (false, None) if value["budget"].is_null() => None,
+                        (true, Some("retention")) => Some(Budget::Retention),
+                        (true, Some("sessionLifetime")) => Some(Budget::SessionLifetime),
+                        _ => return Err(Error::InvalidRequest),
+                    };
+                    state.released = true;
                 }
                 _ => return Err(Error::CleanupUnconfirmed),
             }
@@ -779,7 +887,7 @@ async fn capture_driver(
     }
     receipts.record(
         json!({"terminalReleased":{"binding":binding,"confirmed":true,
-        "retentionExpired":state.retention_expired,"exitStatus":state.exit}}),
+        "retentionExpired":state.retention_expired,"budget":state.expired_budget,"exitStatus":state.exit}}),
     )?;
     state.driver_ok = true;
     Ok(())
@@ -840,6 +948,7 @@ mod tests {
                 scope: authority.scope.clone(),
                 digest: authority.digest.clone(),
                 deadline: authority.deadline,
+                expires_at: authority.expires_at,
                 action_digest: authority.action_digest.clone(),
             };
             let mut changed = action.clone();
@@ -1022,7 +1131,10 @@ mod tests {
             }),
             unavailable: Vec::new(),
             failure: None,
+            terminal_budget_hit: Default::default(),
         };
+        evidence.classify_with_terminal_budget(false, true);
+        assert_eq!(evidence.failure, None);
         evidence.classify_with_terminal_budget(true, true);
         assert_eq!(evidence.failure, Some(FailureClass::TerminalBudget));
         assert!(evidence
@@ -1034,5 +1146,368 @@ mod tests {
         evidence.state.as_mut().unwrap().oom_killed = true;
         evidence.classify_with_terminal_budget(true, true);
         assert_eq!(evidence.failure, Some(FailureClass::Other));
+    }
+
+    #[tokio::test]
+    async fn terminal_near_max_request_bytes_fits_launch_envelope_and_preserves_prespawn_errors() {
+        let (provider, _, _) = fixture();
+        // Exact 32,768-byte Create with cwd/outputByteLimit omitted (expands on normalize).
+        let mut max_create = Create {
+            session_id: "peer".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), String::new()],
+            env: vec![],
+            cwd: None,
+            output_byte_limit: None,
+            meta: None,
+        };
+        let overhead = serde_json::to_vec(&max_create).unwrap().len();
+        max_create.args[1] = "x".repeat(kranz_acp::terminal::MAX_REQUEST_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&max_create).unwrap().len(),
+            kranz_acp::terminal::MAX_REQUEST_BYTES
+        );
+        assert!(max_create.validate().is_ok());
+
+        let normalized = provider.normalize(max_create.clone()).unwrap();
+        let launch = provider.encode_launch(&normalized, 600_000).unwrap();
+        assert!(launch.ends_with(b"\n"));
+        assert!(
+            launch.len() <= MAX_LAUNCH_BYTES,
+            "launch len {} exceeded MAX_LAUNCH_BYTES {}",
+            launch.len(),
+            MAX_LAUNCH_BYTES
+        );
+
+        // If workspace/scratch metadata makes the internal launch envelope exceed
+        // MAX_LAUNCH_BYTES, Provider::create rejects BEFORE command.spawn() with
+        // InvalidRequest (never CleanupUnconfirmed, never marking provider failed).
+        let huge_workspace = format!("/{}", "w".repeat(5_000));
+        let oversized_provider = Provider::new(
+            Context {
+                client: DockerEvaluator::new(std::path::Path::new("/usr/bin/false")).unwrap(),
+                container_id: "a".repeat(64),
+                image: FIXTURE_IMAGE.into(),
+                workspace: huge_workspace.into(),
+                scratch: "/scratch".into(),
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            "run".into(),
+            "engine".into(),
+            "peer".into(),
+            Budgets::default(),
+        );
+        let value = oversized_provider.action(&max_create).unwrap();
+        let options = vec![json!({"optionId":"yes","kind":"allow_once"})];
+        let now = chrono::Utc::now();
+        let proposal = Proposal {
+            id: "proposal-oversized".into(),
+            engine_session_id: "engine".into(),
+            peer_session_id: "peer".into(),
+            peer_request_id: json!(1),
+            tool_call_id: "call".into(),
+            action_digest: digest(&value).unwrap(),
+            options_digest: digest(&options).unwrap(),
+            action: value,
+            options,
+            observed_at: now,
+            deadline: now + chrono::Duration::seconds(10),
+            prohibition: None,
+        };
+        oversized_provider.reserve(&proposal.id).unwrap();
+        let authority = oversized_provider
+            .authorize(&max_create, &proposal)
+            .unwrap();
+        let err = oversized_provider
+            .create(oversized_provider.scope.clone(), max_create, authority)
+            .await;
+        assert_eq!(err, Err(Error::InvalidRequest));
+        assert!(!oversized_provider.failed.load(Ordering::Acquire));
+        let registry = oversized_provider.registry.lock().unwrap();
+        assert_eq!(registry.creations, 0);
+        assert!(registry.entries.is_empty());
+        assert!(registry.authorities.is_empty());
+    }
+
+    #[test]
+    fn terminal_failed_or_expired_authorize_burns_reservation_slot() {
+        let (provider, action, proposal) = fixture();
+
+        // Expired proposal burns its reservation instead of wedging capacity.
+        let mut expired = proposal.clone();
+        expired.id = "exp".into();
+        expired.observed_at -= chrono::Duration::seconds(20);
+        expired.deadline -= chrono::Duration::seconds(20);
+        provider.reserve(&expired.id).unwrap();
+        assert_eq!(
+            provider.authorize(&action, &expired),
+            Err(Error::NotAuthorized)
+        );
+        assert!(provider.registry.lock().unwrap().reservations.is_empty());
+
+        // Prohibited proposal also burns its reservation.
+        let mut prohibited = proposal.clone();
+        prohibited.id = "prohibited".into();
+        prohibited.prohibition = Some("deny".into());
+        provider.reserve(&prohibited.id).unwrap();
+        assert_eq!(
+            provider.authorize(&action, &prohibited),
+            Err(Error::NotAuthorized)
+        );
+        assert!(provider.registry.lock().unwrap().reservations.is_empty());
+
+        // Mismatched action burns its reservation.
+        let mut mismatch = proposal.clone();
+        mismatch.id = "mismatch".into();
+        mismatch.action["rawInput"]["args"] = json!(["different"]);
+        mismatch.action_digest = digest(&mismatch.action).unwrap();
+        provider.reserve(&mismatch.id).unwrap();
+        assert_eq!(
+            provider.authorize(&action, &mismatch),
+            Err(Error::NotAuthorized)
+        );
+        assert!(provider.registry.lock().unwrap().reservations.is_empty());
+
+        // All MAX_TERMINALS capacity slots remain available afterwards.
+        for i in 0..MAX_TERMINALS {
+            provider.reserve(&format!("slot-{i}")).unwrap();
+        }
+    }
+
+    fn insert_mock_entry(provider: &Provider, id: &str, state: State) -> Arc<Entry> {
+        let (changed, _) = watch::channel(());
+        let entry = Arc::new(Entry {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            state: Mutex::new(state),
+            stdin: tokio::sync::Mutex::new(None),
+            changed,
+            abort: Mutex::new(None),
+        });
+        provider
+            .registry
+            .lock()
+            .unwrap()
+            .entries
+            .insert(id.into(), entry.clone());
+        entry
+    }
+
+    #[tokio::test]
+    async fn terminal_post_retention_race_and_session_lifetime_attribution_are_consistent() {
+        let (provider, _, _) = fixture();
+        let exit_ok = ExitStatus {
+            exit_code: Some(0),
+            signal: None,
+        };
+
+        for (id, budget) in [
+            ("ret-race", Budget::Retention),
+            ("sess-race", Budget::SessionLifetime),
+        ] {
+            // [T1, T2] window: driver emitted `released` with retentionExpired=true,
+            // but the entry has not yet moved from `entries` to `retired`.
+            insert_mock_entry(
+                &provider,
+                id,
+                State {
+                    tail: OutputTail::new(64).unwrap(),
+                    started: true,
+                    exit: Some(exit_ok.clone()),
+                    released: true,
+                    releasing: true,
+                    driver_ok: false,
+                    failed: false,
+                    budget: None,
+                    retention_expired: true,
+                    expired_budget: Some(budget),
+                    output_reads: VecDeque::new(),
+                },
+            );
+            assert_eq!(
+                provider.output(provider.scope.clone(), id.into()).await,
+                Err(Error::BudgetExceeded(budget))
+            );
+            assert_eq!(
+                provider
+                    .wait_for_exit(provider.scope.clone(), id.into())
+                    .await,
+                Err(Error::BudgetExceeded(budget))
+            );
+            assert_eq!(
+                provider.kill(provider.scope.clone(), id.into()).await,
+                Err(Error::BudgetExceeded(budget))
+            );
+            assert_eq!(
+                provider.release(provider.scope.clone(), id.into()).await,
+                Err(Error::BudgetExceeded(budget))
+            );
+            assert!(!provider.failed.load(Ordering::Acquire));
+
+            // Retired tombstone preserves exact budget (Retention vs SessionLifetime).
+            {
+                let mut reg = provider.registry.lock().unwrap();
+                reg.entries.remove(id);
+                reg.retired
+                    .insert(id.into(), (exit_ok.clone(), Some(budget)));
+            }
+            assert_eq!(
+                provider.output(provider.scope.clone(), id.into()).await,
+                Err(Error::BudgetExceeded(budget))
+            );
+            assert_eq!(
+                provider.release(provider.scope.clone(), id.into()).await,
+                Err(Error::BudgetExceeded(budget))
+            );
+        }
+
+        // Explicitly released (non-expired) handle in [T1, T2] rejects kill() with
+        // InvalidHandle rather than succeeding or failing the session.
+        insert_mock_entry(
+            &provider,
+            "explicit-released",
+            State {
+                tail: OutputTail::new(64).unwrap(),
+                started: true,
+                exit: Some(exit_ok),
+                released: true,
+                releasing: false,
+                driver_ok: true,
+                failed: false,
+                budget: None,
+                retention_expired: false,
+                expired_budget: None,
+                output_reads: VecDeque::new(),
+            },
+        );
+        assert_eq!(
+            provider
+                .kill(provider.scope.clone(), "explicit-released".into())
+                .await,
+            Err(Error::InvalidHandle)
+        );
+        assert!(!provider.failed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn terminal_close_releases_all_handles_concurrently() {
+        let (provider, _, _) = fixture();
+        let provider = Arc::new(provider);
+        for index in 0..MAX_TERMINALS {
+            let id = format!("terminal-{index}");
+            let entry = insert_mock_entry(
+                &provider,
+                &id,
+                State {
+                    tail: OutputTail::new(64).unwrap(),
+                    started: true,
+                    exit: None,
+                    released: false,
+                    releasing: false,
+                    driver_ok: false,
+                    failed: false,
+                    budget: None,
+                    retention_expired: false,
+                    expired_budget: None,
+                    output_reads: VecDeque::new(),
+                },
+            );
+            tokio::spawn(async move {
+                while !entry.state.lock().unwrap().releasing {
+                    tokio::task::yield_now().await;
+                }
+                // Sequential close across 8 handles would take >= 2.0s;
+                // concurrent close finishes in ~250ms.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                {
+                    let mut state = entry.state.lock().unwrap();
+                    state.exit = Some(ExitStatus {
+                        exit_code: Some(0),
+                        signal: None,
+                    });
+                    state.released = true;
+                    state.driver_ok = true;
+                }
+                entry.changed.send_replace(());
+            });
+        }
+        let started = std::time::Instant::now();
+        let receipts = tokio::time::timeout(Duration::from_millis(1200), provider.close())
+            .await
+            .expect("concurrent close must finish well under sequential sum")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1200));
+        assert_eq!(receipts.len(), MAX_TERMINALS);
+        for (index, receipt) in receipts.iter().enumerate() {
+            assert_eq!(receipt.terminal_id, format!("terminal-{index}"));
+            assert!(receipt.released && receipt.descendants_reaped && receipt.output_drained);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_monotonic_authority_sub_ms_reserve_and_sliding_output_rate_window() {
+        let (mut provider, action, proposal) = fixture();
+
+        // 1. Sub-millisecond remaining session lifetime is rejected at reserve()
+        // before consent/authority is ever issued.
+        provider.session_deadline = tokio::time::Instant::now() + Duration::from_micros(500);
+        assert_eq!(
+            provider.reserve("sub-ms"),
+            Err(Error::BudgetExceeded(Budget::SessionLifetime))
+        );
+        provider.session_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+
+        // 2. Monotonic authority expiry rejects create() when monotonic deadline
+        // has elapsed even if wall-clock chrono::Utc::now() has not passed deadline.
+        let mut long_wall_proposal = proposal.clone();
+        long_wall_proposal.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
+        provider.reserve(&long_wall_proposal.id).unwrap();
+        let mut authority = provider.authorize(&action, &long_wall_proposal).unwrap();
+        authority.expires_at = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            provider
+                .create(provider.scope.clone(), action, authority)
+                .await,
+            Err(Error::NotAuthorized)
+        );
+
+        // 3. Sliding 1s output rate window prevents 20-read boundary bursts:
+        // 5 reads aged >1s expire, while 5 reads from 200ms ago remain counted.
+        let now = tokio::time::Instant::now();
+        let mut output_reads = VecDeque::with_capacity(MAX_OUTPUT_READS_PER_SECOND);
+        for _ in 0..5 {
+            output_reads.push_back(now - Duration::from_millis(1_100));
+        }
+        for _ in 0..5 {
+            output_reads.push_back(now - Duration::from_millis(200));
+        }
+        insert_mock_entry(
+            &provider,
+            "sliding",
+            State {
+                tail: OutputTail::new(64).unwrap(),
+                started: true,
+                exit: None,
+                released: false,
+                releasing: false,
+                driver_ok: false,
+                failed: false,
+                budget: None,
+                retention_expired: false,
+                expired_budget: None,
+                output_reads,
+            },
+        );
+        for _ in 0..5 {
+            provider
+                .output(provider.scope.clone(), "sliding".into())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            provider
+                .output(provider.scope.clone(), "sliding".into())
+                .await,
+            Err(Error::BudgetExceeded(Budget::OutputRate))
+        );
     }
 }

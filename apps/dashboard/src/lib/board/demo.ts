@@ -14,8 +14,8 @@ import type {
   TicketSummary,
 } from '../types';
 
-export const DEMO_STEP_MS = 6_000;
-export const DEMO_STEP_COUNT = 8;
+export const DEMO_STEP_MS = 10_000;
+export const DEMO_STEP_COUNT = 15;
 export const DEMO_LOOP_MS = DEMO_STEP_MS * DEMO_STEP_COUNT;
 
 export interface DemoSnapshot {
@@ -279,7 +279,7 @@ export function demoSnapshotAt(stepIndex: number, nowMs: number): DemoSnapshot {
         },
       });
     }
-  } else if (step === 6) {
+  } else if (step === 6 || step === 7) {
     tTravellerA = {
       slug: 'board-lens',
       priority: 2,

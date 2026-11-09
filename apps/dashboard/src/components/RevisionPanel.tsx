@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { isRevisableStatus, pendingRevision as selectPendingRevision } from '../lib/pendingAsks';
+import { visible } from '../lib/presentation';
 import { useKranzStore } from '../lib/store';
 
 export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
@@ -84,7 +85,7 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
       </div>
       {pending !== null ? (
         <div className="revision-body">
-          <div className="revision-instructions">{pending.instructions}</div>
+          <div className="revision-instructions">{visible(pending.instructions)}</div>
           <div className="revision-actions">
             <button
               type="button"
@@ -104,7 +105,7 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
             </button>
           </div>
           {diff === null && error === null && <div className="dim panel-empty">Loading diff...</div>}
-          {diff !== null && <pre className="revision-diff">{diff}</pre>}
+          {diff !== null && <pre className="revision-diff">{visible(diff)}</pre>}
         </div>
       ) : (
         <div className="revision-body">
@@ -126,7 +127,7 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
       )}
       {error !== null && (
         <div className="picker-error revision-error" role="alert">
-          {error}
+          {visible(error)}
         </div>
       )}
     </section>

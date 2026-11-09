@@ -154,37 +154,95 @@ impl AcpWorkerProfile {
         worker_cwd: &Path,
         scratch_tmpdir: &Path,
     ) -> Result<CredentialSourceReceipt> {
+        self.verify_credential_source_with_extra_write(
+            primary_repo,
+            worker_cwd,
+            scratch_tmpdir,
+            &[],
+        )
+    }
+
+    pub(crate) fn verify_credential_source_with_extra_write(
+        &self,
+        primary_repo: &Path,
+        worker_cwd: &Path,
+        scratch_tmpdir: &Path,
+        extra_write: &[PathBuf],
+    ) -> Result<CredentialSourceReceipt> {
         self.validate_target(std::env::consts::OS, std::env::consts::ARCH)?;
         let definition = self.definition()?;
-        let source = self
-            .credential_file
-            .canonicalize()
-            .map_err(|_| refusal("credential source is unavailable"))?;
-        if [worker_cwd, scratch_tmpdir, primary_repo]
-            .into_iter()
-            .any(|root| source.starts_with(crate::sandbox::absolutize(root)))
-        {
+        let verified = self.load_verified_credential(
+            &definition,
+            primary_repo,
+            worker_cwd,
+            scratch_tmpdir,
+            extra_write,
+        )?;
+        Ok(CredentialSourceReceipt {
+            profile_id: self.id.clone(),
+            credential_sha256: crate::standards_waiver::sha256_hex(&verified.bytes),
+            token_count: verified.secrets.len(),
+            writeback_enabled: false,
+        })
+    }
+
+    fn load_verified_credential(
+        &self,
+        definition: &Definition,
+        primary_repo: &Path,
+        worker_cwd: &Path,
+        scratch_tmpdir: &Path,
+        extra_write: &[PathBuf],
+    ) -> Result<VerifiedCredential> {
+        if credential_path_in_forbidden_roots(
+            &self.credential_file,
+            primary_repo,
+            worker_cwd,
+            scratch_tmpdir,
+            extra_write,
+        ) {
             return Err(refusal(
                 "credential source must be outside repository and worker-writable roots",
             ));
         }
-        let bytes = private_credential(&self.credential_file)?;
+        let link_meta = std::fs::symlink_metadata(&self.credential_file)
+            .map_err(|_| refusal("credential source is unavailable"))?;
+        if link_meta.file_type().is_symlink() {
+            return Err(refusal("cannot open credential source"));
+        }
+        let source = self
+            .credential_file
+            .canonicalize()
+            .map_err(|_| refusal("credential source is unavailable"))?;
+        if credential_path_in_forbidden_roots(
+            &source,
+            primary_repo,
+            worker_cwd,
+            scratch_tmpdir,
+            extra_write,
+        ) {
+            return Err(refusal(
+                "credential source must be outside repository and worker-writable roots",
+            ));
+        }
+        let bytes = private_credential_verified(&self.credential_file, &source)?;
         let value = crate::strict_json::parse(&bytes)
             .map_err(|_| refusal("credential source is not valid unique-key JSON"))?;
-        let mut token_count = 0usize;
-        if definition.claude {
+        let mut secrets = Vec::new();
+        let claude_value = if definition.claude {
             if value.get("credentialEnv").and_then(Value::as_str) != Some("CLAUDE_CODE_OAUTH_TOKEN")
             {
                 return Err(refusal(
                     "Claude profile requires the explicit OAuth credential file",
                 ));
             }
-            let _token = value
+            let token = value
                 .get("value")
                 .and_then(Value::as_str)
                 .filter(|s| s.len() >= 16 && *s == s.trim())
                 .ok_or_else(|| refusal("Claude OAuth token is missing or malformed"))?;
-            token_count = 1;
+            secrets.push(token.to_owned());
+            Some(token.to_owned())
         } else {
             let tokens = value
                 .get("tokens")
@@ -193,22 +251,22 @@ impl AcpWorkerProfile {
                 .ok_or_else(|| refusal("Codex OAuth access token is missing"))?;
             for key in ["access_token", "refresh_token", "id_token"] {
                 if let Some(value) = tokens.get(key) {
-                    let _token = value
+                    let token = value
                         .as_str()
                         .filter(|s| s.len() >= 16 && *s == s.trim())
                         .ok_or_else(|| refusal("Codex OAuth token is malformed"))?;
-                    token_count += 1;
+                    secrets.push(token.to_owned());
                 }
             }
-            if token_count == 0 || value.get("OPENAI_API_KEY").is_some_and(|v| !v.is_null()) {
+            if secrets.is_empty() || value.get("OPENAI_API_KEY").is_some_and(|v| !v.is_null()) {
                 return Err(refusal("Codex profile requires an existing CLI OAuth login; API-key login is not qualified"));
             }
-        }
-        Ok(CredentialSourceReceipt {
-            profile_id: self.id.clone(),
-            credential_sha256: crate::standards_waiver::sha256_hex(&bytes),
-            token_count,
-            writeback_enabled: false,
+            None
+        };
+        Ok(VerifiedCredential {
+            bytes,
+            claude_value,
+            secrets,
         })
     }
 
@@ -503,59 +561,34 @@ impl AcpWorkerProfile {
         }
         // Admission precedes even opening the provider credential source.
         let admitted_host = match definition.qualification {
-            Some(policy) => Some(admission::probe(&sandbox.inputs, policy).await?),
-            None => None,
-        };
-        let source = self
-            .credential_file
-            .canonicalize()
-            .map_err(|_| refusal("credential source is unavailable"))?;
-        if [spec.cwd.as_path(), sandbox.inputs.tmpdir.as_path(), primary]
-            .into_iter()
-            .any(|root| source.starts_with(crate::sandbox::absolutize(root)))
-        {
-            return Err(refusal(
-                "credential source must be outside repository and worker-writable roots",
-            ));
-        }
-        let bytes = private_credential(&self.credential_file)?;
-        let value = crate::strict_json::parse(&bytes)
-            .map_err(|_| refusal("credential source is not valid unique-key JSON"))?;
-        let mut secrets = Vec::new();
-        let token = if definition.claude {
-            if value.get("credentialEnv").and_then(Value::as_str) != Some("CLAUDE_CODE_OAUTH_TOKEN")
-            {
-                return Err(refusal(
-                    "Claude profile requires the explicit OAuth credential file",
-                ));
-            }
-            let token = value
-                .get("value")
-                .and_then(Value::as_str)
-                .filter(|s| s.len() >= 16 && *s == s.trim())
-                .ok_or_else(|| refusal("Claude OAuth token is missing or malformed"))?;
-            secrets.push(token.to_owned());
-            Some(token.to_owned())
-        } else {
-            let tokens = value
-                .get("tokens")
-                .and_then(Value::as_object)
-                .filter(|tokens| tokens.contains_key("access_token"))
-                .ok_or_else(|| refusal("Codex OAuth access token is missing"))?;
-            for key in ["access_token", "refresh_token", "id_token"] {
-                if let Some(value) = tokens.get(key) {
-                    let token = value
-                        .as_str()
-                        .filter(|s| s.len() >= 16 && *s == s.trim())
-                        .ok_or_else(|| refusal("Codex OAuth token is malformed"))?;
-                    secrets.push(token.to_owned());
+            Some(policy) => {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    admission::validate_ambient_docker_env()?;
+                    if let Some(host) = session_admitted_host(&spec.session_id, &container.image) {
+                        Some(host)
+                    } else {
+                        Some(admission::probe(&sandbox.inputs, policy).await?)
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    Some(admission::probe(&sandbox.inputs, policy).await?)
                 }
             }
-            if secrets.is_empty() || value.get("OPENAI_API_KEY").is_some_and(|v| !v.is_null()) {
-                return Err(refusal("Codex profile requires an existing CLI OAuth login; API-key login is not qualified"));
-            }
-            None
+            None => None,
         };
+        let VerifiedCredential {
+            bytes,
+            claude_value,
+            secrets,
+        } = self.load_verified_credential(
+            &definition,
+            primary,
+            &spec.cwd,
+            &sandbox.inputs.tmpdir,
+            &sandbox.inputs.extra_write,
+        )?;
         let scratch_base = crate::sandbox::absolutize(&crate::backend_claude::scratch_root_base());
         if [primary, spec.cwd.as_path()]
             .iter()
@@ -578,8 +611,9 @@ impl AcpWorkerProfile {
                 "private credential home must be outside the worktree",
             ));
         }
-        if let Some(token) = token {
-            spec.env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token);
+        if let Some(claude_value) = claude_value {
+            spec.env
+                .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), claude_value);
             spec.env.insert(
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
                 "1".into(),
@@ -624,6 +658,33 @@ impl AcpWorkerProfile {
     }
 }
 
+struct VerifiedCredential {
+    bytes: Vec<u8>,
+    claude_value: Option<String>,
+    secrets: Vec<String>,
+}
+
+fn credential_path_in_forbidden_roots(
+    candidate: &Path,
+    primary_repo: &Path,
+    worker_cwd: &Path,
+    scratch_tmpdir: &Path,
+    extra_write: &[PathBuf],
+) -> bool {
+    let abs_candidate = crate::sandbox::absolutize(candidate);
+    [worker_cwd, scratch_tmpdir, primary_repo]
+        .into_iter()
+        .chain(extra_write.iter().map(PathBuf::as_path))
+        .any(|root| {
+            let abs_root = crate::sandbox::absolutize(root);
+            abs_candidate.starts_with(&abs_root)
+                || candidate.starts_with(&abs_root)
+                || root.canonicalize().ok().is_some_and(|canon| {
+                    abs_candidate.starts_with(&canon) || candidate.starts_with(&canon)
+                })
+        })
+}
+
 fn same_egress(actual: &[String], expected: &[&str]) -> bool {
     let mut actual: Vec<_> = actual.iter().map(String::as_str).collect();
     let mut expected = expected.to_vec();
@@ -632,16 +693,58 @@ fn same_egress(actual: &[String], expected: &[&str]) -> bool {
     actual == expected
 }
 
+#[cfg(all(unix, test))]
 fn private_credential(path: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
+        let link_meta = std::fs::symlink_metadata(path)
+            .map_err(|_| refusal("cannot open credential source"))?;
+        if link_meta.file_type().is_symlink() {
+            return Err(refusal("cannot open credential source"));
+        }
+        let source = path
+            .canonicalize()
+            .map_err(|_| refusal("cannot open credential source"))?;
+        private_credential_verified(path, &source)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(refusal(
+            "credential file channel is unqualified on this platform",
+        ))
+    }
+}
+
+fn private_credential_verified(original_path: &Path, source: &Path) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let orig_meta = std::fs::symlink_metadata(original_path)
+            .map_err(|_| refusal("cannot open credential source"))?;
+        let source_meta = std::fs::symlink_metadata(source)
+            .map_err(|_| refusal("cannot open credential source"))?;
+        if orig_meta.file_type().is_symlink()
+            || source_meta.file_type().is_symlink()
+            || (orig_meta.dev(), orig_meta.ino()) != (source_meta.dev(), source_meta.ino())
+        {
+            return Err(refusal("cannot open credential source"));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
+            .open(source)
             .map_err(|_| refusal("cannot open credential source"))?;
         let metadata = file.metadata()?;
+        let post_orig_meta = std::fs::symlink_metadata(original_path)
+            .map_err(|_| refusal("cannot open credential source"))?;
+        if post_orig_meta.file_type().is_symlink()
+            || (metadata.dev(), metadata.ino()) != (source_meta.dev(), source_meta.ino())
+            || (metadata.dev(), metadata.ino()) != (post_orig_meta.dev(), post_orig_meta.ino())
+            || original_path.canonicalize().ok().as_deref() != Some(source)
+        {
+            return Err(refusal("cannot open credential source"));
+        }
         // SAFETY: geteuid has no preconditions and returns this process's uid.
         if !metadata.is_file()
             || metadata.uid() != unsafe { libc::geteuid() }
@@ -662,7 +765,7 @@ fn private_credential(path: &Path) -> Result<Vec<u8>> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (original_path, source);
         Err(refusal(
             "credential file channel is unqualified on this platform",
         ))
@@ -679,6 +782,62 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     options.open(path)?.write_all(bytes)?;
     Ok(())
+}
+
+fn ensure_owned_dir_rwx_nofollow(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+        if (meta.mode() & 0o700) != 0o700 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    true
+}
+
+fn unlink_credential_leaf_nofollow(parent_dir: &Path, file_name: &str) {
+    if !ensure_owned_dir_rwx_nofollow(parent_dir) {
+        return;
+    }
+    let target = parent_dir.join(file_name);
+    let Ok(meta) = std::fs::symlink_metadata(&target) else {
+        return;
+    };
+    if meta.file_type().is_dir() {
+        let _ = crate::sandbox_container::remove_owned_tree_nofollow(&target);
+        return;
+    }
+    #[cfg(unix)]
+    if meta.file_type().is_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() == unsafe { libc::geteuid() } && (meta.mode() & 0o600) != 0o600 {
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let _ = std::fs::remove_file(&target);
+}
+
+fn purge_profile_home(root: &Path) -> std::io::Result<()> {
+    // Unlink any seeded or adapter-written credential files FIRST after
+    // restoring 0700 on engine-owned parent dirs (never following symlinks),
+    // before removing the remaining home tree.
+    if ensure_owned_dir_rwx_nofollow(root) {
+        let inner = root.join("home");
+        if ensure_owned_dir_rwx_nofollow(&inner) {
+            unlink_credential_leaf_nofollow(&inner.join(".claude"), ".credentials.json");
+            unlink_credential_leaf_nofollow(&inner.join(".codex"), "auth.json");
+        }
+    }
+    crate::sandbox_container::remove_owned_tree_nofollow(root)
 }
 
 pub(crate) struct PreparedProfile {
@@ -751,10 +910,11 @@ impl PreparedProfile {
         }
         text
     }
+
     pub fn close(&mut self) -> Result<()> {
         if let Some(home) = self.home.take() {
-            let path = home.path().to_path_buf();
-            home.close().map_err(|_| {
+            let path = home.keep();
+            purge_profile_home(&path).map_err(|_| {
                 refusal(&format!(
                     "private credential home cleanup failed; inspect retained directory {}",
                     path.display()
@@ -763,6 +923,332 @@ impl PreparedProfile {
         }
         Ok(())
     }
+}
+
+impl Drop for PreparedProfile {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            let path = home.keep();
+            let _ = purge_profile_home(&path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-admission & single-mount-proof session coordination (KRZ-H2)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PendingResolutionAdmission {
+    cwd_key: PathBuf,
+    mission_key: PathBuf,
+    extra_keys: Vec<PathBuf>,
+    image: String,
+    admitted_host: Option<admission::AdmittedHost>,
+    proven_roots: Vec<PathBuf>,
+    created_at: std::time::Instant,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ActiveSessionAdmission {
+    image: String,
+    admitted_host: Option<admission::AdmittedHost>,
+    proven_roots: Vec<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static PENDING_RESOLUTIONS: std::sync::Mutex<Vec<PendingResolutionAdmission>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static ACTIVE_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, ActiveSessionAdmission>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn active_sessions(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ActiveSessionAdmission>> {
+    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PENDING_RESOLUTION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) struct SessionAdmissionGuard {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    session_id: Option<String>,
+}
+
+impl Drop for SessionAdmissionGuard {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(session_id) = self.session_id.take() {
+            if let Ok(mut map) = active_sessions().lock() {
+                map.remove(&session_id);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_admission_probe_sync(
+    inputs: &crate::sandbox::SandboxInputs,
+    policy: admission::Policy,
+) -> Result<admission::AdmittedHost> {
+    let inputs = inputs.clone();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| EngineError::Backend(format!("admission runtime failed: {e}")))?;
+                runtime.block_on(admission::probe(&inputs, policy))
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                Err(EngineError::Backend(
+                    "admission probe thread panicked".into(),
+                ))
+            })
+    })
+}
+
+/// Runs `admission::probe` BEFORE any Docker mount-proof container when `role_sandbox`
+/// selects the `-v2` `RESOURCE_IMAGE`, and records the proven canonical roots so
+/// `OwnedContainer::prepare_with_host` does not prove `declared_mount_roots` twice.
+pub(crate) fn admit_or_prove_session_mounts(
+    role_sandbox: &crate::types::SandboxConfig,
+    session_cwd: &Path,
+    mission_dir: &Path,
+    runtime: crate::sandbox_container::ContainerRuntime,
+    roots: &[PathBuf],
+) -> crate::sandbox_container::MountProof {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let image = role_sandbox
+            .image
+            .as_deref()
+            .unwrap_or(crate::sandbox_container::DEFAULT_IMAGE);
+        let extra_write: Vec<PathBuf> = role_sandbox
+            .extra_write
+            .iter()
+            .map(|raw| crate::sandbox::expand_tilde(raw))
+            .collect();
+        let (admitted_host, proof) = if image == RESOURCE_IMAGE {
+            if runtime != crate::sandbox_container::ContainerRuntime::Docker {
+                return crate::sandbox_container::MountProof::Failed(
+                    "ACP v2 requires the Docker container runtime".into(),
+                );
+            }
+            let inputs = crate::sandbox::SandboxInputs {
+                enforce: role_sandbox.enforce,
+                session_cwd: session_cwd.to_path_buf(),
+                mission_dir: mission_dir.to_path_buf(),
+                tmpdir: mission_dir.join("runs").join("contract-home"),
+                extra_write: extra_write.clone(),
+                egress: role_sandbox.egress.clone(),
+                validator_read_deny_roots: Vec::new(),
+            };
+            let admitted = match run_admission_probe_sync(&inputs, admission::POLICY) {
+                Ok(host) => host,
+                Err(err) => return crate::sandbox_container::MountProof::Failed(err.to_string()),
+            };
+            let proof = crate::sandbox_container::prove_mount_roots_with_client(
+                &admitted.client,
+                roots,
+                image,
+            );
+            (Some(admitted), proof)
+        } else {
+            (
+                None,
+                crate::sandbox_container::prove_mount_roots(runtime, roots, image),
+            )
+        };
+        if matches!(proof, crate::sandbox_container::MountProof::Proven) {
+            let mut proven_roots = Vec::new();
+            for root in roots {
+                if !root.as_os_str().is_empty() {
+                    let key = crate::sandbox_container::canonical_mount_root_key(root);
+                    if !proven_roots.contains(&key) {
+                        proven_roots.push(key);
+                    }
+                }
+            }
+            let entry = PendingResolutionAdmission {
+                cwd_key: crate::sandbox_container::canonical_mount_root_key(session_cwd),
+                mission_key: crate::sandbox_container::canonical_mount_root_key(mission_dir),
+                extra_keys: extra_write
+                    .iter()
+                    .map(|p| crate::sandbox_container::canonical_mount_root_key(p))
+                    .collect(),
+                image: image.to_string(),
+                admitted_host,
+                proven_roots,
+                created_at: std::time::Instant::now(),
+            };
+            if let Ok(mut pending) = PENDING_RESOLUTIONS.lock() {
+                pending.retain(|item| item.created_at.elapsed() < PENDING_RESOLUTION_TTL);
+                if pending.len() >= 32 {
+                    pending.remove(0);
+                }
+                pending.push(entry);
+            }
+        }
+        proof
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (session_cwd, mission_dir);
+        crate::sandbox_container::prove_mount_roots(
+            runtime,
+            roots,
+            role_sandbox
+                .image
+                .as_deref()
+                .unwrap_or(crate::sandbox_container::DEFAULT_IMAGE),
+        )
+    }
+}
+
+/// Ensures ACP `-v2` (`RESOURCE_IMAGE`) host admission runs BEFORE
+/// `ContainerEgressBoundary::start` or backend session launch, and binds any
+/// pre-proven roots from `sandbox::resolve` to `spec.session_id`.
+pub(crate) async fn prepare_session_admission(spec: &SessionSpec) -> Result<SessionAdmissionGuard> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let Some(sandbox) = spec.sandbox.as_ref() else {
+            return Ok(SessionAdmissionGuard { session_id: None });
+        };
+        if sandbox.backend != crate::sandbox::SandboxBackend::Container
+            || sandbox.inputs.enforce == SandboxEnforce::Off
+        {
+            return Ok(SessionAdmissionGuard { session_id: None });
+        }
+        let Some(container) = sandbox.container.as_ref() else {
+            return Ok(SessionAdmissionGuard { session_id: None });
+        };
+        let cwd_key =
+            crate::sandbox_container::canonical_mount_root_key(&sandbox.inputs.session_cwd);
+        let mission_key =
+            crate::sandbox_container::canonical_mount_root_key(&sandbox.inputs.mission_dir);
+        let extra_keys: Vec<PathBuf> = sandbox
+            .inputs
+            .extra_write
+            .iter()
+            .map(|p| crate::sandbox_container::canonical_mount_root_key(p))
+            .collect();
+        let consumed = PENDING_RESOLUTIONS.lock().ok().and_then(|mut pending| {
+            pending.retain(|item| item.created_at.elapsed() < PENDING_RESOLUTION_TTL);
+            let idx = pending.iter().rposition(|item| {
+                item.cwd_key == cwd_key
+                    && item.mission_key == mission_key
+                    && item.extra_keys == extra_keys
+                    && item.image == container.image
+            })?;
+            Some(pending.remove(idx))
+        });
+
+        let (admitted_host, proven_roots) = match consumed {
+            Some(entry) => (entry.admitted_host, entry.proven_roots),
+            None => (None, Vec::new()),
+        };
+
+        let admitted_host = if container.image == RESOURCE_IMAGE {
+            admission::validate_ambient_docker_env()?;
+            match admitted_host {
+                Some(host) => Some(host),
+                None => Some(admission::probe(&sandbox.inputs, admission::POLICY).await?),
+            }
+        } else {
+            admitted_host
+        };
+
+        if admitted_host.is_some() || !proven_roots.is_empty() {
+            if let Ok(mut map) = active_sessions().lock() {
+                map.insert(
+                    spec.session_id.clone(),
+                    ActiveSessionAdmission {
+                        image: container.image.clone(),
+                        admitted_host,
+                        proven_roots,
+                    },
+                );
+            }
+            return Ok(SessionAdmissionGuard {
+                session_id: Some(spec.session_id.clone()),
+            });
+        }
+        Ok(SessionAdmissionGuard { session_id: None })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = spec;
+        Ok(SessionAdmissionGuard {})
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn session_admitted_host(session_id: &str, image: &str) -> Option<admission::AdmittedHost> {
+    let map = active_sessions().lock().ok()?;
+    let entry = map.get(session_id)?;
+    (entry.image == image)
+        .then(|| entry.admitted_host.clone())
+        .flatten()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn take_session_proven_roots(
+    session_id: &str,
+    image: &str,
+    requires_admitted_host: bool,
+) -> Vec<PathBuf> {
+    let Ok(mut map) = active_sessions().lock() else {
+        return Vec::new();
+    };
+    let Some(entry) = map.get_mut(session_id) else {
+        return Vec::new();
+    };
+    if entry.image != image || (requires_admitted_host && entry.admitted_host.is_none()) {
+        return Vec::new();
+    }
+    std::mem::take(&mut entry.proven_roots)
+}
+
+/// Returns an `env_clear`d, trusted-binary `DockerEvaluator` for
+/// `ContainerEgressBoundary`, running `admission::probe` first and pinning to
+/// the Colima `unix://` socket whenever the session uses ACP `-v2` (`RESOURCE_IMAGE`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) async fn docker_client_for_egress(
+    spec: &SessionSpec,
+) -> Result<crate::gate_evaluation::subprocess::DockerEvaluator> {
+    let sandbox = spec.sandbox.as_ref().ok_or_else(|| {
+        EngineError::Backend("container egress requested without a sandbox".to_string())
+    })?;
+    let container = sandbox.container.as_ref().ok_or_else(|| {
+        EngineError::Backend("container sandbox is missing runtime/image".to_string())
+    })?;
+    if container.image == RESOURCE_IMAGE {
+        admission::validate_ambient_docker_env()?;
+        if let Some(host) = session_admitted_host(&spec.session_id, &container.image) {
+            return Ok(host.client);
+        }
+        let host = admission::probe(&sandbox.inputs, admission::POLICY).await?;
+        if let Ok(mut map) = active_sessions().lock() {
+            let entry =
+                map.entry(spec.session_id.clone())
+                    .or_insert_with(|| ActiveSessionAdmission {
+                        image: container.image.clone(),
+                        admitted_host: None,
+                        proven_roots: Vec::new(),
+                    });
+            entry.admitted_host = Some(host.clone());
+        }
+        return Ok(host.client);
+    }
+    let docker = crate::acp_container::trusted_control_program(&sandbox.inputs, "docker")?;
+    crate::gate_evaluation::subprocess::DockerEvaluator::new(&docker).map_err(EngineError::Backend)
 }
 
 #[cfg(test)]

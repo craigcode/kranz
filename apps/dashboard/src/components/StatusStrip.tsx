@@ -53,9 +53,10 @@ export function StatusStrip() {
     return () => window.clearTimeout(t);
   }, [armedAbandon]);
 
-  // Clear stale control errors when the mission (or its status) changes.
+  // Clear stale control errors and armed abandon when the mission (or its status) changes.
   useEffect(() => {
     setControlError(null);
+    setArmedAbandon(false);
   }, [missionKey, statusKey]);
 
   if (!state) return <div className="status-strip status-planning" />;

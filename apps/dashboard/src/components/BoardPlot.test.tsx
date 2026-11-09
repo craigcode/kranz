@@ -111,4 +111,58 @@ describe('BoardPlot', () => {
     fireEvent.click(screen.getByText('t-launch').closest('button')!);
     expect(onSelect).toHaveBeenCalledWith('ticket-t-launch');
   });
+
+  it('does not schedule continuous rAF loops or re-bind listeners on stationary model updates, and animates only while crafts move', () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () => makeStubContext() as unknown as RenderingContext,
+    );
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => 1);
+    const addVisSpy = vi.spyOn(document, 'addEventListener');
+    const removeVisSpy = vi.spyOn(document, 'removeEventListener');
+
+    const stationaryTickets: TicketSummary[] = [
+      {
+        slug: 't-pad',
+        priority: 1,
+        state: 'review',
+        title: 'Pad wait',
+        blockedBy: [],
+        isBlocked: false,
+        missionId: 'm-pad',
+      },
+    ];
+    const stationaryMissions: MissionSummary[] = [
+      { id: 'm-pad', status: 'planning', goal: 'Pad wait', createdAt: '2026-10-08T10:00:00Z' },
+    ];
+    const model1 = buildFleetModel(stationaryTickets, stationaryMissions, new Map(), NOW_MS);
+
+    const { rerender, unmount } = render(
+      <BoardPlot model={model1} selectedKey={null} onSelectCraft={() => {}} />,
+    );
+
+    expect(rafSpy).not.toHaveBeenCalled();
+    const visBindCount = addVisSpy.mock.calls.filter(([t]) => t === 'visibilitychange').length;
+    expect(visBindCount).toBe(1);
+
+    // Simulate 4 Hz WS/poll updates on stationary fleet + selection change:
+    // zero rAF loops scheduled and visibilitychange listener is NOT torn down/re-added.
+    const model2 = buildFleetModel(stationaryTickets, stationaryMissions, new Map(), NOW_MS + 250, model1);
+    rerender(<BoardPlot model={model2} selectedKey="ticket-t-pad" onSelectCraft={() => {}} />);
+
+    expect(rafSpy).not.toHaveBeenCalled();
+    expect(addVisSpy.mock.calls.filter(([t]) => t === 'visibilitychange').length).toBe(1);
+    expect(removeVisSpy.mock.calls.filter(([t]) => t === 'visibilitychange').length).toBe(0);
+
+    // Add a running mission -> animation loop starts via rAF
+    const movingMissions: MissionSummary[] = [
+      ...stationaryMissions,
+      { id: 'm-run', status: 'running', goal: 'In orbit', createdAt: '2026-10-08T10:05:00Z' },
+    ];
+    const movingModel = buildFleetModel(stationaryTickets, movingMissions, new Map(), NOW_MS + 500, model2);
+    rerender(<BoardPlot model={movingModel} selectedKey={null} onSelectCraft={() => {}} />);
+    expect(rafSpy).toHaveBeenCalledTimes(1);
+
+    unmount();
+    expect(removeVisSpy.mock.calls.filter(([t]) => t === 'visibilitychange').length).toBe(1);
+  });
 });

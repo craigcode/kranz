@@ -4,11 +4,12 @@
 // selected. Every ticket is a row; every mission with no originating ticket
 // ("kranz new") is also a row, so nothing in progress is hidden.
 
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { useKranzStore } from '../lib/store';
 import { RunQueueButton } from './RunQueueButton';
 import { api } from '../lib/api';
 import { renderMarkdown } from '../lib/markdown';
+import { visible } from '../lib/presentation';
 import { buildRows, type Row } from '../lib/pipelineRows';
 import { pipelineStage, primaryAction, parseEstimateFromPlanMd } from '../lib/pipelineStage';
 import { LENSES, filterLensRows, landedCount, type Lens } from '../lib/lensFilter';
@@ -43,12 +44,17 @@ function ReviewablePlan({ missionId }: { missionId: string }) {
   }, [missionId]);
 
   if (error !== null) {
-    return <div className="picker-error pipeline-inline-error">Could not load plan: {error}</div>;
+    return (
+      <div className="picker-error pipeline-inline-error">
+        Could not load plan: {visible(error)}
+      </div>
+    );
   }
   if (markdown === null) {
     return <div className="dim pipeline-inline-loading">Loading plan…</div>;
   }
 
+  const normalizedMarkdown = visible(markdown.replace(/\r\n/g, '\n'));
   const estimate = parseEstimateFromPlanMd(markdown);
 
   return (
@@ -59,7 +65,7 @@ function ReviewablePlan({ missionId }: { missionId: string }) {
           {estimate.expectedUsd.toFixed(2)})
         </div>
       )}
-      {renderMarkdown(markdown)}
+      {renderMarkdown(normalizedMarkdown)}
     </div>
   );
 }
@@ -77,7 +83,8 @@ export function ReviewableTicketRow({
   const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
   const action = primaryAction('reviewable');
   const busy = r.slug !== undefined && ticketBusySlug === r.slug;
-  const title = r.isBlocked ? `blocked by ${r.blockedBy.join(', ')}` : 'queue for run';
+  const blockedSummary = visible(r.blockedBy.join(', '));
+  const title = r.isBlocked ? `blocked by ${blockedSummary}` : 'queue for run';
   const showBlockedBadge = r.blockedBy.length > 0 && r.isBlocked;
   const missionId =
     r.item.kind === 'mission' || r.item.mission !== undefined ? r.missionId : undefined;
@@ -92,15 +99,15 @@ export function ReviewableTicketRow({
           </span>
           {missionId !== undefined ? (
             <a className="mono picker-id" href={missionHash(missionId)}>
-              {r.id}
+              {visible(r.id)}
             </a>
           ) : (
-            <span className="mono picker-id">{r.id}</span>
+            <span className="mono picker-id">{visible(r.id)}</span>
           )}
-          <span className="picker-goal">{r.title}</span>
+          <span className="picker-goal">{visible(r.title)}</span>
           {showBlockedBadge && (
-            <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
-              blocked by {r.blockedBy.join(', ')}
+            <span className="ticket-blocker-badge" title={`blocked by ${blockedSummary}`}>
+              blocked by {blockedSummary}
             </span>
           )}
         </div>
@@ -158,7 +165,9 @@ function DeliveredReport({ missionId }: { missionId: string }) {
 
   if (error !== null) {
     return (
-      <div className="picker-error pipeline-inline-error">Could not load report: {error}</div>
+      <div className="picker-error pipeline-inline-error">
+        Could not load report: {visible(error)}
+      </div>
     );
   }
   if (report === null || diffStat === null) {
@@ -167,8 +176,8 @@ function DeliveredReport({ missionId }: { missionId: string }) {
 
   return (
     <div className="pipeline-inline-panel pipeline-inline-report">
-      <pre className="pipeline-diff-stat">{diffStat}</pre>
-      {renderMarkdown(report)}
+      <pre className="pipeline-diff-stat">{visible(diffStat.replace(/\r\n/g, '\n'))}</pre>
+      {renderMarkdown(visible(report.replace(/\r\n/g, '\n')))}
     </div>
   );
 }
@@ -298,16 +307,32 @@ export function PipelineView({
   const approveTicket = useKranzStore((s) => s.approveTicket);
   const ticketBusySlug = useKranzStore((s) => s.ticketBusySlug);
   const [lens, setLens] = useState<Lens>(initialLens);
+  const pendingExitDemoLensRef = useRef<Lens | null>(null);
+  const isBoard = lens === 'board';
 
   useEffect(() => {
-    if (boardDemo || initialLens === 'board') return;
+    if (boardDemo || isBoard) return;
     void loadTickets();
     void loadMissions();
-  }, [boardDemo, initialLens, loadTickets, loadMissions]);
+  }, [boardDemo, isBoard, loadTickets, loadMissions]);
 
   useEffect(() => {
+    if (!boardDemo && pendingExitDemoLensRef.current !== null) {
+      setLens(pendingExitDemoLensRef.current);
+      pendingExitDemoLensRef.current = null;
+      return;
+    }
     setLens(initialLens);
-  }, [initialLens]);
+  }, [initialLens, boardDemo]);
+
+  const selectLens = (next: Lens) => {
+    if (boardDemo && next !== 'board') {
+      pendingExitDemoLensRef.current = next;
+      const suffix = next === 'actionable' && repoId !== null ? '' : next;
+      window.location.hash = repoHash(suffix);
+    }
+    setLens(next);
+  };
 
   const rows = buildRows(tickets, missions);
   const visibleRows = filterLensRows(rows, lens);
@@ -443,12 +468,12 @@ export function PipelineView({
     if (missionId !== undefined) {
       return (
         <a className="mono picker-id" href={missionHash(missionId)}>
-          {row.id}
+          {visible(row.id)}
         </a>
       );
     }
 
-    return <span className="mono picker-id">{row.id}</span>;
+    return <span className="mono picker-id">{visible(row.id)}</span>;
   };
 
   const row = (r: Row) => {
@@ -462,6 +487,7 @@ export function PipelineView({
     }
     const showBlockedBadge =
       (stage === 'captured' || stage === 'reviewable') && r.blockedBy.length > 0 && r.isBlocked;
+    const blockedSummary = visible(r.blockedBy.join(', '));
 
     return (
       <li key={r.key} className="picker-item picker-item--stacked">
@@ -472,10 +498,10 @@ export function PipelineView({
               {stage}
             </span>
             {renderRowId(r)}
-            <span className="picker-goal">{r.title}</span>
+            <span className="picker-goal">{visible(r.title)}</span>
             {showBlockedBadge && (
-              <span className="ticket-blocker-badge" title={`blocked by ${r.blockedBy.join(', ')}`}>
-                blocked by {r.blockedBy.join(', ')}
+              <span className="ticket-blocker-badge" title={`blocked by ${blockedSummary}`}>
+                blocked by {blockedSummary}
               </span>
             )}
             {stage === 'delivered' && (
@@ -497,8 +523,6 @@ export function PipelineView({
       </li>
     );
   };
-
-  const isBoard = lens === 'board';
 
   return (
     <div className={'picker' + (isBoard ? ' picker--board' : '')}>
@@ -560,7 +584,7 @@ export function PipelineView({
               type="button"
               className={'lens-tab' + (lens === l.id ? ' lens-tab--active' : '')}
               aria-pressed={lens === l.id}
-              onClick={() => setLens(l.id)}
+              onClick={() => selectLens(l.id)}
             >
               {l.label}
             </button>
@@ -577,7 +601,7 @@ export function PipelineView({
               <button
                 type="button"
                 className="lens-landed-hint"
-                onClick={() => setLens('all')}
+                onClick={() => selectLens('all')}
               >
                 Landed ({landedCount(rows)}) — view all
               </button>
@@ -588,9 +612,13 @@ export function PipelineView({
               </div>
             )}
             <ul className="picker-list">{visibleRows.map(row)}</ul>
-            <SignalsPanel />
-            <FlightSurgeonPanel />
-            <OutcomesPanel />
+            {!boardDemo && (
+              <>
+                <SignalsPanel />
+                <FlightSurgeonPanel />
+                <OutcomesPanel />
+              </>
+            )}
           </>
         )}
       </div>

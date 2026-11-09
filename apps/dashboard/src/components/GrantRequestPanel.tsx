@@ -11,6 +11,7 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
 import { pendingGrant } from '../lib/pendingAsks';
+import { hasAmbiguous, visible } from '../lib/presentation';
 import { useKranzStore } from '../lib/store';
 
 export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
@@ -23,6 +24,8 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
 
   if (mission === null || pending === null) return null;
 
+  const ambiguous = hasAmbiguous(pending);
+
   const blurb =
     pending.kind === 'touch-path'
       ? 'A worker wrote a path outside the mission’s touch-set:'
@@ -33,6 +36,7 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
           : 'A validator is blocked on a command outside its allow-set:';
 
   const decide = async (kind: 'approve' | 'deny') => {
+    if (kind === 'approve' && ambiguous) return;
     setBusy(kind);
     setError(null);
     try {
@@ -53,16 +57,21 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
     <section className="panel panel-grant">
       <div className="section-label">
         Grant request
-        <span className="section-count mono">{pending.milestoneId}</span>
+        <span className="section-count mono">{visible(pending.milestoneId)}</span>
       </div>
       <div className="revision-body">
         <div className="dim">{blurb}</div>
-        <pre className="revision-diff">{pending.command}</pre>
+        <pre className="revision-diff">{visible(pending.command)}</pre>
+        {ambiguous && (
+          <p role="status">
+            Blocked: invisible or control characters make this request unsafe to approve.
+          </p>
+        )}
         <div className="revision-actions">
           <button
             type="button"
             className="strip-btn"
-            disabled={busy !== null}
+            disabled={busy !== null || ambiguous}
             onClick={() => void decide('approve')}
           >
             {busy === 'approve' ? 'Approving...' : 'Approve grant'}
@@ -79,7 +88,7 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
       </div>
       {error !== null && (
         <div className="picker-error revision-error" role="alert">
-          {error}
+          {visible(error)}
         </div>
       )}
     </section>

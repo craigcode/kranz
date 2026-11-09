@@ -12,6 +12,7 @@ pub(crate) struct Output {
     pub stderr: Vec<u8>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     program: &Path,
@@ -24,8 +25,30 @@ pub(crate) async fn run(
     stderr_cap: usize,
     cancelled: &AtomicBool,
 ) -> Result<Output, String> {
+    run_with_notify(
+        program, args, env, input, wall, write, stdout_cap, stderr_cap, cancelled, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_notify(
+    program: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+    input: &[u8],
+    wall: Duration,
+    write: Duration,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    cancelled: &AtomicBool,
+    cancel_notify: Option<&tokio::sync::Notify>,
+) -> Result<Output, String> {
     if cancelled.load(Ordering::Acquire) {
         return Err("evaluation cancelled before spawn".into());
+    }
+    if wall.is_zero() {
+        return Err("evaluation process timed out".into());
     }
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).env_clear();
@@ -73,8 +96,23 @@ pub(crate) async fn run(
     let leader = super::control_leader_exited(child.0.id().ok_or("unowned control process")?);
     tokio::pin!(leader);
     let cancellation = async {
-        while !cancelled.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(notify) = cancel_notify {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::select! {
+                    () = &mut notified => {}
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     };
     let mut captured = None;
@@ -187,5 +225,63 @@ mod tests {
             .await;
             assert!(result.err().unwrap().contains("byte limit"));
         }
+    }
+
+    #[tokio::test]
+    async fn gate_subprocess_v1_io_zero_wall_times_out_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("must-not-exist");
+        let env = HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+        let result = run(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                format!("printf spawned > '{}'", sentinel.display()),
+            ],
+            &env,
+            b"",
+            Duration::ZERO,
+            Duration::from_secs(1),
+            64,
+            64,
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(
+            result.err().as_deref(),
+            Some("evaluation process timed out")
+        );
+        assert!(
+            !sentinel.exists(),
+            "zero wall timeout must reject before cmd.spawn()"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_subprocess_v1_io_notify_wakes_cancellation_immediately() {
+        let env = HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel_clone = cancel.clone();
+        let notify_clone = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            cancel_clone.store(true, Ordering::Release);
+            notify_clone.notify_waiters();
+        });
+        let result = run_with_notify(
+            Path::new("/bin/sh"),
+            &["-c".into(), "sleep 60".into()],
+            &env,
+            b"",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            64,
+            64,
+            &cancel,
+            Some(&notify),
+        )
+        .await;
+        assert_eq!(result.err().as_deref(), Some("evaluation cancelled"));
     }
 }
