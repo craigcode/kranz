@@ -22,7 +22,14 @@ describe('LENSES', () => {
       { id: 'backlog', label: 'Backlog' },
       { id: 'missions', label: 'Missions' },
       { id: 'all', label: 'All' },
+      { id: 'board', label: 'Board' },
     ]);
+  });
+
+  it('trajectory board lens is registered and passes rows through unfiltered', () => {
+    const rows = [ticketRow('new'), missionRow('running'), missionRow('abandoned')];
+    expect(LENSES.some((l) => l.id === 'board' && l.label === 'Board')).toBe(true);
+    expect(filterLensRows(rows, 'board')).toEqual(rows);
   });
 });
 

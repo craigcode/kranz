@@ -13,17 +13,18 @@
 
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { pendingQuestions } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
 import type { PendingQuestion } from '../lib/types';
 
-export function QuestionRequestPanel() {
+export function QuestionRequestPanel({ onActed }: { onActed?: () => void } = {}) {
   const state = useKranzStore((s) => s.state);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [freeText, setFreeText] = useState<Record<string, string>>({});
 
   const mission = state?.mission ?? null;
-  const questions = state?.pendingQuestions ?? [];
+  const questions = pendingQuestions(state);
 
   if (mission === null || questions.length === 0) return null;
 
@@ -33,6 +34,7 @@ export function QuestionRequestPanel() {
     try {
       await api.answerQuestion(mission.id, question.questionId, text, option);
       setFreeText((prev) => ({ ...prev, [question.questionId]: '' }));
+      onActed?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

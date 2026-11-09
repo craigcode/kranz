@@ -5,6 +5,20 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-08
+
+- Added the Trajectory Board lens (`#/board` and `#/r/<repo>/board`) to the
+  Mission Control dashboard: a figure-8 Apollo flight-plan 2D canvas plot,
+  shared pending-ask predicates across mission panels and the fleet model, a
+  deterministic scripted demo route (`#/board/demo`), and act-in-place beside
+  the board reusing existing ask-owner panels without new mutation call sites.
+- Retained deterministic review-effort pilot cases (`review_effort_pilot`
+  example, verification harness, and execution receipts) pending human
+  observations.
+- Marked completed ACP qualification milestones on the roadmap and updated
+  workspace, Tauri, dashboard, Even G2, and GitHub Actions dependencies with
+  refreshed third-party license notices.
+
 ## 0.4.4 - 2026-11-07
 
 - Serve the embedded dashboard by default. Filesystem dashboards require an

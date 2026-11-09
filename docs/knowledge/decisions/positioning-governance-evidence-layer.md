@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-09
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md

@@ -1,12 +1,11 @@
+import { pendingGateReviews } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
 import { useNow } from '../lib/useNow';
 
 export function GateReviewPanel() {
-  const records = useKranzStore((s) => s.state?.gateEvaluations);
+  const state = useKranzStore((s) => s.state);
   const now = useNow();
-  const pending = Object.values(records ?? {})
-    .filter((r) => !r.closed && !r.consumed && r.resolution && r.resolution.disposition !== 'proceed')
-    .sort((a, b) => a.requestedSeq - b.requestedSeq);
+  const pending = pendingGateReviews(state);
   return <>{pending.map((record) => {
     const request = record.requested.request.params;
     const outcome = record.finished?.outcome;

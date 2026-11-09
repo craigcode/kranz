@@ -90,7 +90,7 @@ export default function App() {
   if (route.view === 'pipeline') {
     return (
       <>
-        <PipelineView initialLens={route.lens} />
+        <PipelineView initialLens={route.lens} boardDemo={route.boardDemo === true} />
         <TokenPrompt />
       </>
     );

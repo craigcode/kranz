@@ -2,7 +2,7 @@ import type { Lens } from './lensFilter';
 
 export type Route =
   | { view: 'projects'; repoId: null }
-  | { view: 'pipeline'; repoId: string | null; lens?: Lens }
+  | { view: 'pipeline'; repoId: string | null; lens?: Lens; boardDemo?: boolean }
   | { view: 'new'; repoId: string | null }
   | { view: 'new-ticket'; repoId: string | null }
   | { view: 'mission'; repoId: string | null; id: string }
@@ -23,6 +23,8 @@ function parseRepoRoute(repoId: string, rest: string): Route {
   if (rest === '/new') return { view: 'new', repoId };
   if (rest === '/new-ticket') return { view: 'new-ticket', repoId };
   if (rest === '/backlog') return { view: 'pipeline', repoId, lens: 'backlog' };
+  if (rest === '/board') return { view: 'pipeline', repoId, lens: 'board' };
+  if (rest === '/board/demo') return { view: 'pipeline', repoId, lens: 'board', boardDemo: true };
   const mission = /^\/m\/(.+)$/.exec(rest);
   if (mission) return { view: 'mission', repoId, id: decodeSegment(mission[1]) };
   const ticket = /^\/backlog\/(.+)$/.exec(rest);
@@ -40,6 +42,8 @@ export function parseHash(hash = window.location.hash): Route {
   const mission = /^#\/m\/(.+)$/.exec(hash);
   if (mission) return { view: 'mission', repoId: null, id: decodeSegment(mission[1]) };
   if (hash === '#/backlog') return { view: 'pipeline', repoId: null, lens: 'backlog' };
+  if (hash === '#/board') return { view: 'pipeline', repoId: null, lens: 'board' };
+  if (hash === '#/board/demo') return { view: 'pipeline', repoId: null, lens: 'board', boardDemo: true };
   const ticket = /^#\/backlog\/(.+)$/.exec(hash);
   if (ticket) return { view: 'ticket', repoId: null, slug: decodeSegment(ticket[1]) };
   if (hash !== '' && hash !== '#/' && hash !== '#') return { view: 'pipeline', repoId: null };
