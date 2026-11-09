@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "kranz"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-acp"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-engine"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-server"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "kranz-slack"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
