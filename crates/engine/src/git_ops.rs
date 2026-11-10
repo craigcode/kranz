@@ -305,6 +305,9 @@ fn clear_local_git_env(cmd: &mut Command, user_config: UserConfig) {
             cmd.env(key, value);
         }
     }
+    // `refs/replace/*` is worker-writable like every other ref; never let a
+    // replacement object stand in for a commit the engine resolved.
+    cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
     if user_config == UserConfig::Visible {
         for key in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME"] {
             if let Some(value) = std::env::var_os(key) {
@@ -871,6 +874,34 @@ impl GitRepo {
     pub fn current_branch(&self) -> Result<String> {
         Ok(self
             .run(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string())
+    }
+
+    /// Commit a LOCAL BRANCH points at, resolved as `refs/heads/<name>` and
+    /// never by short name. `git rev-parse main` prefers `refs/tags/main`
+    /// over the branch, and refs are worker-writable, so a short-name lookup
+    /// lets a tag stand in for the base or mission branch (2026-11-10 audit
+    /// H3). Use this wherever a branch is meant; [`Self::rev_parse`] is for
+    /// SHAs and expressions.
+    ///
+    /// `current_branch` reports `heads/<name>` when a same-named tag exists
+    /// and `HEAD` when detached, so both recorded spellings are accepted.
+    pub fn branch_tip(&self, name: &str) -> Result<String> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing branch lookup of flag-shaped name {name:?}"
+            )));
+        }
+        let spec = match name {
+            "HEAD" => "HEAD^{commit}".to_string(),
+            _ => format!(
+                "refs/heads/{}^{{commit}}",
+                name.strip_prefix("heads/").unwrap_or(name)
+            ),
+        };
+        Ok(self
+            .run(&["rev-parse", "--verify", "--end-of-options", &spec])?
             .trim()
             .to_string())
     }

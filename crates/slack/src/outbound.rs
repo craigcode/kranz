@@ -208,7 +208,7 @@ fn mission_diff_stat(repo_root: &Path, mission: &kranz_engine::types::Mission) -
     if !repo.branch_exists(&mission.mission_branch).ok()? {
         return None;
     }
-    let tip = repo.rev_parse(&mission.mission_branch).ok()?;
+    let tip = repo.branch_tip(&mission.mission_branch).ok()?;
     repo.diff_stat(base_sha, &tip).ok()
 }
 

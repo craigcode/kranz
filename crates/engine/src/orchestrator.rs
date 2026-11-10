@@ -1241,7 +1241,7 @@ impl MissionEngine {
         // otherwise a concurrent base advance can pin policy from one commit,
         // create the mission branch from another, and record a third SHA.
         let base = self.state.mission.base_branch.clone();
-        let base_sha = self.repo.rev_parse(&base)?;
+        let base_sha = self.repo.branch_tip(&base)?;
         let review_contract = crate::review_artifact::parse_from_goal(&self.state.mission.goal)?;
         if let Some(contract) = &review_contract {
             crate::review_artifact::validate_source(&self.repo, &base_sha, contract)?;
@@ -1268,7 +1268,7 @@ impl MissionEngine {
         }
         let branch = self.state.mission.mission_branch.clone();
         if self.repo.branch_exists(&branch)? {
-            let existing_tip = self.repo.rev_parse(&branch)?;
+            let existing_tip = self.repo.branch_tip(&branch)?;
             if existing_tip != base_sha {
                 return Err(EngineError::InvalidState(format!(
                     "mission branch `{branch}` already exists at {existing_tip}, not the pinned \
@@ -4028,7 +4028,9 @@ impl MissionEngine {
             let Some(run) = run else { continue };
             // Read-only probe on the shared refs (worktree isolation
             // untouched): the tree hash anchors the verdict to exact bytes.
-            let tree = self.repo.rev_parse(&format!("{}^{{tree}}", ws.branch))?;
+            let tree = self
+                .repo
+                .rev_parse(&format!("refs/heads/{}^{{tree}}", ws.branch))?;
             candidates.push(DivergenceCandidate {
                 run_id: run.id.clone(),
                 branch: ws.branch.clone(),

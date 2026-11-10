@@ -394,8 +394,8 @@ where
 
     // Resolve moving refs once. Every read, merge, and final advance below
     // uses these SHAs so a late branch update cannot bypass validation.
-    let live_base_sha = repo.rev_parse(base_branch)?;
-    let mission_tip_sha = repo.rev_parse(mission_branch)?;
+    let live_base_sha = repo.branch_tip(base_branch)?;
+    let mission_tip_sha = repo.branch_tip(mission_branch)?;
 
     let diff = repo.diff_full(base_sha, &mission_tip_sha)?;
     let allowlist = repo
@@ -423,7 +423,7 @@ where
         Err(detail) => return Ok(MergeReport::GateConfigInvalid { detail }),
     };
 
-    let stale_base = stale_base_warning(repo, base_branch, base_sha)?;
+    let stale_base = stale_base_warning(repo, base_branch, &live_base_sha, base_sha)?;
     let merge_message = metadata
         .as_ref()
         .map(|metadata| with_kranz_trailers(&format!("Merge {mission_branch}"), metadata));
@@ -644,7 +644,7 @@ where
 
     // Production holds the repo-wide busy guard throughout this call.
     // Re-check anyway so external/manual movement fails closed.
-    let current_base = repo.rev_parse(base_branch)?;
+    let current_base = repo.branch_tip(base_branch)?;
     if current_base != live_base_sha {
         return Ok(MergeReport::RefusedPreMerge {
             detail: format!(
@@ -761,9 +761,10 @@ fn remove_stale_scratch_worktrees(repo: &GitRepo) {
 fn stale_base_warning(
     repo: &GitRepo,
     base_branch: &str,
+    live_base_sha: &str,
     base_sha: &str,
 ) -> Result<Option<StaleBaseWarning>> {
-    let merge_commits_since_base = repo.merge_commit_count(base_sha, base_branch)?;
+    let merge_commits_since_base = repo.merge_commit_count(base_sha, live_base_sha)?;
     if merge_commits_since_base < STALE_BASE_MERGE_THRESHOLD {
         return Ok(None);
     }

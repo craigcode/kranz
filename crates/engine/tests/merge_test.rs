@@ -417,6 +417,76 @@ fn merge_commit_carries_parseable_kranz_trailers() {
     }
 }
 
+/// 2026-11-10 audit H3: refs are worker-writable and `git rev-parse main`
+/// prefers `refs/tags/main` over the branch. Tags named like the base and
+/// mission branches must not redirect the merge: gates come from the real
+/// base, and only the real mission branch lands.
+#[test]
+fn tags_named_like_the_branches_do_not_redirect_the_merge() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+    let real_mission_tip = raw_git(dir.path(), &["rev-parse", "refs/heads/kranz/mission-x"]);
+
+    // A commit carrying a weakened gate suite and unreviewed content, hung on
+    // tags that shadow both branch names.
+    repo.create_branch("side", Some(&seed)).unwrap();
+    repo.checkout("side").unwrap();
+    write(
+        &dir,
+        MERGE_GATES_PATH,
+        "{\"gates\":[{\"command\":\"true\"}]}\n",
+    );
+    write(&dir, "smuggled.txt", "never reviewed\n");
+    let evil = repo.add_all_and_commit("shadow commit").unwrap();
+    raw_git(dir.path(), &["checkout", "refs/heads/main"]);
+    raw_git(dir.path(), &["checkout", "-B", "main"]);
+    raw_git(dir.path(), &["tag", "main", &evil]);
+    raw_git(dir.path(), &["tag", "kranz/mission-x", &evil]);
+    assert_eq!(
+        raw_git(dir.path(), &["rev-parse", "main"]).trim(),
+        evil,
+        "precondition: the short name resolves to the tag"
+    );
+    assert_eq!(repo.branch_tip("main").unwrap(), seed);
+    assert_eq!(repo.branch_tip("heads/main").unwrap(), seed);
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |cmd: &str, _cwd: &Path| {
+            seen.lock().unwrap().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["cargo fmt --all --check".to_string()],
+        "gates are read from the real base branch"
+    );
+    let parents = raw_git(
+        dir.path(),
+        &["rev-list", "--parents", "-n", "1", "refs/heads/main"],
+    );
+    assert!(
+        parents.contains(&seed) && parents.contains(real_mission_tip.trim()),
+        "{parents}"
+    );
+    assert!(!parents.contains(&evil), "{parents}");
+    assert!(!dir.path().join("smuggled.txt").exists());
+    assert!(dir.path().join("src/lib.rs").exists());
+}
+
 #[test]
 fn stale_base_warning_counts_sibling_merges_since_mission_base() {
     if !setup() {
