@@ -89,6 +89,7 @@ pub mod sandbox_container;
 pub mod sandbox_windows;
 pub mod scrub;
 pub mod sgian;
+pub mod sgian_terminal;
 pub mod signals;
 pub mod standards_attestation;
 pub mod standards_coverage;

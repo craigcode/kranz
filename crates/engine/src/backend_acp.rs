@@ -82,7 +82,6 @@ use std::sync::{Arc, Mutex};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod terminals;
 
 #[derive(Debug)]
@@ -144,7 +143,6 @@ enum Input {
     PermissionAnswer(crate::live_permission::Answer),
     PermissionExpired,
     Terminal(TerminalCompletion),
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     TerminalReceipt(Value),
 }
 
@@ -480,6 +478,7 @@ pub struct AcpBackend {
     program: PathBuf,
     args: Vec<String>,
     profile: Option<crate::acp_worker::AcpWorkerProfile>,
+    sgian_terminals: Option<crate::sgian::SgianTerminalConfig>,
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     resource_fixture: Option<crate::acp_worker::Resources>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -494,6 +493,7 @@ impl AcpBackend {
             program: program.into(),
             args,
             profile: None,
+            sgian_terminals: None,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             resource_fixture: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -515,6 +515,7 @@ impl AcpBackend {
                 program: definition.program.into(),
                 args: definition.args.iter().map(|s| (*s).to_owned()).collect(),
                 profile: Some((**profile).clone()),
+                sgian_terminals: None,
                 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
                 resource_fixture: None,
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -526,6 +527,14 @@ impl AcpBackend {
             })?;
             Ok(Self::new(command, cfg.acp_args.clone()))
         }
+    }
+
+    /// Explicitly opt an uncontained host ACP session (`SandboxEnforce::Off`)
+    /// into Sgian execution-grant terminals (`docs/design/execution-grants.md`).
+    /// Never admitted when `spec.sandbox.is_some()` or with a contained profile.
+    pub fn with_sgian_terminals(mut self, config: crate::sgian::SgianTerminalConfig) -> Self {
+        self.sgian_terminals = Some(config);
+        self
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -607,6 +616,21 @@ impl AgentBackend for AcpBackend {
                     .to_string(),
             ));
         }
+        if self.sgian_terminals.is_some() {
+            if spec.sandbox.is_some() || self.profile.is_some() {
+                return Err(EngineError::Backend(
+                    "sgian terminal provider is only permitted for uncontained native ACP sessions"
+                        .into(),
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if self.terminal_fixture_run.is_some() {
+                return Err(EngineError::Backend(
+                    "sgian terminal provider cannot be combined with contained terminal fixture"
+                        .into(),
+                ));
+            }
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.terminal_fixture_run.is_some() && (!container_requested || self.profile.is_some()) {
             return Err(EngineError::Backend(
@@ -642,8 +666,11 @@ impl AgentBackend for AcpBackend {
         let terminals = terminals::Broker::prepare(
             self.terminal_fixture_run.clone(),
             container.as_ref(),
+            self.sgian_terminals.as_ref(),
             &spec,
         )?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let terminals = terminals::Broker::prepare(self.sgian_terminals.as_ref(), &spec)?;
         command
             .current_dir(&spec.cwd)
             // ACP is bidirectional: stdin carries the client's requests.
@@ -713,17 +740,11 @@ impl AgentBackend for AcpBackend {
             crate::live_permission::PermissionResponder::channel();
         let mut session = AcpSession {
             session_id: spec.session_id.clone(),
-            protocol: {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if terminals.admitted() {
-                    Client::with_terminal_support()
-                } else {
-                    Client::new()
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            protocol: if terminals.admitted() {
+                Client::with_terminal_support()
+            } else {
                 Client::new()
             },
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
             terminals,
             model,
             spec,
@@ -816,12 +837,10 @@ impl AcpBackend {
 struct PendingPermission {
     proposal: crate::live_permission::Proposal,
     expires_at: tokio::time::Instant,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     terminal: Option<kranz_acp::terminal::Create>,
 }
 
 pub struct AcpSession {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     terminals: terminals::Broker,
     session_id: String,
     protocol: Client,
@@ -968,7 +987,6 @@ impl AcpSession {
             .accept_session(request.id, &new_result)
             .map_err(|e| EngineError::Backend(e.to_string()))?
             .to_owned();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.terminals.bind(&self.session_id, &acp_session_id);
         self.handshake_complete = true;
         let reported_model = peer_reported_model(&new_result).map(str::to_owned);
@@ -1090,14 +1108,7 @@ impl AcpSession {
             }
             let can_answer = !self.lines.has_partial_line();
             let read = {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 let terminal = self.terminals.next();
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                let terminal = async {
-                    std::future::pending::<Result<TerminalCompletion>>()
-                        .await
-                        .map(Input::Terminal)
-                };
                 let line = self.lines.next_line();
                 tokio::pin!(line);
                 let read = if let Some(deadline) = self.drain_deadline {
@@ -1197,7 +1208,6 @@ impl AcpSession {
                 ));
             }
             Input::Terminal(completion) => return self.complete_terminal(completion).await,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Input::TerminalReceipt(raw) => {
                 self.terminals.observe_receipt(&raw);
                 self.queue.push_back(AgentEvent::Other { raw });
@@ -1223,7 +1233,6 @@ impl AcpSession {
                 params,
                 raw,
             } => {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if method.starts_with("terminal/") && self.terminals.provider.is_some() {
                     return self.handle_terminal(id, &method, params).await;
                 }
@@ -1547,15 +1556,12 @@ impl AcpSession {
             }
         };
         let peer_id = serde_json::to_string(&id)?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.terminals.in_flight(&peer_id) {
             return Err(EngineError::Backend(
                 "duplicate in-flight ACP request".into(),
             ));
         }
-        let pending_count = self.pending_permissions.len();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let pending_count = pending_count + self.terminals.pending();
+        let pending_count = self.pending_permissions.len() + self.terminals.pending();
         if pending_count >= crate::live_permission::MAX_PENDING
             || self.seen_permission_ids.len() >= 1024
             || !self.seen_permission_ids.insert(peer_id)
@@ -1611,7 +1617,6 @@ impl AcpSession {
             proposal.id.clone(),
             PendingPermission {
                 proposal: proposal.clone(),
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 terminal: None,
                 expires_at: tokio::time::Instant::now()
                     + std::time::Duration::from_secs(
@@ -1654,7 +1659,6 @@ impl AcpSession {
             .pending_permissions
             .remove(&answer.proposal.id)
             .expect("checked above");
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(action) = pending.terminal {
             return self
                 .answer_terminal(pending.proposal, action, answer.allow)
@@ -1702,14 +1706,9 @@ impl AcpSession {
             response["error"]["data"] = completion.receipt.clone();
         }
         let sent = self.write_message(response).await;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let emit_receipt = {
-            self.terminals
-                .completed(&serde_json::to_string(&completion.id)?);
-            self.terminals.record_completion(&completion.result)
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let emit_receipt = true;
+        self.terminals
+            .completed(&serde_json::to_string(&completion.id)?);
+        let emit_receipt = self.terminals.record_completion(&completion.result);
         if let Some(id) = completion.permission_id {
             let delivery = if sent.is_ok() {
                 crate::live_permission::Delivery::Sent
@@ -1818,7 +1817,6 @@ impl AcpSession {
     /// Kill only while the leader is still owned. Never signal a cached PID
     /// after reaping; the same-group cleanup precedes Child::wait.
     async fn kill_child(&mut self) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.terminals.stop();
         self.stdin.take();
         if self.child_status.is_none() {
@@ -1839,10 +1837,13 @@ impl AcpSession {
                 tracing::error!(%error, "ACP cleanup requires recovery");
             }
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(provider) = self.terminals.provider.clone() {
             if !self.terminals.cleanup_recorded {
                 self.terminals.cleanup_recorded = true;
+                if provider.is_sgian() && !provider.abort_cleanup().await {
+                    self.cleanup_failure
+                        .get_or_insert("sgian terminal cleanup unconfirmed");
+                }
                 if let Ok(receipts) = provider.drain_receipts() {
                     for raw in receipts {
                         self.terminals.observe_receipt(&raw);
@@ -1851,7 +1852,7 @@ impl AcpSession {
                 }
                 self.queue.push_back(AgentEvent::Other {
                     raw: json!({"terminalNamespaceCleanup": {
-                        "scope":provider.scope, "confirmed":self.cleanup_failure.is_none(),
+                        "scope":provider.scope(), "confirmed":self.cleanup_failure.is_none(),
                         "cause":self.cleanup_failure,
                         "refusedRequests":self.terminals.refused_terminal_requests,
                         "suppressedRefusals":self.terminals.suppressed_terminal_refusals,
@@ -1898,7 +1899,6 @@ impl AcpSession {
             ));
             return;
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Err(error) = self.close_terminals().await {
             self.kill_child().await;
             self.exit = Some(SessionExit::Failed(error.to_string()));
@@ -2004,7 +2004,6 @@ impl AgentSession for AcpSession {
                 }
                 Err(e) => {
                     self.kill_child().await;
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if self.terminals.provider.is_some() {
                         self.queue.push_back(AgentEvent::Other {
                             raw: json!({"terminalSessionFailure":e.to_string()}),
@@ -2062,7 +2061,8 @@ impl AgentSession for AcpSession {
             && (self.cleanup_failure.is_some() || self.child_status.is_none());
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let container_cleanup_failed = false;
-        if container_cleanup_failed {
+        let sgian_cleanup_failed = self.terminals.has_sgian() && self.cleanup_failure.is_some();
+        if container_cleanup_failed || sgian_cleanup_failed {
             let cause = self
                 .cleanup_failure
                 .unwrap_or("host process did not reap within cleanup deadline");

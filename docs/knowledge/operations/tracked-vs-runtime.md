@@ -2,7 +2,7 @@
 title: Tracked vs runtime files
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-06
+last_verified: 2026-11-10
 verified_against:
   - AGENTS.md
   - crates/engine/src/workspace_contract.rs
@@ -30,7 +30,7 @@ terms; `crates/engine/src/domain_lint.rs`, docs/domain-lint.md), and each
 mission's `plan.md` / `plan.json` / `report.md` (on the mission branch). Gitignored runtime
 (never commit): `events.jsonl`, `state.json`, `runs/`, `control/`,
 `missions/*/workspace/` (container-provider compose files),
-`.kranz/config.json`, `serve.token`, `serve.read.token`,
+`.kranz/config.json`, `serve.token`, `serve.read.token`, `serve.grant.key`,
 `.kranz/missions/*/enqueue-source*.json` (external-producer ownership and
 returned receipts),
 `.kranz/domain-terms.local` (plaintext lint vocabulary), `.kranz/tickets/*.status`,

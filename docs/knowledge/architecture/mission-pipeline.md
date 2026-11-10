@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` (`AcpBackend::with_sgian_terminals`) for uncontained host ACP sessions (`sandbox.enforce: off`, refused when combined with contained profiles) using rotated `.kranz/serve.grant.key` (`0600`, gitignored and authority-denied) and signed canonical JSON `ExecutionGrant`s over `sgian ctl`. Pipeline stages, released profiles and event schemas are unchanged.
 
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal budgets and v2 host admission onto v0.5.0 main alongside workspace containment and Trajectory Board changes. Pipeline stages and event schemas are unchanged.
 

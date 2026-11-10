@@ -67,10 +67,47 @@ The engine calls `sgian ctl` with the discovery allowlist and without any
 `SGIAN_CLIENT_TOKEN`, so the request is made as the workspace owner, the only
 identity that can issue credentials under Sgian's default `open` policy.
 
+## Execution grants (`SgianTerminalProvider`)
+
+For ACP workers running in an explicitly opted-in, uncontained host session
+(`sandbox.enforce: off`, `spec.sandbox.is_none()`), Kranz also ships
+`SgianTerminalProvider` (`crates/engine/src/sgian_terminal.rs`), wired into
+`AcpBackend::with_sgian_terminals`. When configured:
+
+1. `kranz serve` (and `SgianTerminalProvider` when absent) provisions a 256-bit
+   HMAC-SHA256 key (`sgk_<64-hex>`) at `<repo>/.kranz/serve.grant.key` (`0600`,
+   non-symlink, gitignored, denied by worker tool/sandbox policies, excluded
+   from gate snapshots, and redacted by the shared scrubber).
+2. `AcpBackend` advertises the ACP `terminal` client capability (`terminal:
+   true`) only for that opted-in host session. Contained `AcpWorkerProfile` and
+   sandboxed sessions refuse `with_sgian_terminals` before spawning the peer and
+   never fall back to Sgian.
+3. Each `terminal/create` still requires Kranz one-call operator consent
+   (`PermissionRequested` / `allow_once`), rejects caller-supplied environment
+   values (`env` must be empty; Sgian filters its own scrubbed spawn environment
+   through `GRANT_ENV_ALLOW`), rejects relative `./` or workspace-interior
+   executables, and re-validates canonical non-symlink `cwd` containment right
+   before signing.
+4. Once approved, Kranz signs a canonical sorted-key JSON `ExecutionGrant`
+   (`grant`, `mission`, `run`, `repo`, `cwd`, `argv`, `env_allow`,
+   `expires_ms`, `issued_ms`) under `.kranz/serve.grant.key` and routes
+   `terminal/create`, `terminal/output`, `terminal/wait_for_exit`,
+   `terminal/kill`, and `terminal/release` through
+   `sgian ctl --workspace <repo> --json grant exec|output|wait|kill|release`.
+5. `SgianTerminalProvider` enforces Kranz's `Scope` + `generation` fencing,
+   UTF-8 `OutputTail` truncation, `OutputRate`, `CommandLifetime`,
+   `SessionLifetime`, and `Retention` budgets, projects verified
+   `PaneObservation` states (`observe_pane`), and fails closed with
+   `CleanupUnconfirmed` if Sgian cannot confirm `descendants_reaped` and
+   `output_drained`.
+
 ## Where it lives
 
-`crates/engine/src/sgian.rs` holds the helper; `build_worker_spec` in
-`crates/engine/src/runner.rs` issues the credential next to the other
+`crates/engine/src/sgian.rs` holds the credential, grant-key, canonical-JSON,
+and HMAC helpers; `crates/engine/src/sgian_terminal.rs` implements
+`SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) integrated via
+`crates/engine/src/backend_acp/terminals.rs`; `build_worker_spec` in
+`crates/engine/src/runner.rs` issues the run credential next to the other
 per-session environment, and the two worker entry points own the revocation
 guard across `run_session_to`. Validator and orchestrator sessions do not get a
-credential: they never drive panes.
+credential or terminal provider: they never drive panes.

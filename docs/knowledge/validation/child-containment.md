@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -33,7 +33,7 @@ profiles additionally verify and pin the admitted local Docker host before
 session mount proofs or `env_clear`d container-egress provisioning). ACP profiles pin
 image, startup and selected file credentials; generic ACP commands and all
 other unsupported pairs remain refused. Do not widen without proof. `serve.token` is mutation authority, `serve.read.token`
-reads only; both must stay unreadable inside sandboxes
+reads only, and `serve.grant.key` signs Sgian execution grants; all three must stay unreadable inside sandboxes
 (`authority_read_deny_paths`). Engine-run gates (validation-round,
 final-gate, and merge-gate commands) also execute worker-authored code:
 they run WRAPPED in the resolved worker sandbox profile when

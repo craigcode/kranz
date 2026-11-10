@@ -1,16 +1,223 @@
-//! Consent and asynchronous terminal routing. Production admission remains closed.
+//! Consent and asynchronous terminal routing. Production admission remains closed
+//! unless an explicit contained fixture or Sgian host execution-grant config is supplied.
 use super::*;
-use crate::acp_terminal::{Budgets, Context, Provider};
-use kranz_acp::terminal::{self, Budget, Create, Error, Target, TerminalProvider};
+use kranz_acp::terminal::{
+    self, Budget, CleanupReceipt, Create, Error, ExitStatus, OutputSnapshot, Scope, Target,
+    TerminalProvider,
+};
 use std::collections::HashSet;
 
 const MAX_PENDING_CONTROL: usize = 32;
 pub(super) const MAX_REFUSED_TERMINAL_TRANSCRIPT: usize = 256;
 
+enum PreparedBackend {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Contained(
+        crate::acp_terminal::Context,
+        String,
+        crate::acp_terminal::Budgets,
+    ),
+    Sgian(crate::sgian_terminal::PreparedContext),
+}
+
+#[derive(Clone)]
+pub(super) enum TerminalBackend {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Contained(Arc<crate::acp_terminal::Provider>),
+    Sgian(Arc<crate::sgian_terminal::Provider>),
+}
+
+pub(super) enum BackendAuthority {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Contained(crate::acp_terminal::Authority),
+    Sgian(crate::sgian_terminal::Authority),
+}
+
+impl TerminalBackend {
+    pub(super) fn scope(&self) -> &Scope {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => &p.scope,
+            Self::Sgian(p) => &p.scope,
+        }
+    }
+
+    pub(super) fn is_sgian(&self) -> bool {
+        matches!(self, Self::Sgian(_))
+    }
+
+    pub(super) fn normalize(&self, action: Create) -> std::result::Result<Create, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.normalize(action),
+            Self::Sgian(p) => p.normalize(action),
+        }
+    }
+
+    pub(super) fn action(&self, request: &Create) -> std::result::Result<Value, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.action(request),
+            Self::Sgian(p) => p.action(request),
+        }
+    }
+
+    pub(super) fn reserve(&self, proposal: &str) -> std::result::Result<(), Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.reserve(proposal),
+            Self::Sgian(p) => p.reserve(proposal),
+        }
+    }
+
+    pub(super) fn cancel_reservation(&self, proposal: &str) -> std::result::Result<(), Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.cancel_reservation(proposal),
+            Self::Sgian(p) => p.cancel_reservation(proposal),
+        }
+    }
+
+    pub(super) fn exit_status(&self, id: &str) -> Option<ExitStatus> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.exit_status(id),
+            Self::Sgian(p) => p.exit_status(id),
+        }
+    }
+
+    pub(super) fn authorize(
+        &self,
+        action: &Create,
+        proposal: &crate::live_permission::Proposal,
+    ) -> std::result::Result<BackendAuthority, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p
+                .authorize(action, proposal)
+                .map(BackendAuthority::Contained),
+            Self::Sgian(p) => p.authorize(action, proposal).map(BackendAuthority::Sgian),
+        }
+    }
+
+    pub(super) async fn create(
+        &self,
+        scope: Scope,
+        action: Create,
+        authority: BackendAuthority,
+    ) -> std::result::Result<String, Error> {
+        match (self, authority) {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            (Self::Contained(p), BackendAuthority::Contained(auth)) => {
+                p.create(scope, action, auth).await
+            }
+            (Self::Sgian(p), BackendAuthority::Sgian(auth)) => p.create(scope, action, auth).await,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            _ => Err(Error::NotAuthorized),
+        }
+    }
+
+    pub(super) async fn output(
+        &self,
+        scope: Scope,
+        id: String,
+    ) -> std::result::Result<OutputSnapshot, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.output(scope, id).await,
+            Self::Sgian(p) => p.output(scope, id).await,
+        }
+    }
+
+    pub(super) async fn wait_for_exit(
+        &self,
+        scope: Scope,
+        id: String,
+    ) -> std::result::Result<ExitStatus, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.wait_for_exit(scope, id).await,
+            Self::Sgian(p) => p.wait_for_exit(scope, id).await,
+        }
+    }
+
+    pub(super) async fn kill(
+        &self,
+        scope: Scope,
+        id: String,
+    ) -> std::result::Result<CleanupReceipt, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.kill(scope, id).await,
+            Self::Sgian(p) => p.kill(scope, id).await,
+        }
+    }
+
+    pub(super) async fn release(
+        &self,
+        scope: Scope,
+        id: String,
+    ) -> std::result::Result<CleanupReceipt, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.release(scope, id).await,
+            Self::Sgian(p) => p.release(scope, id).await,
+        }
+    }
+
+    pub(super) async fn failure(&self) {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.failure().await,
+            Self::Sgian(p) => p.failure().await,
+        }
+    }
+
+    pub(super) fn stop(&self) {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.stop(),
+            Self::Sgian(p) => p.stop(),
+        }
+    }
+
+    pub(super) async fn next_receipt(&self) -> std::result::Result<Value, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.next_receipt().await,
+            Self::Sgian(p) => p.next_receipt().await,
+        }
+    }
+
+    pub(super) fn drain_receipts(&self) -> std::result::Result<Vec<Value>, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.drain_receipts(),
+            Self::Sgian(p) => p.drain_receipts(),
+        }
+    }
+
+    pub(super) async fn close(&self) -> std::result::Result<Vec<CleanupReceipt>, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(p) => p.close().await,
+            Self::Sgian(p) => p.close().await,
+        }
+    }
+
+    pub(super) async fn abort_cleanup(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Contained(_) => true,
+            Self::Sgian(p) => p.abort_cleanup().await,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Broker {
-    prepared: Option<(Context, String, Budgets)>,
-    pub(super) provider: Option<Arc<Provider>>,
+    prepared: Option<PreparedBackend>,
+    pub(super) provider: Option<TerminalBackend>,
     tasks: tokio::task::JoinSet<TerminalCompletion>,
     pub(super) cleanup_recorded: bool,
     pub(super) saw_budget_hit: bool,
@@ -23,19 +230,54 @@ pub(super) struct Broker {
 
 impl Broker {
     pub(super) fn prepare(
-        run: Option<(String, Budgets)>,
-        container: Option<&crate::acp_container::OwnedContainer>,
+        #[cfg(any(target_os = "macos", target_os = "linux"))] run: Option<(
+            String,
+            crate::acp_terminal::Budgets,
+        )>,
+        #[cfg(any(target_os = "macos", target_os = "linux"))] container: Option<
+            &crate::acp_container::OwnedContainer,
+        >,
+        sgian: Option<&crate::sgian_terminal::Config>,
         spec: &SessionSpec,
     ) -> Result<Self> {
-        let prepared = run
-            .map(|(run, budgets)| {
-                if run.trim().is_empty() || run.len() > 256 {
-                    return Err(failure());
-                }
-                let context = container.ok_or_else(failure)?.terminal_context(spec)?;
-                Ok((context, run, budgets))
-            })
-            .transpose()?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if run.is_some() && sgian.is_some() {
+            return Err(EngineError::Backend(
+                "acp terminals cannot combine contained fixture and sgian provider".into(),
+            ));
+        }
+
+        let prepared = if let Some(sgian_cfg) = sgian {
+            if spec.sandbox.is_some() {
+                return Err(EngineError::Backend(
+                    "sgian terminal provider is only permitted for uncontained host sessions"
+                        .into(),
+                ));
+            }
+            let ctx = crate::sgian_terminal::PreparedContext::prepare(sgian_cfg, &spec.cwd)
+                .map_err(|msg| {
+                    EngineError::Backend(format!("sgian terminal prepare failed: {msg}"))
+                })?;
+            Some(PreparedBackend::Sgian(ctx))
+        } else {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                run.map(|(run, budgets)| {
+                    if run.trim().is_empty() || run.len() > 256 {
+                        return Err(failure(false));
+                    }
+                    let context = container
+                        .ok_or_else(|| failure(false))?
+                        .terminal_context(spec)?;
+                    Ok(PreparedBackend::Contained(context, run, budgets))
+                })
+                .transpose()?
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                None
+            }
+        };
         Ok(Self {
             prepared,
             provider: None,
@@ -54,15 +296,33 @@ impl Broker {
         self.prepared.is_some()
     }
 
+    pub(super) fn has_sgian(&self) -> bool {
+        self.provider
+            .as_ref()
+            .is_some_and(TerminalBackend::is_sgian)
+    }
+
     pub(super) fn bind(&mut self, engine: &str, peer: &str) {
-        if let Some((context, run, budgets)) = self.prepared.take() {
-            self.provider = Some(Arc::new(Provider::new(
-                context,
-                run,
-                engine.into(),
-                peer.into(),
-                budgets,
-            )));
+        if let Some(prepared) = self.prepared.take() {
+            self.provider = Some(match prepared {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                PreparedBackend::Contained(context, run, budgets) => {
+                    TerminalBackend::Contained(Arc::new(crate::acp_terminal::Provider::new(
+                        context,
+                        run,
+                        engine.into(),
+                        peer.into(),
+                        budgets,
+                    )))
+                }
+                PreparedBackend::Sgian(context) => TerminalBackend::Sgian(Arc::new(
+                    crate::sgian_terminal::Provider::from_prepared(
+                        context,
+                        engine.into(),
+                        peer.into(),
+                    ),
+                )),
+            });
         }
     }
 
@@ -70,12 +330,13 @@ impl Broker {
         let Some(provider) = &self.provider else {
             return std::future::pending().await;
         };
+        let is_sgian = provider.is_sgian();
         tokio::select! {
             biased;
-            _ = provider.failure() => Err(failure()),
-            receipt = provider.next_receipt() => receipt.map(Input::TerminalReceipt).map_err(|_| failure()),
+            _ = provider.failure() => Err(failure(is_sgian)),
+            receipt = provider.next_receipt() => receipt.map(Input::TerminalReceipt).map_err(|_| failure(is_sgian)),
             result = self.tasks.join_next(), if !self.tasks.is_empty() =>
-                result.ok_or_else(failure)?.map(Input::Terminal).map_err(|_| failure()),
+                result.ok_or_else(|| failure(is_sgian))?.map(Input::Terminal).map_err(|_| failure(is_sgian)),
         }
     }
 
@@ -150,10 +411,14 @@ impl Drop for Broker {
     }
 }
 
-fn failure() -> EngineError {
-    EngineError::Backend(
-        "contained terminal operation or cleanup failed; ending owned namespace".into(),
-    )
+fn failure(is_sgian: bool) -> EngineError {
+    if is_sgian {
+        EngineError::Backend("sgian terminal operation or cleanup failed; ending session".into())
+    } else {
+        EngineError::Backend(
+            "contained terminal operation or cleanup failed; ending owned namespace".into(),
+        )
+    }
 }
 
 impl AcpSession {
@@ -163,7 +428,12 @@ impl AcpSession {
         method: &str,
         params: Value,
     ) -> Result<()> {
-        let provider = self.terminals.provider.clone().ok_or_else(failure)?;
+        let provider = self
+            .terminals
+            .provider
+            .clone()
+            .ok_or_else(|| failure(false))?;
+        let is_sgian = provider.is_sgian();
         // Request IDs are retained for replay detection, so bound them before
         // insertion as well as bounding the typed payload and operation count.
         if id
@@ -190,7 +460,7 @@ impl AcpSession {
         let make_requested = |params: &Value| -> Result<AgentEvent> {
             Ok(AgentEvent::Other {
                 raw: json!({"terminalRequested": {
-                    "method":method,"requestId":id,"scope":provider.scope,
+                    "method":method,"requestId":id,"scope":provider.scope(),
                     "requestDigest":crate::live_permission::digest(params)?,
                 }}),
             })
@@ -210,7 +480,7 @@ impl AcpSession {
                 .map_err(|_| Error::InvalidRequest)
                 .and_then(|target| {
                     target.validate()?;
-                    if target.session_id != provider.scope.peer_session_id {
+                    if target.session_id != provider.scope().peer_session_id {
                         return Err(Error::InvalidHandle);
                     }
                     Ok(target)
@@ -269,7 +539,7 @@ impl AcpSession {
                 }
                 self.queue.push_back(make_requested(&params)?);
                 self.seen_permission_ids.insert(peer_id);
-                let value = provider.action(&action).map_err(|_| failure())?;
+                let value = provider.action(&action).map_err(|_| failure(is_sgian))?;
                 let options = vec![
                     json!({"optionId":"execute-once","kind":"allow_once","name":"Execute this exact command"}),
                     json!({"optionId":"deny-once","kind":"reject_once","name":"Deny"}),
@@ -284,7 +554,7 @@ impl AcpSession {
                 let proposal = crate::live_permission::Proposal {
                     id: proposal_id,
                     engine_session_id: self.session_id.clone(),
-                    peer_session_id: provider.scope.peer_session_id.clone(),
+                    peer_session_id: provider.scope().peer_session_id.clone(),
                     peer_request_id: id,
                     tool_call_id: format!("terminal-create-{}", uuid::Uuid::new_v4()),
                     action_digest: crate::live_permission::digest(&value)?,
@@ -330,7 +600,7 @@ impl AcpSession {
                 }
                 let method = method.to_owned();
                 self.terminals.tasks.spawn(async move {
-                    let scope = provider.scope.clone();
+                    let scope = provider.scope().clone();
                     let mut receipt = json!({"scope":scope,"terminalId":target.terminal_id});
                     let terminal_id = target.terminal_id.clone();
                     let result =
@@ -393,11 +663,16 @@ impl AcpSession {
         action: Create,
         allow: bool,
     ) -> Result<()> {
-        let provider = self.terminals.provider.clone().ok_or_else(failure)?;
+        let provider = self
+            .terminals
+            .provider
+            .clone()
+            .ok_or_else(|| failure(false))?;
+        let is_sgian = provider.is_sgian();
         if !allow {
             provider
                 .cancel_reservation(&proposal.id)
-                .map_err(|_| failure())?;
+                .map_err(|_| failure(is_sgian))?;
             return self
                 .complete_terminal(TerminalCompletion {
                     id: proposal.peer_request_id,
@@ -410,12 +685,12 @@ impl AcpSession {
         }
         let authority = provider
             .authorize(&action, &proposal)
-            .map_err(|_| failure())?;
+            .map_err(|_| failure(is_sgian))?;
         self.terminals
             .creating
             .insert(serde_json::to_string(&proposal.peer_request_id)?);
         self.terminals.tasks.spawn(async move {
-            let scope = provider.scope.clone();
+            let scope = provider.scope().clone();
             let result = provider.create(scope.clone(), action, authority).await;
             let receipt = json!({"scope":scope,"actionDigest":proposal.action_digest,
                 "started":result.is_ok(),"terminalId":result.as_ref().ok()});
@@ -434,22 +709,23 @@ impl AcpSession {
         let Some(provider) = self.terminals.provider.clone() else {
             return Ok(());
         };
+        let is_sgian = provider.is_sgian();
         // A prompt result while consent or an operation is pending cannot turn
         // a lost command outcome into successful completion.
         if !self.terminals.tasks.is_empty() || !self.pending_permissions.is_empty() {
-            return Err(failure());
+            return Err(failure(is_sgian));
         }
         let receipts = tokio::time::timeout(std::time::Duration::from_secs(8), provider.close())
             .await
-            .map_err(|_| failure())?
-            .map_err(|_| failure())?;
-        for raw in provider.drain_receipts().map_err(|_| failure())? {
+            .map_err(|_| failure(is_sgian))?
+            .map_err(|_| failure(is_sgian))?;
+        for raw in provider.drain_receipts().map_err(|_| failure(is_sgian))? {
             self.terminals.observe_receipt(&raw);
             self.queue.push_back(AgentEvent::Other { raw });
         }
         self.queue.push_back(AgentEvent::Other {
             raw: json!({"terminalSessionCleanup": {
-                "scope":provider.scope,"receipts":receipts,"confirmed":true,
+                "scope":provider.scope(),"receipts":receipts,"confirmed":true,
                 "refusedRequests":self.terminals.refused_terminal_requests,
                 "suppressedRefusals":self.terminals.suppressed_terminal_refusals,
             }}),
@@ -487,9 +763,12 @@ mod tests {
         broker.admit_control("excess".into()).unwrap();
     }
 
-    async fn test_session_with_provider(sink: &std::path::Path) -> (AcpSession, Arc<Provider>) {
-        let provider = Arc::new(Provider::new(
-            Context {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn test_session_with_provider(
+        sink: &std::path::Path,
+    ) -> (AcpSession, Arc<crate::acp_terminal::Provider>) {
+        let provider = Arc::new(crate::acp_terminal::Provider::new(
+            crate::acp_terminal::Context {
                 client: crate::gate_evaluation::subprocess::DockerEvaluator::new(
                     std::path::Path::new("/usr/bin/false"),
                 )
@@ -503,7 +782,7 @@ mod tests {
             "run-fixture".into(),
             "sess-1".into(),
             "peer-1".into(),
-            Budgets::default(),
+            crate::acp_terminal::Budgets::default(),
         ));
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.args(["-c", "cat > \"$1\"", "sh"])
@@ -529,7 +808,7 @@ mod tests {
         let (permission_responder, permission_answers) =
             crate::live_permission::PermissionResponder::channel();
         let mut broker = Broker::default();
-        broker.provider = Some(Arc::clone(&provider));
+        broker.provider = Some(TerminalBackend::Contained(Arc::clone(&provider)));
         let session = AcpSession {
             terminals: broker,
             session_id: "sess-1".into(),
@@ -586,6 +865,7 @@ mod tests {
         (session, provider)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn base_resource_evidence() -> crate::acp_resources::ResourceEvidence {
         let now = chrono::Utc::now();
         let counters = crate::acp_resources::Counters {
@@ -630,6 +910,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn terminal_rapid_output_rate_refusals_bound_transcript_while_returning_rpc_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -679,6 +960,7 @@ mod tests {
         assert_eq!(rpc_refusals, 2_000);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn terminal_budget_hit_wires_into_session_resource_evidence_and_exit_status() {
         use crate::acp_resources::FailureClass;

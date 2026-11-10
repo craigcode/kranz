@@ -32,10 +32,20 @@ use std::time::Duration;
 pub const TOKEN_ENV: &str = "SGIAN_CLIENT_TOKEN";
 /// Operator override for the `sgian` binary; empty disables the lane.
 pub const BIN_ENV: &str = "KRANZ_SGIAN_BIN";
+/// Sibling of `.kranz/serve.read.token` (`0600`) shared with Sgian for HMAC-SHA256 execution grants.
+pub const GRANT_KEY_DIR: &str = ".kranz";
+pub const GRANT_KEY_FILE: &str = "serve.grant.key";
+pub const GRANT_KEY_MIN_BYTES: usize = 16;
+pub const GRANT_KEY_MAX_BYTES: usize = 4096;
 /// Upper bound on one `sgian ctl` call. The daemon answers on a local socket
 /// in milliseconds; anything longer is a wedged client and the run must not
 /// wait on it.
 pub const DEADLINE: Duration = Duration::from_secs(5);
+
+pub use crate::sgian_terminal::{
+    Authority as SgianAuthority, Budgets as SgianTerminalBudgets, Config as SgianTerminalConfig,
+    ExecutionGrant, Provider as SgianTerminalProvider, GRANT_ENV_ALLOW,
+};
 
 /// A credential the engine issued for one run and owes a revocation for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +241,7 @@ pub fn resolve_bin(override_var: Option<OsString>, _path_var: Option<OsString>) 
     path.is_absolute().then_some(path)
 }
 
-fn trusted_bin(override_var: Option<OsString>, workspace: &Path) -> Option<PathBuf> {
+pub(crate) fn trusted_bin(override_var: Option<OsString>, workspace: &Path) -> Option<PathBuf> {
     let bin = resolve_bin(override_var, None)?.canonicalize().ok()?;
     let workspace = workspace.canonicalize().ok()?;
     // Resolve symlinks before checking ownership: a repository-provided helper
@@ -239,25 +249,303 @@ fn trusted_bin(override_var: Option<OsString>, workspace: &Path) -> Option<PathB
     (bin.is_file() && !bin.starts_with(workspace)).then_some(bin)
 }
 
+#[derive(Debug)]
+pub(crate) enum CtlError {
+    TimedOut(String),
+    Io(String),
+    Exited {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+    },
+}
+
+impl std::fmt::Display for CtlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(msg) | Self::Io(msg) => f.write_str(msg),
+            Self::Exited { status, .. } => write!(f, "exited with {status}"),
+        }
+    }
+}
+
+fn ctl_extra_env() -> Vec<(String, String)> {
+    let mut extra = Vec::new();
+    for key in ["XDG_DATA_HOME", "XDG_RUNTIME_DIR"] {
+        if let Some(val) = std::env::var_os(key) {
+            extra.push((key.to_string(), val.to_string_lossy().into_owned()));
+        }
+    }
+    extra
+}
+
+pub(crate) fn run_ctl_detailed(
+    bin: &Path,
+    args: &[&str],
+    limits: crate::git_ops::process::Limits,
+) -> Result<Vec<u8>, CtlError> {
+    let mut command = Command::new(bin);
+    let extra = ctl_extra_env();
+    command
+        .args(args)
+        .env_clear()
+        .envs(crate::agent_env::probe_child_env(&extra));
+    let output = crate::git_ops::process::output(command, limits).map_err(|error| {
+        let msg = format!("{} control call failed: {error}", bin.display());
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            CtlError::TimedOut(msg)
+        } else {
+            CtlError::Io(msg)
+        }
+    })?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(CtlError::Exited {
+            status: output.status,
+            stdout: output.stdout,
+        })
+    }
+}
+
 /// Run the operator helper with bounded pipes and process-tree cleanup. The
 /// discovery allowlist keeps HOME for daemon lookup, without forwarding provider
 /// credentials or a worker's client token. Never log the helper's reply bytes.
 fn run_ctl(bin: &Path, args: &[&str], deadline: Duration) -> Result<Vec<u8>, String> {
-    let mut command = Command::new(bin);
-    command
-        .args(args)
-        .env_clear()
-        .envs(crate::agent_env::probe_child_env(&[]));
-    let output = crate::git_ops::process::output(
-        command,
+    run_ctl_detailed(
+        bin,
+        args,
         crate::git_ops::process::Limits::for_control(deadline),
     )
-    .map_err(|error| format!("{} control call failed: {error}", bin.display()))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(format!("{} exited with {}", bin.display(), output.status))
+    .map_err(|error| format!("{} {error}", bin.display()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
     }
+    out
+}
+
+/// Mint a fresh 256-bit execution-grant key (`sgk_<64 lowercase hex digits>`).
+pub fn generate_grant_key() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"kranz.sgian.grant-key.v1\0");
+    hasher.update(uuid::Uuid::new_v4().as_bytes());
+    hasher.update(uuid::Uuid::new_v4().as_bytes());
+    hasher.update(uuid::Uuid::new_v4().as_bytes());
+    format!("sgk_{}", hex_encode(&hasher.finalize()))
+}
+
+/// Atomically write a fresh `0600` `<repo>/.kranz/serve.grant.key`, refusing
+/// symlinked `.kranz` directories and replacing any existing inode via rename.
+pub fn rotate_grant_key(repo_root: &Path) -> std::io::Result<PathBuf> {
+    write_grant_key(repo_root, &generate_grant_key())
+}
+
+/// Write an explicit grant key to `<repo>/.kranz/serve.grant.key` (`0600`).
+pub fn write_grant_key(repo_root: &Path, key_text: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let trimmed = key_text.trim();
+    if trimmed.len() < GRANT_KEY_MIN_BYTES || trimmed.len() > GRANT_KEY_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "grant key length is outside [16, 4096] bytes",
+        ));
+    }
+    let kranz_dir = repo_root.join(GRANT_KEY_DIR);
+    match std::fs::symlink_metadata(&kranz_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    ".kranz must be a real directory (not a symlink)",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&kranz_dir)?;
+        }
+        Err(err) => return Err(err),
+    }
+
+    let dest = kranz_dir.join(GRANT_KEY_FILE);
+    let tmp = kranz_dir.join(format!(
+        ".{GRANT_KEY_FILE}.tmp-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let write_tmp = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(trimmed.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    };
+    if let Err(err) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(dest)
+}
+
+/// Read and validate `<repo_canon>/.kranz/serve.grant.key`: refuses symlinks on
+/// `.kranz` and the key file, enforces `0600` owner-only permissions on Unix,
+/// and validates `[16, 4096]` trimmed key bytes (matching Sgian's verifier).
+pub fn load_grant_key(repo_canon: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let kranz_dir = repo_canon.join(GRANT_KEY_DIR);
+    let dir_meta = std::fs::symlink_metadata(&kranz_dir)
+        .map_err(|error| format!("grant key unavailable ({}): {error}", kranz_dir.display()))?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        return Err(format!(
+            "grant key directory {} must be a real directory (not a symlink)",
+            kranz_dir.display()
+        ));
+    }
+    let key_path = kranz_dir.join(GRANT_KEY_FILE);
+    let meta = std::fs::symlink_metadata(&key_path)
+        .map_err(|error| format!("grant key unavailable ({}): {error}", key_path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!(
+            "grant key {} must be a regular file (not a symlink)",
+            key_path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "grant key {} has insecure permissions {:04o}; expected owner-only (0600)",
+                key_path.display(),
+                mode
+            ));
+        }
+    }
+    if meta.len() > GRANT_KEY_MAX_BYTES as u64 {
+        return Err(format!(
+            "grant key {} exceeds {} bytes",
+            key_path.display(),
+            GRANT_KEY_MAX_BYTES
+        ));
+    }
+    let mut raw = Vec::new();
+    std::fs::File::open(&key_path)
+        .and_then(|file| {
+            file.take(GRANT_KEY_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut raw)
+        })
+        .map_err(|error| format!("failed to read grant key {}: {error}", key_path.display()))?;
+    if raw.len() > GRANT_KEY_MAX_BYTES {
+        return Err(format!(
+            "grant key {} exceeds {} bytes",
+            key_path.display(),
+            GRANT_KEY_MAX_BYTES
+        ));
+    }
+    let start = raw
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    let trimmed = &raw[start..end];
+    if trimmed.len() < GRANT_KEY_MIN_BYTES {
+        return Err(format!(
+            "grant key {} is shorter than {} bytes",
+            key_path.display(),
+            GRANT_KEY_MIN_BYTES
+        ));
+    }
+    Ok(trimmed.to_vec())
+}
+
+/// Load `<repo_canon>/.kranz/serve.grant.key` if present (failing closed on
+/// symlinks or insecure permissions), or provision a fresh `0600` key when absent.
+pub fn ensure_grant_key(repo_canon: &Path) -> Result<Vec<u8>, String> {
+    let key_path = repo_canon.join(GRANT_KEY_DIR).join(GRANT_KEY_FILE);
+    match std::fs::symlink_metadata(&key_path) {
+        Ok(_) => load_grant_key(repo_canon),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            rotate_grant_key(repo_canon)
+                .map_err(|e| format!("failed to provision grant key: {e}"))?;
+            load_grant_key(repo_canon)
+        }
+        Err(err) => Err(format!(
+            "grant key unavailable ({}): {err}",
+            key_path.display()
+        )),
+    }
+}
+
+/// Canonical JSON serialization (recursively sorted object keys, no whitespace),
+/// matching Sgian's `canonical_json` byte-for-byte.
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    fn sort_value(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for k in keys {
+                    sorted.insert(k.clone(), sort_value(&map[k]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sort_value).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    sort_value(value).to_string()
+}
+
+/// Pure-Rust RFC 2104 HMAC-SHA256 encoded as 64 lowercase hex digits.
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_LEN: usize = 64;
+    let mut key_block = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        let digest = Sha256::digest(key);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_LEN];
+    let mut opad = [0x5cu8; BLOCK_LEN];
+    for i in 0..BLOCK_LEN {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    hex_encode(&outer.finalize())
 }
 
 /// Apply an issued credential to a session env; a convenience for callers

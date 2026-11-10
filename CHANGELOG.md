@@ -5,6 +5,16 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
+  `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
+  ACP sessions (`sandbox.enforce: off`, refused when combined with contained
+  profiles): rotates `<repo>/.kranz/serve.grant.key` (`0600`, authority-denied,
+  sandbox-masked, and scrubbed), mints RFC 2104 HMAC-SHA256-signed canonical JSON
+  `ExecutionGrant`s, and routes `terminal/create|output|wait_for_exit|kill|release`
+  through `sgian ctl --workspace <repo> --json grant` with one-call consent,
+  scope/generation fencing, lifetime/retention budgets, verified
+  `PaneObservation` projection, and fail-closed `CleanupReceipt` confirmation.
+
 ## 0.5.0 - 2026-11-08
 
 - Added the Trajectory Board lens (`#/board` and `#/r/<repo>/board`) to the
