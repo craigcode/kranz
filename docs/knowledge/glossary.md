@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan review surfaces now list the plan's command grants and touch set. No term changed.
 
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal-budget vocabulary and v2 admission notes onto v0.5.0 main; role boundaries and mission lifecycle terms remain unchanged.
 

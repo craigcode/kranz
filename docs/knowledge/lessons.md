@@ -2,13 +2,15 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-10 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 
 Rechecked 2026-11-09 (UTC) after merging ACP R4 terminal budgets and v2 admission onto v0.5.0 main; lesson capture and provenance rules remain unchanged.
 
