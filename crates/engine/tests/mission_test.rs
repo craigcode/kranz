@@ -7222,6 +7222,9 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     if !setup() {
         return;
     }
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
+        return;
+    }
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -7310,10 +7313,14 @@ async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
         "the disposable worktree registration is pruned"
     );
     let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
-    assert!(
-        md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
-        "{md}"
-    );
+    if kranz_engine::test_capability::approval_lint_runs_here() {
+        assert!(
+            md.contains("author-bug suspects (already pass / no verdict on the untouched base)"),
+            "{md}"
+        );
+    } else {
+        assert!(md.contains("not linted (never run on the base)"), "{md}");
+    }
     assert!(
         !md.contains("working tree with uncommitted changes"),
         "the pinned disposable tree is clean: {md}"
@@ -7514,6 +7521,9 @@ async fn contract_gate_named_verdicts_reach_plan_md_and_decision() {
     if !setup() {
         return;
     }
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
+        return;
+    }
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::new());
     let mut engine = make_engine(&backend, &root, test_cfg());
@@ -7642,6 +7652,9 @@ async fn contract_gate_final_gate_decision_names_vacuous_green() {
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_result_events_record_the_approval_ladder() {
     if !setup() {
+        return;
+    }
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
         return;
     }
     let (_dir, root) = init_repo();

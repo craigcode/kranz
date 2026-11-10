@@ -216,13 +216,25 @@ pub fn render_plan_markdown(
 
     if !contract_lint.is_empty() {
         let _ = writeln!(md, "## Contract lint\n");
-        let _ = writeln!(
-            md,
-            "Each `check: command` assertion above was run once against the untouched base \
-             tree at approval time. Suspects are assertions that already pass (or could not \
-             reach a verdict) before this plan's work lands — a possible polarity/vacuity bug \
-             in the assertion itself. This never blocks approval.\n"
-        );
+        if contract_lint.not_linted().len() == contract_lint.results.len() {
+            // Planner-authored commands only run contained; say plainly when
+            // that was not possible rather than imply a clean lint.
+            let _ = writeln!(
+                md,
+                "The `check: command` assertions above were NOT run against the base tree \
+                 at approval time: no sandbox was available to contain them (or the lint \
+                 budget was spent). Polarity and vacuity are unchecked. This never blocks \
+                 approval.\n"
+            );
+        } else {
+            let _ = writeln!(
+                md,
+                "Each `check: command` assertion above was run once against the untouched base \
+                 tree at approval time. Suspects are assertions that already pass (or could not \
+                 reach a verdict) before this plan's work lands — a possible polarity/vacuity bug \
+                 in the assertion itself. This never blocks approval.\n"
+            );
+        }
         let _ = writeln!(md, "{}\n", contract_lint.summary());
         // Named contract-validation gates (contract-validation-gates): the
         // defect classes behind the lint, each verdict carrying its class

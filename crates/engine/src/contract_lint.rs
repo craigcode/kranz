@@ -225,6 +225,28 @@ pub(crate) fn with_git_hooks_disabled(mut env: HashMap<String, String>) -> HashM
     env
 }
 
+/// Whether `sandbox` can actually run a command here. Resolution only picks a
+/// provider; applying it can still fail (a nested Seatbelt apply inside
+/// another sandbox, an unprepared host). A lint run through a sandbox that
+/// cannot start would report every assertion as failing on the base, so the
+/// approval path probes first and skips the lint instead.
+pub(crate) fn containment_usable(
+    cwd: &Path,
+    scratch: &Path,
+    base_sha: Option<&str>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> bool {
+    let env = lint_env(scratch, base_sha, &[]);
+    let (code, _) = crate::command_exec::run_shell_command_sandboxed_blocking(
+        cwd,
+        "exit 0",
+        Duration::from_secs(30),
+        &env,
+        sandbox,
+    );
+    code == Some(0)
+}
+
 /// Lint every `check: command` assertion in `contract` against the
 /// untouched base tree, using the module's default per-command timeout and
 /// overall budget. `passthrough` is the mission config's
@@ -397,6 +419,32 @@ mod tests {
         assert!(AssertionLintOutcome::CouldNotVerdict.is_author_bug_suspect());
         assert!(!AssertionLintOutcome::FailedOnBase.is_author_bug_suspect());
         assert!(!AssertionLintOutcome::NotLinted.is_author_bug_suspect());
+    }
+
+    #[test]
+    fn skipped_report_runs_nothing_and_says_so() {
+        let command = |id: &str, cmd: &str| Assertion {
+            id: id.into(),
+            statement: "s".into(),
+            check: AssertionCheck::Command,
+            command: Some(cmd.into()),
+            negative_control: None,
+            pty_script: None,
+        };
+        let mut judged = command("a-2", "unused");
+        judged.check = AssertionCheck::AgentJudgement;
+        let report = ContractLintReport::skipped(&[command("a-1", "exit 0"), judged]);
+        assert_eq!(
+            report.results.len(),
+            1,
+            "only command assertions are listed"
+        );
+        assert_eq!(report.not_linted().len(), 1);
+        assert!(report.suspects().is_empty());
+        assert_eq!(
+            report.summary(),
+            "not linted (never run on the base): [a-1] exit 0"
+        );
     }
 
     #[test]

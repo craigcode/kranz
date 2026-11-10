@@ -1406,42 +1406,68 @@ impl MissionEngine {
             if !operator_enforced {
                 policy.enforce = SandboxEnforce::Fs;
             }
-            let resolved = crate::command_exec::resolve_gate_sandbox(
-                &policy,
-                &lint_root,
-                &self.paths.mission_dir(),
-                &scratch,
-                &self.paths.runs_dir(),
-            );
-            match resolved {
-                Ok(resolution) => {
-                    let mut sandbox = resolution.sandbox;
-                    let report = if sandbox.enforce() == SandboxEnforce::Off {
-                        contract_lint::ContractLintReport::skipped(&plan.validation_contract)
-                    } else {
-                        contract_lint::run_contract_lint(
-                            &lint_root,
-                            &scratch,
-                            Some(&base_sha),
-                            &plan.validation_contract,
-                            true,
-                            &[],
-                            &sandbox,
-                        )
-                    };
-                    sandbox.cleanup()?;
-                    report
-                }
-                // An operator-enforced posture keeps failing closed. A host
-                // that cannot contain at all loses only the advisory lint.
-                Err(e) if operator_enforced => return Err(e),
-                Err(e) => {
-                    tracing::warn!(
-                        mission = %self.state.mission.id,
-                        error = %e,
-                        "approval contract lint skipped: no containment available"
-                    );
-                    contract_lint::ContractLintReport::skipped(&plan.validation_contract)
+            // Raising an `off` posture is only done where the raised sandbox
+            // is known to run commands faithfully: native macOS/Linux, and
+            // only after a smoke probe (a nested apply inside another sandbox
+            // cannot start, and would report every assertion as failing).
+            // Windows has no verified contract for it, as with contract
+            // controls. An operator-enforced posture is used as resolved.
+            let skipped = || contract_lint::ContractLintReport::skipped(&plan.validation_contract);
+            if !operator_enforced && cfg!(windows) {
+                skipped()
+            } else {
+                match crate::command_exec::resolve_gate_sandbox(
+                    &policy,
+                    &lint_root,
+                    &self.paths.mission_dir(),
+                    &scratch,
+                    &self.paths.runs_dir(),
+                ) {
+                    Ok(resolution) => {
+                        let mut sandbox = resolution.sandbox;
+                        let usable = sandbox.enforce() != SandboxEnforce::Off
+                            && (operator_enforced
+                                || contract_lint::containment_usable(
+                                    &lint_root,
+                                    &scratch,
+                                    Some(&base_sha),
+                                    &sandbox,
+                                ));
+                        let report = if usable {
+                            contract_lint::run_contract_lint(
+                                &lint_root,
+                                &scratch,
+                                Some(&base_sha),
+                                &plan.validation_contract,
+                                true,
+                                &[],
+                                &sandbox,
+                            )
+                        } else {
+                            skipped()
+                        };
+                        match sandbox.cleanup() {
+                            Err(e) if operator_enforced => return Err(e),
+                            Err(e) => tracing::warn!(
+                                mission = %self.state.mission.id,
+                                error = %e,
+                                "approval contract lint sandbox cleanup failed"
+                            ),
+                            Ok(()) => {}
+                        }
+                        report
+                    }
+                    // An operator-enforced posture keeps failing closed. A
+                    // host that cannot contain loses only the advisory lint.
+                    Err(e) if operator_enforced => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            mission = %self.state.mission.id,
+                            error = %e,
+                            "approval contract lint skipped: no containment available"
+                        );
+                        skipped()
+                    }
                 }
             }
         } else {
