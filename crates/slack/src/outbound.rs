@@ -112,6 +112,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             Some(Outbound::PermissionReady(Box::new(request.clone())))
         }
         EventKind::PlanApproved { plan, .. } => Some(Outbound::PlanReady(PlanReady {
+            authority: crate::format::PlanAuthority::of(plan),
             mission_id: state.mission.id.clone(),
             goal: plan.goal.clone(),
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
@@ -124,6 +125,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             plan,
             instructions,
         } => Some(Outbound::RevisionReady(RevisionReady {
+            authority: crate::format::PlanAuthority::of(plan),
             mission_id: state.mission.id.clone(),
             revision: *revision,
             instructions: instructions.clone(),

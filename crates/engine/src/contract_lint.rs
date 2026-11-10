@@ -93,6 +93,37 @@ impl ContractLintReport {
         self.results.is_empty()
     }
 
+    /// Results that were never run (budget spent, or no containment).
+    pub fn not_linted(&self) -> Vec<&AssertionLint> {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == AssertionLintOutcome::NotLinted)
+            .collect()
+    }
+
+    /// A report that runs nothing: every command assertion is
+    /// [`AssertionLintOutcome::NotLinted`]. Approval uses this when no
+    /// containment resolves, because the commands are planner-authored and
+    /// no human has reviewed the plan yet.
+    pub(crate) fn skipped(contract: &[Assertion]) -> Self {
+        let results = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+            .filter_map(|a| {
+                Some(AssertionLint {
+                    id: a.id.clone(),
+                    command: a.command.clone()?,
+                    outcome: AssertionLintOutcome::NotLinted,
+                    output_tail: String::new(),
+                })
+            })
+            .collect();
+        ContractLintReport {
+            results,
+            tree_clean_at_base: true,
+        }
+    }
+
     /// Compact operator-facing summary: suspects first under a clear label,
     /// then base-expected-to-fail assertions under a separate label. When
     /// `tree_clean_at_base` is false, prepends a note that the lint ran
@@ -132,6 +163,16 @@ impl ContractLintReport {
                 .collect::<Vec<_>>()
                 .join("; ");
             parts.push(format!("base-expected-to-fail (benign): {list}"));
+        }
+
+        let not_linted = self.not_linted();
+        if !not_linted.is_empty() {
+            let list = not_linted
+                .iter()
+                .map(|a| format!("[{}] {}", a.id, a.command))
+                .collect::<Vec<_>>()
+                .join("; ");
+            parts.push(format!("not linted (never run on the base): {list}"));
         }
 
         parts.join("\n")

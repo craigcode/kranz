@@ -7,6 +7,7 @@
 // with a "back to conversation" link on both steps.
 
 import { useKranzStore } from '../lib/store';
+import { visible } from '../lib/presentation';
 import type { CostEstimate, NegativeControl } from '../lib/types';
 
 /** Verbatim mirror of crates/cli/src/output.rs render_cost_estimate. */
@@ -87,6 +88,45 @@ export function PlanReview() {
         </header>
 
         <p className="plan-review-goal">{plan.goal}</p>
+
+        {/* Approval copies these into the mission with no further prompt, so
+            they are shown in full, first, and never truncated (audit H2). */}
+        {((plan.commandGrants?.length ?? 0) > 0 || (plan.touchSet?.length ?? 0) > 0) && (
+          <section aria-label="Authority granted on approval" className="plan-authority">
+            <div className="section-label">Authority granted on approval</div>
+            <p className="dim">
+              Approving this plan grants the following to the mission&apos;s sessions with no
+              further prompt.
+            </p>
+            {(plan.commandGrants?.length ?? 0) > 0 && (
+              <>
+                <p>
+                  Commands ({plan.commandGrants!.length}) — each is a prefix, so <code>x</code>{' '}
+                  also allows <code>x &lt;anything&gt;</code>:
+                </p>
+                <ul className="plan-authority-list">
+                  {plan.commandGrants!.map((grant, i) => (
+                    <li key={i}>
+                      <code className="mono">{visible(grant)}</code>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {(plan.touchSet?.length ?? 0) > 0 && (
+              <>
+                <p>Write paths ({plan.touchSet!.length}) — glob patterns the mission may change:</p>
+                <ul className="plan-authority-list">
+                  {plan.touchSet!.map((pattern, i) => (
+                    <li key={i}>
+                      <code className="mono">{visible(pattern)}</code>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </section>
+        )}
 
         <section aria-label="Reviewer independence">
           <div className="section-label">Reviewer independence</div>

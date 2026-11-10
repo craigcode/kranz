@@ -213,6 +213,8 @@ export interface Plan {
   validationContract: Assertion[];
   milestones: PlanMilestone[];
   consideredAlternatives?: ConsideredAlternatives;
+  /** Commands granted mission-wide on approval; each is a prefix pattern. */
+  commandGrants?: string[];
   touchSet?: string[];
   standardsManifest?: StandardsPin;
   reviewerIndependence?: { scrutiny: boolean; functional: boolean };

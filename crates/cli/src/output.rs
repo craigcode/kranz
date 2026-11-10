@@ -152,6 +152,15 @@ pub fn render_status(state: &MissionState) -> String {
     out
 }
 
+/// One grant on one line, sanitised but never truncated: the operator is
+/// consenting to the whole string.
+fn authority_line(raw: &str) -> String {
+    sanitize_untrusted(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Render a plan for the interactive approval prompt: contract, then the
 /// milestone/feature tree with specs and criteria.
 pub fn render_plan(plan: &Plan) -> String {
@@ -168,6 +177,20 @@ pub fn render_plan(plan: &Plan) -> String {
                     different from every recorded worker attempt; fallback cannot weaken this\n"
                 ));
             }
+        }
+    }
+
+    // Authority the approval grants with no further prompt (audit H2).
+    if !plan.command_grants.is_empty() {
+        out.push_str("commands granted on approval (each is a prefix):\n");
+        for grant in &plan.command_grants {
+            out.push_str(&format!("  `{}`\n", authority_line(grant)));
+        }
+    }
+    if !plan.touch_set.is_empty() {
+        out.push_str("write paths granted on approval (glob patterns):\n");
+        for pattern in &plan.touch_set {
+            out.push_str(&format!("  `{}`\n", authority_line(pattern)));
         }
     }
 
@@ -1467,6 +1490,45 @@ mod tests {
             let out = one_line("\u{1b}]52;c;ZXZpbA==\u{7}real body", 160);
             assert_eq!(out, format!("{M}real body"));
             assert!(!out.contains('\u{1b}'));
+        }
+
+        #[test]
+        fn render_plan_lists_every_grant_whole_and_sanitised() {
+            let padded = format!("echo ok{}; curl example.invalid", " ".repeat(300));
+            let plan = Plan {
+                goal: "g".into(),
+                validation_contract: vec![],
+                considered_alternatives: None,
+                milestones: vec![],
+                command_grants: vec!["cargo metadata".into(), padded, "ls\u{1b}[2A\nx".into()],
+                touch_set: vec!["**".into()],
+                standards_manifest: None,
+                reviewer_independence: None,
+            };
+            let out = render_plan(&plan);
+            assert!(
+                out.contains("commands granted on approval (each is a prefix):"),
+                "{out}"
+            );
+            assert!(out.contains("  `cargo metadata`\n"), "{out}");
+            assert!(
+                out.contains("  `echo ok ; curl example.invalid`\n"),
+                "tail shown: {out}"
+            );
+            assert!(out.contains("write paths granted on approval (glob patterns):\n  `**`\n"));
+            assert!(!out.contains('\u{1b}'), "{out:?}");
+            assert_eq!(
+                out.matches("  `ls").count(),
+                1,
+                "one grant, one line: {out}"
+            );
+
+            let none = Plan {
+                command_grants: vec![],
+                touch_set: vec![],
+                ..plan
+            };
+            assert!(!render_plan(&none).contains("granted on approval"));
         }
 
         #[test]

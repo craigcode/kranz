@@ -551,6 +551,7 @@ pub(crate) async fn dispatch_action(
             match host.request_plan(mission_id).await {
                 Ok(PlanOutcome::Ready { plan, estimate }) => {
                     let review = crate::format::build_plan_review(&crate::format::PlanReview {
+                        authority: crate::format::PlanAuthority::of(&plan),
                         mission_id: mission_id.clone(),
                         goal: plan.goal.clone(),
                         milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),

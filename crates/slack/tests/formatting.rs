@@ -54,6 +54,7 @@ fn all_text(blocks: &[Value]) -> String {
 fn plan_ready_block_kit() {
     let blocks = build_plan_ready(
         &PlanReady {
+            authority: Default::default(),
             mission_id: "m-42".into(),
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
@@ -244,6 +245,7 @@ fn approved_status_card_reads_approved_not_running() {
 #[test]
 fn plan_review_block_kit_has_start_and_queue_buttons() {
     let blocks = build_plan_review(&PlanReview {
+        authority: Default::default(),
         mission_id: "m-42".into(),
         goal: "Rate-limit the notes API".into(),
         milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
@@ -337,6 +339,7 @@ fn deep_link_shape_and_button_presence() {
 #[test]
 fn plan_ready_deep_link_present_only_when_url_set() {
     let p = PlanReady {
+        authority: Default::default(),
         mission_id: "m-42".into(),
         goal: "g".into(),
         milestone_titles: vec![],
