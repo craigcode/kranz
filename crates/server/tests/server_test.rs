@@ -2424,6 +2424,74 @@ async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
     assert_eq!(row["merged"], true, "{row}");
 }
 
+/// Completion as the engine now records it: the validated mission tip sealed
+/// in a decision, then `mission.completed`.
+fn mark_mission_complete_at_tip(paths: &MissionPaths, id: &str, tip: &str) {
+    let mut log = EventLog::acquire(paths, id, Duration::ZERO, LockForce::No).unwrap();
+    log.append(EventKind::OrchestratorDecision {
+        summary: format!("{}{tip}", kranz_engine::merge::VALIDATED_TIP_DECISION),
+        detail: None,
+    })
+    .unwrap();
+    log.append(EventKind::MissionCompleted {}).unwrap();
+}
+
+/// 2026-11-10 audit INT-2: the merge lands only the commit the validators
+/// and final gates accepted. A mission branch that moved after completion is
+/// refused and the base is untouched; the unmoved branch merges.
+#[tokio::test]
+async fn merge_route_refuses_a_mission_branch_that_moved_after_validation() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    let paths = seed_diffable_mission(&repo_root, "m-moved", &base_sha, true);
+    let branch = "kranz/mission-m-moved";
+    let validated = raw_git(&repo_root, &["rev-parse", &format!("refs/heads/{branch}")])
+        .trim()
+        .to_string();
+    mark_mission_complete_at_tip(&paths, "m-moved", &validated);
+
+    // Something with ref write access appends unvalidated content.
+    raw_git(&repo_root, &["checkout", "-q", branch]);
+    std::fs::write(repo_root.join("smuggled.txt"), "never validated\n").unwrap();
+    raw_git(&repo_root, &["add", "smuggled.txt"]);
+    raw_git(&repo_root, &["commit", "-q", "-m", "late commit"]);
+    raw_git(&repo_root, &["checkout", "-q", "main"]);
+
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+    let base_before = raw_git(&repo_root, &["rev-parse", "refs/heads/main"]);
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-moved/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("never validated"), "{body}");
+    assert!(error.contains(&validated), "{body}");
+    assert_eq!(
+        base_before,
+        raw_git(&repo_root, &["rev-parse", "refs/heads/main"]),
+        "base branch must not advance"
+    );
+
+    // Back at the validated commit, the same mission merges.
+    raw_git(&repo_root, &["branch", "-f", branch, &validated]);
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-moved/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["merged"], true, "{body}");
+    assert!(!repo_root.join("smuggled.txt").exists());
+}
+
 #[tokio::test]
 async fn merge_route_fails_closed_when_base_has_no_gate_config() {
     if !setup() {

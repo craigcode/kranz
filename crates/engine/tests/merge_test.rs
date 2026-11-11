@@ -487,6 +487,66 @@ fn tags_named_like_the_branches_do_not_redirect_the_merge() {
     assert!(dir.path().join("src/lib.rs").exists());
 }
 
+/// 2026-11-10 audit INT-3: changed paths are reported as stored, never
+/// C-quoted, so a non-ASCII or quote-bearing filename still matches the
+/// `whenPaths` prefixes and path-scoped standards that key on it.
+#[test]
+fn changed_paths_are_never_c_quoted() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    let odd = "migrations/2026_\u{e9}t\u{e9} \"q\".sql";
+    seed_mission_branch_with_files(
+        &dir,
+        &repo,
+        &seed,
+        &[
+            (odd, "select 1;\n"),
+            ("migrations/plain.sql", "select 2;\n"),
+        ],
+    );
+    let mut paths = repo.changed_paths(&seed, "kranz/mission-x").unwrap();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![odd.to_string(), "migrations/plain.sql".to_string()]
+    );
+    assert!(paths.iter().all(|p| p.starts_with("migrations/")));
+}
+
+/// The sealed completion record parses back to the commit, and anything that
+/// is not exactly a 40-hex sha is ignored rather than trusted.
+#[test]
+fn validated_tip_reads_the_latest_well_formed_record() {
+    use kranz_engine::events::{Event, EventKind};
+    use kranz_engine::merge::{validated_tip, VALIDATED_TIP_DECISION};
+    let decision = |seq: u64, summary: String| Event {
+        seq,
+        ts: chrono::Utc::now(),
+        mission_id: "m-x".into(),
+        kind: EventKind::OrchestratorDecision {
+            summary,
+            detail: None,
+        },
+    };
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    assert_eq!(validated_tip(&[]), None);
+    assert_eq!(
+        validated_tip(&[
+            decision(1, format!("{VALIDATED_TIP_DECISION}{a}")),
+            decision(2, "unrelated".into()),
+            decision(3, format!("{VALIDATED_TIP_DECISION}{b}")),
+        ]),
+        Some(b)
+    );
+    assert_eq!(
+        validated_tip(&[decision(1, format!("{VALIDATED_TIP_DECISION}main"))]),
+        None
+    );
+}
+
 #[test]
 fn stale_base_warning_counts_sibling_merges_since_mission_base() {
     if !setup() {
