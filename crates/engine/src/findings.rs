@@ -145,7 +145,8 @@ impl MissionEngine {
     ) -> Result<FindingsConversion> {
         let findings_json = serde_json::to_string_pretty(findings)?;
         let message = format!(
-            "Validation of milestone {milestone_id} produced these findings:\n{findings_json}\n\n\
+            "Validation of milestone {milestone_id} produced the findings below.\n\n{note}\n\n\
+             {fenced}\n\n\
              For each finding decide: convert it to a fix-feature (it violates or endangers \
              the validation contract / feature criteria; fresh worker sessions will implement \
              fix features), WAIVE it with a one-line justification (cosmetic, \
@@ -159,7 +160,9 @@ impl MissionEngine {
              command assertion. The contract is the bar; minor severity is not automatically \
              waivable and major severity is not automatically fixable — judge. Respond with \
              ONLY this JSON:\n\
-             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"waived\":[{{\"subject\":\"string\",\"reason\":\"string\"}}],\"commandBroken\":[{{\"subject\":\"string\",\"diagnosis\":\"string\"}}],\"summary\":\"string\"}}"
+             {{\"fixFeatures\":[{{\"title\":\"string\",\"spec\":\"string\",\"validationCriteria\":[\"string\"]}}],\"waived\":[{{\"subject\":\"string\",\"reason\":\"string\"}}],\"commandBroken\":[{{\"subject\":\"string\",\"diagnosis\":\"string\"}}],\"summary\":\"string\"}}",
+            note = crate::presentation::UNTRUSTED_SESSION_TEXT_NOTE,
+            fenced = crate::presentation::fence_session_text("FINDINGS", &findings_json),
         );
         let (decision, text) = self.json_decision::<FixFeaturesDecision>(&message).await?;
         let (specs, waived, command_broken, summary) = match decision {

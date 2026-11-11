@@ -18,6 +18,8 @@ verified_against:
   - 'command: cargo test -p kranz-slack'
 ---
 
+Rechecked 2026-11-11 (UTC) against the second audit round: the plan-ready card offers no approve buttons for a mission already queued or started, and a card Slack rejects as content is replaced by a plain notice (the event is skipped if that is rejected too). Routing and the allowlist gate are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the consent-display fixes: the grant card withholds Approve for a long, padded or hidden-character target and escapes hidden characters in what it shows. Grant routing, the allowlist gate and the button value format are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the ticket-queue binding: the todo Queue button carries the drafted mission its row showed, and the host's ticket approve call takes that mission and refuses a ticket re-drafted since. The typed `queue` and `approve <slug>` commands name no mission and behave as before.

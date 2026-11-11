@@ -122,6 +122,26 @@ pub(crate) async fn github_hook(
         ));
     };
 
+    // Each CI-failure draft starts a paid planner session; a burst of failing
+    // runs gets the first few and a clear refusal after that.
+    if !hooks::ci_draft_allowed(&repo_root, &trigger, &cfg) {
+        decision_trigger(
+            &trigger,
+            "rate-limited",
+            "hooks.ciDraftsPerHour reached for CI-failure drafts",
+        );
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "outcome": "rate-limited",
+                "reason": format!(
+                    "at most {} CI-failure tickets are drafted per hour (hooks.ciDraftsPerHour)",
+                    cfg.ci_drafts_per_hour
+                ),
+            })),
+        ));
+    }
+
     match hooks::draft_trigger_ticket(&repo_root, &trigger).map_err(ApiError::from)? {
         TriggerDraft::Duplicate { slug } => {
             decision_trigger(

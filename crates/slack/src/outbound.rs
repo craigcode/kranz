@@ -84,6 +84,34 @@ pub enum NotifyClass {
 /// other branch stays a pure function of `event` + `state`. Git access is
 /// best-effort — any failure (no repo, unpinned base, missing branch) just
 /// degrades `diff_stat` to `None`, same as an unset cost.
+/// Whether `mission_id` is already queued or past approval in `repo_root`.
+/// Read at the moment the plan card is built, which is when its buttons are
+/// offered.
+fn plan_dispatch(repo_root: &Path, mission_id: &str) -> Option<crate::format::PlanDispatch> {
+    // "Running" is read from the mission's own log, not from the repo busy
+    // probe: a hosted planning engine holds the mission's log lock while it
+    // waits for approval, and that probe would call it busy.
+    let started = kranz_engine::event_log::EventLog::read_events(
+        &kranz_engine::paths::MissionPaths::new(repo_root, mission_id).events_file(),
+    )
+    .ok()
+    .and_then(|events| kranz_engine::reducer::fold(&events).ok())
+    .is_some_and(|state| {
+        !matches!(
+            state.mission.status,
+            kranz_engine::types::MissionStatus::Planning
+                | kranz_engine::types::MissionStatus::Approved
+        )
+    });
+    if started {
+        Some(crate::format::PlanDispatch::Running)
+    } else if kranz_engine::queue::contains(repo_root, mission_id) {
+        Some(crate::format::PlanDispatch::Queued)
+    } else {
+        None
+    }
+}
+
 pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option<Outbound> {
     match &event.kind {
         EventKind::GateResolutionRecorded { resolution }
@@ -118,6 +146,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             milestone_titles: plan.milestones.iter().map(|m| m.title.clone()).collect(),
             assertion_count: plan.validation_contract.len(),
             plan_identity: crate::format::plan_identity(plan),
+            dispatched: plan_dispatch(repo_root, &state.mission.id),
         })),
 
         EventKind::PlanRevisionProposed {

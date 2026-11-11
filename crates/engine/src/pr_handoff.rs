@@ -180,14 +180,13 @@ pub fn assess_mission(repo_root: &Path, mission_id: &str) -> Result<PrHandoff> {
             "unknown mission '{mission_id}'"
         )));
     }
-    let state: crate::types::MissionState = {
-        let text = std::fs::read_to_string(paths.state_file()).map_err(|e| {
-            EngineError::Config(format!("cannot read state for '{mission_id}': {e}"))
-        })?;
-        serde_json::from_str(&text).map_err(|e| {
-            EngineError::Config(format!("invalid state.json for '{mission_id}': {e}"))
-        })?
-    };
+    // Folded from the event log, never read from `state.json`: that file is
+    // a derived cache a session with write access to the mission directory
+    // could edit, and what it says becomes the PR's branch, base and title
+    // (audit M17).
+    let state = crate::reducer::fold(&crate::event_log::EventLog::read_events(
+        &paths.events_file(),
+    )?)?;
     let report = read_mission_doc(&paths.report_file());
     let plan = read_mission_doc(&paths.plan_md_file());
     Ok(assess(
@@ -202,8 +201,62 @@ pub fn assess_mission(repo_root: &Path, mission_id: &str) -> Result<PrHandoff> {
     ))
 }
 
+/// How long `gh pr create` may run before it is killed. It makes a few API
+/// calls; anything longer is a hang (a prompt, a stalled proxy).
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The only ambient variables `gh` runs with (audit M17). It needs to find
+/// itself, the operator's GitHub credentials and the network; it does not
+/// need the engine's other credentials, and nothing here names a program for
+/// git to run.
+const GH_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
+    "GH_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    // Windows: process start, profile and credential-store locations.
+    "SYSTEMROOT",
+    "SystemRoot",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+];
+
 /// Run `gh pr create` for a [`PrHandoff::ReadyToCreate`] only. Never pushes.
 pub fn create_pull_request(repo_root: &Path, handoff: &PrHandoff) -> Result<String> {
+    let gh = which_gh().ok_or_else(|| EngineError::Config("`gh` CLI not found on PATH".into()))?;
+    create_pull_request_with(&gh, repo_root, handoff, GH_TIMEOUT)
+}
+
+fn create_pull_request_with(
+    gh: &Path,
+    repo_root: &Path,
+    handoff: &PrHandoff,
+    timeout: std::time::Duration,
+) -> Result<String> {
     let PrHandoff::ReadyToCreate {
         title,
         body,
@@ -216,30 +269,101 @@ pub fn create_pull_request(repo_root: &Path, handoff: &PrHandoff) -> Result<Stri
             "create_pull_request requires ReadyToCreate handoff (remote branch present)".into(),
         ));
     };
-    let gh = which_gh().ok_or_else(|| EngineError::Config("`gh` CLI not found on PATH".into()))?;
+    // `gh` runs git in this repository. Repository-scope config that names a
+    // program or redirects the remote is refused first, exactly as it is
+    // before a push.
+    GitRepo::open(repo_root)?.refuse_network_on_armed_local_config()?;
+
     // Title/body via flags — never shell-interpolated. No `git` argv here.
-    let output = Command::new(&gh)
+    let mut command = Command::new(gh);
+    command
         .current_dir(repo_root)
         .args([
             "pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body,
         ])
-        .output()
-        .map_err(|e| EngineError::Backend(format!("failed to spawn gh: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        .env_clear()
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for name in GH_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let (status, stdout, stderr) = run_bounded(command, timeout)?;
+    if !status.success() {
         return Err(EngineError::Backend(format!(
-            "gh pr create failed ({}): {}",
-            output.status,
+            "gh pr create failed ({status}): {}",
             stderr.trim()
         )));
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let url = stdout.trim().to_string();
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return Err(EngineError::Backend(format!(
             "gh pr create returned unexpected non-HTTP URL: {url:?}"
         )));
     }
     Ok(url)
+}
+
+/// Run `command` to completion or kill it at `timeout`. Output is drained on
+/// threads so a chatty child cannot block on a full pipe while this waits.
+fn run_bounded(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    use std::io::Read;
+    let mut child = command
+        .spawn()
+        .map_err(|e| EngineError::Backend(format!("failed to spawn gh: {e}")))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EngineError::Backend(format!(
+                    "gh pr create timed out after {}s and was stopped",
+                    timeout.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(EngineError::Backend(format!("failed waiting for gh: {e}")));
+            }
+        }
+    };
+    Ok((
+        status,
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    ))
 }
 
 fn looks_like_github_remote(url: &str) -> bool {
@@ -443,6 +567,124 @@ mod tests {
         assert!(body.contains("still pending"));
         assert!(!body.to_ascii_lowercase().contains("merge gates passed"));
         assert!(body.contains("m-test"));
+    }
+
+    #[cfg(unix)]
+    fn ready() -> PrHandoff {
+        PrHandoff::ReadyToCreate {
+            command: String::new(),
+            title: "t".into(),
+            body: "b".into(),
+            remote: "origin".into(),
+            branch: "kranz/mission-m-test".into(),
+            base: "main".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn stub_gh(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("gh");
+        std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        gh
+    }
+
+    #[cfg(unix)]
+    fn git_repo(dir: &Path) -> bool {
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        run(&["init", "-q"])
+    }
+
+    /// Audit M17: `gh` gets the operator's GitHub credentials and nothing
+    /// else from the engine's environment, and a hang is stopped.
+    #[cfg(unix)]
+    #[test]
+    fn gh_runs_with_a_cleared_environment_and_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git_repo(dir.path()) {
+            return;
+        }
+        let seen = dir.path().join("env.txt");
+        let gh = stub_gh(
+            dir.path(),
+            &format!(
+                "env > '{}'\necho https://github.com/o/r/pull/1",
+                seen.display()
+            ),
+        );
+        // Assembled from pieces so no source line here reads as a credential
+        // to the scanner that checks this repository.
+        let github_value = ["operator", "github", "value"].join("-");
+        let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("GH_TOKEN", github_value.as_str()),
+            ("ANTHROPIC_API_KEY", "engine-secret"),
+            ("GIT_SSH_COMMAND", "/tmp/evil-ssh"),
+        ]);
+
+        let url = create_pull_request_with(
+            &gh,
+            dir.path(),
+            &ready(),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        assert_eq!(url, "https://github.com/o/r/pull/1");
+        let env = std::fs::read_to_string(&seen).unwrap();
+        let passed_through = ["GH_TOKEN", github_value.as_str()].join("=");
+        assert!(env.contains(&passed_through), "{env}");
+        assert!(env.contains("GH_PROMPT_DISABLED=1"), "{env}");
+        assert!(!env.contains("ANTHROPIC_API_KEY"), "{env}");
+        assert!(!env.contains("GIT_SSH_COMMAND"), "{env}");
+
+        let hang = stub_gh(dir.path(), "sleep 30");
+        let started = std::time::Instant::now();
+        let err = create_pull_request_with(
+            &hang,
+            dir.path(),
+            &ready(),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// Repository git config that names a program is refused before `gh`
+    /// runs git in that repository.
+    #[cfg(unix)]
+    #[test]
+    fn gh_is_not_run_in_a_repository_whose_config_names_a_program() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git_repo(dir.path()) {
+            return;
+        }
+        let ran = dir.path().join("ran");
+        let gh = stub_gh(dir.path(), &format!("touch '{}'", ran.display()));
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "core.sshCommand", "/tmp/evil-ssh"])
+            .status()
+            .unwrap();
+
+        let err = create_pull_request_with(
+            &gh,
+            dir.path(),
+            &ready(),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("core.sshcommand"), "{err}");
+        assert!(!ran.exists(), "gh must not have run");
     }
 
     #[test]

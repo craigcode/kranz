@@ -299,6 +299,51 @@ fn pr_comment_payload(body: &str) -> Value {
 // Accepted triggers
 // ---------------------------------------------------------------------------
 
+/// Audit M23: a failing run past the hourly limit is refused with 429 and
+/// starts nothing; a repeat of a run that already has a ticket still reports
+/// as a duplicate.
+#[tokio::test]
+async fn ghook_ci_failures_past_the_hourly_limit_are_refused() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_hook_repo(Some(SECRET));
+    let app = hook_app(&root, 0);
+    let tickets = Ticket::tickets_dir(&root);
+    std::fs::create_dir_all(&tickets).unwrap();
+    for id in 1..=kranz_engine::hooks::DEFAULT_CI_DRAFTS_PER_HOUR {
+        std::fs::write(
+            tickets.join(format!("trigger-ci-{id}.md")),
+            "---\ntitle: earlier failure\n---\n\n## Goal\nfix it\n",
+        )
+        .unwrap();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(hook_post(
+            "workflow_run",
+            Some(SECRET),
+            &workflow_run_payload("failure", "main"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_json(response).await;
+    assert_eq!(body["outcome"], "rate-limited");
+    assert!(!tickets.join("trigger-ci-9876543210.md").exists());
+    assert!(MissionPaths::list_missions(&root).is_empty());
+
+    let mut repeat = workflow_run_payload("failure", "main");
+    repeat["workflow_run"]["id"] = json!(1);
+    let response = app
+        .oneshot(hook_post("workflow_run", Some(SECRET), &repeat))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(response).await["outcome"], "duplicate");
+}
+
 #[tokio::test]
 async fn ghook_ci_failure_drafts_one_ticket_and_second_event_dedupes() {
     if !setup() {
