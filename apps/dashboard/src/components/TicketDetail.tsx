@@ -13,6 +13,7 @@ import { api } from '../lib/api';
 import { renderMarkdown } from '../lib/markdown';
 import { relTime } from '../lib/format';
 import { repoHash } from '../lib/routes';
+import { visible } from '../lib/presentation';
 import type { MissionEvent, Ticket } from '../lib/types';
 
 function describeEvent(e: MissionEvent): string {
@@ -39,7 +40,7 @@ function ListSection({ title, items }: { title: string; items: string[] }) {
       <div className="section-label">{title}</div>
       <ul>
         {items.map((item, i) => (
-          <li key={i}>{item}</li>
+          <li key={i}>{visible(item)}</li>
         ))}
       </ul>
     </div>
@@ -82,7 +83,7 @@ export function TicketDetail({ slug }: { slug: string }) {
   if (loadError !== null) {
     return (
       <div className="picker-error" role="alert">
-        Could not load ticket: {loadError}{' '}
+        Could not load ticket: {visible(loadError)}{' '}
         <button type="button" className="btn-small" onClick={load}>
           retry
         </button>
@@ -118,7 +119,7 @@ export function TicketDetail({ slug }: { slug: string }) {
       <div className="picker-box ticket-detail">
         <div className="picker-title">
           <span className="picker-brand mono">KRANZ</span>
-          <span className="mono">{ticket.slug}</span>
+          <span className="mono">{visible(ticket.slug)}</span>
           <span className={`status-pill pill-${ticket.state}`}>
             <span className="status-dot" aria-hidden="true" />
             {ticket.state}
@@ -134,16 +135,16 @@ export function TicketDetail({ slug }: { slug: string }) {
           </button>
         </div>
 
-        <h2>{ticket.title}</h2>
+        <h2>{visible(ticket.title)}</h2>
 
         <div className="ticket-section">
           <div className="section-label">Goal</div>
-          {renderMarkdown(ticket.goal)}
+          {renderMarkdown(visible(ticket.goal.replace(/\r\n/g, '\n')))}
         </div>
 
         <div className="ticket-section">
           <div className="section-label">Context</div>
-          {renderMarkdown(ticket.context)}
+          {renderMarkdown(visible(ticket.context.replace(/\r\n/g, '\n')))}
         </div>
 
         <ListSection title="Scoping answers" items={ticket.scopingAnswers} />
@@ -153,11 +154,11 @@ export function TicketDetail({ slug }: { slug: string }) {
             <div className="section-label">Review artifact contract</div>
             <div>
               <span className="dim">read-only input </span>
-              <code>{ticket.reviewArtifact}</code>
+              <code>{visible(ticket.reviewArtifact)}</code>
             </div>
             <div>
               <span className="dim">required output </span>
-              <code>{ticket.reviewOutput}</code>
+              <code>{visible(ticket.reviewOutput ?? '')}</code>
             </div>
           </div>
         )}
@@ -167,17 +168,17 @@ export function TicketDetail({ slug }: { slug: string }) {
             {ticket.signal != null && (
               <div>
                 <span className="dim">signal </span>
-                <code>{ticket.signal}</code>
+                <code>{visible(ticket.signal)}</code>
               </div>
             )}
             <div>
               <span className="dim">consent </span>
-              <code>{ticket.signalProposal ?? 'consented'}</code>
+              <code>{visible(ticket.signalProposal ?? 'consented')}</code>
             </div>
             {ticket.tracedFromMission != null && (
               <div>
                 <span className="dim">traced from mission </span>
-                <code>{ticket.tracedFromMission}</code>
+                <code>{visible(ticket.tracedFromMission)}</code>
               </div>
             )}
             {ticket.signalCandidates != null && ticket.signalCandidates.length > 0 && (
@@ -192,7 +193,7 @@ export function TicketDetail({ slug }: { slug: string }) {
                     <option value="">None (unconfirmed)</option>
                     {ticket.signalCandidates.map((cand) => (
                       <option key={cand} value={cand}>
-                        {cand}
+                        {visible(cand)}
                       </option>
                     ))}
                   </select>
@@ -205,13 +206,13 @@ export function TicketDetail({ slug }: { slug: string }) {
         {ticket.wrongPlan !== null && (
           <div className="ticket-section">
             <div className="section-label">Wrong plan (planner escalation)</div>
-            <p>{ticket.wrongPlan}</p>
+            <p>{visible(ticket.wrongPlan)}</p>
           </div>
         )}
 
         {ticketError !== null && (
           <div className="picker-error" role="alert">
-            {ticketError}
+            {visible(ticketError)}
           </div>
         )}
 
@@ -257,7 +258,7 @@ export function TicketDetail({ slug }: { slug: string }) {
             <ul className="log-list">
               {events.map((e) => (
                 <li key={e.seq} className="log-row">
-                  <span className="log-text">{describeEvent(e)}</span>
+                  <span className="log-text">{visible(describeEvent(e))}</span>
                   <span className="log-time dim mono">{relTime(e.ts)}</span>
                 </li>
               ))}

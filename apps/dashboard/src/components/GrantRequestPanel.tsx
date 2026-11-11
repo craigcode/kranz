@@ -11,7 +11,7 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
 import { pendingGrant } from '../lib/pendingAsks';
-import { hasAmbiguous, visible } from '../lib/presentation';
+import { hasAmbiguous, sizeNote, visible } from '../lib/presentation';
 import { useKranzStore } from '../lib/store';
 
 export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
@@ -62,6 +62,7 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
       <div className="revision-body">
         <div className="dim">{blurb}</div>
         <pre className="revision-diff">{visible(pending.command)}</pre>
+        {sizeNote(pending.command) !== null && <div className="dim">{sizeNote(pending.command)}</div>}
         {ambiguous && (
           <p role="status">
             Blocked: invisible or control characters make this request unsafe to approve.

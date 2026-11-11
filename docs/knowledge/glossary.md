@@ -23,6 +23,8 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the orchestrator backend rule: the project layer may set `orchestrator.backend` only to `claude`; the operator-only entry says so. No other term changed.
+
 Rechecked 2026-11-11 (UTC) against the ticket-queue binding: the Slack todo Queue target now carries a mission id alongside the slug. No glossary term changed meaning.
 
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: webhook queueing now needs the operator-only `hooks.autoQueue` key, documented in `docs/protocol.md`. No term changed.
@@ -142,7 +144,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   containment escape: `claudeBinary`, `packDir`, `contractEnvPassthrough`,
   `slack`, `hookStatus`, `<role>.baseUrl`, `<role>.acpProfile`, the `<role>.sandbox.*` widening
   keys, and the `dangerouslyAllowAll` family. They are settable from the global
-  layer only. A repository may RAISE `sandbox.enforce`, never lower it.
+  layer only. A repository may RAISE `sandbox.enforce`, never lower it, and
+  may set `orchestrator.backend` only to `claude`, since orchestrator sessions
+  run at the primary checkout without a sandbox.
   Runtime `config-change` patches carry the same split by source: the
   authenticated control inbox may re-tune bounded mission knobs, while
   consent-bearing keys need an operator surface.

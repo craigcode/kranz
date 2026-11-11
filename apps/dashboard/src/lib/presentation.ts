@@ -9,6 +9,16 @@ export function visible(text: string): string {
     : c).join('');
 }
 
+/** A size line for text an approval acts on, so padding that pushes the end
+ * of a command far from its start is announced before it is read. `null`
+ * for short single-line text, which needs no note. */
+export function sizeNote(text: string): string | null {
+  const lines = text.split('\n').length;
+  const chars = Array.from(text).length;
+  if (lines === 1 && chars <= 200) return null;
+  return `${lines} line${lines === 1 ? '' : 's'} · ${chars} characters, shown in full`;
+}
+
 export function hasAmbiguous(value: unknown): boolean {
   if (typeof value === 'string') return ambiguous.test(value);
   if (Array.isArray(value)) return value.some(hasAmbiguous);

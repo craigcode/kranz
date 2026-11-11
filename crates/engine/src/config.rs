@@ -659,6 +659,20 @@ fn walk_project_layer(
                 )));
             }
         }
+        // Orchestrator sessions run at the primary checkout with no OS
+        // sandbox; what bounds them is the Claude CLI's own tool
+        // restrictions, which the other backends do not honour the same way.
+        // So a repository may ask for the contained backend and may not pick
+        // another one (audit M9). Worker and validator backends stay
+        // repo-settable: those sessions run inside the sandbox and worktree.
+        if dotted == "orchestrator.backend" && value.as_str() != Some("claude") {
+            return Err(project_layer_refusal(
+                file,
+                &dotted,
+                "it selects the backend for sessions that run at the primary checkout \
+                 without a sandbox; a repository may only set it to \"claude\"",
+            ));
+        }
         if let Some(rule) = config_trust_rule(&normalized) {
             match rule.project {
                 ProjectPolicy::OperatorOnly => {
@@ -2959,6 +2973,47 @@ mod tests {
                 "project layer must refuse weakening {patch}"
             );
         }
+    }
+
+    /// Audit M9: a repository cannot move the orchestrator, which runs at the
+    /// primary checkout without a sandbox, onto a backend that does not
+    /// enforce the tool restrictions. The operator's own layer still can, and
+    /// worker backends stay repo-settable.
+    #[test]
+    fn project_layer_cannot_pick_a_non_claude_orchestrator_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.json");
+        let write = |value: serde_json::Value| {
+            std::fs::write(&project, value.to_string()).unwrap();
+        };
+
+        for backend in ["codex", "droid", "local", "acp"] {
+            write(serde_json::json!({ "orchestrator": { "backend": backend } }));
+            let err = load_layers_with_roles(&[(project.clone(), Layer::Project)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("orchestrator.backend"), "{backend}: {err}");
+        }
+
+        write(serde_json::json!({ "orchestrator": { "backend": "claude" } }));
+        load_layers_with_roles(&[(project.clone(), Layer::Project)])
+            .expect("asking for the contained backend is allowed");
+
+        write(serde_json::json!({ "validatorScrutiny": { "backend": "codex" } }));
+        load_layers_with_roles(&[(project.clone(), Layer::Project)])
+            .expect("sandboxed roles keep a repo-settable backend");
+
+        write(
+            serde_json::json!({ "orchestrator": { "backend": "codex", "model": "gpt-5.6-sol" } }),
+        );
+        let refused_as_project = load_layers_with_roles(&[(project.clone(), Layer::Project)]);
+        let as_operator = load_layers_with_roles(&[(project.clone(), Layer::Global)]);
+        assert!(refused_as_project.is_err());
+        assert!(
+            as_operator.is_ok(),
+            "the operator's own layer may still choose it: {:?}",
+            as_operator.err()
+        );
     }
 
     trait RoleConfigTestExt {
