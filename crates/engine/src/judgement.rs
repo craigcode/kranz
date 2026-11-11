@@ -99,12 +99,15 @@ impl MissionEngine {
         };
         let message = format!(
             "A worker run for feature {feature_id} just finished. Judge it.\n\n\
-             RUNNER VERDICT:\n{runner_summary}\n\n\
-             WORKER REPORT:\n{report_text}\n\n\
-             COMMITS THIS RUN:\n{commits_text}\n\n\
-             DIFF STAT:\n{diff_stat}\n\n\
+             {note}\n\n\
+             RUNNER VERDICT (engine-written):\n{runner_summary}\n\n\
+             {report}\n\n{commits}\n\n{stat}\n\n\
              Respond with ONLY this JSON:\n\
-             {{\"decision\":\"complete\"|\"failed\"|\"respawn\",\"guidance\":\"string\",\"summary\":\"string\"}}"
+             {{\"decision\":\"complete\"|\"failed\"|\"respawn\",\"guidance\":\"string\",\"summary\":\"string\"}}",
+            note = crate::presentation::UNTRUSTED_SESSION_TEXT_NOTE,
+            report = crate::presentation::fence_session_text("WORKER REPORT", &report_text),
+            commits = crate::presentation::fence_session_text("COMMITS THIS RUN", &commits_text),
+            stat = crate::presentation::fence_session_text("DIFF STAT", &diff_stat),
         );
         let (decision, text) = self.json_decision::<JudgementDecision>(&message).await?;
 
@@ -172,9 +175,11 @@ impl MissionEngine {
         let message = format!(
             "Final contract gate. Verify each of these agent-judgement assertions against \
              the mission's work (diff stat of {base}..HEAD below). Inspect the repository \
-             read-only as needed.\n\nASSERTIONS:\n{listed}\n\nDIFF STAT:\n{diff_stat}\n\n\
+             read-only as needed.\n\nASSERTIONS:\n{listed}\n\n{note}\n\n{stat}\n\n\
              Respond with ONLY this JSON:\n\
-             {{\"verdicts\":[{{\"id\":\"string\",\"pass\":true,\"evidence\":\"string\"}}],\"summary\":\"string\"}}"
+             {{\"verdicts\":[{{\"id\":\"string\",\"pass\":true,\"evidence\":\"string\"}}],\"summary\":\"string\"}}",
+            note = crate::presentation::UNTRUSTED_SESSION_TEXT_NOTE,
+            stat = crate::presentation::fence_session_text("DIFF STAT", &diff_stat),
         );
         let (decision, text) = self.json_decision::<VerdictsDecision>(&message).await?;
 
@@ -237,9 +242,11 @@ impl MissionEngine {
             "Flight Rules contextual final checker. Judge EVERY listed rule against the full \
              repository diff {base}..HEAD and current tree. Return exactly one verdict for each \
              listed id and no duplicate ids. The verdict is authoritative; do not infer policy \
-             from prose outside these pinned statements.\n\nRULES:\n{listed}\n\nDIFF STAT:\n{diff_stat}\n\n\
+             from prose outside these pinned statements.\n\nRULES:\n{listed}\n\n{note}\n\n{stat}\n\n\
              Respond with ONLY this JSON:\n\
-             {{\"verdicts\":[{{\"id\":\"string\",\"pass\":true,\"evidence\":\"string\"}}],\"summary\":\"string\"}}"
+             {{\"verdicts\":[{{\"id\":\"string\",\"pass\":true,\"evidence\":\"string\"}}],\"summary\":\"string\"}}",
+            note = crate::presentation::UNTRUSTED_SESSION_TEXT_NOTE,
+            stat = crate::presentation::fence_session_text("DIFF STAT", &diff_stat),
         );
         let (decision, text) = self.json_decision::<VerdictsDecision>(&message).await?;
         let (reports, summary) = match decision {
