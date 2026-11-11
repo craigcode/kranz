@@ -185,22 +185,17 @@ pub(crate) async fn approve_ticket(
     let value = crate::host::parse_body(&body)?;
     let force = value.get("force").and_then(Value::as_bool).unwrap_or(false);
     // A review surface names the drafted mission it showed. If the ticket was
-    // re-drafted from another surface since, that mission is no longer the
-    // one this approval would queue: refuse rather than queue an unseen plan.
-    if let Some(shown) = value.get("missionId") {
-        let shown = shown
-            .as_str()
-            .ok_or_else(|| ApiError::bad_request("missionId must be a string"))?;
-        let current = Ticket::mission_for(server.host.repo_root(), &slug);
-        if current.as_deref() != Some(shown) {
-            return Err(ApiError::conflict(format!(
-                "ticket '{slug}' was re-drafted: it now points at {}, not the reviewed {shown}. \
-                 Reload the ticket and review the current plan before queueing it.",
-                current.as_deref().unwrap_or("no drafted mission")
-            )));
-        }
-    }
-    let approved = server.host.approve_ticket(&slug, force)?;
+    // re-drafted from another surface since, the host refuses rather than
+    // queue an unseen plan.
+    let shown = match value.get("missionId") {
+        Some(shown) => Some(
+            shown
+                .as_str()
+                .ok_or_else(|| ApiError::bad_request("missionId must be a string"))?,
+        ),
+        None => None,
+    };
+    let approved = server.host.approve_ticket(&slug, force, shown)?;
     Ok(Json(
         json!({ "approved": true, "missionId": approved.mission_id }),
     ))

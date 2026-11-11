@@ -238,6 +238,7 @@ pub async fn run_approve_ticket_command(
     cfg: &SlackConfig,
     host: Option<&SharedHost>,
     slug: &str,
+    reviewed_mission: Option<&str>,
     user_id: Option<&str>,
 ) -> ApproveTicketInvocation {
     if !cfg.is_authorized(user_id) {
@@ -256,7 +257,7 @@ pub async fn run_approve_ticket_command(
             ))),
         };
     };
-    let result = match host.approve_ticket(slug).await {
+    let result = match host.approve_ticket(slug, reviewed_mission).await {
         Ok(mission_id) => error_blocks(&format!(
             ":white_check_mark: Approved and queued — ticket `{slug}` \u{2192} mission \
              `{mission_id}`. The `kranz work` dispatcher runs it next."

@@ -1024,7 +1024,9 @@ pub enum TicketCommand {
         /// The ticket slug
         slug: String,
 
-        /// The drafted mission id (auto-detected from the ticket goal if omitted)
+        /// The drafted mission id you reviewed (defaults to the ticket's
+        /// recorded draft). Refused when the ticket has been re-drafted and
+        /// now records a different mission
         #[arg(long, value_name = "ID")]
         mission: Option<String>,
 
@@ -1041,7 +1043,9 @@ pub enum TicketCommand {
         /// The ticket slug
         slug: String,
 
-        /// The drafted mission id (auto-detected from the ticket goal if omitted)
+        /// The drafted mission id you reviewed (defaults to the ticket's
+        /// recorded draft). Refused when the ticket has been re-drafted and
+        /// now records a different mission
         #[arg(long, value_name = "ID")]
         mission: Option<String>,
 

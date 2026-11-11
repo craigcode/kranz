@@ -1434,7 +1434,10 @@ fn pipeline_todo_actions(
                 } else {
                     (
                         "Queue reviewed plan for run.".to_string(),
-                        TodoTarget::QueueTicket { slug: slug.clone() },
+                        TodoTarget::QueueTicket {
+                            slug: slug.clone(),
+                            mission_id: row.mission_id.clone(),
+                        },
                     )
                 };
                 actions.push(TodoAction {

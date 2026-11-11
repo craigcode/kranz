@@ -23,6 +23,8 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the ticket-queue binding: the Slack todo Queue target now carries a mission id alongside the slug. No glossary term changed meaning.
+
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: webhook queueing now needs the operator-only `hooks.autoQueue` key, documented in `docs/protocol.md`. No term changed.
 
 Rechecked 2026-11-11 (UTC) against the scratch-removal and reaper fixes: ACP private-home cleanup now walks by directory descriptor. No term changed.

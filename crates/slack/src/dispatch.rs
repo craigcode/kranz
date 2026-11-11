@@ -647,7 +647,8 @@ pub(crate) async fn dispatch_action(
                 .await;
             } else if is_ticket_slug(repo_root, mission_id) {
                 let invocation =
-                    run_approve_ticket_command(cfg, host, mission_id, user_id.as_deref()).await;
+                    run_approve_ticket_command(cfg, host, mission_id, None, user_id.as_deref())
+                        .await;
                 if !invocation.authorized {
                     reply_ephemeral(
                         cfg,
@@ -684,6 +685,7 @@ pub(crate) async fn dispatch_action(
         // `/kranz approve <id>` instead of being interpreted as a mission id.
         Action::QueueTicket {
             slug,
+            reviewed_mission,
             user_id,
             response_url,
         } => {
@@ -701,7 +703,14 @@ pub(crate) async fn dispatch_action(
                 .await;
                 return;
             }
-            let invocation = run_approve_ticket_command(cfg, host, slug, user_id.as_deref()).await;
+            let invocation = run_approve_ticket_command(
+                cfg,
+                host,
+                slug,
+                reviewed_mission.as_deref(),
+                user_id.as_deref(),
+            )
+            .await;
             if !invocation.authorized {
                 reply_ephemeral(
                     cfg,
@@ -1432,6 +1441,7 @@ mod tests {
             None,
             &Action::QueueTicket {
                 slug: "m-a".into(),
+                reviewed_mission: None,
                 user_id: None,
                 response_url: None,
             },

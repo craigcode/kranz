@@ -105,13 +105,17 @@ impl PlanningHost for HostedPlanning {
         Box::pin(async move { self.0.draft(slug, false).await.map_err(plain) })
     }
 
-    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+    fn approve_ticket<'a>(
+        &'a self,
+        slug: &'a str,
+        reviewed_mission: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<String>> {
         // `force: false` — `/kranz approve <slug>` runs the plain gate, same
         // as REST's default body; a blocked-by refusal is a refusal, not a
         // reason to silently override it from Slack.
         Box::pin(async move {
             self.0
-                .approve_ticket(slug, false)
+                .approve_ticket(slug, false, reviewed_mission)
                 .map(|a| a.mission_id)
                 .map_err(plain)
         })
