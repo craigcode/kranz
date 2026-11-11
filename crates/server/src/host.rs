@@ -378,6 +378,10 @@ impl MissionHost {
             })?;
         }
         config::validate(&cfg)?;
+        // `config::load` checked the layered files' `claudeBinary`; a request
+        // patch can replace it afterwards, and it names the program this host
+        // is about to execute (audit M22).
+        config::validate_claude_binary(&cfg, &self.repo_root)?;
 
         let backend = self.backend(cfg.claude_binary.as_deref()).await?;
         let engine = MissionEngine::create(backend, self.repo_root.clone(), goal, cfg)?;
@@ -2618,6 +2622,32 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(json!(actual), fixture);
+    }
+
+    /// Audit M22: a request patch is merged after the layered files were
+    /// checked, so the binary it names is checked again before anything runs.
+    #[tokio::test]
+    async fn create_refuses_a_patched_claude_binary_the_file_layers_would_refuse() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+        let inside = root.join("tools").join("claude");
+
+        for binary in [
+            json!("bin/claude"),
+            json!(inside.to_str().unwrap()),
+            json!(""),
+        ] {
+            let patch = json!({ "claudeBinary": binary });
+            let err = host
+                .create("ship it", Some(&patch))
+                .await
+                .expect_err("a relative, in-repo or empty binary must be refused");
+            assert!(err.message.contains("claudeBinary"), "{}", err.message);
+        }
+        assert!(kranz_engine::paths::MissionPaths::list_missions(&root).is_empty());
     }
 
     #[tokio::test]

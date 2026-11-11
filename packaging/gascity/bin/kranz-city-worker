@@ -144,6 +144,27 @@ valid_mission_id() {
     printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
 }
 
+# A runtime file this adapter may act on: a regular file, not a link, that
+# git does not track. kranz never commits anything under .kranz/missions/, so
+# a tracked receipt or state file came with the repository, not from a
+# mission this host ran, and must not decide which bead is closed.
+runtime_file() {
+    # $1 = rig directory, $2 = path relative to it.
+    [ -f "$1/$2" ] && [ ! -L "$1/$2" ] || return 1
+    if git -C "$1" ls-files --error-unmatch -- "$2" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# Echoes a mission's folded status, or nothing when its state file is absent
+# or not a runtime file.
+mission_status() {
+    # $1 = rig directory, $2 = mission id.
+    runtime_file "$1" ".kranz/missions/$2/state.json" || return 0
+    jq -r '.mission.status // empty' < "$1/.kranz/missions/$2/state.json" 2>/dev/null || true
+}
+
 native_terminal_return() {
     RIG_LIST=$(mktemp "$WORK_ROOT/.kranz-rigs.XXXXXX") || return 1
     write_native_rigs "$RIG_LIST" || { rm -f "$RIG_LIST"; return 1; }
@@ -151,6 +172,7 @@ native_terminal_return() {
         [ -d "$RIG_DIR/.git" ] || continue
         for SOURCE in "$RIG_DIR"/.kranz/missions/*/enqueue-source.json; do
             [ -e "$SOURCE" ] || continue
+            runtime_file "$RIG_DIR" "${SOURCE#"$RIG_DIR"/}" || continue
             SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
             PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
             MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || MID=""
@@ -160,7 +182,7 @@ native_terminal_return() {
             [ "$PRODUCER" = "gascity" ] || continue
             valid_mission_id "$MID" || continue
             [ -n "$MID" ] && [ "$MID" = "$DIR_MID" ] && [ -n "$ID" ] || continue
-            STATUS=$(jq -r '.mission.status // empty' < "$RIG_DIR/.kranz/missions/$MID/state.json" 2>/dev/null) || STATUS=""
+            STATUS=$(mission_status "$RIG_DIR" "$MID")
             case $STATUS in
                 complete | blocked | failed | abandoned) : ;;
                 *) continue ;;
@@ -186,6 +208,7 @@ native_queue_front() {
             [ -n "$MID" ] || continue
             valid_mission_id "$MID" || break
             SOURCE="$RIG_DIR/.kranz/missions/$MID/enqueue-source.json"
+            runtime_file "$RIG_DIR" ".kranz/missions/$MID/enqueue-source.json" || break
             SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
             PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
             SOURCE_MID=$(jq -r '.missionId // empty' < "$SOURCE" 2>/dev/null) || SOURCE_MID=""

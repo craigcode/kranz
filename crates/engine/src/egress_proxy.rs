@@ -59,7 +59,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -564,7 +564,13 @@ async fn read_request_head(reader: &mut BufReader<TcpStream>) -> std::io::Result
     let mut head = String::new();
     loop {
         let mut line = String::new();
-        let read = tokio::time::timeout(HEAD_TIMEOUT, reader.read_line(&mut line))
+        // `read_line` alone buffers until it sees a newline, so a client that
+        // never sends one could grow this string without limit before the
+        // size check below ever ran. Cap the read itself: one byte past the
+        // budget is enough to trip that check.
+        let budget = (MAX_HEAD_BYTES + 1).saturating_sub(head.len()) as u64;
+        let mut limited = (&mut *reader).take(budget);
+        let read = tokio::time::timeout(HEAD_TIMEOUT, limited.read_line(&mut line))
             .await
             .map_err(|_| {
                 std::io::Error::new(
@@ -747,6 +753,33 @@ mod tests {
             }),
             hook_status: None,
         }
+    }
+
+    /// Audit SBX-8: a client that sends bytes and never a newline is cut off
+    /// at the head budget instead of being buffered without limit.
+    #[tokio::test]
+    async fn a_request_head_with_no_newline_is_refused_at_the_size_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Far more than the budget, with no line terminator anywhere.
+            let _ = stream.write_all(&vec![b'A'; MAX_HEAD_BYTES * 8]).await;
+            let _ = stream.flush().await;
+            // Hold the connection open: the refusal must not depend on EOF.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            read_request_head(&mut reader),
+        )
+        .await
+        .expect("the read is bounded by size, not by the client closing")
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        client.abort();
     }
 
     // -- CONNECT parsing ----------------------------------------------------

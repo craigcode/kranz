@@ -61,6 +61,7 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
 
   const decide = async (kind: 'approve' | 'reject') => {
     if (pending === null) return;
+    if (kind === 'approve' && diff === null) return;
     setDecisionBusy(kind);
     setError(null);
     try {
@@ -86,11 +87,22 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
       {pending !== null ? (
         <div className="revision-body">
           <div className="revision-instructions">{visible(pending.instructions)}</div>
+          {/* The diff is what is being approved, so it comes first and Approve
+              waits for it: approving while it was still loading, or after it
+              failed to load, would be consent to something never shown. */}
+          {diff === null && error === null && <div className="dim panel-empty">Loading diff...</div>}
+          {diff !== null && <pre className="revision-diff">{visible(diff)}</pre>}
+          {diff === null && error !== null && (
+            <p role="status">
+              The revision diff could not be loaded, so it cannot be approved here. Reject it, or
+              reload and try again.
+            </p>
+          )}
           <div className="revision-actions">
             <button
               type="button"
               className="strip-btn"
-              disabled={decisionBusy !== null}
+              disabled={decisionBusy !== null || diff === null}
               onClick={() => void decide('approve')}
             >
               {decisionBusy === 'approve' ? 'Approving...' : 'Approve'}
@@ -104,8 +116,6 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
               {decisionBusy === 'reject' ? 'Rejecting...' : 'Reject'}
             </button>
           </div>
-          {diff === null && error === null && <div className="dim panel-empty">Loading diff...</div>}
-          {diff !== null && <pre className="revision-diff">{visible(diff)}</pre>}
         </div>
       ) : (
         <div className="revision-body">

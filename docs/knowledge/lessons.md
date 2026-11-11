@@ -10,6 +10,8 @@ verified_against:
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
 
+Rechecked 2026-11-11 (UTC) after the invariants note was rechecked against the second audit round. No lesson changed.
+
 Rechecked 2026-11-11 (UTC) after the invariants note was rechecked against the Linux socket mask. No lesson changed.
 
 Rechecked 2026-11-11 (UTC) after the invariants note was rechecked against the evidence and containment fixes. No lesson changed.

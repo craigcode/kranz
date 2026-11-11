@@ -454,7 +454,11 @@ fn ghook_load_hooks_refuses_auto_queue_from_the_project_layer() {
     // global file leaves alone, so sharing the isolated home is safe.
     let global = kranz_engine::paths::global_config().expect("isolated home resolves");
     std::fs::create_dir_all(global.parent().unwrap()).unwrap();
-    std::fs::write(&global, r#"{ "hooks": { "autoQueue": true } }"#).unwrap();
+    // Replaced by rename: other tests in this binary read the same file and
+    // must never see it half-written.
+    let staged = global.with_extension("json.staged");
+    std::fs::write(&staged, r#"{ "hooks": { "autoQueue": true } }"#).unwrap();
+    std::fs::rename(&staged, &global).unwrap();
     let cfg = hooks::load_hooks(tmp.path());
     let _ = std::fs::remove_file(&global);
     let cfg = cfg.unwrap();
@@ -534,6 +538,77 @@ fn ghook_draft_trigger_ticket_writes_provenance_and_dedupes() {
     let again = hooks::draft_trigger_ticket(tmp.path(), &trigger).unwrap();
     assert_eq!(again, TriggerDraft::Duplicate { slug: slug.clone() });
     assert_eq!(trigger_tickets_in(tmp.path()), vec![slug]);
+}
+
+/// Audit M23: each CI-failure draft starts a paid planner session, so only
+/// `ciDraftsPerHour` new ones are allowed per rolling hour. A repeat of a
+/// run already ticketed is a duplicate, not a new draft, and comment
+/// triggers are not counted.
+#[test]
+fn ghook_ci_failure_drafts_are_capped_per_hour() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = HooksConfig {
+        ci_drafts_per_hour: 2,
+        ..cfg_with_secret()
+    };
+    let run = |id: u64| {
+        let mut payload = workflow_run_payload("completed", "failure", "main");
+        payload["workflow_run"]["id"] = serde_json::json!(id);
+        hooks::parse_trigger("workflow_run", &payload, &cfg).unwrap()
+    };
+
+    for id in [101, 102] {
+        let trigger = run(id);
+        assert!(hooks::ci_draft_allowed(tmp.path(), &trigger, &cfg));
+        hooks::draft_trigger_ticket(tmp.path(), &trigger).unwrap();
+    }
+    assert!(
+        !hooks::ci_draft_allowed(tmp.path(), &run(103), &cfg),
+        "a third new run inside the hour is over the limit"
+    );
+    assert!(
+        hooks::ci_draft_allowed(tmp.path(), &run(101), &cfg),
+        "a run that already has a ticket is reported as a duplicate, not limited"
+    );
+    assert!(hooks::ci_draft_allowed(
+        tmp.path(),
+        &comment_trigger("kranz:fix the flaky test"),
+        &cfg
+    ));
+
+    let off = HooksConfig {
+        ci_drafts_per_hour: 0,
+        ..cfg_with_secret()
+    };
+    assert!(!hooks::ci_draft_allowed(
+        TempDir::new().unwrap().path(),
+        &run(104),
+        &off
+    ));
+}
+
+/// A repository may lower the CI draft limit and may not raise it.
+#[test]
+fn ghook_load_hooks_lets_the_project_layer_only_lower_the_ci_draft_limit() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let kranz = tmp.path().join(".kranz");
+    std::fs::create_dir_all(&kranz).unwrap();
+    let write = |n: &str| {
+        std::fs::write(
+            kranz.join("config.json"),
+            format!(r#"{{ "hooks": {{ "ciDraftsPerHour": {n} }} }}"#),
+        )
+        .unwrap();
+    };
+
+    write("1");
+    assert_eq!(hooks::load_hooks(tmp.path()).unwrap().ci_drafts_per_hour, 1);
+    for raised in ["50", "\"lots\""] {
+        write(raised);
+        let err = hooks::load_hooks(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("hooks.ciDraftsPerHour"), "{err}");
+    }
 }
 
 #[test]

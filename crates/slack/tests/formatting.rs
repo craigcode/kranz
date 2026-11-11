@@ -60,6 +60,7 @@ fn plan_ready_block_kit() {
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
             assertion_count: 2,
             plan_identity: "planid0000000000".into(),
+            dispatched: None,
         },
         None,
     );
@@ -345,6 +346,7 @@ fn plan_ready_deep_link_present_only_when_url_set() {
         milestone_titles: vec![],
         assertion_count: 1,
         plan_identity: "planid0000000000".into(),
+        dispatched: None,
     };
     assert!(actions_button_urls(&build_plan_ready(&p, None)).is_empty());
     assert_eq!(

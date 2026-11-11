@@ -128,7 +128,7 @@ must originate in the receiving repository; a fork's matching branch name
 does not authorize a draft.
 In a multi-repository
 serve the repo-scoped twin `/api/repos/:repoId/hooks/github` verifies against
-THAT repository's config and identity.
+THAT repository's config and identity. CI-failure triggers are capped: at most `hooks.ciDraftsPerHour` new tickets (default 3) are drafted per rolling hour, and a further failing run is answered `429` with `outcome: "rate-limited"`. The project file may lower that number and may not raise it.
 
 | Method/Path | Behavior |
 |---|---|

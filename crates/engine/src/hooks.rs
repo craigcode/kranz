@@ -61,7 +61,16 @@ pub struct HooksConfig {
     /// repository file must not be able to turn a remote comment into an
     /// unreviewed queued mission.
     pub auto_queue: bool,
+    /// How many CI-failure tickets may be drafted per rolling hour. Each one
+    /// starts a paid planner session, and the trigger is a failing workflow
+    /// run on `main` or a mission branch, which anything that can push a
+    /// branch can produce in bulk. `0` turns CI-failure drafting off. A
+    /// repository's own config may lower this, never raise it.
+    pub ci_drafts_per_hour: u32,
 }
+
+/// Default for [`HooksConfig::ci_drafts_per_hour`].
+pub const DEFAULT_CI_DRAFTS_PER_HOUR: u32 = 3;
 
 impl Default for HooksConfig {
     fn default() -> Self {
@@ -71,6 +80,7 @@ impl Default for HooksConfig {
             queue_label: DEFAULT_QUEUE_LABEL.to_string(),
             allow_users: Vec::new(),
             auto_queue: false,
+            ci_drafts_per_hour: DEFAULT_CI_DRAFTS_PER_HOUR,
         }
     }
 }
@@ -83,6 +93,7 @@ impl fmt::Debug for HooksConfig {
             .field("queue_label", &self.queue_label)
             .field("allow_users", &self.allow_users)
             .field("auto_queue", &self.auto_queue)
+            .field("ci_drafts_per_hour", &self.ci_drafts_per_hour)
             .finish()
     }
 }
@@ -130,6 +141,23 @@ pub fn load_hooks(repo_root: &Path) -> Result<HooksConfig> {
                      are settable from the global layer (~/.kranz/config.json) only.",
                     path.display()
                 )));
+            }
+            if project_layer {
+                let ceiling = merged
+                    .get("ciDraftsPerHour")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::from(DEFAULT_CI_DRAFTS_PER_HOUR));
+                if let Some(asked) = hooks.get("ciDraftsPerHour") {
+                    if asked.as_u64().is_none_or(|asked| asked > ceiling) {
+                        return Err(EngineError::Config(format!(
+                            "{}: the project config layer may lower \"hooks.ciDraftsPerHour\" \
+                             (currently {ceiling}) but not raise it — each CI-failure draft \
+                             spends on a planner session. Raise it in the global layer \
+                             (~/.kranz/config.json).",
+                            path.display()
+                        )));
+                    }
+                }
             }
             config::deep_merge(&mut merged, hooks);
         }
@@ -499,6 +527,43 @@ pub fn trigger_slug(kind: TriggerKind, dedup_id: &str) -> String {
         TriggerKind::PrComment => "trigger-pr",
     };
     format!("{prefix}-{clean}")
+}
+
+/// Whether another CI-failure ticket may be drafted now: fewer than
+/// `cfg.ci_drafts_per_hour` `trigger-ci-*` tickets were written in the last
+/// hour (audit M23). A ticket that already exists for this trigger is a
+/// duplicate, not a new draft, so it is always allowed through to be
+/// reported as one. An unreadable tickets directory counts as no tickets.
+pub fn ci_draft_allowed(repo_root: &Path, trigger: &Trigger, cfg: &HooksConfig) -> bool {
+    if trigger.kind != TriggerKind::CiFailure {
+        return true;
+    }
+    let slug = trigger_slug(trigger.kind, &trigger.dedup_id);
+    if std::fs::symlink_metadata(Ticket::md_path(repo_root, &slug)).is_ok() {
+        return true;
+    }
+    let hour = std::time::Duration::from_secs(3600);
+    let recent = std::fs::read_dir(Ticket::tickets_dir(repo_root))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with("trigger-ci-") && name.ends_with(".md")
+                    })
+                })
+                .filter(|entry| {
+                    entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_none_or(|age| age < hour)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    recent < cfg.ci_drafts_per_hour as usize
 }
 
 /// Write the trigger's ticket, deduped by slug: an existing ticket file for
