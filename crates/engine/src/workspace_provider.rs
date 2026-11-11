@@ -215,6 +215,9 @@ pub struct GateEnvPolicy {
     /// content cannot select a weaker posture for setup or reset commands.
     pub mission_dir: PathBuf,
     pub sandbox: crate::types::SandboxConfig,
+    /// The operator's `workspace.allowedMounts`: the second party a contract
+    /// `mounts[]` entry needs before the container provider binds it.
+    pub allowed_mounts: Vec<String>,
 }
 
 impl GateEnvPolicy {
@@ -230,7 +233,14 @@ impl GateEnvPolicy {
             passthrough: passthrough.to_vec(),
             mission_dir: runtime_dir.to_path_buf(),
             sandbox,
+            allowed_mounts: Vec::new(),
         }
+    }
+
+    /// Attach the operator's mount allowlist (empty allows no contract mount).
+    pub fn with_allowed_mounts(mut self, allowed: &[String]) -> Self {
+        self.allowed_mounts = allowed.to_vec();
+        self
     }
 }
 
@@ -741,7 +751,8 @@ impl MissionEngine {
                 &runtime_dir,
                 &self.state.config.contract_env_passthrough,
                 crate::command_exec::worker_gate_sandbox(&self.state.config)?,
-            ),
+            )
+            .with_allowed_mounts(&self.state.config.workspace.allowed_mounts),
             runtime_dir,
             base_sha: self.state.mission.base_sha.clone(),
             contract,
@@ -905,6 +916,7 @@ mod tests {
 
     fn ws_config(provider: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: provider.map(str::to_string),
             remote: None,
             teardown_mode: None,
@@ -1018,6 +1030,7 @@ mod tests {
     #[test]
     fn remote_workspace_resolve_picks_the_adapter_only_with_complete_config() {
         let complete = WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(remote_block()),
             teardown_mode: None,
@@ -1058,6 +1071,7 @@ mod tests {
             ),
         ] {
             let config = WorkspaceConfig {
+                allowed_mounts: Vec::new(),
                 provider: Some("remote".to_string()),
                 remote,
                 teardown_mode: None,
@@ -1240,6 +1254,7 @@ mod tests {
     fn remote_workspace_pin_populates_provider_template_and_adapter_version() {
         let contract = contract(br#"{"schemaVersion": 1, "readiness": ["exit 0"]}"#);
         let config = WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(remote_block()),
             teardown_mode: None,
@@ -1257,6 +1272,7 @@ mod tests {
         );
 
         let incomplete = WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(crate::types::RemoteWorkspaceConfig {
                 template: Some("tmpl".to_string()),

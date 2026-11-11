@@ -285,6 +285,12 @@ neither can strip a safety floor, so they are not findings:
 - **`contractEnvPassthrough`**: extends the cleared contract-command env
   with NAMED vars only; names colliding with managed keys are refused,
   values never logged. Extends-from-empty.
+- **`workspace.allowedMounts`**: host paths the container workspace provider
+  may bind-mount when the workspace contract's `mounts[]` asks for them.
+  Operator-only. The contract is repository content, so a mount needs both
+  parties: a contract mount that is not listed here refuses provisioning,
+  naming it. Paths compare exactly (a trailing `/` is ignored); empty, the
+  default, allows none.
 
 ## Findings and dispositions
 

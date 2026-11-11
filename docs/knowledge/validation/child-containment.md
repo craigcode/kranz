@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-11
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -15,6 +15,8 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-11 (UTC) against the sandbox fixes. The Seatbelt `fs` tier keeps IP networking but denies unix-socket connections except the system resolver, syslog and sockets under the session's own writable roots, so a contained child cannot drive the Docker socket or the ssh-agent; another socket needs its directory in the operator-only `sandbox.extraWrite`. Bubblewrap pathname sockets are not yet restricted. Seatbelt profile files (`runs/kranz-sandbox-*.sb`) are write-denied to the code they confine. One exception to "`off` keeps the env-only posture" below: the approval-time contract lint runs planner-authored commands before human review, so it always runs contained (raised to `fs`) or is skipped, and receives no `contractEnvPassthrough` credentials.
 
 Workspace bootstrap, readiness and data hooks now use the resolved worker gate sandbox as well as the cleared environment. Resolution or launch failures refuse execution. Between-round resets refresh the current worker policy after runtime changes. Container `disk.prune` host commands are refused before provisioning; owned Compose teardown remains available.
 
