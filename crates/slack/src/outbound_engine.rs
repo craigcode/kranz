@@ -466,9 +466,18 @@ async fn poll_mission_with_poster(
                     .post(cfg, client, threads, mission_id, &outbound)
                     .await
                 {
-                    cursor.state = state_before_event;
-                    tracing::warn!(mission = %mission_id, seq = event.seq, error = %e, "slack post failed; will retry");
-                    break;
+                    if e.downcast_ref::<RejectedBySlack>().is_some() {
+                        // Slack refused the card AND the plain notice that
+                        // replaces it. Retrying the same bytes cannot
+                        // succeed, and holding the cursor here would silence
+                        // every later notification for this mission (audit
+                        // M24). Skip this one event, loudly.
+                        tracing::error!(mission = %mission_id, seq = event.seq, error = %e, "slack rejected a notification and its fallback; skipping it");
+                    } else {
+                        cursor.state = state_before_event;
+                        tracing::warn!(mission = %mission_id, seq = event.seq, error = %e, "slack post failed; will retry");
+                        break;
+                    }
                 }
             }
         }
@@ -494,6 +503,64 @@ fn refold_at(events_path: &Path, seq: u64) -> Result<MissionState> {
     let events = EventLog::read_events(events_path)?;
     let upto = usize::try_from(seq).unwrap_or(usize::MAX).min(events.len());
     Ok(reducer::fold(&events[..upto])?)
+}
+
+/// Slack refused both a notification card and the plain notice sent in its
+/// place. Not retryable: the poll loop skips the event instead of wedging.
+#[derive(Debug)]
+struct RejectedBySlack(String);
+
+impl std::fmt::Display for RejectedBySlack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "slack rejected the message content: {}", self.0)
+    }
+}
+
+impl std::error::Error for RejectedBySlack {}
+
+/// Whether Slack answered that the MESSAGE is unacceptable, as opposed to a
+/// transport, auth, channel or rate problem that a retry or an operator fix
+/// can clear. These are the content errors `chat.postMessage` documents.
+fn is_payload_rejection(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    [
+        "invalid_blocks",
+        "invalid_blocks_format",
+        "msg_too_long",
+        "invalid_arguments",
+        "invalid_array_arg",
+        "invalid_json",
+        "no_text",
+    ]
+    .iter()
+    .any(|code| text.ends_with(&format!("failed: {code}")))
+}
+
+/// The short card posted when Slack rejects the real one.
+fn rejected_card_notice(
+    mission_id: &str,
+    outbound: &Outbound,
+    dashboard_url: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let what = match outbound {
+        Outbound::GateReview { .. } => "a gate review",
+        Outbound::PermissionReady(_) => "a permission request",
+        Outbound::PlanReady(_) => "a plan ready for review",
+        Outbound::RevisionReady(_) => "a plan revision",
+        Outbound::GrantReady(_) => "a grant request",
+        Outbound::QuestionReady(_) => "a question",
+        Outbound::Blocked(_) => "a blocked milestone",
+        Outbound::Complete(_) => "a completion report",
+    };
+    let mut blocks = crate::bridge::error_blocks(&format!(
+        "Mission `{}` has {what}, but it is too large to show in Slack. \
+         Nothing can be decided from this message; open the dashboard to see it.",
+        crate::format::escape_mrkdwn(mission_id)
+    ));
+    if let Some(button) = crate::format::dashboard_button(dashboard_url, mission_id) {
+        blocks.push(button);
+    }
+    blocks
 }
 
 /// Post one notification, threading it under the mission's root (creating the
@@ -525,9 +592,33 @@ async fn post_outbound(
     // a `[name]` prefix; unset → the blocks pass through unchanged.
     let blocks = crate::format::label_blocks(blocks, cfg.instance_name.as_deref());
     let thread_ts = threads.thread_ts(mission_id);
-    let posted_ts = client
+    let posted_ts = match client
         .post_message(&cfg.channel, &blocks, thread_ts.as_deref())
-        .await?;
+        .await
+    {
+        Ok(ts) => ts,
+        Err(e) if is_payload_rejection(&e) => {
+            // The card itself is unacceptable to Slack (too long, a field
+            // over a limit). Say so in a card that cannot be: the operator
+            // still learns something is waiting, and where to see it.
+            tracing::warn!(mission = %mission_id, error = %e, "slack rejected a notification card; posting a plain notice instead");
+            let notice = crate::format::label_blocks(
+                rejected_card_notice(mission_id, outbound, dash),
+                cfg.instance_name.as_deref(),
+            );
+            client
+                .post_message(&cfg.channel, &notice, thread_ts.as_deref())
+                .await
+                .map_err(|fallback| {
+                    if is_payload_rejection(&fallback) {
+                        anyhow::Error::new(RejectedBySlack(format!("{e}; fallback: {fallback}")))
+                    } else {
+                        fallback
+                    }
+                })?
+        }
+        Err(e) => return Err(e),
+    };
     // First post for this mission establishes the thread root.
     if thread_ts.is_none() {
         threads.set(mission_id, &posted_ts);
@@ -665,6 +756,113 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// Audit M24: content Slack will never accept is recognised apart from
+    /// failures a retry or an operator fix can clear.
+    #[test]
+    fn only_content_errors_count_as_a_payload_rejection() {
+        for code in ["invalid_blocks", "msg_too_long", "invalid_arguments"] {
+            let err = anyhow::anyhow!("chat.postMessage failed: {code}");
+            assert!(is_payload_rejection(&err), "{code}");
+        }
+        for other in [
+            "chat.postMessage failed: channel_not_found",
+            "chat.postMessage failed: ratelimited",
+            "chat.postMessage request failed",
+            "temporary Slack failure",
+        ] {
+            assert!(
+                !is_payload_rejection(&anyhow::anyhow!(other.to_string())),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rejected_card_notice_is_short_names_the_mission_and_offers_no_decision() {
+        let blocks = rejected_card_notice(
+            "m-big",
+            &Outbound::GrantReady(crate::format::GrantReady {
+                mission_id: "m-big".into(),
+                milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Command,
+                command: "x".repeat(5000),
+            }),
+            Some("http://127.0.0.1:4560"),
+        );
+        let text = serde_json::to_string(&blocks).unwrap();
+        assert!(text.len() < 1000, "{}", text.len());
+        assert!(
+            text.contains("m-big") && text.contains("a grant request"),
+            "{text}"
+        );
+        assert!(!text.contains("kranz_approve_grant") && !text.contains("kranz_deny_grant"));
+    }
+
+    struct RejectingPoster {
+        attempts: usize,
+    }
+
+    impl OutboundPoster for RejectingPoster {
+        fn post<'a>(
+            &'a mut self,
+            _cfg: &'a SlackConfig,
+            _client: &'a SlackClient,
+            _threads: &'a SharedThreads,
+            _mission_id: &'a str,
+            _outbound: &'a Outbound,
+        ) -> PostFuture<'a> {
+            self.attempts += 1;
+            Box::pin(async {
+                Err(anyhow::Error::new(RejectedBySlack(
+                    "chat.postMessage failed: invalid_blocks".into(),
+                )))
+            })
+        }
+    }
+
+    /// A notification Slack rejects outright, fallback included, is skipped
+    /// so the mission's later notifications still post.
+    #[tokio::test]
+    async fn outbound_cursor_skips_a_notification_slack_will_never_accept() {
+        let tmp = TempDir::new().unwrap();
+        let mission_id = "m-rejected";
+        seed_mission(tmp.path(), mission_id, "notify me");
+
+        let cfg = test_cfg();
+        let client = SlackClient::new(&cfg).unwrap();
+        let threads = SharedThreads::load(tmp.path()).unwrap();
+        let mut cursors = HashMap::new();
+        let mut poster = RejectingPoster { attempts: 0 };
+        let persisted = HashMap::new();
+
+        for _ in 0..2 {
+            if poster.attempts == 0 && cursors.contains_key(mission_id) {
+                append_plan_approved(tmp.path(), mission_id, "notify me");
+            }
+            poll_mission_with_poster(
+                &cfg,
+                &client,
+                tmp.path(),
+                &threads,
+                mission_id,
+                &mut cursors,
+                &persisted,
+                &mut poster,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            poster.attempts, 1,
+            "the rejected card is tried once, not forever"
+        );
+        assert_eq!(
+            cursors.get(mission_id).unwrap().last_seq,
+            2,
+            "the cursor moves past the rejected notification"
+        );
     }
 
     #[tokio::test]
