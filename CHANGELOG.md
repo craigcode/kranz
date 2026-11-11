@@ -16,6 +16,13 @@ Notable user-visible changes are documented here. This project follows
   go-ahead, and it tells the orchestrator to plan from the repository as it is
   and say so when a recorded lesson no longer matches it. The orchestrator
   prompt hash recorded on new sessions changes.
+- Changed the worker role prompt: the turn limit is stated as the point where
+  the engine ends the session; ordinary obstacles are to be worked through
+  while the stops the prompt names are reported; the worker keeps the files its
+  feature touches in good shape without changing behaviour the spec does not
+  mention; and subagents are for work that splits into independent parts, not
+  for reviewing the worker's own diff. The worker prompt hash recorded on new
+  sessions changes.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained
