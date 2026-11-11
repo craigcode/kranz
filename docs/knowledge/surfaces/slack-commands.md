@@ -18,6 +18,8 @@ verified_against:
   - 'command: cargo test -p kranz-slack'
 ---
 
+Rechecked 2026-11-11 (UTC) against the write-path notices: every plan and revision card now carries an authority section, which for a plan with no `touchSet` says the plan does not limit which files the mission may change. Buttons and routing are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the lock split in the host merge call: a Slack Merge is refused as busy when another merge is live or a checkout-mode mission is running, and no longer when a worktree mission is running. Commands and cards are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the second audit round: the plan-ready card offers no approve buttons for a mission already queued or started, and a card Slack rejects as content is replaced by a plain notice (the event is skipped if that is rejected too). Routing and the allowlist gate are unchanged.

@@ -135,6 +135,13 @@ export function PlanReview() {
           </section>
         )}
 
+        {(plan.touchSet?.length ?? 0) === 0 && (
+          <p role="note" className="plan-no-write-paths">
+            <strong>Write paths:</strong> none declared. The plan does not limit which files the
+            mission may change.
+          </p>
+        )}
+
         <section aria-label="Reviewer independence">
           <div className="section-label">Reviewer independence</div>
           <p>

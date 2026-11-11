@@ -5,6 +5,14 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: `kranz queue --timing` reports how long each mission waited in the
+  queue and how long it ran, which mission was running when it was queued,
+  and how many approved plans declared write paths. Waiting time is recorded
+  from now on; earlier missions show `-`.
+- Changed: plan review in the dashboard, Slack plan cards, `plan.md` and CLI
+  plan output now state when a plan declares no write paths. The planner's
+  instructions now ask for `touchSet` on every plan, so expect more plans to
+  declare one and more grant requests when a worker writes outside it.
 - Changed: a merge no longer waits for a running mission, and a mission can
   start during a merge, when the mission works in its own worktree (the
   default). Merges still run one at a time, and a mission that works in the

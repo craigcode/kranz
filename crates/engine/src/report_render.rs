@@ -370,10 +370,16 @@ pub(crate) fn render_research_markdown(research: &Research, mission_id: &str) ->
 /// The authority a plan carries beyond its text: `commandGrants` and
 /// `touchSet` are copied into the mission at `plan.approved` with no further
 /// prompt, so every surface that asks for plan consent must show them
-/// (2026-11-10 audit H2). Nothing is written when both are empty.
+/// (2026-11-10 audit H2). A plan that declares no write paths says so: it
+/// puts no bound on what the mission may change (ticket
+/// plan-touch-set-coverage).
+pub const NO_WRITE_PATHS_NOTE: &str = "**Write paths:** none declared. The plan does not limit \
+     which files the mission may change.";
+
 fn write_plan_authority(md: &mut String, plan: &Plan) {
     use std::fmt::Write as _;
     if plan.command_grants.is_empty() && plan.touch_set.is_empty() {
+        let _ = writeln!(md, "{NO_WRITE_PATHS_NOTE}\n");
         return;
     }
     // One line per entry: a planner-authored newline or backtick must not
@@ -406,6 +412,8 @@ fn write_plan_authority(md: &mut String, plan: &Plan) {
             let _ = writeln!(md, "- `{}`", item(pattern));
         }
         let _ = writeln!(md);
+    } else {
+        let _ = writeln!(md, "{NO_WRITE_PATHS_NOTE}\n");
     }
 }
 

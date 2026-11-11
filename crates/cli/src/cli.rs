@@ -428,6 +428,15 @@ pub enum Command {
         /// the producer is cancelling the work rather than re-enqueueing it.
         #[arg(long, value_name = "MISSION_ID")]
         remove: Option<String>,
+
+        /// Show how long each mission waited in the queue and how long it
+        /// ran, with a summary (read-only)
+        #[arg(long, conflicts_with = "remove")]
+        timing: bool,
+
+        /// With --timing: print the report as JSON
+        #[arg(long, requires = "timing")]
+        json: bool,
     },
 
     /// Report docs/knowledge notes whose verified_against paths drifted.

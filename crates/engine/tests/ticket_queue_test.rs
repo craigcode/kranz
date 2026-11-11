@@ -1124,6 +1124,111 @@ fn a_merge_and_a_checkout_mission_still_exclude_each_other() {
     drop(unknown);
 }
 
+/// Ticket queue-wait-metrics: queueing records when, and what was running;
+/// the report derives waiting and running time from that and the event log.
+/// A mission that was never queued reports no wait, not zero.
+#[test]
+fn queue_timing_reports_waiting_behind_a_running_mission() {
+    use kranz_engine::queue_timing;
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let entry = |id: &str| QueueEntry {
+        mission_id: id.to_string(),
+        ticket_slug: None,
+        priority: 2,
+        seq: 0,
+    };
+    let write_run = |id: &str, started_after_secs: i64, ran_secs: i64| {
+        let paths = kranz_engine::paths::MissionPaths::new(root, id);
+        fs::create_dir_all(paths.events_file().parent().unwrap()).unwrap();
+        let t0 = chrono::Utc::now();
+        let at = |secs: i64| t0 + chrono::Duration::seconds(secs);
+        let events = [
+            Event {
+                seq: 1,
+                ts: t0,
+                mission_id: id.to_string(),
+                kind: EventKind::MissionCreated {
+                    goal: "g".to_string(),
+                    base_branch: "main".to_string(),
+                    mission_branch: format!("kranz/mission-{id}"),
+                    config: MissionConfig::default(),
+                },
+            },
+            Event {
+                seq: 2,
+                ts: at(started_after_secs),
+                mission_id: id.to_string(),
+                kind: EventKind::MilestoneStarted {
+                    milestone_id: "ms-1".to_string(),
+                    start_sha: "0".repeat(40),
+                },
+            },
+            Event {
+                seq: 3,
+                ts: at(started_after_secs + ran_secs),
+                mission_id: id.to_string(),
+                kind: EventKind::MissionCompleted {},
+            },
+        ];
+        let body: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        fs::write(paths.events_file(), body).unwrap();
+    };
+
+    // m-first is queued with nothing running, then runs.
+    queue::enqueue(root, entry("m-first")).unwrap();
+    let first = queue_timing::mission_timing(root, "m-first");
+    assert!(first.is_err(), "no log yet: nothing to report");
+    write_run("m-first", 5, 60);
+    let running = queue::acquire_repo_busy(root, "m-first").unwrap();
+    // m-second is queued while m-first runs, and starts ten minutes later.
+    queue::enqueue(root, entry("m-second")).unwrap();
+    drop(running);
+    write_run("m-second", 600, 120);
+    // m-hosted was never queued.
+    write_run("m-hosted", 1, 30);
+
+    let first = queue_timing::mission_timing(root, "m-first").unwrap();
+    assert_eq!(first.running_at_enqueue, None);
+    assert_eq!(first.ran_secs(), Some(60));
+
+    let second = queue_timing::mission_timing(root, "m-second").unwrap();
+    assert_eq!(second.running_at_enqueue.as_deref(), Some("m-first"));
+    let waited = second.waited_secs().expect("queued and started");
+    assert!((595..=605).contains(&waited), "{waited}");
+    assert_eq!(second.ran_secs(), Some(120));
+
+    let hosted = queue_timing::mission_timing(root, "m-hosted").unwrap();
+    assert_eq!(hosted.queued_at, None);
+    assert_eq!(
+        hosted.waited_secs(),
+        None,
+        "never queued is unknown, not zero"
+    );
+    assert_eq!(hosted.ran_secs(), Some(30));
+
+    let summary = queue_timing::summary(root);
+    assert_eq!(summary.measured, 2);
+    assert_eq!(summary.waited_behind_another, 1);
+    assert!(summary.total_waited_secs >= 595);
+
+    // Re-queueing keeps the first receipt.
+    let before = queue_timing::mission_timing(root, "m-second")
+        .unwrap()
+        .queued_at;
+    queue::remove(root, "m-second");
+    queue::enqueue(root, entry("m-second")).unwrap();
+    assert_eq!(
+        queue_timing::mission_timing(root, "m-second")
+            .unwrap()
+            .queued_at,
+        before
+    );
+}
+
 #[test]
 fn blocked_by_frontmatter_parses_into_list() {
     let md = "---\ntitle: needs review\nblocked-by: [a, b]\n---\nbody\n";

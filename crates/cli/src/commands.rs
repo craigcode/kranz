@@ -486,9 +486,17 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
         )
         .await
         .map_err(augment_limit_hint),
-        Command::Queue { remove } => match remove {
+        Command::Queue {
+            remove,
+            timing,
+            json,
+        } => match remove {
             Some(mission_id) => {
                 print!("{}", backlog::cmd_queue_remove(&repo, &mission_id)?);
+                Ok(0)
+            }
+            None if timing => {
+                print!("{}", backlog::cmd_queue_timing(&repo, json)?);
                 Ok(0)
             }
             None => {
