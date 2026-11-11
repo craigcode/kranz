@@ -217,6 +217,78 @@ fn unified_diff_scan_only_checks_added_lines() {
     assert_eq!(findings[0].location, ".env:2");
 }
 
+/// Audit M16: an added line whose own text starts with `++` reads `+++…` in
+/// the diff. It is content, not a file header, and must be scanned.
+#[test]
+fn unified_diff_scan_reads_added_lines_that_start_with_plus_plus() {
+    let secret = "sk-ant-api03-NewSecret_123456";
+    let diff = format!(
+        "diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,2 @@\n context\n+++i; token = \"{secret}\";\n"
+    );
+
+    let findings = scan_unified_diff(&diff);
+
+    assert!(
+        findings.iter().any(|f| f.rule_id == "anthropic-api-key"),
+        "{findings:?}"
+    );
+    assert!(
+        findings.iter().all(|f| f.location == "a.c:2"),
+        "{findings:?}"
+    );
+}
+
+/// Audit M16: added content shaped like a file header must not rename the
+/// file under scan, which would switch on the generated-bundle exemption.
+#[test]
+fn unified_diff_scan_ignores_header_shaped_content_inside_a_hunk() {
+    let generated_value = "MinifiedIdentifier_A1B2C3D4E5F6";
+    let diff = format!(
+        "diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -0,0 +1,2 @@\n+++ b/crates/cli/assets/dashboard/dist/x\n+token=\"{generated_value}\"\n"
+    );
+
+    let findings = scan_unified_diff(&diff);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule_id, "generic-secret-assignment");
+    assert_eq!(findings[0].location, "src/main.ts:2");
+}
+
+/// A C-quoted header (`+++ "b/…"`, git's spelling for a non-ASCII name) still
+/// names the file, so findings are attributed to it and not to the previous
+/// file in the diff.
+#[test]
+fn unified_diff_scan_follows_a_quoted_file_header() {
+    let secret = "sk-ant-api03-NewSecret_123456";
+    let diff = format!(
+        "diff --git a/first.txt b/first.txt\n--- a/first.txt\n+++ b/first.txt\n@@ -0,0 +1 @@\n+plain\ndiff --git \"a/na\\303\\257ve.txt\" \"b/na\\303\\257ve.txt\"\n--- /dev/null\n+++ \"b/na\\303\\257ve.txt\"\n@@ -0,0 +1 @@\n+{secret}\n"
+    );
+
+    let findings = scan_unified_diff(&diff);
+
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].location.starts_with("na"), "{findings:?}");
+}
+
+/// Audit M16: prose after the words "basic" or "bearer" is not a credential,
+/// and a placeholder after them is allowlisted like any other placeholder.
+#[test]
+fn scanner_does_not_flag_prose_or_placeholders_after_a_scheme_word() {
+    for text in [
+        "adds basic internationalization support",
+        "the bearer responsibilities are documented",
+        "Authorization: Bearer your-token-goes-here-example",
+    ] {
+        assert!(
+            scan_text(text).is_empty(),
+            "{text:?}: {:?}",
+            scan_text(text)
+        );
+    }
+    assert!(!scan_text("Authorization: Bearer abc123DEF456ghi789JKL012").is_empty());
+    assert!(!scan_text("Authorization: Basic dXNlcjpwYXNzd29yZDEyMzQ=").is_empty());
+}
+
 #[test]
 fn unified_diff_scan_suppresses_only_generic_generated_bundle_noise() {
     // Machine-generated assignments may trip the generic heuristic, but

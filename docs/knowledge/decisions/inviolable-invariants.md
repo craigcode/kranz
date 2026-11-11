@@ -37,6 +37,8 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
+Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the one push path still pushes a single `kranz/*` branch and nothing else, now also against tag-following, submodule recursion and push options, and only after the mission's range passes the secret scan. No invariant changed.
+
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: a remote comment cannot queue an unreviewed plan unless the operator opted in from the global config layer, and an approved grant means exactly the target shown. No invariant changed.
 
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: the hosted merge lands only the mission commit sealed at completion, and changed paths are read NUL-separated so a quoted filename cannot skip a path-scoped gate. These strengthen the merge invariants; none changed.

@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: `kranz exec --push` scans `base_sha..<branch tip>` before pushing, and the push refuses repository config that redirects or widens it (`pushurl`, `mirror`, `push.followTags`, `push.pushOption`, `push.recurseSubmodules`, `submodule.recurse`). Pipeline stages and event schemas are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: the GitHub queue label queues a drafted plan only when the operator's global config sets `hooks.autoQueue`, the ticket approve route refuses a mission other than the one the caller reviewed, and unofferable grant targets never park. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: completion seals the validated mission tip in an `orchestrator.decision` before `mission.completed`, and the hosted merge refuses a mission branch at any other commit. Stage order is unchanged.

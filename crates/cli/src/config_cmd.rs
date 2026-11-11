@@ -419,7 +419,10 @@ fn read_layer(path: &Path) -> Result<serde_json::Map<String, Value>> {
 /// concurrent `config::load` (serve create, the `kranz work` dispatcher, the
 /// Slack bridge) therefore only ever sees the old bytes or the new bytes,
 /// never a torn/empty file, and a crash mid-write cannot lose the config.
-/// An existing target's permissions are carried over to the replacement.
+///
+/// The replacement is always owner-only (`0600`) on unix: a config layer can
+/// hold the Slack tokens and the webhook secret, so it is never left
+/// group- or world-readable, including when the file it replaces was.
 fn write_layer(path: &Path, tree: &serde_json::Map<String, Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -435,17 +438,28 @@ fn write_layer(path: &Path, tree: &serde_json::Map<String, Value>) -> Result<()>
     );
     {
         use std::io::Write as _;
-        let mut file =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        // `mode` only applies when the open CREATES the file; a tmp left by a
+        // crashed write keeps its old bits, so set them explicitly too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", tmp.display()))?;
+        }
         file.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.sync_data()
             .with_context(|| format!("syncing {}", tmp.display()))?;
-    }
-    // Keep the operator's permissions (e.g. a chmod 600 config) across the
-    // replacement; best-effort — the rename below is the load-bearing part.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
@@ -1221,12 +1235,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn set_replaces_the_file_via_rename_and_preserves_permissions() {
+    fn set_replaces_the_file_via_rename_and_leaves_it_owner_only() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let tmp = TempDir::new().unwrap();
         let layers = temp_layers(&tmp);
         write_json(&layers.project, &json!({ "worker": { "model": "opus" } }));
-        std::fs::set_permissions(&layers.project, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Audit M26: a config that was world-readable must not stay that way.
+        std::fs::set_permissions(&layers.project, std::fs::Permissions::from_mode(0o644)).unwrap();
         let before_ino = std::fs::metadata(&layers.project).unwrap().ino();
 
         set_key(&layers, false, "worker.model", "sonnet").unwrap();
@@ -1242,7 +1257,7 @@ mod tests {
         assert_eq!(
             meta.permissions().mode() & 0o777,
             0o600,
-            "permissions carried over"
+            "a config layer can hold tokens: the rewrite is owner-only whatever it replaced"
         );
         assert_eq!(
             read_json(&layers.project),
