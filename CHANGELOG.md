@@ -18,6 +18,9 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Fixed: on Linux, sandboxed sessions can no longer see the Docker, Podman,
+  containerd and system-bus sockets or the per-user runtime directory. Add a
+  socket's directory to `sandbox.extraWrite` to give a tool access to it.
 - Changed: a mission fails its final gate when a declared pty-script
   assertion failed in its most recent session. Before, only a missing
   transcript failed the gate.
