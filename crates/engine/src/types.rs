@@ -1537,6 +1537,13 @@ pub struct WorkspaceConfig {
     /// named — never a silent default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teardown_mode: Option<String>,
+    /// Host paths the container provider may bind-mount when the workspace
+    /// contract's `mounts[]` asks for them. The contract is repository
+    /// content; this list is the operator's half of a two-party consent, as
+    /// `contractEnvPassthrough` is for `secrets[]`. A contract mount that is
+    /// not listed here refuses provisioning. Empty (the default) allows none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_mounts: Vec<String>,
 }
 
 /// Remote substrate (Coder-shaped) connection config (ticket

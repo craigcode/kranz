@@ -480,6 +480,11 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
         "the per-run capability token rides its endpoint",
     ),
     ConfigTrustRule::operator_only(
+        "workspace.allowedMounts",
+        PatchClass::Never,
+        "it names host paths bind-mounted read-write into the workspace container",
+    ),
+    ConfigTrustRule::operator_only(
         "workspace.remote",
         PatchClass::Never,
         "it names a remote workspace URL and the env var holding its token",
