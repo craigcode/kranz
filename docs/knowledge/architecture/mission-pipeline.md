@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the evidence and containment fixes: the orchestrator digest holds each item to one line and labels recent decisions as a record; session cleanup kills the leader's descendant tree as well as its process group; workspace commands get the ssh agent and operator git config only by two-party consent. Pipeline stages and their order are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the base-policy merge check: the hosted merge takes an optional `acceptBasePolicy` digest and refuses an unaccepted change to `.kranz/merge-gates.json` or `.kranz/secret-allowlist` on the base before any gate runs. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: `kranz exec --push` scans `base_sha..<branch tip>` before pushing, and the push refuses repository config that redirects or widens it (`pushurl`, `mirror`, `push.followTags`, `push.pushOption`, `push.recurseSubmodules`, `submodule.recurse`). Pipeline stages and event schemas are unchanged.

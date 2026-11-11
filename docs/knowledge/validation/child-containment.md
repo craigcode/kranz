@@ -16,6 +16,8 @@ verified_against:
   - docs/acp-containment.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the containment fixes: workspace bootstrap, readiness and data commands receive `SSH_AUTH_SOCK` and the operator's global git config only when the contract's `secrets[]` declares the name and `contractEnvPassthrough` lists it, and otherwise commit as a neutral identity; cleanup kills a child's descendant tree by parent links, so a descendant in its own session dies with it (a double-forked process whose parent already exited is still not found); the validator snapshot opens each untracked file once with no link followed at any component.
+
 Rechecked 2026-11-11 (UTC) against the sandbox fixes. The Seatbelt `fs` tier keeps IP networking but denies unix-socket connections except the system resolver, syslog and sockets under the session's own writable roots, so a contained child cannot drive the Docker socket or the ssh-agent; another socket needs its directory in the operator-only `sandbox.extraWrite`. Bubblewrap pathname sockets are not yet restricted. Seatbelt profile files (`runs/kranz-sandbox-*.sb`) are write-denied to the code they confine. One exception to "`off` keeps the env-only posture" below: the approval-time contract lint runs planner-authored commands before human review, so it always runs contained (raised to `fs`) or is skipped, and receives no `contractEnvPassthrough` credentials.
 
 Workspace bootstrap, readiness and data hooks now use the resolved worker gate sandbox as well as the cleared environment. Resolution or launch failures refuse execution. Between-round resets refresh the current worker policy after runtime changes. Container `disk.prune` host commands are refused before provisioning; owned Compose teardown remains available.
