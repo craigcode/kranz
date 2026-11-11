@@ -7015,7 +7015,7 @@ Used by:
 - proc-macro2 1.0.106 <https://github.com/dtolnay/proc-macro2>
 - quote 1.0.46 <https://github.com/dtolnay/quote>
 - rustix-linux-procfs 0.1.1 <https://github.com/sunfishcode/rustix-linux-procfs>
-- rustix 1.1.4 <https://github.com/bytecodealliance/rustix>
+- rustix 1.1.6 <https://github.com/bytecodealliance/rustix>
 - rustversion 1.0.22 <https://github.com/dtolnay/rustversion>
 - semver 1.0.28 <https://github.com/dtolnay/semver>
 - serde 1.0.229 <https://github.com/serde-rs/serde>
