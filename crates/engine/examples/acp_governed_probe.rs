@@ -586,6 +586,7 @@ async fn run(root: &Path, prepared: Preparation) -> Result<serde_json::Value> {
             },
             &merge_paths,
             Actor::LocalRepositoryAuthority,
+            None,
         )
     })
     .await??;

@@ -468,7 +468,14 @@ export const api = {
 
   // --- delivered stage (gated Merge action) --------------------------------
 
-  merge(id: string): Promise<{ merged: boolean; commit?: string }> {
-    return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, {});
+  /** `acceptBasePolicy` is the digest a `base_policy_changed` refusal named:
+   *  sending it back says the operator reviewed the gate suite / allowlist
+   *  change on the base branch and accepts exactly that policy. */
+  merge(
+    id: string,
+    acceptBasePolicy?: string,
+  ): Promise<{ merged: boolean; commit?: string }> {
+    const body = acceptBasePolicy === undefined ? {} : { acceptBasePolicy };
+    return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, body);
   },
 };

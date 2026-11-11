@@ -61,6 +61,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the base-policy merge check: the gate suite and the secret allowlist are still read from the live base, and a merge now refuses with `base_policy_changed` when either differs from the approval-time base until the caller accepts the current policy by digest. Gate execution order and stop-at-first-failure are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the diff scan now tracks hunks, so added lines that start with `++` are scanned and header-shaped content cannot switch on the generated-bundle exemption; a checkpoint diff that cannot be read refuses the commit; the bearer and basic rules honour the placeholder allowlist and skip plain prose. Gate commands and contracts are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: a denial whose target would be enforced as a pattern (a path with glob syntax, a wildcard host) or that carries control or reordering characters is no longer offered as a grant and stays an ordinary finding or block. Gate commands, the grant cap and deny semantics are unchanged.

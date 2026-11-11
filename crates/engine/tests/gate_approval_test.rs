@@ -318,6 +318,7 @@ async fn gate_subprocess_v1_mission_stages_and_merge_bind_real_deliverables() {
             |cmd, cwd| kranz_engine::command_exec::run_bounded_gate_command(cwd, cmd),
             &active_paths,
             Actor::LocalMutationCapability,
+            None,
         )
         .unwrap()
     })
@@ -451,6 +452,7 @@ async fn gate_subprocess_v1_config_cannot_remove_approved_evaluators() {
         |_, _| panic!("a policy-drifted merge must not run commands"),
         &paths,
         Actor::LocalMutationCapability,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -554,6 +556,7 @@ async fn gate_subprocess_v1_merge_rejects_a_base_advance_after_pass() {
             |cmd, cwd| kranz_engine::command_exec::run_bounded_gate_command(cwd, cmd),
             &merge_paths,
             Actor::LocalMutationCapability,
+            None,
         )
         .unwrap()
     })

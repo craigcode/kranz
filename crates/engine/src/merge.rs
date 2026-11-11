@@ -59,6 +59,23 @@ pub enum MergeReport {
         /// Git's verbatim refusal text.
         detail: String,
     },
+    /// The base branch's merge policy (the gate suite or the secret allowlist)
+    /// is not what it was at the commit pinned when the plan was approved,
+    /// and the caller did not accept the current policy by its digest. Both
+    /// files are read from the LIVE base, a ref a checkout-mode worker can
+    /// move, so a change nobody acknowledged is refused before anything runs.
+    /// Retrying with `policy_digest` as the accepted policy proceeds. Base is
+    /// untouched.
+    BasePolicyChanged {
+        /// The policy files whose bytes differ between the two commits.
+        files: Vec<String>,
+        /// Digest of the live base's policy: what an acceptance must echo.
+        policy_digest: String,
+        /// The commit pinned at plan approval.
+        base_sha: String,
+        /// The live base tip the changed policy was read from.
+        live_base: String,
+    },
     /// The live base's applicable ENFORCED Flight Rules set differs from the
     /// mission's approved pin (KRZ-342, design D-E): policy moved under the
     /// mission. The merge is refused before the gate suite runs — neither
@@ -91,6 +108,43 @@ pub enum MergeReport {
         /// commits already landed on the live base branch.
         stale_base: Option<StaleBaseWarning>,
     },
+}
+
+/// The base-owned files that decide whether a mission may merge. Flight Rules
+/// policy is not listed: its drift has its own pinned check
+/// ([`MergeReport::StandardsDrifted`]).
+pub const BASE_POLICY_PATHS: [&str; 2] = [MERGE_GATES_PATH, scrub::SECRET_ALLOWLIST_PATH];
+
+/// Which of [`BASE_POLICY_PATHS`] differ, byte for byte, between two commits.
+/// A file present on one side and absent on the other differs.
+fn base_policy_changes(repo: &GitRepo, from: &str, to: &str) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    for path in BASE_POLICY_PATHS {
+        if repo.show_file(from, path)? != repo.show_file(to, path)? {
+            changed.push(path.to_string());
+        }
+    }
+    Ok(changed)
+}
+
+/// A digest of the merge policy at `commit`: every [`BASE_POLICY_PATHS`]
+/// entry, with its path, whether it exists, and its length bound in, so no
+/// two different policies share a digest by concatenation.
+pub fn base_policy_digest(repo: &GitRepo, commit: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    for path in BASE_POLICY_PATHS {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        match repo.show_file(commit, path)? {
+            Some(content) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(content.len() as u64).to_be_bytes());
+                bytes.extend_from_slice(&content);
+            }
+            None => bytes.push(0),
+        }
+    }
+    Ok(crate::standards_waiver::sha256_hex(&bytes))
 }
 
 /// Non-blocking merge-time warning for missions drafted from a stale base.
@@ -306,6 +360,7 @@ where
         standards_pin,
         &StandardsMergeEvidence::default(),
         executor,
+        None,
     )
 }
 
@@ -322,6 +377,7 @@ pub fn merge_mission_with_standards_evidence<F>(
     standards_pin: Option<&crate::types::StandardsPin>,
     standards_evidence: &StandardsMergeEvidence,
     executor: F,
+    accepted_base_policy: Option<&str>,
 ) -> Result<MergeReport>
 where
     F: Fn(&str, &Path) -> (bool, String),
@@ -337,6 +393,7 @@ where
         executor,
         None,
         None,
+        accepted_base_policy,
     )
 }
 
@@ -354,6 +411,7 @@ pub fn merge_mission_with_external_evidence<F>(
     executor: F,
     paths: &crate::paths::MissionPaths,
     actor: crate::live_permission::Actor,
+    accepted_base_policy: Option<&str>,
 ) -> Result<MergeReport>
 where
     F: Fn(&str, &Path) -> (bool, String),
@@ -379,6 +437,7 @@ where
         executor,
         audit.as_mut(),
         validated.as_deref(),
+        accepted_base_policy,
     );
     if let Some(audit) = &mut audit {
         // A failed audit write cannot undo an already-landed local merge.
@@ -401,6 +460,7 @@ fn merge_with_external_stage<F>(
     executor: F,
     mut external: Option<&mut external::Audit>,
     validated_tip: Option<&str>,
+    accepted_base_policy: Option<&str>,
 ) -> Result<MergeReport>
 where
     F: Fn(&str, &Path) -> (bool, String),
@@ -432,6 +492,29 @@ where
                  manually, or re-run the mission."
             ),
         });
+    }
+
+    // The gate suite and the secret allowlist below are read from the live
+    // base. If either differs from the approval-time base, somebody changed
+    // the policy this mission is judged by since a human last looked. That is
+    // legitimate when the operator did it (adding a reviewed fingerprint and
+    // retrying is the documented way out of a scan refusal) and an attack
+    // when a worker moved the base ref, and the commit graph cannot tell the
+    // two apart. So the change is refused until the caller accepts the exact
+    // policy now in force, by digest.
+    if live_base_sha != base_sha {
+        let files = base_policy_changes(repo, base_sha, &live_base_sha)?;
+        if !files.is_empty() {
+            let policy_digest = base_policy_digest(repo, &live_base_sha)?;
+            if accepted_base_policy != Some(policy_digest.as_str()) {
+                return Ok(MergeReport::BasePolicyChanged {
+                    files,
+                    policy_digest,
+                    base_sha: base_sha.to_string(),
+                    live_base: live_base_sha,
+                });
+            }
+        }
     }
 
     let diff = repo.diff_full(base_sha, &mission_tip_sha)?;
