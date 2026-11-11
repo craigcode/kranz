@@ -1684,6 +1684,73 @@ async fn api_responses_are_no_store_and_shell_is_no_cache() {
     assert!(response.headers().get(header::CACHE_CONTROL).is_none());
 }
 
+/// Audit UI-9/SRV-8: no response from `kranz serve` may be framed by another
+/// page, whether it is the dashboard shell, a script, an API answer or an
+/// error.
+#[tokio::test]
+async fn every_response_forbids_framing_and_content_sniffing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let static_dir = tmp.path().join("dist");
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(
+        static_dir.join("index.html"),
+        "<html>kranz dashboard</html>",
+    )
+    .unwrap();
+    std::fs::write(static_dir.join("app.js"), "console.log('hi')").unwrap();
+    let app = kranz_server::router(repo_root, Some(static_dir));
+
+    for uri in [
+        "/",
+        "/app.js",
+        "/api/health",
+        "/api/no-such-route",
+        "/api/missions/..%2f",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "frame-ancestors 'none'",
+            "{uri}"
+        );
+        assert_eq!(
+            headers.get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY",
+            "{uri}"
+        );
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff",
+            "{uri}"
+        );
+    }
+
+    // `nosniff` makes the browser trust the declared type, so the dashboard's
+    // own script and stylesheet must be declared as what they are or they
+    // would stop loading.
+    std::fs::write(tmp.path().join("dist").join("app.css"), "body{}").unwrap();
+    for (uri, expected) in [
+        ("/app.js", "javascript"),
+        ("/app.css", "text/css"),
+        ("/", "text/html"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(content_type.contains(expected), "{uri}: {content_type}");
+    }
+}
+
 #[tokio::test]
 async fn embedded_static_serves_files_with_spa_fallback() {
     static FILES: [kranz_server::EmbeddedFile; 2] = [

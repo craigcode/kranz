@@ -176,6 +176,18 @@ pub struct PlanReady {
     /// Identity of the plan this card displays ([`plan_identity`]), carried
     /// in the approve buttons so a stale card cannot commit a newer plan.
     pub plan_identity: String,
+    /// Set when the mission was already queued or started from another
+    /// surface by the time this card posts. The card then says so and offers
+    /// no approve buttons: they could only be refused, which used to send
+    /// operators to the typed command that reviews no card (audit M25).
+    pub dispatched: Option<PlanDispatch>,
+}
+
+/// How a mission was already dispatched when its plan card posted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanDispatch {
+    Queued,
+    Running,
 }
 
 /// A proposed mid-mission plan revision awaiting human consent.
@@ -727,7 +739,14 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
     if let Some((block, _)) = authority {
         blocks.insert(3, block);
     }
-    if shown_in_full {
+    if let Some(dispatch) = p.dispatched {
+        blocks.push(context(match dispatch {
+            PlanDispatch::Queued => "This plan is already approved and queued. Nothing to do here.",
+            PlanDispatch::Running => {
+                "This plan is already approved and has started. Nothing to do here."
+            }
+        }));
+    } else if shown_in_full {
         blocks.push(json!({
             "type": "actions",
             "elements": [
@@ -2233,6 +2252,7 @@ mod tests {
                 milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
                 assertion_count: 3,
                 plan_identity: "planid0000000000".into(),
+                dispatched: None,
             },
             None,
         );
@@ -2687,6 +2707,7 @@ mod tests {
                 milestone_titles: vec![],
                 assertion_count: 1,
                 plan_identity: "planid0000000000".into(),
+                dispatched: None,
             },
             None,
         );
@@ -3259,6 +3280,7 @@ mod tests {
             milestone_titles: vec![],
             assertion_count: 1,
             plan_identity: "planid0000000000".into(),
+            dispatched: None,
         };
         // Unset → no link button (only the approve button, which has no url).
         let blocks = build_plan_ready(&p, None);
@@ -3409,6 +3431,7 @@ mod tests {
                 milestone_titles: vec!["M1".into()],
                 assertion_count: 0,
                 plan_identity: "p".into(),
+                dispatched: None,
             },
             None,
         );
@@ -3440,6 +3463,39 @@ mod tests {
         assert!(has_action(&revision, APPROVE_REVISION_ACTION_ID));
     }
 
+    /// Audit M25: a card for a plan already queued or started says so and
+    /// offers no approve buttons, which could only be refused.
+    #[test]
+    fn plan_card_for_a_dispatched_mission_offers_no_approve_buttons() {
+        for (dispatch, phrase) in [
+            (PlanDispatch::Queued, "already approved and queued"),
+            (PlanDispatch::Running, "already approved and has started"),
+        ] {
+            let blocks = build_plan_ready(
+                &PlanReady {
+                    mission_id: "m-9".into(),
+                    authority: authority(&[], &[]),
+                    goal: "g".into(),
+                    milestone_titles: vec!["M1".into()],
+                    assertion_count: 1,
+                    plan_identity: "abc".into(),
+                    dispatched: Some(dispatch),
+                },
+                Some("http://127.0.0.1:4560"),
+            );
+            assert!(all_text(&blocks).contains(phrase));
+            let ids: Vec<String> = all_buttons(&blocks)
+                .iter()
+                .filter_map(|b| b["action_id"].as_str().map(str::to_string))
+                .collect();
+            assert!(
+                !ids.iter()
+                    .any(|id| id == START_ACTION_ID || id == APPROVE_ACTION_ID),
+                "{ids:?}"
+            );
+        }
+    }
+
     #[test]
     fn plan_cards_withhold_approval_when_grants_do_not_fit() {
         let long = "x".repeat(MAX_FIELD);
@@ -3452,6 +3508,7 @@ mod tests {
                 milestone_titles: vec![],
                 assertion_count: 0,
                 plan_identity: "p".into(),
+                dispatched: None,
             },
             None,
         );
@@ -3503,6 +3560,7 @@ mod tests {
                     milestone_titles: vec!["a".into()],
                     assertion_count: 1,
                     plan_identity: "planid0000000000".into(),
+                    dispatched: None,
                 },
                 Some("http://dash"),
             ),
@@ -3564,6 +3622,7 @@ mod tests {
             milestone_titles: vec![],
             assertion_count: 1,
             plan_identity: "planid0000000000".into(),
+            dispatched: None,
         };
         let unlabeled = build_plan_ready(&p, None);
         let labeled = label_blocks(unlabeled.clone(), Some("studio"));

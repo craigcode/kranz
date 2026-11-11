@@ -702,7 +702,7 @@ impl KimiSession {
                 .id()
                 .and_then(|pid| i32::try_from(pid).ok())
                 .filter(|pid| *pid > 0);
-            let group_killed = matches!(pgid, Some(pgid) if kill_group(pgid));
+            let group_killed = matches!(pgid, Some(pgid) if crate::process_tree::kill_tree(pgid));
             if !group_killed {
                 let _ = self.child.start_kill();
             }

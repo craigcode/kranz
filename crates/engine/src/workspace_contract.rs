@@ -259,6 +259,27 @@ fn validate_workspace_contract(contract: &WorkspaceContract) -> std::result::Res
     }
 
     for (i, service) in contract.services.iter().enumerate() {
+        // The name becomes a compose service key and a `compose exec`
+        // argument. `workspace` is the engine's own service, so a contract
+        // entry of that name would replace its definition, and a leading `-`
+        // would be read as an option.
+        let name_ok = service
+            .name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && service
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            && service.name.len() <= 63;
+        if !name_ok || service.name == "workspace" {
+            return Err(format!(
+                "services[{i}] name {:?} must be 1-63 lowercase letters, digits, '-' or '_', \
+                 start with a letter or digit, and not be \"workspace\" (reserved)",
+                service.name
+            ));
+        }
         if contract.services[..i]
             .iter()
             .any(|s| s.name == service.name)
@@ -467,6 +488,27 @@ mod tests {
         // Missing version defaults to 0 and fails closed too.
         let err = parse_workspace_contract(br#"{"bootstrap": ["true"]}"#).unwrap_err();
         assert!(err.contains("unsupported schemaVersion 0"), "{err}");
+    }
+
+    /// Audit CTR-8: a service name is a compose key and a command argument.
+    #[test]
+    fn workspace_contract_service_names_cannot_replace_the_workspace_or_read_as_options() {
+        for name in ["workspace", "-rm", "", "Api", "a b", "a.b", "a/b"] {
+            let doc = serde_json::json!({
+                "schemaVersion": 1,
+                "services": [{ "name": name, "start": "x", "port": { "policy": "dynamic" } }]
+            });
+            let err = parse_workspace_contract(doc.to_string().as_bytes()).unwrap_err();
+            assert!(err.contains("services[0] name"), "{name:?}: {err}");
+        }
+        for name in ["api", "db-1", "worker_2", "9front"] {
+            let doc = serde_json::json!({
+                "schemaVersion": 1,
+                "services": [{ "name": name, "start": "x", "port": { "policy": "dynamic" } }]
+            });
+            parse_workspace_contract(doc.to_string().as_bytes())
+                .unwrap_or_else(|e| panic!("{name:?} should be accepted: {e}"));
+        }
     }
 
     #[test]

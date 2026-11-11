@@ -37,6 +37,12 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
+Rechecked 2026-11-11 (UTC) against the second audit round (mission id check, `kranz exec` question output). No invariant changed.
+
+Rechecked 2026-11-11 (UTC) against the Linux socket mask in the bubblewrap wrap. No invariant changed.
+
+Rechecked 2026-11-11 (UTC) against the evidence and containment fixes: the final gate fails a pty-script assertion whose most recent session failed, and contract-command output reaches the validator inside an untrusted-output fence. No invariant changed.
+
 Rechecked 2026-11-11 (UTC) against the base-policy merge check: a mission still cannot weaken the checks that judge its own diff, and a base-branch policy change made after approval now needs explicit acceptance at merge. This is detection at the merge, not prevention: a checkout-mode worker can still move the base ref itself. No invariant changed.
 
 Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the one push path still pushes a single `kranz/*` branch and nothing else, now also against tag-following, submodule recursion and push options, and only after the mission's range passes the secret scan. No invariant changed.

@@ -2247,6 +2247,92 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     profile
 }
 
+/// What a host path is, for [`control_socket_masks`]: its link-resolved form
+/// and whether that is a directory. `None` when it does not exist.
+fn probe_host_path(path: &Path) -> Option<(PathBuf, bool)> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let is_dir = std::fs::metadata(&resolved).ok()?.is_dir();
+    Some((resolved, is_dir))
+}
+
+fn current_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid(2) takes no arguments and cannot fail.
+        Some(unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// bwrap arguments that hide the host's control sockets (2026-11-10 audit
+/// SBX-1, Linux half).
+///
+/// `--ro-bind / /` leaves every pathname unix socket on the host
+/// connectable: a read-only mount stops a socket being created, not
+/// connected to, and `--unshare-net` does not isolate pathname sockets
+/// either. A contained session that reaches the Docker or Podman socket can
+/// start a container with the home directory mounted; the per-user runtime
+/// directory holds the session bus, the ssh and gpg agents and rootless
+/// container sockets; the system bus reaches privileged services. The
+/// Seatbelt profile closes the same hole with a unix-socket deny.
+///
+/// Each known location that exists is shadowed: a directory with an empty
+/// tmpfs, a socket with `/dev/null`. This is a list of known places, not a
+/// rule about sockets, so a control socket somewhere else stays reachable;
+/// abstract-namespace sockets are only isolated by `fs+net`. A location that
+/// is inside (or is) a path the operator made writable is left alone, which
+/// is how an operator grants a tool its socket (`sandbox.extraWrite`).
+fn control_socket_masks(
+    home: Option<&Path>,
+    uid: Option<u32>,
+    writable: &[PathBuf],
+    probe: &dyn Fn(&Path) -> Option<(PathBuf, bool)>,
+) -> Vec<String> {
+    let mut candidates: Vec<PathBuf> = [
+        "/run/docker.sock",
+        "/var/run/docker.sock",
+        "/run/containerd",
+        "/run/podman",
+        "/run/crio",
+        "/run/snapd.socket",
+        "/run/dbus/system_bus_socket",
+        "/run/systemd/private",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(uid) = uid {
+        candidates.push(PathBuf::from(format!("/run/user/{uid}")));
+    }
+    if let Some(home) = home {
+        for rel in [".docker/run", ".docker/desktop", ".colima", ".lima", ".rd"] {
+            candidates.push(home.join(rel));
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let Some((resolved, is_dir)) = probe(&candidate) else {
+            continue;
+        };
+        if seen.contains(&resolved) || writable.iter().any(|w| resolved.starts_with(absolutize(w)))
+        {
+            continue;
+        }
+        let display = resolved.display().to_string();
+        if is_dir {
+            out.extend(["--tmpfs".to_string(), display]);
+        } else {
+            out.extend(["--ro-bind".to_string(), "/dev/null".to_string(), display]);
+        }
+        seen.push(resolved);
+    }
+    out
+}
+
 /// Build the bubblewrap argv tail for running `binary args` under the resolved
 /// sandbox. The caller uses program `bwrap` and passes this vector as args.
 ///
@@ -2326,6 +2412,14 @@ pub fn bubblewrap_args(
     if inputs.enforce == crate::types::SandboxEnforce::FsNet {
         out.push("--unshare-net".to_string());
     }
+    // Before the write binds, so a path the operator made writable under a
+    // masked directory is bound back over the mask.
+    out.extend(control_socket_masks(
+        crate::agent_env::operator_home().as_deref(),
+        current_uid(),
+        &write_allowlist(inputs),
+        &probe_host_path,
+    ));
     for path in write_allowlist(inputs) {
         let path = path.display().to_string();
         out.push("--bind".to_string());
@@ -3572,6 +3666,69 @@ mod tests {
     /// on a `ptrace_scope = 0` host, keep the controlling terminal, and
     /// signal the engine. Every namespace flag is unconditional; only
     /// `--unshare-net` stays tier-gated, because it is an egress decision.
+    /// Audit SBX-1, Linux half: known control sockets are shadowed, each
+    /// once, and a location the operator made writable is left to them.
+    /// Unix only: the fake host below is written with `/` separators, and
+    /// the wrap these arguments feed does not exist elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_masks_shadow_what_exists_and_respect_operator_grants() {
+        let home = Path::new("/kranz-test-home/op");
+        // `/var/run` is a link to `/run` on most distributions.
+        let probe = |path: &Path| -> Option<(PathBuf, bool)> {
+            match path.to_str()? {
+                "/run/docker.sock" | "/var/run/docker.sock" => {
+                    Some((PathBuf::from("/run/docker.sock"), false))
+                }
+                "/run/user/1000" => Some((PathBuf::from("/run/user/1000"), true)),
+                "/run/dbus/system_bus_socket" => {
+                    Some((PathBuf::from("/run/dbus/system_bus_socket"), false))
+                }
+                "/kranz-test-home/op/.colima" => {
+                    Some((PathBuf::from("/kranz-test-home/op/.colima"), true))
+                }
+                _ => None,
+            }
+        };
+
+        let masks = control_socket_masks(Some(home), Some(1000), &[], &probe);
+        let expect: Vec<String> = [
+            "--ro-bind",
+            "/dev/null",
+            "/run/docker.sock",
+            "--ro-bind",
+            "/dev/null",
+            "/run/dbus/system_bus_socket",
+            "--tmpfs",
+            "/run/user/1000",
+            "--tmpfs",
+            "/kranz-test-home/op/.colima",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(masks, expect);
+
+        // Granting the socket's directory hands that socket back and nothing else.
+        let granted = control_socket_masks(
+            Some(home),
+            Some(1000),
+            &[PathBuf::from("/kranz-test-home/op/.colima")],
+            &probe,
+        );
+        assert!(
+            !granted.contains(&"/kranz-test-home/op/.colima".to_string()),
+            "{granted:?}"
+        );
+        assert!(
+            granted.contains(&"/run/docker.sock".to_string()),
+            "{granted:?}"
+        );
+
+        // Nothing present, nothing masked: bwrap fails on a missing mount point.
+        assert!(control_socket_masks(Some(home), Some(1000), &[], &|_| None).is_empty());
+    }
+
     #[test]
     fn bubblewrap_args_unshare_every_namespace_on_both_tiers() {
         let session = tempfile::tempdir().unwrap();
@@ -4958,6 +5115,61 @@ mod tests {
             !outside_file.exists(),
             "denied write must not have created the file"
         );
+    }
+
+    /// Audit SBX-1 on a real bwrap: a socket in the per-user runtime
+    /// directory exists on the host and is gone inside the wrap, on both
+    /// tiers. Skips where that directory is absent or not ours to write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_enforcement_linux_bwrap_hides_the_user_runtime_sockets() {
+        use std::process::Command;
+
+        if !bwrap_can_apply() {
+            return;
+        }
+        let Some(uid) = current_uid() else { return };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        let socket = runtime.join(format!("kranz-mask-test-{}.sock", uuid::Uuid::new_v4()));
+        let Ok(_listener) = std::os::unix::net::UnixListener::bind(&socket) else {
+            eprintln!(
+                "SKIP: {} is not available to bind a socket in",
+                runtime.display()
+            );
+            return;
+        };
+
+        let session = tempfile::tempdir().unwrap();
+        let mission = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        for enforce in [
+            crate::types::SandboxEnforce::Fs,
+            crate::types::SandboxEnforce::FsNet,
+        ] {
+            let mut inputs = inputs(session.path(), mission.path(), tmp.path(), vec![]);
+            inputs.enforce = enforce;
+            let args = bubblewrap_args(
+                &inputs,
+                Path::new("/bin/sh"),
+                &["-c".into(), format!("test ! -e {}", socket.display())],
+            )
+            .unwrap();
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--tmpfs" && Path::new(&w[1]) == runtime),
+                "{args:?}"
+            );
+            let status = Command::new("bwrap")
+                .args(args)
+                .status()
+                .expect("failed to run bwrap");
+            assert!(
+                status.success(),
+                "{enforce:?}: the host socket must not be visible inside the wrap"
+            );
+        }
+        assert!(socket.exists(), "the host's own socket is untouched");
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[cfg(target_os = "linux")]

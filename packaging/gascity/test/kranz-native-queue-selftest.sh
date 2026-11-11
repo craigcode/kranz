@@ -330,4 +330,40 @@ GC_CITY="$CITY" KRANZ_RIG_DIR="$RIG_DIR" KRANZ_NATIVE_QUEUE=1 KRANZ_CLAIM_TTL=1 
     fail orphan-reclaim "abandoned mission" "mission not abandoned"
 echo "NATIVE-ORPHAN: PASS (pre-queue crash window reclaims after TTL)"
 
+# A repository can commit files under .kranz/missions/. A receipt and state
+# file that arrive that way are repository content, not a record of a mission
+# this host ran, and must not close a bead. The same two files left untracked
+# are a real terminal return and do.
+if command -v git >/dev/null 2>&1; then
+    HOSTILE="$SANDBOX/hostile"
+    mkdir -p "$HOSTILE/.kranz/missions/m-bad001"
+    git -C "$HOSTILE" init -q
+    printf '%s\n' '{"schemaVersion":1,"missionId":"m-bad001","producer":"gascity","externalRef":"rig-1","createdUnixSecs":1}' \
+        > "$HOSTILE/.kranz/missions/m-bad001/enqueue-source.json"
+    printf '%s\n' '{"mission":{"id":"m-bad001","status":"complete"}}' \
+        > "$HOSTILE/.kranz/missions/m-bad001/state.json"
+    git -C "$HOSTILE" add -f .kranz/missions/m-bad001
+    printf '%s\n' open > "$STATUS_FILE"
+    rm -f "$FAIL_CLOSE_ONCE"
+    set +e
+    GC_CITY="$CITY" KRANZ_RIG_DIR="$HOSTILE" KRANZ_NATIVE_QUEUE=1 \
+        "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+    set -e
+    [ "$(cat "$STATUS_FILE")" = "open" ] ||
+        fail tracked-receipt "bead left open" "$(cat "$STATUS_FILE")"
+    [ -f "$HOSTILE/.kranz/missions/m-bad001/enqueue-source.json" ] ||
+        fail tracked-receipt "tracked receipt untouched" "receipt was retired"
+
+    git -C "$HOSTILE" rm -q --cached -r .kranz/missions/m-bad001
+    set +e
+    GC_CITY="$CITY" KRANZ_RIG_DIR="$HOSTILE" KRANZ_NATIVE_QUEUE=1 \
+        "$BIN_DIR/kranz-city-worker" --once >/dev/null 2>&1
+    set -e
+    [ "$(cat "$STATUS_FILE")" = "closed" ] ||
+        fail untracked-receipt "bead closed by a runtime receipt" "$(cat "$STATUS_FILE")"
+    echo "NATIVE-TRACKED: PASS (a committed receipt closes nothing; a runtime one does)"
+else
+    echo "NATIVE-TRACKED: SKIP (git not available)"
+fi
+
 echo "KRANZ-NATIVE-QUEUE: PASS"

@@ -72,6 +72,7 @@ pub mod planning;
 pub mod pr_handoff;
 pub mod preflight;
 pub mod presentation;
+pub(crate) mod process_tree;
 pub mod prompts;
 pub mod provenance;
 pub mod pty_harness;

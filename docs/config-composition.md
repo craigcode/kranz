@@ -284,7 +284,12 @@ neither can strip a safety floor, so they are not findings:
   roundabout `worker.backend`.
 - **`contractEnvPassthrough`**: extends the cleared contract-command env
   with NAMED vars only; names colliding with managed keys are refused,
-  values never logged. Extends-from-empty.
+  values never logged. Extends-from-empty. Workspace bootstrap, readiness
+  and data commands get a name only when the repo's `secrets[]` also
+  declares it. That includes `SSH_AUTH_SOCK` (the forwarded ssh agent) and
+  `GIT_CONFIG_GLOBAL` (your global git config): both sign in as you, so
+  neither crosses by default. Without the git config those commands commit
+  as a neutral `kranz gate` identity. Proxy and CA variables always cross.
 - **`workspace.allowedMounts`**: host paths the container workspace provider
   may bind-mount when the workspace contract's `mounts[]` asks for them.
   Operator-only. The contract is repository content, so a mount needs both

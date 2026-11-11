@@ -719,6 +719,24 @@ impl MissionEngine {
                     rule: None,
                 });
             }
+            // "Their last round verdict stands" is enforced here, not left to
+            // the validator that read the FAIL line (audit M8): an assertion
+            // whose most recent session failed fails the gate like a failed
+            // command assertion.
+            for assertion in failed_pty_assertions(&contract, &events) {
+                findings.push(Finding {
+                    subject: assertion.id.clone(),
+                    severity: "critical".to_string(),
+                    evidence: format!(
+                        "declared pty-script assertion `{}` failed in its most recent session                          (the latest validation.pty.transcript verdict for it is not PASS; the                          transcript is referenced from that event)",
+                        assertion.id
+                    ),
+                    suggested_fix: "make the terminal session meet the scripted expectations;                         the next validation round drives it again"
+                        .to_string(),
+                    class: "command-assertion".to_string(),
+                    rule: None,
+                });
+            }
         }
 
         // agent-judgement assertions — one orchestrator verdicts turn.

@@ -2,7 +2,7 @@
 title: Tracked vs runtime files
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - AGENTS.md
   - crates/engine/src/workspace_contract.rs
@@ -12,6 +12,8 @@ verified_against:
   - crates/engine/src/hook_status.rs
   - crates/engine/src/migrate_state.rs
 ---
+
+Rechecked 2026-11-11 (UTC) against the workspace contract change: service names are now validated (lowercase letters, digits, `-`, `_`; `workspace` is reserved). The tracked and runtime file lists are unchanged.
 
 # Tracked vs runtime
 

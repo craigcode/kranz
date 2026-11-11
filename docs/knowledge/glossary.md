@@ -23,6 +23,10 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the second audit round: the project layer may lower `hooks.ciDraftsPerHour` and never raise it. No term changed meaning.
+
+Rechecked 2026-11-11 (UTC) against the evidence fixes in the orchestrator (fenced contract-command output, the pty final-gate check). No term changed.
+
 Rechecked 2026-11-11 (UTC) against the orchestrator backend rule: the project layer may set `orchestrator.backend` only to `claude`; the operator-only entry says so. No other term changed.
 
 Rechecked 2026-11-11 (UTC) against the ticket-queue binding: the Slack todo Queue target now carries a mission id alongside the slug. No glossary term changed meaning.
