@@ -66,10 +66,11 @@ By submitting a contribution you agree to the following terms.
   you wrote the change, or otherwise have the right to submit it under the
   project license. Pull requests with unsigned commits are not merged.
 - **Relicensing.** You keep the copyright in your contribution. You also
-  grant Craig Martin, the project's copyright holder, a perpetual, worldwide,
-  non-exclusive, royalty-free, irrevocable license to use, modify, sublicense
-  and distribute your contribution as part of Kranz under other license terms,
-  including terms that are not open source. Releases already published under
-  Apache 2.0 remain available under it.
+  grant Craig Martin, the project's copyright holder, and any successors and
+  assigns, a perpetual, worldwide, non-exclusive, royalty-free, irrevocable
+  license to use, modify, sublicense and distribute your contribution as part
+  of Kranz under other license terms, including terms that are not open
+  source. Releases already published under Apache 2.0 remain available under
+  it.
 - **Employer rights.** If your employer has rights in work you create, confirm
   you have permission to contribute before opening a pull request.
