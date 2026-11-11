@@ -17,6 +17,9 @@ Notable user-visible changes are documented here. This project follows
   start during a merge, when the mission works in its own worktree (the
   default). Merges still run one at a time, and a mission that works in the
   primary checkout still excludes a merge.
+- Changed: every `kranz serve` response now forbids being shown inside a
+  frame (`Content-Security-Policy: frame-ancestors 'none'`,
+  `X-Frame-Options: DENY`) and sets `X-Content-Type-Options: nosniff`.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained
