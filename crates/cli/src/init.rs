@@ -495,9 +495,19 @@ fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("path {} has no file name", path.display()))?;
-    let tmp = path.with_file_name(format!("{}.kranz-init.tmp", file_name.to_string_lossy()));
+    // A name nobody can predict, created exclusively: a fixed name opened
+    // with create-or-truncate would write through a link planted at it.
+    let tmp = path.with_file_name(format!(
+        "{}.kranz-init.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     {
-        let mut file = fs::File::create(&tmp)
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .with_context(|| format!("creating temporary file {}", tmp.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("writing temporary file {}", tmp.display()))?;
