@@ -315,6 +315,38 @@ pub struct RunOutcome {
     pub denied_egress: Vec<crate::egress_proxy::EgressDenial>,
 }
 
+/// Longest refusal category kept in the event log. Categories are short
+/// identifiers; the bound only stops an unexpected value from growing an event.
+const REFUSAL_CATEGORY_MAX: usize = 64;
+
+/// The message to record when a terminal result reports that the model
+/// declined the request, or `None` for every other result.
+///
+/// A refusal is reported in the result message's `stop_reason` (the Claude
+/// CLI passes the API value through), not through `is_error`. The optional
+/// `stop_details.category` says which safeguard declined. Both come from the
+/// agent stream, so the category is scrubbed and bounded before it is stored.
+/// Backends whose result carries no `stop_reason` are unaffected.
+fn refusal_note(raw: &serde_json::Value) -> Option<String> {
+    if raw.get("stop_reason").and_then(serde_json::Value::as_str) != Some("refusal") {
+        return None;
+    }
+    let category = raw
+        .pointer("/stop_details/category")
+        .and_then(serde_json::Value::as_str)
+        .map(|c| scrub::scrub_and_truncate(c, REFUSAL_CATEGORY_MAX))
+        .filter(|c| !c.trim().is_empty());
+    Some(match category {
+        Some(category) => format!(
+            "the model declined this request (stop reason: refusal, category: {category}); \
+             sending the same task again is unlikely to succeed"
+        ),
+        None => "the model declined this request (stop reason: refusal); \
+                 sending the same task again is unlikely to succeed"
+            .to_string(),
+    })
+}
+
 /// Whether `tool` names a shell whose `ToolUse` summary is a runnable command a
 /// `command_grants` entry could unblock. Claude's `Bash` and Codex's
 /// `command_execution` both carry the literal command in the summary
@@ -440,6 +472,7 @@ pub async fn run_session_to(
     let mut cost_usd: Option<f64> = None;
     let mut final_text = String::new();
     let mut last_is_error = false;
+    let mut refusal: Option<String> = None;
     let mut denied_count: u32 = 0;
     // Positional ToolUse↔ToolResult correlation for grant-request: remember
     // the last tool call so a denied result can name the command it blocked.
@@ -542,12 +575,17 @@ pub async fn run_session_to(
                         is_error,
                         usage: turn_usage,
                         cost_usd: turn_cost,
+                        raw,
                         ..
                     } = &event
                     {
                         usage.add(turn_usage);
                         final_text = text.clone();
                         last_is_error = *is_error;
+                        // Latest turn wins, like `last_is_error`: a refusal
+                        // on an earlier turn that a later turn recovered
+                        // from is not the session's outcome.
+                        refusal = refusal_note(raw);
                         if turn_cost.is_some() {
                             cost_usd = *turn_cost;
                         }
@@ -594,7 +632,11 @@ pub async fn run_session_to(
         Role::Orchestrator => {}
     }
 
-    let result = if last_is_error || matches!(exit, SessionExit::Failed(_)) {
+    // A model refusal is a clean process exit with no error flag, so without
+    // this it reads as a session that simply produced no report (`Partial`),
+    // and the same declined request can be respawned. Record it as a failure
+    // with its own message so the judge sees why there is no report.
+    let result = if last_is_error || refusal.is_some() || matches!(exit, SessionExit::Failed(_)) {
         RunResult::Fail
     } else if exit == SessionExit::Aborted {
         // Budget/interrupt: forced Partial even when a report parsed.
@@ -656,6 +698,14 @@ pub async fn run_session_to(
             run_id: run_meta.run_id.clone(),
             denials,
             omitted_count,
+        })?;
+    }
+
+    if let Some(note) = &refusal {
+        log.record(EventKind::WorkerMessage {
+            run_id: run_meta.run_id.clone(),
+            tag: "error".into(),
+            content: note.clone(),
         })?;
     }
 
@@ -2013,6 +2063,43 @@ fn apply_egress_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_note_fires_only_on_a_refusal_stop_reason() {
+        let ended = serde_json::json!({"type": "result", "stop_reason": "end_turn"});
+        assert_eq!(refusal_note(&ended), None);
+        let absent = serde_json::json!({"type": "result", "is_error": false});
+        assert_eq!(refusal_note(&absent), None);
+        let null = serde_json::json!({"type": "result", "stop_reason": null});
+        assert_eq!(refusal_note(&null), None);
+
+        let bare = serde_json::json!({"type": "result", "stop_reason": "refusal"});
+        let note = refusal_note(&bare).expect("a refusal must produce a note");
+        assert!(note.contains("stop reason: refusal"), "{note}");
+        assert!(!note.contains("category"), "{note}");
+    }
+
+    #[test]
+    fn refusal_note_names_a_bounded_category() {
+        let raw = serde_json::json!({
+            "type": "result",
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+        });
+        let note = refusal_note(&raw).expect("a refusal must produce a note");
+        assert!(note.contains("category: cyber"), "{note}");
+
+        let long = serde_json::json!({
+            "stop_reason": "refusal",
+            "stop_details": {"category": "x".repeat(5000)},
+        });
+        let note = refusal_note(&long).expect("a refusal must produce a note");
+        assert!(
+            note.len() < 400,
+            "category must be bounded, got {} bytes",
+            note.len()
+        );
+    }
 
     /// The resolved sandbox must never widen its writable set to the shared
     /// system temp root (ticket sandbox-writable-scope): the runner pins the

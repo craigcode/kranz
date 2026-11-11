@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: a session that the model declines to carry out is recorded as a
+  failed run, with a message in the event log that names the refusal and its
+  category when the agent reports one. It was recorded before as a partial run
+  with no report, which gave no reason for the missing report. This applies to
+  backends whose result reports a stop reason, which today is Claude Code.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained
