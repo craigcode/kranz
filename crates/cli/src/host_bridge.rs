@@ -127,7 +127,9 @@ impl PlanningHost for HostedPlanning {
         // Same seam as `POST /api/missions/:id/merge`: `MissionHost::merge`
         // already carries a user-presentable refusal (dirty tree / failing
         // gate with its verbatim output / conflict) in `ApiError::message`.
-        Box::pin(async move { self.0.merge(id).await.map_err(plain) })
+        // Slack carries no way to accept a changed base policy: that
+        // refusal sends the operator to the dashboard.
+        Box::pin(async move { self.0.merge(id, None).await.map_err(plain) })
     }
 
     fn ask<'a>(&'a self, question: &'a str) -> BoxFuture<'a, anyhow::Result<AskOutcome>> {

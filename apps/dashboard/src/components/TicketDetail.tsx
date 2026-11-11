@@ -241,7 +241,7 @@ export function TicketDetail({ slug }: { slug: string }) {
               className="btn-small"
               disabled={approveDisabled}
               title={approveTitle}
-              onClick={() => void approveTicket(slug, false)}
+              onClick={() => void approveTicket(slug, false, ticket.missionId ?? null)}
             >
               Queue for run
             </button>

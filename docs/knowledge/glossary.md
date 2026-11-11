@@ -23,6 +23,8 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the consent-binding fixes: webhook queueing now needs the operator-only `hooks.autoQueue` key, documented in `docs/protocol.md`. No term changed.
+
 Rechecked 2026-11-11 (UTC) against the scratch-removal and reaper fixes: ACP private-home cleanup now walks by directory descriptor. No term changed.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan review surfaces now list the plan's command grants and touch set. No term changed.

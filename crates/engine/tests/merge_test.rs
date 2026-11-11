@@ -4,7 +4,7 @@
 //! git's global/system config masked, skipping cleanly when git is missing.
 
 use kranz_engine::git_ops::{GitRepo, KranzCommitMetadata};
-use kranz_engine::merge::{merge_mission, MergeReport};
+use kranz_engine::merge::{merge_mission, merge_mission_with_standards_evidence, MergeReport};
 use kranz_engine::merge_gate::MERGE_GATES_PATH;
 use kranz_engine::scrub;
 use kranz_engine::types::TokenUsage;
@@ -732,6 +732,8 @@ fn base_owned_secret_fingerprint_waiver_allows_merge() {
     repo.add_all_and_commit("review secret waiver on base")
         .unwrap();
 
+    // The allowlist on base changed after approval. Nobody has accepted
+    // that, so the merge refuses and names the file and the policy digest.
     let report = merge_mission(
         &repo,
         "main",
@@ -742,11 +744,121 @@ fn base_owned_secret_fingerprint_waiver_allows_merge() {
         passing_executor,
     )
     .unwrap();
+    let MergeReport::BasePolicyChanged {
+        files,
+        policy_digest,
+        base_sha,
+        ..
+    } = report
+    else {
+        panic!("an unaccepted base policy change must refuse, got {report:?}");
+    };
+    assert_eq!(files, vec![scrub::SECRET_ALLOWLIST_PATH.to_string()]);
+    assert_eq!(base_sha, seed);
+    assert_eq!(
+        policy_digest,
+        kranz_engine::merge::base_policy_digest(&repo, "main").unwrap()
+    );
+
+    // Accepting some OTHER policy is not acceptance of this one.
+    let stale = merge_mission_with_standards_evidence(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        &Default::default(),
+        passing_executor,
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+    )
+    .unwrap();
+    assert!(
+        matches!(stale, MergeReport::BasePolicyChanged { .. }),
+        "{stale:?}"
+    );
+
+    // The operator reviewed the waiver and accepts exactly this policy.
+    let report = merge_mission_with_standards_evidence(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        &Default::default(),
+        passing_executor,
+        Some(&policy_digest),
+    )
+    .unwrap();
 
     assert!(
         matches!(report, MergeReport::Merged { .. }),
         "expected base-waived secret finding to merge, got {report:?}"
     );
+}
+
+/// H3 residual: a base that moved WITHOUT touching the merge policy needs no
+/// acceptance. Only a change to the gate suite or the allowlist does.
+#[test]
+fn base_movement_that_leaves_the_policy_alone_needs_no_acceptance() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "feature.txt", "mission work\n");
+    write(&dir, "unrelated.txt", "operator commit on main\n");
+    repo.add_all_and_commit("unrelated work on base").unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        passing_executor,
+    )
+    .unwrap();
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+}
+
+/// H3 residual: a weakened gate suite on the base branch (the shape a worker
+/// that can move the base ref would plant) refuses before any gate runs.
+#[test]
+fn a_changed_gate_suite_on_base_refuses_before_any_gate_runs() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "feature.txt", "mission work\n");
+    write(
+        &dir,
+        ".kranz/merge-gates.json",
+        r#"{"gates":[{"command":"true"}]}"#,
+    );
+    repo.add_all_and_commit("swap the gate suite").unwrap();
+    let live = repo.head_sha().unwrap();
+
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |_: &str, _: &Path| panic!("no gate may run under an unaccepted policy"),
+    )
+    .unwrap();
+    let MergeReport::BasePolicyChanged {
+        files, live_base, ..
+    } = report
+    else {
+        panic!("expected BasePolicyChanged, got {report:?}");
+    };
+    assert_eq!(files, vec![".kranz/merge-gates.json".to_string()]);
+    assert_eq!(live_base, live);
+    assert_eq!(repo.head_sha().unwrap(), live, "base is untouched");
 }
 
 #[test]

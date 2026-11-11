@@ -444,8 +444,16 @@ export const api = {
     return getJson('/api/signals', opts);
   },
 
-  approveTicket(slug: string, force: boolean): Promise<{ approved: boolean; missionId: string }> {
-    return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, { force });
+  /** `reviewedMissionId` is the drafted mission whose plan this surface
+   *  showed; the server refuses (409) when the ticket has been re-drafted to a
+   *  different mission since, so an unseen plan is never queued. */
+  approveTicket(
+    slug: string,
+    force: boolean,
+    reviewedMissionId: string | null,
+  ): Promise<{ approved: boolean; missionId: string }> {
+    const body = reviewedMissionId === null ? { force } : { force, missionId: reviewedMissionId };
+    return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, body);
   },
 
   // --- queue (run-the-queue affordance) ------------------------------------
@@ -460,7 +468,14 @@ export const api = {
 
   // --- delivered stage (gated Merge action) --------------------------------
 
-  merge(id: string): Promise<{ merged: boolean; commit?: string }> {
-    return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, {});
+  /** `acceptBasePolicy` is the digest a `base_policy_changed` refusal named:
+   *  sending it back says the operator reviewed the gate suite / allowlist
+   *  change on the base branch and accepts exactly that policy. */
+  merge(
+    id: string,
+    acceptBasePolicy?: string,
+  ): Promise<{ merged: boolean; commit?: string }> {
+    const body = acceptBasePolicy === undefined ? {} : { acceptBasePolicy };
+    return postJson(`/api/missions/${encodeURIComponent(id)}/merge`, body);
   },
 };

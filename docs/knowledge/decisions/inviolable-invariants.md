@@ -37,6 +37,12 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
+Rechecked 2026-11-11 (UTC) against the base-policy merge check: a mission still cannot weaken the checks that judge its own diff, and a base-branch policy change made after approval now needs explicit acceptance at merge. This is detection at the merge, not prevention: a checkout-mode worker can still move the base ref itself. No invariant changed.
+
+Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the one push path still pushes a single `kranz/*` branch and nothing else, now also against tag-following, submodule recursion and push options, and only after the mission's range passes the secret scan. No invariant changed.
+
+Rechecked 2026-11-11 (UTC) against the consent-binding fixes: a remote comment cannot queue an unreviewed plan unless the operator opted in from the global config layer, and an approved grant means exactly the target shown. No invariant changed.
+
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: the hosted merge lands only the mission commit sealed at completion, and changed paths are read NUL-separated so a quoted filename cannot skip a path-scoped gate. These strengthen the merge invariants; none changed.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: base and mission branches are resolved as `refs/heads/<name>` at approval and merge, so a same-named tag cannot stand in for either, and engine-run git ignores replace refs. This strengthens the pinned-base and merge invariants; none changed.

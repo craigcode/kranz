@@ -1576,6 +1576,129 @@ fn the_refusal_names_every_armed_key_and_covers_ls_remote() {
     );
 }
 
+/// Audit M16: the range a push would deliver is scanned as a whole, and the
+/// mission cannot waive its own finding by editing the allowlist in the same
+/// range. Only the base's allowlist counts.
+#[test]
+fn range_scan_refuses_a_secret_and_ignores_a_self_added_waiver() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, base) = seeded_repo();
+    assert_eq!(
+        repo.secret_scan_range_refusal(&base, &base).unwrap(),
+        None,
+        "an empty range is clean"
+    );
+
+    // Committed with plain git: this is a worker-authored commit, which the
+    // engine's own commit-time scan never sees.
+    write(&dir, "notes.txt", "token = sk-ant-api03-NewSecret_123456\n");
+    raw_git(dir.path(), &["add", "notes.txt"]);
+    raw_git(dir.path(), &["commit", "-q", "-m", "worker commit"]);
+    let tip = raw_git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    let refusal = repo
+        .secret_scan_range_refusal(&base, &tip)
+        .unwrap()
+        .expect("a secret in the range must refuse");
+    // No assertion message echoes the refusal: it is scan output.
+    assert!(refusal.contains("anthropic-api-key"));
+    assert!(!refusal.contains("NewSecret"), "never the secret bytes");
+
+    // The mission waives its own finding in a later commit of the same range.
+    let fingerprint = refusal
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("a formatted finding line")
+        .to_string();
+    std::fs::create_dir_all(dir.path().join(".kranz")).unwrap();
+    write(&dir, ".kranz/secret-allowlist", &format!("{fingerprint}\n"));
+    raw_git(dir.path(), &["add", "-f", ".kranz/secret-allowlist"]);
+    raw_git(dir.path(), &["commit", "-q", "-m", "waive it"]);
+    let tip = raw_git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    assert!(
+        repo.secret_scan_range_refusal(&base, &tip)
+            .unwrap()
+            .is_some(),
+        "a waiver added inside the scanned range must not count"
+    );
+}
+
+/// Audit M15: keys that change WHERE a push goes or WHAT it carries are
+/// refused like the program-naming ones. `pushurl` redirects the push away
+/// from the URL the handle vetted; the others widen one branch into tags,
+/// submodules, a mirror, or server-side options.
+#[test]
+fn push_refuses_repo_config_that_redirects_or_widens_the_push() {
+    if !setup() {
+        return;
+    }
+    for (key, value, named) in [
+        (
+            "remote.origin.pushurl",
+            "/tmp/somewhere-else.git",
+            "remote.origin.pushurl",
+        ),
+        ("remote.origin.mirror", "true", "remote.origin.mirror"),
+        ("push.followTags", "true", "push.followtags"),
+        ("push.pushOption", "ci.skip", "push.pushoption"),
+        (
+            "push.recurseSubmodules",
+            "on-demand",
+            "push.recursesubmodules",
+        ),
+        ("submodule.recurse", "true", "submodule.recurse"),
+    ] {
+        let (dir, repo, _) = seeded_repo();
+        let bare = bare_remote(&dir);
+        repo.create_branch("kranz/mission-1", None).unwrap();
+        raw_git(dir.path(), &["config", key, value]);
+
+        let EngineError::Git(msg) = repo
+            .push_mission_branch("origin", "kranz/mission-1")
+            .expect_err("a redirecting or widening key must refuse the push")
+        else {
+            panic!("expected EngineError::Git for {key}");
+        };
+        assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+        assert!(
+            raw_git(&bare, &["for-each-ref", "--format=%(refname)"])
+                .trim()
+                .is_empty(),
+            "a push refused for {key} must not have delivered anything"
+        );
+    }
+}
+
+/// A worker can tag its own commit. The push names exactly one branch and
+/// carries no tag with it.
+#[test]
+fn push_delivers_the_mission_branch_and_no_tag() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+    let bare = bare_remote(&dir);
+    repo.create_branch("kranz/mission-1", None).unwrap();
+    raw_git(
+        dir.path(),
+        &["tag", "-a", "v9.9.9", "-m", "planted", "kranz/mission-1"],
+    );
+
+    repo.push_mission_branch("origin", "kranz/mission-1")
+        .expect("a clean repo config must push");
+    assert_eq!(
+        raw_git(&bare, &["for-each-ref", "--format=%(refname)"]).trim(),
+        "refs/heads/kranz/mission-1"
+    );
+}
+
 /// The control case: a clean repository config pushes normally. Without this
 /// the refusal above could pass on a push path that never worked.
 #[test]

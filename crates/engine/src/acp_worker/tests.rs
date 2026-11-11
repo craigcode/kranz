@@ -884,6 +884,7 @@ async fn profile_mission(scenario: ProfileScenario) {
             |_, _| panic!("policy drift must refuse before commands"),
             &active_paths,
             Actor::LocalRepositoryAuthority,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -913,6 +914,7 @@ async fn profile_mission(scenario: ProfileScenario) {
             },
             &active_paths,
             Actor::LocalRepositoryAuthority,
+            None,
         )
         .unwrap()
     })

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import { TicketDetail } from './TicketDetail';
 import { useKranzStore } from '../lib/store';
 import type { Ticket, TicketSummary } from '../lib/types';
@@ -131,6 +131,17 @@ describe('TicketDetail', () => {
     const queue = await screen.findByRole('button', { name: 'Queue for run' });
     expect(queue.hasAttribute('disabled')).toBe(false);
     expect(queue.getAttribute('title')).toBe('queue for run');
+  });
+
+  it('queues the mission whose plan this page showed, so a re-draft elsewhere is refused', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(makeTicket({ missionId: 'm-shown' }));
+    vi.mocked(api.tickets).mockResolvedValue([]);
+    vi.mocked(api.approveTicket).mockResolvedValueOnce({ approved: true, missionId: 'm-shown' });
+
+    render(<TicketDetail slug="fix-b" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Queue for run' }));
+    await waitFor(() => expect(api.approveTicket).toHaveBeenCalledWith('fix-b', false, 'm-shown'));
   });
 
   it('enables Queue for run when isBlocked is false even if blockedBy is non-empty', async () => {

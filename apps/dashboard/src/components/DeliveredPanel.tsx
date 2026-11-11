@@ -17,6 +17,8 @@ interface Props {
 }
 
 const SAFE_PR_URL_RE = /^https?:\/\//i;
+/** The digest a `base_policy_changed` merge refusal asks to have echoed. */
+const BASE_POLICY_DIGEST_RE = /acceptBasePolicy "([0-9a-f]{64})"/;
 
 export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   const [merged, setMerged] = useState<boolean | null>(null);
@@ -27,6 +29,9 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
   const [creatingPr, setCreatingPr] = useState(false);
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Set when the last merge was refused because the base branch's gate suite
+  // or secret allowlist changed since approval: the digest to accept.
+  const [changedPolicy, setChangedPolicy] = useState<string | null>(null);
   const activeRef = useRef({ mounted: true, missionId, status });
   activeRef.current.missionId = missionId;
   activeRef.current.status = status;
@@ -46,6 +51,7 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
     setMerging(false);
     setCreatingPr(false);
     setPrUrl(null);
+    setChangedPolicy(null);
     setError(null);
     if (status !== 'complete') return;
 
@@ -83,16 +89,19 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
     };
   }, [missionId, status]);
 
-  const onMerge = useCallback(() => {
+  const onMerge = useCallback((acceptBasePolicy?: string) => {
     const reqMissionId = missionId;
     const isCurrent = () =>
       activeRef.current.mounted &&
       activeRef.current.missionId === reqMissionId &&
       activeRef.current.status === 'complete';
     setError(null);
+    setChangedPolicy(null);
     setMerging(true);
-    api
-      .merge(reqMissionId)
+    (acceptBasePolicy === undefined
+      ? api.merge(reqMissionId)
+      : api.merge(reqMissionId, acceptBasePolicy)
+    )
       .then(() => {
         if (!isCurrent()) return;
         setMerged(true);
@@ -101,6 +110,9 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
       .catch((err: unknown) => {
         if (!isCurrent()) return;
         setError(err instanceof ApiError ? err.message : String(err));
+        if (err instanceof ApiError && err.code === 'base_policy_changed') {
+          setChangedPolicy(BASE_POLICY_DIGEST_RE.exec(err.message)?.[1] ?? null);
+        }
       })
       .finally(() => {
         if (isCurrent()) setMerging(false);
@@ -144,7 +156,7 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
     <div className="delivered-panel">
       <div className="delivered-header">
         <span className="status-pill pill-unmerged">UNMERGED</span>
-        <button type="button" className="btn-small delivered-merge-btn" disabled={merging} onClick={onMerge}>
+        <button type="button" className="btn-small delivered-merge-btn" disabled={merging} onClick={() => onMerge()}>
           {merging ? 'Merging…' : 'Merge'}
         </button>
       </div>
@@ -203,6 +215,16 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
         <pre className="picker-error" role="alert">
           {error}
         </pre>
+      )}
+      {changedPolicy !== null && (
+        <button
+          type="button"
+          className="btn-small"
+          disabled={merging}
+          onClick={() => onMerge(changedPolicy)}
+        >
+          Accept base policy change and merge
+        </button>
       )}
     </div>
   );

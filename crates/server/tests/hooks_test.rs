@@ -238,6 +238,21 @@ fn mission_status(repo: &Path, mission_id: &str) -> MissionStatus {
     kranz_engine::reducer::fold(&events).unwrap().mission.status
 }
 
+/// `hooks.autoQueue` lives in the global layer, which every test in this
+/// binary shares. The two tests that depend on its value hold this lock while
+/// they set it and drive their request; no other test reads the key's effect.
+static AUTO_QUEUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_operator_auto_queue(enabled: bool) {
+    let global = kranz_engine::paths::global_config().expect("isolated home resolves");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    std::fs::write(
+        &global,
+        json!({ "hooks": { "autoQueue": enabled } }).to_string(),
+    )
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Payload fixtures
 // ---------------------------------------------------------------------------
@@ -394,6 +409,8 @@ async fn ghook_fix_and_queue_label_drafts_and_queues_without_running() {
     let (_dir, root) = init_hook_repo(Some(SECRET));
     let app = hook_app(&root, 1);
 
+    let _auto_queue = AUTO_QUEUE.lock().await;
+    set_operator_auto_queue(true);
     let response = app
         .oneshot(hook_post(
             "issue_comment",
@@ -402,6 +419,7 @@ async fn ghook_fix_and_queue_label_drafts_and_queues_without_running() {
         ))
         .await
         .unwrap();
+    set_operator_auto_queue(false);
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = body_json(response).await;
     assert_eq!(body["outcome"], "drafted");
@@ -425,6 +443,59 @@ async fn ghook_fix_and_queue_label_drafts_and_queues_without_running() {
     // Pre-consent is on the record.
     let ticket = Ticket::load(&Ticket::tickets_dir(&root).join(format!("{slug}.md"))).unwrap();
     assert!(ticket.raw_body.contains("Consent: fix-and-queue"));
+}
+
+/// Audit M1: the queue label alone must not put an unreviewed plan in the
+/// queue. Without the operator's global `hooks.autoQueue` the draft parks for
+/// review, and a repository file cannot supply that key.
+#[tokio::test]
+async fn ghook_queue_label_parks_for_review_unless_the_operator_enabled_auto_queue() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_hook_repo(Some(SECRET));
+    let app = hook_app(&root, 1);
+
+    let _auto_queue = AUTO_QUEUE.lock().await;
+    set_operator_auto_queue(false);
+    let response = app
+        .oneshot(hook_post(
+            "issue_comment",
+            Some(SECRET),
+            &pr_comment_payload("kranz:fix-and-queue the flaky test"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = body_json(response).await;
+    assert_eq!(body["outcome"], "drafted");
+    assert_eq!(body["queued"], false);
+
+    let slug = "trigger-pr-42";
+    assert_eq!(wait_ticket_terminal(&root, slug).await, TicketState::Review);
+    assert!(kranz_engine::queue::list(&root).is_empty());
+    let ticket = Ticket::load(&Ticket::tickets_dir(&root).join(format!("{slug}.md"))).unwrap();
+    assert!(ticket
+        .raw_body
+        .contains("Consent: fix-and-queue-not-enabled"));
+
+    // The repository's own config file cannot turn it on.
+    std::fs::write(
+        root.join(".kranz").join("config.json"),
+        json!({ "hooks": { "secret": SECRET, "allowUsers": ["reviewer"], "autoQueue": true } })
+            .to_string(),
+    )
+    .unwrap();
+    let response = hook_app(&root, 0)
+        .oneshot(hook_post(
+            "issue_comment",
+            Some(SECRET),
+            &pr_comment_payload("kranz:fix-and-queue again"),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error() || response.status().is_server_error());
+    assert!(kranz_engine::queue::list(&root).is_empty());
 }
 
 // ---------------------------------------------------------------------------

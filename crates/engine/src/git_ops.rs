@@ -731,6 +731,14 @@ impl GitRepo {
         // Each pattern is matched against the key git prints, which lowercases
         // the section and the final subkey but preserves a subsection's case
         // (probed 2026-09-02) — hence `sshcommand`, `insteadof`.
+        //
+        // The last three rows are keys that change WHERE or WHAT a push
+        // delivers rather than which program runs: `remote.<n>.pushurl`
+        // sends the push somewhere other than the URL this handle vetted (a
+        // local path there runs that repository's `pre-receive`),
+        // `remote.<n>.mirror` and `push.followTags` / `recurseSubmodules`
+        // widen one branch into more refs, and `push.pushOption` hands the
+        // server strings the operator never typed.
         const ARMED: &str = "^(credential\\.\
              |core\\.sshcommand$\
              |core\\.askpass$\
@@ -738,7 +746,9 @@ impl GitRepo {
              |protocol\\.\
              |http\\.(.*\\.)?(proxy|proxyauthmethod|sslcainfo|sslcapath|sslcert|sslkey|sslbackend|extraheader|pinnedpubkey|followredirects)$\
              |url\\..*\\.(insteadof|pushinsteadof)$\
-             |remote\\..*\\.(vcs|proxy|proxyauthmethod|uploadpack|receivepack)$)";
+             |remote\\..*\\.(vcs|proxy|proxyauthmethod|uploadpack|receivepack|pushurl|mirror)$\
+             |push\\.(followtags|pushoption|recursesubmodules|gpgsign)$\
+             |submodule\\.recurse$)";
         // Deliberately NOT `self.probe`: the handle's own `-c` segment sets
         // `credential.helper=` and `protocol.ext.allow=never`, and
         // `--get-regexp` would report those command-line values as matches
@@ -1228,7 +1238,18 @@ impl GitRepo {
 
         let mut findings = Vec::new();
         if !tracked.is_empty() {
-            let diff = self.diff_head_paths(&tracked).unwrap_or_default();
+            // A diff that cannot be read (git error, timeout, over the output
+            // cap) is a refusal, not "no findings": the commit would
+            // otherwise go through unscanned.
+            let diff = match self.diff_head_paths(&tracked) {
+                Ok(diff) => diff,
+                Err(e) => {
+                    return Some(format!(
+                        "secret scan could not read the diff of the changed files, so the \
+                         engine commit is refused rather than made unscanned: {e}"
+                    ))
+                }
+            };
             findings.extend(scrub::scan_unified_diff(&diff));
         }
         if !new_files.is_empty() {
@@ -1244,6 +1265,34 @@ impl GitRepo {
                 scrub::format_findings(&findings)
             ))
         }
+    }
+
+    /// The refusal message when the added lines of `base_sha..tip` carry a
+    /// secret finding, or `None` when the range is clean.
+    ///
+    /// This is the scan a ref must pass before it LEAVES the machine
+    /// (`kranz exec --push`): worker-authored commits are not covered by the
+    /// checkpoint scan, and the only other whole-range scan runs at local
+    /// merge, which a pushed branch never reaches. The allowlist is read from
+    /// `base_sha`, the commit pinned at plan approval, so a fingerprint the
+    /// mission added to its own allowlist waives nothing. A diff that cannot
+    /// be read is an error, never a pass.
+    pub fn secret_scan_range_refusal(&self, base_sha: &str, tip: &str) -> Result<Option<String>> {
+        let diff = self.diff_full(base_sha, tip)?;
+        let allowed = self
+            .show_file(base_sha, scrub::SECRET_ALLOWLIST_PATH)?
+            .map(|bytes| scrub::read_allowlist_text(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        let findings = scrub::filter_allowed(scrub::scan_unified_diff(&diff), &allowed);
+        Ok((!findings.is_empty()).then(|| {
+            format!(
+                "secret scan found {} finding(s) in {base_sha}..{tip}; add a fingerprint to {} on \
+                 the base branch only for a reviewed false positive:\n{}",
+                findings.len(),
+                scrub::SECRET_ALLOWLIST_PATH,
+                scrub::format_findings(&findings)
+            )
+        }))
     }
 
     /// [`Self::commit_paths`] minus the secret scan. Private on purpose:
@@ -2290,13 +2339,29 @@ impl GitRepo {
         // the same-named remote branch.
         // Never --force; never a refspec; never main.
         //
+        // The explicit `--no-*` flags pin the push to that one ref even when
+        // the operator's OWN `~/.gitconfig` (kept in force for the network
+        // path) sets `push.followTags`, `push.recurseSubmodules` or signing:
+        // a worker can create an annotated tag on its own commit, and a
+        // global `followTags` would otherwise deliver it. The empty
+        // `push.pushOption` clears any configured option list.
+        //
         // Network mode ([`Self::run_network`]): the tree being pushed is the
         // one the worker just wrote, so this refuses outright if the
         // repository's own config carries a credential helper, an ssh
         // command, a URL rewrite or a transport hook — while leaving the
         // operator's `~/.gitconfig` in force, which is what makes an https
         // push find a credential at all.
-        self.run_network(&["push", remote, branch])?;
+        self.run_network(&[
+            "-c",
+            "push.pushOption=",
+            "push",
+            "--no-follow-tags",
+            "--no-recurse-submodules",
+            "--no-signed",
+            remote,
+            branch,
+        ])?;
         Ok(())
     }
 
