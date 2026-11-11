@@ -496,7 +496,13 @@ fn changed_paths_are_never_c_quoted() {
         return;
     }
     let (dir, repo, seed) = seeded_repo();
-    let odd = "migrations/2026_\u{e9}t\u{e9} \"q\".sql";
+    // Non-ASCII alone triggers git's C-quoting; a double quote does too, but
+    // Windows forbids it in a filename.
+    let odd = if cfg!(windows) {
+        "migrations/2026_\u{e9}t\u{e9} q.sql"
+    } else {
+        "migrations/2026_\u{e9}t\u{e9} \"q\".sql"
+    };
     seed_mission_branch_with_files(
         &dir,
         &repo,
