@@ -653,12 +653,10 @@ mod imp {
         let note = match exited {
             Some(status) => Some(format!("target exited ({status})")),
             None => {
-                // SAFETY: kill(-pid) targets the child's process group —
-                // valid while the child is ours; ESRCH (already gone) is
-                // harmless.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
+                // The child is unreaped here, so its pid is ours to walk
+                // from: the group and every descendant, whatever session it
+                // moved to. ESRCH (already gone) is harmless.
+                crate::process_tree::kill_tree(pid);
                 let _ = child.kill();
                 // Reap WITHOUT wedging: a SIGKILLed pty target can block in
                 // kernel exit while its slave-side output queue stays

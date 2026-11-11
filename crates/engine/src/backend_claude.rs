@@ -1136,7 +1136,8 @@ pub(crate) fn kill_group(pgid: i32) -> bool {
 pub(crate) fn kill_unreaped_group(child: &Child) {
     if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
         if pid > 0 {
-            kill_group(pid);
+            // Unreaped, so the leader's pid is still ours to walk from.
+            crate::process_tree::kill_tree(pid);
         }
     }
 }
@@ -1304,7 +1305,7 @@ impl ClaudeSession {
                 .id()
                 .and_then(|pid| i32::try_from(pid).ok())
                 .filter(|pid| *pid > 0);
-            let group_killed = matches!(pgid, Some(pgid) if kill_group(pgid));
+            let group_killed = matches!(pgid, Some(pgid) if crate::process_tree::kill_tree(pgid));
             if !group_killed {
                 let _ = self.child.start_kill();
             }
