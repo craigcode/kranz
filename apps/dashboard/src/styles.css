@@ -2125,6 +2125,16 @@ button {
   font-weight: 550;
 }
 
+/* Consent text: wrap, never clip or scroll away the tail. */
+.plan-authority-list {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+.plan-authority-list code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .plan-review .section-label {
   padding-left: 0;
   padding-right: 0;

@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: base and mission branches are resolved as `refs/heads/<name>` at approval and merge, so a same-named tag cannot stand in for either, and engine-run git ignores replace refs. This strengthens the pinned-base and merge invariants; none changed.
 
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal budgets and v2 host admission onto v0.5.0 main alongside the security audit remediation. Exact-action authority, environment clearing, owned cleanup, pre-credential v2 admission, authenticated CLI serving, and workspace containment hold unchanged.
 

@@ -1241,7 +1241,7 @@ impl MissionEngine {
         // otherwise a concurrent base advance can pin policy from one commit,
         // create the mission branch from another, and record a third SHA.
         let base = self.state.mission.base_branch.clone();
-        let base_sha = self.repo.rev_parse(&base)?;
+        let base_sha = self.repo.branch_tip(&base)?;
         let review_contract = crate::review_artifact::parse_from_goal(&self.state.mission.goal)?;
         if let Some(contract) = &review_contract {
             crate::review_artifact::validate_source(&self.repo, &base_sha, contract)?;
@@ -1268,7 +1268,7 @@ impl MissionEngine {
         }
         let branch = self.state.mission.mission_branch.clone();
         if self.repo.branch_exists(&branch)? {
-            let existing_tip = self.repo.rev_parse(&branch)?;
+            let existing_tip = self.repo.branch_tip(&branch)?;
             if existing_tip != base_sha {
                 return Err(EngineError::InvalidState(format!(
                     "mission branch `{branch}` already exists at {existing_tip}, not the pinned \
@@ -1381,12 +1381,15 @@ impl MissionEngine {
             );
         }
 
-        // Run agent-authored approval probes only in a disposable detached
-        // worktree at the already-pinned base SHA. Even an `enforce: off`
-        // mission cannot modify the primary checkout through this advisory
-        // lint; enforced missions additionally get the same gate sandbox as
-        // validation/final commands. The sandbox scratch matches the cleared
-        // contract env's HOME/TMP/CARGO_HOME roots.
+        // These commands are planner-authored and run BEFORE any human has
+        // reviewed the plan (`kranz draft` approves, then parks for review).
+        // They therefore always run contained, in a disposable detached
+        // worktree at the already-pinned base SHA: an `enforce: off` mission
+        // is raised to `fs` for this lint only, exactly as contract controls
+        // are. When no containment resolves the lint is skipped (it is
+        // advisory), never run on the bare host. `contractEnvPassthrough`
+        // credentials are withheld for the same reason. The sandbox scratch
+        // matches the cleared contract env's HOME/TMP/CARGO_HOME roots.
         let command_assertions_present = plan
             .validation_contract
             .iter()
@@ -1398,25 +1401,75 @@ impl MissionEngine {
                 .join("approval-contract-lint-worktree");
             let _lint_worktree = ApprovalLintWorktree::create(&self.repo, &lint_root, &base_sha)?;
             let scratch = self.paths.runs_dir().join("approval-contract-home");
-            let mut sandbox = crate::command_exec::resolve_gate_sandbox(
-                &crate::command_exec::worker_gate_sandbox(&self.state.config)?,
-                &lint_root,
-                &self.paths.mission_dir(),
-                &scratch,
-                &self.paths.runs_dir(),
-            )?
-            .sandbox;
-            let report = contract_lint::run_contract_lint(
-                &lint_root,
-                &scratch,
-                Some(&base_sha),
-                &plan.validation_contract,
-                true,
-                &self.state.config.contract_env_passthrough,
-                &sandbox,
-            );
-            sandbox.cleanup()?;
-            report
+            let mut policy = crate::command_exec::worker_gate_sandbox(&self.state.config)?;
+            let operator_enforced = policy.enforce != SandboxEnforce::Off;
+            if !operator_enforced {
+                policy.enforce = SandboxEnforce::Fs;
+            }
+            // Raising an `off` posture is only done where the raised sandbox
+            // is known to run commands faithfully: native macOS/Linux, and
+            // only after a smoke probe (a nested apply inside another sandbox
+            // cannot start, and would report every assertion as failing).
+            // Windows has no verified contract for it, as with contract
+            // controls. An operator-enforced posture is used as resolved.
+            let skipped = || contract_lint::ContractLintReport::skipped(&plan.validation_contract);
+            if !operator_enforced && cfg!(windows) {
+                skipped()
+            } else {
+                match crate::command_exec::resolve_gate_sandbox(
+                    &policy,
+                    &lint_root,
+                    &self.paths.mission_dir(),
+                    &scratch,
+                    &self.paths.runs_dir(),
+                ) {
+                    Ok(resolution) => {
+                        let mut sandbox = resolution.sandbox;
+                        let usable = sandbox.enforce() != SandboxEnforce::Off
+                            && (operator_enforced
+                                || contract_lint::containment_usable(
+                                    &lint_root,
+                                    &scratch,
+                                    Some(&base_sha),
+                                    &sandbox,
+                                ));
+                        let report = if usable {
+                            contract_lint::run_contract_lint(
+                                &lint_root,
+                                &scratch,
+                                Some(&base_sha),
+                                &plan.validation_contract,
+                                true,
+                                &[],
+                                &sandbox,
+                            )
+                        } else {
+                            skipped()
+                        };
+                        match sandbox.cleanup() {
+                            Err(e) if operator_enforced => return Err(e),
+                            Err(e) => tracing::warn!(
+                                mission = %self.state.mission.id,
+                                error = %e,
+                                "approval contract lint sandbox cleanup failed"
+                            ),
+                            Ok(()) => {}
+                        }
+                        report
+                    }
+                    // An operator-enforced posture keeps failing closed. A
+                    // host that cannot contain loses only the advisory lint.
+                    Err(e) if operator_enforced => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            mission = %self.state.mission.id,
+                            error = %e,
+                            "approval contract lint skipped: no containment available"
+                        );
+                        skipped()
+                    }
+                }
+            }
         } else {
             contract_lint::ContractLintReport {
                 results: Vec::new(),
@@ -1645,7 +1698,13 @@ impl MissionEngine {
         // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
-            let mut headline = if suspect_count > 0 {
+            let skipped = contract_lint_report.not_linted().len();
+            let mut headline = if skipped == contract_lint_report.results.len() {
+                format!(
+                    "contract lint skipped: {skipped} command assertion(s) were not run on \
+                     the base (no containment available or budget spent)"
+                )
+            } else if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
@@ -3995,7 +4054,9 @@ impl MissionEngine {
             let Some(run) = run else { continue };
             // Read-only probe on the shared refs (worktree isolation
             // untouched): the tree hash anchors the verdict to exact bytes.
-            let tree = self.repo.rev_parse(&format!("{}^{{tree}}", ws.branch))?;
+            let tree = self
+                .repo
+                .rev_parse(&format!("refs/heads/{}^{{tree}}", ws.branch))?;
             candidates.push(DivergenceCandidate {
                 run_id: run.id.clone(),
                 branch: ws.branch.clone(),

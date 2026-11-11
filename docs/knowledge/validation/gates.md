@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-09
+last_verified: 2026-11-10
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint runs contained even at `sandbox.enforce: off` and is reported as skipped when nothing can contain it; merge and external gates resolve branches as `refs/heads/<name>`. Gate commands and acceptance rules are unchanged.
 
 Rechecked 2026-11-09 (UTC): Merged the nine named terminal Docker proofs and ACP v2 admission checks onto v0.5.0 main alongside workspace gate sandboxing and GLib backport checks. Gate contracts and acceptance requirements remain unchanged.
 
