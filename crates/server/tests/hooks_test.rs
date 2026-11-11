@@ -246,11 +246,17 @@ static AUTO_QUEUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn set_operator_auto_queue(enabled: bool) {
     let global = kranz_engine::paths::global_config().expect("isolated home resolves");
     std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    // Other tests in this binary read the same file concurrently. Replace it
+    // by rename so none of them ever sees a half-written document (a
+    // truncated read is a config error, which turned an unrelated 403 into a
+    // 400).
+    let staged = global.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(
-        &global,
+        &staged,
         json!({ "hooks": { "autoQueue": enabled } }).to_string(),
     )
     .unwrap();
+    std::fs::rename(&staged, &global).unwrap();
 }
 
 // ---------------------------------------------------------------------------
