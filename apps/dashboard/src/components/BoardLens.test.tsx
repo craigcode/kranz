@@ -899,7 +899,7 @@ describe('trajectory act in place — slice 6 reusing existing panels', () => {
     expect(queueBtn.textContent).toBe('Queue for run');
     fireEvent.click(queueBtn);
 
-    expect(approveSpy).toHaveBeenCalledWith('t-ready', false);
+    expect(approveSpy).toHaveBeenCalledWith('t-ready', false, 'm-ready');
   });
 
   it('renders DeliveredPanel (report, diff stat, and Merge control) when a delivered mission is selected', async () => {

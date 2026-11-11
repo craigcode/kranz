@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use kranz_engine::git_ops::GitRepo;
-use kranz_engine::hooks::{self, Consent, Trigger, TriggerDraft};
+use kranz_engine::hooks::{self, Trigger, TriggerDraft};
 use kranz_engine::signals::proposal::{ingest_verified_signal, IngestResult};
 use kranz_engine::signals::sentry::SentrySignalSource;
 use kranz_engine::signals::source::{DropReason, ReplayCache};
@@ -135,9 +135,10 @@ pub(crate) async fn github_hook(
             ))
         }
         TriggerDraft::Drafted { slug } => {
-            // The existing draft pipeline — plan approval intact. Only the
-            // queue step is pre-consented (queue label); nothing starts
-            // running here: a queued mission still waits for `kranz work`.
+            // The existing draft pipeline. With `hooks.autoQueue` on and the
+            // queue label present the drafted plan is queued with no local
+            // review; otherwise it parks for review. Nothing starts running
+            // here: a queued mission still waits for `kranz work`.
             let then_enqueue = trigger.consent.then_enqueue();
             let mission_id = server.host.draft_async(&slug, then_enqueue).await?;
             decision_trigger(
@@ -189,11 +190,13 @@ fn decision_trigger(trigger: &Trigger, outcome: &str, detail: &str) {
         hooks::TriggerKind::CiFailure => "workflow_run",
         hooks::TriggerKind::PrComment => "pr-comment",
     };
-    let consent = match trigger.consent {
-        Consent::DraftOnly => "draft-only",
-        Consent::PreConsentedQueue => "fix-and-queue",
-    };
-    decision(event, Some(&trigger.actor), Some(consent), outcome, detail);
+    decision(
+        event,
+        Some(&trigger.actor),
+        Some(trigger.consent.as_str()),
+        outcome,
+        detail,
+    );
 }
 
 /// `POST /api/hooks/sentry` — the Sentry issue/alert webhook endpoint

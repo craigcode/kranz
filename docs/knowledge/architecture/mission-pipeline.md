@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the consent-binding fixes: the GitHub queue label queues a drafted plan only when the operator's global config sets `hooks.autoQueue`, the ticket approve route refuses a mission other than the one the caller reviewed, and unofferable grant targets never park. Pipeline stages and event schemas are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: completion seals the validated mission tip in an `orchestrator.decision` before `mission.completed`, and the hosted merge refuses a mission branch at any other commit. Stage order is unchanged.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint always runs contained (or is skipped) and gets no passthrough credentials; plan.md lists the plan's command grants and touch set; base and mission branches resolve as `refs/heads/<name>`. Pipeline stages are unchanged.

@@ -444,8 +444,16 @@ export const api = {
     return getJson('/api/signals', opts);
   },
 
-  approveTicket(slug: string, force: boolean): Promise<{ approved: boolean; missionId: string }> {
-    return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, { force });
+  /** `reviewedMissionId` is the drafted mission whose plan this surface
+   *  showed; the server refuses (409) when the ticket has been re-drafted to a
+   *  different mission since, so an unseen plan is never queued. */
+  approveTicket(
+    slug: string,
+    force: boolean,
+    reviewedMissionId: string | null,
+  ): Promise<{ approved: boolean; missionId: string }> {
+    const body = reviewedMissionId === null ? { force } : { force, missionId: reviewedMissionId };
+    return postJson(`/api/tickets/${encodeURIComponent(slug)}/approve`, body);
   },
 
   // --- queue (run-the-queue affordance) ------------------------------------

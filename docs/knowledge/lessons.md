@@ -10,6 +10,8 @@ verified_against:
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
 
+Rechecked 2026-11-11 (UTC) after a recheck-only edit to the inviolable invariants note for the consent-binding fixes; no lesson changed.
+
 Rechecked 2026-11-11 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 
 Rechecked 2026-11-10 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.

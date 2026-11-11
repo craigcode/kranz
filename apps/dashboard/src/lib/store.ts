@@ -126,7 +126,7 @@ interface KranzStore {
   ) => Promise<void>;
   /** POST approve for a ticket; refreshes tickets and missions on success and
    *  surfaces the server's refusal message verbatim on failure. */
-  approveTicket: (slug: string, force: boolean) => Promise<void>;
+  approveTicket: (slug: string, force: boolean, reviewedMissionId: string | null) => Promise<void>;
   connectMission: (id: string) => void;
   disconnect: () => void;
   selectRun: (runId: string | null) => void;
@@ -418,12 +418,12 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       }
     },
 
-    approveTicket: async (slug: string, force: boolean) => {
+    approveTicket: async (slug: string, force: boolean, reviewedMissionId: string | null) => {
       if (get().ticketBusySlug !== null) return;
       set({ ticketError: null, ticketBusySlug: slug });
       const generation = repoGeneration;
       try {
-        await api.approveTicket(slug, force);
+        await api.approveTicket(slug, force, reviewedMissionId);
         if (repoGeneration !== generation) return;
         await Promise.all([get().loadTickets(), get().loadMissions()]);
       } catch (err) {

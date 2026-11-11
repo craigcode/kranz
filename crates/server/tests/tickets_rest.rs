@@ -500,6 +500,59 @@ async fn rest_ticket_mutations_approve_force_overrides_an_unsatisfied_blocker() 
     );
 }
 
+/// Audit M5: a review surface sends the drafted mission it displayed. When
+/// the ticket has been re-drafted since, the approve must refuse instead of
+/// queueing a mission the operator never saw.
+#[tokio::test]
+async fn rest_ticket_approve_refuses_a_mission_other_than_the_one_reviewed() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(tmp.path(), "standalone", NO_BLOCKER_BODY);
+    Ticket::record_mission(tmp.path(), "standalone", "m-reviewed").unwrap();
+    Ticket::write_state(
+        tmp.path(),
+        "standalone",
+        kranz_engine::ticket::TicketState::Review,
+        None,
+    )
+    .unwrap();
+    // Another surface re-drafts: the ticket now points at a different mission.
+    Ticket::record_mission(tmp.path(), "standalone", "m-redrafted").unwrap();
+
+    let app = hosted_app(tmp.path(), "tok");
+    let approve = |body: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/tickets/standalone/approve")
+            .header("content-type", "application/json")
+            .header("x-kranz-token", "tok")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let response = app
+        .clone()
+        .oneshot(approve(r#"{"force":false,"missionId":"m-reviewed"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = body_json(response).await;
+    let message = json.to_string();
+    assert!(message.contains("m-redrafted"), "{message}");
+    assert_eq!(
+        Ticket::read_state(tmp.path(), "standalone"),
+        kranz_engine::ticket::TicketState::Review
+    );
+    assert!(kranz_engine::queue::list(tmp.path()).is_empty());
+
+    // Naming the mission the ticket really points at queues it.
+    let response = app
+        .oneshot(approve(r#"{"force":false,"missionId":"m-redrafted"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["missionId"], "m-redrafted");
+}
+
 #[tokio::test]
 async fn rest_ticket_mutations_approve_409s_on_a_cycle_even_with_force() {
     let tmp = TempDir::new().unwrap();

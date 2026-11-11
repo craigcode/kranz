@@ -61,6 +61,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the consent-binding fixes: a denial whose target would be enforced as a pattern (a path with glob syntax, a wildcard host) or that carries control or reordering characters is no longer offered as a grant and stays an ordinary finding or block. Gate commands, the grant cap and deny semantics are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: conditional merge gates and path-scoped standards now see changed paths exactly as stored (never C-quoted), and the merge refuses a mission branch that moved after validation. Gate commands and acceptance rules are unchanged.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint runs contained even at `sandbox.enforce: off` and is reported as skipped when nothing can contain it; merge and external gates resolve branches as `refs/heads/<name>`. Gate commands and acceptance rules are unchanged.

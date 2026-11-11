@@ -117,9 +117,9 @@ describe('approveTicket', () => {
     const message = "ticket 'a' is blocked by 'b' (not yet complete)";
     vi.mocked(api.approveTicket).mockRejectedValueOnce(new ApiError(409, message));
 
-    await useKranzStore.getState().approveTicket('a', false);
+    await useKranzStore.getState().approveTicket('a', false, 'm-shown');
 
-    expect(api.approveTicket).toHaveBeenCalledWith('a', false);
+    expect(api.approveTicket).toHaveBeenCalledWith('a', false, 'm-shown');
     expect(useKranzStore.getState().ticketError).toBe(message);
     expect(useKranzStore.getState().ticketBusySlug).toBeNull();
   });
@@ -131,9 +131,9 @@ describe('approveTicket', () => {
     vi.mocked(api.tickets).mockResolvedValueOnce(rows);
     vi.mocked(api.missions).mockResolvedValueOnce(missions);
 
-    await useKranzStore.getState().approveTicket('a', true);
+    await useKranzStore.getState().approveTicket('a', true, null);
 
-    expect(api.approveTicket).toHaveBeenCalledWith('a', true);
+    expect(api.approveTicket).toHaveBeenCalledWith('a', true, null);
     expect(api.tickets).toHaveBeenCalledOnce();
     expect(api.missions).toHaveBeenCalledOnce();
     expect(useKranzStore.getState().tickets).toEqual(rows);
@@ -153,7 +153,7 @@ describe('approveTicket', () => {
     vi.mocked(api.tickets).mockResolvedValueOnce([]);
     vi.mocked(api.missions).mockResolvedValueOnce([]);
 
-    const pending = useKranzStore.getState().approveTicket('a', false);
+    const pending = useKranzStore.getState().approveTicket('a', false, null);
     expect(useKranzStore.getState().ticketBusySlug).toBe('a');
 
     resolveApprove({ approved: true, missionId: 'm-1' });
