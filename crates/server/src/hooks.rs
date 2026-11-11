@@ -211,6 +211,18 @@ pub(crate) async fn sentry_hook(
     let repo_root = server.host.repo_root().clone();
     let signals_cfg = SignalsConfig::load(&repo_root).map_err(ApiError::from)?;
     let sentry_cfg = signals_cfg.sentry.clone().unwrap_or_default();
+    // Refuse before anything else when the operator never configured this
+    // source: an unconfigured repo must not gain a `.kranz/signals/` tree or
+    // spend work on requests from whoever can reach the port.
+    if sentry_cfg
+        .secret
+        .as_deref()
+        .is_none_or(|secret| secret.trim().is_empty())
+    {
+        return Err(ApiError::forbidden(
+            "sentry hooks are not configured for this repository (no signals.sentry.secret)",
+        ));
+    }
     let source = SentrySignalSource::new(sentry_cfg);
 
     let mut header_map = BTreeMap::new();
@@ -220,7 +232,10 @@ pub(crate) async fn sentry_hook(
         }
     }
 
-    let result = {
+    // Ledger verification, fsync and the process-wide locks are blocking
+    // work; keep them off the async workers that serve health, approvals and
+    // WebSockets.
+    let result = tokio::task::spawn_blocking(move || {
         let mut cache = sentry_replay_cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -233,8 +248,10 @@ pub(crate) async fn sentry_hook(
             chrono::Utc::now(),
             &mut cache,
         )
-        .map_err(ApiError::from)?
-    };
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("sentry ingest task failed: {e}")))?
+    .map_err(ApiError::from)?;
 
     match result {
         IngestResult::Dropped { reason } => {
