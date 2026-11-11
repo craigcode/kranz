@@ -118,7 +118,7 @@ export function ReviewableTicketRow({
             disabled={r.isBlocked || ticketBusySlug !== null}
             title={title}
             onClick={() => {
-              void approveTicket(r.slug!, false).then(() => {
+              void approveTicket(r.slug!, false, r.missionId ?? null).then(() => {
                 onQueued?.();
               });
             }}
@@ -368,7 +368,7 @@ export function PipelineView({
           className="btn-small pipeline-primary-action"
           disabled={row.isBlocked || ticketBusySlug !== null}
           title={title}
-          onClick={() => void approveTicket(row.slug!, false)}
+          onClick={() => void approveTicket(row.slug!, false, row.missionId ?? null)}
         >
           {busy ? 'Queuing…' : 'Queue for run'}
         </button>

@@ -769,7 +769,15 @@ impl MissionHost {
     /// merge is independent of the planning/run-loop registry) and runs
     /// [`kranz_engine::merge::merge_mission`] under `spawn_blocking` (git and
     /// the gate suite are both blocking work). Never pushes.
-    pub async fn merge(&self, id: &str) -> Result<Value, ApiError> {
+    ///
+    /// `accepted_base_policy` is the digest of a changed base policy the
+    /// caller has reviewed (see [`MergeReport::BasePolicyChanged`]); `None`
+    /// refuses any such change.
+    pub async fn merge(
+        &self,
+        id: &str,
+        accepted_base_policy: Option<String>,
+    ) -> Result<Value, ApiError> {
         if !MissionPaths::is_safe_id(id) {
             return Err(ApiError::not_found(format!("unknown mission '{id}'")));
         }
@@ -878,6 +886,7 @@ impl MissionHost {
                 },
                 &merge_paths,
                 kranz_engine::live_permission::Actor::LocalMutationCapability,
+                accepted_base_policy.as_deref(),
             );
             // Explicit: the repo-busy hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.
@@ -924,6 +933,21 @@ impl MissionHost {
             MergeReport::RefusedPreMerge { detail } => Err(ApiError::conflict(format!(
                 "merge refused before it started: {detail}"
             ))),
+            MergeReport::BasePolicyChanged {
+                files,
+                policy_digest,
+                base_sha,
+                live_base,
+            } => Err(ApiError::conflict(format!(
+                "merge refused: {} changed on the base branch since this mission's plan was \
+                 approved (approved against {base_sha}, base is now {live_base}). Those files \
+                 decide which gates run and which secret findings are waived. Review \
+                 `git diff {base_sha} {live_base} -- {}`; if the change is yours, retry the \
+                 merge with acceptBasePolicy \"{policy_digest}\".",
+                files.join(" and "),
+                files.join(" ")
+            ))
+            .with_code(ApiErrorCode::BasePolicyChanged)),
             MergeReport::StandardsDrifted {
                 approved_digest,
                 current_digest,
@@ -2383,15 +2407,24 @@ pub(crate) async fn start_mission(
     Ok((StatusCode::ACCEPTED, Json(json!({ "running": true }))))
 }
 
-/// `POST /api/missions/:id/merge` → `200 {"merged":true,"commit":"..."}` on
-/// success. See [`MissionHost::merge`] for the non-2xx shapes (dirty tree /
-/// gate failure / conflict).
+/// `POST /api/missions/:id/merge` — optional body
+/// `{"acceptBasePolicy": "<digest>"}` → `200 {"merged":true,"commit":"..."}`
+/// on success. See [`MissionHost::merge`] for the non-2xx shapes (dirty tree /
+/// gate failure / conflict / `base_policy_changed`, whose message names the
+/// digest to send back).
 pub(crate) async fn merge_mission_route(
     State(server): State<Arc<ServerState>>,
     UrlPath(id): UrlPath<String>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let id = valid_id(&server, &id)?;
-    Ok(Json(server.host.merge(&id).await?))
+    let value = parse_body(&body)?;
+    let accepted = match value.get("acceptBasePolicy") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(digest)) => Some(digest.clone()),
+        Some(_) => return Err(ApiError::bad_request("acceptBasePolicy must be a string")),
+    };
+    Ok(Json(server.host.merge(&id, accepted).await?))
 }
 
 /// `POST /api/queue/drain` — no required body → `200 <drain-state JSON>`.

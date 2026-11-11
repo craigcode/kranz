@@ -165,8 +165,11 @@ pub(crate) async fn create_ticket(
     ))
 }
 
-/// `POST /api/tickets/:slug/approve` — optional body `{"force": bool}`
-/// (default `false`) → `200 {"approved":true,"missionId":"m-…"}`. Runs the
+/// `POST /api/tickets/:slug/approve` — optional body
+/// `{"force": bool, "missionId": "m-…"}` (`force` default `false`) →
+/// `200 {"approved":true,"missionId":"m-…"}`. `missionId`, when sent, is the
+/// drafted mission the caller reviewed: 409 if the ticket no longer points at
+/// it (re-drafted elsewhere), so nothing unseen is queued. Runs the
 /// same gate the CLI's `kranz ticket approve` runs
 /// ([`kranz_engine::deps::approve_ticket`]): 409 naming the unsatisfied
 /// blocker when blocked and `force` is false; 409 with the cycle path on a
@@ -181,6 +184,22 @@ pub(crate) async fn approve_ticket(
         .map_err(|e| ApiError::bad_request(format!("invalid ticket slug '{slug}': {e}")))?;
     let value = crate::host::parse_body(&body)?;
     let force = value.get("force").and_then(Value::as_bool).unwrap_or(false);
+    // A review surface names the drafted mission it showed. If the ticket was
+    // re-drafted from another surface since, that mission is no longer the
+    // one this approval would queue: refuse rather than queue an unseen plan.
+    if let Some(shown) = value.get("missionId") {
+        let shown = shown
+            .as_str()
+            .ok_or_else(|| ApiError::bad_request("missionId must be a string"))?;
+        let current = Ticket::mission_for(server.host.repo_root(), &slug);
+        if current.as_deref() != Some(shown) {
+            return Err(ApiError::conflict(format!(
+                "ticket '{slug}' was re-drafted: it now points at {}, not the reviewed {shown}. \
+                 Reload the ticket and review the current plan before queueing it.",
+                current.as_deref().unwrap_or("no drafted mission")
+            )));
+        }
+    }
     let approved = server.host.approve_ticket(&slug, force)?;
     Ok(Json(
         json!({ "approved": true, "missionId": approved.mission_id }),

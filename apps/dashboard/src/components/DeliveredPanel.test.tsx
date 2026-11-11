@@ -103,6 +103,43 @@ describe('DeliveredPanel', () => {
     expect(screen.queryByText('UNMERGED')).toBeNull();
   });
 
+  it('offers to accept a changed base policy only after that refusal, and sends its digest back', async () => {
+    vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
+    const digest = 'ab'.repeat(32);
+    const refusal = `merge refused: .kranz/merge-gates.json changed on the base branch. Retry the merge with acceptBasePolicy "${digest}".`;
+    vi.mocked(api.merge)
+      .mockRejectedValueOnce(new ApiError(409, refusal, 'base_policy_changed'))
+      .mockResolvedValueOnce({ merged: true, commit: 'abc123' });
+
+    render(<DeliveredPanel missionId="m-1" status="complete" />);
+
+    const accept = /Accept base policy change and merge/;
+    const merge = await screen.findByRole('button', { name: 'Merge' });
+    expect(screen.queryByRole('button', { name: accept })).toBeFalsy();
+    fireEvent.click(merge);
+
+    expect((await screen.findByRole('alert')).textContent).toBe(refusal);
+    fireEvent.click(await screen.findByRole('button', { name: accept }));
+
+    await waitFor(() => expect(api.merge).toHaveBeenLastCalledWith('m-1', digest));
+    expect(api.merge).toHaveBeenNthCalledWith(1, 'm-1');
+  });
+
+  it('does not offer the accept step for any other merge refusal', async () => {
+    vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
+    const digest = 'cd'.repeat(32);
+    // Gate output can contain anything, including the marker text.
+    vi.mocked(api.merge).mockRejectedValueOnce(
+      new ApiError(422, `lint failed: acceptBasePolicy "${digest}"`),
+    );
+
+    render(<DeliveredPanel missionId="m-1" status="complete" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+
+    await screen.findByRole('alert');
+    expect(screen.queryByRole('button', { name: /Accept base policy change and merge/ })).toBeFalsy();
+  });
+
   it('renders the ApiError message verbatim in a role="alert" block on a failed merge', async () => {
     vi.mocked(api.missions).mockResolvedValueOnce([makeSummary({ merged: false })]);
     const gateOutput = 'gate "lint" failed:\nline 1 error\nline 2 error';

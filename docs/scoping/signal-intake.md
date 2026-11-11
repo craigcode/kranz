@@ -38,8 +38,9 @@ deterministic; no model reads signal content before a human has consented.
   block. It then drafts immediately (`draft_async`).
 - **Its consent comes from a trusted actor.** A comment trigger fires only
   when a user on `hooks.allowUsers` posts the fix or queue label, so the
-  labelled comment is the operator's consent to draft, and the queue label
-  pre-consents the queue step. Plan approval is never skipped.
+  labelled comment is the operator's consent to draft. The queue label queues
+  the drafted plan only when the operator set `hooks.autoQueue` in the global
+  config; that path has no local plan review, so it is off by default.
 - **Untrusted text is scrubbed and bounded, not fenced.** Trigger excerpts
   (`bound_scrubbed`, 8 KiB raw, 1000 chars) and ticket notes go into the
   drafter's seed as plain text. The established fence is the validator's

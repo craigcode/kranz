@@ -7,7 +7,8 @@
 //! draft → plan approval → queue → `kranz work` — so spend gates and plan
 //! approval stay exactly where they are. The module performs no git
 //! operations at all: its only action set is [`TRIGGER_ACTIONS`] (draft, or
-//! draft+queue when the operator pre-consented via the queue label), and a
+//! draft+queue when the operator enabled `hooks.autoQueue` and the comment
+//! carried the queue label), and a
 //! regression test scans this file to keep it free of any git-mutation path.
 //!
 //! The webhook HTTP surface lives in `kranz-server` (`POST
@@ -29,8 +30,9 @@ use std::path::Path;
 
 /// Default comment label that drafts a fix ticket.
 pub const DEFAULT_FIX_LABEL: &str = "kranz:fix";
-/// Default comment label that additionally pre-consents to queueing the
-/// drafted plan (plan approval itself is never skipped).
+/// Default comment label that additionally asks for the drafted plan to be
+/// queued. Honoured only when the operator set `hooks.autoQueue` in the global
+/// config: a queued draft is a plan nobody reviewed locally.
 pub const DEFAULT_QUEUE_LABEL: &str = "kranz:fix-and-queue";
 
 /// Webhook trigger configuration — the `hooks` key of `.kranz/config.json`
@@ -54,6 +56,11 @@ pub struct HooksConfig {
     /// disables comment triggers; a valid webhook signature authenticates
     /// GitHub, not the commenter's authority to spend or approve work.
     pub allow_users: Vec<String>,
+    /// Whether the queue label may queue a drafted plan with no local review.
+    /// Default `false`, and read from the global (operator) layer ONLY: a
+    /// repository file must not be able to turn a remote comment into an
+    /// unreviewed queued mission.
+    pub auto_queue: bool,
 }
 
 impl Default for HooksConfig {
@@ -63,6 +70,7 @@ impl Default for HooksConfig {
             fix_label: DEFAULT_FIX_LABEL.to_string(),
             queue_label: DEFAULT_QUEUE_LABEL.to_string(),
             allow_users: Vec::new(),
+            auto_queue: false,
         }
     }
 }
@@ -74,6 +82,7 @@ impl fmt::Debug for HooksConfig {
             .field("fix_label", &self.fix_label)
             .field("queue_label", &self.queue_label)
             .field("allow_users", &self.allow_users)
+            .field("auto_queue", &self.auto_queue)
             .finish()
     }
 }
@@ -84,15 +93,19 @@ impl fmt::Debug for HooksConfig {
 /// skipped; a present-but-invalid `hooks` value is a config error naming the
 /// layer. Absent everywhere ⇒ [`HooksConfig::default`] (no secret ⇒ the
 /// caller refuses closed).
+///
+/// `hooks.autoQueue` is the one operator-only key: the project layer setting
+/// it is a config error, the same refusal `config::load` gives its
+/// operator-only keys.
 pub fn load_hooks(repo_root: &Path) -> Result<HooksConfig> {
-    let mut layers: Vec<std::path::PathBuf> = Vec::new();
+    let mut layers: Vec<(std::path::PathBuf, bool)> = Vec::new();
     if let Some(global) = paths::global_config() {
-        layers.push(global);
+        layers.push((global, false));
     }
-    layers.push(paths::project_config(repo_root));
+    layers.push((paths::project_config(repo_root), true));
 
     let mut merged = serde_json::json!({});
-    for path in layers {
+    for (path, project_layer) in layers {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
@@ -110,6 +123,14 @@ pub fn load_hooks(repo_root: &Path) -> Result<HooksConfig> {
             ))
         })?;
         if let Some(hooks) = value.get("hooks") {
+            if project_layer && hooks.get("autoQueue").is_some() {
+                return Err(EngineError::Config(format!(
+                    "{}: the project config layer may not set \"hooks.autoQueue\" — it lets a \
+                     remote comment queue a plan nobody reviewed locally. Operator-only keys \
+                     are settable from the global layer (~/.kranz/config.json) only.",
+                    path.display()
+                )));
+            }
             config::deep_merge(&mut merged, hooks);
         }
     }
@@ -216,9 +237,13 @@ impl TriggerKind {
 pub enum Consent {
     /// Draft only: a human runs the normal draft → approve → queue path.
     DraftOnly,
-    /// The trigger comment carried the queue label: the draft may auto-queue
-    /// on an approved plan (plan approval itself is never skipped).
+    /// The trigger comment carried the queue label and the operator enabled
+    /// `hooks.autoQueue`: the drafted plan is committed and queued with no
+    /// local review. The operator's standing opt-in is the only human step.
     PreConsentedQueue,
+    /// The trigger comment carried the queue label but `hooks.autoQueue` is
+    /// off: the draft parks for review exactly like [`Consent::DraftOnly`].
+    QueueNotEnabled,
 }
 
 impl Consent {
@@ -233,6 +258,7 @@ impl Consent {
         match self {
             Consent::DraftOnly => "draft-only",
             Consent::PreConsentedQueue => "fix-and-queue",
+            Consent::QueueNotEnabled => "fix-and-queue-not-enabled",
         }
     }
 }
@@ -375,7 +401,11 @@ fn parse_comment(event: &str, payload: &Value, cfg: &HooksConfig) -> Option<Trig
     }
     let body = payload.pointer("/comment/body")?.as_str()?;
     let consent = if body.contains(&cfg.queue_label) {
-        Consent::PreConsentedQueue
+        if cfg.auto_queue {
+            Consent::PreConsentedQueue
+        } else {
+            Consent::QueueNotEnabled
+        }
     } else if body.contains(&cfg.fix_label) {
         Consent::DraftOnly
     } else {
@@ -529,8 +559,12 @@ pub fn trigger_ticket_template(trigger: &Trigger) -> String {
              the trigger itself queues nothing"
         }
         Consent::PreConsentedQueue => {
-            "operator pre-consented via the queue label: the draft \
-             auto-queues on an approved plan (plan approval itself is never skipped)"
+            "the operator enabled hooks.autoQueue and the comment carried the queue label: \
+             the drafted plan is queued without a local review"
+        }
+        Consent::QueueNotEnabled => {
+            "the comment asked to queue, but hooks.autoQueue is off in the operator's global \
+             config: the draft parks for review and the trigger queues nothing"
         }
     };
     let excerpt_heading = match trigger.kind {

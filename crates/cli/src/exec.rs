@@ -403,6 +403,7 @@ async fn run_and_reconcile(
     // (flushes buffered deltas + releases the lock) so the printer's catch-up
     // read sees every event.
     let cost = engine.state().total_cost_usd;
+    let base_sha = engine.state().mission.base_sha.clone();
     drop(engine);
     stop.store(true, Ordering::Relaxed);
     let _ = printer.await;
@@ -441,8 +442,11 @@ async fn run_and_reconcile(
     let mut pushed = false;
     let mut push_failed = false;
     if let (Some(remote), MissionStatus::Complete) = (&push, status) {
+        // Scan everything the mission added before it leaves the machine:
+        // worker-authored commits are not covered by the checkpoint scan and
+        // a pushed branch never reaches the local merge scan.
         match kranz_engine::git_ops::GitRepo::open(&repo)
-            .and_then(|r| r.push_mission_branch(remote, &branch))
+            .and_then(|r| push_scanned(&r, remote, &branch, base_sha.as_deref()))
         {
             Ok(()) => {
                 pushed = true;
@@ -466,10 +470,86 @@ async fn run_and_reconcile(
     Ok(code)
 }
 
+/// The `--push` delivery: refuse unless the mission's whole range
+/// (`base_sha..<branch tip>`) passes the secret scan, then push that branch.
+fn push_scanned(
+    repo: &kranz_engine::git_ops::GitRepo,
+    remote: &str,
+    branch: &str,
+    base_sha: Option<&str>,
+) -> kranz_engine::error::Result<()> {
+    use kranz_engine::error::EngineError;
+    let base_sha = base_sha.ok_or_else(|| {
+        EngineError::Git(format!(
+            "refusing to push {branch}: the mission has no pinned base commit to scan against"
+        ))
+    })?;
+    let tip = repo.branch_tip(branch)?;
+    if let Some(refusal) = repo.secret_scan_range_refusal(base_sha, &tip)? {
+        return Err(EngineError::Git(format!(
+            "refusing to push {branch}: {refusal}"
+        )));
+    }
+    repo.push_mission_branch(remote, branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kranz_engine::types::MissionConfig;
+
+    /// Audit M16: `--push` refuses before contacting the remote when the
+    /// mission's range carries a secret, or when there is no pinned base to
+    /// scan against. No remote is configured here, so reaching the push at
+    /// all would fail with a different message.
+    #[test]
+    fn push_is_refused_when_the_mission_range_fails_the_secret_scan() {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.name", "Kranz Test"]);
+        git(repo, &["config", "user.email", "test@kranz.invalid"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "seed"]);
+        let base = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["checkout", "-q", "-b", "kranz/mission-m1"]);
+        std::fs::write(
+            repo.join("notes.txt"),
+            "token = sk-ant-api03-NewSecret_123456\n",
+        )
+        .unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "worker commit"]);
+
+        let handle = kranz_engine::git_ops::GitRepo::open(repo).unwrap();
+        let err = push_scanned(&handle, "origin", "kranz/mission-m1", Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret scan"), "{err}");
+        assert!(err.contains("anthropic-api-key"), "{err}");
+
+        let err = push_scanned(&handle, "origin", "kranz/mission-m1", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no pinned base"), "{err}");
+    }
 
     #[test]
     fn exit_code_maps_terminal_statuses() {

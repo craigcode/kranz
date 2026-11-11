@@ -9,6 +9,24 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Changed: a GitHub comment carrying the queue label (`kranz:fix-and-queue`)
+  now queues the drafted plan only when `hooks.autoQueue` is `true` in the
+  global config (`~/.kranz/config.json`). It is off by default and cannot be
+  set from a repository's own config file. Without it the draft parks for
+  review.
+- Changed: merging a mission is refused with `base_policy_changed` when
+  `.kranz/merge-gates.json` or `.kranz/secret-allowlist` on the base branch
+  changed after the plan was approved. The dashboard offers an explicit
+  accept step; API callers resend with the digest the refusal names.
+- Changed: `kranz exec --push` scans everything the mission added for secrets
+  before pushing, and refuses repository git config that would redirect or
+  widen the push (`pushurl`, `push.followTags`, `push.pushOption` and
+  similar).
+- Changed: grants whose target would be enforced as a pattern (a written path
+  containing glob syntax, a wildcard host) are no longer offered.
+- Fixed: the secret scan skipped added lines that begin with `++`, and
+  flagged ordinary prose after the words "basic" or "bearer".
+- Fixed: `kranz config set` leaves the config file owner-only.
 
 ## 0.5.0 - 2026-11-08
 

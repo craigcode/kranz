@@ -19,6 +19,9 @@ pub enum ApiErrorCode {
     TurnInFlight,
     RepositoryBusy,
     StalePlan,
+    /// The base branch's merge policy changed since plan approval; the
+    /// message carries the digest an accepting retry must echo.
+    BasePolicyChanged,
 }
 
 #[derive(Debug)]

@@ -5653,6 +5653,80 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
     );
 }
 
+/// Audit M2: an approved touch path is stored verbatim and matched as a glob,
+/// so a file whose NAME is glob syntax would be approved as one path and
+/// enforced as a pattern. Such a write is never offered as a grant; it stays an
+/// ordinary out-of-contract finding.
+#[tokio::test]
+async fn out_of_contract_write_with_glob_syntax_is_never_offered_as_a_touch_grant() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: vec![],
+        milestones: vec![PlanMilestone {
+            title: "M1".to_string(),
+            features: vec![PlanFeature {
+                title: "feature 1".to_string(),
+                spec: "build part 1".to_string(),
+                validation_criteria: vec!["part 1 works".to_string()],
+            }],
+        }],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec!["src/**".to_string()],
+        standards_manifest: None,
+        reviewer_independence: None,
+    };
+    let worker = MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented",
+        "filesTouched": ["notes[1].txt"],
+        "testsAdded": [],
+        "testEvidence": "ok",
+        "commits": []
+    }))
+    .writes_file("notes[1].txt", "written outside the touch-set\n");
+
+    // No grant is offered, so the finding goes straight to the conversion
+    // turn, which waives it.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker,
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("notes[1].txt", "acceptable scratch file"),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(plan).unwrap();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(!types.contains(&"grant.requested"), "{types:?}");
+    assert!(types.contains(&"validation.finding"), "{types:?}");
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(state.mission.touch_set, vec!["src/**".to_string()]);
+}
+
 /// A worker command blocked by a deny rule parks a WORKER-DENY grant naming the
 /// RULE (not the command). Approving it adds the rule to deny_exceptions —
 /// subtracting it from the worker deny set — and the respawned worker completes.

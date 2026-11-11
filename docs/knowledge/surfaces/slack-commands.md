@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-11 (UTC) against the base-policy merge check: the host merge call takes an optional accepted policy digest, and the Slack bridge passes none, so a merge refused because the base's gate suite or secret allowlist changed shows the refusal in Slack and is accepted from the dashboard or the REST route. Routing, cards and binding checks are unchanged.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan and revision cards show the command grants and write paths an approval carries, and withhold approve buttons when the list does not fit. Commands and authorization are unchanged.
 

@@ -88,7 +88,18 @@ What the primitive guarantees:
   rejected **before any git process runs** (no network). Mission branches are
   `kranz/mission-<id>`; mission tags live under `kranz/<id>/…`.
 - The push is a plain `git push <remote> <branch>` — never `--force`, never a
-  refspec, never `main`, never a merge.
+  refspec, never `main`, never a merge. It carries `--no-follow-tags`,
+  `--no-recurse-submodules` and `--no-signed` and clears configured push
+  options, so your own `~/.gitconfig` cannot widen it either.
+- The push is refused when the repository's own `.git/config` (a file a worker
+  can write) sets a credential helper, an ssh command, a URL rewrite, a
+  transport hook, `remote.<name>.pushurl` or `mirror`, `push.followTags`,
+  `push.pushOption`, `push.recurseSubmodules` or `submodule.recurse`. The
+  refusal names every offending key.
+- `kranz exec --push` scans every line the mission added
+  (`base_sha..<branch tip>`) for secrets before pushing and refuses on a
+  finding. Only fingerprints in the base commit's `.kranz/secret-allowlist`
+  waive one; an allowlist edit inside the mission's own range does not.
 - On failure git's stderr is surfaced verbatim, so a bad deploy key or a
   rejected non-fast-forward lands in the mission log with git's own words.
 

@@ -259,7 +259,10 @@ fn ghook_parse_comment_fix_label_is_draft_only() {
 
 #[test]
 fn ghook_parse_comment_queue_label_pre_consents_and_wins_over_fix_label() {
-    let cfg = cfg_with_secret();
+    let cfg = HooksConfig {
+        auto_queue: true,
+        ..cfg_with_secret()
+    };
     // The queue label alone pre-consents…
     let payload = issue_comment_payload("kranz:fix-and-queue", true);
     let trigger = hooks::parse_trigger("issue_comment", &payload, &cfg)
@@ -272,6 +275,19 @@ fn ghook_parse_comment_queue_label_pre_consents_and_wins_over_fix_label() {
     let payload = issue_comment_payload("kranz:fix and also kranz:fix-and-queue", true);
     let trigger = hooks::parse_trigger("issue_comment", &payload, &cfg).unwrap();
     assert_eq!(trigger.consent, Consent::PreConsentedQueue);
+}
+
+/// Audit M1: without the operator's `hooks.autoQueue`, the queue label must
+/// not queue anything. The draft parks for review like a plain fix label.
+#[test]
+fn ghook_queue_label_without_operator_auto_queue_never_enqueues() {
+    let cfg = cfg_with_secret();
+    assert!(!cfg.auto_queue, "autoQueue defaults off");
+    let payload = issue_comment_payload("kranz:fix-and-queue", true);
+    let trigger = hooks::parse_trigger("issue_comment", &payload, &cfg)
+        .expect("a queue-labelled PR comment still drafts");
+    assert_eq!(trigger.consent, Consent::QueueNotEnabled);
+    assert!(!trigger.consent.then_enqueue());
 }
 
 #[test]
@@ -413,6 +429,39 @@ fn ghook_load_hooks_reads_project_layer_and_custom_labels() {
     assert_eq!(cfg.queue_label, hooks::DEFAULT_QUEUE_LABEL);
 }
 
+/// Audit M1: `hooks.autoQueue` is operator-only. A repository file that sets
+/// it is refused; the global layer may set it.
+#[test]
+fn ghook_load_hooks_refuses_auto_queue_from_the_project_layer() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let kranz = tmp.path().join(".kranz");
+    std::fs::create_dir_all(&kranz).unwrap();
+    std::fs::write(
+        kranz.join("config.json"),
+        r#"{ "hooks": { "secret": "s3cr3t", "autoQueue": true } }"#,
+    )
+    .unwrap();
+    let err = hooks::load_hooks(tmp.path()).unwrap_err().to_string();
+    assert!(err.contains("hooks.autoQueue"), "{err}");
+
+    std::fs::write(
+        kranz.join("config.json"),
+        r#"{ "hooks": { "secret": "s3cr3t" } }"#,
+    )
+    .unwrap();
+    // The other tests in this binary assert only defaults for keys this
+    // global file leaves alone, so sharing the isolated home is safe.
+    let global = kranz_engine::paths::global_config().expect("isolated home resolves");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    std::fs::write(&global, r#"{ "hooks": { "autoQueue": true } }"#).unwrap();
+    let cfg = hooks::load_hooks(tmp.path());
+    let _ = std::fs::remove_file(&global);
+    let cfg = cfg.unwrap();
+    assert!(cfg.auto_queue);
+    assert_eq!(cfg.secret.as_deref(), Some("s3cr3t"));
+}
+
 #[test]
 fn ghook_hooks_config_debug_never_shows_the_secret() {
     let cfg = HooksConfig {
@@ -437,11 +486,15 @@ fn ci_trigger() -> Trigger {
     .unwrap()
 }
 
+/// A comment trigger parsed under an operator who enabled `hooks.autoQueue`.
 fn comment_trigger(body: &str) -> Trigger {
     hooks::parse_trigger(
         "issue_comment",
         &issue_comment_payload(body, true),
-        &cfg_with_secret(),
+        &HooksConfig {
+            auto_queue: true,
+            ..cfg_with_secret()
+        },
     )
     .unwrap()
 }
@@ -497,9 +550,7 @@ fn ghook_draft_trigger_ticket_records_queue_pre_consent() {
     let ticket = Ticket::load(&Ticket::tickets_dir(tmp.path()).join(format!("{slug}.md"))).unwrap();
     assert_eq!(ticket.trigger.as_deref(), Some("pr-comment"));
     assert!(ticket.raw_body.contains("Consent: fix-and-queue"));
-    assert!(ticket
-        .raw_body
-        .contains("plan approval itself is never skipped"));
+    assert!(ticket.raw_body.contains("queued without a local review"));
     assert!(ticket
         .raw_body
         .contains("kranz:fix-and-queue the flaky test"));

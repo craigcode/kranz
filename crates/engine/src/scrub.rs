@@ -418,14 +418,20 @@ fn scan_text_with_assignments(
     for rule in rules() {
         let check_allowlist = matches!(
             rule.id,
-            "bearer-token" | "basic-auth" | "connection-string-password"
+            "authorization-bearer" | "authorization-basic" | "connection-string-password"
         );
         for caps in rule.re.captures_iter(text) {
             let m = rule
                 .secret_group
                 .and_then(|idx| caps.get(idx))
                 .or_else(|| caps.get(0));
-            if let Some(m) = m {
+            // A scheme word followed by one long all-lowercase word is prose
+            // (an adjective before a noun), not a credential.
+            // A real bearer token or base64 credential of 16+ characters
+            // that is nothing but lowercase letters is not a thing.
+            let prose_word = matches!(rule.id, "authorization-bearer" | "authorization-basic")
+                && m.is_some_and(|m| m.as_str().chars().all(|c| c.is_ascii_lowercase()));
+            if let Some(m) = m.filter(|_| !prose_word) {
                 push_finding(
                     &mut out,
                     &mut occupied,
@@ -732,27 +738,51 @@ const GENERATED_DIFF_PATH_PREFIXES: &[&str] =
     &["apps/dashboard/dist/", "crates/cli/assets/dashboard/dist/"];
 
 /// Scan only added lines in a unified git diff.
+///
+/// File headers are recognized only OUTSIDE a hunk, and a hunk's extent comes
+/// from the line counts in its `@@` header. Inside a hunk every `+` line is an
+/// added line, whatever follows the `+`: content that itself starts with `++`
+/// (`++i; token = "..."`) is scanned, and content shaped like a header
+/// (`++ b/crates/cli/assets/dashboard/dist/x`) cannot rename the file or
+/// switch on the generated-bundle exemption.
 pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     let mut path = "<diff>".to_string();
     let mut generated_dashboard_bundle = false;
     let mut new_line: Option<usize> = None;
+    // Lines the current hunk still owes on the old and new side. `None` means
+    // "not in a hunk"; an `@@` header whose counts do not parse opens a hunk
+    // that runs to the next `diff --git` line, so nothing after it is skipped.
+    let mut hunk: Option<(usize, usize)> = None;
 
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            path = rest.to_string();
-            generated_dashboard_bundle = GENERATED_DIFF_PATH_PREFIXES
-                .iter()
-                .any(|prefix| path.starts_with(prefix));
+        if hunk == Some((0, 0)) {
+            hunk = None;
+        }
+        if line.starts_with("diff --git ") {
+            // Hunk content always starts with ' ', '+', '-' or '\\', so this
+            // spelling at column 0 is a real header even mid-"unbounded" hunk.
+            hunk = None;
             continue;
         }
-        if line.starts_with("@@ ") {
+        if (hunk.is_none() || hunk == Some((usize::MAX, usize::MAX))) && line.starts_with("@@ ") {
             new_line = parse_new_hunk_start(line);
+            hunk = Some(parse_hunk_counts(line).unwrap_or((usize::MAX, usize::MAX)));
             continue;
         }
-        if line.starts_with("+++") {
+        let Some((old_left, new_left)) = hunk.as_mut() else {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                // `+++ b/path`, or `+++ "b/pa\303\257th"` for a C-quoted name.
+                let rest = rest.strip_prefix('"').unwrap_or(rest);
+                let rest = rest.strip_suffix('"').unwrap_or(rest);
+                path = rest.strip_prefix("b/").unwrap_or(rest).to_string();
+                generated_dashboard_bundle = GENERATED_DIFF_PATH_PREFIXES
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix));
+            }
             continue;
-        }
+        };
+        let unbounded = *old_left == usize::MAX;
         if let Some(added) = line.strip_prefix('+') {
             let line_no = new_line.unwrap_or(0);
             let location = if line_no == 0 {
@@ -768,14 +798,41 @@ pub fn scan_unified_diff(diff: &str) -> Vec<SecretFinding> {
             if let Some(n) = &mut new_line {
                 *n += 1;
             }
-        } else if !line.starts_with('-') {
+            if !unbounded {
+                *new_left = new_left.saturating_sub(1);
+            }
+        } else if line.starts_with('-') {
+            if !unbounded {
+                *old_left = old_left.saturating_sub(1);
+            }
+        } else if !line.starts_with('\\') {
+            // Context line (git may emit a wholly empty line for a blank one).
             if let Some(n) = &mut new_line {
                 *n += 1;
+            }
+            if !unbounded {
+                *old_left = old_left.saturating_sub(1);
+                *new_left = new_left.saturating_sub(1);
             }
         }
     }
 
     findings
+}
+
+/// `(old_count, new_count)` from `@@ -a[,b] +c[,d] @@`; an omitted count is 1.
+fn parse_hunk_counts(line: &str) -> Option<(usize, usize)> {
+    let mut parts = line.split_whitespace().skip(1);
+    let count = |part: &str, sign: char| -> Option<usize> {
+        let body = part.strip_prefix(sign)?;
+        match body.split_once(',') {
+            Some((_, count)) => count.parse().ok(),
+            None => body.parse::<usize>().ok().map(|_| 1),
+        }
+    };
+    let old = count(parts.next()?, '-')?;
+    let new = count(parts.next()?, '+')?;
+    Some((old, new))
 }
 
 fn parse_new_hunk_start(line: &str) -> Option<usize> {

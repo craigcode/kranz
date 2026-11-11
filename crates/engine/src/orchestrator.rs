@@ -402,6 +402,37 @@ pub struct MissionEngine {
     pub(crate) workspace_provider: Option<Arc<dyn crate::workspace_provider::WorkspaceProvider>>,
 }
 
+/// Why a denial must not be offered as a grant, if it must not.
+///
+/// A grant target is taken from what a run did (a path it wrote, a host it
+/// dialled) and, once approved, is appended to a list the engine reads as
+/// PATTERNS: `touch_set` entries are globs and `egress_grants` entries may be
+/// `*.suffix` wildcards. A file literally named `**`, or a `CONNECT` to the
+/// literal host `*.example.com`, would therefore be approved as one thing and
+/// enforced as everything. Characters that reorder or hide text make the
+/// operator approve something other than what is displayed. Neither is
+/// offered; the denial flows on as an ordinary finding or block.
+fn unofferable_grant_target(kind: GrantKind, target: &str) -> Option<&'static str> {
+    if target.is_empty()
+        || target
+            .chars()
+            .any(|c| crate::presentation::ambiguous(c) || c == '\n' || c == '\t')
+    {
+        return Some("it is empty or contains control, invisible or reordering characters");
+    }
+    match kind {
+        GrantKind::TouchPath
+            if target.starts_with('!') || target.contains(['*', '?', '[', ']', '{', '}', '\\']) =>
+        {
+            Some("the path contains glob syntax, so the grant would cover other paths")
+        }
+        GrantKind::Egress if target.contains('*') => {
+            Some("the host contains a wildcard, so the grant would cover other hosts")
+        }
+        _ => None,
+    }
+}
+
 impl MissionEngine {
     // -----------------------------------------------------------------------
     // Construction
@@ -2156,6 +2187,19 @@ impl MissionEngine {
         target: &str,
         blocked_desc: &str,
     ) -> Result<bool> {
+        // An approved target is stored verbatim and then READ as a pattern
+        // (touch-set glob, egress wildcard). Offer only a target that means
+        // exactly what the operator is shown.
+        if let Some(why) = unofferable_grant_target(kind, target) {
+            self.emit_decision(
+                &format!(
+                    "not offering a grant for `{}`: {why}",
+                    crate::presentation::visible(target)
+                ),
+                None,
+            )?;
+            return Ok(false);
+        }
         let prior = *self.grant_requests.get(milestone_id).unwrap_or(&0);
         if prior >= self.grant_request_cap {
             self.emit_decision(
@@ -8179,6 +8223,45 @@ pub(crate) mod tests {
     use super::*;
     use crate::judgement::lesson_orch_script;
     use crate::preflight::DroidEnvGuard;
+
+    /// Audit M2: a grant target that would be enforced as a pattern, or that
+    /// displays as something other than its bytes, is never offered.
+    #[test]
+    fn grant_targets_that_would_widen_or_mislead_are_not_offerable() {
+        for path in ["**", "src/*.rs", "a?b", "x[1]", "{a,b}", "!secret", "a\\b"] {
+            assert!(
+                unofferable_grant_target(GrantKind::TouchPath, path).is_some(),
+                "{path:?} must not be offered as a touch grant"
+            );
+        }
+        assert!(unofferable_grant_target(GrantKind::TouchPath, "src/lib.rs").is_none());
+        assert!(unofferable_grant_target(GrantKind::TouchPath, "docs/naïve file.md").is_none());
+
+        assert!(unofferable_grant_target(GrantKind::Egress, "*.example.com:443").is_some());
+        assert!(unofferable_grant_target(GrantKind::Egress, "api.example.com:443").is_none());
+
+        // A command keeps its shell syntax; only the display hazards apply.
+        assert!(unofferable_grant_target(GrantKind::Command, "ls *.rs").is_none());
+        for kind in [
+            GrantKind::Command,
+            GrantKind::TouchPath,
+            GrantKind::WorkerDeny,
+            GrantKind::Egress,
+        ] {
+            for bad in [
+                "",
+                "safe\u{202e}txt.exe",
+                "a\u{200b}b",
+                "one\ntwo",
+                "x\u{1b}[2J",
+            ] {
+                assert!(
+                    unofferable_grant_target(kind, bad).is_some(),
+                    "{bad:?} must not be offered as a {kind:?} grant"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Mission integration worktree primitive (M7 tier 1, feature f-1-2)

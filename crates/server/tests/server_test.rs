@@ -2492,6 +2492,90 @@ async fn merge_route_refuses_a_mission_branch_that_moved_after_validation() {
     assert!(!repo_root.join("smuggled.txt").exists());
 }
 
+/// 2026-11-10 audit H3 residual: the gate suite and the secret allowlist are
+/// read from the live base, a ref a checkout-mode worker can move. A change
+/// to either since approval refuses the merge until the caller sends back
+/// the digest of the policy now in force.
+#[tokio::test]
+async fn merge_route_refuses_a_changed_base_policy_until_it_is_accepted() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    let paths = seed_diffable_mission(&repo_root, "m-policy", &base_sha, true);
+    mark_mission_complete(&paths, "m-policy");
+
+    // The base branch gains a commit that swaps the gate suite.
+    std::fs::write(
+        repo_root.join(kranz_engine::merge_gate::MERGE_GATES_PATH),
+        r#"{"gates":[{"command":"true"}]}"#,
+    )
+    .unwrap();
+    raw_git(
+        &repo_root,
+        &["add", kranz_engine::merge_gate::MERGE_GATES_PATH],
+    );
+    raw_git(&repo_root, &["commit", "-q", "-m", "swap the gate suite"]);
+    let base_before = raw_git(&repo_root, &["rev-parse", "refs/heads/main"]);
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls_for_executor = Arc::clone(&calls);
+    let app = merge_app(&repo_root, move |cmd, _cwd| {
+        calls_for_executor.lock().unwrap().push(cmd.to_string());
+        (true, String::new())
+    });
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-policy/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "base_policy_changed", "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains(kranz_engine::merge_gate::MERGE_GATES_PATH),
+        "{body}"
+    );
+    assert!(calls.lock().unwrap().is_empty(), "no gate may have run");
+    assert_eq!(
+        base_before,
+        raw_git(&repo_root, &["rev-parse", "refs/heads/main"]),
+        "base branch must not advance"
+    );
+    let digest = error
+        .split("acceptBasePolicy \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the refusal names the digest to accept")
+        .to_string();
+    assert_eq!(digest.len(), 64, "{body}");
+
+    // A wrong digest accepts nothing.
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-policy/merge",
+        Some(MERGE_TOKEN),
+        json!({ "acceptBasePolicy": "not-the-digest" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "base_policy_changed", "{body}");
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-policy/merge",
+        Some(MERGE_TOKEN),
+        json!({ "acceptBasePolicy": digest }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["merged"], true, "{body}");
+    assert_eq!(*calls.lock().unwrap(), vec!["true".to_string()]);
+}
+
 #[tokio::test]
 async fn merge_route_fails_closed_when_base_has_no_gate_config() {
     if !setup() {
