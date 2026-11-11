@@ -474,6 +474,8 @@ async fn api_not_found() -> impl IntoResponse {
 /// dashboard behind a heuristic cache entry; only an incognito window
 /// escaped). Hashed /assets/* bundles stay implicitly cacheable; `no-cache`
 /// on the shell revalidates per load rather than forbidding storage.
+///
+/// Every response also carries the framing and content-type headers below.
 async fn cache_response_headers(request: Request, next: Next) -> Response {
     let is_api = request.uri().path().starts_with("/api");
     let mut response = next.run(request).await;
@@ -494,6 +496,23 @@ async fn cache_response_headers(request: Request, next: Next) -> Response {
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
     }
+    // No page may put this server's pages in a frame: a framed dashboard is
+    // how another site would get a click onto Approve or Merge (2026-11-10
+    // audit UI-9/SRV-8). The dashboard is always the top-level document, in
+    // a browser tab and in the desktop app alike, so nothing legitimate is
+    // affected. `X-Frame-Options` repeats it for clients that predate
+    // `frame-ancestors`; `nosniff` keeps a JSON or text answer from being
+    // run as script.
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
