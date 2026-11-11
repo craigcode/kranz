@@ -3668,6 +3668,9 @@ mod tests {
     /// `--unshare-net` stays tier-gated, because it is an egress decision.
     /// Audit SBX-1, Linux half: known control sockets are shadowed, each
     /// once, and a location the operator made writable is left to them.
+    /// Unix only: the fake host below is written with `/` separators, and
+    /// the wrap these arguments feed does not exist elsewhere.
+    #[cfg(unix)]
     #[test]
     fn control_socket_masks_shadow_what_exists_and_respect_operator_grants() {
         let home = Path::new("/kranz-test-home/op");
