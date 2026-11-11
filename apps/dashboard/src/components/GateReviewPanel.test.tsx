@@ -97,4 +97,48 @@ describe('gate review obligations', () => {
       diffSpy.mockRestore();
     }
   });
+
+  it('holds Approve until the revision diff is shown, and keeps it off when the diff fails (UI-5)', async () => {
+    const pendingState = {
+      mission: {
+        id: 'm-rev', goal: 'goal', validationContract: [], milestones: [], status: 'running',
+        createdAt: '2026-01-01T00:00:00Z', baseBranch: 'main', missionBranch: 'kranz/mission-m-rev',
+      },
+      pendingRevision: {
+        revision: 2, instructions: 'Narrow scope',
+        plan: { goal: 'goal', validationContract: [], milestones: [] },
+      },
+    } as unknown as MissionState;
+    const approve = () => screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement;
+    const reject = () => screen.getByRole('button', { name: 'Reject' }) as HTMLButtonElement;
+
+    let release: (value: { revision: number; instructions: string; markdown: string; diff: string }) => void = () => {};
+    const slow = vi.spyOn(api, 'revisionDiff').mockReturnValueOnce(
+      new Promise((resolve) => { release = resolve; }),
+    );
+    try {
+      useKranzStore.setState({ state: pendingState });
+      render(<RevisionPanel />);
+      expect(approve().disabled).toBe(true);
+      expect(reject().disabled).toBe(false);
+      release({ revision: 2, instructions: 'rev', markdown: '# Plan', diff: '+one line' });
+      await waitFor(() => expect(approve().disabled).toBe(false));
+      const text = document.body.textContent ?? '';
+      expect(text.indexOf('+one line')).toBeLessThan(text.indexOf('Approve'));
+    } finally {
+      slow.mockRestore();
+      cleanup();
+    }
+
+    const failing = vi.spyOn(api, 'revisionDiff').mockRejectedValueOnce(new Error('boom'));
+    try {
+      useKranzStore.setState({ state: { ...pendingState, pendingRevision: { ...pendingState.pendingRevision!, revision: 3 } } as MissionState });
+      render(<RevisionPanel />);
+      await waitFor(() => expect(screen.getByRole('status').textContent).toContain('could not be loaded'));
+      expect(approve().disabled).toBe(true);
+      expect(reject().disabled).toBe(false);
+    } finally {
+      failing.mockRestore();
+    }
+  });
 });
