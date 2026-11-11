@@ -1604,11 +1604,9 @@ fn range_scan_refuses_a_secret_and_ignores_a_self_added_waiver() {
         .secret_scan_range_refusal(&base, &tip)
         .unwrap()
         .expect("a secret in the range must refuse");
-    assert!(refusal.contains("anthropic-api-key"), "{refusal}");
-    assert!(
-        !refusal.contains("NewSecret"),
-        "never the secret bytes: {refusal}"
-    );
+    // No assertion message echoes the refusal: it is scan output.
+    assert!(refusal.contains("anthropic-api-key"));
+    assert!(!refusal.contains("NewSecret"), "never the secret bytes");
 
     // The mission waives its own finding in a later commit of the same range.
     let fingerprint = refusal

@@ -425,8 +425,8 @@ fn scan_text_with_assignments(
                 .secret_group
                 .and_then(|idx| caps.get(idx))
                 .or_else(|| caps.get(0));
-            // `basic internationalization` and `bearer responsibilities`
-            // are prose: a scheme word followed by one long lowercase word.
+            // A scheme word followed by one long all-lowercase word is prose
+            // (an adjective before a noun), not a credential.
             // A real bearer token or base64 credential of 16+ characters
             // that is nothing but lowercase letters is not a thing.
             let prose_word = matches!(rule.id, "authorization-bearer" | "authorization-basic")
