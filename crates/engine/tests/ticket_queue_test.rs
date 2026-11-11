@@ -1681,6 +1681,59 @@ fn defer_until_queue_refuses_future_naming_time() {
     assert!(queue::contains(root, "m-ripe"));
 }
 
+/// Naming a mission is a claim about which draft is queued. When the ticket
+/// records a different one (it was re-drafted since) neither is queued, from
+/// the CLI's `--mission` or from a review surface; the recorded one queues.
+#[test]
+fn queueing_a_mission_the_ticket_no_longer_records_is_refused() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    write_ticket(&dir, "moved", "---\ntitle: Moved\n---\n\n## Goal\nx\n");
+    Ticket::record_mission(root, "moved", "m-current").unwrap();
+    Ticket::write_state(root, "moved", TicketState::Review, None).unwrap();
+
+    for err in [
+        deps::approve_ticket(root, "moved", Some("m-stale"), false).unwrap_err(),
+        deps::approve_reviewed_ticket(root, "moved", Some("m-stale"), false).unwrap_err(),
+    ] {
+        let msg = err.to_string();
+        assert!(msg.contains("was re-drafted"), "{msg}");
+        assert!(
+            msg.contains("m-current") && msg.contains("m-stale"),
+            "{msg}"
+        );
+    }
+    assert!(queue::list(root).is_empty());
+    assert_eq!(Ticket::read_state(root, "moved"), TicketState::Review);
+
+    let approved = deps::approve_reviewed_ticket(root, "moved", Some("m-current"), false).unwrap();
+    assert_eq!(approved.mission_id, "m-current");
+}
+
+/// A review surface that showed a mission cannot queue a ticket whose draft
+/// link is gone; a command that reviewed nothing claims nothing.
+#[test]
+fn a_reviewed_mission_must_be_the_one_the_ticket_records() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let dir = Ticket::tickets_dir(root);
+    fs::create_dir_all(&dir).unwrap();
+    write_ticket(
+        &dir,
+        "unlinked",
+        "---\ntitle: Unlinked\n---\n\n## Goal\nx\n",
+    );
+    Ticket::write_state(root, "unlinked", TicketState::Review, None).unwrap();
+
+    let msg = deps::approve_reviewed_ticket(root, "unlinked", Some("m-shown"), false)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("no drafted mission"), "{msg}");
+    assert!(queue::list(root).is_empty());
+}
+
 #[test]
 fn defer_until_queue_force_overrides() {
     let repo = tempfile::tempdir().unwrap();

@@ -9,6 +9,10 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Changed: a Slack Queue button now queues only the drafted mission its card
+  showed, and `kranz ticket queue --mission <id>` is refused when the ticket
+  records a different mission. Both name the current mission in the refusal.
+  A ticket re-drafted after the card was posted needs a fresh look first.
 - Changed: a GitHub comment carrying the queue label (`kranz:fix-and-queue`)
   now queues the drafted plan only when `hooks.autoQueue` is `true` in the
   global config (`~/.kranz/config.json`). It is off by default and cannot be

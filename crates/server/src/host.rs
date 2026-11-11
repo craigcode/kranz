@@ -532,12 +532,17 @@ impl MissionHost {
     /// gate (cycle detection, unsatisfied-blocker refusal) plus the
     /// enqueue side effects — the exact same core `kranz_cli`'s `kranz
     /// ticket approve` calls, so the CLI and REST surfaces can never drift.
+    ///
+    /// `reviewed_mission` is the drafted mission the calling surface showed
+    /// the operator, if it showed one; a ticket re-drafted since is refused.
     pub fn approve_ticket(
         &self,
         slug: &str,
         force: bool,
+        reviewed_mission: Option<&str>,
     ) -> Result<deps::ApprovedTicket, ApiError> {
-        deps::approve_ticket(&self.repo_root, slug, None, force).map_err(ApiError::from)
+        deps::approve_reviewed_ticket(&self.repo_root, slug, reviewed_mission, force)
+            .map_err(ApiError::from)
     }
 
     /// `POST /api/missions/:id/planning/turn`: one conversational turn. A

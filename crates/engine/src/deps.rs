@@ -174,9 +174,16 @@ pub fn approve_ticket(
         )));
     }
 
+    let recorded = Ticket::mission_for(repo_root, slug);
     let mission_id = match explicit_mission {
-        Some(id) => id.to_string(),
-        None => Ticket::mission_for(repo_root, slug)
+        // Naming a mission is a claim about which draft is being queued. When
+        // the ticket records a different one, the named draft is stale (the
+        // ticket was re-drafted since): refuse rather than run either.
+        Some(id) => match recorded.as_deref() {
+            Some(current) if current != id => return Err(redrafted(slug, Some(current), id)),
+            _ => id.to_string(),
+        },
+        None => recorded
             .or_else(|| find_mission_for_ticket(repo_root, &ticket))
             .ok_or_else(|| {
                 EngineError::InvalidState(format!(
@@ -200,6 +207,37 @@ pub fn approve_ticket(
         mission_id: entry.mission_id,
         priority: entry.priority,
     })
+}
+
+/// [`approve_ticket`] for a review surface that showed the operator one
+/// drafted mission (a dashboard ticket page, a Slack card). `reviewed_mission`
+/// is the mission that surface displayed; when the ticket no longer points at
+/// it (re-drafted from another surface, or the link is gone) the approval is
+/// refused, so a click never queues a plan the operator did not see. `None`
+/// claims nothing (a typed command that reviewed no card) and behaves exactly
+/// like [`approve_ticket`] with no explicit mission.
+pub fn approve_reviewed_ticket(
+    repo_root: &Path,
+    slug: &str,
+    reviewed_mission: Option<&str>,
+    force: bool,
+) -> Result<ApprovedTicket> {
+    Ticket::ensure_valid_slug(slug)?;
+    if let Some(reviewed) = reviewed_mission {
+        let current = Ticket::mission_for(repo_root, slug);
+        if current.as_deref() != Some(reviewed) {
+            return Err(redrafted(slug, current.as_deref(), reviewed));
+        }
+    }
+    approve_ticket(repo_root, slug, reviewed_mission, force)
+}
+
+fn redrafted(slug: &str, current: Option<&str>, reviewed: &str) -> EngineError {
+    EngineError::InvalidState(format!(
+        "ticket '{slug}' was re-drafted: it now points at {}, not the reviewed {reviewed}. \
+         Reload the ticket and review the current plan before queueing it.",
+        current.unwrap_or("no drafted mission")
+    ))
 }
 
 /// UPPERCASE label for a ticket pipeline state, matching

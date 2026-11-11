@@ -437,16 +437,26 @@ impl PlanningHost for FakeHost {
         })
     }
 
-    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
+    fn approve_ticket<'a>(
+        &'a self,
+        slug: &'a str,
+        reviewed_mission: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<String>> {
         self.approve_ticket_calls.fetch_add(1, Ordering::SeqCst);
         let repo_root = self
             .repo_root
             .clone()
             .expect("approve_ticket tests must construct FakeHost::with_repo_root");
         let slug = slug.to_string();
+        let reviewed = reviewed_mission.map(str::to_string);
         Box::pin(async move {
-            let approved = kranz_engine::deps::approve_ticket(&repo_root, &slug, None, false)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let approved = kranz_engine::deps::approve_reviewed_ticket(
+                &repo_root,
+                &slug,
+                reviewed.as_deref(),
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(approved.mission_id)
         })
     }
@@ -715,7 +725,8 @@ async fn approve_slug_for_review_ticket_queues_the_drafted_mission_end_to_end() 
     let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
     let host: SharedHost = fake.clone();
 
-    let invocation = run_approve_ticket_command(&cfg, Some(&host), "rate-limit-notes", None).await;
+    let invocation =
+        run_approve_ticket_command(&cfg, Some(&host), "rate-limit-notes", None, None).await;
 
     assert!(invocation.authorized);
     let result_text =
@@ -743,6 +754,44 @@ async fn approve_slug_for_review_ticket_queues_the_drafted_mission_end_to_end() 
     assert_eq!(entries[0].ticket_slug.as_deref(), Some("rate-limit-notes"));
 }
 
+/// A Queue card names the drafted mission its row showed. When the ticket was
+/// re-drafted after the card was posted, the click queues nothing; the same
+/// card's mission queues once the ticket points at it.
+#[tokio::test]
+async fn queue_card_for_a_since_redrafted_ticket_queues_nothing() {
+    let tmp = TempDir::new().unwrap();
+    write_ticket(
+        tmp.path(),
+        "rate-limit-notes",
+        "---\ntitle: Rate-limit the notes API\npriority: 1\n---\n## Goal\nAdd a token bucket.\n",
+    );
+    Ticket::record_mission(tmp.path(), "rate-limit-notes", "m-new").unwrap();
+    Ticket::write_state(tmp.path(), "rate-limit-notes", TicketState::Review, None).unwrap();
+
+    let cfg = gated_cfg_open(vec![]);
+    let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
+    let host: SharedHost = fake.clone();
+
+    let stale =
+        run_approve_ticket_command(&cfg, Some(&host), "rate-limit-notes", Some("m-old"), None)
+            .await;
+    let text = serde_json::to_string(&stale.result.expect("a refusal is posted")).unwrap();
+    assert!(text.contains("was re-drafted"), "{text}");
+    assert!(text.contains("m-new") && text.contains("m-old"), "{text}");
+    assert!(kranz_engine::queue::list(tmp.path()).is_empty());
+    assert_eq!(
+        Ticket::read_state(tmp.path(), "rate-limit-notes"),
+        TicketState::Review
+    );
+
+    let current =
+        run_approve_ticket_command(&cfg, Some(&host), "rate-limit-notes", Some("m-new"), None)
+            .await;
+    let text = serde_json::to_string(&current.result.expect("a result is posted")).unwrap();
+    assert!(text.to_lowercase().contains("queued"), "{text}");
+    assert_eq!(kranz_engine::queue::list(tmp.path())[0].mission_id, "m-new");
+}
+
 #[tokio::test]
 async fn approve_slug_blocked_by_unsatisfied_dependency_refuses_verbatim_and_queues_nothing() {
     let tmp = TempDir::new().unwrap();
@@ -763,7 +812,7 @@ async fn approve_slug_blocked_by_unsatisfied_dependency_refuses_verbatim_and_que
     let fake = Arc::new(FakeHost::with_repo_root(tmp.path().to_path_buf()));
     let host: SharedHost = fake.clone();
 
-    let invocation = run_approve_ticket_command(&cfg, Some(&host), "downstream", None).await;
+    let invocation = run_approve_ticket_command(&cfg, Some(&host), "downstream", None, None).await;
 
     assert!(invocation.authorized);
     let result_text =

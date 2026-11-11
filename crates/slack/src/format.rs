@@ -422,9 +422,19 @@ impl TodoActionKind {
 /// Optional one-tap affordance for a todo row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TodoTarget {
-    QueueTicket { slug: String },
-    MergeMission { mission_id: String },
-    OpenUrl { label: String, url: String },
+    /// `mission_id` is the drafted mission this row describes; the button
+    /// carries it so a click queues that mission or nothing.
+    QueueTicket {
+        slug: String,
+        mission_id: Option<String>,
+    },
+    MergeMission {
+        mission_id: String,
+    },
+    OpenUrl {
+        label: String,
+        url: String,
+    },
     None,
 }
 
@@ -523,6 +533,15 @@ pub use kranz_engine::planning::plan_identity;
 /// click names the decision and not merely the mission.
 fn approve_button_value(mission_id: &str, plan_identity: &str) -> String {
     format!("{mission_id}:{plan_identity}")
+}
+
+/// The `value` a Queue button carries: `<slug>:<mission-id>`, or the bare slug
+/// when the ticket records no drafted mission. Slugs never contain `:`.
+fn queue_button_value(slug: &str, mission_id: Option<&str>) -> String {
+    match mission_id {
+        Some(mission_id) => format!("{slug}:{mission_id}"),
+        None => slug.to_string(),
+    }
 }
 
 /// Escape Slack mrkdwn control characters in user-supplied text so it renders
@@ -1816,12 +1835,12 @@ fn todo_action_text(action: &TodoAction) -> String {
 
 fn todo_button(target: &TodoTarget) -> Option<Value> {
     match target {
-        TodoTarget::QueueTicket { slug } => Some(json!({
+        TodoTarget::QueueTicket { slug, mission_id } => Some(json!({
             "type": "button",
             "style": "primary",
             "text": { "type": "plain_text", "text": "Queue" },
             "action_id": QUEUE_TICKET_ACTION_ID,
-            "value": slug,
+            "value": queue_button_value(slug, mission_id.as_deref()),
         })),
         TodoTarget::MergeMission { mission_id } => Some(json!({
             "type": "button",
@@ -2854,6 +2873,7 @@ mod tests {
                     note: Some("Queue reviewed plan for run.".into()),
                     target: TodoTarget::QueueTicket {
                         slug: "review-ticket".into(),
+                        mission_id: Some("m-review".into()),
                     },
                 },
                 TodoAction {
@@ -2898,7 +2918,8 @@ mod tests {
         assert_eq!(buttons.len(), 3);
         assert!(buttons
             .iter()
-            .any(|b| b["action_id"] == QUEUE_TICKET_ACTION_ID && b["value"] == "review-ticket"));
+            .any(|b| b["action_id"] == QUEUE_TICKET_ACTION_ID
+                && b["value"] == "review-ticket:m-review"));
         assert!(buttons
             .iter()
             .any(|b| b["action_id"] == MERGE_ACTION_ID && b["value"] == "m-delivered"));
