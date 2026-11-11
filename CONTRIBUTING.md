@@ -52,5 +52,24 @@ and any compatibility or rollout concern. Add regression tests for behavior
 changes. Do not commit credentials, raw agent transcripts, operator home paths,
 or captured workstation/plugin inventories.
 
-By contributing, you agree that your contribution is licensed under the MIT
-license in this repository.
+## Licensing of contributions
+
+Kranz is licensed under the Apache License, Version 2.0 (see `LICENSE`).
+By submitting a contribution you agree to the following terms.
+
+- **Inbound license.** Your contribution is licensed to the project and its
+  users under the Apache License 2.0, including its patent grant, as set out
+  in section 5 of that license.
+- **Sign-off.** Every commit you submit carries a `Signed-off-by:` line with
+  your real name and email (`git commit -s`). The line certifies the
+  [Developer Certificate of Origin 1.1](https://developercertificate.org/):
+  you wrote the change, or otherwise have the right to submit it under the
+  project license. Pull requests with unsigned commits are not merged.
+- **Relicensing.** You keep the copyright in your contribution. You also
+  grant Craig Martin, the project's copyright holder, a perpetual, worldwide,
+  non-exclusive, royalty-free, irrevocable license to use, modify, sublicense
+  and distribute your contribution as part of Kranz under other license terms,
+  including terms that are not open source. Releases already published under
+  Apache 2.0 remain available under it.
+- **Employer rights.** If your employer has rights in work you create, confirm
+  you have permission to contribute before opening a pull request.

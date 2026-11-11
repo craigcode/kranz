@@ -8,7 +8,7 @@ class Kranz < Formula
   homepage "https://github.com/craigcode/kranz"
   url "https://github.com/craigcode/kranz/archive/refs/tags/vVERSION.tar.gz"
   sha256 "SHA256"
-  license "MIT"
+  license "Apache-2.0"
 
   depends_on "rust" => :build
 

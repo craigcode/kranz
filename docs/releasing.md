@@ -188,7 +188,7 @@ The tag starts `.github/workflows/release.yml`. It rechecks version/main
 alignment, all reachable history, Rust/dashboard gates, documentation, and
 dependency policy before building. It also verifies upstream license text
 and the committed dependency notices using pinned cargo-about 0.9.2. Each
-platform archive contains the executable, MIT license, Rust/dashboard
+platform archive contains the executable, Apache 2.0 license, Rust/dashboard
 dependency notices, and the build toolchain's Rust library copyright inventory.
 Archives receive GitHub build-provenance attestations. The final
 protected-environment job assembles the archives, SPDX JSON SBOM and

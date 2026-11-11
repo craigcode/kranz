@@ -221,7 +221,7 @@ Physical glasses acceptance remains a separate operator receipt. Ubuntu and
 macOS also build and exercise the bounded ACP compatibility probe with a local
 synthetic peer; this check requires no provider credentials or model calls.
 
-The supply-chain job also checks the four package MIT notices, regenerates
+The supply-chain job also checks the five package Apache 2.0 license copies, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
 generic-license fallbacks without upstream source text. Archive tests verify
 the binary and notice payload for all five release targets. The dashboard
