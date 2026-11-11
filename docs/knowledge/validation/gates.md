@@ -65,6 +65,8 @@ Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the dif
 
 Rechecked 2026-11-11 (UTC) against the consent-binding fixes: a denial whose target would be enforced as a pattern (a path with glob syntax, a wildcard host) or that carries control or reordering characters is no longer offered as a grant and stays an ordinary finding or block. Gate commands, the grant cap and deny semantics are unchanged.
 
+Rechecked 2026-11-11 (UTC) against the relicensing: `scripts/check-package-licenses.sh` now compares each package archive against the repository Apache 2.0 license instead of the MIT notice. The comparison, the package list and the gate that runs it are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the merge-binding fix: conditional merge gates and path-scoped standards now see changed paths exactly as stored (never C-quoted), and the merge refuses a mission branch that moved after validation. Gate commands and acceptance rules are unchanged.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint runs contained even at `sandbox.enforce: off` and is reported as skipped when nothing can contain it; merge and external gates resolve branches as `refs/heads/<name>`. Gate commands and acceptance rules are unchanged.
@@ -227,7 +229,7 @@ Physical glasses acceptance remains a separate operator receipt. Ubuntu and
 macOS also build and exercise the bounded ACP compatibility probe with a local
 synthetic peer; this check requires no provider credentials or model calls.
 
-The supply-chain job also checks the four package MIT notices, regenerates
+The supply-chain job also checks the five package Apache 2.0 license copies, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
 generic-license fallbacks without upstream source text. Archive tests verify
 the binary and notice payload for all five release targets. The dashboard

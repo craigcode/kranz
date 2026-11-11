@@ -1,7 +1,7 @@
 Kranz release archive
 =====================
 
-This archive contains the Kranz executable, its MIT license, Rust dependency
+This archive contains the Kranz executable, its Apache 2.0 license, Rust dependency
 and dashboard notices, and the build toolchain's Rust library copyright
 inventory. Keep these files together when redistributing the archive.
 
