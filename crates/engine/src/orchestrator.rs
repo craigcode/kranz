@@ -8012,6 +8012,36 @@ fn unexecuted_pty_assertions<'a>(
         .collect()
 }
 
+/// Declared pty-script assertions whose MOST RECENT session failed (audit
+/// M8). The final gate does not re-run pty sessions and says "their last
+/// round verdict stands"; this is what makes that true. A failing transcript
+/// used to reach the functional validator as one evidence line it was free
+/// to pass over, and the gate only checked that some transcript existed.
+/// Earlier failures are fine: a later round that drove the session again and
+/// passed supersedes them.
+fn failed_pty_assertions<'a>(contract: &'a [Assertion], events: &[Event]) -> Vec<&'a Assertion> {
+    let mut latest: HashMap<&str, crate::gate::GateVerdict> = HashMap::new();
+    for event in events {
+        if let EventKind::ValidationPtyTranscript {
+            assertion_id,
+            verdict,
+            ..
+        } = &event.kind
+        {
+            latest.insert(assertion_id.as_str(), *verdict);
+        }
+    }
+    contract
+        .iter()
+        .filter(|a| {
+            a.check == AssertionCheck::PtyScript
+                && latest
+                    .get(a.id.as_str())
+                    .is_some_and(|verdict| *verdict != crate::gate::GateVerdict::Pass)
+        })
+        .collect()
+}
+
 /// De-duplicated, first-seen-order commands this milestone's workers CLAIM
 /// they ran, gathered from each feature's `worker_runs` reports.
 ///
@@ -11439,6 +11469,32 @@ pub(crate) mod tests {
 
         // A contract with no pty assertions flags nothing, events or not.
         assert!(flagged_ids(&contract[2..], &[]).is_empty());
+
+        // Audit M8: an executed session that FAILED is not a pass. The most
+        // recent verdict per assertion decides, so a later passing round
+        // clears an earlier failure and a later failure overrides a pass.
+        let failed_ids = |events: &[Event]| -> Vec<String> {
+            failed_pty_assertions(&contract, events)
+                .iter()
+                .map(|a| a.id.clone())
+                .collect()
+        };
+        assert!(
+            failed_ids(&[]).is_empty(),
+            "never executed is the other check's finding"
+        );
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Fail, 1),
+            transcript_event("a-pty-2", crate::gate::GateVerdict::Pass, 2),
+        ];
+        assert_eq!(failed_ids(&events), vec!["a-pty".to_string()]);
+        let events = vec![
+            transcript_event("a-pty", crate::gate::GateVerdict::Fail, 1),
+            transcript_event("a-pty", crate::gate::GateVerdict::Pass, 2),
+            transcript_event("a-pty-2", crate::gate::GateVerdict::Pass, 3),
+            transcript_event("a-pty-2", crate::gate::GateVerdict::Fail, 4),
+        ];
+        assert_eq!(failed_ids(&events), vec!["a-pty-2".to_string()]);
     }
 
     // ---------------------------------------------------------------------------
