@@ -929,6 +929,7 @@ pub(crate) fn authority_read_deny_paths(inputs: &SandboxInputs) -> Vec<PathBuf> 
     for name in [
         "serve.token",
         "serve.read.token",
+        "serve.grant.key",
         "config.json",
         "domain-terms.local",
     ] {
@@ -1134,6 +1135,7 @@ const KRANZ_ENGINE_OWNED_DIRS: &[&str] = &["queue", "tickets", "lessons", "hook-
 const KRANZ_AUTHORITY_FILES: &[&str] = &[
     "serve.token",
     "serve.read.token",
+    "serve.grant.key",
     "config.json",
     "domain-terms.local",
 ];

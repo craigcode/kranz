@@ -35,6 +35,7 @@ const RUNTIME_IGNORE_PATTERNS: &[&str] = &[
     ".kranz/tickets/*.status",
     ".kranz/serve.token",
     ".kranz/serve.read.token",
+    ".kranz/serve.grant.key",
 ];
 
 #[derive(Debug, Clone, Default)]

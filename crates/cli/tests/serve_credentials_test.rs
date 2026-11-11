@@ -59,6 +59,7 @@ async fn serve_rejects_invalid_read_credentials_before_binding_or_publishing() {
             );
             assert!(!repo.join(".kranz/serve.token").exists());
             assert!(!repo.join(".kranz/serve.read.token").exists());
+            assert!(!repo.join(".kranz/serve.grant.key").exists());
             assert!(!operator.join("serve").exists());
         }
     }
@@ -122,6 +123,19 @@ async fn serve_published_read_credential_matches_live_server() {
     let published = std::fs::read_to_string(repo.join(".kranz/serve.read.token")).unwrap();
     assert_eq!(published, "dummy-read");
     assert_eq!(body["token"], published);
+    let grant_key_path = repo.join(".kranz/serve.grant.key");
+    let grant_key = std::fs::read_to_string(&grant_key_path).unwrap();
+    assert!(grant_key.starts_with("sgk_"));
+    assert_eq!(grant_key.len(), 68);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&grant_key_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     let response = client
         .post(format!("{url}api/queue/drain"))
         .header("x-kranz-token", &published)

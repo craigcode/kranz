@@ -2727,7 +2727,7 @@ async fn serve_multi_with_token_cleanup(
     options: kranz_server::ServeOptions,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let (token_file, read_token_file) = if multi_host.uses_operator_catalog() {
+    let (token_file, read_token_file, grant_key_file) = if multi_host.uses_operator_catalog() {
         let address = listener
             .local_addr()
             .context("cannot resolve the bound address for operator token storage")?;
@@ -2735,13 +2735,15 @@ async fn serve_multi_with_token_cleanup(
             .context("cannot securely store the operator serve token")?;
         let read_token_file = write_operator_serve_read_token(address, &read_token)
             .context("cannot securely store the operator serve read token")?;
-        (token_file, read_token_file)
+        (token_file, read_token_file, None)
     } else {
         let token_file =
             write_serve_token(repo, &token).context("cannot securely store the serve token")?;
         let read_token_file = write_serve_read_token(repo, &read_token)
             .context("cannot securely store the serve read token")?;
-        (token_file, read_token_file)
+        let grant_key_file = kranz_engine::sgian::rotate_grant_key(repo)
+            .context("cannot securely store the serve grant key")?;
+        (token_file, read_token_file, Some(grant_key_file))
     };
     let result = kranz_server::serve_multi_on_listener_with_options(
         multi_host,
@@ -2755,6 +2757,9 @@ async fn serve_multi_with_token_cleanup(
     .await;
     remove_token_file(&token_file);
     remove_token_file(&read_token_file);
+    if let Some(grant_key_file) = &grant_key_file {
+        remove_token_file(grant_key_file);
+    }
     result
 }
 
@@ -2778,6 +2783,7 @@ async fn serve_with_token_cleanup(
     // so this file must never be written world- or group-readable.
     let token_file = write_serve_token(repo, &token)?;
     let read_token_file = write_serve_read_token(repo, &read_token)?;
+    let grant_key_file = kranz_engine::sgian::rotate_grant_key(repo)?;
 
     let result = kranz_server::serve_on_listener(
         host,
@@ -2790,6 +2796,7 @@ async fn serve_with_token_cleanup(
 
     remove_token_file(&token_file);
     remove_token_file(&read_token_file);
+    remove_token_file(&grant_key_file);
 
     result
 }

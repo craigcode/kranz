@@ -37,6 +37,7 @@ pub const EXCLUDED_PREFIXES: &[&str] = &[
     ".kranz/config.json",
     ".kranz/serve.token",
     ".kranz/serve.read.token",
+    ".kranz/serve.grant.key",
     ".kranz/domain-terms.local",
 ];
 

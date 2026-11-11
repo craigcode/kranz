@@ -47,6 +47,8 @@ Rechecked 2026-11-11 (UTC) against the merge-binding fix: the hosted merge lands
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: base and mission branches are resolved as `refs/heads/<name>` at approval and merge, so a same-named tag cannot stand in for either, and engine-run git ignores replace refs. This strengthens the pinned-base and merge invariants; none changed.
 
+Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` for uncontained host ACP sessions; contained worker profiles and enforced sandboxes refuse it, `.kranz/serve.grant.key` joins authority/sandbox denies and scrubbing, `sgian ctl` invocations run `env_clear`d with bounded terminal output limits, and unconfirmed Sgian cleanup fails closed. All documented invariants hold unchanged.
+
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal budgets and v2 host admission onto v0.5.0 main alongside the security audit remediation. Exact-action authority, environment clearing, owned cleanup, pre-credential v2 admission, authenticated CLI serving, and workspace containment hold unchanged.
 
 Rechecked 2026-11-07 (UTC): Reconciled ACP R4 with current main: exact-action authority, environment clearing, owned cleanup and pre-credential v2 host admission remain enforced. Terminal expiry is recoverable only after confirmed cleanup. The public compatibility-probe constructor still refuses released worker profiles.

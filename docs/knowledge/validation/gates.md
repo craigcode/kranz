@@ -73,6 +73,8 @@ Rechecked 2026-11-11 (UTC) against the merge-binding fix: conditional merge gate
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint runs contained even at `sandbox.enforce: off` and is reported as skipped when nothing can contain it; merge and external gates resolve branches as `refs/heads/<name>`. Gate commands and acceptance rules are unchanged.
 
+Rechecked 2026-11-10 (UTC): Added `sgian-grant-key` scrubbing (`sgk_<64-hex>`), `serve.grant.key` rotation in `kranz serve`, and opt-in `SgianTerminalProvider` for uncontained host ACP sessions; gate contracts, contained ACP proofs and acceptance requirements remain unchanged.
+
 Rechecked 2026-11-09 (UTC): Merged the nine named terminal Docker proofs and ACP v2 admission checks onto v0.5.0 main alongside workspace gate sandboxing and GLib backport checks. Gate contracts and acceptance requirements remain unchanged.
 
 Rechecked 2026-11-07 (UTC): Reconciled the nine named terminal Docker proofs with upstream security and pane regressions. R5 remains open; recoverable terminal-budget receipts do not by themselves establish an attempt-level resource failure or real-adapter qualification.
