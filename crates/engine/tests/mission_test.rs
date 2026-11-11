@@ -1133,6 +1133,7 @@ async fn unknown_workspace_provider_refused_at_approve() {
 fn remote_workspace_cfg(base_url: &str, token_env: &str) -> MissionConfig {
     MissionConfig {
         workspace: WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(RemoteWorkspaceConfig {
                 base_url: Some(base_url.to_string()),
@@ -1327,6 +1328,7 @@ async fn remote_workspace_incomplete_config_refused_at_approve() {
     let backend = Arc::new(MockBackend::new());
     let cfg = MissionConfig {
         workspace: WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(RemoteWorkspaceConfig {
                 base_url: None, // missing — must be named in the refusal
@@ -1649,6 +1651,7 @@ fn remote_workspace_cfg_teardown(
 ) -> MissionConfig {
     MissionConfig {
         workspace: WorkspaceConfig {
+            allowed_mounts: Vec::new(),
             provider: Some("remote".to_string()),
             remote: Some(RemoteWorkspaceConfig {
                 base_url: Some(base_url.to_string()),

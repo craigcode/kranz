@@ -208,9 +208,29 @@ fn spawn_bounded(argv: &[String], timeout: Duration) -> (Option<i32>, String) {
     let Some((program, args)) = argv.split_first() else {
         return (None, "empty argv".to_string());
     };
-    let secret_env = extract_exec_secret_env(args);
-    match crate::command_exec::run_with_timeout_env(Path::new(program), args, &secret_env, timeout)
-    {
+    // The compose client gets the runtime's own client configuration and
+    // the consented `exec -e` secrets, never the engine's ambient
+    // environment: Compose interpolates `${VAR}` from its environment into
+    // the rendered file, which would hand repo-authored contract strings any
+    // credential the engine holds (2026-11-10 audit CTR-2).
+    let mut client_env: Vec<(String, String)> = [
+        ContainerRuntime::Docker,
+        ContainerRuntime::Podman,
+        ContainerRuntime::Nerdctl,
+        ContainerRuntime::AppleContainer,
+    ]
+    .into_iter()
+    .flat_map(|runtime| runtime.client_env())
+    .collect::<std::collections::BTreeMap<_, _>>()
+    .into_iter()
+    .collect();
+    client_env.extend(extract_exec_secret_env(args));
+    match crate::command_exec::run_with_timeout_cleared_env(
+        Path::new(program),
+        args,
+        &client_env,
+        timeout,
+    ) {
         Some(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -448,7 +468,7 @@ pub(crate) fn render_compose_file(
         services.insert(service.name.clone(), def);
     }
 
-    json!({
+    let mut doc = json!({
         "name": project,
         "services": services,
         "x-kranz": {
@@ -456,7 +476,54 @@ pub(crate) fn render_compose_file(
             "bootstrap": contract.bootstrap,
             "readiness": contract.readiness,
         },
-    })
+    });
+    escape_compose_interpolation(&mut doc);
+    doc
+}
+
+/// Compose interpolates `$VAR` / `${VAR}` in every string value, including
+/// extension fields. Nothing kranz renders is meant to be interpolated:
+/// contract strings are repository content and env values are literal. `$$`
+/// is Compose's escape for a literal `$`, so a shell `$HOME` in a contract
+/// command still reaches `sh -c` as `$HOME`.
+fn escape_compose_interpolation(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains('$') {
+                *text = text.replace('$', "$$");
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(escape_compose_interpolation),
+        serde_json::Value::Object(map) => map.values_mut().for_each(escape_compose_interpolation),
+        _ => {}
+    }
+}
+
+/// Two-party consent for host mounts: the contract (repository content) asks,
+/// the operator's `workspace.allowedMounts` permits. Any contract mount the
+/// operator has not listed refuses provisioning outright, naming it — a mount
+/// is bound read-write at its host path, so `/var/run/docker.sock` or the
+/// kranz authority directory would hand the container the host (2026-11-10
+/// audit CTR-1). Paths compare exactly, ignoring a trailing separator.
+fn refuse_unapproved_mounts(contract: &WorkspaceContract, allowed: &[String]) -> Result<()> {
+    let normal = |path: &str| path.trim_end_matches('/').to_string();
+    let allowed: std::collections::BTreeSet<String> =
+        allowed.iter().map(|path| normal(path)).collect();
+    let refused: Vec<&str> = contract
+        .mounts
+        .iter()
+        .filter(|mount| !allowed.contains(&normal(mount)))
+        .map(String::as_str)
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Config(format!(
+        "workspace contract mounts {refused:?} are not in the operator's \
+         workspace.allowedMounts; a contract mount is bound read-write at its host path, so \
+         the operator must list each one in the global kranz config (owner: operator) or the \
+         contract must drop it"
+    )))
 }
 
 /// Parse the OS-assigned host port out of `compose port <svc> <port>`
@@ -522,6 +589,9 @@ impl WorkspaceProvider for LocalContainerProvider {
                 gate_env: spec.gate_env.clone(),
             });
         };
+        // Before any runtime work: an unconsented host mount refuses the
+        // whole provision rather than starting a container without it.
+        refuse_unapproved_mounts(contract, &spec.gate_env.allowed_mounts)?;
 
         if contract
             .disk
@@ -1188,6 +1258,113 @@ mod tests {
                 .join(".kranz/missions/m-collision/workspace/compose.json")
                 .exists(),
             "the refusal precedes any runtime work: no compose file written"
+        );
+    }
+
+    /// 2026-11-10 audit CTR-1: a contract mount is honoured only when the
+    /// operator's `workspace.allowedMounts` lists it. An unlisted mount
+    /// refuses the whole provision before any runtime is touched.
+    #[tokio::test]
+    async fn provision_refuses_contract_mounts_the_operator_did_not_allow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = LocalContainerProvider::with_hooks(RuntimeHooks {
+            detect: Arc::new(|| panic!("no runtime detection before the mount check")),
+            run: Arc::new(|_argv, _timeout| panic!("no runtime invocation before the mount check")),
+        });
+        let wants = contract(
+            br#"{"schemaVersion": 1, "readiness": ["true"],
+                 "mounts": ["/var/run/docker.sock", "/var/cache/cargo/"]}"#,
+        );
+
+        let mut partly = spec(dir.path(), "m-mounts", Some(wants.clone()));
+        partly.gate_env = partly
+            .gate_env
+            .with_allowed_mounts(&["/var/cache/cargo".to_string()]);
+        let msg = provider
+            .provision(&partly)
+            .await
+            .expect_err("an unlisted mount refuses provisioning")
+            .to_string();
+        assert!(msg.contains("workspace.allowedMounts"), "{msg}");
+        assert!(msg.contains("/var/run/docker.sock"), "{msg}");
+        assert!(
+            !msg.contains("/var/cache/cargo"),
+            "the allowed mount is not named: {msg}"
+        );
+
+        let none = spec(dir.path(), "m-mounts", Some(wants));
+        assert!(
+            provider.provision(&none).await.is_err(),
+            "the default allows none"
+        );
+    }
+
+    /// With every mount listed (trailing separators ignored) the check passes
+    /// and provisioning proceeds to runtime detection.
+    #[tokio::test]
+    async fn provision_accepts_contract_mounts_the_operator_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = LocalContainerProvider::with_hooks(RuntimeHooks {
+            detect: Arc::new(|| None),
+            run: Arc::new(|_argv, _timeout| panic!("no runtime was detected")),
+        });
+        let mut allowed = spec(
+            dir.path(),
+            "m-mounts-ok",
+            Some(contract(
+                br#"{"schemaVersion": 1, "readiness": ["true"], "mounts": ["/var/cache/cargo/"]}"#,
+            )),
+        );
+        allowed.gate_env = allowed
+            .gate_env
+            .with_allowed_mounts(&["/var/cache/cargo".to_string()]);
+        let msg = provider
+            .provision(&allowed)
+            .await
+            .expect_err("no runtime, so provisioning stops later")
+            .to_string();
+        assert!(!msg.contains("allowedMounts"), "{msg}");
+        assert!(msg.contains("workspace.provider"), "{msg}");
+    }
+
+    /// 2026-11-10 audit CTR-2: Compose interpolates `$VAR` from its own
+    /// environment in every string. Rendered contract strings are escaped so
+    /// nothing is substituted, and a shell `$HOME` still reaches `sh -c`.
+    #[test]
+    fn rendered_compose_file_escapes_every_dollar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contract = contract(
+            br#"{
+                "schemaVersion": 1,
+                "bootstrap": ["echo ${AWS_SECRET_ACCESS_KEY}"],
+                "services": [{
+                    "name": "api",
+                    "start": "fetch ${GH_TOKEN} && echo $HOME",
+                    "port": { "policy": "dynamic" },
+                    "healthCheck": "test -n $SLACK_BOT_TOKEN"
+                }],
+                "readiness": ["true"]
+            }"#,
+        );
+        let mut env = HashMap::new();
+        env.insert("LITERAL".to_string(), "a$b".to_string());
+        let doc = render_compose_file("kranz-ws-m-esc", &contract, dir.path(), &env);
+        let text = serde_json::to_string(&doc).unwrap();
+        assert!(
+            !text.replace("$$", "").contains('$'),
+            "an unescaped $ remains: {text}"
+        );
+        assert_eq!(
+            doc["services"]["api"]["command"][2],
+            "fetch $${GH_TOKEN} && echo $$HOME"
+        );
+        assert_eq!(
+            doc["services"][WORKSPACE_SERVICE]["environment"]["LITERAL"],
+            "a$$b"
+        );
+        assert_eq!(
+            doc["x-kranz"]["bootstrap"][0],
+            "echo $${AWS_SECRET_ACCESS_KEY}"
         );
     }
 

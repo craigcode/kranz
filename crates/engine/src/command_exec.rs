@@ -190,7 +190,31 @@ pub(crate) fn run_with_timeout_env(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Option<std::process::Output> {
+    run_with_timeout_inner(program, args, env, false, timeout)
+}
+
+/// As [`run_with_timeout_env`], but the child sees ONLY `env`: the engine's
+/// ambient environment is cleared first.
+pub(crate) fn run_with_timeout_cleared_env(
+    program: &std::path::Path,
+    args: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    run_with_timeout_inner(program, args, env, true, timeout)
+}
+
+fn run_with_timeout_inner(
+    program: &std::path::Path,
+    args: &[String],
+    env: &[(String, String)],
+    clear_env: bool,
+    timeout: Duration,
+) -> Option<std::process::Output> {
     let mut cmd = std::process::Command::new(program);
+    if clear_env {
+        cmd.env_clear();
+    }
     cmd.args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())

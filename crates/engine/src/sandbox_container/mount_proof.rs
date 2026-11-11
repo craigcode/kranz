@@ -299,7 +299,24 @@ impl Helper {
         let probe = self.probe.as_ref().expect("owned probe").path();
         super::validate_container_mount_path(probe)?;
         super::validate_container_mount_path(Path::new(super::MOUNT_PROOF_GUEST_DIR))?;
-        std::fs::write(probe.join("host.txt"), host).map_err(|e| e.to_string())?;
+        // The probe sits inside a declared mount root, which a live worker of
+        // another session may be able to write. `create_new` + `O_NOFOLLOW`
+        // refuses a pre-planted `host.txt` (a symlink would otherwise send
+        // these bytes, and a truncation, to its target).
+        {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+            }
+            options
+                .open(probe.join("host.txt"))
+                .and_then(|mut file| file.write_all(host.as_ref()))
+                .map_err(|e| format!("mount proof could not create its probe file: {e}"))?;
+        }
         let payload = super::mount_proof_script(guest);
         // Build a create/start pair so successful creation has an immutable ID
         // before attach can time out. No image ENTRYPOINT or network is used.
@@ -563,6 +580,40 @@ fn owner_pid_is_provably_dead(owner_pid: u32, owner_identity: Option<&str>) -> b
     rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Owned by this user and not writable by group or other.
+fn owned_private(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// A `unix://` endpoint whose socket exists and belongs to this user.
+fn owned_local_socket(endpoint: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        endpoint
+            .strip_prefix("unix://")
+            .filter(|path| path.starts_with('/'))
+            .and_then(|path| std::fs::metadata(path).ok())
+            .is_some_and(|meta| {
+                meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() }
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = endpoint;
+        false
+    }
+}
+
 pub(super) async fn reap_dead_owner_ledgers(
     scratch_base: &Path,
     client: &DockerEvaluator,
@@ -594,6 +645,13 @@ pub(super) async fn reap_dead_owner_ledgers(
         if !dir_meta.file_type().is_dir() {
             continue;
         }
+        // The scratch base may be a shared temp directory. A ledger is only
+        // ours if this user created it and nobody else can write into it;
+        // otherwise another local user could name a Docker endpoint and a
+        // tree for us to act on (2026-11-10 audit CTR-3).
+        if !owned_private(&dir_meta) {
+            continue;
+        }
         let record_path = ledger_dir.join("owner.json");
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
@@ -605,7 +663,7 @@ pub(super) async fn reap_dead_owner_ledgers(
         let Ok(file_meta) = file.metadata() else {
             continue;
         };
-        if !file_meta.is_file() || file_meta.len() > 64 * 1024 {
+        if !file_meta.is_file() || file_meta.len() > 64 * 1024 || !owned_private(&file_meta) {
             continue;
         }
         if !min_age.is_zero()
@@ -659,7 +717,9 @@ pub(super) async fn reap_dead_owner_ledgers(
         let mut ledger_client = client.clone();
         match record.get("endpoint") {
             None | Some(serde_json::Value::Null) => {}
-            Some(serde_json::Value::String(ep)) if !ep.trim().is_empty() => {
+            // Only a local socket this user owns: never a TCP or SSH
+            // endpoint taken from a file.
+            Some(serde_json::Value::String(ep)) if owned_local_socket(ep) => {
                 ledger_client.pin_local_endpoint(ep);
             }
             Some(_) => continue,
@@ -693,6 +753,8 @@ pub(super) async fn reap_dead_owner_ledgers(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("kranz-mount-proof-"))
+                && std::fs::symlink_metadata(probe_path)
+                    .is_ok_and(|meta| meta.file_type().is_dir() && owned_private(&meta))
             {
                 let _ = super::remove_owned_tree_nofollow(probe_path);
             }
@@ -900,12 +962,57 @@ mod containment_remediation_tests {
         )
         .unwrap();
 
+        // 2026-11-10 audit CTR-3: a dead-owner ledger is acted on only if
+        // this user owns it privately and it names no remote endpoint. Both
+        // of these look reapable otherwise and must be left untouched.
+        let untrusted = |label: &str, endpoint: Option<&str>, mode: u32| {
+            let ledger = tempfile::Builder::new()
+                .prefix("kranz-mount-ledger-")
+                .tempdir_in(&scratch)
+                .unwrap()
+                .keep();
+            let mut record = serde_json::json!({
+                "schema": 1,
+                "ownerLabel": OWNER_LABEL,
+                "owner": label,
+                "ownerPid": dead_pid,
+                "ownerIdentity": "dead-identity-token-never-matches",
+                "docker": client.program(),
+            });
+            if let Some(endpoint) = endpoint {
+                record["endpoint"] = endpoint.into();
+            }
+            std::fs::write(
+                ledger.join("owner.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(mode)).unwrap();
+            ledger
+        };
+        let shared_ledger = untrusted("11111111111111111111111111111111", None, 0o777);
+        let remote_ledger = untrusted(
+            "22222222222222222222222222222222",
+            Some("tcp://203.0.113.7:2375"),
+            0o700,
+        );
+
         let reaped = reap_dead_owner_ledgers(&scratch, &client, Duration::ZERO).await;
         assert_eq!(reaped, 1);
         assert!(removed_marker.exists());
         assert!(!dead_ledger.exists());
         assert!(!probe_dir.exists());
         assert!(live_ledger.exists());
+        assert!(
+            shared_ledger.exists(),
+            "a ledger others can write is not ours"
+        );
+        assert!(
+            remote_ledger.exists(),
+            "a remote endpoint is never taken from a ledger"
+        );
+        super::super::remove_owned_tree_nofollow(&shared_ledger).unwrap();
+        super::super::remove_owned_tree_nofollow(&remote_ledger).unwrap();
         super::super::remove_owned_tree_nofollow(&live_ledger).unwrap();
     }
 }

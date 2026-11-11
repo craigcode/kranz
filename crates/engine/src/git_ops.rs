@@ -1592,8 +1592,8 @@ impl GitRepo {
         self.run_os(&args)
     }
 
-    /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),
-    /// one per line as git reports them.
+    /// Paths changed in `from..to` (`git diff --name-only -z <from>..<to>`),
+    /// exactly as stored: never C-quoted.
     ///
     /// Rejects a flag-shaped `from`/`to` (leading `-`) before invoking git,
     /// mirroring the guard on [`GitRepo::is_ancestor`]/[`GitRepo::rev_parse`].
@@ -1605,12 +1605,15 @@ impl GitRepo {
                 )));
             }
         }
+        // `-z`: without it git C-quotes any path with a non-ASCII byte, quote,
+        // tab or backslash (`"migrations/2026_\303\251.sql"`), and a quoted
+        // path never matches a `whenPaths` prefix or a path-scoped standard,
+        // so one odd filename skipped conditional gates (audit INT-3).
         let range = format!("{from}..{to}");
-        let out = self.run(&["diff", "--name-only", &range])?;
+        let out = self.run(&["diff", "--name-only", "-z", &range])?;
         Ok(out
-            .lines()
-            .map(|l| l.trim_end_matches('\r').trim())
-            .filter(|l| !l.is_empty())
+            .split('\0')
+            .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect())
     }

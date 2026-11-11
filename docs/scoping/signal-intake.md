@@ -98,7 +98,9 @@ deterministic; no model reads signal content before a human has consented.
    `sandbox::authority_read_deny_paths` so sandboxed workers, validators, and
    gates cannot read raw signal payloads.
 4. **Unverified or replayed payloads are dropped** after a one-line decision
-   log that carries neither secret nor body. Authenticity and replay bounds
+   log that carries neither secret nor body. They are never written to the
+   ledger: the sender is unauthenticated, and an append-only record must not
+   grow at the request of whoever can reach the port. Authenticity and replay bounds
    (timestamp header within a 5-minute skew window plus a bounded replay cache
    of `(source, delivery_id_or_sig_hash, timestamp)`) are checked first.
 5. **Every intake decision is durable and replayable** in the signal ledger
