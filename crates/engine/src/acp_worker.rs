@@ -784,58 +784,17 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_owned_dir_rwx_nofollow(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return false;
-        }
-        if (meta.mode() & 0o700) != 0o700 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    true
-}
-
-fn unlink_credential_leaf_nofollow(parent_dir: &Path, file_name: &str) {
-    if !ensure_owned_dir_rwx_nofollow(parent_dir) {
-        return;
-    }
-    let target = parent_dir.join(file_name);
-    let Ok(meta) = std::fs::symlink_metadata(&target) else {
-        return;
-    };
-    if meta.file_type().is_dir() {
-        let _ = crate::sandbox_container::remove_owned_tree_nofollow(&target);
-        return;
-    }
-    #[cfg(unix)]
-    if meta.file_type().is_file() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() == unsafe { libc::geteuid() } && (meta.mode() & 0o600) != 0o600 {
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-    let _ = std::fs::remove_file(&target);
-}
-
 fn purge_profile_home(root: &Path) -> std::io::Result<()> {
-    // Unlink any seeded or adapter-written credential files FIRST after
-    // restoring 0700 on engine-owned parent dirs (never following symlinks),
-    // before removing the remaining home tree.
-    if ensure_owned_dir_rwx_nofollow(root) {
-        let inner = root.join("home");
-        if ensure_owned_dir_rwx_nofollow(&inner) {
-            unlink_credential_leaf_nofollow(&inner.join(".claude"), ".credentials.json");
-            unlink_credential_leaf_nofollow(&inner.join(".codex"), "auth.json");
-        }
+    // Remove the credential-bearing adapter directories FIRST, then the rest
+    // of the home. `home/` is the guest's mount and may be rewritten by a
+    // container that is still alive (Drop, or a failed removal), so nothing
+    // under it is addressed by path: `remove_owned_tree_nofollow` walks by
+    // directory descriptor, repairs a guest `chmod 0000`, and unlinks a
+    // swapped-in symlink instead of following it (2026-11-10 audit ACP-1).
+    // `root` itself is outside every guest mount.
+    let inner = root.join("home");
+    for credentials in [".claude", ".codex"] {
+        let _ = crate::sandbox_container::remove_owned_tree_nofollow(&inner.join(credentials));
     }
     crate::sandbox_container::remove_owned_tree_nofollow(root)
 }
@@ -929,7 +888,11 @@ impl Drop for PreparedProfile {
     fn drop(&mut self) {
         if let Some(home) = self.home.take() {
             let path = home.keep();
-            let _ = purge_profile_home(&path);
+            if let Err(error) = purge_profile_home(&path) {
+                // Drop cannot fail the run; make a surviving credential home
+                // visible instead of silent.
+                tracing::error!(%error, "ACP private home was not fully removed on drop");
+            }
         }
     }
 }
