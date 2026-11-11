@@ -32,6 +32,11 @@ BLOCK_SCALAR_RE = re.compile(
     r"[|>][0-9+-]*(?:\s+#.*)?\s*$"
 )
 FLOW_USES_RE = re.compile(r"(?<!\$)\{[^{}]*\buses\s*:")
+# A quoted mapping key (`"uses": x`, `'uses': x`) or an explicit one (`? uses`).
+# YAML reads these as the same key the plain-key pattern above matches, so a
+# checker that only knows the plain spelling would wave the reference through.
+QUOTED_KEY_RE = re.compile(r"""^\s*(?:-\s+)?(?P<quote>["'])(?P<key>.*?)(?P=quote)\s*:""")
+EXPLICIT_KEY_RE = re.compile(r"^\s*(?:-\s+)?\?\s")
 ACTION_REF_RE = re.compile(
     r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?P<subpath>(?:/[A-Za-z0-9_.-]+)*)@(?P<ref>.+)$"
 )
@@ -141,6 +146,23 @@ def extract_workflow_uses(path: Path) -> tuple[list[tuple[int, str]], list[str]]
         if FLOW_USES_RE.search(uncommented):
             errors.append(
                 f"{path}:{lineno}: flow-mapping `uses:` syntax is forbidden; use standard block YAML"
+            )
+            continue
+
+        quoted = QUOTED_KEY_RE.match(raw_line)
+        if quoted is not None:
+            key = quoted.group("key")
+            # A double-quoted key can spell `uses` with escapes (`"u\x73es"`);
+            # no workflow key needs one, so any escape is refused unread.
+            if key.strip() == "uses" or (quoted.group("quote") == '"' and "\\" in key):
+                errors.append(
+                    f"{path}:{lineno}: quoted `uses` key (or an escaped quoted key) is forbidden; "
+                    "write a plain `uses:`"
+                )
+                continue
+        if EXPLICIT_KEY_RE.match(raw_line):
+            errors.append(
+                f"{path}:{lineno}: explicit `? key` mapping syntax is forbidden; use standard block YAML"
             )
             continue
 
@@ -311,6 +333,40 @@ jobs:
             _, errors = verify_workflows(allowlist_path, wf)
             self.assertEqual(len(errors), 1)
             self.assertIn("40-character", errors[0])
+
+    def test_rejects_uses_keys_the_plain_pattern_cannot_see(self) -> None:
+        # Audit M21: each of these is a real `uses` key to a YAML parser. One
+        # valid plain reference alongside keeps the "zero references" backstop
+        # from being what fails the file.
+        evasions = [
+            '"uses": untrusted/action@v1',
+            "'uses': untrusted/action@v1",
+            '"uses" : untrusted/action@v1',
+            '"u\\x73es": untrusted/action@v1',
+            "? uses\n        : untrusted/action@v1",
+        ]
+        for evasion in evasions:
+            with self.subTest(evasion=evasion), tempfile.TemporaryDirectory() as tmp:
+                allowlist_path, wf = self._write_fixture(
+                    Path(tmp),
+                    "jobs:\n  a:\n    steps:\n"
+                    f"      - uses: actions/checkout@{self.SHA_A}\n"
+                    f"      - {evasion}\n",
+                )
+                _, errors = verify_workflows(allowlist_path, wf)
+                self.assertEqual(len(errors), 1, f"expected one refusal for {evasion!r}: {errors}")
+                self.assertIn("forbidden", errors[0])
+
+        # An ordinary quoted key that is not `uses` stays legal.
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist_path, wf = self._write_fixture(
+                Path(tmp),
+                '"on": push\njobs:\n  a:\n    steps:\n'
+                f"      - uses: actions/checkout@{self.SHA_A}\n"
+                '        "with":\n          "fetch-depth": 0\n',
+            )
+            _, errors = verify_workflows(allowlist_path, wf)
+            self.assertEqual(errors, [])
 
     def test_rejects_flow_mapping_and_verified_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
