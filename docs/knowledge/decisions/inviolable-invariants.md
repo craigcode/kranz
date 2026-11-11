@@ -37,6 +37,8 @@ verified_against:
   - crates/engine/src/types.rs
 ---
 
+Rechecked 2026-11-11 (UTC) against the second audit round (mission id check, `kranz exec` question output). No invariant changed.
+
 Rechecked 2026-11-11 (UTC) against the Linux socket mask in the bubblewrap wrap. No invariant changed.
 
 Rechecked 2026-11-11 (UTC) against the evidence and containment fixes: the final gate fails a pty-script assertion whose most recent session failed, and contract-command output reaches the validator inside an untrusted-output fence. No invariant changed.

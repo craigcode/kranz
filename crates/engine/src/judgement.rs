@@ -107,7 +107,7 @@ impl MissionEngine {
             note = crate::presentation::UNTRUSTED_SESSION_TEXT_NOTE,
             report = crate::presentation::fence_session_text("WORKER REPORT", &report_text),
             commits = crate::presentation::fence_session_text("COMMITS THIS RUN", &commits_text),
-            stat = crate::presentation::fence_session_text("DIFF STAT", &diff_stat),
+            stat = crate::presentation::fence_session_text("DIFF STAT", diff_stat),
         );
         let (decision, text) = self.json_decision::<JudgementDecision>(&message).await?;
 

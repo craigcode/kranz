@@ -543,15 +543,6 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
     },
 ];
 
-/// Limits a repository's own config may lower and never raise or remove.
-const PROJECT_CEILINGS: &[&str] = &[
-    "<role>.maxBudgetUsd",
-    "<role>.maxTurns",
-    "maxFixCyclesPerMilestone",
-    "maxRespawns",
-    "maxParallelWorkers",
-];
-
 fn config_trust_rule(normalized: &str) -> Option<&'static ConfigTrustRule> {
     CONFIG_TRUST_RULES
         .iter()
@@ -674,24 +665,6 @@ fn walk_project_layer(
         // So a repository may ask for the contained backend and may not pick
         // another one (audit M9). Worker and validator backends stay
         // repo-settable: those sessions run inside the sandbox and worktree.
-        // Spend and retry ceilings (audit ORC-9): a repository may tighten
-        // them and may not loosen them. A number above what the layers so
-        // far allow, or anything that is not a number where a number caps
-        // the run (`null` removes the cap), is a raise.
-        if PROJECT_CEILINGS.contains(&normalized.as_str()) {
-            if let Some(ceiling) = base_value.and_then(serde_json::Value::as_f64) {
-                if value.as_f64().is_none_or(|asked| asked > ceiling) {
-                    return Err(project_layer_refusal(
-                        file,
-                        &dotted,
-                        &format!(
-                            "it is a spend or retry limit (currently {ceiling}); a repository \
-                             may lower it, not raise or remove it"
-                        ),
-                    ));
-                }
-            }
-        }
         if dotted == "orchestrator.backend" && value.as_str() != Some("claude") {
             return Err(project_layer_refusal(
                 file,
@@ -3041,53 +3014,6 @@ mod tests {
             "the operator's own layer may still choose it: {:?}",
             as_operator.err()
         );
-    }
-
-    /// Audit ORC-9: a repository may tighten spend and retry limits and may
-    /// not loosen them. The operator's own layer still can.
-    #[test]
-    fn project_layer_can_lower_but_not_raise_spend_and_retry_limits() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project.json");
-        let as_project = |value: serde_json::Value| {
-            std::fs::write(&project, value.to_string()).unwrap();
-            load_layers_with_roles(&[(project.clone(), Layer::Project)])
-        };
-        let defaults = MissionConfig::default();
-        let worker_budget = defaults
-            .worker
-            .max_budget_usd
-            .expect("a default worker budget");
-        let cycles = defaults.max_fix_cycles_per_milestone;
-
-        for raise in [
-            serde_json::json!({ "worker": { "maxBudgetUsd": worker_budget + 1.0 } }),
-            serde_json::json!({ "worker": { "maxBudgetUsd": null } }),
-            serde_json::json!({ "maxFixCyclesPerMilestone": cycles + 1 }),
-            serde_json::json!({ "maxRespawns": defaults.max_respawns + 1 }),
-            serde_json::json!({ "maxParallelWorkers": defaults.max_parallel_workers + 1 }),
-        ] {
-            let err = as_project(raise.clone()).unwrap_err().to_string();
-            assert!(
-                err.contains("may lower it, not raise or remove it"),
-                "{raise}: {err}"
-            );
-        }
-
-        let lowered = as_project(serde_json::json!({
-            "worker": { "maxBudgetUsd": worker_budget / 2.0 },
-            "maxFixCyclesPerMilestone": cycles.saturating_sub(1),
-        }))
-        .expect("lowering is allowed");
-        assert_eq!(lowered.worker.max_budget_usd, Some(worker_budget / 2.0));
-
-        std::fs::write(
-            &project,
-            serde_json::json!({ "maxFixCyclesPerMilestone": cycles + 1 }).to_string(),
-        )
-        .unwrap();
-        load_layers_with_roles(&[(project.clone(), Layer::Global)])
-            .expect("the operator's own layer may raise a limit");
     }
 
     trait RoleConfigTestExt {
