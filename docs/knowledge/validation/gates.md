@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,12 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-11 (UTC) against the relicensing: `scripts/check-package-licenses.sh` now compares each package archive against the repository Apache 2.0 license instead of the MIT notice. The comparison, the package list and the gate that runs it are unchanged.
+
+Rechecked 2026-11-11 (UTC) against the merge-binding fix: conditional merge gates and path-scoped standards now see changed paths exactly as stored (never C-quoted), and the merge refuses a mission branch that moved after validation. Gate commands and acceptance rules are unchanged.
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint runs contained even at `sandbox.enforce: off` and is reported as skipped when nothing can contain it; merge and external gates resolve branches as `refs/heads/<name>`. Gate commands and acceptance rules are unchanged.
 
 Rechecked 2026-11-10 (UTC): Added `sgian-grant-key` scrubbing (`sgk_<64-hex>`), `serve.grant.key` rotation in `kranz serve`, and opt-in `SgianTerminalProvider` for uncontained host ACP sessions; gate contracts, contained ACP proofs and acceptance requirements remain unchanged.
 
@@ -221,7 +227,7 @@ Physical glasses acceptance remains a separate operator receipt. Ubuntu and
 macOS also build and exercise the bounded ACP compatibility probe with a local
 synthetic peer; this check requires no provider credentials or model calls.
 
-The supply-chain job also checks the four package MIT notices, regenerates
+The supply-chain job also checks the five package Apache 2.0 license copies, regenerates
 the locked Rust dependency notices with pinned cargo-about 0.9.2, and rejects
 generic-license fallbacks without upstream source text. Archive tests verify
 the binary and notice payload for all five release targets. The dashboard

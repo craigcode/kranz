@@ -244,63 +244,161 @@ pub(crate) fn scratch_root_base() -> PathBuf {
 }
 
 /// Recursively removes an engine-owned scratch directory without ever following
-/// symlinks (`std::fs::symlink_metadata`), repairing `0700` on engine-owned
-/// directories and `0600` on engine-owned regular files first so a same-UID
+/// a symlink, repairing `0700` on engine-owned directories first so a same-UID
 /// guest `chmod 0000` cannot pin credentials on host disk or mask gate outcomes.
 /// `ErrorKind::NotFound` is treated as `Ok(())`.
+///
+/// On Unix every step below the parent of `path` is relative to an open
+/// directory descriptor (`openat(O_NOFOLLOW | O_DIRECTORY)`, `unlinkat`,
+/// `fchmod`), so a live process that swaps a directory for a symlink between
+/// the check and the use cannot redirect the walk outside the tree
+/// (2026-11-10 audit CTR-4 / ACP-1). The parent of `path` is the caller's
+/// trust anchor and is opened by path.
+#[cfg(unix)]
+pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn cstr(bytes: &[u8]) -> std::io::Result<std::ffi::CString> {
+        std::ffi::CString::new(bytes)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    }
+    fn not_found_ok(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+    fn check(rc: libc::c_int) -> std::io::Result<()> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    fn open_dir_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<OwnedFd> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    fn entry_names(dir: &OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
+        // `fdopendir` takes ownership of the descriptor it is given.
+        let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(dup) };
+        if stream.is_null() {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(dup) };
+            return Err(err);
+        }
+        let mut names = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if !matches!(name.to_bytes(), b"." | b"..") {
+                names.push(name.to_owned());
+            }
+        }
+        unsafe { libc::closedir(stream) };
+        Ok(names)
+    }
+    fn remove_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<()> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            return not_found_ok(Err(std::io::Error::last_os_error()));
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            // Files, symlinks and anything else: unlinking needs no
+            // permission on the entry itself and never follows a link.
+            return not_found_ok(check(unsafe { libc::unlinkat(dir, name.as_ptr(), 0) }));
+        }
+        let euid = unsafe { libc::geteuid() };
+        let child = match open_dir_at(dir, name) {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // A guest `chmod 0000` on a directory we own: restore search and
+            // read so it can be opened. A symlink swapped in here is not
+            // followed on macOS (AT_SYMLINK_NOFOLLOW) and is refused by the
+            // O_NOFOLLOW re-open on every platform.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied && stat.st_uid == euid =>
+            {
+                #[cfg(target_os = "macos")]
+                let flag = libc::AT_SYMLINK_NOFOLLOW;
+                #[cfg(not(target_os = "macos"))]
+                let flag = 0;
+                check(unsafe { libc::fchmodat(dir, name.as_ptr(), 0o700, flag) })?;
+                open_dir_at(dir, name)?
+            }
+            Err(err) => return Err(err),
+        };
+        let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::fstat(child.as_raw_fd(), &mut opened) })?;
+        if opened.st_uid == euid && (opened.st_mode & 0o700) != 0o700 {
+            check(unsafe { libc::fchmod(child.as_raw_fd(), 0o700) })?;
+        }
+        for entry in entry_names(&child)? {
+            remove_at(child.as_raw_fd(), &entry)?;
+        }
+        drop(child);
+        not_found_ok(check(unsafe {
+            libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR)
+        }))
+    }
+
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent_c = cstr(parent.as_os_str().as_bytes())?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let parent_fd = unsafe { libc::open(parent_c.as_ptr(), flags) };
+    if parent_fd < 0 {
+        return not_found_ok(Err(std::io::Error::last_os_error()));
+    }
+    let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
+    remove_at(parent_fd.as_raw_fd(), &cstr(name.as_bytes())?)
+}
+
+/// Windows has no descriptor-relative walk here; the container contracts that
+/// call this are refused on Windows, so this keeps the path-based form.
+#[cfg(not(unix))]
 pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
-    let file_type = meta.file_type();
-    if file_type.is_symlink() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        };
-    }
-    if file_type.is_dir() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let euid = unsafe { libc::geteuid() };
-            if meta.uid() == euid && (meta.mode() & 0o700) != 0o700 {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
+    let not_found_ok = |result: std::io::Result<()>| match result {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    };
+    if meta.file_type().is_dir() {
         for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            remove_owned_tree_nofollow(&entry.path())?;
+            remove_owned_tree_nofollow(&entry?.path())?;
         }
-        return match std::fs::remove_dir(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        };
+        return not_found_ok(std::fs::remove_dir(path));
     }
-    #[cfg(unix)]
-    if file_type.is_file() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let euid = unsafe { libc::geteuid() };
-        if meta.uid() == euid && (meta.mode() & 0o600) != 0o600 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-    #[cfg(not(unix))]
     if meta.permissions().readonly() {
         let mut perms = meta.permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         let _ = std::fs::set_permissions(path, perms);
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+    not_found_ok(std::fs::remove_file(path))
 }
 
 /// Canonical deduplication key for a mount root. Resolves existing paths via
@@ -2936,6 +3034,43 @@ mod git_mount_tests {
             gate_err.contains("forbidden delimiter"),
             "unexpected: {gate_err}"
         );
+    }
+
+    /// 2026-11-10 audit CTR-4 / ACP-1: a directory entry that is a symlink to
+    /// a directory is unlinked, never entered, at every depth, and a locked
+    /// nested directory is still removed. The outside tree is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn remove_owned_tree_nofollow_unlinks_directory_symlinks_at_depth() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep/keep.txt"), "untouched").unwrap();
+
+        let tree = dir.path().join("tree");
+        let nested = tree.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&outside, nested.join("link-to-outside")).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("top-link")).unwrap();
+        std::fs::write(nested.join("file"), "x").unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(tree.join("a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        remove_owned_tree_nofollow(&tree).unwrap();
+
+        assert!(!tree.exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("deep/keep.txt")).unwrap(),
+            "untouched"
+        );
+        // Missing targets and a symlink given as the root are both fine.
+        remove_owned_tree_nofollow(&tree).unwrap();
+        let root_link = dir.path().join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link).unwrap();
+        remove_owned_tree_nofollow(&root_link).unwrap();
+        assert!(!root_link.exists() && outside.join("deep/keep.txt").exists());
     }
 
     #[cfg(unix)]

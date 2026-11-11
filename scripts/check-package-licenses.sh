@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Cargo packages are independent copies of the software. Keep each package's
-# MIT notice byte-identical to the repository license and prove it is actually
+# license byte-identical to the repository license and prove it is actually
 # present in the archive Cargo will upload.
 packages=(
   'kranz-acp:crates/acp'
@@ -32,4 +32,4 @@ for entry in "${packages[@]}"; do
   fi
 done
 
-echo 'package license check: all workspace archives contain the canonical MIT notice'
+echo 'package license check: all workspace archives contain the canonical Apache 2.0 license'

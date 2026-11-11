@@ -253,6 +253,24 @@ impl StandardsMergeEvidence {
     }
 }
 
+/// Prefix of the sealed `orchestrator.decision` that records the mission
+/// branch commit the final gates and validators accepted. Emitted immediately
+/// before `mission.completed`; the hosted merge refuses a mission branch that
+/// has moved since (2026-11-10 audit INT-2).
+pub const VALIDATED_TIP_DECISION: &str = "validated mission tip: ";
+
+/// The commit recorded by the latest [`VALIDATED_TIP_DECISION`], if any.
+/// Missions completed before the record existed have none and merge as before.
+pub fn validated_tip(events: &[crate::events::Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        crate::events::EventKind::OrchestratorDecision { summary, .. } => summary
+            .strip_prefix(VALIDATED_TIP_DECISION)
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+        _ => None,
+    })
+}
+
 /// Runs the gated merge: refuse-if-dirty, then gates, then `--no-ff` merge.
 ///
 /// `executor` is forwarded to the [`crate::merge_gate::MergeSuiteGate`]
@@ -318,6 +336,7 @@ where
         standards_evidence,
         executor,
         None,
+        None,
     )
 }
 
@@ -340,6 +359,12 @@ where
     F: Fn(&str, &Path) -> (bool, String),
 {
     let mut audit = external::Audit::open(repo, paths, actor)?;
+    let events_file = paths.events_file();
+    let validated = if events_file.exists() {
+        validated_tip(&crate::event_log::EventLog::read_events(&events_file)?)
+    } else {
+        None
+    };
     if let Some(audit) = &audit {
         audit.verify_target(base_branch, base_sha, mission_branch)?;
     }
@@ -353,6 +378,7 @@ where
         standards_evidence,
         executor,
         audit.as_mut(),
+        validated.as_deref(),
     );
     if let Some(audit) = &mut audit {
         // A failed audit write cannot undo an already-landed local merge.
@@ -374,6 +400,7 @@ fn merge_with_external_stage<F>(
     standards_evidence: &StandardsMergeEvidence,
     executor: F,
     mut external: Option<&mut external::Audit>,
+    validated_tip: Option<&str>,
 ) -> Result<MergeReport>
 where
     F: Fn(&str, &Path) -> (bool, String),
@@ -394,8 +421,18 @@ where
 
     // Resolve moving refs once. Every read, merge, and final advance below
     // uses these SHAs so a late branch update cannot bypass validation.
-    let live_base_sha = repo.rev_parse(base_branch)?;
-    let mission_tip_sha = repo.rev_parse(mission_branch)?;
+    let live_base_sha = repo.branch_tip(base_branch)?;
+    let mission_tip_sha = repo.branch_tip(mission_branch)?;
+    if let Some(validated) = validated_tip.filter(|sha| *sha != mission_tip_sha) {
+        return Ok(MergeReport::RefusedPreMerge {
+            detail: format!(
+                "mission branch {mission_branch:?} is at {mission_tip_sha}, not the commit \
+                 its validators and final gates accepted ({validated}); refusing to merge \
+                 content that was never validated. Review the extra commits and merge \
+                 manually, or re-run the mission."
+            ),
+        });
+    }
 
     let diff = repo.diff_full(base_sha, &mission_tip_sha)?;
     let allowlist = repo
@@ -423,7 +460,7 @@ where
         Err(detail) => return Ok(MergeReport::GateConfigInvalid { detail }),
     };
 
-    let stale_base = stale_base_warning(repo, base_branch, base_sha)?;
+    let stale_base = stale_base_warning(repo, base_branch, &live_base_sha, base_sha)?;
     let merge_message = metadata
         .as_ref()
         .map(|metadata| with_kranz_trailers(&format!("Merge {mission_branch}"), metadata));
@@ -644,7 +681,7 @@ where
 
     // Production holds the repo-wide busy guard throughout this call.
     // Re-check anyway so external/manual movement fails closed.
-    let current_base = repo.rev_parse(base_branch)?;
+    let current_base = repo.branch_tip(base_branch)?;
     if current_base != live_base_sha {
         return Ok(MergeReport::RefusedPreMerge {
             detail: format!(
@@ -761,9 +798,10 @@ fn remove_stale_scratch_worktrees(repo: &GitRepo) {
 fn stale_base_warning(
     repo: &GitRepo,
     base_branch: &str,
+    live_base_sha: &str,
     base_sha: &str,
 ) -> Result<Option<StaleBaseWarning>> {
-    let merge_commits_since_base = repo.merge_commit_count(base_sha, base_branch)?;
+    let merge_commits_since_base = repo.merge_commit_count(base_sha, live_base_sha)?;
     if merge_commits_since_base < STALE_BASE_MERGE_THRESHOLD {
         return Ok(None);
     }

@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,10 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-11 (UTC) against the merge-binding fix: completion seals the validated mission tip in an `orchestrator.decision` before `mission.completed`, and the hosted merge refuses a mission branch at any other commit. Stage order is unchanged.
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint always runs contained (or is skipped) and gets no passthrough credentials; plan.md lists the plan's command grants and touch set; base and mission branches resolve as `refs/heads/<name>`. Pipeline stages are unchanged.
 
 Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` (`AcpBackend::with_sgian_terminals`) for uncontained host ACP sessions (`sandbox.enforce: off`, refused when combined with contained profiles) using rotated `.kranz/serve.grant.key` (`0600`, gitignored and authority-denied) and signed canonical JSON `ExecutionGrant`s over `sgian ctl`. Pipeline stages, released profiles and event schemas are unchanged.
 

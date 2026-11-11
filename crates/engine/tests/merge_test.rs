@@ -417,6 +417,142 @@ fn merge_commit_carries_parseable_kranz_trailers() {
     }
 }
 
+/// 2026-11-10 audit H3: refs are worker-writable and `git rev-parse main`
+/// prefers `refs/tags/main` over the branch. Tags named like the base and
+/// mission branches must not redirect the merge: gates come from the real
+/// base, and only the real mission branch lands.
+#[test]
+fn tags_named_like_the_branches_do_not_redirect_the_merge() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    seed_mission_branch(&dir, &repo, &seed, "src/lib.rs", "fn a() {}\n");
+    let real_mission_tip = raw_git(dir.path(), &["rev-parse", "refs/heads/kranz/mission-x"]);
+
+    // A commit carrying a weakened gate suite and unreviewed content, hung on
+    // tags that shadow both branch names.
+    repo.create_branch("side", Some(&seed)).unwrap();
+    repo.checkout("side").unwrap();
+    write(
+        &dir,
+        MERGE_GATES_PATH,
+        "{\"gates\":[{\"command\":\"true\"}]}\n",
+    );
+    write(&dir, "smuggled.txt", "never reviewed\n");
+    let evil = repo.add_all_and_commit("shadow commit").unwrap();
+    raw_git(dir.path(), &["checkout", "refs/heads/main"]);
+    raw_git(dir.path(), &["checkout", "-B", "main"]);
+    raw_git(dir.path(), &["tag", "main", &evil]);
+    raw_git(dir.path(), &["tag", "kranz/mission-x", &evil]);
+    assert_eq!(
+        raw_git(dir.path(), &["rev-parse", "main"]).trim(),
+        evil,
+        "precondition: the short name resolves to the tag"
+    );
+    assert_eq!(repo.branch_tip("main").unwrap(), seed);
+    assert_eq!(repo.branch_tip("heads/main").unwrap(), seed);
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    let report = merge_mission(
+        &repo,
+        "main",
+        &seed,
+        "kranz/mission-x",
+        None,
+        None,
+        |cmd: &str, _cwd: &Path| {
+            seen.lock().unwrap().push(cmd.to_string());
+            (true, String::new())
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(report, MergeReport::Merged { .. }), "{report:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["cargo fmt --all --check".to_string()],
+        "gates are read from the real base branch"
+    );
+    let parents = raw_git(
+        dir.path(),
+        &["rev-list", "--parents", "-n", "1", "refs/heads/main"],
+    );
+    assert!(
+        parents.contains(&seed) && parents.contains(real_mission_tip.trim()),
+        "{parents}"
+    );
+    assert!(!parents.contains(&evil), "{parents}");
+    assert!(!dir.path().join("smuggled.txt").exists());
+    assert!(dir.path().join("src/lib.rs").exists());
+}
+
+/// 2026-11-10 audit INT-3: changed paths are reported as stored, never
+/// C-quoted, so a non-ASCII or quote-bearing filename still matches the
+/// `whenPaths` prefixes and path-scoped standards that key on it.
+#[test]
+fn changed_paths_are_never_c_quoted() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, seed) = seeded_repo();
+    // Non-ASCII alone triggers git's C-quoting; a double quote does too, but
+    // Windows forbids it in a filename.
+    let odd = if cfg!(windows) {
+        "migrations/2026_\u{e9}t\u{e9} q.sql"
+    } else {
+        "migrations/2026_\u{e9}t\u{e9} \"q\".sql"
+    };
+    seed_mission_branch_with_files(
+        &dir,
+        &repo,
+        &seed,
+        &[
+            (odd, "select 1;\n"),
+            ("migrations/plain.sql", "select 2;\n"),
+        ],
+    );
+    let mut paths = repo.changed_paths(&seed, "kranz/mission-x").unwrap();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![odd.to_string(), "migrations/plain.sql".to_string()]
+    );
+    assert!(paths.iter().all(|p| p.starts_with("migrations/")));
+}
+
+/// The sealed completion record parses back to the commit, and anything that
+/// is not exactly a 40-hex sha is ignored rather than trusted.
+#[test]
+fn validated_tip_reads_the_latest_well_formed_record() {
+    use kranz_engine::events::{Event, EventKind};
+    use kranz_engine::merge::{validated_tip, VALIDATED_TIP_DECISION};
+    let decision = |seq: u64, summary: String| Event {
+        seq,
+        ts: chrono::Utc::now(),
+        mission_id: "m-x".into(),
+        kind: EventKind::OrchestratorDecision {
+            summary,
+            detail: None,
+        },
+    };
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    assert_eq!(validated_tip(&[]), None);
+    assert_eq!(
+        validated_tip(&[
+            decision(1, format!("{VALIDATED_TIP_DECISION}{a}")),
+            decision(2, "unrelated".into()),
+            decision(3, format!("{VALIDATED_TIP_DECISION}{b}")),
+        ]),
+        Some(b)
+    );
+    assert_eq!(
+        validated_tip(&[decision(1, format!("{VALIDATED_TIP_DECISION}main"))]),
+        None
+    );
+}
+
 #[test]
 fn stale_base_warning_counts_sibling_merges_since_mission_base() {
     if !setup() {

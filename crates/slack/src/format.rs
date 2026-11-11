@@ -101,11 +101,73 @@ pub const CONFIG_MODEL_ACTION: &str = "model_text";
 pub const CONFIG_EFFORT_BLOCK: &str = "effort";
 pub const CONFIG_EFFORT_ACTION: &str = "effort_select";
 
+/// What a plan grants at approval beyond its text: `commandGrants` and
+/// `touchSet` are copied into the mission with no further prompt, so every
+/// card that offers a plan or revision approval shows them (audit H2).
+#[derive(Debug, Clone, Default)]
+pub struct PlanAuthority {
+    pub command_grants: Vec<String>,
+    pub touch_set: Vec<String>,
+}
+
+impl PlanAuthority {
+    pub fn of(plan: &kranz_engine::types::Plan) -> Self {
+        Self {
+            command_grants: plan.command_grants.clone(),
+            touch_set: plan.touch_set.clone(),
+        }
+    }
+
+    /// The card section, and whether it shows every entry in full. `None`
+    /// when the plan grants nothing. A list too long for one Slack section is
+    /// replaced by a notice and reports `false`: the caller then withholds
+    /// its approve buttons rather than offer consent to text it clipped.
+    fn section(&self) -> Option<(Value, bool)> {
+        if self.command_grants.is_empty() && self.touch_set.is_empty() {
+            return None;
+        }
+        let item = |raw: &str| {
+            let shown = kranz_engine::presentation::visible(raw.trim())
+                .replace(['\n', '\r'], "\\n")
+                .replace('`', "'");
+            format!("\n• `{}`", escape_mrkdwn(&shown))
+        };
+        let mut body = String::from("*Granted on approval* (no further prompt)");
+        if !self.command_grants.is_empty() {
+            body.push_str("\n_Commands — each is a prefix:_");
+            self.command_grants
+                .iter()
+                .for_each(|g| body.push_str(&item(g)));
+        }
+        if !self.touch_set.is_empty() {
+            body.push_str("\n_Write paths — glob patterns:_");
+            self.touch_set.iter().for_each(|t| body.push_str(&item(t)));
+        }
+        if body.chars().count() <= MAX_FIELD {
+            return Some((section(&body), true));
+        }
+        Some((
+            section(&format!(
+                "*Granted on approval* (no further prompt)\n:warning: {} command grant{} and {} \
+                 write path{} — too long to show here. Review `plan.md` or the dashboard; \
+                 approval is not offered on this card.",
+                self.command_grants.len(),
+                plural(self.command_grants.len()),
+                self.touch_set.len(),
+                plural(self.touch_set.len()),
+            )),
+            false,
+        ))
+    }
+}
+
 /// A mission whose plan is ready for review. The `value` carried by the approve
 /// button is the mission id, so a click round-trips back to the right mission.
 #[derive(Debug, Clone)]
 pub struct PlanReady {
     pub mission_id: String,
+    /// Commands and write paths the approval grants.
+    pub authority: PlanAuthority,
     pub goal: String,
     /// Milestone titles, in plan order (rendered as a compact bullet list).
     pub milestone_titles: Vec<String>,
@@ -120,6 +182,8 @@ pub struct PlanReady {
 #[derive(Debug, Clone)]
 pub struct RevisionReady {
     pub mission_id: String,
+    /// Commands and write paths the approval grants.
+    pub authority: PlanAuthority,
     pub revision: u32,
     pub instructions: String,
     pub milestone_titles: Vec<String>,
@@ -417,6 +481,8 @@ pub struct RoadmapSnapshot {
 #[derive(Debug, Clone)]
 pub struct PlanReview {
     pub mission_id: String,
+    /// Commands and write paths the approval grants.
+    pub authority: PlanAuthority,
     pub goal: String,
     pub milestone_titles: Vec<String>,
     pub assertion_count: usize,
@@ -629,7 +695,14 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
             plural(p.assertion_count),
             p.mission_id
         )),
-        json!({
+    ];
+    let authority = p.authority.section();
+    let shown_in_full = authority.as_ref().is_none_or(|(_, full)| *full);
+    if let Some((block, _)) = authority {
+        blocks.insert(3, block);
+    }
+    if shown_in_full {
+        blocks.push(json!({
             "type": "actions",
             "elements": [
                 {
@@ -646,8 +719,8 @@ pub fn build_plan_ready(p: &PlanReady, dashboard_url: Option<&str>) -> Vec<Value
                     "value": approve_button_value(&p.mission_id, &p.plan_identity),
                 }
             ]
-        }),
-    ];
+        }));
+    }
     push_dashboard_button(&mut blocks, dashboard_url, &p.mission_id);
     blocks
 }
@@ -700,6 +773,17 @@ pub fn build_revision_ready(r: &RevisionReady, dashboard_url: Option<&str>) -> V
             ]
         }),
     ];
+    // A revision may extend the grants. Show them above the buttons; if they
+    // do not fit, keep Reject but withhold Approve.
+    if let Some((block, shown_in_full)) = r.authority.section() {
+        let actions = blocks.len() - 1;
+        if !shown_in_full {
+            if let Some(elements) = blocks[actions]["elements"].as_array_mut() {
+                elements.retain(|e| e["action_id"] != APPROVE_REVISION_ACTION_ID);
+            }
+        }
+        blocks.insert(actions, block);
+    }
     push_dashboard_button(&mut blocks, dashboard_url, &r.mission_id);
     blocks
 }
@@ -1805,7 +1889,15 @@ pub fn build_plan_review(p: &PlanReview) -> Vec<Value> {
     {
         meta.push_str(&format!(" · {est}"));
     }
+    let authority = p.authority.section();
+    let shown_in_full = authority.as_ref().is_none_or(|(_, full)| *full);
+    if let Some((block, _)) = authority {
+        blocks.push(block);
+    }
     blocks.push(context(&meta));
+    if !shown_in_full {
+        return blocks;
+    }
     blocks.push(json!({
         "type": "actions",
         "elements": [
@@ -2078,6 +2170,7 @@ mod tests {
     fn plan_ready_announcement_has_facts_and_approve_buttons() {
         let blocks = build_plan_ready(
             &PlanReady {
+                authority: PlanAuthority::default(),
                 mission_id: "m-42".into(),
                 goal: "Rate-limit the notes API".into(),
                 milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
@@ -2427,6 +2520,7 @@ mod tests {
         #[test]
         fn plan_review_considered_alternatives_are_escaped() {
             let blocks = build_plan_review(&PlanReview {
+                authority: PlanAuthority::default(),
                 mission_id: "m-1".into(),
                 goal: payload("add login"),
                 milestone_titles: vec![payload("wire it up")],
@@ -2481,6 +2575,7 @@ mod tests {
     fn plan_ready_single_assertion_is_singular() {
         let blocks = build_plan_ready(
             &PlanReady {
+                authority: PlanAuthority::default(),
                 mission_id: "m-1".into(),
                 goal: "g".into(),
                 milestone_titles: vec![],
@@ -2895,6 +2990,7 @@ mod tests {
     #[test]
     fn plan_review_has_two_buttons_carrying_mission_and_plan_identity() {
         let blocks = build_plan_review(&PlanReview {
+            authority: PlanAuthority::default(),
             mission_id: "m-42".into(),
             goal: "Rate-limit the notes API".into(),
             milestone_titles: vec!["Token bucket".into(), "429 responses".into()],
@@ -2969,6 +3065,7 @@ mod tests {
     #[test]
     fn plan_review_omits_estimate_when_absent() {
         let blocks = build_plan_review(&PlanReview {
+            authority: PlanAuthority::default(),
             mission_id: "m-1".into(),
             goal: "g".into(),
             milestone_titles: vec![],
@@ -3048,6 +3145,7 @@ mod tests {
     #[test]
     fn plan_ready_adds_dashboard_button_only_when_url_set() {
         let p = PlanReady {
+            authority: PlanAuthority::default(),
             mission_id: "m-42".into(),
             goal: "g".into(),
             milestone_titles: vec![],
@@ -3177,6 +3275,104 @@ mod tests {
 
     // -- instance labels ------------------------------------------------------
 
+    fn authority(grants: &[&str], touch: &[&str]) -> PlanAuthority {
+        PlanAuthority {
+            command_grants: grants.iter().map(|s| s.to_string()).collect(),
+            touch_set: touch.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn has_action(blocks: &[Value], action_id: &str) -> bool {
+        blocks.iter().any(|b| {
+            b["elements"]
+                .as_array()
+                .is_some_and(|els| els.iter().any(|e| e["action_id"] == action_id))
+        })
+    }
+
+    #[test]
+    fn plan_cards_show_every_grant_the_approval_carries() {
+        let auth = authority(&["cargo metadata", "curl <!channel> `x`\u{202e}"], &["**"]);
+        let ready = build_plan_ready(
+            &PlanReady {
+                authority: auth.clone(),
+                mission_id: "m-1".into(),
+                goal: "g".into(),
+                milestone_titles: vec!["M1".into()],
+                assertion_count: 0,
+                plan_identity: "p".into(),
+            },
+            None,
+        );
+        let text = serde_json::to_string(&ready).unwrap();
+        assert!(text.contains("Granted on approval"), "{text}");
+        assert!(text.contains("cargo metadata"), "{text}");
+        assert!(
+            text.contains("&lt;!channel&gt;"),
+            "mentions are escaped: {text}"
+        );
+        assert!(text.contains("\\\\u202e"), "bidi is made visible: {text}");
+        assert!(text.contains("• `**`"), "{text}");
+        assert!(has_action(&ready, APPROVE_ACTION_ID));
+
+        let revision = build_revision_ready(
+            &RevisionReady {
+                authority: auth,
+                mission_id: "m-1".into(),
+                revision: 2,
+                instructions: "i".into(),
+                milestone_titles: vec![],
+                assertion_count: 0,
+            },
+            None,
+        );
+        assert!(serde_json::to_string(&revision)
+            .unwrap()
+            .contains("cargo metadata"));
+        assert!(has_action(&revision, APPROVE_REVISION_ACTION_ID));
+    }
+
+    #[test]
+    fn plan_cards_withhold_approval_when_grants_do_not_fit() {
+        let long = "x".repeat(MAX_FIELD);
+        let auth = authority(&[&long], &[]);
+        let ready = build_plan_ready(
+            &PlanReady {
+                authority: auth.clone(),
+                mission_id: "m-1".into(),
+                goal: "g".into(),
+                milestone_titles: vec![],
+                assertion_count: 0,
+                plan_identity: "p".into(),
+            },
+            None,
+        );
+        assert!(serde_json::to_string(&ready)
+            .unwrap()
+            .contains("too long to show here"));
+        assert!(!has_action(&ready, APPROVE_ACTION_ID));
+        assert!(!has_action(&ready, START_ACTION_ID));
+
+        let revision = build_revision_ready(
+            &RevisionReady {
+                authority: auth,
+                mission_id: "m-1".into(),
+                revision: 2,
+                instructions: "i".into(),
+                milestone_titles: vec![],
+                assertion_count: 0,
+            },
+            None,
+        );
+        assert!(!has_action(&revision, APPROVE_REVISION_ACTION_ID));
+        assert!(has_action(&revision, REJECT_REVISION_ACTION_ID));
+    }
+
+    #[test]
+    fn plan_cards_without_grants_are_unchanged() {
+        assert!(PlanAuthority::default().section().is_none());
+    }
+
     #[test]
     fn escape_mrkdwn_escapes_amp_lt_gt_and_nothing_else() {
         assert_eq!(escape_mrkdwn("<&>"), "&lt;&amp;&gt;");
@@ -3193,6 +3389,7 @@ mod tests {
         let shapes: Vec<Vec<Value>> = vec![
             build_plan_ready(
                 &PlanReady {
+                    authority: PlanAuthority::default(),
                     mission_id: "m-1".into(),
                     goal: "g".into(),
                     milestone_titles: vec!["a".into()],
@@ -3253,6 +3450,7 @@ mod tests {
     #[test]
     fn label_blocks_prefixes_the_header_and_adds_no_blocks() {
         let p = PlanReady {
+            authority: PlanAuthority::default(),
             mission_id: "m-42".into(),
             goal: "g".into(),
             milestone_titles: vec![],

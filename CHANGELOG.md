@@ -14,6 +14,10 @@ Notable user-visible changes are documented here. This project follows
   through `sgian ctl --workspace <repo> --json grant` with one-call consent,
   scope/generation fencing, lifetime/retention budgets, verified
   `PaneObservation` projection, and fail-closed `CleanupReceipt` confirmation.
+- Changed the project license from MIT to Apache 2.0. Releases up to and
+  including 0.5.0 remain available under MIT. Contributions now require a
+  Developer Certificate of Origin sign-off and carry the relicensing grant
+  described in `CONTRIBUTING.md`.
 
 ## 0.5.0 - 2026-11-08
 

@@ -2017,6 +2017,30 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     }
     profile.push_str(")\n");
     profile.push('\n');
+    // `(allow network*)` above also authorises connecting to ANY unix-domain
+    // socket, which is a way out of the filesystem boundary: a contained
+    // session could drive the Docker/Colima socket (mount the home directory)
+    // or use the ssh-agent (2026-11-10 audit SBX-1). Keep IP networking, and
+    // allow unix sockets only where the session may already write, plus the
+    // system resolver, without which DNS fails. Order matters here: these
+    // later, narrower network rules override the broad deny (probed with
+    // sandbox-exec). A tool that needs another socket gets its directory via
+    // the operator-only `sandbox.extraWrite`. `fs+net` is unaffected: it
+    // allows only loopback TCP.
+    if matches!(
+        inputs.enforce,
+        crate::types::SandboxEnforce::Fs | crate::types::SandboxEnforce::Off
+    ) {
+        profile.push_str("(deny network-outbound (remote unix-socket))\n");
+        profile.push_str("(allow network-outbound\n");
+        profile.push_str("  (literal \"/private/var/run/mDNSResponder\")\n");
+        profile.push_str("  (literal \"/private/var/run/syslog\")\n");
+        for lit in &write_literals {
+            profile.push_str(&format!("  (remote unix-socket (subpath \"{lit}\"))\n"));
+        }
+        profile.push_str(")\n");
+        profile.push('\n');
+    }
     // Mission metadata write deny: the allowlist no longer names the mission
     // dir, but in checkout mode `session_cwd` IS the repo root and the
     // mission dir sits under it — without these denies the audit log, state
@@ -2049,6 +2073,13 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
     }
     for lit in &deny_regexes {
         profile.push_str(&format!("  (regex #\"^{lit}/[^/]*\\.jsonl$\")\n"));
+        // The Seatbelt profile files themselves (`write_profile_file`) live
+        // here and one is reused across a gate round: confined code must not
+        // rewrite the profile that confines the next command, nor plant one
+        // (2026-11-10 audit SBX-3).
+        profile.push_str(&format!(
+            "  (regex #\"^{lit}/kranz-sandbox-[^/]*\\.sb$\")\n"
+        ));
     }
     profile.push_str(")\n");
     profile.push('\n');
@@ -2153,6 +2184,9 @@ pub fn generate_profile(inputs: &SandboxInputs) -> String {
             profile.push_str(&format!("  (regex #\"^{root}/[^/]+/control(/|$)\")\n"));
             profile.push_str(&format!(
                 "  (regex #\"^{root}/[^/]+/runs/[^/]*\\.jsonl$\")\n"
+            ));
+            profile.push_str(&format!(
+                "  (regex #\"^{root}/[^/]+/runs/kranz-sandbox-[^/]*\\.sb$\")\n"
             ));
         }
     }
@@ -2834,6 +2868,143 @@ mod tests {
         assert!(run("printf scratch > \"$1\"", &scratch.join("work.txt"))
             .status
             .success());
+    }
+
+    /// 2026-11-10 audit SBX-3: the Seatbelt profile file lives in
+    /// `<mission>/runs/` and one profile is reused for every command in a
+    /// gate round. In checkout mode the repo root is writable, so the confined
+    /// code must not be able to rewrite the profile that confines the next
+    /// command.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_checkout_cannot_rewrite_its_own_profile_file() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let mission = root.join(".kranz/missions/m-current");
+        let runs = mission.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let scratch = runs.join("contract-home");
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = generate_profile(&inputs(&root, &mission, &scratch, vec![]));
+        let profile_path = write_profile_file(&runs, &profile).unwrap();
+        let original = std::fs::read_to_string(&profile_path).unwrap();
+        let run = |script: &str, path: &Path| {
+            Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .args(["/bin/sh", "-c", script, "probe"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let probe = run("exit 0", &root);
+        if !probe.status.success()
+            && String::from_utf8_lossy(&probe.stderr).contains("sandbox_apply")
+        {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        for script in [
+            "printf '(version 1)(allow default)' > \"$1\"",
+            "rm -f \"$1\"",
+            "mv \"$1\" \"$1.gone\"",
+        ] {
+            let _ = run(script, &profile_path);
+            assert!(
+                std::fs::read_to_string(&profile_path).ok().as_deref() == Some(original.as_str()),
+                "confined code changed its own profile with: {script}"
+            );
+        }
+        // A new profile for a later session must not be plantable either.
+        let planted = runs.join("kranz-sandbox-planted.sb");
+        let _ = run("printf x > \"$1\"", &planted);
+        assert!(!planted.exists(), "confined code planted a profile file");
+        // The session's own scratch under runs/ stays writable.
+        assert!(run("printf ok > \"$1\"", &scratch.join("work.txt"))
+            .status
+            .success());
+    }
+
+    /// 2026-11-10 audit SBX-1: the `fs` tier keeps IP networking but must not
+    /// reach a unix socket outside the session's writable roots (the Docker
+    /// or ssh-agent socket). Sockets the session owns still work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_fs_tier_reaches_only_its_own_unix_sockets() {
+        use std::process::{Command, Stdio};
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let mission = root.join(".kranz/missions/m-current");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let cfg = inputs(&root, &mission, &scratch, vec![]);
+        assert_eq!(cfg.enforce, crate::types::SandboxEnforce::Fs);
+        let profile = generate_profile(&cfg);
+        assert!(profile.contains("(deny network-outbound (remote unix-socket))"));
+
+        let run = |script: &str, path: &Path| {
+            Command::new("sandbox-exec")
+                .args(["-p", &profile, "/bin/sh", "-c", script, "probe"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let probe = run("exit 0", &root);
+        if !probe.status.success()
+            && String::from_utf8_lossy(&probe.stderr).contains("sandbox_apply")
+        {
+            eprintln!("SKIP-UNDER-WRAP: nested sandbox unavailable");
+            return;
+        }
+        let listen = |path: &Path| {
+            let child = Command::new("/usr/bin/nc")
+                .arg("-lU")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..100 {
+                if path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(path.exists(), "listener did not bind {}", path.display());
+            child
+        };
+        let connect = "/usr/bin/nc -U \"$1\" </dev/null";
+
+        let own = scratch.join("own.sock");
+        let mut own_listener = listen(&own);
+        assert!(
+            run(connect, &own).status.success(),
+            "a socket under the session's writable root must stay reachable"
+        );
+        let _ = own_listener.kill();
+        let _ = own_listener.wait();
+
+        let foreign = outside.join("daemon.sock");
+        let mut foreign_listener = listen(&foreign);
+        let denied = run(connect, &foreign);
+        // Negative control: the same connect succeeds without the sandbox, so
+        // the refusal above is the profile's and not a broken listener.
+        let unsandboxed = Command::new("/bin/sh")
+            .args(["-c", connect, "probe"])
+            .arg(&foreign)
+            .output()
+            .unwrap();
+        let _ = foreign_listener.kill();
+        let _ = foreign_listener.wait();
+        assert!(
+            !denied.status.success(),
+            "the fs tier reached a unix socket outside its writable roots"
+        );
+        assert!(unsandboxed.status.success(), "negative control failed");
     }
 
     #[cfg(target_os = "macos")]

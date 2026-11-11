@@ -132,6 +132,49 @@ pub fn skip(capability: &str, detail: &str) {
     }
 }
 
+/// Whether the approval-time contract lint runs its commands on this host at
+/// the default `sandbox.enforce: off`. It runs only where it can be contained
+/// (native macOS/Linux with a sandbox that can start), and is reported as
+/// skipped elsewhere. Tests that assert on lint VERDICTS call this first;
+/// tests of the skipped path do not.
+pub fn approval_lint_runs_here() -> bool {
+    let ran = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map(|output| output.status.success())
+    };
+    if cfg!(target_os = "macos") {
+        match ran(
+            "sandbox-exec",
+            &["-p", "(version 1)\n(allow default)\n", "/usr/bin/true"],
+        ) {
+            Ok(true) => true,
+            Ok(false) => {
+                eprintln!(
+                    "SKIP-UNDER-WRAP (gate-sandbox-supervision-dogfood): the approval lint \
+                     cannot nest a Seatbelt apply inside the gate sandbox wrap; skipping"
+                );
+                false
+            }
+            Err(_) => {
+                skip(capability::SANDBOX_EXEC, "sandbox-exec not found");
+                false
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        if matches!(ran("bwrap", &["--ro-bind", "/", "/", "true"]), Ok(true)) {
+            true
+        } else {
+            skip(capability::BWRAP, "bwrap cannot start a sandbox here");
+            false
+        }
+    } else {
+        eprintln!("approval lint is not run at enforce: off on this platform; skipping");
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

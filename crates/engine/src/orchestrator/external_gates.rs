@@ -276,7 +276,7 @@ impl MissionEngine {
         }
         self.close_external_gates("superseded by explicit revised-plan approval")?;
         let branch = self.state.mission.mission_branch.clone();
-        let tip = self.repo.rev_parse(&branch)?;
+        let tip = self.repo.branch_tip(&branch)?;
         let bytes = serde_json::to_vec(plan)?;
         let paths = self.paths.clone();
         let records = driver::evaluate_stage(
@@ -312,7 +312,7 @@ impl MissionEngine {
             |kind| self.emit_event(kind),
         )?;
         let current = self.external_authority()?.0;
-        if authority.verify(&current).is_err() || self.repo.rev_parse(&branch)? != tip {
+        if authority.verify(&current).is_err() || self.repo.branch_tip(&branch)? != tip {
             self.close_external_gates("revision authority or candidate changed while checks ran")?;
             return Err(driver::invalid(
                 "revision authority or candidate changed while checks ran",
@@ -417,7 +417,7 @@ impl MissionEngine {
         )?;
         // Consume only after the whole ladder has succeeded and every binding
         // is still current. A later gate failure consumes none of its peers.
-        if self.repo.rev_parse(&self.state.mission.base_branch)? != base
+        if self.repo.branch_tip(&self.state.mission.base_branch)? != base
             || Digest::of(&serde_json::to_vec(&self.state.config)?) != policy_digest
             || Digest::of(&serde_json::to_vec(plan)?) != Digest::of(&bytes)
         {
@@ -425,7 +425,7 @@ impl MissionEngine {
             return Err(driver::invalid("approval inputs changed while checks ran; retry against the current base and policy"));
         }
         let branch = &self.state.mission.mission_branch;
-        if self.repo.branch_exists(branch)? && self.repo.rev_parse(branch)? != base {
+        if self.repo.branch_exists(branch)? && self.repo.branch_tip(branch)? != base {
             self.close_external_gates("mission branch changed while approval checks ran")?;
             return Err(driver::invalid(
                 "mission branch changed while approval checks ran",

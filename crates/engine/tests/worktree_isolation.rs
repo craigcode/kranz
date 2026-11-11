@@ -1439,6 +1439,9 @@ async fn approval_lint_covers_worktree_mode() {
     let Some((_dir, root)) = mission_init_repo() else {
         return;
     };
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
+        return;
+    }
     let backend = Arc::new(MockBackend::new());
     let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
     let mut engine =

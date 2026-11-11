@@ -845,7 +845,7 @@ pub(crate) async fn mission_diff_stat(
                     "mission '{id}' has no mission branch yet"
                 )));
             }
-            let tip = repo.rev_parse(&state.mission.mission_branch)?;
+            let tip = repo.branch_tip(&state.mission.mission_branch)?;
             let diff_stat = repo.diff_stat(&base_sha, &tip)?;
             Ok(Json(json!({
                 "diffStat": diff_stat,

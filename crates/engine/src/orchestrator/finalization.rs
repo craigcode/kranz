@@ -1039,6 +1039,14 @@ impl MissionEngine {
         // every one moot. Clear them so the projection never shows a
         // "your move" on a mission that can no longer act on it.
         self.clear_open_questions("mission completed", |_| true)?;
+        // Seal the commit the gates and validators accepted, so the merge can
+        // refuse a mission branch that moves after this point.
+        let branch = self.state.mission.mission_branch.clone();
+        let tip = self.repo.branch_tip(&branch)?;
+        self.emit_decision(
+            &format!("{}{tip}", crate::merge::VALIDATED_TIP_DECISION),
+            None,
+        )?;
         self.emit(EventKind::MissionCompleted {})?;
         Ok(MissionStatus::Complete)
     }

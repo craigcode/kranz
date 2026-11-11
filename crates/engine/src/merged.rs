@@ -32,8 +32,8 @@ pub fn merged_bit_for_branches(
     if !repo.branch_exists(mission_branch).ok()? {
         return None;
     }
-    let mission_tip = repo.rev_parse(mission_branch).ok()?;
-    let base_tip = repo.rev_parse(base_branch).ok()?;
+    let mission_tip = repo.branch_tip(mission_branch).ok()?;
+    let base_tip = repo.branch_tip(base_branch).ok()?;
     repo.is_ancestor(&mission_tip, &base_tip).ok()
 }
 

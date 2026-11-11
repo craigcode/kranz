@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-02
+last_verified: 2026-11-10
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan and revision cards show the command grants and write paths an approval carries, and withhold approve buttons when the list does not fit. Commands and authorization are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline: `SignalProposalReady` cards post an `allowUsers`-gated **Draft** button (`kranz_draft_ticket`) that records explicit operator consent on `signal-proposal: unconsented` tickets through `MissionHost::draft_async_with_consent` before starting a draft.
 

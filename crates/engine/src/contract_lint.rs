@@ -93,6 +93,37 @@ impl ContractLintReport {
         self.results.is_empty()
     }
 
+    /// Results that were never run (budget spent, or no containment).
+    pub fn not_linted(&self) -> Vec<&AssertionLint> {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == AssertionLintOutcome::NotLinted)
+            .collect()
+    }
+
+    /// A report that runs nothing: every command assertion is
+    /// [`AssertionLintOutcome::NotLinted`]. Approval uses this when no
+    /// containment resolves, because the commands are planner-authored and
+    /// no human has reviewed the plan yet.
+    pub(crate) fn skipped(contract: &[Assertion]) -> Self {
+        let results = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+            .filter_map(|a| {
+                Some(AssertionLint {
+                    id: a.id.clone(),
+                    command: a.command.clone()?,
+                    outcome: AssertionLintOutcome::NotLinted,
+                    output_tail: String::new(),
+                })
+            })
+            .collect();
+        ContractLintReport {
+            results,
+            tree_clean_at_base: true,
+        }
+    }
+
     /// Compact operator-facing summary: suspects first under a clear label,
     /// then base-expected-to-fail assertions under a separate label. When
     /// `tree_clean_at_base` is false, prepends a note that the lint ran
@@ -132,6 +163,16 @@ impl ContractLintReport {
                 .collect::<Vec<_>>()
                 .join("; ");
             parts.push(format!("base-expected-to-fail (benign): {list}"));
+        }
+
+        let not_linted = self.not_linted();
+        if !not_linted.is_empty() {
+            let list = not_linted
+                .iter()
+                .map(|a| format!("[{}] {}", a.id, a.command))
+                .collect::<Vec<_>>()
+                .join("; ");
+            parts.push(format!("not linted (never run on the base): {list}"));
         }
 
         parts.join("\n")
@@ -182,6 +223,28 @@ pub(crate) fn with_git_hooks_disabled(mut env: HashMap<String, String>) -> HashM
     env.insert("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string());
     env.insert("GIT_CONFIG_VALUE_0".to_string(), "/dev/null".to_string());
     env
+}
+
+/// Whether `sandbox` can actually run a command here. Resolution only picks a
+/// provider; applying it can still fail (a nested Seatbelt apply inside
+/// another sandbox, an unprepared host). A lint run through a sandbox that
+/// cannot start would report every assertion as failing on the base, so the
+/// approval path probes first and skips the lint instead.
+pub(crate) fn containment_usable(
+    cwd: &Path,
+    scratch: &Path,
+    base_sha: Option<&str>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> bool {
+    let env = lint_env(scratch, base_sha, &[]);
+    let (code, _) = crate::command_exec::run_shell_command_sandboxed_blocking(
+        cwd,
+        "exit 0",
+        Duration::from_secs(30),
+        &env,
+        sandbox,
+    );
+    code == Some(0)
 }
 
 /// Lint every `check: command` assertion in `contract` against the
@@ -356,6 +419,32 @@ mod tests {
         assert!(AssertionLintOutcome::CouldNotVerdict.is_author_bug_suspect());
         assert!(!AssertionLintOutcome::FailedOnBase.is_author_bug_suspect());
         assert!(!AssertionLintOutcome::NotLinted.is_author_bug_suspect());
+    }
+
+    #[test]
+    fn skipped_report_runs_nothing_and_says_so() {
+        let command = |id: &str, cmd: &str| Assertion {
+            id: id.into(),
+            statement: "s".into(),
+            check: AssertionCheck::Command,
+            command: Some(cmd.into()),
+            negative_control: None,
+            pty_script: None,
+        };
+        let mut judged = command("a-2", "unused");
+        judged.check = AssertionCheck::AgentJudgement;
+        let report = ContractLintReport::skipped(&[command("a-1", "exit 0"), judged]);
+        assert_eq!(
+            report.results.len(),
+            1,
+            "only command assertions are listed"
+        );
+        assert_eq!(report.not_linted().len(), 1);
+        assert!(report.suspects().is_empty());
+        assert_eq!(
+            report.summary(),
+            "not linted (never run on the base): [a-1] exit 0"
+        );
     }
 
     #[test]

@@ -149,7 +149,7 @@ pub fn compute_review_packet(repo_root: &Path, mission_id: &str) -> Result<Revie
                 .mission
                 .base_sha
                 .as_ref()
-                .zip(repository.rev_parse(&state.mission.mission_branch).ok())
+                .zip(repository.branch_tip(&state.mission.mission_branch).ok())
             {
                 if let Ok(diff_stat) = repository.diff_stat(base, &head) {
                     packet.committed_change = Some(CommittedChange {
@@ -309,9 +309,9 @@ pub fn project(
                 candidate_commit,
                 ..
             } => repo.is_some_and(|r| {
-                r.rev_parse(&state.mission.base_branch).ok().as_deref()
+                r.branch_tip(&state.mission.base_branch).ok().as_deref()
                     == Some(live_base_commit.value.as_str())
-                    && r.rev_parse(&state.mission.mission_branch).ok().as_deref()
+                    && r.branch_tip(&state.mission.mission_branch).ok().as_deref()
                         == Some(candidate_commit.value.as_str())
             }),
             _ => true,

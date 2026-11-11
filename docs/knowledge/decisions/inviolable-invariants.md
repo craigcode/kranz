@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,10 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-11 (UTC) against the merge-binding fix: the hosted merge lands only the mission commit sealed at completion, and changed paths are read NUL-separated so a quoted filename cannot skip a path-scoped gate. These strengthen the merge invariants; none changed.
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: base and mission branches are resolved as `refs/heads/<name>` at approval and merge, so a same-named tag cannot stand in for either, and engine-run git ignores replace refs. This strengthens the pinned-base and merge invariants; none changed.
 
 Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` for uncontained host ACP sessions; contained worker profiles and enforced sandboxes refuse it, `.kranz/serve.grant.key` joins authority/sandbox denies and scrubbing, `sgian ctl` invocations run `env_clear`d with bounded terminal output limits, and unconfirmed Sgian cleanup fails closed. All documented invariants hold unchanged.
 

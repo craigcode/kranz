@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-10
+last_verified: 2026-11-11
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,10 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-11 (UTC) against the scratch-removal and reaper fixes: ACP private-home cleanup now walks by directory descriptor. No term changed.
+
+Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan review surfaces now list the plan's command grants and touch set. No term changed.
 
 Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` behind `AcpBackend::with_sgian_terminals` for uncontained host ACP sessions; released ACP worker profiles keep terminal capability disabled, and mission lifecycle and role vocabulary remain unchanged.
 

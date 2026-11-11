@@ -50,6 +50,7 @@ pub fn render_plan_markdown(
          twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.\n",
         mission.mission_branch, mission.base_branch
     );
+    write_plan_authority(&mut md, plan);
 
     if let Some(policy) = plan.reviewer_independence {
         let roles = [
@@ -215,13 +216,25 @@ pub fn render_plan_markdown(
 
     if !contract_lint.is_empty() {
         let _ = writeln!(md, "## Contract lint\n");
-        let _ = writeln!(
-            md,
-            "Each `check: command` assertion above was run once against the untouched base \
-             tree at approval time. Suspects are assertions that already pass (or could not \
-             reach a verdict) before this plan's work lands — a possible polarity/vacuity bug \
-             in the assertion itself. This never blocks approval.\n"
-        );
+        if contract_lint.not_linted().len() == contract_lint.results.len() {
+            // Planner-authored commands only run contained; say plainly when
+            // that was not possible rather than imply a clean lint.
+            let _ = writeln!(
+                md,
+                "The `check: command` assertions above were NOT run against the base tree \
+                 at approval time: no sandbox was available to contain them (or the lint \
+                 budget was spent). Polarity and vacuity are unchecked. This never blocks \
+                 approval.\n"
+            );
+        } else {
+            let _ = writeln!(
+                md,
+                "Each `check: command` assertion above was run once against the untouched base \
+                 tree at approval time. Suspects are assertions that already pass (or could not \
+                 reach a verdict) before this plan's work lands — a possible polarity/vacuity bug \
+                 in the assertion itself. This never blocks approval.\n"
+            );
+        }
         let _ = writeln!(md, "{}\n", contract_lint.summary());
         // Named contract-validation gates (contract-validation-gates): the
         // defect classes behind the lint, each verdict carrying its class
@@ -354,6 +367,48 @@ pub(crate) fn render_research_markdown(research: &Research, mission_id: &str) ->
     crate::presentation::visible(&scrub::scrub(&md))
 }
 
+/// The authority a plan carries beyond its text: `commandGrants` and
+/// `touchSet` are copied into the mission at `plan.approved` with no further
+/// prompt, so every surface that asks for plan consent must show them
+/// (2026-11-10 audit H2). Nothing is written when both are empty.
+fn write_plan_authority(md: &mut String, plan: &Plan) {
+    use std::fmt::Write as _;
+    if plan.command_grants.is_empty() && plan.touch_set.is_empty() {
+        return;
+    }
+    // One line per entry: a planner-authored newline or backtick must not
+    // break out of the list item or its code span.
+    let item = |raw: &str| raw.replace(['\n', '\r'], "\\n").replace('`', "'");
+    let _ = writeln!(md, "## Authority granted on approval\n");
+    let _ = writeln!(
+        md,
+        "Approving this plan grants the following to the mission's sessions with no \
+         further prompt.\n"
+    );
+    if !plan.command_grants.is_empty() {
+        let _ = writeln!(
+            md,
+            "**Commands** ({}; each is a prefix, so `x` also allows `x <anything>`):",
+            plan.command_grants.len()
+        );
+        for grant in &plan.command_grants {
+            let _ = writeln!(md, "- `{}`", item(grant));
+        }
+        let _ = writeln!(md);
+    }
+    if !plan.touch_set.is_empty() {
+        let _ = writeln!(
+            md,
+            "**Write paths** ({}; glob patterns the mission may change):",
+            plan.touch_set.len()
+        );
+        for pattern in &plan.touch_set {
+            let _ = writeln!(md, "- `{}`", item(pattern));
+        }
+        let _ = writeln!(md);
+    }
+}
+
 /// Render the revised plan as human-readable markdown for review (roadmap M2),
 /// committed to the mission branch as `revised-plan.md`. Shows the full revised
 /// plan plus a "Re-plan changes" section describing the reducer's merge rules.
@@ -406,6 +461,7 @@ pub fn render_revised_plan_markdown(
         );
     }
     let _ = writeln!(md);
+    write_plan_authority(&mut md, plan);
 
     let _ = writeln!(md, "## Full revised plan\n");
     for (mi, m) in plan.milestones.iter().enumerate() {

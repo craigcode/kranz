@@ -266,8 +266,8 @@ impl Audit {
             self.close("integration bytes changed while checks ran")?;
             return Err(error);
         }
-        if repo.rev_parse(&self.state.mission.base_branch)? != live_base
-            || repo.rev_parse(&self.state.mission.mission_branch)? != candidate
+        if repo.branch_tip(&self.state.mission.base_branch)? != live_base
+            || repo.branch_tip(&self.state.mission.mission_branch)? != candidate
         {
             self.close("base or candidate changed while merge checks ran")?;
             return Err(driver::invalid(

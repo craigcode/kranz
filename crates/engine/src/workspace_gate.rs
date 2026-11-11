@@ -581,6 +581,7 @@ mod tests {
             passthrough: passthrough.iter().map(|s| s.to_string()).collect(),
             mission_dir: home.join("mission"),
             sandbox: Default::default(),
+            allowed_mounts: Vec::new(),
         }
     }
 

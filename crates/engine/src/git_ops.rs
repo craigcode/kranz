@@ -305,6 +305,9 @@ fn clear_local_git_env(cmd: &mut Command, user_config: UserConfig) {
             cmd.env(key, value);
         }
     }
+    // `refs/replace/*` is worker-writable like every other ref; never let a
+    // replacement object stand in for a commit the engine resolved.
+    cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
     if user_config == UserConfig::Visible {
         for key in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME"] {
             if let Some(value) = std::env::var_os(key) {
@@ -871,6 +874,34 @@ impl GitRepo {
     pub fn current_branch(&self) -> Result<String> {
         Ok(self
             .run(&["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string())
+    }
+
+    /// Commit a LOCAL BRANCH points at, resolved as `refs/heads/<name>` and
+    /// never by short name. `git rev-parse main` prefers `refs/tags/main`
+    /// over the branch, and refs are worker-writable, so a short-name lookup
+    /// lets a tag stand in for the base or mission branch (2026-11-10 audit
+    /// H3). Use this wherever a branch is meant; [`Self::rev_parse`] is for
+    /// SHAs and expressions.
+    ///
+    /// `current_branch` reports `heads/<name>` when a same-named tag exists
+    /// and `HEAD` when detached, so both recorded spellings are accepted.
+    pub fn branch_tip(&self, name: &str) -> Result<String> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing branch lookup of flag-shaped name {name:?}"
+            )));
+        }
+        let spec = match name {
+            "HEAD" => "HEAD^{commit}".to_string(),
+            _ => format!(
+                "refs/heads/{}^{{commit}}",
+                name.strip_prefix("heads/").unwrap_or(name)
+            ),
+        };
+        Ok(self
+            .run(&["rev-parse", "--verify", "--end-of-options", &spec])?
             .trim()
             .to_string())
     }
@@ -1561,8 +1592,8 @@ impl GitRepo {
         self.run_os(&args)
     }
 
-    /// Paths changed in `from..to` (`git diff --name-only <from>..<to>`),
-    /// one per line as git reports them.
+    /// Paths changed in `from..to` (`git diff --name-only -z <from>..<to>`),
+    /// exactly as stored: never C-quoted.
     ///
     /// Rejects a flag-shaped `from`/`to` (leading `-`) before invoking git,
     /// mirroring the guard on [`GitRepo::is_ancestor`]/[`GitRepo::rev_parse`].
@@ -1574,12 +1605,15 @@ impl GitRepo {
                 )));
             }
         }
+        // `-z`: without it git C-quotes any path with a non-ASCII byte, quote,
+        // tab or backslash (`"migrations/2026_\303\251.sql"`), and a quoted
+        // path never matches a `whenPaths` prefix or a path-scoped standard,
+        // so one odd filename skipped conditional gates (audit INT-3).
         let range = format!("{from}..{to}");
-        let out = self.run(&["diff", "--name-only", &range])?;
+        let out = self.run(&["diff", "--name-only", "-z", &range])?;
         Ok(out
-            .lines()
-            .map(|l| l.trim_end_matches('\r').trim())
-            .filter(|l| !l.is_empty())
+            .split('\0')
+            .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect())
     }
