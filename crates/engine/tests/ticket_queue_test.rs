@@ -1024,6 +1024,106 @@ fn write_mission_events(root: &Path, mission_id: &str, complete: bool) {
     fs::write(paths.events_file(), body).unwrap();
 }
 
+/// A mission log whose recorded config uses the given worker isolation.
+fn write_mission_with_isolation(
+    root: &Path,
+    mission_id: &str,
+    isolation: kranz_engine::types::WorkerIsolation,
+) {
+    let paths = kranz_engine::paths::MissionPaths::new(root, mission_id);
+    fs::create_dir_all(paths.events_file().parent().unwrap()).unwrap();
+    let event = Event {
+        seq: 1,
+        ts: chrono::Utc::now(),
+        mission_id: mission_id.to_string(),
+        kind: EventKind::MissionCreated {
+            goal: "do the thing".to_string(),
+            base_branch: "main".to_string(),
+            mission_branch: format!("kranz/mission-{mission_id}"),
+            config: MissionConfig {
+                worker_isolation: isolation,
+                ..MissionConfig::default()
+            },
+        },
+    };
+    fs::write(
+        paths.events_file(),
+        serde_json::to_string(&event).unwrap() + "\n",
+    )
+    .unwrap();
+}
+
+/// Ticket repo-lock-split: merges serialize against each other, and against
+/// a run only when that run works in the primary checkout. A mission in its
+/// own worktree neither blocks a merge nor is blocked by one.
+#[test]
+fn a_merge_and_a_worktree_mission_do_not_exclude_each_other() {
+    use kranz_engine::types::WorkerIsolation;
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    write_mission_with_isolation(root, "m-run", WorkerIsolation::Worktree);
+    write_mission_with_isolation(root, "m-done", WorkerIsolation::Worktree);
+
+    // A merge while a worktree mission runs.
+    let running = queue::acquire_repo_busy(root, "m-run").unwrap();
+    let merging = queue::acquire_repo_merge(root, "m-done").expect("merge during a worktree run");
+    // Two merges still serialize.
+    let second = queue::acquire_repo_merge(root, "m-done")
+        .unwrap_err()
+        .to_string();
+    assert!(second.contains("another merge is in progress"), "{second}");
+    // One mission at a time is unchanged.
+    assert!(queue::acquire_repo_busy(root, "m-done").is_err());
+    drop(running);
+
+    // A worktree mission starting while a merge runs.
+    let started = queue::acquire_repo_busy(root, "m-run").expect("start during a merge");
+    drop(started);
+    drop(merging);
+    assert!(
+        queue::acquire_repo_merge(root, "m-done").is_ok(),
+        "the merge lock is released"
+    );
+}
+
+/// A mission whose workers write in the primary checkout still excludes a
+/// merge in both directions, and so does one whose isolation cannot be read.
+#[test]
+fn a_merge_and_a_checkout_mission_still_exclude_each_other() {
+    use kranz_engine::types::WorkerIsolation;
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    write_mission_with_isolation(root, "m-inplace", WorkerIsolation::Checkout);
+    write_mission_with_isolation(root, "m-done", WorkerIsolation::Worktree);
+
+    let running = queue::acquire_repo_busy(root, "m-inplace").unwrap();
+    let refused = queue::acquire_repo_merge(root, "m-done")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("works in the primary checkout"),
+        "{refused}"
+    );
+    drop(running);
+    assert!(queue::is_repo_busy(root).is_none());
+
+    let merging = queue::acquire_repo_merge(root, "m-done").unwrap();
+    let refused = queue::acquire_repo_busy(root, "m-inplace")
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("a merge is in progress"), "{refused}");
+    assert!(
+        queue::is_repo_busy(root).is_none(),
+        "a refused start leaves no run lock behind"
+    );
+    drop(merging);
+
+    // No log to read the isolation from: treated like a checkout mission.
+    let unknown = queue::acquire_repo_busy(root, "m-nolog").unwrap();
+    assert!(queue::acquire_repo_merge(root, "m-done").is_err());
+    drop(unknown);
+}
+
 #[test]
 fn blocked_by_frontmatter_parses_into_list() {
     let md = "---\ntitle: needs review\nblocked-by: [a, b]\n---\nbody\n";

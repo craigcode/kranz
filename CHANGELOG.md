@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: a merge no longer waits for a running mission, and a mission can
+  start during a merge, when the mission works in its own worktree (the
+  default). Merges still run one at a time, and a mission that works in the
+  primary checkout still excludes a merge.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained
