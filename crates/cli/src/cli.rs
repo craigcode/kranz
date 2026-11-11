@@ -1000,6 +1000,35 @@ pub enum TicketCommand {
         force: bool,
     },
 
+    /// Import a Magic Atlas program bundle as one ticket per group, with
+    /// `blocked-by` following the bundle's group dependencies so missions
+    /// run callee-first. Verifies every file against `bundle.json` first and
+    /// writes nothing unless the whole bundle is sound. One way only
+    ImportAtlas {
+        /// Path to the bundle directory (must hold bundle.json), inside this
+        /// repository
+        path: PathBuf,
+
+        /// Ticket slug prefix: each ticket is `<prefix>-<group id>`
+        #[arg(long, default_value = crate::atlas::DEFAULT_PREFIX)]
+        prefix: String,
+
+        /// Directory for coverage maps, relative to the repository root; the
+        /// generated acceptance command reads `<map-dir>/<group id>.jsonl`
+        #[arg(long, default_value = crate::atlas::DEFAULT_MAP_DIR)]
+        map_dir: String,
+
+        /// The target language, framework and code location, inserted
+        /// verbatim into each ticket's goal (default: a placeholder line
+        /// for the operator to fill in)
+        #[arg(long)]
+        target_note: Option<String>,
+
+        /// Overwrite tickets that already exist
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Append a note to a ticket's discussion
     /// (`.kranz/tickets/<slug>.notes.jsonl` — append-only, committed with the
     /// ticket; D-BW-3). Author is $KRANZ_NOTE_AUTHOR, else "operator"

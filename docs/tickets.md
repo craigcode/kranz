@@ -119,6 +119,133 @@ The lighter-weight alternative needs no import at all: point a review ticket
 at the proposal with `task-class: spec-review` and `review-artifact`, and
 kranz will critique the spec before anyone builds against it.
 
+## Importing a Magic Atlas program bundle
+
+A program bundle is a frozen work package that Magic Atlas (the `mgatlas`
+command) writes from a documented legacy application: the programs reachable
+from one root, grouped by static call dependency in callee-first order, with a
+context packet per program, a facts file per group, and a `bundle.json` that
+records the size and SHA-256 of every other file. The bundle's own `README.md`
+is the format reference. `kranz ticket import-atlas` turns one bundle into one
+ticket per group:
+
+```bash
+kranz ticket import-atlas bundles/app
+kranz ticket import-atlas bundles/app --prefix legacy \
+  --target-note "the stack described in docs/target.md, code under src/new"
+```
+
+Each ticket is `.kranz/tickets/<prefix>-<group id>.md` (`--prefix` defaults to
+`atlas`), written in the bundle's group order. Its `blocked-by` lists the
+tickets of the groups it depends on, in the bundle's order, so the blocked-by
+gate described below runs the missions callee-first. Priority is the ticket
+default for every group: the order comes from `blocked-by`, never from
+priority. The importer reads only the documented bundle files; `mgatlas` does
+not need to be installed to import. It must be on the `PATH` wherever missions
+run their gates, because the generated acceptance commands call it.
+
+The bundle must be a directory inside the repository, reached without passing
+through a symlink, because workers run in isolated worktrees of this
+repository and read the bundle there. Each component of its path must be
+letters, digits, `-`, `_` or `.`, since the path goes into a generated
+command, and must be spelled as the directory is named on disk: a filesystem
+that ignores letter case would open another spelling, but a worker's worktree
+may not. The importer does not ask git whether the bundle is tracked (neither
+does `import-openspec`): import first, then commit the bundle and the tickets
+together. A bundle that is not committed is invisible to a worker.
+
+Before writing anything it checks the whole bundle and refuses on the first
+problem: a `bundle_schema` other than 1 or 2, a bundle not marked `complete`,
+a missing field, a manifest path that leaves the bundle, a duplicate group
+(two ids that differ only by letter case count as duplicates, since their
+tickets would be one file on a filesystem that ignores case), a dependency on
+an unknown group, a dependency cycle, a group id that cannot be part of a
+slug, a program its group's list repeats or leaves out, two groups sharing one
+facts file, and any difference between the directory and `bundle.json`. That
+last check re-hashes every listed file and also refuses a file or empty
+directory the manifest does not list, as `mgatlas bundle --verify` does. A
+bundle that fails it would fail the generated acceptance command too. It also
+counts the non-empty lines of each facts file and refuses a group whose
+`fact_count` says otherwise, because the acceptance text is built on that
+count. A bundle with more than 2000 groups, or a group that depends on more
+than 200 others, is refused.
+
+What a ticket holds:
+
+- `## Goal` asks for the group's programs to be reimplemented on the target
+  stack and for every fact to be accounted for in the coverage map. It names
+  no language or framework. The target stack is yours to state: pass
+  `--target-note TEXT` and it is inserted verbatim, or fill in the line marked
+  `OPERATOR:` before drafting.
+- `## Context` gives the bundle path and the SHA-256 of `bundle.json` at
+  import, the group id and layer, each program with its entity id, name and
+  packet index, the facts and blocks files with their counts, the group's
+  loose ends and data sources from `groups.json`, and the instruction to read
+  a packet's index before relying on the packet. Lists stop at 20 programs,
+  10 loose ends and 10 data sources, each with an "N more in `<file>`" line.
+- `## Acceptance hints` carries a command that can fail:
+
+  ```bash
+  mgatlas coverage --bundle bundles/app --map atlas-coverage/<group id>.jsonl --group <group id>
+  ```
+
+  It exits 0 only when every fact of the group is mapped or waived in the map
+  file, which the worker writes as JSON Lines as the bundle README describes.
+  An empty or missing map fails. `--map-dir` moves the maps (default
+  `atlas-coverage/` at the repository root, tracked like any other
+  deliverable); it cannot point inside the bundle, under any letter case,
+  where a new file would break the manifest. A group with no recorded facts
+  would pass with an empty map, so its ticket says the command is not a gate
+  there.
+
+  The coverage command refuses a bundle whose files differ from `bundle.json`,
+  but no hash covers `bundle.json` itself: rewritten to record an emptied
+  facts file, it would let the command pass with an empty map. So a second
+  hint pins the manifest to the SHA-256 recorded at import:
+
+  ```bash
+  mgatlas bundle --verify bundles/app | grep -Eq '"manifest_sha256": *"<sha256 at import>"'
+  ```
+
+  Adopt both commands together; the first is only as good as the second.
+
+Text taken from the bundle is treated as untrusted. Names, ids and paths are
+kept on one line, cut to a fixed length and Markdown-escaped, so a crafted
+program name cannot add a frontmatter key, a section heading or an instruction
+block. Characters that render as nothing (zero-width and bidirectional
+controls, fillers, variation selectors, tag characters) are replaced by a
+space, so a name cannot carry text the reviewer does not see.
+
+Re-importing refuses the whole import, and writes nothing, if any of its
+tickets already exists; `--force` overwrites them all, including tickets you
+have edited since. Tickets left over from an earlier import of a different
+bundle are not removed. Ticket state sidecars are never touched. If a write
+fails after the checks passed (a full disk, a ticket another process created
+in between), the tickets already written are removed, or with `--force`
+restored to what they held, and the error names any that could not be.
+
+The command prints one line per ticket and a closing note with the number of
+tickets and layers and the size of the largest group. A group with more than
+8 programs gets a warning that one mission may be too large. A group is a set
+of programs that call each other, so the importer cannot split it; read the
+drafted plan's estimate before approving.
+
+Three things it deliberately does not do.
+
+It does not treat the coverage command as proof that the work is right. The
+command shows that every recorded fact was accounted for. A map target is free
+text nobody opens, and a fact can be waived with any reason, so the new code
+can be wrong while the command exits 0. The ticket says so and keeps a line
+marked `OPERATOR:` for commands that can fail for behaviour, guarded by a
+passed count. Fill it in before drafting.
+
+It does not choose the target language, framework or code location, and it
+does not copy packet or fact content into the ticket. The ticket points at the
+bundle; the worker reads the bundle.
+
+It does not write back. Nothing under the bundle directory is changed, and it
+could not be without making the bundle differ from its manifest.
+
 ## Listing the backlog
 
 ```sh
