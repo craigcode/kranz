@@ -480,18 +480,9 @@ impl GitHubSignalSource {
         now: DateTime<Utc>,
         replay_cache: &mut ReplayCache,
     ) -> std::result::Result<Option<(Trigger, hooks::TriggerDraft)>, DropReason> {
-        let verified = match self.verify(headers, body, now, replay_cache) {
-            Ok(v) => v,
-            Err(reason) => {
-                let _ = SignalLedger::record_dropped(
-                    repo_root,
-                    self.source_id(),
-                    reason.as_str(),
-                    header_value(headers, "x-github-delivery"),
-                );
-                return Err(reason);
-            }
-        };
+        // A verification failure is unauthenticated and never written to the
+        // ledger (see `ingest_verified_signal`). The route logs the decision.
+        let verified = self.verify(headers, body, now, replay_cache)?;
         let payload: serde_json::Value =
             serde_json::from_slice(body).map_err(|_| DropReason::MalformedPayload)?;
         let event = header_value(headers, "x-github-event").unwrap_or_default();

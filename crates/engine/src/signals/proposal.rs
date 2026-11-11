@@ -385,7 +385,8 @@ fn resolve_signal_ticket(repo_root: &Path, slug_or_signal_id: &str) -> Result<Ti
 }
 
 /// Full deterministic intake pipeline for a monitoring [`SignalSource`]:
-/// 1. Verify signature, size cap, timestamp skew, and replay cache (or record `Dropped`).
+/// 1. Verify signature, size cap, timestamp skew, and replay cache. A failure
+///    is returned as `Dropped` and never written to the ledger.
 /// 2. Persist scrubbed raw payload and `Received` ledger record.
 /// 3. Normalise and validate fields against strict allowlists.
 /// 4. Triage deterministically (`Proposed`, `Parked`, or `NotACodeChange`).
@@ -402,11 +403,11 @@ pub fn ingest_verified_signal<S: SignalSource>(
 ) -> Result<IngestResult> {
     let verified = match source.verify(headers, body, now, replay_cache) {
         Ok(v) => v,
-        Err(reason) => {
-            let _ =
-                SignalLedger::record_dropped(repo_root, source.source_id(), reason.as_str(), None);
-            return Ok(IngestResult::Dropped { reason });
-        }
+        // A request that fails verification is unauthenticated: anyone who
+        // can reach the port can send one. It must not append to the sealed
+        // ledger (unbounded growth of an audit log, and a full re-verify plus
+        // fsync per request). The caller logs the one-line decision.
+        Err(reason) => return Ok(IngestResult::Dropped { reason }),
     };
 
     let normalised = match source.normalise(headers, body) {

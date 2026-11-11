@@ -611,6 +611,27 @@ fn ghook_handler_source_has_no_git_mutation_paths() {
 // Sentry Signal Intake (`POST /api/hooks/sentry`, `GET /api/signals`, consent)
 // ---------------------------------------------------------------------------
 
+/// A repo that never configured the Sentry source refuses every request with
+/// 403 and gains no signal state, however many arrive.
+#[tokio::test]
+async fn sentry_hook_without_a_secret_refuses_and_writes_nothing() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_sentry_repo(None);
+    let app = hook_app(&root, 1);
+    for sign_with in [None, Some("guess")] {
+        let resp = app
+            .clone()
+            .oneshot(sentry_post(sign_with, "issue", &sentry_payload()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    assert!(!root.join(".kranz/signals").exists());
+    assert!(MissionPaths::list_missions(&root).is_empty());
+}
+
 fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
     let (dir, root) = init_repo();
     if let Some(secret) = secret {
@@ -690,7 +711,8 @@ async fn sentry_hook_proposes_unconsented_ticket_and_requires_explicit_consent_t
     let (_dir, root) = init_sentry_repo(Some(SECRET));
     let app = hook_app(&root, 1);
 
-    // 1. Bad signature is 401 and records a dropped entry in the signal ledger.
+    // 1. Bad signature is 401. The sender is unauthenticated, so nothing is
+    //    written: no ledger, no `.kranz/signals/` tree (2026-11-10 audit H6).
     let bad_resp = app
         .clone()
         .oneshot(sentry_post(
@@ -702,6 +724,22 @@ async fn sentry_hook_proposes_unconsented_ticket_and_requires_explicit_consent_t
         .unwrap();
     assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
     assert!(MissionPaths::list_missions(&root).is_empty());
+    for _ in 0..25 {
+        let resp = app
+            .clone()
+            .oneshot(sentry_post(
+                Some("wrong-secret"),
+                "issue",
+                &sentry_payload(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert!(
+        !root.join(".kranz/signals").exists(),
+        "unauthenticated requests must not create or grow the signal ledger"
+    );
 
     // 2. Valid Sentry webhook creates an unconsented proposal ticket and NO mission.
     let ok_resp = app
