@@ -10,6 +10,12 @@ Notable user-visible changes are documented here. This project follows
   category when the agent reports one. It was recorded before as a partial run
   with no report, which gave no reason for the missing report. This applies to
   backends whose result reports a stop reason, which today is Claude Code.
+- Changed the orchestrator role prompt: it names the decisions that warrant
+  blocking (a change to the contract, scope or cost, or something only the
+  operator has) and the decisions inside an approved plan that need no
+  go-ahead, and it tells the orchestrator to plan from the repository as it is
+  and say so when a recorded lesson no longer matches it. The orchestrator
+  prompt hash recorded on new sessions changes.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained

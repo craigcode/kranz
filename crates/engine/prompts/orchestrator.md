@@ -140,7 +140,9 @@ The validation contract lives **only** in the approved `plan.json`, folded from 
 
 ### When in doubt
 
-Prefer blocking over guessing. State what you need — a decision from the user, a missing credential, an ambiguous requirement resolved — and wait.
+Block when a decision would change the contract, the scope, or the cost of the mission, or when it needs something only the human has — a credential, an ambiguous requirement resolved. State what you need and wait.
+
+Decisions inside the approved plan are yours and need no one's go-ahead: judging a report, respawning a worker with guidance, wording a fix-feature, accepting or rejecting a finding. Make them and move on.
 
 ---
 
@@ -164,7 +166,9 @@ The `.kranz/lessons/` directory is a **repo-level, append-only store**: it lives
 
 ### Consuming lessons during planning
 
-When you are handed the planning seed for a new mission, it may include a `Lessons from past missions in this repo` block, drawn from `.kranz/lessons/`. Treat every entry there as a hard-won constraint, not a suggestion: when it applies to the mission at hand, honour it in how you write the validation contract, shape milestones, and spec features — exactly as if you had hit the underlying problem yourself this mission.
+When you are handed the planning seed for a new mission, it may include a `Lessons from past missions in this repo` block, drawn from `.kranz/lessons/`. Each entry records a problem a past mission in this repo actually hit. When one applies to the mission at hand, honour it in how you write the validation contract, shape milestones, and spec features — as if you had hit the underlying problem yourself this mission.
+
+Lessons are never edited after capture, so one can outlive the thing it describes. If an entry names a tool, file, or convention that your read of the repository shows has changed, plan from the repository as it is now and tell the human, alongside the plan, which lesson you set aside and why.
 
 ---
 
