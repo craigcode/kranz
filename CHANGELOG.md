@@ -18,6 +18,22 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Changed: the plan review, ticket page, status strip and delivered panel
+  show hidden and reordering characters as `\uXXXX` escapes, and the plan
+  review says when a plan contains any.
+- Changed: the box showing a command or invocation awaiting approval wraps
+  and grows to its full height, with no scroll region, and long or padded
+  text carries a size line.
+- Changed: a Slack grant card offers Approve only for a short, unpadded
+  target with no hidden characters; other grants are approved in the
+  dashboard.
+- Changed: a repository's own config file may set `orchestrator.backend`
+  only to `claude`. Other orchestrator backends are chosen in
+  `~/.kranz/config.json`.
+- Changed: a Slack Queue button now queues only the drafted mission its card
+  showed, and `kranz ticket queue --mission <id>` is refused when the ticket
+  records a different mission. Both name the current mission in the refusal.
+  A ticket re-drafted after the card was posted needs a fresh look first.
 - Changed: a GitHub comment carrying the queue label (`kranz:fix-and-queue`)
   now queues the drafted plan only when `hooks.autoQueue` is `true` in the
   global config (`~/.kranz/config.json`). It is off by default and cannot be

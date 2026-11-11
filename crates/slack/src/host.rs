@@ -172,7 +172,15 @@ pub trait PlanningHost: Send + Sync + 'static {
     /// unsatisfied blocker exists. `Ok(mission_id)` = the ticket's drafted
     /// mission was queued; `Err` carries the engine's refusal message
     /// VERBATIM (never paraphrased) for the bridge to forward unchanged.
-    fn approve_ticket<'a>(&'a self, slug: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
+    ///
+    /// `reviewed_mission` is the drafted mission a Queue card showed; the
+    /// host refuses when the ticket no longer points at it. `None` is the
+    /// typed command, which reviewed no card and claims no mission.
+    fn approve_ticket<'a>(
+        &'a self,
+        slug: &'a str,
+        reviewed_mission: Option<&'a str>,
+    ) -> BoxFuture<'a, anyhow::Result<String>>;
 
     /// `/kranz work run` → trigger the queue drain/claim/skip loop THROUGH
     /// the host (`POST /api/queue/drain`'s seam): the host spawns the drain

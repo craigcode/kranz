@@ -18,6 +18,10 @@ verified_against:
   - 'command: cargo test -p kranz-slack'
 ---
 
+Rechecked 2026-11-11 (UTC) against the consent-display fixes: the grant card withholds Approve for a long, padded or hidden-character target and escapes hidden characters in what it shows. Grant routing, the allowlist gate and the button value format are unchanged.
+
+Rechecked 2026-11-11 (UTC) against the ticket-queue binding: the todo Queue button carries the drafted mission its row showed, and the host's ticket approve call takes that mission and refuses a ticket re-drafted since. The typed `queue` and `approve <slug>` commands name no mission and behave as before.
+
 Rechecked 2026-11-11 (UTC) against the base-policy merge check: the host merge call takes an optional accepted policy digest, and the Slack bridge passes none, so a merge refused because the base's gate suite or secret allowlist changed shows the refusal in Slack and is accepted from the dashboard or the REST route. Routing, cards and binding checks are unchanged.
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan and revision cards show the command grants and write paths an approval carries, and withhold approve buttons when the list does not fit. Commands and authorization are unchanged.
@@ -101,7 +105,14 @@ the signal-proposal **Draft** button (`kranz_draft_ticket`),
 **Approve/Reject revision**, and **Approve/Deny grant** (`kranz_approve_grant` /
 `kranz_deny_grant`, on the parked capability-grant card) all capture `user.id` +
 `response_url` so the bridge refuses an unlisted clicker exactly like the slash
-twin. A thread reply
+twin. The grant card offers **Approve** only for a target it can show at a
+glance: at most 500 characters, no run of 8 or more blank characters, and no
+hidden or control characters (shown as `\u` escapes). Otherwise it keeps
+**Deny** and points at the dashboard; a target too long for a Slack button
+value gets no buttons. The todo **Queue** button's value is `<slug>:<mission-id>`, the drafted
+mission its row showed; the host refuses the click when the ticket has been
+re-drafted and records a different mission. The typed `queue <slug>` reviewed
+no card and names no mission. A thread reply
 (`Action::Guidance`) is gated too: a planning-mission reply runs a hosted
 planning turn, and steering a running mission is gated as spend-adjacent.
 

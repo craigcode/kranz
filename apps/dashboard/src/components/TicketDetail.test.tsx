@@ -90,6 +90,17 @@ beforeEach(() => {
 });
 
 describe('TicketDetail', () => {
+  it('shows hidden characters in ticket text as escapes', async () => {
+    vi.mocked(api.ticket).mockResolvedValueOnce(
+      makeTicket({ title: 'Fix \u202ethe bug', goal: 'Ship\u200b the fix.' }),
+    );
+    const { container } = render(<TicketDetail slug="fix-b" />);
+
+    expect(await screen.findByText('Fix \\u202ethe bug')).toBeTruthy();
+    expect(screen.getByText('Ship\\u200b the fix.')).toBeTruthy();
+    expect(container.textContent).not.toMatch(/[\u202e\u200b]/);
+  });
+
   it('shows the immutable input and required review output', async () => {
     vi.mocked(api.ticket).mockResolvedValueOnce(
       makeTicket({

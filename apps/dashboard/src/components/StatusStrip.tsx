@@ -2,6 +2,7 @@
 // a confirm-gated abandon, blocked reason (impossible to miss), and a thin
 // feature-progress bar.
 
+import { visible } from '../lib/presentation';
 import { useEffect, useState } from 'react';
 import { isMissionBlocked } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
@@ -170,21 +171,21 @@ export function StatusStrip() {
 
       {isBlocked && (
         <span className="strip-reason">
-          {blockedReason ?? 'milestone blocked'}
+          {visible(blockedReason ?? 'milestone blocked')}
           <span className="strip-hint"> — send a message to unblock</span>
         </span>
       )}
       {status === 'failed' && failedReason?.type === 'mission.failed' && (
-        <span className="strip-reason">{failedReason.payload.reason}</span>
+        <span className="strip-reason">{visible(failedReason.payload.reason)}</span>
       )}
       {startRunError !== null && (
         <span className="strip-reason" role="alert">
-          {startRunError}
+          {visible(startRunError)}
         </span>
       )}
       {controlError !== null && (
         <span className="strip-reason" role="alert">
-          {controlError}
+          {visible(controlError)}
         </span>
       )}
 

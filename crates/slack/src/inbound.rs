@@ -212,8 +212,12 @@ pub enum Action {
     /// `run_approve_ticket_command`) and refuse with a helpful error when
     /// `slug` doesn't name an on-disk backlog ticket. Spend/allowlist-gated
     /// identically to the ticket-slug path of `/kranz approve`.
+    ///
+    /// `reviewed_mission` is the drafted mission a Queue card showed, taken
+    /// from its button value. The typed command reviewed no card: `None`.
     QueueTicket {
         slug: String,
+        reviewed_mission: Option<String>,
         user_id: Option<String>,
         response_url: Option<String>,
     },
@@ -586,11 +590,16 @@ fn route_interactive(payload: &Value) -> Action {
                         user_id,
                         response_url,
                     },
-                    ButtonKind::QueueTicket => Action::QueueTicket {
-                        slug: value,
-                        user_id,
-                        response_url,
-                    },
+                    ButtonKind::QueueTicket => {
+                        // Same `<id>:<claim>` shape as the approve button.
+                        let (slug, reviewed_mission) = parse_approve_button_value(&value);
+                        Action::QueueTicket {
+                            slug,
+                            reviewed_mission,
+                            user_id,
+                            response_url,
+                        }
+                    }
                     ButtonKind::DraftTicket => Action::Draft {
                         slug: value,
                         user_id,
@@ -1112,6 +1121,7 @@ fn route_slash(payload: &Value) -> Action {
         if !slug.is_empty() {
             return Action::QueueTicket {
                 slug: slug.to_string(),
+                reviewed_mission: None,
                 user_id,
                 response_url,
             };
@@ -1639,7 +1649,7 @@ mod tests {
                 "user": { "id": "Uqueue" },
                 "response_url": "https://hooks.slack/q",
                 "actions": [
-                    { "action_id": QUEUE_TICKET_ACTION_ID, "value": "reviewable-ticket", "type": "button" }
+                    { "action_id": QUEUE_TICKET_ACTION_ID, "value": "reviewable-ticket:m-shown", "type": "button" }
                 ]
             }
         });
@@ -1649,8 +1659,34 @@ mod tests {
             routed.action,
             Action::QueueTicket {
                 slug: "reviewable-ticket".into(),
+                reviewed_mission: Some("m-shown".into()),
                 user_id: Some("Uqueue".into()),
                 response_url: Some("https://hooks.slack/q".into()),
+            }
+        );
+    }
+
+    /// A ticket with no recorded draft posts a bare-slug button: it names no
+    /// mission, so it claims none.
+    #[test]
+    fn block_actions_todo_queue_button_without_a_mission_claims_none() {
+        let env = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Uqueue" },
+                "actions": [
+                    { "action_id": QUEUE_TICKET_ACTION_ID, "value": "legacy-ticket", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&env, &lookup_none()).action,
+            Action::QueueTicket {
+                slug: "legacy-ticket".into(),
+                reviewed_mission: None,
+                user_id: Some("Uqueue".into()),
+                response_url: None,
             }
         );
     }
@@ -2491,6 +2527,7 @@ mod tests {
             route(&env, &lookup_none()).action,
             Action::QueueTicket {
                 slug: "rate-limit-notes".into(),
+                reviewed_mission: None,
                 user_id: Some("U9".into()),
                 response_url: Some("https://hooks.slack/a".into())
             }

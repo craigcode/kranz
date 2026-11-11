@@ -574,6 +574,7 @@ mod tests {
             fn approve_ticket<'a>(
                 &'a self,
                 _slug: &'a str,
+                _reviewed_mission: Option<&'a str>,
             ) -> BoxFuture<'a, anyhow::Result<String>> {
                 Box::pin(async { unreachable!() })
             }
