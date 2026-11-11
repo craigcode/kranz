@@ -31,6 +31,8 @@ Rechecked 2026-11-11 (UTC) against the scratch-removal and reaper fixes: ACP pri
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: plan review surfaces now list the plan's command grants and touch set. No term changed.
 
+Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` behind `AcpBackend::with_sgian_terminals` for uncontained host ACP sessions; released ACP worker profiles keep terminal capability disabled, and mission lifecycle and role vocabulary remain unchanged.
+
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal-budget vocabulary and v2 admission notes onto v0.5.0 main; role boundaries and mission lifecycle terms remain unchanged.
 
 Rechecked 2026-11-07 (UTC): Reconciled the typed terminal-budget vocabulary with upstream pane observation types. A read-only pane binding conveys no execution authority, and resource/terminal implementation does not establish R5 qualification.

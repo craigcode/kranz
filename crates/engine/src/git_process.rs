@@ -24,6 +24,14 @@ impl Limits {
         }
     }
 
+    pub(crate) fn for_terminal_output(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            stdout: 4 * 1024 * 1024,
+            stderr: 8 * 1024,
+        }
+    }
+
     pub(super) fn for_command(args: &[OsString], network: bool) -> Self {
         let config = args.first().is_some_and(|arg| arg == "config");
         Self {

@@ -20,6 +20,8 @@ Rechecked 2026-11-11 (UTC) after a recheck-only edit to the inviolable invariant
 
 Rechecked 2026-11-10 (UTC) after a recheck-only edit to the inviolable invariants note; no lesson changed.
 
+Rechecked 2026-11-10 (UTC) after the Sgian execution-grant invariants recheck; lesson capture and provenance rules remain unchanged.
+
 Rechecked 2026-11-09 (UTC) after merging ACP R4 terminal budgets and v2 admission onto v0.5.0 main; lesson capture and provenance rules remain unchanged.
 
 Rechecked 2026-11-07 (UTC) after the ACP reconciliation and AGENTS.md reference split. Full-workspace gates, exact staging, containment, provenance and lesson capture remain unchanged.

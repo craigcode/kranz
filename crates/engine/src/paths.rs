@@ -48,6 +48,7 @@ pub const KRANZ_GITIGNORE_RULES: &[&str] = &[
     "tickets/*.status",
     "serve.token",
     "serve.read.token",
+    "serve.grant.key",
 ];
 
 #[derive(Debug, Clone)]

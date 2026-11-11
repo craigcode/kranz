@@ -51,6 +51,8 @@ Rechecked 2026-11-11 (UTC) against the merge-binding fix: completion seals the v
 
 Rechecked 2026-11-10 (UTC) against the plan-consent and branch-resolution fixes: the approval-time contract lint always runs contained (or is skipped) and gets no passthrough credentials; plan.md lists the plan's command grants and touch set; base and mission branches resolve as `refs/heads/<name>`. Pipeline stages are unchanged.
 
+Rechecked 2026-11-10 (UTC): Added opt-in `SgianTerminalProvider` (`AcpBackend::with_sgian_terminals`) for uncontained host ACP sessions (`sandbox.enforce: off`, refused when combined with contained profiles) using rotated `.kranz/serve.grant.key` (`0600`, gitignored and authority-denied) and signed canonical JSON `ExecutionGrant`s over `sgian ctl`. Pipeline stages, released profiles and event schemas are unchanged.
+
 Rechecked 2026-11-09 (UTC): Merged ACP R4 terminal budgets and v2 host admission onto v0.5.0 main alongside workspace containment and Trajectory Board changes. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-11-07 (UTC): Reconciled ACP R4 with current main: upstream tool-call subject tracking and read-only pane contracts coexist with atomic terminal reservations and independent control accounting. Released profiles still refuse terminal capability; pipeline stages and event schemas are unchanged.
