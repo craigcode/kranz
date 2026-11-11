@@ -638,7 +638,8 @@ mod tests {
         .unwrap();
         assert_eq!(url, "https://github.com/o/r/pull/1");
         let env = std::fs::read_to_string(&seen).unwrap();
-        assert!(env.contains(&format!("GH_TOKEN={github_value}")), "{env}");
+        let passed_through = ["GH_TOKEN", github_value.as_str()].join("=");
+        assert!(env.contains(&passed_through), "{env}");
         assert!(env.contains("GH_PROMPT_DISABLED=1"), "{env}");
         assert!(!env.contains("ANTHROPIC_API_KEY"), "{env}");
         assert!(!env.contains("GIT_SSH_COMMAND"), "{env}");
