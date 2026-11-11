@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed the project license from MIT to Apache 2.0. Releases up to and
+  including 0.5.0 remain available under MIT. Contributions now require a
+  Developer Certificate of Origin sign-off and carry the relicensing grant
+  described in `CONTRIBUTING.md`.
+
 ## 0.5.0 - 2026-11-08
 
 - Added the Trajectory Board lens (`#/board` and `#/r/<repo>/board`) to the
