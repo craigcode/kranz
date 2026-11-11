@@ -121,7 +121,10 @@ Add a base-branch-owned tracked artifact (proposed path
 - `data` — optional `{ clone, migrate, reset, skewCheck }` hooks (commands
   or provider ops); secret **names** only
 - `previews[]` — name → URL template or path once ready
-- `secrets[]` — names the provider must inject; never values. For remote
+- `secrets[]` — names the provider must inject; never values. A name
+  crosses only when the operator's `contractEnvPassthrough` also lists it;
+  list `SSH_AUTH_SOCK` or `GIT_CONFIG_GLOBAL` here when a bootstrap needs the
+  operator's ssh agent or git config. For remote
   providers that support it, prefer **workload identity** over injection:
   short-lived OIDC tokens minted per workspace with mission-scoped claims
   (repo, mission id, profile), so services trust the issuer and no secret

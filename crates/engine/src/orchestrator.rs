@@ -5558,8 +5558,10 @@ impl MissionEngine {
                     let (ok, output) =
                         run_shell_command_sandboxed(root, command, env, sandbox).await;
                     let verdict = if ok { "PASS" } else { "FAIL" };
-                    let tail = scrub::scrub(&output);
-                    rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}\n"));
+                    // The verdict line is the engine's. The output is whatever
+                    // the mission's own code printed, so it goes in a fence.
+                    let tail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}"));
                 }
                 None => rendered.push_str(&format!(
                     "- [{id}] (check=command but no command — cannot run)\n"

@@ -354,7 +354,9 @@ fn fold_outcome(
     if !pass {
         let tail = tail_text(&outcome.transcript, FAIL_TAIL_BYTES);
         if !tail.is_empty() {
-            line.push_str(&format!("{}\n", crate::scrub::scrub(&tail)));
+            line.push_str(&crate::presentation::fence_command_output(
+                &crate::scrub::scrub(&tail),
+            ));
         }
     }
     let artifact = transcript_rel.map(|rel| PtyAssertionArtifact {

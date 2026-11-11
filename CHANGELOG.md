@@ -18,6 +18,14 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Changed: workspace bootstrap, readiness and data commands no longer get
+  your ssh agent socket or global git config by default. Declare
+  `SSH_AUTH_SOCK` or `GIT_CONFIG_GLOBAL` in the workspace contract's
+  `secrets[]` and list the same name in `contractEnvPassthrough` to restore
+  either. Without the git config these commands commit as `kranz gate`.
+- Changed: contract-command and pty output shown to the functional validator
+  is fenced as untrusted data, and the orchestrator's state digest keeps each
+  item on one line.
 - Changed: the plan review, ticket page, status strip and delivered panel
   show hidden and reordering characters as `\uXXXX` escapes, and the plan
   review says when a plan contains any.

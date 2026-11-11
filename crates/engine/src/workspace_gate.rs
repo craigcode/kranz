@@ -237,19 +237,23 @@ pub(crate) fn remove_gate_home(root: &std::path::Path) {
 /// review, M-2).
 ///
 /// H4's cleared env dropped these along with the credentials, which broke
-/// ordinary bootstraps in ways that read as repo bugs: no `SSH_AUTH_SOCK`
-/// means `git clone git@…` and `git submodule update --init` fail, and no
-/// proxy/CA vars means `npm ci` / `pip install` / `cargo fetch` fail behind a
-/// corporate proxy or a TLS-inspecting CA. None of them is a credential: each
-/// is a LOCATION (a socket path, a proxy URL, a CA bundle path).
+/// ordinary bootstraps in ways that read as repo bugs: no proxy/CA vars means
+/// `npm ci` / `pip install` / `cargo fetch` fail behind a corporate proxy or
+/// a TLS-inspecting CA. None of them is a credential: each is a LOCATION (a
+/// proxy URL, a CA bundle path).
 ///
-/// What is deliberately NOT here: anything that names a PROGRAM.
-/// `GIT_SSH_COMMAND`, `GIT_CONFIG_*` (beyond the one value this module sets
-/// itself, below), `GIT_EXTERNAL_DIFF`, `LD_PRELOAD` and their kin turn a
-/// later git invocation into arbitrary host execution, which is the same
-/// class of hole the `.git/config` write deny exists to close.
+/// What is deliberately NOT here:
+///
+/// - anything that names a PROGRAM. `GIT_SSH_COMMAND`, `GIT_CONFIG_*`,
+///   `GIT_EXTERNAL_DIFF`, `LD_PRELOAD` and their kin turn a later git
+///   invocation into arbitrary host execution, which is the same class of
+///   hole the `.git/config` write deny exists to close;
+/// - anything that AUTHENTICATES. `SSH_AUTH_SOCK` is a path, but a command
+///   holding it can sign in to any host as the operator, and the operator's
+///   global git config can name a credential helper or carry a token in a
+///   URL rewrite. Those two cross only by two-party consent
+///   ([`two_party_secrets`]), like any other credential (audit M12).
 pub(crate) const GATE_OPERATIONAL_ENV: &[&str] = &[
-    "SSH_AUTH_SOCK",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
@@ -259,6 +263,16 @@ pub(crate) const GATE_OPERATIONAL_ENV: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "GIT_SSL_CAINFO",
+];
+
+/// The identity git uses in a gate command when the operator's git config
+/// does not cross, so a bootstrap that commits into its throwaway workspace
+/// still works without learning who the operator is.
+const GATE_GIT_IDENTITY: &[(&str, &str)] = &[
+    ("GIT_AUTHOR_NAME", "kranz gate"),
+    ("GIT_AUTHOR_EMAIL", "kranz-gate@localhost"),
+    ("GIT_COMMITTER_NAME", "kranz gate"),
+    ("GIT_COMMITTER_EMAIL", "kranz-gate@localhost"),
 ];
 
 /// The operator's real global git config, for `GIT_CONFIG_GLOBAL` (follow-up
@@ -357,18 +371,20 @@ pub(crate) fn two_party_secrets(declared: &[String], operator_allows: &[String])
 ///    ONE shared gate home ([`mission_gate_home`], M-1) and `KRANZ_BASE_SHA`
 ///    pinned, plus exactly the ambient vars BOTH parties named
 ///    ([`two_party_secrets`], H-6);
-/// 2. the fixed operational allowlist ([`GATE_OPERATIONAL_ENV`], M-2) and
-///    `GIT_CONFIG_GLOBAL`. These are set AFTER the secrets deliberately: a
-///    repo-declared secret named `HTTPS_PROXY` or `GIT_CONFIG_GLOBAL` must not
-///    be able to point the gate's git or TLS at somewhere of the repo's
-///    choosing;
+/// 2. the fixed operational allowlist ([`GATE_OPERATIONAL_ENV`], M-2), set
+///    AFTER the secrets deliberately: a repo-declared secret named
+///    `HTTPS_PROXY` must not be able to point the gate's TLS at somewhere of
+///    the repo's choosing. `GIT_CONFIG_GLOBAL` is set here too, to the
+///    operator's resolved file, and only when both parties named it
+///    ([`two_party_secrets`]); otherwise git gets a neutral identity;
 /// 3. the handle env last, so a provider-supplied value (the
 ///    container/remote providers' endpoints) still reaches the command.
 ///
 /// Known boundary, documented rather than papered over: `~/.ssh` does NOT
 /// cross. The relocated HOME hides it and no key file is copied, so ssh
 /// authentication for gate commands works through the FORWARDED AGENT
-/// (`SSH_AUTH_SOCK`) only — key-file auth without an agent is unsupported
+/// (`SSH_AUTH_SOCK`) only, and only when the repo declared it and the
+/// operator allowed it — key-file auth without an agent is unsupported
 /// here, because admitting it means either handing the contract the operator's
 /// private keys or letting it name an ssh program.
 ///
@@ -392,11 +408,25 @@ pub(crate) fn gate_command_env(
             env.insert((*name).to_string(), value.to_string_lossy().into_owned());
         }
     }
-    if let Some(gitconfig) = operator_global_gitconfig() {
-        env.insert(
-            "GIT_CONFIG_GLOBAL".to_string(),
-            gitconfig.display().to_string(),
-        );
+    // The operator's git config crosses only by two-party consent, and then
+    // as the file this module resolved, never as the ambient value the
+    // passthrough copied. Without consent git gets a neutral identity.
+    env.remove("GIT_CONFIG_GLOBAL");
+    let gitconfig_consented = secrets
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("GIT_CONFIG_GLOBAL"));
+    match operator_global_gitconfig().filter(|_| gitconfig_consented) {
+        Some(gitconfig) => {
+            env.insert(
+                "GIT_CONFIG_GLOBAL".to_string(),
+                gitconfig.display().to_string(),
+            );
+        }
+        None => {
+            for (key, value) in GATE_GIT_IDENTITY {
+                env.insert((*key).to_string(), (*value).to_string());
+            }
+        }
     }
     for (key, value) in handle_env {
         env.insert(key.clone(), value.clone());
@@ -650,10 +680,10 @@ mod tests {
 
     /// M-2 (follow-up review): H4's cleared env also dropped the non-secret
     /// OPERATIONAL vars, which breaks ordinary bootstraps as if they were
-    /// repo bugs — no `SSH_AUTH_SOCK` means `git clone git@…` fails, no
-    /// proxy/CA vars means `npm ci` fails behind a corporate proxy. These are
-    /// locations, not credentials, and cross unconditionally. Anything that
-    /// names a PROGRAM does not.
+    /// repo bugs — no proxy/CA vars means `npm ci` fails behind a corporate
+    /// proxy. These are locations, not credentials, and cross
+    /// unconditionally. Anything that names a PROGRAM or authenticates as the
+    /// operator does not (audit M12).
     #[test]
     fn gate_env_always_carries_the_operational_allowlist_but_never_a_program_var() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -667,9 +697,9 @@ mod tests {
 
         let env = gate_command_env(&policy(home.path(), &[]), &HashMap::new(), None);
 
-        assert_eq!(
-            env.get("SSH_AUTH_SOCK").map(String::as_str),
-            Some("/tmp/ssh-agent.sock")
+        assert!(
+            !env.contains_key("SSH_AUTH_SOCK"),
+            "the agent socket signs in as the operator; it needs consent: {env:?}"
         );
         assert_eq!(
             env.get("HTTPS_PROXY").map(String::as_str),
@@ -689,27 +719,65 @@ mod tests {
         assert!(!env.contains_key("GIT_SSL_CAINFO"));
     }
 
-    /// The gate's relocated HOME hides `~/.gitconfig`, so `git commit` in a
-    /// bootstrap fails "Please tell me who you are" and `insteadOf` /
-    /// `credential.helper` rewrites vanish (M-2). `GIT_CONFIG_GLOBAL` names
-    /// the operator's real file for READ — unconditionally, with no contract
-    /// declaration and no operator passthrough entry involved.
+    /// Audit M12: the forwarded ssh agent and the operator's git config
+    /// authenticate as the operator (a credential helper, a token in a URL
+    /// rewrite), so they cross like any credential: only when the repo
+    /// declares the name AND the operator's passthrough lists it. One party
+    /// alone is not enough, and without the git config git still has an
+    /// identity to commit with.
     #[test]
-    fn gate_env_points_git_at_the_operator_global_config() {
+    fn the_ssh_agent_and_operator_gitconfig_need_two_party_consent() {
         let home = tempfile::tempdir().expect("tempdir");
         let operator = tempfile::tempdir().expect("tempdir");
         let gitconfig = operator.path().join("gitconfig");
         std::fs::write(&gitconfig, "[user]\n\tname = Operator\n").expect("write");
         let _guard = crate::agent_env::EnvTestGuard::engage(&[
+            ("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock"),
             ("GIT_CONFIG_GLOBAL", gitconfig.to_str().unwrap()),
             ("HOME", operator.path().to_str().unwrap()),
         ]);
+        let both = ["SSH_AUTH_SOCK", "GIT_CONFIG_GLOBAL"];
+        let declaring = contract_declaring(&both);
 
-        let env = gate_command_env(&policy(home.path(), &[]), &HashMap::new(), None);
+        for (label, env) in [
+            (
+                "neither party",
+                gate_command_env(&policy(home.path(), &[]), &HashMap::new(), None),
+            ),
+            (
+                "repo only",
+                gate_command_env(&policy(home.path(), &[]), &HashMap::new(), Some(&declaring)),
+            ),
+            (
+                "operator only",
+                gate_command_env(&policy(home.path(), &both), &HashMap::new(), None),
+            ),
+        ] {
+            assert!(!env.contains_key("SSH_AUTH_SOCK"), "{label}: {env:?}");
+            assert!(!env.contains_key("GIT_CONFIG_GLOBAL"), "{label}: {env:?}");
+            assert_eq!(
+                env.get("GIT_AUTHOR_EMAIL").map(String::as_str),
+                Some("kranz-gate@localhost"),
+                "{label}: git can still commit"
+            );
+        }
+
+        let env = gate_command_env(
+            &policy(home.path(), &both),
+            &HashMap::new(),
+            Some(&declaring),
+        );
+        assert_eq!(
+            env.get("SSH_AUTH_SOCK").map(String::as_str),
+            Some("/tmp/ssh-agent.sock")
+        );
         assert_eq!(
             env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
             Some(gitconfig.to_str().unwrap()),
-            "git reads the operator's own global config: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GIT_AUTHOR_EMAIL"),
+            "the operator's own identity applies once their config crosses"
         );
         assert_ne!(
             env.get("HOME").map(String::as_str),
