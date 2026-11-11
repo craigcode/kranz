@@ -7,7 +7,7 @@ version = "0.5.0"
 edition = "2021"
 # README quick-start floor; inherited by every member crate and checked in CI.
 rust-version = "1.88"
-license = "MIT"
+license = "Apache-2.0"
 description = "Git-native mission control for governed, validated AI coding-agent work."
 readme = "README.md"
 # release.yml and the Homebrew formula template reference this same craigcode/kranz
