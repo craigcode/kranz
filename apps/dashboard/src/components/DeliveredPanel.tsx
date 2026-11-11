@@ -161,7 +161,7 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
         </button>
       </div>
       {diffStat !== null && (
-        <pre className="delivered-diff-stat">{diffStat}</pre>
+        <pre className="delivered-diff-stat">{visible(diffStat)}</pre>
       )}
       {prHandoff !== null && (
         <div className="delivered-pr-handoff">
@@ -170,7 +170,7 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
               <p className="delivered-pr-label">
                 Branch is local only — kranz never pushes. Copy this for your machine:
               </p>
-              <pre className="delivered-pr-command">{prHandoff.command}</pre>
+              <pre className="delivered-pr-command">{visible(prHandoff.command)}</pre>
               <button
                 type="button"
                 className="btn-small"
@@ -183,7 +183,7 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
           {prHandoff.kind === 'readyToCreate' && (
             <>
               <p className="delivered-pr-label">Remote branch present — open a PR (no push):</p>
-              <pre className="delivered-pr-command">{prHandoff.command}</pre>
+              <pre className="delivered-pr-command">{visible(prHandoff.command)}</pre>
               <button
                 type="button"
                 className="btn-small"
@@ -206,14 +206,14 @@ export function DeliveredPanel({ missionId, status, onMerged }: Props) {
             </>
           )}
           {prHandoff.kind === 'unavailable' && (
-            <p className="delivered-pr-unavailable">PR handoff unavailable: {prHandoff.reason}</p>
+            <p className="delivered-pr-unavailable">PR handoff unavailable: {visible(prHandoff.reason)}</p>
           )}
         </div>
       )}
-      {reportMarkdown !== null && <div className="delivered-report">{renderMarkdown(reportMarkdown)}</div>}
+      {reportMarkdown !== null && <div className="delivered-report">{renderMarkdown(visible(reportMarkdown.replace(/\r\n/g, '\n')))}</div>}
       {error !== null && (
         <pre className="picker-error" role="alert">
-          {error}
+          {visible(error)}
         </pre>
       )}
       {changedPolicy !== null && (

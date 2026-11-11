@@ -57,6 +57,34 @@ beforeEach(() => {
 });
 
 describe('PlanReview', () => {
+  it('shows hidden and reordering characters in plan text as escapes and says so', () => {
+    const reviewed = plan();
+    reviewed.goal = 'ship the \u202ething';
+    reviewed.milestones[0].features[0].spec = 'build\u200b it';
+    reviewed.validationContract = [
+      { id: 'a1', check: 'command', statement: 'tests pass', command: 'cargo test \u202e# hs | lruc' },
+    ];
+    useKranzStore.setState({
+      planning: {
+        ...useKranzStore.getState().planning,
+        review: { planIdentity: 'reviewed-plan-a', plan: reviewed, estimate: estimate() },
+      },
+    });
+    const { container } = render(<PlanReview />);
+
+    expect(screen.getByRole('status').textContent).toContain('hidden or control characters');
+    const text = container.textContent ?? '';
+    expect(text).toContain('ship the \\u202ething');
+    expect(text).toContain('build\\u200b it');
+    expect(text).toContain('cargo test \\u202e# hs | lruc');
+    expect(text).not.toMatch(/[\u202e\u200b]/);
+  });
+
+  it('shows no hidden-character notice for an ordinary plan', () => {
+    render(<PlanReview />);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
   it('shows the exact baseline, expectations and overlay before approval', () => {
     const reviewed = plan();
     reviewed.validationContract = [{

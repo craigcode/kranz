@@ -7,7 +7,7 @@
 // with a "back to conversation" link on both steps.
 
 import { useKranzStore } from '../lib/store';
-import { visible } from '../lib/presentation';
+import { hasAmbiguous, visible } from '../lib/presentation';
 import type { CostEstimate, NegativeControl } from '../lib/types';
 
 /** Verbatim mirror of crates/cli/src/output.rs render_cost_estimate. */
@@ -32,15 +32,15 @@ function NegativeControlReview({ assertionId, control }: { assertionId: string; 
         The command above runs against both disposable fixtures: the valid case must pass,
         and the defective case must report the expected failure. Checker files must match their pinned source.
       </p>
-      <p>Expected failure: <code>{control.expectedFailure}</code></p>
+      <p>Expected failure: <code>{visible(control.expectedFailure)}</code></p>
       <p className="dim">Timeout: {control.timeoutSeconds ?? 60}s per fixture (maximum 180s).</p>
       {control.baselinePair && (
         <section aria-label={`Baseline and candidate expectations for ${assertionId}`}>
           <strong>Baseline and candidate evidence (advisory)</strong>
-          <p>Baseline commit: <code>{control.baselinePair.baselineRevision}</code></p>
-          <p>Expected baseline: <code>{JSON.stringify(control.baselinePair.expectedBaseline)}</code></p>
-          <p>Expected candidate: <code>{JSON.stringify(control.baselinePair.expectedCandidate)}</code></p>
-          <p>Environment label: {control.baselinePair.environmentLabel}</p>
+          <p>Baseline commit: <code>{visible(control.baselinePair.baselineRevision)}</code></p>
+          <p>Expected baseline: <code>{visible(JSON.stringify(control.baselinePair.expectedBaseline))}</code></p>
+          <p>Expected candidate: <code>{visible(JSON.stringify(control.baselinePair.expectedCandidate))}</code></p>
+          <p>Environment label: {visible(control.baselinePair.environmentLabel)}</p>
           <p>{control.baselinePair.overlayCheckerOnBaseline
             ? 'The exact checker files below may be overlaid onto the baseline snapshot. The candidate must deliver them.'
             : 'Both revisions must already contain the exact checker files below.'}</p>
@@ -52,8 +52,8 @@ function NegativeControlReview({ assertionId, control }: { assertionId: string; 
           <div>{label}</div>
           {files.map((file) => (
             <details key={file.path}>
-              <summary><code>{file.path}</code> — review contents</summary>
-              {file.content === '' ? <p className="dim">Empty file</p> : <pre>{file.content}</pre>}
+              <summary><code>{visible(file.path)}</code> — review contents</summary>
+              {file.content === '' ? <p className="dim">Empty file</p> : <pre>{visible(file.content)}</pre>}
             </details>
           ))}
         </div>
@@ -87,7 +87,14 @@ export function PlanReview() {
           </span>
         </header>
 
-        <p className="plan-review-goal">{plan.goal}</p>
+        {hasAmbiguous(plan) && (
+          <p role="status" className="plan-review-hidden-chars">
+            This plan contains hidden or control characters. Each is shown below as a{' '}
+            <code>\uXXXX</code> escape where it occurs; check those places before approving.
+          </p>
+        )}
+
+        <p className="plan-review-goal">{visible(plan.goal)}</p>
 
         {/* Approval copies these into the mission with no further prompt, so
             they are shown in full, first, and never truncated (audit H2). */}
@@ -148,15 +155,15 @@ export function PlanReview() {
             <div className="section-label">Considered alternatives</div>
             <div className="plan-alternatives">
               <p>
-                <span className="dim">Chosen:</span> {plan.consideredAlternatives.chosen}
+                <span className="dim">Chosen:</span> {visible(plan.consideredAlternatives.chosen)}
               </p>
               {plan.consideredAlternatives.rejected.length > 0 && (
                 <ul>
                   {plan.consideredAlternatives.rejected.map((rejected, i) => (
                     <li key={i}>
-                      <strong>{rejected.approach}</strong>
+                      <strong>{visible(rejected.approach)}</strong>
                       {' — '}
-                      {rejected.tradeOff}
+                      {visible(rejected.tradeOff)}
                     </li>
                   ))}
                 </ul>
@@ -169,9 +176,9 @@ export function PlanReview() {
           <section aria-label="Flight Rules consent" className="standards-consent">
             <div className="section-label">Flight Rules consent</div>
             <div className="standards-pack-line">
-              <strong>{standards.packName}</strong>
+              <strong>{visible(standards.packName)}</strong>
               <span>
-                {standards.source} · {standards.packDir}/{standards.standardsRoot}
+                {visible(`${standards.source} · ${standards.packDir}/${standards.standardsRoot}`)}
               </span>
               <code className="mono" title={standards.digest}>
                 sha256:{standards.digest}
@@ -179,24 +186,24 @@ export function PlanReview() {
             </div>
             {[...new Set(standards.rules.map((rule) => rule.rfc))].map((rfc) => (
               <div className="standards-rfc" key={rfc}>
-                <h3>{rfc}</h3>
+                <h3>{visible(rfc)}</h3>
                 <ul className="standards-rule-list">
                   {standards.rules
                     .filter((rule) => rule.rfc === rfc)
                     .map((rule) => (
                       <li key={`${rule.id}-r${rule.revision}`} className="standards-rule-card">
                         <div className="standards-rule-head">
-                          <code className="mono">{rule.id} r{rule.revision}</code>
+                          <code className="mono">{visible(rule.id)} r{rule.revision}</code>
                           <span className="standards-state-text">
-                            {rule.effectiveStatus} · {rule.level.toUpperCase()}
+                            {visible(rule.effectiveStatus)} · {visible(rule.level.toUpperCase())}
                           </span>
                         </div>
-                        <p>{rule.statement}</p>
+                        <p>{visible(rule.statement)}</p>
                         <div className="standards-rule-meta">
-                          <span>checker: <code>{rule.checker ?? 'unavailable'}</code></span>
+                          <span>checker: <code>{visible(rule.checker ?? 'unavailable')}</code></span>
                           <span>waiver: {rule.waivable ? 'permitted by exact human approval' : 'prohibited'}</span>
                           <span>
-                            source: {standards.packName}/{standards.standardsRoot}
+                            source: {visible(`${standards.packName}/${standards.standardsRoot}`)}
                           </span>
                         </div>
                       </li>
@@ -212,14 +219,14 @@ export function PlanReview() {
           <ul className="contract-list">
             {plan.validationContract.map((a) => (
               <li key={a.id} className="contract-row">
-                <span className="mono contract-id">[{a.id}]</span>
-                <span className="contract-check dim">({a.check})</span>
+                <span className="mono contract-id">[{visible(a.id)}]</span>
+                <span className="contract-check dim">({visible(a.check)})</span>
                 <div className="contract-statement">
-                  {a.statement}
+                  {visible(a.statement)}
                   {a.command !== undefined && a.command !== '' && (
                     <>
                       {' — '}
-                      <code className="mono">{a.command}</code>
+                      <code className="mono">{visible(a.command)}</code>
                     </>
                   )}
                   {a.negativeControl !== undefined && (
@@ -236,7 +243,7 @@ export function PlanReview() {
           <ol className="plan-milestones">
             {plan.milestones.map((ms, mi) => (
               <li key={mi} className="plan-milestone">
-                <div className="plan-milestone-title">{ms.title}</div>
+                <div className="plan-milestone-title">{visible(ms.title)}</div>
                 <ol className="plan-features">
                   {ms.features.map((f, fi) => (
                     <li key={fi} className="plan-feature">
@@ -244,13 +251,13 @@ export function PlanReview() {
                         <span className="mono dim">
                           {mi + 1}.{fi + 1}
                         </span>{' '}
-                        {f.title}
+                        {visible(f.title)}
                       </div>
-                      <div className="plan-feature-spec">{f.spec}</div>
+                      <div className="plan-feature-spec">{visible(f.spec)}</div>
                       {f.validationCriteria.length > 0 && (
                         <ul className="plan-donewhen">
                           {f.validationCriteria.map((c, ci) => (
-                            <li key={ci}>{c}</li>
+                            <li key={ci}>{visible(c)}</li>
                           ))}
                         </ul>
                       )}
@@ -271,7 +278,7 @@ export function PlanReview() {
       <footer className="plan-review-consent">
         {error !== null && (
           <div className="composer-error" role="alert">
-            {error}
+            {visible(error)}
           </div>
         )}
         {approvedBranch === null ? (
@@ -291,7 +298,7 @@ export function PlanReview() {
         ) : (
           <div className="consent-row">
             <span className="consent-committed">
-              plan approved and committed on <code className="mono">{approvedBranch}</code>
+              plan approved and committed on <code className="mono">{visible(approvedBranch)}</code>
             </span>
             <button
               type="button"

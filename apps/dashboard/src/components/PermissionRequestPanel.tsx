@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { hasAmbiguous, visible } from '../lib/presentation';
+import { hasAmbiguous, sizeNote, visible } from '../lib/presentation';
 import { api } from '../lib/api';
 import { pendingPermissions } from '../lib/pendingAsks';
 import { useKranzStore } from '../lib/store';
@@ -37,6 +37,7 @@ function PermissionCard({ record, onActed }: { record: LivePermission; onActed?:
         <div className="dim">Run {visible(binding.runId)} · expires {new Date(proposal.deadline).toLocaleTimeString()}</div>
         <div className="mono">{visible(binding.workspace)}</div>
         <pre className="revision-diff">{visible(JSON.stringify(proposal.action, null, 2))}</pre>
+        <div className="dim">{sizeNote(JSON.stringify(proposal.action, null, 2))}</div>
         <details>
           <summary>Approval binding</summary>
           <pre className="revision-diff">{visible(JSON.stringify({ requestId: proposal.id, bindingDigest, plan: binding.planDigest, policy: binding.policyDigest }, null, 2))}</pre>
