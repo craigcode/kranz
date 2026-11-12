@@ -43,6 +43,14 @@ Notable user-visible changes are documented here. This project follows
   start during a merge, when the mission works in its own worktree (the
   default). Merges still run one at a time, and a mission that works in the
   primary checkout still excludes a merge.
+- Added `kranz ticket import-atlas <BUNDLE_DIR>`: imports a Magic Atlas
+  program bundle as one ticket per group, with `blocked-by` following the
+  bundle's group dependencies so missions run callee-first. The bundle is
+  verified against `bundle.json` before anything is written, and each ticket
+  carries an `mgatlas coverage` command as an acceptance hint that fails until
+  every fact of the group is mapped or waived, with a second command that
+  fails if `bundle.json` is no longer the file that was imported. See
+  `docs/tickets.md`.
 - Changed: every `kranz serve` response now forbids being shown inside a
   frame (`Content-Security-Policy: frame-ancestors 'none'`,
   `X-Frame-Options: DENY`) and sets `X-Content-Type-Options: nosniff`.

@@ -704,6 +704,26 @@ fn dispatch_ticket(repo: &Path, command: TicketCommand, mission: Option<&str>) -
             );
             Ok(0)
         }
+        TicketCommand::ImportAtlas {
+            path,
+            prefix,
+            map_dir,
+            target_note,
+            force,
+        } => {
+            let report = crate::atlas::import_bundle(
+                repo,
+                &path,
+                &crate::atlas::ImportOptions {
+                    prefix: &prefix,
+                    map_dir: &map_dir,
+                    target_note: target_note.as_deref(),
+                    force,
+                },
+            )?;
+            print!("{}", report.render());
+            Ok(0)
+        }
         TicketCommand::Note { slug, text } => {
             print!(
                 "{}",
