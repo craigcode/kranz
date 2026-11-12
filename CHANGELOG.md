@@ -5,6 +5,14 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: `kranz ticket import-atlas` reads Magic Atlas bundles of schema 3
+  as well as 1 and 2. A schema 3 ticket says which of its `blocked-by` tickets
+  the group reaches by reference only (a program an expression or an unbound
+  variable names: a mention, not a call), lists the group's external
+  invocations and uninterpreted operations with its other loose ends, and
+  warns when the bundle was cut from an export that does not record such
+  links, so its dependencies may be incomplete. Tickets imported from schema 1
+  and 2 bundles are unchanged. See `docs/tickets.md`.
 - Changed: a session that the model declines to carry out is recorded as a
   failed run, with a message in the event log that names the refusal and its
   category when the agent reports one. It was recorded before as a partial run
