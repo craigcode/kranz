@@ -254,11 +254,21 @@ impl Broker {
                         .into(),
                 ));
             }
-            let ctx = crate::sgian_terminal::PreparedContext::prepare(sgian_cfg, &spec.cwd)
-                .map_err(|msg| {
-                    EngineError::Backend(format!("sgian terminal prepare failed: {msg}"))
-                })?;
-            Some(PreparedBackend::Sgian(ctx))
+            match crate::sgian_terminal::PreparedContext::prepare_for_session(
+                sgian_cfg,
+                &spec.cwd,
+                &spec.session_id,
+            ) {
+                Ok(crate::sgian_terminal::PrepareOutcome::Enabled(ctx)) => {
+                    Some(PreparedBackend::Sgian(ctx))
+                }
+                Ok(crate::sgian_terminal::PrepareOutcome::SkippedOutsideRepo) => None,
+                Err(msg) => {
+                    return Err(EngineError::Backend(format!(
+                        "sgian terminal prepare failed: {msg}"
+                    )));
+                }
+            }
         } else {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
@@ -545,13 +555,16 @@ impl AcpSession {
                     json!({"optionId":"deny-once","kind":"reject_once","name":"Deny"}),
                 ];
                 let now = chrono::Utc::now();
-                // Arbitrary deny patterns cannot be soundly matched against a
-                // shell program. This fixture refuses any restricted tool set.
-                let prohibition = (!self.spec.writable || !self.spec.disallowed_tools.is_empty())
-                    .then(|| {
+                let prohibition = if is_sgian {
+                    sgian_terminal_prohibition(&self.spec, &action, &value)
+                } else {
+                    // Arbitrary deny patterns cannot be soundly matched against a
+                    // shell program. This fixture refuses any restricted tool set.
+                    (!self.spec.writable || !self.spec.disallowed_tools.is_empty()).then(|| {
                         "terminal execution is prohibited by this session's tool policy".into()
-                    });
-                let proposal = crate::live_permission::Proposal {
+                    })
+                };
+                let mut proposal = crate::live_permission::Proposal {
                     id: proposal_id,
                     engine_session_id: self.session_id.clone(),
                     peer_session_id: provider.scope().peer_session_id.clone(),
@@ -566,6 +579,10 @@ impl AcpSession {
                         + chrono::Duration::seconds(crate::live_permission::REQUEST_TTL_SECS),
                     prohibition,
                 };
+                if is_sgian && proposal.prohibition.is_none() && proposal.ambiguous_display() {
+                    proposal.prohibition =
+                        Some("permission contains invisible or terminal control characters".into());
+                }
                 proposal.validate()?;
                 self.pending_permissions.insert(
                     proposal.id.clone(),
@@ -732,6 +749,231 @@ impl AcpSession {
         });
         Ok(())
     }
+}
+
+fn join_command_args(command: &str, args: &[String]) -> String {
+    let mut full = command.to_string();
+    for arg in args {
+        full.push(' ');
+        full.push_str(arg);
+    }
+    full
+}
+
+fn push_command_and_basename(subjects: &mut Vec<String>, command_line: &str) {
+    let trimmed = command_line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    subjects.push(trimmed.to_string());
+    let (first, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest)) => (first, Some(rest.trim_start())),
+        None => (trimmed, None),
+    };
+    if first.contains(['/', '\\']) {
+        let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+        if !base.is_empty() {
+            subjects.push(match rest {
+                Some(r) if !r.is_empty() => format!("{base} {r}"),
+                _ => base.to_string(),
+            });
+        }
+    }
+}
+
+fn sgian_terminal_prohibition(
+    spec: &SessionSpec,
+    action: &kranz_acp::terminal::Create,
+    value: &Value,
+) -> Option<String> {
+    if !spec.writable {
+        return Some("terminal execution is prohibited by this session's tool policy".into());
+    }
+    if spec.disallowed_tools.iter().any(|pattern| {
+        let (name, glob) = super::split_pattern(pattern);
+        glob == "*"
+            && ["Write", "Edit", "MultiEdit", "NotebookEdit"]
+                .iter()
+                .any(|tool| tool.eq_ignore_ascii_case(name))
+    }) {
+        return Some("terminal execution is prohibited by this session's tool policy".into());
+    }
+
+    let mut subjects = super::tool_call_subject("execute", &action.command, value);
+    if subjects.is_empty() {
+        return Some("terminal execution is prohibited by this session's tool policy".into());
+    }
+    let base = action
+        .command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&action.command);
+    if !base.trim().is_empty() && base != action.command {
+        subjects.push(join_command_args(base, &action.args));
+    }
+
+    if base.eq_ignore_ascii_case("env") {
+        let mut idx = 0usize;
+        while idx < action.args.len() {
+            let tok = action.args[idx].as_str();
+            if tok == "--" {
+                idx += 1;
+                break;
+            }
+            if matches!(
+                tok,
+                "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+            ) {
+                idx += 2;
+                continue;
+            }
+            if tok.starts_with('-') || tok.contains('=') {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        if idx < action.args.len() {
+            push_command_and_basename(
+                &mut subjects,
+                &join_command_args(&action.args[idx], &action.args[idx + 1..]),
+            );
+        }
+    }
+
+    if matches!(
+        base.to_ascii_lowercase().as_str(),
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "ash"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "cmd.exe"
+    ) {
+        for (idx, arg) in action.args.iter().enumerate() {
+            let is_cmd_flag =
+                (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'))
+                    || arg.eq_ignore_ascii_case("/c")
+                    || arg == "--command";
+            if is_cmd_flag {
+                if let Some(script) = action.args.get(idx + 1) {
+                    push_command_and_basename(&mut subjects, script);
+                    for segment in script.split(['\n', ';', '|', '&', '(', ')', '`']) {
+                        push_command_and_basename(&mut subjects, segment);
+                    }
+                }
+            }
+        }
+    }
+
+    if let super::PermissionDecision::Deny(reason) = super::decide_permission(
+        spec,
+        &super::ToolCallInfo {
+            kind: "execute".into(),
+            title: action.command.clone(),
+            subject: subjects,
+        },
+    ) {
+        return Some(reason);
+    }
+
+    let path_patterns: Vec<(&str, &str)> = spec
+        .disallowed_tools
+        .iter()
+        .filter_map(|pattern| {
+            let (name, glob) = super::split_pattern(pattern);
+            let is_file_rule = ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+                .iter()
+                .any(|tool| tool.eq_ignore_ascii_case(name));
+            (is_file_rule && glob != "*").then_some((pattern.as_str(), glob))
+        })
+        .collect();
+    if path_patterns.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let mut push_candidate = |raw_arg: &str| {
+        let cleaned = raw_arg.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '<' | '>' | ';' | '(' | ')')
+        });
+        if !cleaned.is_empty() {
+            candidates.push(cleaned.to_string());
+            if let Some((_, rhs)) = cleaned.split_once('=') {
+                let rhs_clean = rhs.trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
+                if !rhs_clean.is_empty() {
+                    candidates.push(rhs_clean.to_string());
+                }
+            }
+        }
+    };
+    push_candidate(&action.command);
+    for arg in &action.args {
+        push_candidate(arg);
+        for sub in arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&')) {
+            push_candidate(sub);
+        }
+    }
+
+    let spec_cwd = super::normalized_policy_path(&spec.cwd.to_string_lossy());
+    let eff_cwd = action
+        .cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| spec.cwd.clone());
+    let mut home_prefixes = Vec::new();
+    if let Some(h) = spec.env.get("HOME") {
+        let norm = super::normalized_policy_path(h);
+        if !norm.is_empty() {
+            home_prefixes.push(norm);
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        let norm = super::normalized_policy_path(&h);
+        if !norm.is_empty() && !home_prefixes.contains(&norm) {
+            home_prefixes.push(norm);
+        }
+    }
+
+    for (pattern, glob) in path_patterns {
+        for cand in &candidates {
+            let normalized = super::normalized_policy_path(cand);
+            if normalized.is_empty() {
+                continue;
+            }
+            let abs_eff =
+                super::normalized_policy_path(&eff_cwd.join(&normalized).to_string_lossy());
+            let abs_spec =
+                super::normalized_policy_path(&spec.cwd.join(&normalized).to_string_lossy());
+            let rel_spec = abs_eff
+                .strip_prefix(&format!("{spec_cwd}/"))
+                .unwrap_or(&normalized);
+            let tilde_match = home_prefixes.iter().any(|home| {
+                abs_eff
+                    .strip_prefix(&format!("{home}/"))
+                    .is_some_and(|rest| super::wildcard_match(glob, &format!("~/{rest}")))
+            });
+            if super::wildcard_match(glob, cand)
+                || super::wildcard_match(glob, &normalized)
+                || super::wildcard_match(glob, &abs_eff)
+                || super::wildcard_match(glob, &abs_spec)
+                || super::wildcard_match(glob, rel_spec)
+                || tilde_match
+            {
+                return Some(format!(
+                    "matches SessionSpec.disallowed_tools pattern {pattern:?}"
+                ));
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1041,5 +1283,77 @@ mod tests {
         exited_budget_ev.classify(true);
         assert_eq!(exited_budget_ev.failure, Some(FailureClass::TerminalBudget));
         session2.kill_child().await;
+    }
+
+    #[test]
+    fn sgian_terminal_prohibition_enforces_worker_and_authority_deny_patterns() {
+        let mut spec = SessionSpec {
+            cwd: PathBuf::from("/repo"),
+            prompt: PromptMode::SingleShot("test".into()),
+            append_system_prompt: None,
+            model: "fixture".into(),
+            effort: "high".into(),
+            session_id: "sess-p".into(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: vec!["Bash".into()],
+            disallowed_tools: vec![
+                "Bash(git push*)".into(),
+                "Bash(curl*)".into(),
+                "Read(.kranz/serve.grant.key)".into(),
+                "Read(~/.kranz/**)".into(),
+            ],
+            tools: vec![],
+            writable: true,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env: std::collections::HashMap::from([("HOME".into(), "/home/tester".into())]),
+            sandbox: None,
+            hook_status: None,
+        };
+        let make_create = |cmd: &str, args: &[&str]| {
+            let create = kranz_acp::terminal::Create {
+                session_id: "peer-1".into(),
+                command: cmd.into(),
+                args: args.iter().map(|s| (*s).to_string()).collect(),
+                env: vec![],
+                cwd: Some("/repo".into()),
+                output_byte_limit: Some(65_536),
+                meta: None,
+            };
+            let val = json!({
+                "kind": "execute",
+                "rawInput": {
+                    "command": create.command,
+                    "args": create.args,
+                }
+            });
+            (create, val)
+        };
+
+        let (ok_cmd, ok_val) = make_create("/bin/sh", &["-c", "cargo test --workspace"]);
+        assert!(sgian_terminal_prohibition(&spec, &ok_cmd, &ok_val).is_none());
+
+        for (cmd, args) in [
+            ("/usr/bin/curl", &["https://example.invalid"][..]),
+            ("env", &["FOO=1", "git", "push", "origin", "main"][..]),
+            ("/bin/sh", &["-lc", "echo a; /usr/bin/git push"][..]),
+            ("cat", &[".kranz/serve.grant.key"][..]),
+            (
+                "/bin/sh",
+                &["-c", "cat /home/tester/.kranz/config.json"][..],
+            ),
+        ] {
+            let (create, val) = make_create(cmd, args);
+            assert!(
+                sgian_terminal_prohibition(&spec, &create, &val).is_some(),
+                "expected prohibition for {cmd} {args:?}"
+            );
+        }
+
+        spec.writable = false;
+        assert!(sgian_terminal_prohibition(&spec, &ok_cmd, &ok_val).is_some());
     }
 }

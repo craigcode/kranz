@@ -294,6 +294,7 @@ pub fn enqueue(repo_root: &Path, entry: QueueEntry) -> Result<QueueEntry> {
     let entry = QueueEntry { seq, ..entry };
     let json = serde_json::to_string_pretty(&entry)?;
     atomic_write(&dir.join(entry.file_name()), json.as_bytes())?;
+    crate::queue_timing::record_enqueue(repo_root, &entry.mission_id);
     Ok(entry)
 }
 

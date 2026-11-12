@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-11
+last_verified: 2026-11-12
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-12 (UTC) against the Sgian mission-runner terminal wiring: automatic Sgian terminal wiring remains restricted to uncontained checkout ACP workers with an external `KRANZ_SGIAN_BIN` and `0600` `.kranz/serve.grant.key`, and `terminal/create` evaluates `SessionSpec.disallowed_tools` (including shell `-c` subcommands and `.kranz` authority paths) and ambiguous-display checks before presenting one-call operator consent. Contained profiles and invariants are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the second audit round (mission id check, `kranz exec` question output). No invariant changed.
 

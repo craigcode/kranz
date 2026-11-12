@@ -123,8 +123,17 @@ impl PlanAuthority {
     /// replaced by a notice and reports `false`: the caller then withholds
     /// its approve buttons rather than offer consent to text it clipped.
     fn section(&self) -> Option<(Value, bool)> {
+        // A plan that declares no write paths puts no bound on what the
+        // mission may change. That is said outright, never left as a missing
+        // section (ticket plan-touch-set-coverage).
         if self.command_grants.is_empty() && self.touch_set.is_empty() {
-            return None;
+            return Some((
+                section(
+                    "*Write paths:* none declared. The plan does not limit which files the \
+                     mission may change.",
+                ),
+                true,
+            ));
         }
         let item = |raw: &str| {
             let shown = kranz_engine::presentation::visible(raw.trim())
@@ -139,7 +148,12 @@ impl PlanAuthority {
                 .iter()
                 .for_each(|g| body.push_str(&item(g)));
         }
-        if !self.touch_set.is_empty() {
+        if self.touch_set.is_empty() {
+            body.push_str(
+                "\n_Write paths:_ none declared. The plan does not limit which files the \
+                 mission may change.",
+            );
+        } else {
             body.push_str("\n_Write paths — glob patterns:_");
             self.touch_set.iter().for_each(|t| body.push_str(&item(t)));
         }
@@ -3534,8 +3548,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_cards_without_grants_are_unchanged() {
-        assert!(PlanAuthority::default().section().is_none());
+    fn plan_cards_say_when_a_plan_declares_no_write_paths() {
+        let (block, full) = PlanAuthority::default().section().expect("always shown");
+        assert!(full);
+        assert!(block.to_string().contains("none declared"), "{block}");
+
+        let (block, _) = authority(&["cargo test"], &[]).section().unwrap();
+        let text = block.to_string();
+        assert!(
+            text.contains("cargo test") && text.contains("none declared"),
+            "{text}"
+        );
+
+        let (block, _) = authority(&[], &["crates/**"]).section().unwrap();
+        assert!(!block.to_string().contains("none declared"), "{block}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-11
+last_verified: 2026-11-12
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,10 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-12 (UTC) against the Sgian mission-runner terminal wiring: `MissionEngine::resolve_kind_backend` constructs `AcpBackend::for_mission_worker` for checkout-isolated uncontained ACP workers when `KRANZ_SGIAN_BIN` and `.kranz/serve.grant.key` exist, `runner` binds each `session_id` to its active `run_id`, and worktree sessions outside the Sgian-served root skip the provider cleanly. Pipeline stages and event schemas are unchanged.
+
+Rechecked 2026-11-11 (UTC) against queue timing: queueing a mission now also writes a `runs/queue-receipt.json` (time queued, and the mission running then), read only by `kranz queue --timing`. Queue order, claims and the pipeline stages are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the lock split: the run lock still admits one mission per repository; the merge lock is separate. Pipeline stages and their order are unchanged.
 

@@ -187,7 +187,11 @@ pub fn render_plan(plan: &Plan) -> String {
             out.push_str(&format!("  `{}`\n", authority_line(grant)));
         }
     }
-    if !plan.touch_set.is_empty() {
+    if plan.touch_set.is_empty() {
+        out.push_str(
+            "write paths: none declared (the plan does not limit which files the mission may change)\n",
+        );
+    } else {
         out.push_str("write paths granted on approval (glob patterns):\n");
         for pattern in &plan.touch_set {
             out.push_str(&format!("  `{}`\n", authority_line(pattern)));
@@ -1528,7 +1532,12 @@ mod tests {
                 touch_set: vec![],
                 ..plan
             };
-            assert!(!render_plan(&none).contains("granted on approval"));
+            let rendered = render_plan(&none);
+            assert!(!rendered.contains("granted on approval"));
+            assert!(
+                rendered.contains("write paths: none declared"),
+                "an unbounded plan says so: {rendered}"
+            );
         }
 
         #[test]

@@ -1043,8 +1043,16 @@ impl MissionEngine {
                 // convention, so the initialize handshake at session start
                 // IS the probe — a non-ACP executable fails there, loudly,
                 // and there is no claude fallback to hide that behind.
-                let backend: Arc<dyn AgentBackend> =
-                    Arc::new(crate::backend_acp::AcpBackend::for_worker(role_cfg)?);
+                let acp = if role == Role::Worker {
+                    crate::backend_acp::AcpBackend::for_mission_worker(
+                        role_cfg,
+                        &self.paths.repo_root,
+                        &self.paths.mission_id,
+                    )?
+                } else {
+                    crate::backend_acp::AcpBackend::for_worker(role_cfg)?
+                };
+                let backend: Arc<dyn AgentBackend> = Arc::new(acp);
                 Ok(backend)
             }
         }

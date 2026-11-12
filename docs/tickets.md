@@ -254,6 +254,7 @@ kranz ticket show <slug>   # one ticket in full, incl. needs-context questions
                            # or a wrong-plan escalation reason
 kranz queue                # the execution queue (approved, awaiting a run)
 kranz queue --remove <id>  # retire one runnable entry; keep its mission audit
+kranz queue --timing       # how long each mission waited and ran; --json for data
 kranz work --once --expect <id> # run only if this mission is still the front
 ```
 
