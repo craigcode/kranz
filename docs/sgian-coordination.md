@@ -72,7 +72,14 @@ identity that can issue credentials under Sgian's default `open` policy.
 For ACP workers running in an explicitly opted-in, uncontained host session
 (`sandbox.enforce: off`, `spec.sandbox.is_none()`), Kranz also ships
 `SgianTerminalProvider` (`crates/engine/src/sgian_terminal.rs`), wired into
-`AcpBackend::with_sgian_terminals`. When configured:
+`AcpBackend::with_sgian_terminals` and automatically enabled by
+`MissionEngine` (`AcpBackend::for_mission_worker` + `runner.rs`) for
+`workerIsolation: "checkout"` ACP workers when both `KRANZ_SGIAN_BIN` (an
+explicit absolute executable outside the repository) and
+`<repo>/.kranz/serve.grant.key` (`0600`) are present. When `workerIsolation:
+"worktree"` places the session working directory outside the Sgian-served
+primary checkout, the mission runner skips `SgianTerminalProvider` cleanly so
+worktree runs remain unaffected. When configured:
 
 1. `kranz serve` (and `SgianTerminalProvider` when absent) provisions a 256-bit
    HMAC-SHA256 key (`sgk_<64-hex>`) at `<repo>/.kranz/serve.grant.key` (`0600`,
@@ -82,12 +89,14 @@ For ACP workers running in an explicitly opted-in, uncontained host session
    true`) only for that opted-in host session. Contained `AcpWorkerProfile` and
    sandboxed sessions refuse `with_sgian_terminals` before spawning the peer and
    never fall back to Sgian.
-3. Each `terminal/create` still requires Kranz one-call operator consent
-   (`PermissionRequested` / `allow_once`), rejects caller-supplied environment
-   values (`env` must be empty; Sgian filters its own scrubbed spawn environment
-   through `GRANT_ENV_ALLOW`), rejects relative `./` or workspace-interior
-   executables, and re-validates canonical non-symlink `cwd` containment right
-   before signing.
+3. Each `terminal/create` enforces `SessionSpec.disallowed_tools` (`WORKER_DENY`
+   and `AUTHORITY_DENY`, including shell `-c` subcommands and protected `.kranz`
+   authority paths) and ambiguous-display checks before presenting Kranz one-call
+   operator consent (`PermissionRequested` / `allow_once`), rejects
+   caller-supplied environment values (`env` must be empty; Sgian filters its own
+   scrubbed spawn environment through `GRANT_ENV_ALLOW`), rejects relative `./`
+   or workspace-interior executables, and re-validates canonical non-symlink
+   `cwd` containment right before signing.
 4. Once approved, Kranz signs a canonical sorted-key JSON `ExecutionGrant`
    (`grant`, `mission`, `run`, `repo`, `cwd`, `argv`, `env_allow`,
    `expires_ms`, `issued_ms`) under `.kranz/serve.grant.key` and routes
@@ -104,10 +113,12 @@ For ACP workers running in an explicitly opted-in, uncontained host session
 ## Where it lives
 
 `crates/engine/src/sgian.rs` holds the credential, grant-key, canonical-JSON,
-and HMAC helpers; `crates/engine/src/sgian_terminal.rs` implements
-`SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) integrated via
-`crates/engine/src/backend_acp/terminals.rs`; `build_worker_spec` in
-`crates/engine/src/runner.rs` issues the run credential next to the other
-per-session environment, and the two worker entry points own the revocation
-guard across `run_session_to`. Validator and orchestrator sessions do not get a
-credential or terminal provider: they never drive panes.
+HMAC, and `mission_terminal_config` helpers; `crates/engine/src/sgian_terminal.rs`
+implements `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`)
+integrated via `crates/engine/src/backend_acp/terminals.rs` and
+`AcpBackend::for_mission_worker` (`crates/engine/src/orchestrator.rs`);
+`build_worker_spec` in `crates/engine/src/runner.rs` binds each uncontained
+worker session's `session_id -> run_id` correlation alongside the run
+credential, and the worker entry points own the cleanup lease across
+`run_session_to`. Validator and orchestrator sessions do not get a credential
+or terminal provider: they never drive panes.

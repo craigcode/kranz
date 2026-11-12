@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-11
+last_verified: 2026-11-12
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-12 (UTC) against the Sgian mission-runner terminal wiring: `AcpBackend::for_mission_worker` enables `SgianTerminalProvider` for uncontained checkout ACP workers when configured; released ACP profiles, role boundaries and mission lifecycle terms remain unchanged.
 
 Rechecked 2026-11-11 (UTC) against the write-path notices: Slack plan cards state when a plan declares no write paths. No term changed.
 

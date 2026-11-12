@@ -494,6 +494,54 @@ pub fn ensure_grant_key(repo_canon: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Returns `true` when `<repo_root>/.kranz/serve.grant.key` exists (including
+/// symlinks or unreadable entries that [`load_grant_key`] must fail closed on),
+/// or when `<repo_root>/.kranz` itself is a symlink. Returns `false` only when
+/// `.kranz` or `serve.grant.key` is genuinely absent (`NotFound`).
+pub fn has_grant_key_artifact(repo_root: &Path) -> bool {
+    let kranz_dir = repo_root.join(GRANT_KEY_DIR);
+    match std::fs::symlink_metadata(&kranz_dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(meta) if meta.file_type().is_symlink() => return true,
+        Ok(_) => {}
+    }
+    match std::fs::symlink_metadata(kranz_dir.join(GRANT_KEY_FILE)) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(_) | Err(_) => true,
+    }
+}
+
+/// Resolve mission-level [`SgianTerminalConfig`] when both `KRANZ_SGIAN_BIN`
+/// (an explicit absolute executable outside `repo_root`) and
+/// `<repo_root>/.kranz/serve.grant.key` are present.
+///
+/// Used by [`crate::backend_acp::AcpBackend::for_mission_worker`] for
+/// uncontained host ACP workers (`acp_profile: None`, `sandbox.enforce: off`).
+/// If `<repo_root>/.kranz` or `serve.grant.key` exists with invalid permissions
+/// or as a symlink, this returns `Some(...)` so session preparation fails closed.
+pub fn mission_terminal_config(repo_root: &Path, mission_id: &str) -> Option<SgianTerminalConfig> {
+    let bin = trusted_bin(std::env::var_os(BIN_ENV), repo_root)?;
+    if !crate::sgian_terminal::is_executable_file(&bin) {
+        tracing::debug!(
+            helper = %bin.display(),
+            "sgian helper is not executable; leaving Sgian terminal provider disabled"
+        );
+        return None;
+    }
+    let repo_canon = repo_root.canonicalize().ok()?;
+    if !has_grant_key_artifact(&repo_canon) {
+        tracing::debug!(
+            repo = %repo_canon.display(),
+            "no .kranz/serve.grant.key present; leaving Sgian terminal provider disabled"
+        );
+        return None;
+    }
+    Some(SgianTerminalConfig::for_mission(
+        bin, repo_canon, mission_id,
+    ))
+}
+
 /// Canonical JSON serialization (recursively sorted object keys, no whitespace),
 /// matching Sgian's `canonical_json` byte-for-byte.
 pub fn canonical_json(value: &serde_json::Value) -> String {
