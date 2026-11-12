@@ -118,6 +118,7 @@ pub struct Config {
     pub mission_id: String,
     pub run_id: String,
     pub budgets: Budgets,
+    pub(crate) bind_session_run: bool,
 }
 
 impl Config {
@@ -133,6 +134,26 @@ impl Config {
             mission_id: mission_id.into(),
             run_id: run_id.into(),
             budgets: Budgets::default(),
+            bind_session_run: false,
+        }
+    }
+
+    /// Construct mission-level terminal configuration whose per-attempt `run_id`
+    /// is bound from the active [`crate::runner`] worker session via
+    /// [`bind_session_run`], and which requires an already-provisioned
+    /// `<repo_root>/.kranz/serve.grant.key` (`0600`).
+    pub fn for_mission(
+        sgian_bin: impl Into<PathBuf>,
+        repo_root: impl Into<PathBuf>,
+        mission_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            sgian_bin: sgian_bin.into(),
+            repo_root: repo_root.into(),
+            mission_id: mission_id.into(),
+            run_id: String::new(),
+            budgets: Budgets::default(),
+            bind_session_run: true,
         }
     }
 
@@ -152,6 +173,53 @@ impl Config {
     }
 }
 
+fn session_run_bindings() -> &'static Mutex<HashMap<String, String>> {
+    static BINDINGS: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII guard registering a worker session's engine `session_id -> run_id`
+/// correlation across `AgentBackend::start` without modifying `SessionSpec`.
+pub(crate) struct SessionRunGuard {
+    session_id: String,
+}
+
+pub(crate) fn bind_session_run(session_id: &str, run_id: &str) -> SessionRunGuard {
+    session_run_bindings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.to_string(), run_id.to_string());
+    SessionRunGuard {
+        session_id: session_id.to_string(),
+    }
+}
+
+fn lookup_session_run(session_id: &str) -> Option<String> {
+    session_run_bindings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+}
+
+impl Drop for SessionRunGuard {
+    fn drop(&mut self) {
+        session_run_bindings()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PrepareOutcome {
+    Enabled(PreparedContext),
+    /// Mission-runner automatic opt-in skipped cleanly because the worker
+    /// session runs in an external worktree outside the Sgian-served `repo_root`.
+    SkippedOutsideRepo,
+}
+
 /// Validated filesystem and credential context bound before spawning an ACP peer.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedContext {
@@ -166,6 +234,19 @@ pub(crate) struct PreparedContext {
 
 impl PreparedContext {
     pub(crate) fn prepare(config: &Config, session_cwd: &Path) -> Result<Self, String> {
+        match Self::prepare_for_session(config, session_cwd, "")? {
+            PrepareOutcome::Enabled(ctx) => Ok(ctx),
+            PrepareOutcome::SkippedOutsideRepo => {
+                Err("sgian mission terminal session cwd is outside repo_root".into())
+            }
+        }
+    }
+
+    pub(crate) fn prepare_for_session(
+        config: &Config,
+        session_cwd: &Path,
+        session_id: &str,
+    ) -> Result<PrepareOutcome, String> {
         let _ = Budgets::new(config.budgets.command_ms, config.budgets.retention_ms)?;
 
         let mission_trimmed = config.mission_id.trim();
@@ -175,16 +256,6 @@ impl PreparedContext {
             || config.mission_id.chars().any(char::is_control)
         {
             return Err("sgian terminal mission_id must be 1..=128 non-control chars".into());
-        }
-        let run_trimmed = config.run_id.trim();
-        if run_trimmed.is_empty()
-            || run_trimmed != config.run_id
-            || config.run_id.len() > 48
-            || !config.run_id.chars().all(|c| c.is_ascii_graphic())
-        {
-            return Err(
-                "sgian terminal run_id must be 1..=48 printable ASCII graphic chars".into(),
-            );
         }
 
         if !config.sgian_bin.is_absolute() {
@@ -218,11 +289,39 @@ impl PreparedContext {
             ));
         }
         if !session_cwd_canon.starts_with(&repo_canon) {
+            if config.bind_session_run {
+                tracing::debug!(
+                    session_id,
+                    session_cwd = %session_cwd_canon.display(),
+                    repo_root = %repo_canon.display(),
+                    "skipping Sgian terminal provider: worker session cwd is outside Sgian-served repo_root"
+                );
+                return Ok(PrepareOutcome::SkippedOutsideRepo);
+            }
             return Err(format!(
                 "sgian session cwd {} escapes repo_root {}",
                 session_cwd_canon.display(),
                 repo_canon.display()
             ));
+        }
+
+        let resolved_run_id = if config.bind_session_run {
+            lookup_session_run(session_id).ok_or_else(|| {
+                "sgian mission terminal config requires an active runner session run_id binding"
+                    .to_string()
+            })?
+        } else {
+            config.run_id.clone()
+        };
+        let run_trimmed = resolved_run_id.trim();
+        if run_trimmed.is_empty()
+            || run_trimmed != resolved_run_id
+            || resolved_run_id.len() > 48
+            || !resolved_run_id.chars().all(|c| c.is_ascii_graphic())
+        {
+            return Err(
+                "sgian terminal run_id must be 1..=48 printable ASCII graphic chars".into(),
+            );
         }
 
         let sgian_bin = config
@@ -242,22 +341,27 @@ impl PreparedContext {
             ));
         }
 
-        // Verify (or atomically provision) `.kranz/serve.grant.key` (`0600`) up front.
-        let _ = ensure_grant_key(&repo_canon)?;
+        // Mission-bound configs require an already-provisioned `.kranz/serve.grant.key` (`0600`);
+        // explicit `Config::new` callers verify or atomically provision one up front.
+        if config.bind_session_run {
+            let _ = load_grant_key(&repo_canon)?;
+        } else {
+            let _ = ensure_grant_key(&repo_canon)?;
+        }
 
-        Ok(Self {
+        Ok(PrepareOutcome::Enabled(Self {
             sgian_bin,
             repo_canon,
             session_cwd_canon,
             mission_id: config.mission_id.clone(),
-            run_id: config.run_id.clone(),
+            run_id: resolved_run_id,
             budgets: config.budgets,
             alive: Arc::new(AtomicBool::new(true)),
-        })
+        }))
     }
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -564,10 +668,20 @@ impl Provider {
         engine_session_id: impl Into<String>,
         peer_session_id: impl Into<String>,
     ) -> Result<Self, String> {
-        let context = PreparedContext::prepare(config, session_cwd)?;
+        let engine_session = engine_session_id.into();
+        let context = if config.bind_session_run {
+            match PreparedContext::prepare_for_session(config, session_cwd, &engine_session)? {
+                PrepareOutcome::Enabled(ctx) => ctx,
+                PrepareOutcome::SkippedOutsideRepo => {
+                    return Err("sgian mission terminal session cwd is outside repo_root".into());
+                }
+            }
+        } else {
+            PreparedContext::prepare(config, session_cwd)?
+        };
         Ok(Self::from_prepared(
             context,
-            engine_session_id.into(),
+            engine_session,
             peer_session_id.into(),
         ))
     }
@@ -2978,5 +3092,542 @@ exit 0
             has_lease_taken,
             "expected lease.taken for kranz:run-live-42 in ledger: {records:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn mission_engine_automatically_wires_sgian_terminals_for_uncontained_checkout_acp_workers(
+    ) {
+        // Isolate process-wide `KRANZ_SGIAN_BIN` mutations from sibling workspace tests.
+        const MARKER: &str = "KRANZ_SGIAN_MISSION_WIRING_FIXTURE";
+        if std::env::var(MARKER).as_deref() != Ok("1") {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "sgian_terminal::tests::mission_engine_automatically_wires_sgian_terminals_for_uncontained_checkout_acp_workers",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed;"));
+            return;
+        }
+
+        use crate::backend::{AgentBackend, PromptMode, SessionSpec};
+        use crate::backend_acp::AcpBackend;
+        use crate::backend_mock::{
+            mock_init, mock_result_text, mock_text, MockBackend, MockScript,
+        };
+        use crate::control;
+        use crate::event_log::EventLog;
+        use crate::events::EventKind;
+        use crate::live_permission::{Actor, Resolution};
+        use crate::orchestrator::MissionEngine;
+        use crate::sgian::{load_grant_key, mission_terminal_config};
+        use crate::types::{
+            ControlCommand, MissionConfig, MissionStatus, Plan, SandboxEnforce, WorkerIsolation,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let helper_dir = tmp.path().join("helper");
+        let peer_dir = tmp.path().join("peers");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let init_seed_repo = |dir: &std::path::Path| -> std::path::PathBuf {
+            std::fs::create_dir_all(dir).unwrap();
+            for args in [
+                &["init", "-b", "main"][..],
+                &["config", "user.name", "test"][..],
+                &["config", "user.email", "test@example.com"][..],
+            ] {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            std::fs::write(dir.join(".gitignore"), ".kranz/serve.grant.key\n").unwrap();
+            std::fs::write(dir.join("source.txt"), "initial\n").unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["add", ".gitignore", "source.txt"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+            assert!(std::process::Command::new("git")
+                .args(["commit", "-qm", "seed"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+            dir.canonicalize().unwrap()
+        };
+        let wt_repo_canon = init_seed_repo(&tmp.path().join("wt-repo"));
+        let repo_canon = init_seed_repo(&repo);
+
+        let sgian_log = tmp.path().join("sgian-calls.log");
+        let grant_capture = tmp.path().join("captured-grant.json");
+        let fake_sgian = write_exec_script(
+            &helper_dir,
+            "sgian",
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"identity issue"*)
+    printf '{{"id":"cred-mw-1","holder":"%s","scopes":["write"],"token":"sgc_mw"}}\n' "$8"
+    ;;
+  *"identity revoke"*)
+    printf '{{"id":"cred-mw-1","revoked":true}}\n'
+    ;;
+  *"grant exec"*)
+    cp "$8" '{}'
+    printf '{{"terminal_id":"term-mw-1","pane_id":"%s"}}\n' "%4"
+    ;;
+  *"grant output"*)
+    printf '{{"terminal_id":"term-mw-1","output":"changed\\n","truncated":false,"exit_status":{{"exit_code":0,"signal":null}}}}\n'
+    ;;
+  *"grant wait"*)
+    printf '{{"terminal_id":"term-mw-1","exited":true,"timed_out":false,"exit_status":{{"exit_code":0,"signal":null}}}}\n'
+    ;;
+  *"grant release"*|*"grant kill"*)
+    printf '{{"terminal_id":"term-mw-1","descendants_reaped":true,"output_drained":true,"released":true,"exit_status":{{"exit_code":0,"signal":null}}}}\n'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+                sgian_log.display(),
+                grant_capture.display(),
+            ),
+        );
+
+        // 1. With `KRANZ_SGIAN_BIN` set, absent `.kranz/serve.grant.key` keeps Sgian terminals OFF
+        //    and does NOT auto-create `.kranz/serve.grant.key`.
+        std::env::set_var(BIN_ENV, &fake_sgian);
+        assert!(
+            mission_terminal_config(&repo_canon, "m-absent").is_none(),
+            "absent serve.grant.key must leave Sgian terminal provider disabled"
+        );
+        assert!(!repo_canon.join(GRANT_KEY_DIR).join(GRANT_KEY_FILE).exists());
+
+        // 2. Provision `.kranz/serve.grant.key` (`0600`), then verify relative / in-repo `KRANZ_SGIAN_BIN` is refused.
+        let key_path = rotate_grant_key(&repo_canon).unwrap();
+        let in_repo_helper = write_exec_script(&repo_canon, "untrusted-sgian.sh", "exit 0\n");
+        std::env::set_var(BIN_ENV, "./sgian");
+        assert!(mission_terminal_config(&repo_canon, "m-rel").is_none());
+        std::env::set_var(BIN_ENV, &in_repo_helper);
+        assert!(mission_terminal_config(&repo_canon, "m-inrepo").is_none());
+        std::fs::remove_file(&in_repo_helper).unwrap();
+
+        // Restore valid external `KRANZ_SGIAN_BIN`.
+        std::env::set_var(BIN_ENV, &fake_sgian);
+        assert!(mission_terminal_config(&repo_canon, "m-ok").is_some());
+
+        // 3. Direct `start()` on `for_mission_worker` without a runner `SessionRunGuard` fails closed,
+        //    and a `0644` tampered `serve.grant.key` also fails closed before spawning the peer.
+        let never_spawned_marker = tmp.path().join("never-spawned");
+        let never_peer = write_exec_script(
+            &peer_dir,
+            "never-peer.sh",
+            &format!("touch '{}'\nexit 1\n", never_spawned_marker.display()),
+        );
+        let mut raw_role = MissionConfig::default().worker;
+        raw_role.backend = Some("acp".into());
+        raw_role.acp_command = Some(never_peer.display().to_string());
+        raw_role.sandbox.enforce = SandboxEnforce::Off;
+        let mission_backend =
+            AcpBackend::for_mission_worker(&raw_role, &repo_canon, "m-direct").unwrap();
+        let direct_spec = SessionSpec {
+            cwd: repo_canon.clone(),
+            prompt: PromptMode::SingleShot("noop".into()),
+            append_system_prompt: None,
+            model: "acp-test".into(),
+            effort: "high".into(),
+            session_id: "unbound-session".into(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            tools: vec![],
+            writable: true,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env: HashMap::new(),
+            sandbox: None,
+            hook_status: None,
+        };
+        let unbound_err = match mission_backend.start(direct_spec.clone()).await {
+            Ok(_) => panic!("expected unbound session to fail closed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            unbound_err.contains("run_id binding"),
+            "unexpected error: {unbound_err}"
+        );
+        assert!(!never_spawned_marker.exists());
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        {
+            let _guard = bind_session_run("tampered-key-session", "run-tampered");
+            let mut tampered_spec = direct_spec;
+            tampered_spec.session_id = "tampered-key-session".into();
+            let key_err = match mission_backend.start(tampered_spec).await {
+                Ok(_) => panic!("expected 0644 serve.grant.key to fail closed"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                key_err.contains("0600"),
+                "expected 0600 error, got: {key_err}"
+            );
+            assert!(!never_spawned_marker.exists());
+        }
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // 4. `WorkerIsolation::Worktree` places `session_cwd` in `$TMPDIR/kranz-wt-...` outside
+        //    `repo_root`: `MissionEngine::run()` must cleanly skip `SgianTerminalProvider`
+        //    (advertising `terminal` capability = false) and complete without error.
+        let worktree_peer = write_exec_script(
+            &peer_dir,
+            "wt-peer.sh",
+            r#"
+IFS= read -r init_line
+case "$init_line" in
+  *'"terminal":true'*)
+    echo "unexpected terminal capability advertised in external worktree" >&2
+    exit 91
+    ;;
+esac
+id=$(printf '%s' "$init_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+IFS= read -r new_line
+id=$(printf '%s' "$new_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"peer-wt-1"}}\n' "$id"
+IFS= read -r prompt_line
+pid=$(printf '%s' "$prompt_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf 'changed\n' > source.txt
+printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"peer-wt-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"updated in worktree"},"messageId":"m1"}}}\n'
+printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$pid"
+exit 0
+"#,
+        );
+        {
+            let checkpoint = r#"{"action":"commit-as-is","note":"host checkpoint"}"#;
+            let complete = r#"{"decision":"complete","guidance":"","summary":"accepted"}"#;
+            let mock_orch = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(
+                vec![mock_init("orch-wt"), mock_result_text("ready")],
+            )
+            .responding(
+                [checkpoint, complete, "NONE"]
+                    .into_iter()
+                    .map(|r| vec![mock_text(r), mock_result_text(r)])
+                    .collect(),
+            )]));
+            let mut wt_cfg = MissionConfig {
+                skip_scrutiny: true,
+                skip_functional: true,
+                validator_allow_uncontained_degrade: true,
+                allow_below_default_worker_model: true,
+                worker_isolation: WorkerIsolation::Worktree,
+                ..MissionConfig::default()
+            };
+            wt_cfg.worker.backend = Some("acp".into());
+            wt_cfg.worker.acp_command = Some(worktree_peer.display().to_string());
+            wt_cfg.worker.sandbox.enforce = SandboxEnforce::Off;
+            let _wt_key = rotate_grant_key(&wt_repo_canon).unwrap();
+            let mut wt_engine =
+                MissionEngine::create(mock_orch, &wt_repo_canon, "worktree acp goal", wt_cfg)
+                    .unwrap();
+            let wt_plan: Plan = serde_json::from_value(json!({
+                "goal": "worktree acp goal",
+                "touchSet": ["source.txt"],
+                "validationContract": [{
+                    "id": "a-wt",
+                    "statement": "source changed",
+                    "check": "command",
+                    "command": "grep -qx changed source.txt"
+                }],
+                "milestones": [{
+                    "title": "M1",
+                    "features": [{
+                        "title": "update source",
+                        "spec": "write changed to source.txt",
+                        "validationCriteria": ["source changed"]
+                    }]
+                }]
+            }))
+            .unwrap();
+            wt_engine.approve_plan(wt_plan).unwrap();
+            let wt_status = tokio::time::timeout(Duration::from_secs(15), wt_engine.run())
+                .await
+                .unwrap_or_else(|_| {
+                    let evs =
+                        EventLog::read_events(&wt_engine.paths().events_file()).unwrap_or_default();
+                    let kinds: Vec<_> = evs
+                        .iter()
+                        .map(|e| format!("{}: {:?}", e.seq, e.kind))
+                        .collect();
+                    panic!("wt_engine.run() timed out!\nevents:\n{}", kinds.join("\n"));
+                })
+                .unwrap();
+            assert_eq!(wt_status, MissionStatus::Complete);
+        }
+
+        // Reset `sgian_log` before the `Checkout` run so assertions inspect only this mission.
+        let _ = std::fs::remove_file(&sgian_log);
+
+        // 5. Full `MissionEngine::run()` in `WorkerIsolation::Checkout` (`sandbox.enforce: off`):
+        //    `MissionEngine::resolve_kind_backend` + `runner` automatically wire `SgianTerminalProvider`,
+        //    auto-deny `WORKER_DENY` / `AUTHORITY_DENY` commands before operator consent,
+        //    route allowed `terminal/create` through durable `PermissionRequested` / `ResolvePermission`,
+        //    and mint a signed `ExecutionGrant` whose `mission` and `run` match `WorkerSpawned`.
+        let checkout_peer = write_exec_script(
+            &peer_dir,
+            "checkout-peer.sh",
+            r#"
+IFS= read -r init_line
+case "$init_line" in
+  *'"terminal":true'*) ;;
+  *) echo "expected terminal:true in initialize: $init_line" >&2; exit 92 ;;
+esac
+id=$(printf '%s' "$init_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+IFS= read -r new_line
+id=$(printf '%s' "$new_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"peer-co-1"}}\n' "$id"
+IFS= read -r prompt_line
+pid=$(printf '%s' "$prompt_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+
+# 5a. Shell-wrapped `git push` must be auto-denied by WORKER_DENY policy.
+printf '{"jsonrpc":"2.0","id":38,"method":"terminal/create","params":{"sessionId":"peer-co-1","command":"/bin/sh","args":["-c","echo pre && git push origin main"]}}\n'
+IFS= read -r push_resp
+case "$push_resp" in
+  *'"error":'*) ;;
+  *) echo "expected policy error on git push, got: $push_resp" >&2; exit 95 ;;
+esac
+
+# 5b. Authority key read must be auto-denied by AUTHORITY_DENY policy.
+printf '{"jsonrpc":"2.0","id":39,"method":"terminal/create","params":{"sessionId":"peer-co-1","command":"cat","args":[".kranz/serve.grant.key"]}}\n'
+IFS= read -r auth_resp
+case "$auth_resp" in
+  *'"error":'*) ;;
+  *) echo "expected policy error on serve.grant.key read, got: $auth_resp" >&2; exit 96 ;;
+esac
+
+# 5c. Allowed command requires one-call operator consent, then executes via Sgian grant.
+printf '{"jsonrpc":"2.0","id":40,"method":"terminal/create","params":{"sessionId":"peer-co-1","command":"printf","args":["changed\\n"]}}\n'
+IFS= read -r create_resp
+tid=$(printf '%s' "$create_resp" | sed -n 's/.*"terminalId":"\([^"]*\)".*/\1/p')
+if [ -z "$tid" ]; then
+  echo "create failed: $create_resp" >&2
+  exit 93
+fi
+
+printf '{"jsonrpc":"2.0","id":41,"method":"terminal/wait_for_exit","params":{"sessionId":"peer-co-1","terminalId":"%s"}}\n' "$tid"
+IFS= read -r _wait_resp
+printf '{"jsonrpc":"2.0","id":42,"method":"terminal/output","params":{"sessionId":"peer-co-1","terminalId":"%s"}}\n' "$tid"
+IFS= read -r out_resp
+case "$out_resp" in
+  *'"output":"changed\n"'*) ;;
+  *) echo "unexpected output: $out_resp" >&2; exit 94 ;;
+esac
+printf '{"jsonrpc":"2.0","id":43,"method":"terminal/release","params":{"sessionId":"peer-co-1","terminalId":"%s"}}\n' "$tid"
+IFS= read -r _rel_resp
+
+printf 'changed\n' > source.txt
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"peer-co-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"{\"result\":\"pass\",\"summary\":\"delivered via sgian terminal\",\"filesTouched\":[\"source.txt\"],\"testsAdded\":[],\"testEvidence\":\"printf ok\",\"commits\":[]}"},"messageId":"m1"}}}'
+printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$pid"
+exit 0
+"#,
+        );
+
+        let checkpoint = r#"{"action":"commit-as-is","note":"host checkpoint"}"#;
+        let complete = r#"{"decision":"complete","guidance":"","summary":"accepted"}"#;
+        let mock_orch = Arc::new(MockBackend::with_scripts(vec![MockScript::streaming(
+            vec![mock_init("orch-co"), mock_result_text("ready")],
+        )
+        .responding(
+            [checkpoint, complete, "NONE"]
+                .into_iter()
+                .map(|r| vec![mock_text(r), mock_result_text(r)])
+                .collect(),
+        )]));
+        let mut co_cfg = MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            validator_allow_uncontained_degrade: true,
+            allow_below_default_worker_model: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        };
+        co_cfg.worker.backend = Some("acp".into());
+        co_cfg.worker.acp_command = Some(checkout_peer.display().to_string());
+        co_cfg.worker.sandbox.enforce = SandboxEnforce::Off;
+
+        let mut co_engine =
+            MissionEngine::create(mock_orch, &repo_canon, "checkout sgian goal", co_cfg).unwrap();
+        let mission_id = co_engine.mission_id().to_string();
+        let co_plan: Plan = serde_json::from_value(json!({
+            "goal": "checkout sgian goal",
+            "touchSet": ["source.txt"],
+            "validationContract": [{
+                "id": "a-co",
+                "statement": "source changed",
+                "check": "command",
+                "command": "grep -qx changed source.txt"
+            }],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "update source via sgian terminal",
+                    "spec": "run terminal command and update source.txt",
+                    "validationCriteria": ["source changed"]
+                }]
+            }]
+        }))
+        .unwrap();
+        co_engine.approve_plan(co_plan).unwrap();
+        let operator_paths = co_engine.paths().clone();
+
+        let operator = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(15), async move {
+                loop {
+                    let events = EventLog::read_events(&operator_paths.events_file()).unwrap();
+                    if let Some(request) = events.into_iter().find_map(|e| match e.kind {
+                        EventKind::PermissionRequested { request }
+                            if request.proposal.prohibition.is_none() =>
+                        {
+                            Some(request)
+                        }
+                        _ => None,
+                    }) {
+                        control::enqueue(
+                            &operator_paths,
+                            &ControlCommand::ResolvePermission {
+                                resolution: Resolution {
+                                    request_id: request.proposal.id,
+                                    binding_digest: request.binding_digest,
+                                    allow: true,
+                                    actor: Actor::LocalRepositoryAuthority,
+                                    reason: "approve sgian terminal".into(),
+                                },
+                            },
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("timed out waiting for non-prohibited PermissionRequested");
+        });
+
+        let co_status = tokio::time::timeout(Duration::from_secs(15), co_engine.run())
+            .await
+            .unwrap_or_else(|_| {
+                let evs =
+                    EventLog::read_events(&co_engine.paths().events_file()).unwrap_or_default();
+                let kinds: Vec<_> = evs
+                    .iter()
+                    .map(|e| format!("{}: {:?}", e.seq, e.kind))
+                    .collect();
+                let sg = std::fs::read_to_string(&sgian_log).unwrap_or_default();
+                panic!(
+                    "co_engine.run() timed out!\nevents:\n{}\nsgian_log:\n{sg}",
+                    kinds.join("\n")
+                );
+            })
+            .unwrap();
+        operator.await.unwrap();
+        std::env::remove_var(BIN_ENV);
+
+        assert_eq!(co_status, MissionStatus::Complete);
+
+        let events = EventLog::read_events(&co_engine.paths().events_file()).unwrap();
+        let policy_denials = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::PermissionResolved { resolution }
+                        if resolution.actor == Actor::Policy && !resolution.allow
+                )
+            })
+            .count();
+        assert_eq!(
+            policy_denials, 2,
+            "expected 2 policy denials before operator-consented command"
+        );
+        let operator_allows = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::PermissionResolved { resolution }
+                        if resolution.actor == Actor::LocalRepositoryAuthority && resolution.allow
+                )
+            })
+            .count();
+        assert_eq!(operator_allows, 1);
+
+        let spawned_run_id = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::WorkerSpawned {
+                    run_id,
+                    role: crate::types::Role::Worker,
+                    ..
+                } => Some(run_id.clone()),
+                _ => None,
+            })
+            .expect("WorkerSpawned event recorded");
+
+        let logged = std::fs::read_to_string(&sgian_log).unwrap();
+        assert!(
+            logged.contains(&format!("identity issue --holder kranz:{spawned_run_id}")),
+            "credential holder must match WorkerSpawned.run_id: {logged}"
+        );
+        assert!(
+            logged.contains("identity revoke cred-mw-1"),
+            "credential must be revoked after worker completion: {logged}"
+        );
+
+        let exec_lines: Vec<&str> = logged
+            .lines()
+            .filter(|l| l.contains("grant exec"))
+            .collect();
+        assert_eq!(
+            exec_lines.len(),
+            1,
+            "prohibited terminal/create requests must never mint Sgian grants: {logged}"
+        );
+        let exec_line = exec_lines[0];
+        let sig_hex = exec_line
+            .rsplit_once(" --signature ")
+            .map(|(_, sig)| sig.trim())
+            .expect("expected --signature argument");
+        let grant_raw = std::fs::read(&grant_capture).unwrap();
+        let grant_val: Value = serde_json::from_slice(&grant_raw).unwrap();
+        assert_eq!(grant_val["mission"], mission_id);
+        assert_eq!(grant_val["run"], spawned_run_id);
+        assert_eq!(grant_val["argv"], json!(["printf", "changed\n"]));
+
+        let key_bytes = load_grant_key(&repo_canon).unwrap();
+        let expected_sig = hmac_sha256_hex(&key_bytes, &grant_raw);
+        assert_eq!(sig_hex, expected_sig);
     }
 }

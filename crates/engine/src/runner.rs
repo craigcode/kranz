@@ -1132,9 +1132,7 @@ pub async fn run_worker_in(
     .await?;
     let mut target = LogTarget::Live(log);
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    if let Some(guard) = sgian {
-        guard.close().await;
-    }
+    sgian.close().await;
     outcome
 }
 
@@ -1249,9 +1247,7 @@ pub(crate) async fn run_worker_in_buffered_controlled(
         None => LogTarget::Buffer(Vec::new()),
     };
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
-    if let Some(guard) = sgian {
-        guard.close().await;
-    }
+    sgian.close().await;
     if matches!(target, LogTarget::Controlled { .. }) {
         if let Err(error) = &outcome {
             if matches!(target, LogTarget::Controlled { relayed: true, .. }) {
@@ -1381,6 +1377,19 @@ fn seed_worker_env(
     }
 }
 
+pub(crate) struct WorkerSgianLease {
+    revocation: Option<crate::sgian::RevocationGuard>,
+    _session_run: Option<crate::sgian_terminal::SessionRunGuard>,
+}
+
+impl WorkerSgianLease {
+    async fn close(mut self) {
+        if let Some(guard) = self.revocation.take() {
+            guard.close().await;
+        }
+    }
+}
+
 /// Build the worker [`SessionSpec`] + [`RunMeta`] shared by the live and
 /// buffered worker paths. Identical spec construction guarantees a buffered
 /// run and a live run are byte-for-byte the same session, differing only in
@@ -1412,7 +1421,7 @@ async fn build_worker_spec(
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
-) -> Result<(SessionSpec, RunMeta, Option<crate::sgian::RevocationGuard>)> {
+) -> Result<(SessionSpec, RunMeta, WorkerSgianLease)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -1586,13 +1595,20 @@ async fn build_worker_spec(
 
     // Host coordination authority is opt-in and incompatible with containment.
     spec.env.remove(crate::sgian::TOKEN_ENV);
-    let sgian =
+    let session_run = (role_cfg.acp_profile.is_none()
+        && role_cfg.sandbox.enforce == crate::types::SandboxEnforce::Off)
+        .then(|| crate::sgian_terminal::bind_session_run(&spec.session_id, &run_id));
+    let revocation =
         crate::sgian::issue_worker(repo_root, session_cwd, &run_id, role_cfg.sandbox.enforce)
             .await
             .map(|(guard, token)| {
                 crate::sgian::seed_env(&mut spec.env, token);
                 guard
             });
+    let sgian = WorkerSgianLease {
+        revocation,
+        _session_run: session_run,
+    };
 
     let run_meta = RunMeta {
         backend: Some(cfg.backend_kind(role)),
