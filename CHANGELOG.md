@@ -23,6 +23,14 @@ Notable user-visible changes are documented here. This project follows
   mention; and subagents are for work that splits into independent parts, not
   for reviewing the worker's own diff. The worker prompt hash recorded on new
   sessions changes.
+- Wired `SgianTerminalProvider` automatically into `MissionEngine` and `runner`
+  (`AcpBackend::for_mission_worker`) for `checkout`-isolated uncontained ACP
+  workers when both an external `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key`
+  (`0600`) are present, binding each active worker `run_id`, skipping cleanly on
+  external `worktree` checkouts outside Sgian's served root, and enforcing
+  `SessionSpec.disallowed_tools` (`WORKER_DENY` and `AUTHORITY_DENY`, including
+  shell `-c` subcommands and protected `.kranz` authority paths) plus
+  ambiguous-display checks before presenting one-call operator consent.
 - Added: `kranz queue --timing` reports how long each mission waited in the
   queue and how long it ran, which mission was running when it was queued,
   and how many approved plans declared write paths. Waiting time is recorded

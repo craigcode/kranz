@@ -529,6 +529,24 @@ impl AcpBackend {
         }
     }
 
+    /// Mission-runner worker construction: attaches Sgian execution-grant
+    /// terminal support automatically when the worker is an uncontained host
+    /// ACP session (`acp_profile: None`, `sandbox.enforce: off`) and both
+    /// `KRANZ_SGIAN_BIN` and `<repo_root>/.kranz/serve.grant.key` are present.
+    pub fn for_mission_worker(
+        cfg: &crate::types::RoleConfig,
+        repo_root: &std::path::Path,
+        mission_id: &str,
+    ) -> Result<Self> {
+        let mut backend = Self::for_worker(cfg)?;
+        if cfg.acp_profile.is_none() && cfg.sandbox.enforce == crate::types::SandboxEnforce::Off {
+            if let Some(sgian_cfg) = crate::sgian::mission_terminal_config(repo_root, mission_id) {
+                backend = backend.with_sgian_terminals(sgian_cfg);
+            }
+        }
+        Ok(backend)
+    }
+
     /// Explicitly opt an uncontained host ACP session (`SandboxEnforce::Off`)
     /// into Sgian execution-grant terminals (`docs/design/execution-grants.md`).
     /// Never admitted when `spec.sandbox.is_some()` or with a contained profile.
