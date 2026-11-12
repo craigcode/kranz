@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Shipped in #172: planner instructions request touchSet, review surfaces/CLI/Slack/plan.md state when a plan declares no write paths, and queue --timing reports coverage.
 title: Declare write paths on every plan, or flag their absence at review
 priority: 2
 schedule: once

@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Shipped in #171 and #174: separate merge lock (.kranz/queue/.repo.merge.lock) and soak_merge_during_run concurrent worktree-mission + merge soak test.
 title: Split the repo busy lock into a run lock and a merge lock
 priority: 2
 schedule: once
