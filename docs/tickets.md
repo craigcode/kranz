@@ -138,7 +138,8 @@ kranz ticket import-atlas bundles/app --prefix legacy \
 Each ticket is `.kranz/tickets/<prefix>-<group id>.md` (`--prefix` defaults to
 `atlas`), written in the bundle's group order. Its `blocked-by` lists the
 tickets of the groups it depends on, in the bundle's order, so the blocked-by
-gate described below runs the missions callee-first. Priority is the ticket
+gate described below runs the missions callee-first. A dependency the group
+reaches by reference only still blocks (see below). Priority is the ticket
 default for every group: the order comes from `blocked-by`, never from
 priority. The importer reads only the documented bundle files; `mgatlas` does
 not need to be installed to import. It must be on the `PATH` wherever missions
@@ -155,20 +156,22 @@ does `import-openspec`): import first, then commit the bundle and the tickets
 together. A bundle that is not committed is invisible to a worker.
 
 Before writing anything it checks the whole bundle and refuses on the first
-problem: a `bundle_schema` other than 1 or 2, a bundle not marked `complete`,
+problem: a `bundle_schema` other than 1, 2 or 3, a bundle not marked `complete`,
 a missing field, a manifest path that leaves the bundle, a duplicate group
 (two ids that differ only by letter case count as duplicates, since their
 tickets would be one file on a filesystem that ignores case), a dependency on
-an unknown group, a dependency cycle, a group id that cannot be part of a
-slug, a program its group's list repeats or leaves out, two groups sharing one
-facts file, and any difference between the directory and `bundle.json`. That
-last check re-hashes every listed file and also refuses a file or empty
-directory the manifest does not list, as `mgatlas bundle --verify` does. A
-bundle that fails it would fail the generated acceptance command too. It also
-counts the non-empty lines of each facts file and refuses a group whose
-`fact_count` says otherwise, because the acceptance text is built on that
-count. A bundle with more than 2000 groups, or a group that depends on more
-than 200 others, is refused.
+an unknown group, a dependency cycle, a `depends_on_by_reference_only` list
+that a schema 3 group lacks, a schema 1 or 2 group has, or that names a group
+outside the group's `depends_on` or names one twice, a group id that cannot
+be part of a slug, a program its group's list repeats or leaves out, two
+groups sharing one facts file, and any difference between the directory and
+`bundle.json`. That last check re-hashes every listed file and also refuses
+a file or empty directory the manifest does not list, as
+`mgatlas bundle --verify` does. A bundle that fails it would fail the
+generated acceptance command too. It also counts the non-empty lines of each
+facts file and refuses a group whose `fact_count` says otherwise, because the
+acceptance text is built on that count. A bundle with more than 2000 groups,
+or a group that depends on more than 200 others, is refused.
 
 What a ticket holds:
 
@@ -183,6 +186,28 @@ What a ticket holds:
   loose ends and data sources from `groups.json`, and the instruction to read
   a packet's index before relying on the packet. Lists stop at 20 programs,
   10 loose ends and 10 data sources, each with an "N more in `<file>`" line.
+- From a schema 3 bundle, `## Context` also holds what that schema adds:
+  - The dependencies the group reaches by reference only
+    (`depends_on_by_reference_only`), named by ticket. A program of the group
+    names a program of that ticket in an expression or in a variable no
+    control is bound to, and the bundle records no call between them. It is a
+    mention, not a call. The ticket stays in `blocked-by`, because the
+    mentioned program is still worth having first, and the text tells the
+    worker to check what the expression does with it. `groups.json` lists the
+    pairs under `reference_links`.
+  - The group's external invocations and uninterpreted operations, among the
+    loose ends and within the same limit of 10.
+  - A `Links:` line when the bundle's `link_details` is anything but
+    `available`. Such a bundle was cut from an export that does not record
+    links from expressions, properties and external invocations, and only
+    Call Program operations were followed, so the dependencies and
+    `blocked-by` may be incomplete. Export the application again with a
+    current Magic Atlas, write the bundle again and re-import. The command's
+    output carries the same warning. A value the importer does not know, or a
+    missing one, is read as not available instead of refused: the import
+    stays usable and the ticket says what may be missing.
+
+  Tickets imported from schema 1 and 2 bundles read exactly as before.
 - `## Acceptance hints` carries a command that can fail:
 
   ```bash

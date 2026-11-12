@@ -676,10 +676,7 @@ fn note_referenced(note: &KnowledgeNote, haystack_lower: &str) -> bool {
         }
     }
     let title_l = note.title.to_ascii_lowercase();
-    if title_l.len() >= 8 && contains_word(haystack_lower, &title_l) {
-        return true;
-    }
-    false
+    title_l.len() >= 8 && contains_word(haystack_lower, &title_l)
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {

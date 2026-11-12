@@ -10,9 +10,11 @@
 //!
 //! Each group becomes one ticket, and the bundle's `depends_on` edges become
 //! `blocked-by`, so missions run callee-first without anyone ordering them by
-//! hand. Like the OpenSpec importer this runs ONE WAY: nothing is written
-//! into the bundle, and it could not be, because any change there makes the
-//! bundle differ from its manifest.
+//! hand. A schema 3 bundle also says which of those edges only a reference
+//! leads to; they still order the work, and the ticket names them. Like the
+//! OpenSpec importer this runs ONE WAY: nothing is written into the bundle,
+//! and it could not be, because any change there makes the bundle differ
+//! from its manifest.
 //!
 //! Three choices carry the risk.
 //!
@@ -49,7 +51,12 @@ use sha2::{Digest as _, Sha256};
 
 const MANIFEST: &str = "bundle.json";
 const GROUPS: &str = "groups.json";
-const SUPPORTED_SCHEMAS: std::ops::RangeInclusive<u64> = 1..=2;
+const SUPPORTED_SCHEMAS: std::ops::RangeInclusive<u64> = 1..=3;
+/// The first schema that records links from expressions and properties,
+/// external invocations and uninterpreted operations, and with them
+/// `link_details` and `depends_on_by_reference_only`.
+const LINK_SCHEMA: u64 = 3;
+const LINKS_AVAILABLE: &str = "available";
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BUNDLE_ENTRIES: usize = 200_000;
@@ -146,6 +153,9 @@ pub struct ImportReport {
     pub tickets: Vec<ImportedTicket>,
     /// Whether `--target-note` supplied the target stack.
     pub target_stated: bool,
+    /// False when a schema 3 bundle does not say its link details are
+    /// available, so its dependency lists may be incomplete.
+    pub links_recorded: bool,
 }
 
 impl ImportReport {
@@ -179,6 +189,14 @@ impl ImportReport {
                     ticket.slug, ticket.programs
                 ));
             }
+        }
+        if !self.links_recorded {
+            out.push_str(
+                "warning: the bundle was cut from an export that does not record links from \
+                 expressions, properties and external invocations, so 'blocked-by' may be \
+                 incomplete; export the application again with a current Magic Atlas, write \
+                 the bundle again and re-import\n",
+            );
         }
         if !self.target_stated {
             out.push_str(
@@ -218,6 +236,10 @@ struct ManifestGroup {
     layer: u64,
     programs: Vec<String>,
     depends_on: Vec<String>,
+    /// The dependencies only a reference leads to. Schema 3 always records
+    /// the list; schemas 1 and 2 never do. A null is not an absent field.
+    #[serde(default, deserialize_with = "present")]
+    depends_on_by_reference_only: Option<Vec<String>>,
     facts: String,
     fact_count: u64,
     /// Absent when the source has no block records.
@@ -225,6 +247,16 @@ struct ManifestGroup {
     blocks: Option<String>,
     #[serde(default)]
     block_units: u64,
+}
+
+/// Reads a field that is present, so `null` fails to parse instead of
+/// passing for a field the bundle left out.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -264,6 +296,8 @@ struct LooseEnds {
     dynamic_calls: Vec<LooseCall>,
     absent_calls: Vec<LooseCall>,
     outside_output_calls: Vec<LooseCall>,
+    external_invocations: Vec<LooseCall>,
+    uninterpreted_operations: Vec<LooseCall>,
     cross_application_calls: Vec<CrossApplicationCall>,
     data_sources: Vec<DataSource>,
 }
@@ -281,6 +315,9 @@ struct LooseObject {
     entity: Option<String>,
     expression: Option<String>,
     diagnostic: Option<String>,
+    kind: Option<String>,
+    code: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -304,6 +341,9 @@ struct Bundle {
     /// Repository-relative path, `/`-separated, safe to put in a command.
     path: String,
     schema: u64,
+    /// False only for a schema 3 bundle whose `link_details` is not
+    /// `available`.
+    links_recorded: bool,
     manifest_sha256: String,
     manifest: Manifest,
     loose_ends: HashMap<String, LooseEnds>,
@@ -361,6 +401,7 @@ pub fn import_bundle(repo: &Path, dir: &Path, options: &ImportOptions) -> Result
         bundle: bundle.path,
         tickets,
         target_stated: target_note.is_some(),
+        links_recorded: bundle.links_recorded,
     })
 }
 
@@ -640,11 +681,20 @@ fn read_bundle(root: &Dir, path: String) -> Result<Bundle> {
              write it again"
         );
     }
+    // Only `available` promises the links. Any other value, a missing one
+    // or one that is not text is read as not available: the ticket then
+    // carries the warning, which is the safe reading of a value this importer
+    // does not know. Earlier schemas have no such field and get no warning.
+    let links_recorded = schema < LINK_SCHEMA
+        || value
+            .get("link_details")
+            .and_then(|details| details.as_str())
+            == Some(LINKS_AVAILABLE);
     let manifest: Manifest = serde_json::from_value(value)
         .map_err(bounded_error)
         .with_context(|| format!("{path}/{MANIFEST} is missing a field this importer needs"))?;
 
-    check_manifest(&manifest, &path)?;
+    check_manifest(&manifest, schema, &path)?;
     let lines = verify_files(root, &manifest.files, &path)?;
     // The coverage command counts the facts it finds in the file, so a
     // manifest that records more than the file holds would make the ticket
@@ -666,6 +716,7 @@ fn read_bundle(root: &Dir, path: String) -> Result<Bundle> {
     Ok(Bundle {
         path,
         schema,
+        links_recorded,
         manifest_sha256,
         manifest,
         loose_ends,
@@ -679,7 +730,7 @@ fn inside_bundle(path: &str) -> bool {
 }
 
 /// Everything about `bundle.json` that can be checked without the files.
-fn check_manifest(manifest: &Manifest, bundle: &str) -> Result<()> {
+fn check_manifest(manifest: &Manifest, schema: u64, bundle: &str) -> Result<()> {
     let mut listed = HashSet::new();
     let mut total_bytes = 0u64;
     for file in &manifest.files {
@@ -804,6 +855,37 @@ fn check_manifest(manifest: &Manifest, bundle: &str) -> Result<()> {
             }
             if !seen.insert(dependency.as_str()) {
                 bail!("group {id} depends on group {} twice", shown(dependency));
+            }
+        }
+        match &group.depends_on_by_reference_only {
+            Some(_) if schema < LINK_SCHEMA => bail!(
+                "group {id} has depends_on_by_reference_only, which a schema {schema} bundle \
+                 does not record"
+            ),
+            None if schema >= LINK_SCHEMA => bail!(
+                "group {id} has no depends_on_by_reference_only, which a schema {schema} \
+                 bundle records for every group"
+            ),
+            None => {}
+            // Every entry must be a dependency and none may repeat, so the
+            // loop ends within the dependency limit whatever the list holds.
+            Some(by_reference) => {
+                let mut named = HashSet::new();
+                for dependency in by_reference {
+                    if !seen.contains(dependency.as_str()) {
+                        bail!(
+                            "group {id} gives group {} as a dependency by reference only, \
+                             but does not depend on it",
+                            shown(dependency)
+                        );
+                    }
+                    if !named.insert(dependency.as_str()) {
+                        bail!(
+                            "group {id} gives group {} twice as a dependency by reference only",
+                            shown(dependency)
+                        );
+                    }
+                }
             }
         }
         require_listed(&group.facts, "a facts file")?;
@@ -1163,8 +1245,14 @@ fn render_tickets(
         let loose_ends = &bundle.loose_ends[&group.id];
 
         let title = render_title(group, &members);
+        let by_reference: Vec<String> = group
+            .depends_on_by_reference_only
+            .iter()
+            .flatten()
+            .map(|id| slug_of(id))
+            .collect();
         let goal = render_goal(bundle, group, &map, target_note);
-        let context = render_context(bundle, group, index, &members, loose_ends);
+        let context = render_context(bundle, group, index, &members, loose_ends, &by_reference);
         let mut body = Ticket::ticket_template(&title, Some(&goal), Some(&context));
         if !blocked_by.is_empty() {
             // The title is one line, so the first `schedule:` line is the
@@ -1232,8 +1320,16 @@ fn render_goal(
         1 => "the program".to_string(),
         n => format!("the {n} programs"),
     };
+    let by_reference = group
+        .depends_on_by_reference_only
+        .as_ref()
+        .is_some_and(|ids| !ids.is_empty());
     let dependencies = if group.depends_on.is_empty() {
         "This group calls no other group of the bundle."
+    } else if by_reference {
+        "The programs this group calls or refers to belong to the tickets in `blocked-by`: \
+         build on what those delivered instead of reimplementing them. The Context says \
+         which of those tickets this group only refers to."
     } else {
         "The programs this group calls belong to the tickets in `blocked-by`: build on \
          what those delivered instead of reimplementing them."
@@ -1257,6 +1353,7 @@ fn render_context(
     index: usize,
     members: &[&ManifestProgram],
     loose_ends: &LooseEnds,
+    by_reference: &[String],
 ) -> String {
     let path = &bundle.path;
     let in_bundle = |file: &str| code(&format!("{path}/{file}"), MAX_PATH_CHARS);
@@ -1279,6 +1376,15 @@ fn render_context(
         index + 1,
         bundle.manifest.groups.len()
     );
+    if !bundle.links_recorded {
+        out.push_str(
+            "- Links: this bundle was cut from an export that does not record links from \
+             expressions, properties and external invocations, and only Call Program \
+             operations were followed. The dependencies below and `blocked-by` may be \
+             incomplete. To get them, export the application again with a current Magic \
+             Atlas, write the bundle again and re-import.\n",
+        );
+    }
     out.push_str(&match group.depends_on.len() {
         0 => "- Depends on no other group.\n".to_string(),
         n => format!(
@@ -1286,6 +1392,23 @@ fn render_context(
             count(n, "group")
         ),
     });
+    if !by_reference.is_empty() {
+        // The slugs passed the slug rule, so they are inert in a code span.
+        let slugs: Vec<String> = by_reference
+            .iter()
+            .map(|slug| format!("`{slug}`"))
+            .collect();
+        out.push_str(&format!(
+            "- By reference only ({} of them): {}. A program of this group names a program \
+             of that ticket in an expression or in a variable no control is bound to, and \
+             the bundle records no call between them. That is a mention, not a call: the \
+             ticket still waits for it, but check what the expression does with the program \
+             before treating it as one this group runs. `{path}/{GROUPS}` lists the pairs \
+             under `reference_links`.\n",
+            by_reference.len(),
+            slugs.join(", ")
+        ));
+    }
     out.push_str(&format!(
         "- Facts: {} ({}).\n",
         in_bundle(&group.facts),
@@ -1356,6 +1479,44 @@ fn render_context(
             code(&call.callee, MAX_ID_CHARS)
         ));
     }
+    // Two kinds that only schema 3 records. An earlier bundle is rendered
+    // without them whatever its groups file holds.
+    let mut link_counts = String::new();
+    if bundle.schema >= LINK_SCHEMA {
+        for call in &loose_ends.external_invocations {
+            // An invocation of a type the bundle does not interpret has no
+            // text, only the stored type code.
+            let text = call.object.text.as_deref().unwrap_or("");
+            let detail = match call.object.code.as_deref() {
+                Some(stored) if text.trim().is_empty() && !stored.trim().is_empty() => {
+                    format!("stored type {}", plain(stored, MAX_NAME_CHARS))
+                }
+                _ => plain(text, MAX_NAME_CHARS),
+            };
+            lines.push(format!(
+                "- external invocation in {}: {} {detail}\n",
+                code(&call.program, MAX_ID_CHARS),
+                plain(call.object.kind.as_deref().unwrap_or(""), MAX_NAME_CHARS),
+            ));
+        }
+        // The bundle records such an operation as a target with no
+        // definition, so what it says about it is the diagnostic.
+        for call in &loose_ends.uninterpreted_operations {
+            lines.push(format!(
+                "- operation the bundle does not interpret in {}: {}\n",
+                code(&call.program, MAX_ID_CHARS),
+                plain(
+                    call.object.diagnostic.as_deref().unwrap_or(""),
+                    MAX_NAME_CHARS
+                )
+            ));
+        }
+        link_counts = format!(
+            ", external invocations {}, operations the bundle does not interpret {}",
+            loose_ends.external_invocations.len(),
+            loose_ends.uninterpreted_operations.len()
+        );
+    }
     if lines.is_empty() {
         out.push_str(&format!(
             "\nLoose ends recorded in `{path}/{GROUPS}`: none.\n"
@@ -1364,7 +1525,7 @@ fn render_context(
         out.push_str(&format!(
             "\nLoose ends recorded in `{path}/{GROUPS}` ({}): dynamic call targets {}, call \
              targets with no definition {}, call targets outside the selected output {}, \
-             calls into another application {}.\n",
+             calls into another application {}{link_counts}.\n",
             lines.len(),
             loose_ends.dynamic_calls.len(),
             loose_ends.absent_calls.len(),
@@ -1729,9 +1890,80 @@ mod tests {
         error
     }
 
+    /// Turn a sealed synthetic bundle into a schema 3 one: `link_details` as
+    /// given, and for each group the dependencies reached by reference only.
+    fn to_schema_3(dir: &Path, link_details: Option<&str>, by_reference: &[(&str, &[&str])]) {
+        let listed = |id: &Value| {
+            let found = by_reference.iter().find(|(group, _)| id == group);
+            json!(found.map_or(&[][..], |(_, ids)| ids))
+        };
+        edit_json(&dir.join(GROUPS), |groups| {
+            groups["bundle_schema"] = json!(3);
+            for group in groups["groups"].as_array_mut().unwrap() {
+                group["depends_on_by_reference_only"] = listed(&group["id"]);
+            }
+        });
+        edit_manifest(dir, |manifest| {
+            manifest["bundle_schema"] = json!(3);
+            if let Some(details) = link_details {
+                manifest["link_details"] = json!(details);
+            }
+            for group in manifest["groups"].as_array_mut().unwrap() {
+                group["depends_on_by_reference_only"] = listed(&group["id"]);
+            }
+        });
+        seal(dir);
+    }
+
     fn read_ticket(repo: &Path, slug: &str) -> String {
         std::fs::read_to_string(Ticket::md_path(repo, slug)).unwrap()
     }
+
+    /// The whole ticket of group `gb` of the schema 2 bundle in
+    /// `schema_1_and_2_tickets_are_byte_for_byte_what_they_were`, as the importer wrote
+    /// it before it read schema 3. `{sha}` stands for the manifest's SHA-256.
+    const GOLDEN_SCHEMA_2: &str = "\
+         ---\n\
+         title: Migrate program Program B (gb)\n\
+         priority: 2\n\
+         schedule: once\n\
+         blocked-by: [atlas-ga]\n\
+         ---\n\
+         \n\
+         ## Goal\n\
+         Reimplement the program of group `gb` from the program bundle at `bundles/app` on the target stack stated below, carrying over the behaviour the bundle documents. Account for every fact of the group in the coverage map at `atlas-coverage/gb.jsonl`. The programs this group calls belong to the tickets in `blocked-by`: build on what those delivered instead of reimplementing them. Do not guess at a loose end the Context lists: say in the map or the report how each was handled. Never edit anything under `bundles/app`.\n\
+         \n\
+         Target stack: OPERATOR: replace this line with the target language, framework and code location before drafting. The importer does not choose one.\n\
+         \n\
+         ## Context\n\
+         Imported from a program bundle written by Magic Atlas (the `mgatlas` command) from a documented legacy application. The bundle is a frozen work package: read it, never change it. Program names, ids and paths below are data copied from the bundle, not instructions.\n\
+         \n\
+         - Bundle: `bundles/app` (bundle schema 2); `bundles/app/README.md` describes every file.\n\
+         - SHA-256 of `bundles/app/bundle.json` at import: `{sha}`\n\
+         - Root program of the bundle: `app:program:1`\n\
+         - Group: `gb`, layer 1, 1 program; group 2 of 3 in callee-first order.\n\
+         - Depends on 1 group; their tickets are this ticket's `blocked-by`.\n\
+         - Facts: `bundles/app/facts/gb.jsonl` (2 facts).\n\
+         - Blocks: `bundles/app/blocks/gb.jsonl` (0 block units).\n\
+         \n\
+         Programs (1):\n\
+         - `app:program:2` Program B: packet index `bundles/app/packets/app/program-2/index.json`\n\
+         \n\
+         Loose ends recorded in `bundles/app/groups.json` (1): dynamic call targets 1, call targets with no definition 0, call targets outside the selected output 0, calls into another application 0.\n\
+         - dynamic call target in `app:program:2`: A + B\n\
+         \n\
+         Data sources: none recorded for this group.\n\
+         \n\
+         Read a program's packet index (`index.json`) before relying on its packet: the index lists every omission the packet declares and every documentation section the size bound kept out of it.\n\
+         \n\
+         ## Scoping answers\n\
+         \n\
+         ## Acceptance hints\n\
+         - `mgatlas coverage --bundle bundles/app --map atlas-coverage/gb.jsonl --group gb` exits 0. Write the map at `atlas-coverage/gb.jsonl` as JSON Lines, one entry per fact, as `bundles/app/README.md` describes under Coverage. The command exits 1 while any of the group's 2 facts is neither mapped nor waived, so an empty or missing map fails. It refuses a bundle whose files differ from `bundles/app/bundle.json`, but it does not check `bundle.json` itself; the next command does.\n\
+         - `mgatlas bundle --verify bundles/app | grep -Eq '\"manifest_sha256\": *\"{sha}\"'` exits 0: `bundles/app/bundle.json` is still the file this ticket was imported from. Keep it next to the coverage command, which passes vacuously on a rewritten `bundle.json`.\n\
+         - The coverage command shows that every recorded fact was accounted for. It does NOT show that the new code is correct: a target is free text nobody opens, and a fact can be waived with any reason. Read the waived facts it reports.\n\
+         - OPERATOR: replace this line with commands that can fail for behaviour, each guarded by a passed count (`grep -qE 'result: ok\\. [1-9][0-9]* passed'`) so a zero-match filter cannot report success.\n\
+         ";
 
     #[test]
     fn a_chain_becomes_one_ticket_per_group_blocked_by_its_callees() {
@@ -2073,8 +2305,8 @@ mod tests {
             ),
             (|m| m["complete"] = json!("true"), "was not finished"),
             (
-                |m| m["bundle_schema"] = json!(3),
-                "unsupported bundle schema 3",
+                |m| m["bundle_schema"] = json!(4),
+                "unsupported bundle schema 4",
             ),
             (
                 |m| m["bundle_schema"] = json!(0),
@@ -2136,6 +2368,296 @@ mod tests {
         assert!(
             ticket.contains("holds no blocks file for this group"),
             "{ticket}"
+        );
+    }
+
+    #[test]
+    fn schema_1_and_2_tickets_are_byte_for_byte_what_they_were() {
+        for schema in [2, 1] {
+            let repo = tempfile::tempdir().unwrap();
+            let mut groups = chain();
+            // Kinds only schema 3 records are not rendered from an earlier bundle.
+            groups[1].loose_ends = json!({
+                "dynamic_calls": [{"program": "app:program:2", "object": {"expression": "A + B"}}],
+                "external_invocations": [
+                    {"program": "app:program:2", "object": {"kind": "os", "text": "run"}},
+                ],
+                "uninterpreted_operations": [
+                    {"program": "app:program:2", "object": {"status": "absent", "diagnostic": "x"}},
+                ],
+            });
+            let dir = write_bundle(repo.path(), "bundles/app", &groups);
+            edit_manifest(&dir, |manifest| manifest["bundle_schema"] = json!(schema));
+            import(repo.path(), &dir).unwrap();
+
+            let sha = hex(&Sha256::digest(std::fs::read(dir.join(MANIFEST)).unwrap()));
+            let expected = GOLDEN_SCHEMA_2
+                .replace("{sha}", &sha)
+                .replace("(bundle schema 2)", &format!("(bundle schema {schema})"));
+            assert_eq!(read_ticket(repo.path(), "atlas-gb"), expected, "{schema}");
+        }
+    }
+
+    #[test]
+    fn a_schema_3_bundle_with_link_details_differs_only_by_its_schema_number() {
+        let mut tickets = Vec::new();
+        for schema_3 in [false, true] {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = write_bundle(repo.path(), "bundles/app", &chain());
+            if schema_3 {
+                to_schema_3(&dir, Some("available"), &[]);
+            }
+            let report = import(repo.path(), &dir).unwrap();
+            assert!(report.links_recorded);
+            assert!(!report.render().contains("does not record links"));
+            let sha = hex(&Sha256::digest(std::fs::read(dir.join(MANIFEST)).unwrap()));
+            tickets.push(
+                ["atlas-ga", "atlas-gb", "atlas-gc"]
+                    .map(|slug| read_ticket(repo.path(), slug).replace(&sha, "SHA")),
+            );
+        }
+        assert!(
+            tickets[1][1].contains("(bundle schema 3)"),
+            "{}",
+            tickets[1][1]
+        );
+        let renumbered = tickets[1]
+            .clone()
+            .map(|ticket| ticket.replace("(bundle schema 3)", "(bundle schema 2)"));
+        assert_eq!(tickets[0], renumbered);
+    }
+
+    #[test]
+    fn a_dependency_by_reference_only_still_blocks_and_is_named_as_a_mention() {
+        let repo = tempfile::tempdir().unwrap();
+        let groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 0, &["Program B"], &[]),
+            group("gc", 1, &["Program C"], &["ga", "gb"]),
+            group("gd", 2, &["Program D"], &["gc"]),
+        ];
+        let dir = write_bundle(repo.path(), "bundles/app", &groups);
+        to_schema_3(&dir, Some("available"), &[("gc", &["gb"])]);
+
+        let report = import(repo.path(), &dir).unwrap();
+
+        assert_eq!(report.tickets[2].blocked_by, ["atlas-ga", "atlas-gb"]);
+        let ticket = Ticket::load(&Ticket::md_path(repo.path(), "atlas-gc")).unwrap();
+        assert_eq!(ticket.blocked_by, ["atlas-ga", "atlas-gb"]);
+        assert!(
+            ticket.goal.contains("calls or refers to") && ticket.goal.contains("only refers to"),
+            "{}",
+            ticket.goal
+        );
+        assert!(
+            ticket.context.contains(
+                "- By reference only (1 of them): `atlas-gb`. A program of this group names"
+            ),
+            "{}",
+            ticket.context
+        );
+        assert!(
+            ticket.context.contains("a mention, not a call"),
+            "{}",
+            ticket.context
+        );
+        assert!(
+            ticket
+                .context
+                .contains("`bundles/app/groups.json` lists the pairs under `reference_links`"),
+            "{}",
+            ticket.context
+        );
+        // A group whose dependencies are all calls reads as before.
+        let ticket = read_ticket(repo.path(), "atlas-gd");
+        assert!(!ticket.contains("eference only"), "{ticket}");
+        assert!(!ticket.contains("refers to"), "{ticket}");
+    }
+
+    #[test]
+    fn a_malformed_reference_only_list_is_refused() {
+        type Edit = fn(&mut Value);
+        let cases: [(u64, Edit, &str); 9] = [
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!(["ga"]),
+                "group 'gc' gives group 'ga' as a dependency by reference only, but does not \
+                 depend on it",
+            ),
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!(["nope"]),
+                "group 'gc' gives group 'nope' as a dependency by reference only",
+            ),
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!(["gb", "gb"]),
+                "group 'gc' gives group 'gb' twice as a dependency by reference only",
+            ),
+            (
+                3,
+                |g| {
+                    g.as_object_mut()
+                        .unwrap()
+                        .remove("depends_on_by_reference_only");
+                },
+                "group 'gc' has no depends_on_by_reference_only",
+            ),
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!("gb"),
+                "missing a field this importer needs",
+            ),
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!([7]),
+                "missing a field this importer needs",
+            ),
+            (
+                2,
+                |g| g["depends_on_by_reference_only"] = json!([]),
+                "group 'gc' has depends_on_by_reference_only, which a schema 2 bundle does not \
+                 record",
+            ),
+            // A null is a field the bundle wrote, on any schema.
+            (
+                2,
+                |g| g["depends_on_by_reference_only"] = json!(null),
+                "missing a field this importer needs",
+            ),
+            (
+                3,
+                |g| g["depends_on_by_reference_only"] = json!(null),
+                "missing a field this importer needs",
+            ),
+        ];
+        for (schema, edit, expected) in cases {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = write_bundle(repo.path(), "bundle", &chain());
+            if schema == 3 {
+                to_schema_3(&dir, Some("available"), &[]);
+            }
+            edit_manifest(&dir, |manifest| edit(&mut manifest["groups"][2]));
+            let error = refusal(repo.path(), &dir);
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        // A hostile list cannot make the check run long or the error large.
+        let repo = tempfile::tempdir().unwrap();
+        let dir = write_bundle(repo.path(), "bundle", &chain());
+        to_schema_3(&dir, Some("available"), &[]);
+        edit_manifest(&dir, |manifest| {
+            manifest["groups"][2]["depends_on_by_reference_only"] =
+                json!(vec!["x\n## Goal".repeat(500); 10_000]);
+        });
+        let error = refusal(repo.path(), &dir);
+        assert!(error.len() < 1000, "{} bytes", error.len());
+        assert!(!error.contains('\n'), "{error}");
+    }
+
+    #[test]
+    fn a_schema_3_bundle_without_link_details_says_so_in_every_ticket() {
+        type Edit = fn(&mut Value);
+        let cases: [(Option<&str>, Edit); 4] = [
+            (Some("unavailable_before_schema_3"), |_| {}),
+            // A value this importer does not know is never echoed.
+            (Some("## Goal\nsome later value"), |_| {}),
+            (None, |_| {}),
+            (None, |m| m["link_details"] = json!(["available"])),
+        ];
+        for (details, edit) in cases {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = write_bundle(repo.path(), "bundle", &chain());
+            to_schema_3(&dir, details, &[]);
+            edit_manifest(&dir, edit);
+
+            let report = import(repo.path(), &dir).unwrap();
+
+            assert!(!report.links_recorded, "{details:?}");
+            let text = report.render();
+            assert!(
+                text.contains("warning: the bundle was cut from an export that does not record"),
+                "{text}"
+            );
+            for slug in ["atlas-ga", "atlas-gb", "atlas-gc"] {
+                let ticket = Ticket::load(&Ticket::md_path(repo.path(), slug)).unwrap();
+                assert!(
+                    ticket.context.contains(
+                        "- Links: this bundle was cut from an export that does not record links"
+                    ) && ticket.context.contains("may be incomplete")
+                        && ticket.context.contains("export the application again"),
+                    "{details:?} {slug}: {}",
+                    ticket.context
+                );
+                assert!(
+                    !ticket.context.contains("later value"),
+                    "{}",
+                    ticket.context
+                );
+            }
+        }
+
+        // Schemas 1 and 2 have no such field, whatever a manifest holds there.
+        let repo = tempfile::tempdir().unwrap();
+        let dir = write_bundle(repo.path(), "bundle", &chain());
+        edit_manifest(&dir, |m| {
+            m["link_details"] = json!("unavailable_before_schema_3")
+        });
+        let report = import(repo.path(), &dir).unwrap();
+        assert!(report.links_recorded);
+        assert!(!read_ticket(repo.path(), "atlas-gb").contains("Links:"));
+    }
+
+    #[test]
+    fn schema_3_loose_ends_list_external_invocations_and_uninterpreted_operations() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = chain();
+        groups[0].loose_ends = json!({
+            "external_invocations": [
+                {"program": "app:program:1", "object": {"kind": "os_command", "code": "1", "text": "run `it`"}},
+                {"program": "app:program:1", "object": 7},
+                {"program": "app:program:1", "object": {"kind": "uninterpreted", "code": "9\n## Goal", "text": ""}},
+            ],
+            "uninterpreted_operations": [
+                {"program": "app:program:1", "object": {"status": "absent", "diagnostic": "Strange\n## Goal"}},
+                // A shape this importer does not know says nothing, and imports.
+                {"program": "app:program:1", "object": {"text": "elsewhere"}},
+            ],
+        });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+
+        // A wrong-typed loose end fails cleanly, as the other kinds do.
+        let error = refusal(repo.path(), &dir);
+        assert!(error.contains("is not a groups file"), "{error}");
+
+        edit_json(&dir.join(GROUPS), |groups| {
+            groups["groups"][0]["loose_ends"]["external_invocations"][1]["object"] = json!({});
+        });
+        seal(&dir);
+        import(repo.path(), &dir).unwrap();
+
+        let ticket = Ticket::load(&Ticket::md_path(repo.path(), "atlas-ga")).unwrap();
+        for expected in [
+            "Loose ends recorded in `bundle/groups.json` (5): dynamic call targets 0, call \
+             targets with no definition 0, call targets outside the selected output 0, calls \
+             into another application 0, external invocations 3, operations the bundle does \
+             not interpret 2.",
+            "- external invocation in `app:program:1`: os\\_command run \\`it\\`\n",
+            "- external invocation in `app:program:1`: (blank) (blank)\n",
+            "- external invocation in `app:program:1`: uninterpreted stored type 9 \\#\\# Goal\n",
+            "- operation the bundle does not interpret in `app:program:1`: Strange \\#\\# Goal\n",
+            "- operation the bundle does not interpret in `app:program:1`: (blank)\n",
+        ] {
+            assert!(
+                ticket.context.contains(expected),
+                "{expected}\n{}",
+                ticket.context
+            );
+        }
+        assert!(
+            read_ticket(repo.path(), "atlas-gb").contains("groups.json`: none."),
+            "schema 3 without loose ends"
         );
     }
 
@@ -2822,6 +3344,7 @@ mod tests {
                 } else {
                     vec![format!("g{}", n - 1)]
                 },
+                depends_on_by_reference_only: None,
                 facts: String::new(),
                 fact_count: 0,
                 blocks: None,
