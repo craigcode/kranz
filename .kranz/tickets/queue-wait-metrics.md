@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Shipped in #172: enqueue writes runs/queue-receipt.json and kranz queue --timing (--json) reports per-mission and summary queue/run times.
 title: Record how long each mission waited in the queue and how long it ran
 priority: 3
 schedule: once
