@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: a merge no longer waits for a running mission, and a mission can
+  start during a merge, when the mission works in its own worktree (the
+  default). Merges still run one at a time, and a mission that works in the
+  primary checkout still excludes a merge.
 - Added `kranz ticket import-atlas <BUNDLE_DIR>`: imports a Magic Atlas
   program bundle as one ticket per group, with `blocked-by` following the
   bundle's group dependencies so missions run callee-first. The bundle is

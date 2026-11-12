@@ -1,8 +1,11 @@
 # Per-repo merge gates
 
 The human-triggered dashboard/Slack Merge action requires a COMPLETE mission,
-holds the repo-wide busy lock, and pins both the live base and mission tip
-before doing any work. It reads `.kranz/merge-gates.json` and
+holds the repository's merge lock, and pins both the live base and mission tip
+before doing any work. Merges run one at a time. A mission running in its own
+worktree does not block a merge and is not blocked by one; a mission that
+works in the primary checkout (`workerIsolation: "checkout"`) and a merge
+still exclude each other. It reads `.kranz/merge-gates.json` and
 `.kranz/secret-allowlist` from that pinned live base. Both are tracked repo
 policy: a mission branch may change its copy for a future merge, but cannot
 weaken or waive the checks judging its own code.

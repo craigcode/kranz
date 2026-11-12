@@ -795,19 +795,22 @@ impl MissionHost {
             return Err(ApiError::not_found(format!("unknown mission '{id}'")));
         }
         // Serialize the complete read/pin/integrate/gate/advance transaction
-        // against mission runs and other merges in this repo. The hold moves
+        // against other merges in this repo, and against a mission that
+        // works in the primary checkout. A mission running in its own
+        // worktree no longer blocks a merge, nor a merge it. The hold moves
         // INTO the blocking task below: if the client disconnects mid-gate-
         // suite this handler future is dropped, but the detached blocking
         // merge keeps mutating the primary tree — a hold living here would
-        // be released early, letting a dispatcher claim the busy repo.
-        let repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id).map_err(
-            |error| match error {
-                error @ EngineError::LockHeld(_) => {
-                    ApiError::from(error).with_code(ApiErrorCode::RepositoryBusy)
+        // be released early, letting a second merge start.
+        let repo_busy =
+            kranz_engine::queue::acquire_repo_merge(&self.repo_root, id).map_err(|error| {
+                match error {
+                    error @ EngineError::LockHeld(_) => {
+                        ApiError::from(error).with_code(ApiErrorCode::RepositoryBusy)
+                    }
+                    other => other.into(),
                 }
-                other => other.into(),
-            },
-        )?;
+            })?;
         let events = EventLog::read_events(&paths.events_file())?;
         let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
         if state.mission.status != MissionStatus::Complete {
@@ -897,7 +900,7 @@ impl MissionHost {
                 kranz_engine::live_permission::Actor::LocalMutationCapability,
                 accepted_base_policy.as_deref(),
             );
-            // Explicit: the repo-busy hold is released HERE, once the merge
+            // Explicit: the merge hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.
             drop(repo_busy);
             report
