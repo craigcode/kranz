@@ -23,6 +23,21 @@ Notable user-visible changes are documented here. This project follows
   mention; and subagents are for work that splits into independent parts, not
   for reviewing the worker's own diff. The worker prompt hash recorded on new
   sessions changes.
+- Added: `kranz queue --timing` reports how long each mission waited in the
+  queue and how long it ran, which mission was running when it was queued,
+  and how many approved plans declared write paths. Waiting time is recorded
+  from now on; earlier missions show `-`.
+- Changed: plan review in the dashboard, Slack plan cards, `plan.md` and CLI
+  plan output now state when a plan declares no write paths. The planner's
+  instructions now ask for `touchSet` on every plan, so expect more plans to
+  declare one and more grant requests when a worker writes outside it.
+- Changed: a merge no longer waits for a running mission, and a mission can
+  start during a merge, when the mission works in its own worktree (the
+  default). Merges still run one at a time, and a mission that works in the
+  primary checkout still excludes a merge.
+- Changed: every `kranz serve` response now forbids being shown inside a
+  frame (`Content-Security-Policy: frame-ancestors 'none'`,
+  `X-Frame-Options: DENY`) and sets `X-Content-Type-Options: nosniff`.
 - Added `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`) behind
   `AcpBackend::with_sgian_terminals` for explicitly opted-in, uncontained host
   ACP sessions (`sandbox.enforce: off`, refused when combined with contained
@@ -36,6 +51,42 @@ Notable user-visible changes are documented here. This project follows
   including 0.5.0 remain available under MIT. Contributions now require a
   Developer Certificate of Origin sign-off and carry the relicensing grant
   described in `CONTRIBUTING.md`.
+- Changed: at most `hooks.ciDraftsPerHour` CI-failure tickets (default 3)
+  are drafted per rolling hour; further failing runs get `429`. Raise it in
+  `~/.kranz/config.json`; a repository's own config may only lower it.
+- Changed: `gh pr create` from the dashboard runs with only the GitHub and
+  network variables it needs, stops after 120 seconds, and is refused when
+  the repository's git config names a program.
+- Changed: the revision panel shows the diff above its buttons and enables
+  Approve only once the diff has loaded.
+- Changed: a Slack plan card for a mission already queued or started says so
+  and offers no approve buttons. A card Slack rejects is replaced by a short
+  notice pointing at the dashboard.
+- Changed: workspace service names must be lowercase letters, digits, `-` or
+  `_`, and cannot be `workspace`.
+- Fixed: `POST /api/missions` now checks a patched `claudeBinary` the way
+  the config files are checked.
+- Fixed: the Gas City pack ignores receipts and state files that are tracked
+  by git.
+- Fixed: on Linux, sandboxed sessions can no longer see the Docker, Podman,
+  containerd and system-bus sockets or the per-user runtime directory. Add a
+  socket's directory to `sandbox.extraWrite` to give a tool access to it.
+- Changed: a mission fails its final gate when a declared pty-script
+  assertion failed in its most recent session. Before, only a missing
+  transcript failed the gate.
+- Fixed: stopping a session or command now also kills descendants that moved
+  to their own session or process group, on macOS and Linux. A process that
+  double-forks and lets its parent exit first is still not found.
+- Fixed: the validator snapshot copies each untracked file through a single
+  open that follows no symbolic link at the file or any directory above it.
+- Changed: workspace bootstrap, readiness and data commands no longer get
+  your ssh agent socket or global git config by default. Declare
+  `SSH_AUTH_SOCK` or `GIT_CONFIG_GLOBAL` in the workspace contract's
+  `secrets[]` and list the same name in `contractEnvPassthrough` to restore
+  either. Without the git config these commands commit as `kranz gate`.
+- Changed: contract-command and pty output shown to the functional validator
+  is fenced as untrusted data, and the orchestrator's state digest keeps each
+  item on one line.
 - Changed: the plan review, ticket page, status strip and delivered panel
   show hidden and reordering characters as `\uXXXX` escapes, and the plan
   review says when a plan contains any.

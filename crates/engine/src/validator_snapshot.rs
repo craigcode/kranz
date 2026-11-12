@@ -291,6 +291,95 @@ impl Drop for ValidatorSnapshot {
     }
 }
 
+/// Open `rel` beneath `root` for reading without following a symbolic link
+/// at ANY component, and without blocking on a FIFO or device.
+///
+/// Unix walks the path one component at a time with `openat` and
+/// `O_NOFOLLOW`, so a directory swapped for a link mid-walk is refused by the
+/// kernel instead of being followed. Elsewhere the leaf is checked and then
+/// opened by path, which keeps the old window.
+#[cfg(unix)]
+fn open_beneath_no_follow(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a plain relative path",
+        )
+    };
+    let mut names: Vec<std::ffi::CString> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                names.push(std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?);
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    let Some(leaf) = names.pop() else {
+        return Err(invalid());
+    };
+    let mut dir: OwnedFd = std::fs::File::open(root)?.into();
+    for name in &names {
+        // SAFETY: `dir` is an open descriptor and `name` a NUL-terminated
+        // string, both alive for the call; a non-negative return is a new
+        // descriptor this code now owns.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    // SAFETY: as above.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_beneath_no_follow(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    let path = root.join(rel);
+    if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symbolic link",
+        ));
+    }
+    std::fs::File::open(path)
+}
+
+/// Whether an open failed because a component was a link (`ELOOP`), or a
+/// parent that should be a directory was one (`ENOTDIR` under `O_NOFOLLOW`).
+fn is_link_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR || code == libc::EMLINK
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::InvalidInput
+    }
+}
+
 /// Byte-copy the worker's untracked non-ignored files into the snapshot,
 /// preserving repo-relative paths. A file that vanishes between the
 /// `ls-files` listing and the copy is skipped (a racing external process
@@ -312,20 +401,30 @@ fn copy_untracked(
     for rel in untracked {
         let src = session_root.join(rel);
         let dst = snapshot_root.join(rel);
-        let metadata = match std::fs::symlink_metadata(&src) {
-            Ok(m) => m,
+        // One open decides what is copied: the entry is opened beneath the
+        // session root with no link followed at any component, and the type
+        // check and the bytes both come from that handle. A stat followed by
+        // a path copy left a window to swap the entry, or a directory above
+        // it, for a link to a file the validator must not read (audit M13).
+        let mut source = match open_beneath_no_follow(session_root, Path::new(rel)) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if is_link_refusal(&e) => {
+                skipped.push(format!("{} (symlink)", rel.to_string_lossy()));
+                continue;
+            }
             Err(e) => {
                 return Err(EngineError::Git(format!(
-                    "snapshot untracked stat {}: {e}",
+                    "snapshot untracked open {}: {e}",
                     src.display()
                 )))
             }
         };
+        let metadata = source.metadata().map_err(|e| {
+            EngineError::Git(format!("snapshot untracked stat {}: {e}", src.display()))
+        })?;
         if !metadata.file_type().is_file() {
-            let kind = if metadata.file_type().is_symlink() {
-                "symlink"
-            } else if metadata.file_type().is_dir() {
+            let kind = if metadata.file_type().is_dir() {
                 "dir"
             } else {
                 "special"
@@ -338,16 +437,15 @@ fn copy_untracked(
                 EngineError::Git(format!("snapshot untracked {}: {e}", parent.display()))
             })?;
         }
-        match std::fs::copy(&src, &dst) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(EngineError::Git(format!(
-                    "snapshot untracked copy {} -> {}: {e}",
-                    src.display(),
-                    dst.display()
-                )))
-            }
+        let copied = std::fs::File::create(&dst)
+            .and_then(|mut out| std::io::copy(&mut source, &mut out).map(|_| ()))
+            .and_then(|()| std::fs::set_permissions(&dst, metadata.permissions()));
+        if let Err(e) = copied {
+            return Err(EngineError::Git(format!(
+                "snapshot untracked copy {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            )));
         }
     }
     Ok((!skipped.is_empty()).then(|| {
@@ -628,6 +726,62 @@ fn copy_dir_contents(src: &cap_std::fs::Dir, dst: &cap_std::fs::Dir) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit M13: the untracked copy opens each entry once, beneath the
+    /// session root, following no link at the entry or at any directory
+    /// above it. A link to an authority file is skipped and named, a link
+    /// in the directory chain is skipped, and an ordinary file crosses with
+    /// its mode.
+    #[cfg(unix)]
+    #[test]
+    fn untracked_copy_follows_no_link_at_the_entry_or_above_it() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session");
+        let snapshot = dir.path().join("snapshot");
+        let outside = dir.path().join("outside");
+        for d in [&session, &snapshot, &outside] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(outside.join("serve.token"), "fake-authority").unwrap();
+        std::fs::create_dir(session.join("real")).unwrap();
+        std::fs::write(session.join("real/tool.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            session.join("real/tool.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        // A leaf link, and a directory link that makes `via/serve.token`
+        // resolve outside the session.
+        symlink(outside.join("serve.token"), session.join("leak")).unwrap();
+        symlink(&outside, session.join("via")).unwrap();
+
+        let listed: Vec<std::ffi::OsString> = ["real/tool.sh", "leak", "via/serve.token", "gone"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let note = copy_untracked(&session, &snapshot, &listed)
+            .unwrap()
+            .expect("skipped entries are reported");
+
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("real/tool.sh")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        let mode = std::fs::metadata(snapshot.join("real/tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "the executable bit crosses");
+        assert!(!snapshot.join("leak").exists());
+        assert!(!snapshot.join("via").exists());
+        assert!(note.contains("leak (symlink)"), "{note}");
+        assert!(note.contains("via/serve.token (symlink)"), "{note}");
+        assert!(note.starts_with("skipped 2 "), "{note}");
+
+        // A path that climbs out of the root is refused, not resolved.
+        assert!(open_beneath_no_follow(&session, Path::new("../outside/serve.token")).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

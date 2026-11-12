@@ -319,15 +319,38 @@ fn parses_draft_from_mission() {
 #[test]
 fn parses_queue() {
     let cli = Cli::try_parse_from(["kranz", "queue"]).unwrap();
-    assert!(matches!(cli.command, Command::Queue { remove: None }));
+    assert!(matches!(
+        cli.command,
+        Command::Queue {
+            remove: None,
+            timing: false,
+            ..
+        }
+    ));
 
     let remove = Cli::try_parse_from(["kranz", "queue", "--remove", "m-abc123"]).unwrap();
     assert!(matches!(
         remove.command,
         Command::Queue {
-            remove: Some(ref mission_id)
+            remove: Some(ref mission_id),
+            ..
         } if mission_id == "m-abc123"
     ));
+
+    let timing = Cli::try_parse_from(["kranz", "queue", "--timing", "--json"]).unwrap();
+    assert!(matches!(
+        timing.command,
+        Command::Queue {
+            remove: None,
+            timing: true,
+            json: true,
+        }
+    ));
+    assert!(
+        Cli::try_parse_from(["kranz", "queue", "--timing", "--remove", "m-abc123"]).is_err(),
+        "--timing is a read-only report and does not combine with --remove"
+    );
+    assert!(Cli::try_parse_from(["kranz", "queue", "--json"]).is_err());
 }
 
 #[test]

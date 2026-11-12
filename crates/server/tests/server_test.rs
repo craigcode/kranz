@@ -1684,6 +1684,73 @@ async fn api_responses_are_no_store_and_shell_is_no_cache() {
     assert!(response.headers().get(header::CACHE_CONTROL).is_none());
 }
 
+/// Audit UI-9/SRV-8: no response from `kranz serve` may be framed by another
+/// page, whether it is the dashboard shell, a script, an API answer or an
+/// error.
+#[tokio::test]
+async fn every_response_forbids_framing_and_content_sniffing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let static_dir = tmp.path().join("dist");
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(
+        static_dir.join("index.html"),
+        "<html>kranz dashboard</html>",
+    )
+    .unwrap();
+    std::fs::write(static_dir.join("app.js"), "console.log('hi')").unwrap();
+    let app = kranz_server::router(repo_root, Some(static_dir));
+
+    for uri in [
+        "/",
+        "/app.js",
+        "/api/health",
+        "/api/no-such-route",
+        "/api/missions/..%2f",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "frame-ancestors 'none'",
+            "{uri}"
+        );
+        assert_eq!(
+            headers.get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY",
+            "{uri}"
+        );
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff",
+            "{uri}"
+        );
+    }
+
+    // `nosniff` makes the browser trust the declared type, so the dashboard's
+    // own script and stylesheet must be declared as what they are or they
+    // would stop loading.
+    std::fs::write(tmp.path().join("dist").join("app.css"), "body{}").unwrap();
+    for (uri, expected) in [
+        ("/app.js", "javascript"),
+        ("/app.css", "text/css"),
+        ("/", "text/html"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(content_type.contains(expected), "{uri}: {content_type}");
+    }
+}
+
 #[tokio::test]
 async fn embedded_static_serves_files_with_spa_fallback() {
     static FILES: [kranz_server::EmbeddedFile; 2] = [
@@ -2385,6 +2452,42 @@ async fn merge_route_refuses_while_the_repo_busy_lock_is_held() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
     assert_eq!(raw_git(&repo_root, &["rev-parse", "main"]).trim(), base_sha);
+}
+
+/// Ticket repo-lock-split: a mission running in its own worktree no longer
+/// blocks the merge of another, delivered mission.
+#[tokio::test]
+async fn merge_route_merges_while_a_worktree_mission_is_running() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    let paths = seed_diffable_mission(&repo_root, "m-land", &base_sha, true);
+    mark_mission_complete(&paths, "m-land");
+    // A second mission, default (worktree) isolation, holding the run lock.
+    seed_diffable_mission(&repo_root, "m-run", &base_sha, false);
+    let _running = kranz_engine::queue::acquire_repo_busy(&repo_root, "m-run").unwrap();
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-land/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(
+        raw_git(&repo_root, &["rev-parse", "main"]).trim(),
+        base_sha,
+        "the base branch advanced"
+    );
+    assert_eq!(
+        kranz_engine::queue::is_repo_busy(&repo_root).as_deref(),
+        Some("m-run"),
+        "the running mission still holds its run lock"
+    );
 }
 
 #[tokio::test]

@@ -69,7 +69,11 @@ impl MissionPaths {
     /// filesystem paths. Reject separators, `..`, and drive designators before
     /// constructing paths from those ids.
     pub fn is_safe_id(id: &str) -> bool {
-        !id.is_empty() && !id.contains(['/', '\\', ':']) && !id.contains("..")
+        !id.is_empty()
+            && !id.starts_with('.')
+            && !id.contains(['/', '\\', ':'])
+            && !id.contains("..")
+            && !id.chars().any(|c| c.is_control() || c.is_whitespace())
     }
 
     pub fn kranz_dir(&self) -> PathBuf {
@@ -1124,7 +1128,19 @@ mod tests {
 
     #[test]
     fn safe_id_rejects_path_traversal_shapes() {
-        for id in ["", "../m-x", "m-x/../../y", "m-x\\..\\y", "c:m-x", "m-.."] {
+        for id in [
+            "",
+            "../m-x",
+            "m-x/../../y",
+            "m-x\\..\\y",
+            "c:m-x",
+            "m-..",
+            ".",
+            ".hidden",
+            "m-1\n",
+            "m 1",
+            "m-\u{0}",
+        ] {
             assert!(!MissionPaths::is_safe_id(id), "{id:?} should be unsafe");
         }
         for id in ["m-abc123", "m-2026-07-08", "m_ticket.linked"] {

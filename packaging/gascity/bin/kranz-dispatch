@@ -186,6 +186,27 @@ valid_mission_id() {
     printf '%s\n' "$1" | grep -qE '^m-[0-9a-f]{6}$'
 }
 
+# A runtime file this adapter may act on: a regular file, not a link, that
+# git does not track. kranz never commits anything under .kranz/missions/, so
+# a tracked receipt or state file came with the repository, not from a
+# mission this host ran, and must not decide which bead is closed.
+runtime_file() {
+    # $1 = rig directory, $2 = path relative to it.
+    [ -f "$1/$2" ] && [ ! -L "$1/$2" ] || return 1
+    if git -C "$1" ls-files --error-unmatch -- "$2" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# Echoes a mission's folded status, or nothing when its state file is absent
+# or not a runtime file.
+mission_status() {
+    # $1 = rig directory, $2 = mission id.
+    runtime_file "$1" ".kranz/missions/$2/state.json" || return 0
+    jq -r '.mission.status // empty' < "$1/.kranz/missions/$2/state.json" 2>/dev/null || true
+}
+
 # Resolve the durable, structured producer binding that `kranz exec
 # --enqueue-source gascity` writes BEFORE exposing the queue entry. Prompt
 # text is never identity: a bead title/description may contain any marker.
@@ -195,6 +216,7 @@ native_binding_mission() {
     [ -n "$BINDING_RIG" ] || return 1
     for SOURCE in "$BINDING_RIG"/.kranz/missions/*/enqueue-source.json; do
         [ -e "$SOURCE" ] || continue
+        runtime_file "$BINDING_RIG" "${SOURCE#"$BINDING_RIG"/}" || continue
         SCHEMA=$(jq -r '.schemaVersion // empty' < "$SOURCE" 2>/dev/null) || SCHEMA=""
         PRODUCER=$(jq -r '.producer // empty' < "$SOURCE" 2>/dev/null) || PRODUCER=""
         BOUND_ID=$(jq -r '.externalRef // empty' < "$SOURCE" 2>/dev/null) || BOUND_ID=""
@@ -236,7 +258,7 @@ native_binding_is_durable() {
     DURABLE_MID=$(native_binding_mission "$1") || return 1
     DURABLE_RIG=$(resolve_rig "$1")
     [ -n "$DURABLE_RIG" ] || return 1
-    DURABLE_STATUS=$(jq -r '.mission.status // empty' < "$DURABLE_RIG/.kranz/missions/$DURABLE_MID/state.json" 2>/dev/null) || DURABLE_STATUS=""
+    DURABLE_STATUS=$(mission_status "$DURABLE_RIG" "$DURABLE_MID")
     if [ "$DURABLE_STATUS" = "approved" ]; then
         native_queue_contains_mission "$DURABLE_RIG" "$DURABLE_MID" && return 0
         SOURCE_CREATED=$(jq -r '.createdUnixSecs // empty' < "$DURABLE_RIG/.kranz/missions/$DURABLE_MID/enqueue-source.json" 2>/dev/null) || SOURCE_CREATED=""

@@ -238,7 +238,9 @@ async fn cmd_exec_with_backend(
             for line in questions.lines() {
                 let line = line.trim();
                 if !line.is_empty() {
-                    eprintln!("  - {line}");
+                    // Model-authored text going to a terminal or CI log:
+                    // control and escape characters are shown, not sent.
+                    eprintln!("  - {}", kranz_engine::presentation::visible(line));
                 }
             }
             println!(

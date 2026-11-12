@@ -7478,7 +7478,8 @@ async fn plan_md_lists_every_grant_the_approval_carries() {
     assert!(md.contains("- `**`"), "{md}");
 }
 
-/// A plan that grants nothing renders no authority section.
+/// A plan that grants nothing renders no authority section, and says that
+/// it declares no write paths (ticket plan-touch-set-coverage).
 #[tokio::test(flavor = "multi_thread")]
 async fn plan_md_omits_authority_when_nothing_is_granted() {
     if !setup() {
@@ -7490,6 +7491,10 @@ async fn plan_md_omits_authority_when_nothing_is_granted() {
     engine.approve_plan(simple_plan(1, vec![])).unwrap();
     let md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
     assert!(!md.contains("Authority granted on approval"), "{md}");
+    assert!(
+        md.contains("**Write paths:** none declared."),
+        "an unbounded plan says so: {md}"
+    );
 }
 
 /// A predictable mission-branch name is not an authority channel. If a

@@ -61,6 +61,14 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the CLI change (`kranz queue --timing`, a read-only report). No gate changed.
+
+Rechecked 2026-11-11 (UTC) against the lock split: the merge takes its own lock (`acquire_repo_merge`), so merges serialize against each other and against a mission that works in the primary checkout, and no longer against a mission running in its own worktree. The merge steps and gate rules are unchanged.
+
+Rechecked 2026-11-11 (UTC) against the second audit round: the worker-run judgement and final-gate judgement prompts carry worker reports, commit subjects and diff stats inside untrusted-text fences. Verdict rules are unchanged.
+
+Rechecked 2026-11-11 (UTC) against the evidence fixes: each contract-command and failing pty result reaches the functional validator as an engine-written verdict line followed by the command's output inside an untrusted-output fence, and the final gate adds a critical finding for a pty-script assertion whose latest transcript verdict is not PASS. Gate commands and the unexecuted-assertion backstop are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the base-policy merge check: the gate suite and the secret allowlist are still read from the live base, and a merge now refuses with `base_policy_changed` when either differs from the approval-time base until the caller accepts the current policy by digest. Gate execution order and stop-at-first-failure are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the push-guard and secret-scan fixes: the diff scan now tracks hunks, so added lines that start with `++` are scanned and header-shaped content cannot switch on the generated-bundle exemption; a checkpoint diff that cannot be read refuses the commit; the bearer and basic rules honour the placeholder allowlist and skip plain prose. Gate commands and contracts are unchanged.
@@ -428,8 +436,9 @@ in order, refusing early and leaving base untouched on any failure:
    optional `whenPaths` prefixes select component-specific gates. Stops at the
    first failure → `GateFailed`.
 6. Recheck that the live base SHA has not moved, then fast-forward it to the
-   exact tested merge commit. The repo-busy lock serializes this transaction
-   against runs and sibling Merge requests.
+   exact tested merge commit. The repository's merge lock serializes this
+   transaction against sibling Merge requests, and against a running mission
+   only when that mission works in the primary checkout.
 
 Kranz's tracked suite mirrors its CI: fmt/clippy/workspace tests always, plus
 the six dashboard gates when `apps/dashboard` changed. Other repositories

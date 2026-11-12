@@ -378,6 +378,10 @@ impl MissionHost {
             })?;
         }
         config::validate(&cfg)?;
+        // `config::load` checked the layered files' `claudeBinary`; a request
+        // patch can replace it afterwards, and it names the program this host
+        // is about to execute (audit M22).
+        config::validate_claude_binary(&cfg, &self.repo_root)?;
 
         let backend = self.backend(cfg.claude_binary.as_deref()).await?;
         let engine = MissionEngine::create(backend, self.repo_root.clone(), goal, cfg)?;
@@ -791,19 +795,22 @@ impl MissionHost {
             return Err(ApiError::not_found(format!("unknown mission '{id}'")));
         }
         // Serialize the complete read/pin/integrate/gate/advance transaction
-        // against mission runs and other merges in this repo. The hold moves
+        // against other merges in this repo, and against a mission that
+        // works in the primary checkout. A mission running in its own
+        // worktree no longer blocks a merge, nor a merge it. The hold moves
         // INTO the blocking task below: if the client disconnects mid-gate-
         // suite this handler future is dropped, but the detached blocking
         // merge keeps mutating the primary tree — a hold living here would
-        // be released early, letting a dispatcher claim the busy repo.
-        let repo_busy = kranz_engine::queue::acquire_repo_busy(&self.repo_root, id).map_err(
-            |error| match error {
-                error @ EngineError::LockHeld(_) => {
-                    ApiError::from(error).with_code(ApiErrorCode::RepositoryBusy)
+        // be released early, letting a second merge start.
+        let repo_busy =
+            kranz_engine::queue::acquire_repo_merge(&self.repo_root, id).map_err(|error| {
+                match error {
+                    error @ EngineError::LockHeld(_) => {
+                        ApiError::from(error).with_code(ApiErrorCode::RepositoryBusy)
+                    }
+                    other => other.into(),
                 }
-                other => other.into(),
-            },
-        )?;
+            })?;
         let events = EventLog::read_events(&paths.events_file())?;
         let state = kranz_engine::reducer::fold(&events).map_err(ApiError::from)?;
         if state.mission.status != MissionStatus::Complete {
@@ -893,7 +900,7 @@ impl MissionHost {
                 kranz_engine::live_permission::Actor::LocalMutationCapability,
                 accepted_base_policy.as_deref(),
             );
-            // Explicit: the repo-busy hold is released HERE, once the merge
+            // Explicit: the merge hold is released HERE, once the merge
             // has fully finished — never earlier by a dropped handler future.
             drop(repo_busy);
             report
@@ -2618,6 +2625,32 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(json!(actual), fixture);
+    }
+
+    /// Audit M22: a request patch is merged after the layered files were
+    /// checked, so the binary it names is checked again before anything runs.
+    #[tokio::test]
+    async fn create_refuses_a_patched_claude_binary_the_file_layers_would_refuse() {
+        let Some((_dir, root)) = init_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+        let host = MissionHost::with_backend(root.clone(), backend);
+        let inside = root.join("tools").join("claude");
+
+        for binary in [
+            json!("bin/claude"),
+            json!(inside.to_str().unwrap()),
+            json!(""),
+        ] {
+            let patch = json!({ "claudeBinary": binary });
+            let err = host
+                .create("ship it", Some(&patch))
+                .await
+                .expect_err("a relative, in-repo or empty binary must be refused");
+            assert!(err.message.contains("claudeBinary"), "{}", err.message);
+        }
+        assert!(kranz_engine::paths::MissionPaths::list_missions(&root).is_empty());
     }
 
     #[tokio::test]

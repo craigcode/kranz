@@ -80,6 +80,24 @@ describe('PlanReview', () => {
     expect(text).not.toMatch(/[\u202e\u200b]/);
   });
 
+  it('says when a plan declares no write paths, and not when it declares some', () => {
+    const { unmount } = render(<PlanReview />);
+    expect(screen.getByRole('note').textContent).toContain('none declared');
+    unmount();
+
+    const bounded = plan();
+    bounded.touchSet = ['crates/engine/**'];
+    useKranzStore.setState({
+      planning: {
+        ...useKranzStore.getState().planning,
+        review: { planIdentity: 'reviewed-plan-a', plan: bounded, estimate: estimate() },
+      },
+    });
+    render(<PlanReview />);
+    expect(screen.queryByRole('note')).toBeNull();
+    expect(screen.getByText('crates/engine/**')).toBeTruthy();
+  });
+
   it('shows no hidden-character notice for an ordinary plan', () => {
     render(<PlanReview />);
     expect(screen.queryByRole('status')).toBeNull();

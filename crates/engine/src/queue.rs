@@ -294,6 +294,7 @@ pub fn enqueue(repo_root: &Path, entry: QueueEntry) -> Result<QueueEntry> {
     let entry = QueueEntry { seq, ..entry };
     let json = serde_json::to_string_pretty(&entry)?;
     atomic_write(&dir.join(entry.file_name()), json.as_bytes())?;
+    crate::queue_timing::record_enqueue(repo_root, &entry.mission_id);
     Ok(entry)
 }
 
@@ -360,6 +361,9 @@ pub fn contains(repo_root: &Path, mission_id: &str) -> bool {
 
 // ---------------------------------------------------------------------------
 // Repo busy guard: one RUNNING mission per working tree
+//
+// This is the RUN lock. Merges take their own lock ([`acquire_repo_merge`])
+// and exclude a run only when that run works in the primary checkout.
 // ---------------------------------------------------------------------------
 
 fn repo_busy_lock(repo_root: &Path) -> PathBuf {
@@ -427,10 +431,26 @@ impl RepoBusyGuard {
                         let _ = std::fs::remove_file(&lock_path);
                         return Err(e);
                     }
-                    return Ok(Self {
+                    let guard = Self {
                         lock_path,
                         mission_path,
-                    });
+                    };
+                    // A merge advances the base branch in the primary
+                    // checkout. A mission whose workers write in that same
+                    // checkout must not start under it; one that works in
+                    // its own worktree may. The run lock is taken BEFORE
+                    // this look and the merge takes its lock before looking
+                    // for a run, so at least one side always sees the other.
+                    // Dropping `guard` on refusal releases the run lock.
+                    if merge_in_progress(repo_root) && !works_in_own_worktree(repo_root, mission_id)
+                    {
+                        return Err(EngineError::LockHeld(
+                            "a merge is in progress in this repository and this mission \
+                             works in the primary checkout"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(guard);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if lock_pid_is_alive(&lock_path) {
@@ -474,6 +494,101 @@ pub fn acquire_repo_busy(repo_root: &Path, mission_id: &str) -> Result<RepoBusyH
     Ok(RepoBusyHold {
         _inner: RepoBusyGuard::acquire_allowing_own_legacy(repo_root, mission_id, true)?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Merge lock: one merge at a time, independent of the run lock
+// ---------------------------------------------------------------------------
+
+fn repo_merge_lock(repo_root: &Path) -> PathBuf {
+    queue_dir(repo_root).join(".repo.merge.lock")
+}
+
+fn merge_in_progress(repo_root: &Path) -> bool {
+    let lock = repo_merge_lock(repo_root);
+    lock.exists() && lock_pid_is_alive(&lock)
+}
+
+/// Whether `mission_id`'s recorded config isolates its workers in a worktree,
+/// read from its own event log. Unknown (no log, unreadable, unfoldable)
+/// counts as "no": the caller then keeps runs and merges apart.
+fn works_in_own_worktree(repo_root: &Path, mission_id: &str) -> bool {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return false;
+    }
+    let events_file = MissionPaths::new(repo_root, mission_id).events_file();
+    crate::event_log::EventLog::read_events(&events_file)
+        .ok()
+        .and_then(|events| crate::reducer::fold(&events).ok())
+        .is_some_and(|state| state.config.isolation() == crate::types::WorkerIsolation::Worktree)
+}
+
+/// RAII hold on the repository's merge lock.
+#[derive(Debug)]
+pub struct RepoMergeHold {
+    lock_path: PathBuf,
+}
+
+impl Drop for RepoMergeHold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Take the merge lock for merging `mission_id`.
+///
+/// Merges serialize against each other always. They no longer serialize
+/// against every run: a merge works in a detached scratch worktree on pinned
+/// base and tip commits, so a mission running in its OWN worktree is not
+/// disturbed by it and does not disturb it. Refused with
+/// [`EngineError::LockHeld`] when another merge is live, or when a mission
+/// is running that works in the primary checkout (`workerIsolation:
+/// "checkout"`) or whose isolation cannot be read. A live log lock held for
+/// `mission_id` itself is not a conflict, as with [`acquire_repo_busy`].
+pub fn acquire_repo_merge(repo_root: &Path, mission_id: &str) -> Result<RepoMergeHold> {
+    std::fs::create_dir_all(queue_dir(repo_root))?;
+    let lock_path = repo_merge_lock(repo_root);
+    let mut hold = None;
+    for _ in 0..16 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                write!(file, "{}", crate::event_log::current_lock_holder_record())?;
+                file.sync_data()?;
+                hold = Some(RepoMergeHold {
+                    lock_path: lock_path.clone(),
+                });
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_pid_is_alive(&lock_path) {
+                    return Err(EngineError::LockHeld(
+                        "another merge is in progress in this repository".to_string(),
+                    ));
+                }
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let Some(hold) = hold else {
+        return Err(EngineError::LockHeld(
+            "repo merge lock changed too often to acquire safely".to_string(),
+        ));
+    };
+    // Looked at only once the merge lock is held (see the run side).
+    if let Some(running) = is_repo_busy(repo_root) {
+        if running != mission_id && !works_in_own_worktree(repo_root, &running) {
+            return Err(EngineError::LockHeld(format!(
+                "repo is busy with mission {running}, which works in the primary checkout"
+            )));
+        }
+    }
+    Ok(hold)
 }
 
 // ---------------------------------------------------------------------------

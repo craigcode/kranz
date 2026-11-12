@@ -93,6 +93,11 @@ Approval never happens inside this conversation: the human triggers a FORMAL pla
   },
   "commandGrants": [
     "gc lint"
+  ],
+  "touchSet": [
+    "crates/engine/src/**",
+    "crates/engine/tests/**",
+    "docs/protocol.md"
   ]
 }
 ```
@@ -103,6 +108,8 @@ a concise chosen approach and at least two rejected shapes with one-line
 trade-offs so the human approval gate can see what was weighed.
 
 `commandGrants` is an optional, top-level array of read-only shell commands granted mission-wide: every worker AND validator session may run them (and their `--help` forms), regardless of which feature or milestone they're working. It is the single source of truth shared by both surfaces, so use it for brief-granted command exceptions — e.g. a project CLI like `gc lint` — that validators must be able to re-run to independently verify a worker's claim rather than trusting it blind.
+
+`touchSet` is a top-level array of glob patterns naming every path the mission may change: source, tests, docs, lockfiles and generated files the work will touch. Declare it on every plan. The human approving the plan sees it as the bound on what the mission may write, a write outside it stops the mission to ask for a grant, and a plan without one is shown to the reviewer as having no bound at all. Keep it as narrow as the work allows and no narrower: prefer `crates/engine/src/**` to `**`, and include the files a change of this kind always drags along (a changelog, a lockfile, an embedded bundle).
 
 ---
 
