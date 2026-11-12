@@ -542,10 +542,7 @@ fn is_resolved_ip_allowed_for_entries(
         std::net::IpAddr::V4(v4) => v4.is_link_local(),
         std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     };
-    if canonical_ip.is_unspecified() || is_link_local {
-        return false;
-    }
-    true
+    !(canonical_ip.is_unspecified() || is_link_local)
 }
 
 fn proxy_authorization(head: &str) -> Option<&str> {
