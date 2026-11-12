@@ -61,6 +61,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-11 (UTC) against the CLI change (`kranz queue --timing`, a read-only report). No gate changed.
+
 Rechecked 2026-11-11 (UTC) against the lock split: the merge takes its own lock (`acquire_repo_merge`), so merges serialize against each other and against a mission that works in the primary checkout, and no longer against a mission running in its own worktree. The merge steps and gate rules are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the second audit round: the worker-run judgement and final-gate judgement prompts carry worker reports, commit subjects and diff stats inside untrusted-text fences. Verdict rules are unchanged.

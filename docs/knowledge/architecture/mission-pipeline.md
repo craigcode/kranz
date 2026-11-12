@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-11 (UTC) against queue timing: queueing a mission now also writes a `runs/queue-receipt.json` (time queued, and the mission running then), read only by `kranz queue --timing`. Queue order, claims and the pipeline stages are unchanged.
+
 Rechecked 2026-11-11 (UTC) against the lock split: the run lock still admits one mission per repository; the merge lock is separate. Pipeline stages and their order are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the second audit round: the findings-conversion turn takes validator findings inside an untrusted-text fence; `kranz exec` prints planner questions with control characters shown as escapes; mission ids beginning with a dot or containing control or whitespace characters are refused. Pipeline stages and their order are unchanged.

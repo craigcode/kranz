@@ -77,6 +77,7 @@ pub mod prompts;
 pub mod provenance;
 pub mod pty_harness;
 pub mod queue;
+pub mod queue_timing;
 pub mod reducer;
 pub mod report_render;
 pub mod review_artifact;

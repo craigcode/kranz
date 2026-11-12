@@ -399,6 +399,62 @@ pub fn cmd_queue(repo: &Path) -> String {
     render_queue(&entries, busy.as_deref())
 }
 
+/// `kranz queue --timing`: how long each mission waited and ran, and whether
+/// its plan declared write paths (tickets queue-wait-metrics and
+/// plan-touch-set-coverage). Read-only.
+pub fn cmd_queue_timing(repo: &Path, json: bool) -> Result<String> {
+    let summary = kranz_engine::queue_timing::summary(repo);
+    if json {
+        return Ok(serde_json::to_string_pretty(&summary)? + "\n");
+    }
+    Ok(render_queue_timing(&summary))
+}
+
+fn duration_label(secs: Option<i64>) -> String {
+    match secs {
+        None => "-".to_string(),
+        Some(s) if s < 60 => format!("{s}s"),
+        Some(s) if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        Some(s) => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+fn render_queue_timing(summary: &kranz_engine::queue_timing::TimingSummary) -> String {
+    let mut out = String::new();
+    out.push_str("mission     waited   ran      queued behind\n");
+    for mission in &summary.missions {
+        if mission.started_at.is_none() && mission.queued_at.is_none() {
+            continue;
+        }
+        out.push_str(&format!(
+            "{:<11} {:<8} {:<8} {}\n",
+            kranz_engine::presentation::visible(&mission.mission_id),
+            duration_label(mission.waited_secs()),
+            duration_label(mission.ran_secs()),
+            mission
+                .running_at_enqueue
+                .as_deref()
+                .map(kranz_engine::presentation::visible)
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+    out.push_str(&format!(
+        "\n{} mission(s) with a recorded queue wait: total {}, median {}; {} queued while another was running\n",
+        summary.measured,
+        duration_label(Some(summary.total_waited_secs)),
+        duration_label(summary.median_waited_secs),
+        summary.waited_behind_another,
+    ));
+    out.push_str(&format!(
+        "plans declaring write paths: {} of {}\n",
+        summary.plans_declaring_write_paths, summary.plans_approved
+    ));
+    out.push_str(
+        "\"-\" means not recorded: a mission that was never queued, or queued before timing was recorded.\n",
+    );
+    out
+}
+
 /// `kranz queue --remove <mission-id>`: retire only the runnable queue entry.
 /// The mission record remains append-only/auditable and may be abandoned or
 /// re-enqueued by the caller's own lifecycle policy.
