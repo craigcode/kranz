@@ -28,6 +28,7 @@ mod embedded_dashboard {
 }
 
 pub mod amm;
+pub mod atlas;
 pub mod backlog;
 pub mod cli;
 pub mod commands;

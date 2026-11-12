@@ -87,6 +87,65 @@ fn parses_ticket_show() {
 }
 
 #[test]
+fn parses_ticket_import_atlas_with_defaults_and_every_flag() {
+    let cli = Cli::try_parse_from(["kranz", "ticket", "import-atlas", "bundles/app"]).unwrap();
+    match cli.command {
+        Command::Ticket {
+            command:
+                TicketCommand::ImportAtlas {
+                    path,
+                    prefix,
+                    map_dir,
+                    target_note,
+                    force,
+                },
+        } => {
+            assert_eq!(path, std::path::PathBuf::from("bundles/app"));
+            assert_eq!(prefix, "atlas");
+            assert_eq!(map_dir, "atlas-coverage");
+            assert_eq!(target_note, None);
+            assert!(!force);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "kranz",
+        "ticket",
+        "import-atlas",
+        "bundles/app",
+        "--prefix",
+        "legacy",
+        "--map-dir",
+        "migration/maps",
+        "--target-note",
+        "the stack in docs/target.md",
+        "--force",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Ticket {
+            command:
+                TicketCommand::ImportAtlas {
+                    prefix,
+                    map_dir,
+                    target_note,
+                    force,
+                    ..
+                },
+        } => {
+            assert_eq!(prefix, "legacy");
+            assert_eq!(map_dir, "migration/maps");
+            assert_eq!(target_note.as_deref(), Some("the stack in docs/target.md"));
+            assert!(force);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    assert!(Cli::try_parse_from(["kranz", "ticket", "import-atlas"]).is_err());
+}
+
+#[test]
 fn parses_ticket_new_with_title_and_goal() {
     let cli = Cli::try_parse_from([
         "kranz",
