@@ -2454,6 +2454,42 @@ async fn merge_route_refuses_while_the_repo_busy_lock_is_held() {
     assert_eq!(raw_git(&repo_root, &["rev-parse", "main"]).trim(), base_sha);
 }
 
+/// Ticket repo-lock-split: a mission running in its own worktree no longer
+/// blocks the merge of another, delivered mission.
+#[tokio::test]
+async fn merge_route_merges_while_a_worktree_mission_is_running() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo_root, base_sha) = init_repo();
+    let paths = seed_diffable_mission(&repo_root, "m-land", &base_sha, true);
+    mark_mission_complete(&paths, "m-land");
+    // A second mission, default (worktree) isolation, holding the run lock.
+    seed_diffable_mission(&repo_root, "m-run", &base_sha, false);
+    let _running = kranz_engine::queue::acquire_repo_busy(&repo_root, "m-run").unwrap();
+    let app = merge_app(&repo_root, |_cmd, _cwd| (true, String::new()));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-land/merge",
+        Some(MERGE_TOKEN),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(
+        raw_git(&repo_root, &["rev-parse", "main"]).trim(),
+        base_sha,
+        "the base branch advanced"
+    );
+    assert_eq!(
+        kranz_engine::queue::is_repo_busy(&repo_root).as_deref(),
+        Some("m-run"),
+        "the running mission still holds its run lock"
+    );
+}
+
 #[tokio::test]
 async fn merge_route_merges_on_green_gates_and_flips_the_merged_bit() {
     if !setup() {

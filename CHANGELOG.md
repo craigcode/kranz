@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: a merge no longer waits for a running mission, and a mission can
+  start during a merge, when the mission works in its own worktree (the
+  default). Merges still run one at a time, and a mission that works in the
+  primary checkout still excludes a merge.
 - Changed: every `kranz serve` response now forbids being shown inside a
   frame (`Content-Security-Policy: frame-ancestors 'none'`,
   `X-Frame-Options: DENY`) and sets `X-Content-Type-Options: nosniff`.
