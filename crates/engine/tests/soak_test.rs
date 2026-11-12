@@ -682,6 +682,197 @@ async fn run_conflict_iteration(iter: usize) {
 // The soak driver
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Merge during a run (ticket repo-lock-split): a delivered mission is merged
+// into the base branch WHILE another mission runs in its own worktree
+// ---------------------------------------------------------------------------
+
+/// A one-feature mission under worktree isolation, approved and ready to
+/// run. The session order is the one `worktree_isolation.rs` proves: the
+/// worker, then the orchestrator's dirty-tree, judgement and lesson turns.
+fn worktree_mission(root: &Path) -> MissionEngine {
+    let commit_as_is = dirty_tree_commit_as_is();
+    let complete = judgement("complete", "");
+    let orchestrator =
+        MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")])
+            .responding(vec![
+                vec![mock_text(&commit_as_is), mock_result_text(&commit_as_is)],
+                vec![mock_text(&complete), mock_result_text(&complete)],
+                vec![mock_text("NONE"), mock_result_text("NONE")],
+            ]);
+    let backend = Arc::new(MockBackend::with_scripts(vec![worker_pass(), orchestrator]));
+    let cfg = MissionConfig {
+        worker_isolation: WorkerIsolation::Worktree,
+        validator_allow_uncontained_degrade: true,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(backend, root, cfg);
+    engine.seed_worker_auth_verdict_for_test(kranz_engine::auth_verify::AuthVerdict::Inconclusive);
+    engine.approve_plan(soak_plan(1, 1)).expect("approve plan");
+    engine
+}
+
+/// One delivered mission, run to Complete under worktree isolation. Returns
+/// its id, pinned base sha and branch.
+async fn deliver_worktree_mission(iter: usize, root: &Path) -> (String, String, String) {
+    let mut engine = worktree_mission(root);
+    let ctx = SoakCtx {
+        iter,
+        variant: "MERGE-DURING-RUN (deliver)",
+        paths: engine.paths().clone(),
+    };
+    let status = run_to_status(&ctx, &mut engine).await;
+    ctx.ensure(
+        status == MissionStatus::Complete,
+        format!("delivering mission returned {status:?}, want Complete"),
+    );
+    let mission = &engine.state().mission;
+    (
+        mission.id.clone(),
+        mission.base_sha.clone().expect("pinned base"),
+        mission.mission_branch.clone(),
+    )
+}
+
+async fn run_merge_during_run_iteration(iter: usize) {
+    let (_dir, root) = init_repo();
+    std::fs::create_dir_all(root.join(".kranz")).unwrap();
+    std::fs::write(
+        root.join(kranz_engine::merge_gate::MERGE_GATES_PATH),
+        "{\"gates\":[{\"command\":\"true\"}]}\n",
+    )
+    .unwrap();
+    raw_git(
+        &root,
+        &["add", "-f", kranz_engine::merge_gate::MERGE_GATES_PATH],
+    );
+    raw_git(&root, &["commit", "-m", "merge gates"]);
+
+    let (delivered_id, delivered_base, delivered_branch) =
+        deliver_worktree_mission(iter, &root).await;
+    let main_before = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+
+    // The second mission: approved now, so its base is the pre-merge main.
+    let mut engine = worktree_mission(&root);
+    let running_id = engine.mission_id().to_string();
+    let ctx = SoakCtx {
+        iter,
+        variant: "MERGE-DURING-RUN",
+        paths: engine.paths().clone(),
+    };
+
+    // The run lock, as a dispatcher would hold it for the whole run.
+    let run_lock = kranz_engine::queue::acquire_repo_busy(&root, &running_id)
+        .unwrap_or_else(|e| ctx.fail(format!("run lock: {e}")));
+
+    // The merge of the delivered mission, on its own thread, under its own
+    // lock, started as the run starts.
+    let merge_root = root.clone();
+    let merge = tokio::task::spawn_blocking(move || {
+        let _merge_lock = kranz_engine::queue::acquire_repo_merge(&merge_root, &delivered_id)
+            .map_err(|e| format!("merge lock: {e}"))?;
+        let repo = GitRepo::open(&merge_root).map_err(|e| format!("open repo: {e}"))?;
+        kranz_engine::merge::merge_mission(
+            &repo,
+            "main",
+            &delivered_base,
+            &delivered_branch,
+            None,
+            None,
+            |_command, _cwd| (true, String::new()),
+        )
+        .map(|report| format!("{report:?}"))
+        .map_err(|e| format!("merge: {e}"))
+    });
+
+    let status = run_to_status(&ctx, &mut engine).await;
+    let merged = merge
+        .await
+        .unwrap_or_else(|e| ctx.fail(format!("merge task panicked: {e}")))
+        .unwrap_or_else(|e| ctx.fail(e));
+    drop(run_lock);
+    ctx.ensure(
+        status == MissionStatus::Complete,
+        format!("running mission returned {status:?}, want Complete"),
+    );
+    ctx.ensure(
+        merged.starts_with("Merged"),
+        format!("the merge during the run did not land: {merged}"),
+    );
+    drop(engine);
+
+    // The base advanced, and only by the merge.
+    let main_after = raw_git(&root, &["rev-parse", "main"]).trim().to_string();
+    ctx.ensure(main_after != main_before, "main did not advance");
+    ctx.ensure(
+        raw_git(
+            &root,
+            &["merge-base", "--is-ancestor", &main_before, "main"],
+        )
+        .is_empty(),
+        "main is not a descendant of its earlier tip",
+    );
+    // The running mission's log is whole and its work is on its own branch,
+    // not on main.
+    let events = read_log(&ctx.paths);
+    for (i, event) in events.iter().enumerate() {
+        ctx.ensure(event.seq == i as u64 + 1, "event seq is not contiguous");
+    }
+    let state = reducer::fold(&events).unwrap_or_else(|e| ctx.fail(format!("fold: {e}")));
+    ctx.ensure(
+        state.mission.status == MissionStatus::Complete,
+        "folded status is not Complete",
+    );
+    let running_branch = state.mission.mission_branch.clone();
+    ctx.ensure(
+        !raw_git(
+            &root,
+            &["log", "--oneline", &format!("main..{running_branch}")],
+        )
+        .trim()
+        .is_empty(),
+        "the running mission delivered no commits of its own",
+    );
+    // The object store and every ref survived both writers.
+    let fsck = Command::new("git")
+        .args(["fsck", "--no-progress", "--connectivity-only"])
+        .current_dir(&root)
+        .output()
+        .expect("spawn git fsck");
+    ctx.ensure(
+        fsck.status.success(),
+        format!("git fsck failed: {}", String::from_utf8_lossy(&fsck.stderr)),
+    );
+    ctx.ensure(
+        raw_git(&root, &["status", "--porcelain", "--untracked-files=no"])
+            .trim()
+            .is_empty(),
+        "the primary checkout has tracked changes",
+    );
+    ctx.ensure(
+        kranz_engine::queue::is_repo_busy(&root).is_none(),
+        "a lock was left behind",
+    );
+}
+
+/// Run by `scripts/soak.sh` alongside the corruption soak.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "merge-during-run soak; run explicitly via scripts/soak.sh"]
+async fn soak_merge_during_run() {
+    if !setup() {
+        return;
+    }
+    let iters: usize = std::env::var("KRANZ_SOAK_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    for i in 0..iters {
+        run_merge_during_run_iteration(i).await;
+        eprintln!("soak iter {}/{iters} [MERGE-DURING-RUN] ok", i + 1);
+    }
+    eprintln!("soak PASS: {iters} merges landed during a running worktree mission");
+}
+
 /// Roadmap M3 corruption soak: `KRANZ_SOAK_ITERS` iterations (default 20),
 /// cycling CLEAN → CRASH+RESUME → CONFLICT, full invariant set after each.
 /// Run via `scripts/soak.sh` (release) or directly:
