@@ -489,6 +489,25 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
         PatchClass::Never,
         "it names a remote workspace URL and the env var holding its token",
     ),
+    // `signals.sentry.secret` is deliberately ABSENT from this list, for the
+    // same reason `hooks.secret` is: it is the per-repository HMAC key
+    // Sentry's inbound webhook signature is checked against, not an
+    // outbound endpoint or a containment escape.
+    ConfigTrustRule::operator_only(
+        "signals.sentry.apiBaseUrl",
+        PatchClass::Never,
+        "it names the endpoint Sentry write-back sends issue updates to",
+    ),
+    ConfigTrustRule::operator_only(
+        "signals.sentry.tokenEnv",
+        PatchClass::Never,
+        "it names the environment variable the Sentry write-back token is read from",
+    ),
+    ConfigTrustRule::operator_only(
+        "signals.sentry.allowedHosts",
+        PatchClass::Never,
+        "it is the host allowlist Sentry write-back may contact",
+    ),
     ConfigTrustRule::operator_only(
         "<role>.acpProfile",
         PatchClass::Never,

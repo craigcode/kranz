@@ -772,8 +772,7 @@ fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
                         "outcome": "proposed"
                     }],
                     "sentry": {
-                        "secret": secret,
-                        "allowedHosts": ["sentry.io"]
+                        "secret": secret
                     }
                 }
             })
