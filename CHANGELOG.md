@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: release builds no longer restore a Rust or npm cache
+  (`.github/workflows/release.yml`), so every release artifact is built only
+  from the tagged source; `scripts/check-release-workflow.py` guards this in
+  CI's `supply-chain` job.
 - Wired `SgianTerminalProvider` automatically into `MissionEngine` and `runner`
   (`AcpBackend::for_mission_worker`) for `checkout`-isolated uncontained ACP
   workers when both an external `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key`
