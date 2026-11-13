@@ -784,9 +784,16 @@ fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
     (dir, root)
 }
 
+/// Builds a Sentry webhook payload with a unique per-call marker field (ignored
+/// by the adapter) so each POSTed body is distinct. The Sentry replay cache keys
+/// on the signed raw body, so byte-identical bodies from separate calls would
+/// otherwise collide as replays against the server's process-wide replay cache.
 fn sentry_payload() -> Value {
+    static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call_id = CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     json!({
         "action": "created",
+        "kranzTestDelivery": call_id,
         "data": {
             "issue": {
                 "id": "998877",
