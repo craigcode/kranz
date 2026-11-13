@@ -7,6 +7,9 @@ version: 2
 updates:
   # Actions are SHA-pinned for supply-chain reasons; dependabot preserves the
   # pin and updates the version comment — this is what keeps pinning cheap.
+  # The allowlist lists exact reviewed commits (no wildcards, github_owned_allowed
+  # false), so any bump here must add the new commit to .github/actions-allowlist.json
+  # in the same PR or check-actions-allowlist.py will fail the workflow.
   - package-ecosystem: github-actions
     directory: /
     schedule:
