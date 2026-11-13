@@ -2,7 +2,7 @@
 title: Skill capture stays outside the harness
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 verified_against:
   - docs/knowledge/decisions/positioning-governance-evidence-layer.md
   - docs/roadmap.md
@@ -11,6 +11,8 @@ verified_against:
   - .kranz/tickets/m5-skill-capture-positioning-decision.md
   - .kranz/tickets/training-corpus-export.md
 ---
+
+Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. The skill-capture decision is unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake positioning note: sealed signal intake and human-consented proposal tickets do not create, install, or optimize skills. The skill-capture decision is unchanged.
 

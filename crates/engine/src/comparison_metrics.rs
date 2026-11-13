@@ -488,6 +488,7 @@ mod tests {
     #[test]
     fn comparison_metrics_no_git_repo_degrades_the_git_derived_denominator() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let _ceiling = crate::agent_env::git_ceiling_at_temp_root();
         // A mission closed inside the window, but the tempdir is no git
         // repository: the mission-derived anchor is recorded while the
         // git-derived count reads absent with its dependency named.

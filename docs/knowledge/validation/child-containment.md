@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-11
+last_verified: 2026-11-13
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -15,6 +15,8 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. The unix socket reach test now prints `SKIP-UNDER-WRAP` when it has no short writable temp root for a socket path. Containment rules are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the Linux socket mask: the bubblewrap wrap shadows the known host control sockets that exist (Docker, containerd, Podman, CRI-O, snapd, the system bus, the systemd private socket, the per-user runtime directory, and the Docker Desktop, Colima, Lima and Rancher directories under the operator's home), on both tiers, unless the location is inside a path the operator made writable. It is a list of known places: a control socket elsewhere and abstract-namespace sockets under `fs` stay reachable.
 
