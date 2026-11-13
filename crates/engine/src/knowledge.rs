@@ -1210,6 +1210,7 @@ mod tests {
     #[test]
     fn knowledge_refresh_reports_git_open_failure() {
         let tmp = tempfile::tempdir().unwrap();
+        let _ceiling = crate::agent_env::git_ceiling_at_temp_root();
         fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
         vault(tmp.path());
         write_note(
