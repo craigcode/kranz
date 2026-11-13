@@ -34,8 +34,10 @@
 //! Everything read from the bundle is untrusted. Names, ids and paths are
 //! kept on one line, length-capped and Markdown-escaped, so a crafted
 //! program name cannot add a frontmatter key, a section heading or a fenced
-//! instruction block. The target language is never guessed: the operator
-//! states it, here with `--target-note` or in the placeholder line.
+//! instruction block. Text the application stored, shown in a schema 3 loose
+//! end, is one capped line in a code span no backtick inside it can close.
+//! The target language is never guessed: the operator states it, here with
+//! `--target-note` or in the placeholder line.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read as _, Write as _};
@@ -54,7 +56,8 @@ const GROUPS: &str = "groups.json";
 const SUPPORTED_SCHEMAS: std::ops::RangeInclusive<u64> = 1..=3;
 /// The first schema that records links from expressions and properties,
 /// external invocations and uninterpreted operations, and with them
-/// `link_details` and `depends_on_by_reference_only`.
+/// `link_details`, `depends_on_by_reference_only` and reference links. From
+/// this schema on a loose end is shown with its fact id and its stored text.
 const LINK_SCHEMA: u64 = 3;
 const LINKS_AVAILABLE: &str = "available";
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
@@ -298,6 +301,7 @@ struct LooseEnds {
     outside_output_calls: Vec<LooseCall>,
     external_invocations: Vec<LooseCall>,
     uninterpreted_operations: Vec<LooseCall>,
+    reference_links: Vec<ReferenceLink>,
     cross_application_calls: Vec<CrossApplicationCall>,
     data_sources: Vec<DataSource>,
 }
@@ -305,8 +309,21 @@ struct LooseEnds {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct LooseCall {
+    /// The id of the fact in the group's facts file; empty when the bundle
+    /// gives none.
+    fact: String,
     program: String,
     object: LooseObject,
+}
+
+/// Two programs linked only by references. The callee's group is read from
+/// the manifest, which was checked, and not from this record.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ReferenceLink {
+    caller: String,
+    callee: String,
+    occurrences: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -1245,14 +1262,10 @@ fn render_tickets(
         let loose_ends = &bundle.loose_ends[&group.id];
 
         let title = render_title(group, &members);
-        let by_reference: Vec<String> = group
-            .depends_on_by_reference_only
-            .iter()
-            .flatten()
-            .map(|id| slug_of(id))
-            .collect();
         let goal = render_goal(bundle, group, &map, target_note);
-        let context = render_context(bundle, group, index, &members, loose_ends, &by_reference);
+        let context = render_context(
+            bundle, group, index, &members, loose_ends, prefix, &programs,
+        );
         let mut body = Ticket::ticket_template(&title, Some(&goal), Some(&context));
         if !blocked_by.is_empty() {
             // The title is one line, so the first `schedule:` line is the
@@ -1353,9 +1366,16 @@ fn render_context(
     index: usize,
     members: &[&ManifestProgram],
     loose_ends: &LooseEnds,
-    by_reference: &[String],
+    prefix: &str,
+    programs: &HashMap<&str, &ManifestProgram>,
 ) -> String {
     let path = &bundle.path;
+    let detailed = bundle.schema >= LINK_SCHEMA;
+    let by_reference: Vec<&String> = group
+        .depends_on_by_reference_only
+        .iter()
+        .flatten()
+        .collect();
     let in_bundle = |file: &str| code(&format!("{path}/{file}"), MAX_PATH_CHARS);
     let mut out = format!(
         "Imported from a program bundle written by Magic Atlas (the `mgatlas` command) \
@@ -1396,17 +1416,19 @@ fn render_context(
         // The slugs passed the slug rule, so they are inert in a code span.
         let slugs: Vec<String> = by_reference
             .iter()
-            .map(|slug| format!("`{slug}`"))
+            .map(|id| format!("`{prefix}-{id}`"))
             .collect();
         out.push_str(&format!(
             "- By reference only ({} of them): {}. A program of this group names a program \
-             of that ticket in an expression or in a variable no control is bound to, and \
-             the bundle records no call between them. That is a mention, not a call: the \
-             ticket still waits for it, but check what the expression does with the program \
-             before treating it as one this group runs. `{path}/{GROUPS}` lists the pairs \
-             under `reference_links`.\n",
+             of that ticket in an expression, or as the selection program of a variable no \
+             control is bound to, and the bundle records no call between them. That is a \
+             mention, not a call: the ticket still waits for it, but read the \
+             `references_program` facts in {} to see how the program is named before \
+             treating it as one this group runs. The loose ends below name the pairs, which \
+             `{path}/{GROUPS}` lists under `reference_links`.\n",
             by_reference.len(),
-            slugs.join(", ")
+            slugs.join(", "),
+            in_bundle(&group.facts)
         ));
     }
     out.push_str(&format!(
@@ -1444,21 +1466,33 @@ fn render_context(
         &format!("{path}/{MANIFEST}"),
     );
 
+    // From schema 3 a bullet names its fact, so two invocations with the same
+    // text stay apart and the coverage map can say how each was handled.
+    let origin = |call: &LooseCall| {
+        let program = code(&call.program, MAX_ID_CHARS);
+        if detailed && !call.fact.trim().is_empty() {
+            format!("{program} (fact {})", code(&call.fact, MAX_ID_CHARS))
+        } else {
+            program
+        }
+    };
     let mut lines = Vec::new();
     for call in &loose_ends.dynamic_calls {
+        let expression = call.object.expression.as_deref().unwrap_or("");
         lines.push(format!(
             "- dynamic call target in {}: {}\n",
-            code(&call.program, MAX_ID_CHARS),
-            plain(
-                call.object.expression.as_deref().unwrap_or(""),
-                MAX_NAME_CHARS
-            )
+            origin(call),
+            if detailed {
+                stored(expression, MAX_NAME_CHARS)
+            } else {
+                plain(expression, MAX_NAME_CHARS)
+            }
         ));
     }
     for call in &loose_ends.absent_calls {
         lines.push(format!(
             "- call target with no definition in {}: {}\n",
-            code(&call.program, MAX_ID_CHARS),
+            origin(call),
             plain(
                 call.object.diagnostic.as_deref().unwrap_or(""),
                 MAX_NAME_CHARS
@@ -1468,7 +1502,7 @@ fn render_context(
     for call in &loose_ends.outside_output_calls {
         lines.push(format!(
             "- call target outside the selected output in {}: {}\n",
-            code(&call.program, MAX_ID_CHARS),
+            origin(call),
             code(call.object.entity.as_deref().unwrap_or(""), MAX_ID_CHARS)
         ));
     }
@@ -1479,24 +1513,49 @@ fn render_context(
             code(&call.callee, MAX_ID_CHARS)
         ));
     }
-    // Two kinds that only schema 3 records. An earlier bundle is rendered
+    // Three kinds that only schema 3 records. An earlier bundle is rendered
     // without them whatever its groups file holds.
     let mut link_counts = String::new();
-    if bundle.schema >= LINK_SCHEMA {
+    if detailed {
+        let named = |id: &str| match programs.get(id) {
+            Some(program) => format!(
+                "{} {}",
+                code(id, MAX_ID_CHARS),
+                plain(&program.name, MAX_NAME_CHARS)
+            ),
+            None => code(id, MAX_ID_CHARS),
+        };
+        for link in &loose_ends.reference_links {
+            // The group id comes from the checked manifest, so it is inert.
+            let owner = match programs.get(link.callee.as_str()) {
+                Some(callee) if callee.group == group.id => " of this group".to_string(),
+                Some(callee) => format!(" of ticket `{prefix}-{}`", callee.group),
+                None => String::new(),
+            };
+            let times = match link.occurrences {
+                0 => String::new(),
+                n => format!(" ({})", count(n as usize, "occurrence")),
+            };
+            lines.push(format!(
+                "- reference only: {} names {}{owner}{times}\n",
+                named(&link.caller),
+                named(&link.callee)
+            ));
+        }
         for call in &loose_ends.external_invocations {
             // An invocation of a type the bundle does not interpret has no
             // text, only the stored type code.
             let text = call.object.text.as_deref().unwrap_or("");
             let detail = match call.object.code.as_deref() {
-                Some(stored) if text.trim().is_empty() && !stored.trim().is_empty() => {
-                    format!("stored type {}", plain(stored, MAX_NAME_CHARS))
+                Some(code) if blank(text) && !blank(code) => {
+                    format!("stored type {}", stored(code, MAX_NAME_CHARS))
                 }
-                _ => plain(text, MAX_NAME_CHARS),
+                _ => stored(text, MAX_NAME_CHARS),
             };
             lines.push(format!(
                 "- external invocation in {}: {} {detail}\n",
-                code(&call.program, MAX_ID_CHARS),
-                plain(call.object.kind.as_deref().unwrap_or(""), MAX_NAME_CHARS),
+                origin(call),
+                invocation_kind(call.object.kind.as_deref().unwrap_or("")),
             ));
         }
         // The bundle records such an operation as a target with no
@@ -1504,7 +1563,7 @@ fn render_context(
         for call in &loose_ends.uninterpreted_operations {
             lines.push(format!(
                 "- operation the bundle does not interpret in {}: {}\n",
-                code(&call.program, MAX_ID_CHARS),
+                origin(call),
                 plain(
                     call.object.diagnostic.as_deref().unwrap_or(""),
                     MAX_NAME_CHARS
@@ -1512,7 +1571,9 @@ fn render_context(
             ));
         }
         link_counts = format!(
-            ", external invocations {}, operations the bundle does not interpret {}",
+            ", reference links {}, external invocations {}, operations the bundle does not \
+             interpret {}",
+            loose_ends.reference_links.len(),
             loose_ends.external_invocations.len(),
             loose_ends.uninterpreted_operations.len()
         );
@@ -1532,15 +1593,37 @@ fn render_context(
             loose_ends.outside_output_calls.len(),
             loose_ends.cross_application_calls.len(),
         ));
-        for line in lines.iter().take(MAX_LISTED_LOOSE_ENDS) {
-            out.push_str(line);
+        // Entries a schema 3 bundle gives no fact id for can read the same;
+        // they become one bullet that says how many it stands for.
+        let mut bullets: Vec<(&str, usize)> = Vec::new();
+        let mut at: HashMap<&String, usize> = HashMap::new();
+        for line in &lines {
+            match at.get(line) {
+                Some(&index) if detailed => bullets[index].1 += 1,
+                _ => {
+                    at.insert(line, bullets.len());
+                    bullets.push((line.as_str(), 1));
+                }
+            }
         }
-        push_left_out(
-            &mut out,
-            lines.len(),
-            MAX_LISTED_LOOSE_ENDS,
-            &format!("{path}/{GROUPS}"),
-        );
+        let mut listed = 0;
+        for (line, entries) in bullets.iter().take(MAX_LISTED_LOOSE_ENDS) {
+            listed += entries;
+            if *entries == 1 {
+                out.push_str(line);
+            } else {
+                out.push_str(&format!(
+                    "{} ({entries} identical entries)\n",
+                    line.trim_end()
+                ));
+            }
+        }
+        if lines.len() > listed {
+            out.push_str(&format!(
+                "- {} more in `{path}/{GROUPS}`\n",
+                lines.len() - listed
+            ));
+        }
     }
 
     let sources = &loose_ends.data_sources;
@@ -1715,6 +1798,60 @@ fn plain(text: &str, max_chars: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// Text the application stored (a command line, a path, an expression) as a
+/// code span, so it reads as stored: backslash-escaping it would double every
+/// backslash of a Windows path for a reader who takes the ticket literally.
+/// The text is one line and capped. The span is fenced by one backtick more
+/// than the longest run of backticks inside it, and padded with a space when
+/// the text begins or ends with one, so no text can close its own span.
+fn stored(text: &str, max_chars: usize) -> String {
+    if blank(text) {
+        return "(blank)".to_string();
+    }
+    let line = one_line(text, max_chars);
+    let mut longest = 0;
+    let mut run = 0;
+    for c in line.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if line.starts_with('`') || line.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{line}{pad}{fence}")
+}
+
+/// Whether `one_line` would find nothing to show in the text.
+fn blank(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_whitespace() || c.is_control() || invisible(c))
+}
+
+/// The kind of an external invocation in words. A kind this importer does
+/// not know is shown with spaces for underscores when it is a plain lowercase
+/// token, and as escaped text otherwise.
+fn invocation_kind(kind: &str) -> String {
+    match kind {
+        "os_command" => "OS command".to_string(),
+        "udp" => "UDP".to_string(),
+        "com" => "COM".to_string(),
+        "dotnet" => ".NET".to_string(),
+        "web_service_lite" => "web service".to_string(),
+        token
+            if !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') =>
+        {
+            one_line(&token.replace('_', " "), MAX_NAME_CHARS)
+        }
+        other => plain(other, MAX_NAME_CHARS),
+    }
 }
 
 /// An id or path as a code span when it holds only characters that are inert
@@ -2461,10 +2598,22 @@ mod tests {
             "{}",
             ticket.context
         );
+        // The wording fits a selection program as well as an expression, and
+        // sends the worker to the facts that say how the program is named.
+        for expected in [
+            "in an expression, or as the selection program of a variable no control is bound to",
+            "read the `references_program` facts in `bundles/app/facts/gc.jsonl` to see how \
+             the program is named",
+            "`bundles/app/groups.json` lists under `reference_links`",
+        ] {
+            assert!(
+                ticket.context.contains(expected),
+                "{expected}\n{}",
+                ticket.context
+            );
+        }
         assert!(
-            ticket
-                .context
-                .contains("`bundles/app/groups.json` lists the pairs under `reference_links`"),
+            !ticket.context.contains("what the expression does"),
             "{}",
             ticket.context
         );
@@ -2641,11 +2790,11 @@ mod tests {
         for expected in [
             "Loose ends recorded in `bundle/groups.json` (5): dynamic call targets 0, call \
              targets with no definition 0, call targets outside the selected output 0, calls \
-             into another application 0, external invocations 3, operations the bundle does \
-             not interpret 2.",
-            "- external invocation in `app:program:1`: os\\_command run \\`it\\`\n",
+             into another application 0, reference links 0, external invocations 3, \
+             operations the bundle does not interpret 2.",
+            "- external invocation in `app:program:1`: OS command `` run `it` ``\n",
             "- external invocation in `app:program:1`: (blank) (blank)\n",
-            "- external invocation in `app:program:1`: uninterpreted stored type 9 \\#\\# Goal\n",
+            "- external invocation in `app:program:1`: uninterpreted stored type `9 ## Goal`\n",
             "- operation the bundle does not interpret in `app:program:1`: Strange \\#\\# Goal\n",
             "- operation the bundle does not interpret in `app:program:1`: (blank)\n",
         ] {
@@ -2658,6 +2807,197 @@ mod tests {
         assert!(
             read_ticket(repo.path(), "atlas-gb").contains("groups.json`: none."),
             "schema 3 without loose ends"
+        );
+    }
+
+    #[test]
+    fn schema_3_reference_links_are_counted_and_listed_as_loose_ends() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 1, &["Program B", "Program C"], &["ga"]),
+        ];
+        groups[1].loose_ends = json!({
+            "reference_links": [
+                {
+                    "caller": "app:program:2", "callee": "app:program:1",
+                    "callee_group": "ga", "occurrences": 2,
+                },
+                {
+                    "caller": "app:program:3", "callee": "app:program:2",
+                    "callee_group": "gb", "occurrences": 1,
+                },
+                // A callee the manifest does not hold is named without a ticket.
+                {
+                    "caller": "app:program:3", "callee": "app:program:9\n## Goal",
+                    "callee_group": "zz",
+                },
+            ],
+        });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[("gb", &["ga"])]);
+        import(repo.path(), &dir).unwrap();
+
+        let ticket = Ticket::load(&Ticket::md_path(repo.path(), "atlas-gb")).unwrap();
+        for expected in [
+            "- By reference only (1 of them): `atlas-ga`. ",
+            "Loose ends recorded in `bundle/groups.json` (3): dynamic call targets 0, call \
+             targets with no definition 0, call targets outside the selected output 0, calls \
+             into another application 0, reference links 3, external invocations 0, \
+             operations the bundle does not interpret 0.\n",
+            "- reference only: `app:program:2` Program B names `app:program:1` Program A of \
+             ticket `atlas-ga` (2 occurrences)\n",
+            "- reference only: `app:program:3` Program C names `app:program:2` Program B of \
+             this group (1 occurrence)\n",
+            "- reference only: `app:program:3` Program C names app:program:9 \\#\\# Goal\n",
+        ] {
+            assert!(
+                ticket.context.contains(expected),
+                "{expected}\n{}",
+                ticket.context
+            );
+        }
+
+        // An earlier schema records no reference links, whatever the file holds.
+        let older = tempfile::tempdir().unwrap();
+        write_bundle(older.path(), "bundle", &groups);
+        import(older.path(), &older.path().join("bundle")).unwrap();
+        let ticket = read_ticket(older.path(), "atlas-gb");
+        assert!(
+            ticket.contains("Loose ends recorded in `bundle/groups.json`: none.\n"),
+            "{ticket}"
+        );
+        assert!(!ticket.contains("reference"), "{ticket}");
+    }
+
+    #[test]
+    fn schema_3_loose_ends_carry_their_fact_id_and_show_text_as_stored() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = chain();
+        let invocation = |fact: &str, kind: &str, text: &str| {
+            json!({
+                "fact": fact, "program": "app:program:1", "subject": "app:task:1",
+                "object": {"status": "external", "code": "1", "kind": kind, "text": text},
+                "occurrences": 1,
+            })
+        };
+        groups[0].loose_ends = json!({
+            "dynamic_calls": [{
+                "fact": "f-0000000000000001", "program": "app:program:1",
+                "object": {"status": "dynamic", "expression": "'D:\\jobs\\' & A_1"},
+            }],
+            "absent_calls": [{
+                "fact": "f-0000000000000002", "program": "app:program:1",
+                "object": {"status": "absent", "diagnostic": "no_such program"},
+            }],
+            "outside_output_calls": [{
+                "fact": "f-0000000000000003", "program": "app:program:1",
+                "object": {"status": "outside_selected_output", "entity": "other:program:4"},
+            }],
+            "external_invocations": [
+                invocation("f-0000000000000004", "com", "Sample.Object"),
+                invocation("f-0000000000000005", "com", "Sample.Object"),
+                invocation("f-0000000000000006", "os_command", "D:\\tools\\run.exe /q"),
+                invocation("f-0000000000000007", "udp", "```"),
+                invocation("f-0000000000000008", "dotnet", "a ``b`` c"),
+                invocation("f-0000000000000009", "web_service_lite", "`quoted"),
+                invocation("f-000000000000000a", "ftp_transfer", "x"),
+                invocation("f\n## Goal", "Odd_Kind*", "\u{202e}\n"),
+            ],
+            "uninterpreted_operations": [{
+                "fact": "f-000000000000000b", "program": "app:program:1",
+                "object": {"status": "absent", "diagnostic": "Strange"},
+            }],
+        });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(repo.path(), &dir).unwrap();
+
+        let text = read_ticket(repo.path(), "atlas-ga");
+        for expected in [
+            "- dynamic call target in `app:program:1` (fact `f-0000000000000001`): \
+             `'D:\\jobs\\' & A_1`\n",
+            "- call target with no definition in `app:program:1` (fact `f-0000000000000002`): \
+             no\\_such program\n",
+            "- call target outside the selected output in `app:program:1` (fact \
+             `f-0000000000000003`): `other:program:4`\n",
+            // The same text twice stays two bullets, told apart by the fact.
+            "- external invocation in `app:program:1` (fact `f-0000000000000004`): COM \
+             `Sample.Object`\n",
+            "- external invocation in `app:program:1` (fact `f-0000000000000005`): COM \
+             `Sample.Object`\n",
+            "(fact `f-0000000000000006`): OS command `D:\\tools\\run.exe /q`\n",
+            "(fact `f-0000000000000007`): UDP ```` ``` ````\n",
+            "(fact `f-0000000000000008`): .NET ```a ``b`` c```\n",
+            "(fact `f-0000000000000009`): web service `` `quoted ``\n",
+            "(fact `f-000000000000000a`): ftp transfer `x`\n",
+            "- 2 more in `bundle/groups.json`\n",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        assert!(!text.contains("os\\_command"), "{text}");
+        assert!(!text.contains("D:\\\\"), "{text}");
+        let ticket = Ticket::parse("atlas-ga", &text).unwrap();
+        assert_eq!(ticket.acceptance_hints.len(), 4);
+
+        // A hostile fact id, kind and text stay one escaped line.
+        let other = tempfile::tempdir().unwrap();
+        groups[0].loose_ends["external_invocations"] =
+            json!([groups[0].loose_ends["external_invocations"][7]]);
+        groups[0].loose_ends["dynamic_calls"] = json!([]);
+        let dir = write_bundle(other.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(other.path(), &dir).unwrap();
+        let text = read_ticket(other.path(), "atlas-ga");
+        assert!(
+            text.contains(
+                "- external invocation in `app:program:1` (fact f \\#\\# Goal): Odd\\_Kind\\* \
+                 stored type `1`\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("## Goal").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn schema_3_loose_ends_without_a_fact_id_collapse_into_one_counted_bullet() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = chain();
+        let same =
+            json!({"program": "app:program:1", "object": {"kind": "com", "text": "Sample.Object"}});
+        let mut invocations = vec![same; 4];
+        invocations.extend((1..=11).map(|n| {
+            json!({
+                "program": "app:program:1",
+                "object": {"kind": "com", "text": format!("Other.{n}")},
+            })
+        }));
+        groups[0].loose_ends = json!({ "external_invocations": invocations });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(repo.path(), &dir).unwrap();
+
+        let text = read_ticket(repo.path(), "atlas-ga");
+        assert!(
+            text.contains("groups.json` (15): ") && text.contains("external invocations 15,"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches(
+                "- external invocation in `app:program:1`: COM `Sample.Object` (4 identical \
+                 entries)\n"
+            )
+            .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(text.matches("COM `Sample.Object`").count(), 1, "{text}");
+        // Ten bullets stand for 13 of the 15 entries.
+        assert!(text.contains("COM `Other.9`\n"), "{text}");
+        assert!(!text.contains("Other.10"), "{text}");
+        assert!(
+            text.contains("- 2 more in `bundle/groups.json`\n"),
+            "{text}"
         );
     }
 

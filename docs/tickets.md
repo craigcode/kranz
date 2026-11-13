@@ -192,11 +192,29 @@ What a ticket holds:
     names a program of that ticket in an expression or in a variable no
     control is bound to, and the bundle records no call between them. It is a
     mention, not a call. The ticket stays in `blocked-by`, because the
-    mentioned program is still worth having first, and the text tells the
-    worker to check what the expression does with it. `groups.json` lists the
-    pairs under `reference_links`.
-  - The group's external invocations and uninterpreted operations, among the
-    loose ends and within the same limit of 10.
+    mentioned program is still worth having first. The mention is a program
+    literal in an expression or the selection program of such a variable, so
+    the text sends the worker to the group's `references_program` facts to
+    see how the program is named.
+  - The group's reference links (`reference_links` in `groups.json`), external
+    invocations and uninterpreted operations, among the loose ends, counted
+    in the loose-ends line and within the same limit of 10. A reference link
+    reads "`<caller id>` <name> names `<callee id>` <name> of ticket
+    `<slug>`" with its number of occurrences, so the pairs behind the
+    by-reference line are in the ticket.
+  - A loose end that is a fact carries its fact id, as in
+    "external invocation in `<program id>` (fact `<fact id>`): COM
+    `<stored text>`". Two invocations with the same text stay two bullets,
+    and the worker can say in the coverage map how each was handled. Entries
+    that carry no fact id and read the same become one bullet ending in
+    "(N identical entries)"; the "N more" line counts entries, not bullets.
+  - The kind of an external invocation in words: OS command, UDP, COM, .NET,
+    web service. A kind the importer does not know is shown with spaces for
+    underscores.
+  - Text the application stored (the target of an external invocation, the
+    expression of a dynamic call target) in a code span, exactly as stored:
+    a Windows path keeps its single backslashes. The span is fenced with one
+    backtick more than the longest run inside the text.
   - A `Links:` line when the bundle's `link_details` is anything but
     `available`. Such a bundle was cut from an export that does not record
     links from expressions, properties and external invocations, and only
@@ -237,9 +255,11 @@ What a ticket holds:
 Text taken from the bundle is treated as untrusted. Names, ids and paths are
 kept on one line, cut to a fixed length and Markdown-escaped, so a crafted
 program name cannot add a frontmatter key, a section heading or an instruction
-block. Characters that render as nothing (zero-width and bidirectional
-controls, fillers, variation selectors, tag characters) are replaced by a
-space, so a name cannot carry text the reviewer does not see.
+block. Stored text in a schema 3 loose end is kept on one line and cut the
+same way, then put in a code span that no backtick inside it can close.
+Characters that render as nothing (zero-width and bidirectional controls,
+fillers, variation selectors, tag characters) are replaced by a space, so a
+name cannot carry text the reviewer does not see.
 
 Re-importing refuses the whole import, and writes nothing, if any of its
 tickets already exists; `--force` overwrites them all, including tickets you
