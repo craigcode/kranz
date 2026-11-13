@@ -1,0 +1,160 @@
+# Mission plan — m-daa3aa
+
+**Goal:** Close three confirmed over-trust gaps in release and delivery tooling: release builds restore no cache, the Actions allowlist admits only exact reviewed commits (first- and third-party), and `kranz exec --push` refuses an unusable remote before any mission is created.
+
+Branch `kranz/mission-m-daa3aa` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Commands** (4; each is a prefix, so `x` also allows `x <anything>`):
+- `python3 scripts/check-actions-allowlist.py`
+- `python3 scripts/check-actions-allowlist.py --self-test`
+- `python3 scripts/check-release-workflow.py`
+- `python3 scripts/check-release-workflow.py --self-test`
+
+**Write paths** (12; glob patterns the mission may change):
+- `.github/workflows/release.yml`
+- `.github/workflows/ci.yml`
+- `.github/actions-allowlist.json`
+- `.github/dependabot.yml`
+- `scripts/check-actions-allowlist.py`
+- `scripts/check-release-workflow.py`
+- `crates/engine/src/git_ops.rs`
+- `crates/cli/src/exec.rs`
+- `crates/cli/src/cli.rs`
+- `docs/deploy.md`
+- `docs/public-readiness.md`
+- `CHANGELOG.md`
+
+## Cost estimate
+
+Estimated **$6.49 – $32.45** (expected ~$14.94). Rough estimate — live usage is authoritative; based on 49 completed mission(s).
+
+Context-fit check (corpus p90 over 51 plan(s): 4185 chars / 22 files):
+- **f-1-1** (Release workflow restores no cache, with a CI guard) — spec points at 25 files (corpus p90: 22)
+- **f-1-2** (Actions allowlist admits only exact reviewed commits) — spec points at 33 files (corpus p90: 22)
+- **f-2-1** (Preflight the --push remote before creating the mission) — spec is 4213 chars (corpus p90: 4185)
+
+## Considered alternatives
+
+**Chosen approach:** Two milestones and three features, one per confirmed item. Milestone 1 groups the two CI/Python fixes (release workflow cache removal with a new structural guard; exact-commit allowlist enforced by the checker itself, keeping GitHub's selected-actions JSON shape). Milestone 2 is the Rust --push preflight, which reuses push_mission_branch's checks via one shared validator plus a read-only ls-remote. Each fix has a test that fails on the base commit, and the contract asserts behaviour with probe fixtures rather than file contents alone.
+
+Rejected shapes:
+- **Flip github_owned_allowed to false and pin entries in the JSON only, leaving the checker unchanged** — No test fails without it, and a later edit back to true or to `@*` would pass silently; the checker must enforce exact commits
+- **Remove the cache only from the release build job and keep it in the verify job** — Faster releases, but the release gates would still run on restored state; a whole-workflow rule is also simpler to guard
+- **Run the --push preflight as a dry-run push (or offline checks only)** — A probe push writes or races refs on the remote; offline-only checks miss the most common failure (unreachable host or bad credentials)
+- **One milestone per item (three milestones)** — Triples validator runs for low-severity, small changes; the two CI-script items share a surface and validate cheaply together
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** The release workflow restores no build or dependency cache in any job (no Swatinem/rust-cache, no actions/cache, no setup-node cache/cache-dependency-path inputs) while still building the release binary and setting up Node
+  `! grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*.?(Swatinem/rust-cache|actions/cache)|^[[:space:]]*cache(-dependency-path)?[[:space:]]*:' .github/workflows/release.yml && grep -q 'cargo build --release --locked -p kranz' .github/workflows/release.yml && grep -q 'actions/setup-node@' .github/workflows/release.yml`
+- **[a2]** A release-workflow guard passes its self-test and the real release.yml, runs in CI, and exits 1 naming the offending line when a cache restore (rust-cache step or setup-node `cache:` input) is added back to release.yml
+  `python3 scripts/check-release-workflow.py --self-test && python3 scripts/check-release-workflow.py && grep -q 'python3 scripts/check-release-workflow.py' .github/workflows/ci.yml && tmp=$(mktemp -d) && cp .github/workflows/release.yml "$tmp/a.yml" && cp .github/workflows/release.yml "$tmp/b.yml" && printf '      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n' >> "$tmp/a.yml" && printf '          cache: npm\n' >> "$tmp/b.yml" && python3 scripts/check-release-workflow.py "$tmp/a.yml" > "$tmp/a.out" 2>&1; rc1=$?; python3 scripts/check-release-workflow.py "$tmp/b.yml" > "$tmp/b.out" 2>&1; rc2=$?; cat "$tmp/a.out" "$tmp/b.out"; [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && grep -qF 'Swatinem/rust-cache' "$tmp/a.out" && grep -qF 'cache: npm' "$tmp/b.out"`
+- **[a3]** The Actions allowlist check refuses first-party actions (actions/*, github/*) pinned to a 40-hex commit that is not a listed reviewed commit, naming each refused reference, while the repository's real workflows produce no other error
+  `tmp=$(mktemp -d) && cp -R .github/workflows "$tmp/wf" && printf 'jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567\n      - uses: github/codeql-action/init@0123456789abcdef0123456789abcdef01234567\n' > "$tmp/wf/zz-probe.yml" && python3 scripts/check-actions-allowlist.py --workflows-dir "$tmp/wf" > "$tmp/out" 2>&1; rc=$?; cat "$tmp/out"; [ "$rc" -eq 1 ] && [ "$(grep -c '^check-actions-allowlist: ' "$tmp/out")" -eq 2 ] && grep -qF 'actions/checkout@0123456789abcdef0123456789abcdef01234567' "$tmp/out" && grep -qF 'github/codeql-action/init@0123456789abcdef0123456789abcdef01234567' "$tmp/out"`
+- **[a4]** The Actions allowlist check refuses a third-party action pinned to an unlisted 40-hex commit, naming the reference, while the real workflows produce no other error
+  `tmp=$(mktemp -d) && cp -R .github/workflows "$tmp/wf" && printf 'jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@0123456789abcdef0123456789abcdef01234567\n' > "$tmp/wf/zz-probe.yml" && python3 scripts/check-actions-allowlist.py --workflows-dir "$tmp/wf" > "$tmp/out" 2>&1; rc=$?; cat "$tmp/out"; [ "$rc" -eq 1 ] && [ "$(grep -c '^check-actions-allowlist: ' "$tmp/out")" -eq 1 ] && grep -qF 'dtolnay/rust-toolchain@0123456789abcdef0123456789abcdef01234567' "$tmp/out"`
+- **[a5]** The allowlist check refuses an allowlist that sets github_owned_allowed=true, and refuses one containing a non-exact (wildcard) pattern, naming the offending setting or entry
+  `tmp=$(mktemp -d) && python3 -c "import json,sys; d=json.load(open('.github/actions-allowlist.json')); d['github_owned_allowed']=True; json.dump(d,open(sys.argv[1],'w')); d['github_owned_allowed']=False; d['patterns_allowed']=d['patterns_allowed']+['dtolnay/rust-toolchain@*']; json.dump(d,open(sys.argv[2],'w'))" "$tmp/owned.json" "$tmp/wild.json" && python3 scripts/check-actions-allowlist.py --allowlist "$tmp/owned.json" > "$tmp/o.out" 2>&1; rc1=$?; python3 scripts/check-actions-allowlist.py --allowlist "$tmp/wild.json" > "$tmp/w.out" 2>&1; rc2=$?; cat "$tmp/o.out" "$tmp/w.out"; [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && grep -qF 'github_owned_allowed' "$tmp/o.out" && grep -qF 'dtolnay/rust-toolchain@*' "$tmp/w.out"`
+- **[a6]** The committed allowlist keeps GitHub's selected-actions shape (exactly github_owned_allowed, verified_allowed, patterns_allowed), sets both booleans false, lists only exact owner/repo[/path]@<40-hex> entries, and the checker passes its self-test and the real workflows
+  `python3 -c "import json,re; d=json.load(open('.github/actions-allowlist.json')); assert set(d)=={'github_owned_allowed','verified_allowed','patterns_allowed'}, sorted(d); assert d['github_owned_allowed'] is False and d['verified_allowed'] is False, d; p=d['patterns_allowed']; assert p and all(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}', x) for x in p), p" && python3 scripts/check-actions-allowlist.py --self-test && python3 scripts/check-actions-allowlist.py`
+- **[a7]** The allowlist checker's embedded self-test suite grew by at least four cases (base has five) and passes
+  `tmp=$(mktemp -d) && python3 scripts/check-actions-allowlist.py --self-test > "$tmp/st" 2>&1; rc=$?; cat "$tmp/st"; n=$(sed -n 's/^Ran \([0-9]*\) test.*/\1/p' "$tmp/st"); [ "$rc" -eq 0 ] && [ "${n:-0}" -ge 9 ]`
+- **[a8]** `kranz exec --push <remote>` refuses an unconfigured remote, a `::` remote-helper URL, a repository-local config that arms the network path, and an unreachable remote before any mission is created (exit 4, no .kranz/missions entry, no agent spawned), and accepts a reachable remote (at least 5 exec_push_preflight_ tests pass)
+  `out=$(cargo test --workspace exec_push_preflight_ 2>&1); echo "$out" | tail -n 40; echo "$out" | grep -qE 'test result: ok\. ([5-9]|[1-9][0-9]+) passed' && ! echo "$out" | grep -q 'test result: FAILED'`
+- **[a9]** The whole workspace test suite passes
+  `cargo test --workspace`
+- **[a10]** Clippy is clean with warnings denied across the workspace
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a11]** Code is rustfmt-formatted
+  `cargo fmt --all --check`
+- **[a12]** Contract files (events.rs, types.rs, backend.rs, error.rs) change additively only: no line is removed or modified relative to the mission base
+  `! git diff $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | grep -qE '^-[^-]'`
+- **[a13]** Each of the three fixes carries a test that would fail on $KRANZ_BASE_SHA (release guard, new allowlist self-test cases including a first-party unreviewed-commit case, exec_push_preflight_ tests); the --push preflight runs before MissionEngine::create and before any backend spawn and reuses the same remote checks as push_mission_branch (single source of truth, existing push refusal messages unchanged); docs/deploy.md describes the preflight and docs/public-readiness.md tells the operator the allowlist lists exact reviewed commits with github_owned_allowed false and must be re-applied to the repository setting; no change goes beyond the three items *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+base-expected-to-fail (benign): [a1] ! grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*.?(Swatinem/rust-cache|actions/cache)|^[[:space:]]*cache(-dependency-path)?[[:space:]]*:' .github/workflows/release.yml && grep -q 'cargo build --release --locked -p kranz' .github/workflows/release.yml && grep -q 'actions/setup-node@' .github/workflows/release.yml; [a2] python3 scripts/check-release-workflow.py --self-test && python3 scripts/check-release-workflow.py && grep -q 'python3 scripts/check-release-workflow.py' .github/workflows/ci.yml && tmp=$(mktemp -d) && cp .github/workflows/release.yml "$tmp/a.yml" && cp .github/workflows/release.yml "$tmp/b.yml" && printf '      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n' >> "$tmp/a.yml" && printf '          cache: npm\n' >> "$tmp/b.yml" && python3 scripts/check-release-workflow.py "$tmp/a.yml" > "$tmp/a.out" 2>&1; rc1=$?; python3 scripts/check-release-workflow.py "$tmp/b.yml" > "$tmp/b.out" 2>&1; rc2=$?; cat "$tmp/a.out" "$tmp/b.out"; [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && grep -qF 'Swatinem/rust-cache' "$tmp/a.out" && grep -qF 'cache: npm' "$tmp/b.out"; [a3] tmp=$(mktemp -d) && cp -R .github/workflows "$tmp/wf" && printf 'jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567\n      - uses: github/codeql-action/init@0123456789abcdef0123456789abcdef01234567\n' > "$tmp/wf/zz-probe.yml" && python3 scripts/check-actions-allowlist.py --workflows-dir "$tmp/wf" > "$tmp/out" 2>&1; rc=$?; cat "$tmp/out"; [ "$rc" -eq 1 ] && [ "$(grep -c '^check-actions-allowlist: ' "$tmp/out")" -eq 2 ] && grep -qF 'actions/checkout@0123456789abcdef0123456789abcdef01234567' "$tmp/out" && grep -qF 'github/codeql-action/init@0123456789abcdef0123456789abcdef01234567' "$tmp/out"; [a4] tmp=$(mktemp -d) && cp -R .github/workflows "$tmp/wf" && printf 'jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@0123456789abcdef0123456789abcdef01234567\n' > "$tmp/wf/zz-probe.yml" && python3 scripts/check-actions-allowlist.py --workflows-dir "$tmp/wf" > "$tmp/out" 2>&1; rc=$?; cat "$tmp/out"; [ "$rc" -eq 1 ] && [ "$(grep -c '^check-actions-allowlist: ' "$tmp/out")" -eq 1 ] && grep -qF 'dtolnay/rust-toolchain@0123456789abcdef0123456789abcdef01234567' "$tmp/out"; [a5] tmp=$(mktemp -d) && python3 -c "import json,sys; d=json.load(open('.github/actions-allowlist.json')); d['github_owned_allowed']=True; json.dump(d,open(sys.argv[1],'w')); d['github_owned_allowed']=False; d['patterns_allowed']=d['patterns_allowed']+['dtolnay/rust-toolchain@*']; json.dump(d,open(sys.argv[2],'w'))" "$tmp/owned.json" "$tmp/wild.json" && python3 scripts/check-actions-allowlist.py --allowlist "$tmp/owned.json" > "$tmp/o.out" 2>&1; rc1=$?; python3 scripts/check-actions-allowlist.py --allowlist "$tmp/wild.json" > "$tmp/w.out" 2>&1; rc2=$?; cat "$tmp/o.out" "$tmp/w.out"; [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && grep -qF 'github_owned_allowed' "$tmp/o.out" && grep -qF 'dtolnay/rust-toolchain@*' "$tmp/w.out"; [a6] python3 -c "import json,re; d=json.load(open('.github/actions-allowlist.json')); assert set(d)=={'github_owned_allowed','verified_allowed','patterns_allowed'}, sorted(d); assert d['github_owned_allowed'] is False and d['verified_allowed'] is False, d; p=d['patterns_allowed']; assert p and all(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}', x) for x in p), p" && python3 scripts/check-actions-allowlist.py --self-test && python3 scripts/check-actions-allowlist.py; [a7] tmp=$(mktemp -d) && python3 scripts/check-actions-allowlist.py --self-test > "$tmp/st" 2>&1; rc=$?; cat "$tmp/st"; n=$(sed -n 's/^Ran \([0-9]*\) test.*/\1/p' "$tmp/st"); [ "$rc" -eq 0 ] && [ "${n:-0}" -ge 9 ]; [a8] out=$(cargo test --workspace exec_push_preflight_ 2>&1); echo "$out" | tail -n 40; echo "$out" | grep -qE 'test result: ok\. ([5-9]|[1-9][0-9]+) passed' && ! echo "$out" | grep -q 'test result: FAILED'; [a9] cargo test --workspace
+not linted (never run on the base): [a10] cargo clippy --workspace --all-targets -- -D warnings; [a11] cargo fmt --all --check; [a12] ! git diff $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | grep -qE '^-[^-]'
+
+named contract gates (defect classes):
+- vacuous-filter: PASS
+- wrong-polarity: PASS
+- passes-on-base: PASS
+- env-sensitive: PASS
+
+
+## Milestone 1 — CI trusts only the source it builds and the commits it reviewed
+
+### 1.1 Release workflow restores no cache, with a CI guard
+
+Context: the kranz repo (Rust workspace + Python CI helper scripts). A code review found that `.github/workflows/release.yml` restores build caches, so a release artifact can include output not built from the tagged source. Confirmed on current code: the `verify` job has `- uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3` (around line 43) and `actions/setup-node@...` with `cache: npm` plus a multi-line `cache-dependency-path: |` block (around lines 71-77); the artifact-producing `build` matrix job also has a `Swatinem/rust-cache` step (around line 267) before `cargo build --release --locked -p kranz ...`.
+
+Do:
+1. In `.github/workflows/release.yml`, delete both `Swatinem/rust-cache` steps and remove the `cache:` and `cache-dependency-path:` inputs (and its continuation lines) from the setup-node step, keeping `node-version: 22`. Add one short comment near the top-level header or the build job saying release jobs deliberately restore no cache so every artifact is built only from the tagged source. Change nothing else in release.yml.
+2. Create `scripts/check-release-workflow.py`, stdlib-only Python 3, styled like `scripts/check-actions-allowlist.py` (module docstring, `sys.dont_write_bytecode = True`, a `unittest.TestCase` class, `--self-test` flag running it, `main()` returning an int, `raise SystemExit(main())`). CLI: optional positional path, default `<repo root>/.github/workflows/release.yml` (ROOT = Path(__file__).resolve().parent.parent). Line-based scan, skipping blank lines and lines whose stripped form starts with `#`; strip trailing ` #` comments. Report a finding for: (a) a `uses:` value (optionally after `- `, optionally quoted) starting with `Swatinem/rust-cache` or `actions/cache` (covers actions/cache/restore); (b) a mapping key `cache:` or `cache-dependency-path:` at any indent (optionally after `- `). Each finding is printed to stderr as `check-release-workflow: <path>:<lineno>: <stripped offending line> restores a cache; release builds must start clean`. Exit 1 if any finding, else print a one-line OK to stdout and exit 0. Being conservative inside `run: |` blocks is acceptable (fail closed).
+3. Self-tests (at least 4): clean workflow passes; rust-cache step refused; actions/cache/restore refused; setup-node `cache: npm` refused; commented-out `# - uses: Swatinem/rust-cache@...` is NOT refused.
+4. Wire into `.github/workflows/ci.yml` job `supply-chain`: add a step right after the existing 'Verify GitHub Actions SHA pinning and allowlist' step, named e.g. 'Verify release workflow restores no cache', running `python3 scripts/check-release-workflow.py --self-test` and `python3 scripts/check-release-workflow.py` (one command per line in a `run: |`). Do not add any new `uses:` lines.
+5. Add one bullet under `## Unreleased` in `CHANGELOG.md` (style: 'Changed: release builds no longer restore a Rust or npm cache ...').
+
+Verify with: `python3 scripts/check-release-workflow.py --self-test`, `python3 scripts/check-release-workflow.py`, `python3 scripts/check-actions-allowlist.py` (must still pass), and confirm appending `      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0` to a temp copy of release.yml makes the guard exit 1 naming it. Do NOT modify `.github/actions-allowlist.json` or `scripts/check-actions-allowlist.py` (another feature owns them). No Rust changes.
+
+Done when:
+- release.yml contains no Swatinem/rust-cache or actions/cache `uses:` and no `cache:`/`cache-dependency-path:` keys, yet still runs `cargo build --release --locked -p kranz` and actions/setup-node
+- `python3 scripts/check-release-workflow.py --self-test` passes with at least 4 cases including a commented-out step that is not refused
+- `python3 scripts/check-release-workflow.py` exits 0 on the committed release.yml
+- the guard exits 1 and names the line when a rust-cache step or a `cache: npm` input is appended to a copy of release.yml
+- ci.yml supply-chain job runs both the self-test and the real check
+
+### 1.2 Actions allowlist admits only exact reviewed commits
+
+Context: kranz repo. `scripts/check-actions-allowlist.py` verifies every `uses:` in `.github/workflows/*.yml|*.yaml` against `.github/actions-allowlist.json`. Confirmed defect: `check_action_ref` returns early (`if github_owned_allowed and owner in GITHUB_OWNED_ORGS: return None`, ~line 213) so ANY 40-hex commit of any `actions/*` or `github/*` action passes, and `patterns_allowed` holds wildcards like `dtolnay/rust-toolchain@*` matched by `fnmatchcase`, so third-party actions also accept any commit. The JSON file deliberately mirrors GitHub's repository 'selected actions' API (keys exactly `github_owned_allowed`, `verified_allowed`, `patterns_allowed`; see docs/public-readiness.md 'GitHub controls'), so KEEP those three keys and nothing else.
+
+Do:
+1. Checker (`load_allowlist` / `check_action_ref` / docstring):
+   - Refuse `github_owned_allowed: true` with a ValueError whose message contains `github_owned_allowed` and explains it admits every commit of actions/* and github/*; require false (like the existing `verified_allowed` rule).
+   - Every `patterns_allowed` entry must fullmatch `<owner>/<repo>[/<subpath>]@<40 lowercase hex>` (reuse ACTION_REF_RE and SHA40_RE); otherwise ValueError naming the entry verbatim (e.g. `dtolnay/rust-toolchain@*`). No wildcards.
+   - A `uses:` reference is allowed only if it is exactly (string equality) one listed entry; remove the GITHUB_OWNED_ORGS shortcut and fnmatch use. The refusal message must keep the existing format `<workflow>:<lineno>: \`uses: <ref>\` is not ...` and say it is not a reviewed commit listed in .github/actions-allowlist.json. Keep every other existing rule (tag/short/uppercase SHA, local/docker, quoted keys, flow mappings, verified_allowed) and the `check-actions-allowlist: <err>` stderr line format, one line per error.
+   - Update the module docstring.
+2. Self-tests in `CheckActionsAllowlistTests`: change the default fixture allowlist to `github_owned_allowed: False` with exact entries for every ref the existing tests expect to pass (`actions/checkout@SHA_A`, `github/codeql-action/init@SHA_A`, `dtolnay/rust-toolchain@SHA_B`) and keep all existing tests passing. Add at least 4 new tests: (a) first-party `actions/checkout@<SHA_B>` refused when only SHA_A is listed (and `github/codeql-action/init@SHA_B` likewise); (b) third-party `dtolnay/rust-toolchain@SHA_A` refused when only SHA_B is listed; (c) allowlist with github_owned_allowed true raises ValueError; (d) non-exact patterns (`dtolnay/rust-toolchain@*`, `actions/*`, `actions/checkout@v4`) each raise ValueError.
+3. `.github/actions-allowlist.json`: `github_owned_allowed: false`, `verified_allowed: false`, `patterns_allowed` = the sorted, de-duplicated list of every `uses:` value currently present across `.github/workflows/*.yml` (derive mechanically, e.g. by importing `extract_workflow_uses` from the script — note release.yml may no longer use rust-cache but ci.yml does). Drop entries no workflow uses. Do not change any workflow's pins.
+4. Docs: in `docs/public-readiness.md` 'GitHub controls', state the allowlist lists exact reviewed commits for first- and third-party actions with github_owned_allowed false, that the operator must re-apply the file to the repository's selected-actions setting after it changes, and that an Actions update (e.g. Dependabot) must add the new reviewed commit to the allowlist in the same PR. Update the github-actions comment in `.github/dependabot.yml` to say the same in one line. Add a `## Unreleased` bullet to CHANGELOG.md.
+
+Verify: `python3 scripts/check-actions-allowlist.py --self-test` (≥9 tests, OK) and `python3 scripts/check-actions-allowlist.py` (exit 0). Do not edit any workflow file.
+
+Done when:
+- self-test suite has at least 9 tests and passes, including a first-party actions/* ref at an unlisted 40-hex commit being refused
+- a workflow using actions/checkout or github/codeql-action/init at an unlisted 40-hex commit is refused with an error naming the reference
+- a workflow using dtolnay/rust-toolchain at an unlisted 40-hex commit is refused
+- an allowlist with github_owned_allowed=true is refused with a message naming github_owned_allowed
+- an allowlist containing `dtolnay/rust-toolchain@*` is refused naming that entry
+- the committed allowlist has exactly the three GitHub keys, both booleans false, only exact @<40-hex> entries, and the checker exits 0 on the real workflows
+
+
+## Milestone 2 — kranz exec --push refuses an unusable remote before the mission starts
+
+### 2.1 Preflight the --push remote before creating the mission
+
+Context: kranz repo (Rust). `kranz exec -f mission.md --push <REMOTE>` (crates/cli/src/exec.rs) only touches the remote after the mission has run: `cmd_exec_with_backend` creates the mission (`MissionEngine::create`), plans, approves, runs, and only then `run_and_reconcile` -> `push_scanned` -> `GitRepo::push_mission_branch` (crates/engine/src/git_ops.rs ~line 2288) checks the remote. So a bad remote is discovered after the spend. Remote checks inside push_mission_branch today: remote name non-empty / no leading '-' / no ':' / no whitespace; `self.refuse_network_on_armed_local_config()?`; `self.remote_url(remote)?` must be Some ('refusing to push to unconfigured remote ...'); URL must not contain '::' (remote-helper). Read-only network probe pattern exists in `remote_has_branch` (uses `probe_network(&["ls-remote", "--heads", ...])`).
+
+Do:
+1. git_ops.rs: extract the remote-only checks into `pub fn validate_push_remote(&self, remote: &str) -> Result<()>` (name shape, armed local config, configured, no '::') and have `push_mission_branch` call it, keeping its error messages byte-identical and keeping the kranz/* branch checks before any git process runs (order: remote name shape, branch checks, then the rest is fine as long as existing tests pass). Add `pub fn preflight_push_remote(&self, remote: &str) -> Result<()>` = `validate_push_remote` + a read-only reachability probe via `probe_network` running `git ls-remote --heads <remote> refs/heads/kranz/preflight` (success with empty output = reachable); on non-success return EngineError::Git naming the remote and git's stderr (use `failure_detail`). Doc-comment both, noting write permission is only proven by the push itself. Do NOT touch error.rs/events.rs/types.rs/backend.rs.
+2. exec.rs: at the very top of `cmd_exec_with_backend` (before `EnqueueCheckoutGuard::new` and `MissionEngine::create`), if `options.push` is Some(remote): open `GitRepo::open(&repo)` and call `preflight_push_remote`; on Err print `kranz exec: refusing --push {remote} before starting the mission: {e}` to stderr and return `Ok(EXIT_PUSH_FAILED)` (4), printing nothing to stdout. Update the `EXIT_PUSH_FAILED` and `cmd_exec` doc comments. Leave the post-run push path unchanged. In crates/cli/src/cli.rs update the `--push` help text to say the remote is checked before the mission starts.
+3. Tests in exec.rs `mod tests`, every name prefixed `exec_push_preflight_` (no existing test uses that prefix). Seed a temp git repo like `enqueue_only_exec_creates_approved_mission_without_running_worker` does; backend = `MockBackend::with_scripts(vec![])` so any agent spawn errors; call `cmd_exec_with_backend` with `push: Some(...)`, `enqueue: false`; assert `Ok(4)`, that `<repo>/.kranz/missions` does not exist or is empty, and the checkout is still on main. Cases: (a) `exec_push_preflight_refuses_unconfigured_remote`; (b) `..._refuses_remote_helper_url` (`git remote add origin 'ext::sh -c true'` or `foo::bar`); (c) `..._refuses_armed_local_config` (e.g. `git config credential.helper store` plus a configured remote — read `refuse_network_on_armed_local_config` for keys it refuses); (d) `..._refuses_unreachable_remote` (remote URL = a nonexistent local path); (e) `exec_push_preflight_accepts_reachable_remote`: `git init --bare` a second temp dir, add it as remote, assert `GitRepo::open(&repo).unwrap().preflight_push_remote("origin")` is Ok. If hardened network mode blocks the local file transport, see how git_ops tests near `push_mission_branch_runs_on_a_hardened_handle` (~line 3031) build a pushable remote and mirror that. Each refusal test must fail on the pre-change code.
+4. docs/deploy.md section '3. The scoped-push flow': add a bullet that `kranz exec --push` checks the remote (name, configured, no '::' helper URL, no armed repository config, read-only ls-remote reachability) before creating the mission and exits 4 with no mission on refusal; write permission is still proven only by the push. Add a `## Unreleased` CHANGELOG.md bullet.
+
+Run before finishing (bare exit codes, never piped): `cargo fmt --all`, `cargo test --workspace exec_push_preflight_`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+Done when:
+- exec_push_preflight_refuses_unconfigured_remote: exit 4, no mission directory, no agent spawned
+- exec_push_preflight_refuses_remote_helper_url: a '::' remote URL is refused before the mission is created
+- exec_push_preflight_refuses_armed_local_config: a repository-local credential/transport key is refused before the mission is created
+- exec_push_preflight_refuses_unreachable_remote: a remote whose URL points at a nonexistent path is refused before the mission is created
+- exec_push_preflight_accepts_reachable_remote: a configured local bare remote passes preflight
+- existing push_mission_branch and exec tests pass unchanged; workspace tests, clippy and fmt are clean

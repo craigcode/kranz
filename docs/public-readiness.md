@@ -122,6 +122,14 @@ silently become the supported distribution.
   `allowed_actions` to `selected` and apply
   `.github/actions-allowlist.json`; GitHub only applies repository-level
   `patterns_allowed` to a personal-account repository after it is public.
+  The allowlist's `patterns_allowed` lists exact reviewed commits for both
+  first- and third-party actions — no wildcards, and `github_owned_allowed`
+  stays `false` so `actions/*` and `github/*` get no blanket exemption; every
+  action, GitHub-owned or not, is admitted only at the specific commit that
+  was reviewed. After this file changes, the operator must re-apply it to
+  the repository's selected-actions setting. Any Actions update (including a
+  Dependabot bump) must add the new reviewed commit to the allowlist in the
+  same PR, or the workflow referencing it will fail the check.
 - The `release` environment requires the repository owner to approve the
   publish job.
   The 2026-09-06 preparation attempt to add that rule was rejected by GitHub

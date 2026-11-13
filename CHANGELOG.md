@@ -5,6 +5,22 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: release builds no longer restore a Rust or npm cache
+  (`.github/workflows/release.yml`), so every release artifact is built only
+  from the tagged source; `scripts/check-release-workflow.py` guards this in
+  CI's `supply-chain` job.
+- Changed: `.github/actions-allowlist.json` now lists exact reviewed commits
+  for every first- and third-party action (`github_owned_allowed` and
+  `verified_allowed` both `false`, no wildcards); `scripts/check-actions-allowlist.py`
+  no longer exempts `actions/*`/`github/*` at any commit or matches
+  `patterns_allowed` entries by glob. An Actions update must add its new
+  commit to the allowlist in the same PR, and the operator must re-apply the
+  file to the repository's selected-actions setting after it changes.
+- Changed: `kranz exec -f mission.md --push <remote>` now preflights the
+  remote (configured, no armed local config, no `::` remote-helper URL, and a
+  read-only `git ls-remote` reachability probe) before `MissionEngine::create`,
+  so an unusable `--push` target is refused (exit 4, no mission created)
+  before any spend rather than only after the mission runs.
 - Changed: `kranz ticket import-atlas` reads Magic Atlas bundles of schema 3
   as well as 1 and 2. A schema 3 ticket says which of its `blocked-by` tickets
   the group reaches by reference only (a program an expression or an unbound

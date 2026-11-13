@@ -2256,6 +2256,64 @@ impl GitRepo {
         Ok(self.remote_url(name)?.is_some())
     }
 
+    /// Validate that `remote` is a safe push target: a plain configured
+    /// remote name (no flags, colons, or whitespace), no armed local
+    /// transport config (see [`Self::refuse_network_on_armed_local_config`]),
+    /// an already-configured remote, and no `::` remote-helper URL.
+    ///
+    /// This is every check [`Self::push_mission_branch`] runs against the
+    /// remote itself, extracted so [`Self::preflight_push_remote`] can run
+    /// them before a mission exists. It does **not** prove write access —
+    /// only the push itself (`push_mission_branch`) proves that.
+    pub fn validate_push_remote(&self, remote: &str) -> Result<()> {
+        if remote.is_empty()
+            || remote.starts_with('-')
+            || remote.contains(':')
+            || remote.chars().any(char::is_whitespace)
+        {
+            return Err(EngineError::Git(format!(
+                "refusing to push to malformed remote {remote:?}: --push accepts a plain configured remote name"
+            )));
+        }
+        self.refuse_network_on_armed_local_config()?;
+        let Some(remote_url) = self.remote_url(remote)? else {
+            return Err(EngineError::Git(format!(
+                "refusing to push to unconfigured remote {remote:?}: add and review the remote before cloud handoff"
+            )));
+        };
+        if remote_url.contains("::") {
+            return Err(EngineError::Git(format!(
+                "refusing to push to remote {remote:?}: remote helper URLs containing '::' are not permitted"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pre-mission check that `remote` is a safe and reachable `--push`
+    /// target, run by `kranz exec --push` **before** `MissionEngine::create`
+    /// so a bad remote is refused before any spend, not after the mission
+    /// has already run.
+    ///
+    /// Combines [`Self::validate_push_remote`] with a read-only
+    /// `git ls-remote --heads <remote> refs/heads/kranz/preflight` probe (an
+    /// empty, successful reply means the remote is reachable; `kranz/preflight`
+    /// need not exist). Reachability is as far as this goes: write
+    /// permission is proven only by the push itself, in
+    /// [`Self::push_mission_branch`].
+    pub fn preflight_push_remote(&self, remote: &str) -> Result<()> {
+        self.validate_push_remote(remote)?;
+        let out =
+            self.probe_network(&["ls-remote", "--heads", remote, "refs/heads/kranz/preflight"])?;
+        if !out.status.success() {
+            return Err(EngineError::Git(format!(
+                "git ls-remote --heads {remote} refs/heads/kranz/preflight failed ({}): {}",
+                out.status,
+                failure_detail(&out)
+            )));
+        }
+        Ok(())
+    }
+
     /// Push a single `kranz/*` mission ref to `remote` — **the one and only
     /// push path in Kranz, and it is cloud-opt-in.**
     ///
@@ -2324,17 +2382,7 @@ impl GitRepo {
         }
         // Report every armed network key before the remote lookup's narrower
         // local-execution guard runs. run_network rechecks before transport.
-        self.refuse_network_on_armed_local_config()?;
-        let Some(remote_url) = self.remote_url(remote)? else {
-            return Err(EngineError::Git(format!(
-                "refusing to push to unconfigured remote {remote:?}: add and review the remote before cloud handoff"
-            )));
-        };
-        if remote_url.contains("::") {
-            return Err(EngineError::Git(format!(
-                "refusing to push to remote {remote:?}: remote helper URLs containing '::' are not permitted"
-            )));
-        }
+        self.validate_push_remote(remote)?;
         // Plain push to one already-configured remote of one local branch to
         // the same-named remote branch.
         // Never --force; never a refspec; never main.
