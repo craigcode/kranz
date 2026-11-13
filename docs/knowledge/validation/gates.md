@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. Gate commands, contracts and containment rules are unchanged.
 
 Rechecked 2026-11-12 (UTC) against the Sgian mission-runner terminal wiring: `runner` binds each uncontained worker session's `run_id` across `run_session_to`, and Sgian `terminal/create` enforces worker and authority deny patterns before live operator consent. Gate commands, contracts and containment rules are unchanged.
 

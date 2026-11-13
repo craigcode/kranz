@@ -4275,7 +4275,7 @@ esac
 
         let (ok, output) = run_bounded_gate_command_sandboxed(
             repo.path(),
-            "test \"$(git config user.name)\" = 'Gate Wrap Test' \
+            "test \"$(git config --global user.name)\" = 'Gate Wrap Test' \
              && ! touch \"$HOME/gate_sandbox_wrap_marker\" \
              && case \"$TMPDIR\" in *kranz-gate-*/tmp) true ;; *) false ;; esac \
              && case \"$CARGO_HOME\" in *kranz-gate-*/.cargo-cache-only-*) true ;; *) false ;; esac",

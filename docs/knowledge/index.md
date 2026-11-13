@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-11-12
+last_verified: 2026-11-13
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -10,6 +10,8 @@ verified_against:
   - docs/knowledge/decisions/skill-capture-boundary.md
   - .kranz/tickets/repo-knowledge-refresh-drift.md
 ---
+
+Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. The map is unchanged.
 
 # Kranz knowledge vault
 

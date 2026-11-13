@@ -3027,13 +3027,25 @@ mod tests {
     #[test]
     fn sandbox_fs_tier_reaches_only_its_own_unix_sockets() {
         use std::process::{Command, Stdio};
-        let root = tempfile::tempdir().unwrap();
+        // A unix socket path is capped near 104 bytes on macOS. A long
+        // TMPDIR (a gate's scratch home) would fail the bind, which is not
+        // the property under test, so long temp roots fall back to /tmp.
+        let base = std::env::temp_dir();
+        let base = if base.as_os_str().len() > 60 {
+            PathBuf::from("/tmp")
+        } else {
+            base
+        };
+        let (Ok(root), Ok(outside)) = (tempfile::tempdir_in(&base), tempfile::tempdir_in(&base))
+        else {
+            eprintln!("SKIP-UNDER-WRAP: no short writable temp root for unix sockets");
+            return;
+        };
         let root = root.path().canonicalize().unwrap();
         let mission = root.join(".kranz/missions/m-current");
         std::fs::create_dir_all(&mission).unwrap();
         let scratch = root.join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let outside = tempfile::tempdir().unwrap();
         let outside = outside.path().canonicalize().unwrap();
         let cfg = inputs(&root, &mission, &scratch, vec![]);
         assert_eq!(cfg.enforce, crate::types::SandboxEnforce::Fs);
