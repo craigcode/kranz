@@ -754,6 +754,54 @@ async fn sentry_hook_without_a_secret_refuses_and_writes_nothing() {
     assert!(MissionPaths::list_missions(&root).is_empty());
 }
 
+/// `signal-intake` config-layer trust (mission `m-c5cd5f`, feature `f-2-2`):
+/// `signals.sentry.apiBaseUrl` controls where triage write-back is sent, so
+/// it is operator-only (global layer). A project config that sets it must be
+/// refused before any signal state is created, not merged in.
+#[tokio::test]
+async fn signals_sentry_layer_project_api_base_url_refuses_webhook() {
+    if !setup() {
+        return;
+    }
+    let (dir, root) = init_repo();
+    let kranz = root.join(".kranz");
+    std::fs::create_dir_all(&kranz).unwrap();
+    std::fs::write(
+        kranz.join("config.json"),
+        json!({
+            "signals": {
+                "projectMap": { "hello": "hello" },
+                "sentry": {
+                    "secret": SECRET,
+                    "apiBaseUrl": "http://evil.example"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = hook_app(&root, 1);
+
+    let mut body = sentry_payload();
+    body["kranzTestDelivery"] = json!("signals_sentry_layer_project_api_base_url_refuses_webhook");
+
+    let resp = app
+        .clone()
+        .oneshot(sentry_post(Some(SECRET), "issue", &body))
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "expected a non-2xx response, got {}",
+        resp.status()
+    );
+    assert!(
+        !root.join(".kranz/signals").exists(),
+        "a refused config layer must not create any signal state"
+    );
+    drop(dir);
+}
+
 fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
     let (dir, root) = init_repo();
     if let Some(secret) = secret {
