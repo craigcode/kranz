@@ -9,6 +9,13 @@ Notable user-visible changes are documented here. This project follows
   (`.github/workflows/release.yml`), so every release artifact is built only
   from the tagged source; `scripts/check-release-workflow.py` guards this in
   CI's `supply-chain` job.
+- Changed: `.github/actions-allowlist.json` now lists exact reviewed commits
+  for every first- and third-party action (`github_owned_allowed` and
+  `verified_allowed` both `false`, no wildcards); `scripts/check-actions-allowlist.py`
+  no longer exempts `actions/*`/`github/*` at any commit or matches
+  `patterns_allowed` entries by glob. An Actions update must add its new
+  commit to the allowlist in the same PR, and the operator must re-apply the
+  file to the repository's selected-actions setting after it changes.
 - Wired `SgianTerminalProvider` automatically into `MissionEngine` and `runner`
   (`AcpBackend::for_mission_worker`) for `checkout`-isolated uncontained ACP
   workers when both an external `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key`

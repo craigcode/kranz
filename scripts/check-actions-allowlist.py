@@ -4,15 +4,16 @@
 Every `uses:` reference across `.github/workflows/*.yml` and `*.yaml` must:
 1. Pin an immutable full-length 40-character lowercase hexadecimal commit SHA
    (`<owner>/<repo>(/<subpath>)?@<40-hex-sha>`).
-2. Be permitted by `.github/actions-allowlist.json` (`github_owned_allowed` or
-   `patterns_allowed`, with `verified_allowed` required to stay `false` so policy
-   enforcement remains offline and deterministic).
+2. Match, by exact string equality, one entry in `.github/actions-allowlist.json`
+   `patterns_allowed`. There is no wildcard matching and no shortcut for
+   `actions/*` or `github/*`: `github_owned_allowed` and `verified_allowed` must
+   both stay `false` so policy enforcement admits only commits that were
+   actually reviewed and stays offline and deterministic.
 """
 
 from __future__ import annotations
 
 import argparse
-from fnmatch import fnmatchcase
 import json
 from pathlib import Path
 import re
@@ -41,7 +42,6 @@ ACTION_REF_RE = re.compile(
     r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?P<subpath>(?:/[A-Za-z0-9_.-]+)*)@(?P<ref>.+)$"
 )
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
-GITHUB_OWNED_ORGS = frozenset({"actions", "github"})
 
 
 def strip_yaml_comment(raw: str) -> str:
@@ -96,15 +96,26 @@ def load_allowlist(path: Path) -> tuple[bool, list[str]]:
     patterns = data["patterns_allowed"]
     if not isinstance(github_owned, bool) or not isinstance(verified_allowed, bool):
         raise ValueError(f"{path}: github_owned_allowed and verified_allowed must be booleans")
+    if github_owned:
+        raise ValueError(
+            f"{path}: github_owned_allowed=true admits every commit of any actions/* or "
+            "github/* action, not just reviewed ones; keep false"
+        )
     if verified_allowed:
         raise ValueError(
             f"{path}: verified_allowed=true cannot be enforced deterministically offline; keep false"
         )
-    if not isinstance(patterns, list) or not all(
-        isinstance(p, str) and p.strip() and p.strip() != "*" for p in patterns
-    ):
-        raise ValueError(f"{path}: patterns_allowed must be a list of explicit action patterns")
-    return github_owned, [p.strip() for p in patterns]
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError(f"{path}: patterns_allowed must be a list of explicit action references")
+    entries = [p.strip() for p in patterns]
+    for entry in entries:
+        match = ACTION_REF_RE.match(entry)
+        if match is None or SHA40_RE.fullmatch(match.group("ref")) is None:
+            raise ValueError(
+                f"{path}: patterns_allowed entry `{entry}` is not an exact "
+                "`<owner>/<repo>[/<subpath>]@<40-hex-sha>` reviewed commit reference"
+            )
+    return github_owned, entries
 
 
 def extract_workflow_uses(path: Path) -> tuple[list[tuple[int, str]], list[str]]:
@@ -210,15 +221,12 @@ def check_action_ref(
             "lowercase hexadecimal commit SHA"
         )
 
-    if github_owned_allowed and owner in GITHUB_OWNED_ORGS:
-        return None
-
-    if any(fnmatchcase(ref_value, pattern) for pattern in patterns_allowed):
+    if ref_value in patterns_allowed:
         return None
 
     return (
-        f"{workflow}:{lineno}: `uses: {ref_value}` is not permitted by "
-        ".github/actions-allowlist.json"
+        f"{workflow}:{lineno}: `uses: {ref_value}` is not a reviewed commit "
+        "listed in .github/actions-allowlist.json"
     )
 
 
@@ -267,9 +275,13 @@ class CheckActionsAllowlistTests(unittest.TestCase):
                 allowlist
                 if allowlist is not None
                 else {
-                    "github_owned_allowed": True,
+                    "github_owned_allowed": False,
                     "verified_allowed": False,
-                    "patterns_allowed": ["dtolnay/rust-toolchain@*"],
+                    "patterns_allowed": [
+                        f"actions/checkout@{self.SHA_A}",
+                        f"github/codeql-action/init@{self.SHA_A}",
+                        f"dtolnay/rust-toolchain@{self.SHA_B}",
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -383,13 +395,73 @@ jobs:
                 Path(tmp),
                 f"jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{self.SHA_A}\n",
                 allowlist={
-                    "github_owned_allowed": True,
+                    "github_owned_allowed": False,
                     "verified_allowed": True,
                     "patterns_allowed": [],
                 },
             )
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as ctx:
                 verify_workflows(allowlist_path, wf)
+            self.assertIn("verified_allowed", str(ctx.exception))
+
+    def test_rejects_first_party_commit_not_on_allowlist(self) -> None:
+        for ref in (
+            f"actions/checkout@{self.SHA_B}",
+            f"github/codeql-action/init@{self.SHA_B}",
+        ):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as tmp:
+                allowlist_path, wf = self._write_fixture(
+                    Path(tmp),
+                    f"jobs:\n  a:\n    steps:\n      - uses: {ref}\n",
+                )
+                _, errors = verify_workflows(allowlist_path, wf)
+                self.assertEqual(len(errors), 1, f"expected refusal for {ref}: {errors}")
+                self.assertIn(ref, errors[0])
+
+    def test_rejects_third_party_commit_not_on_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist_path, wf = self._write_fixture(
+                Path(tmp),
+                f"jobs:\n  a:\n    steps:\n      - uses: dtolnay/rust-toolchain@{self.SHA_A}\n",
+            )
+            _, errors = verify_workflows(allowlist_path, wf)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("dtolnay/rust-toolchain", errors[0])
+
+    def test_github_owned_allowed_true_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist_path, wf = self._write_fixture(
+                Path(tmp),
+                f"jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{self.SHA_A}\n",
+                allowlist={
+                    "github_owned_allowed": True,
+                    "verified_allowed": False,
+                    "patterns_allowed": [f"actions/checkout@{self.SHA_A}"],
+                },
+            )
+            with self.assertRaises(ValueError) as ctx:
+                verify_workflows(allowlist_path, wf)
+            self.assertIn("github_owned_allowed", str(ctx.exception))
+
+    def test_wildcard_patterns_allowed_entries_are_refused(self) -> None:
+        for bad_entry in (
+            "dtolnay/rust-toolchain@*",
+            "actions/*",
+            "actions/checkout@v4",
+        ):
+            with self.subTest(bad_entry=bad_entry), tempfile.TemporaryDirectory() as tmp:
+                allowlist_path, wf = self._write_fixture(
+                    Path(tmp),
+                    f"jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{self.SHA_A}\n",
+                    allowlist={
+                        "github_owned_allowed": False,
+                        "verified_allowed": False,
+                        "patterns_allowed": [bad_entry],
+                    },
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    verify_workflows(allowlist_path, wf)
+                self.assertIn(bad_entry, str(ctx.exception))
 
 
 def main() -> int:
