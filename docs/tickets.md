@@ -205,6 +205,31 @@ What a ticket holds:
     are in the ticket unless a group has more than 10 of them; the
     by-reference line then says that only the first 10 are listed and that
     `groups.json` holds them all.
+  - How a reference link names its program, when the bundle says so. A
+    current Magic Atlas writes `reference_kinds` and `facts` on every
+    reference link; a schema 3 bundle written before that has neither, and its
+    tickets read exactly as they did. With them the bullet goes on after the
+    occurrences, one part for each way the program is named, each with the
+    ids of its facts in facts-file order: "(3 occurrences): in an expression
+    (facts `<fact id>`, `<fact id>`); as the selection program of a variable
+    no control is bound to (fact `<fact id>`)". The ids are those of the
+    `references_program` facts in the group's facts file. A link names at
+    most 10 facts; the rest are counted, as in "and 2 more in `groups.json`".
+    The kind `unclassified`, or a fact with no kind, reads "in a way the
+    bundle does not classify". Any other kind reads "as a reference of a kind
+    this importer does not know", with the kind next to each fact id; it is
+    never presented as one of the known kinds. When every reference link of
+    the group says how its program is named, the by-reference line stops
+    listing the ways a program can be named and sends the worker to the pairs,
+    which can differ from one to the next.
+  - What a reference link contradicts itself on. The two fields are read as
+    leniently as the rest of a loose end: a value of another shape reads as
+    absent, an entry that is not a record is left out, and the import never
+    fails on them. A fact whose `program` is not the link's caller, or whose
+    target is not its callee, is left out and the bullet says how many were.
+    When the occurrences of the facts do not add up to the link's
+    `occurrences`, the bullet says "`groups.json` is inconsistent here" with
+    both numbers. The link's own count is still the one shown.
   - A loose end that is a fact carries its fact id, as in
     "external invocation in `<program id>` (fact `<fact id>`): COM
     `<stored text>`". Two invocations with the same text stay two bullets,

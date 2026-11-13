@@ -327,6 +327,29 @@ struct ReferenceLink {
     callee: String,
     #[serde(deserialize_with = "lenient")]
     occurrences: u64,
+    /// The distinct kinds of `facts`. A schema 3 bundle written before the
+    /// two fields were added has neither, and both then read as empty.
+    #[serde(deserialize_with = "lenient_list")]
+    reference_kinds: Vec<String>,
+    #[serde(deserialize_with = "lenient_list")]
+    facts: Vec<LinkFact>,
+}
+
+/// One `references_program` fact behind a reference link. Every field is
+/// lenient: the record is shown, never relied on.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct LinkFact {
+    #[serde(deserialize_with = "lenient")]
+    fact: String,
+    #[serde(deserialize_with = "lenient")]
+    program: String,
+    #[serde(deserialize_with = "lenient")]
+    object: LooseObject,
+    #[serde(deserialize_with = "lenient")]
+    occurrences: u64,
+    #[serde(deserialize_with = "lenient")]
+    reference_kind: String,
 }
 
 /// A field only schema 3 tickets show. A value of another shape reads as the
@@ -1445,7 +1468,10 @@ fn render_context(
     });
     // Reference links, which only schema 3 records, are the first loose ends
     // listed: the by-reference line above them sends the worker to them.
+    let full = format!("`{path}/{GROUPS}`");
     let mut reference_lines = Vec::new();
+    // True while every link listed says how its callee is named.
+    let mut all_described = true;
     if detailed {
         let named = |id: &str| match programs.get(id) {
             Some(program) => format!(
@@ -1466,8 +1492,17 @@ fn render_context(
                 0 => String::new(),
                 n => format!(" ({})", count(n as usize, "occurrence")),
             };
+            // A link of a bundle written before `reference_kinds` and
+            // `facts` has no detail, and reads as it always did.
+            let (detail, described) = reference_detail(link, &full);
+            all_described &= described;
+            let detail = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", detail.join("; "))
+            };
             reference_lines.push(format!(
-                "- reference only: {} names {}{owner}{times}\n",
+                "- reference only: {} names {}{owner}{times}{detail}\n",
                 named(&link.caller),
                 named(&link.callee)
             ));
@@ -1492,16 +1527,31 @@ fn render_context(
                  `{path}/{GROUPS}` lists them all under `reference_links`."
             ),
         };
+        // When every pair says how its program is named, the line leaves the
+        // kinds to the pairs: they can differ from one pair to the next.
+        let how = if !reference_lines.is_empty() && all_described {
+            format!(
+                "A program of this group names a program of that ticket, and the bundle \
+                 records no call between them. That is a mention, not a call: the ticket \
+                 still waits for it, but see how the program is named before treating it as \
+                 one this group runs. Each pair below says how, and the facts it names are \
+                 `references_program` facts in {}.",
+                in_bundle(&group.facts)
+            )
+        } else {
+            format!(
+                "A program of this group names a program of that ticket in an expression, \
+                 or as the selection program of a variable no control is bound to, and the \
+                 bundle records no call between them. That is a mention, not a call: the \
+                 ticket still waits for it, but read the `references_program` facts in {} \
+                 to see how the program is named before treating it as one this group runs.",
+                in_bundle(&group.facts)
+            )
+        };
         out.push_str(&format!(
-            "- By reference only ({} of them): {}. A program of this group names a program \
-             of that ticket in an expression, or as the selection program of a variable no \
-             control is bound to, and the bundle records no call between them. That is a \
-             mention, not a call: the ticket still waits for it, but read the \
-             `references_program` facts in {} to see how the program is named before \
-             treating it as one this group runs. {pairs}\n",
+            "- By reference only ({} of them): {}. {how} {pairs}\n",
             by_reference.len(),
             slugs.join(", "),
-            in_bundle(&group.facts)
         ));
     }
     out.push_str(&format!(
@@ -1549,7 +1599,6 @@ fn render_context(
             program
         }
     };
-    let full = format!("`{path}/{GROUPS}`");
     let mut lines = reference_lines;
     for call in &loose_ends.dynamic_calls {
         let expression = call.object.expression.as_deref().unwrap_or("");
@@ -1924,6 +1973,140 @@ fn invocation_kind(kind: &str) -> String {
         }
         other => plain(other, MAX_NAME_CHARS),
     }
+}
+
+/// What a reference link says beyond its two programs, from the
+/// `reference_kinds` and `facts` a current exporter writes: one part for each
+/// way the callee is named, with the ids of the facts that name it so, then
+/// what the record contradicts itself on. The second value is whether any way
+/// of naming is given. A link without the two fields gives nothing.
+///
+/// At most `MAX_LISTED_LOOSE_ENDS` facts are named for a link, in the order
+/// of the facts file; `full` is where the others are. A fact that names
+/// another caller or callee is not this link's, and is left out and counted.
+fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
+    const UNKNOWN: usize = 3;
+    const WAYS: [&str; 4] = [
+        "in an expression",
+        "as the selection program of a variable no control is bound to",
+        "in a way the bundle does not classify",
+        "as a reference of a kind this importer does not know",
+    ];
+    let way_of = |kind: &str| match kind {
+        "expression_literal" => 0,
+        "variable_selection_program" => 1,
+        "unclassified" => 2,
+        kind if blank(kind) => 2,
+        _ => UNKNOWN,
+    };
+    struct Way {
+        way: usize,
+        shown: Vec<String>,
+        total: usize,
+    }
+    let mut ways: Vec<Way> = Vec::new();
+    let mut slot = |way: usize| match ways.iter().position(|known| known.way == way) {
+        Some(index) => index,
+        None => {
+            ways.push(Way {
+                way,
+                shown: Vec::new(),
+                total: 0,
+            });
+            ways.len() - 1
+        }
+    };
+    let mut places = Vec::new();
+    let mut room = MAX_LISTED_LOOSE_ENDS;
+    let mut foreign = 0;
+    let mut sum: u64 = 0;
+    for fact in &link.facts {
+        let other_caller = !blank(&fact.program) && fact.program != link.caller;
+        let other_callee = fact
+            .object
+            .entity
+            .as_deref()
+            .is_some_and(|entity| entity != link.callee);
+        if other_caller || other_callee {
+            foreign += 1;
+            continue;
+        }
+        sum = sum.saturating_add(fact.occurrences);
+        let way = way_of(&fact.reference_kind);
+        let label = (!blank(&fact.fact)).then(|| {
+            let id = code(&fact.fact, MAX_ID_CHARS);
+            if way == UNKNOWN {
+                format!(
+                    "{id} of kind {}",
+                    code(&fact.reference_kind, MAX_NAME_CHARS)
+                )
+            } else {
+                id
+            }
+        });
+        places.push((slot(way), true, label));
+    }
+    // Kinds without facts still say how the program is named.
+    if link.facts.is_empty() {
+        for kind in &link.reference_kinds {
+            let way = way_of(kind);
+            let label = (way == UNKNOWN).then(|| code(kind, MAX_NAME_CHARS));
+            places.push((slot(way), way == UNKNOWN, label));
+        }
+    }
+    for (index, counted, label) in places {
+        let way = &mut ways[index];
+        way.total += usize::from(counted);
+        if let Some(label) = label {
+            if room > 0 {
+                room -= 1;
+                way.shown.push(label);
+            }
+        }
+    }
+    let noun = if link.facts.is_empty() {
+        "kind"
+    } else {
+        "fact"
+    };
+    let described = !ways.is_empty();
+    let mut parts: Vec<String> = ways
+        .iter()
+        .map(|way| {
+            let phrase = WAYS[way.way];
+            let more = way.total - way.shown.len();
+            match (way.shown.len(), more) {
+                (0, 0) => phrase.to_string(),
+                (0, _) => format!("{phrase} ({} in {full})", count(more, noun)),
+                (shown, _) => format!(
+                    "{phrase} ({noun}{} {}{})",
+                    if shown == 1 { "" } else { "s" },
+                    way.shown.join(", "),
+                    if more == 0 {
+                        String::new()
+                    } else {
+                        format!(" and {more} more in {full}")
+                    }
+                ),
+            }
+        })
+        .collect();
+    if described && !link.facts.is_empty() && link.occurrences > 0 && sum != link.occurrences {
+        parts.push(format!(
+            "{full} is inconsistent here: these facts add up to {}, not {}",
+            count(usize::try_from(sum).unwrap_or(usize::MAX), "occurrence"),
+            link.occurrences
+        ));
+    }
+    if foreign > 0 {
+        parts.push(format!(
+            "{} listed with this link in {full} {} another caller or callee and {} left out",
+            count(foreign, "fact"),
+            if foreign == 1 { "names" } else { "name" },
+            if foreign == 1 { "is" } else { "are" }
+        ));
+    }
+    (parts, described)
 }
 
 /// An id or path as a code span when it holds only characters that are inert
@@ -3186,6 +3369,425 @@ mod tests {
         let text = ticket_with(Vec::new());
         assert!(text.contains(file_only), "{text}");
         assert!(!text.contains("loose ends below"), "{text}");
+    }
+
+    /// One fact of a reference link, as a current exporter writes it.
+    fn link_fact(id: u64, caller: usize, callee: usize, kind: &str) -> Value {
+        json!({
+            "fact": format!("f-{id:016x}"), "program": format!("app:program:{caller}"),
+            "subject": format!("app:task:{caller}"),
+            "object": {"status": "resolved", "entity": format!("app:program:{callee}")},
+            "occurrences": 1, "reference_kind": kind,
+        })
+    }
+
+    /// A reference link with its facts; the kinds and the count follow them.
+    fn link_with(caller: usize, callee: usize, facts: Vec<Value>) -> Value {
+        let mut kinds: Vec<&str> = facts
+            .iter()
+            .filter_map(|fact| fact["reference_kind"].as_str())
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        json!({
+            "caller": format!("app:program:{caller}"), "callee": format!("app:program:{callee}"),
+            "callee_group": if callee == 1 { "ga" } else { "gb" },
+            "occurrences": facts.len(), "reference_kinds": kinds, "facts": facts,
+        })
+    }
+
+    /// The ticket of group `gb` (programs 2 and 3), which reaches group `ga`
+    /// (program 1) by reference only, with `links` as its reference links.
+    /// The manifest's SHA-256 reads `SHA`.
+    fn reference_ticket(links: Value) -> String {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 1, &["Program B", "Program C"], &["ga"]),
+        ];
+        groups[1].loose_ends = json!({ "reference_links": links });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[("gb", &["ga"])]);
+        import(repo.path(), &dir).unwrap();
+        let sha = hex(&Sha256::digest(std::fs::read(dir.join(MANIFEST)).unwrap()));
+        let text = read_ticket(repo.path(), "atlas-gb");
+        Ticket::parse("atlas-gb", &text).unwrap();
+        text.replace(&sha, "SHA")
+    }
+
+    const EXPRESSION: &str = "expression_literal";
+    const SELECTION: &str = "variable_selection_program";
+
+    #[test]
+    fn a_reference_link_says_how_the_program_is_named_and_by_which_facts() {
+        let text = reference_ticket(json!([
+            link_with(2, 1, vec![link_fact(1, 2, 1, EXPRESSION)]),
+            // A program that refers to itself.
+            link_with(2, 2, vec![link_fact(2, 2, 2, EXPRESSION)]),
+            link_with(3, 1, vec![link_fact(3, 3, 1, SELECTION)]),
+            link_with(
+                3,
+                2,
+                vec![
+                    link_fact(4, 3, 2, SELECTION),
+                    link_fact(5, 3, 2, EXPRESSION),
+                    link_fact(6, 3, 2, SELECTION),
+                ],
+            ),
+        ]));
+        for expected in [
+            "- reference only: `app:program:2` Program B names `app:program:1` Program A of \
+             ticket `atlas-ga` (1 occurrence): in an expression (fact `f-0000000000000001`)\n",
+            "- reference only: `app:program:2` Program B names `app:program:2` Program B of \
+             this group (1 occurrence): in an expression (fact `f-0000000000000002`)\n",
+            "- reference only: `app:program:3` Program C names `app:program:1` Program A of \
+             ticket `atlas-ga` (1 occurrence): as the selection program of a variable no \
+             control is bound to (fact `f-0000000000000003`)\n",
+            // Both kinds on one link, each with its facts in facts-file order.
+            "- reference only: `app:program:3` Program C names `app:program:2` Program B of \
+             this group (3 occurrences): as the selection program of a variable no control \
+             is bound to (facts `f-0000000000000004`, `f-0000000000000006`); in an \
+             expression (fact `f-0000000000000005`)\n",
+            // The line leaves the kinds to the pairs, which differ.
+            "- By reference only (1 of them): `atlas-ga`. A program of this group names a \
+             program of that ticket, and the bundle records no call between them. That is a \
+             mention, not a call: the ticket still waits for it, but see how the program is \
+             named before treating it as one this group runs. Each pair below says how, and \
+             the facts it names are `references_program` facts in `bundle/facts/gb.jsonl`. \
+             The loose ends below name the pairs, which `bundle/groups.json` lists under \
+             `reference_links`.\n",
+            "reference links 4, external invocations 0,",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        assert!(!text.contains("in an expression, or as"), "{text}");
+    }
+
+    #[test]
+    fn a_reference_link_without_kinds_and_facts_reads_as_it_did() {
+        let old = json!([
+            {
+                "caller": "app:program:2", "callee": "app:program:1",
+                "callee_group": "ga", "occurrences": 2,
+            },
+            {
+                "caller": "app:program:3", "callee": "app:program:3",
+                "callee_group": "gb", "occurrences": 1,
+            },
+        ]);
+        let text = reference_ticket(old.clone());
+        // The by-reference line and the loose ends, whole, as the importer
+        // wrote them before it read `reference_kinds` and `facts`.
+        let expected = "\
+            - By reference only (1 of them): `atlas-ga`. A program of this group names a \
+            program of that ticket in an expression, or as the selection program of a \
+            variable no control is bound to, and the bundle records no call between them. \
+            That is a mention, not a call: the ticket still waits for it, but read the \
+            `references_program` facts in `bundle/facts/gb.jsonl` to see how the program is \
+            named before treating it as one this group runs. The loose ends below name the \
+            pairs, which `bundle/groups.json` lists under `reference_links`.\n\
+            - Facts: `bundle/facts/gb.jsonl` (2 facts).\n\
+            - Blocks: `bundle/blocks/gb.jsonl` (0 block units).\n\
+            \n\
+            Programs (2):\n\
+            - `app:program:2` Program B: packet index `bundle/packets/app/program-2/index.json`\n\
+            - `app:program:3` Program C: packet index `bundle/packets/app/program-3/index.json`\n\
+            \n\
+            Loose ends recorded in `bundle/groups.json` (2): dynamic call targets 0, call \
+            targets with no definition 0, call targets outside the selected output 0, calls \
+            into another application 0, reference links 2, external invocations 0, \
+            operations the bundle does not interpret 0.\n\
+            - reference only: `app:program:2` Program B names `app:program:1` Program A of \
+            ticket `atlas-ga` (2 occurrences)\n\
+            - reference only: `app:program:3` Program C names `app:program:3` Program C of \
+            this group (1 occurrence)\n\
+            \n\
+            Data sources: none recorded for this group.\n";
+        assert!(text.contains(expected), "{text}");
+
+        // Empty or null fields are absent ones.
+        for empty in [json!([]), json!(null)] {
+            let mut links = old.clone();
+            for link in links.as_array_mut().unwrap() {
+                link["reference_kinds"] = empty.clone();
+                link["facts"] = empty.clone();
+            }
+            assert_eq!(reference_ticket(links), text, "{empty}");
+        }
+
+        // One link without the fields keeps the general wording for the group.
+        let mut mixed = old.clone();
+        mixed[1] = link_with(3, 3, vec![link_fact(1, 3, 3, EXPRESSION)]);
+        let mixed = reference_ticket(mixed);
+        assert!(
+            mixed.contains("in an expression, or as the selection program of a variable"),
+            "{mixed}"
+        );
+        assert!(
+            mixed.contains("ticket `atlas-ga` (2 occurrences)\n")
+                && mixed.contains("(1 occurrence): in an expression (fact `f-0000000000000001`)\n"),
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn a_reference_kind_the_importer_does_not_know_is_not_called_a_known_one() {
+        let mut blank = link_fact(4, 2, 1, "");
+        blank.as_object_mut().unwrap().remove("reference_kind");
+        let text = reference_ticket(json!([link_with(
+            2,
+            1,
+            vec![
+                link_fact(1, 2, 1, "unclassified"),
+                link_fact(2, 2, 1, "stored_property"),
+                link_fact(3, 2, 1, "Odd Kind*\n## Goal `x`"),
+                blank,
+                link_fact(5, 2, 1, EXPRESSION),
+            ],
+        )]));
+        let expected = "- reference only: `app:program:2` Program B names `app:program:1` \
+             Program A of ticket `atlas-ga` (5 occurrences): in a way the bundle does not \
+             classify (facts `f-0000000000000001`, `f-0000000000000004`); as a reference of \
+             a kind this importer does not know (facts `f-0000000000000002` of kind \
+             `stored_property`, `f-0000000000000003` of kind Odd Kind\\* \\#\\# Goal \
+             \\`x\\`); in an expression (fact `f-0000000000000005`)\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+        assert_eq!(text.matches("## Goal").count(), 1, "{text}");
+        // Kinds the pairs name keep the by-reference line free of them.
+        assert!(text.contains("Each pair below says how"), "{text}");
+
+        // Kinds without facts still say how, and an unknown one is named.
+        let text = reference_ticket(json!([{
+            "caller": "app:program:2", "callee": "app:program:1", "occurrences": 2,
+            "reference_kinds": [EXPRESSION, "stored_property", "unclassified"],
+        }]));
+        let expected = "ticket `atlas-ga` (2 occurrences): in an expression; as a reference \
+                        of a kind this importer does not know (kind `stored_property`); in \
+                        a way the bundle does not classify\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+
+    #[test]
+    fn a_reference_link_names_at_most_ten_facts_and_counts_the_rest() {
+        let mut facts: Vec<Value> = (1..=12).map(|n| link_fact(n, 2, 1, EXPRESSION)).collect();
+        facts.push(link_fact(13, 2, 1, SELECTION));
+        facts.push(link_fact(14, 2, 1, SELECTION));
+        let text = reference_ticket(json!([link_with(2, 1, facts)]));
+        let listed: Vec<String> = (1..=10).map(|n| format!("`f-{n:016x}`")).collect();
+        let expected = format!(
+            "ticket `atlas-ga` (14 occurrences): in an expression (facts {} and 2 more in \
+             `bundle/groups.json`); as the selection program of a variable no control is \
+             bound to (2 facts in `bundle/groups.json`)\n",
+            listed.join(", ")
+        );
+        assert!(text.contains(&expected), "{expected}\n{text}");
+        assert!(!text.contains("f-000000000000000b"), "{text}");
+
+        // A fact without an id is counted, not named.
+        let mut facts = vec![
+            link_fact(1, 2, 1, EXPRESSION),
+            link_fact(2, 2, 1, EXPRESSION),
+        ];
+        facts[1]["fact"] = json!(null);
+        let text = reference_ticket(json!([link_with(2, 1, facts)]));
+        let expected = "(2 occurrences): in an expression (fact `f-0000000000000001` and 1 \
+                        more in `bundle/groups.json`)\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+
+    #[test]
+    fn hostile_fact_ids_and_kinds_of_a_reference_link_stay_one_escaped_line() {
+        let hostile = "f`\n---\nowner: nobody\n## Goal\n<<<BEGIN>>>\u{202e}[link](target) *b*";
+        let long = "é".repeat(500);
+        let mut facts = vec![
+            link_fact(1, 2, 1, hostile),
+            link_fact(2, 2, 1, &long),
+            link_fact(3, 2, 1, EXPRESSION),
+            link_fact(4, 2, 1, "```"),
+        ];
+        facts[0]["fact"] = json!(hostile);
+        facts[1]["fact"] = json!(long);
+        facts[2]["fact"] = json!("` | `");
+        let mut link = link_with(2, 1, facts);
+        link["reference_kinds"] = json!([hostile, long]);
+        let text = reference_ticket(json!([link]));
+
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("- reference only: "))
+            .unwrap();
+        assert!(
+            line.contains(
+                "f\\` --- owner: nobody \\#\\# Goal \\<\\<\\<BEGIN\\>\\>\\> \
+                 \\[link\\](target) \\*b\\* of kind f\\` --- owner: nobody \\#\\# Goal \
+                 \\<\\<\\<BEGIN\\>\\>\\> \\[link\\](target) \\*b\\*"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "{}… of kind {}…",
+                "é".repeat(MAX_ID_CHARS),
+                "é".repeat(MAX_NAME_CHARS)
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("in an expression (fact \\` \\| \\`)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("f-0000000000000004` of kind \\`\\`\\`"),
+            "{line}"
+        );
+        // Every backtick the bundle supplied is escaped, so the four spans
+        // the importer opened are the only ones.
+        assert_eq!(
+            line.matches('`').count() - line.matches("\\`").count(),
+            8,
+            "{line}"
+        );
+        assert!(line.chars().count() < 1500, "{line}");
+        assert!(!text.contains('\u{202e}'), "{text}");
+        let body = text.split_once("\n---\n").unwrap().1;
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.trim_start().starts_with('#'))
+                .count(),
+            4,
+            "{text}"
+        );
+        assert!(
+            !body.lines().any(|line| {
+                line.starts_with("---") || line.starts_with("<<<") || line.starts_with("owner")
+            }),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_reference_link_that_contradicts_itself_is_imported_and_says_so() {
+        // The link's count is not the sum of its facts.
+        let mut link = link_with(2, 1, vec![link_fact(1, 2, 1, EXPRESSION)]);
+        link["occurrences"] = json!(3);
+        let text = reference_ticket(json!([link]));
+        let expected = "ticket `atlas-ga` (3 occurrences): in an expression (fact \
+                        `f-0000000000000001`); `bundle/groups.json` is inconsistent here: \
+                        these facts add up to 1 occurrence, not 3\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+
+        // A fact of another caller, and one of another callee, are not the
+        // link's: neither is named, and neither lends its kind.
+        let link = link_with(
+            2,
+            1,
+            vec![
+                link_fact(1, 2, 1, EXPRESSION),
+                link_fact(2, 3, 1, SELECTION),
+                link_fact(3, 2, 3, SELECTION),
+            ],
+        );
+        let text = reference_ticket(json!([link]));
+        let expected = "ticket `atlas-ga` (3 occurrences): in an expression (fact \
+                        `f-0000000000000001`); `bundle/groups.json` is inconsistent here: \
+                        these facts add up to 1 occurrence, not 3; 2 facts listed with this \
+                        link in `bundle/groups.json` name another caller or callee and are \
+                        left out\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+        assert!(!text.contains("selection program of a variable no control is bound to ("));
+
+        // With no fact of its own the link says nothing about how, and the
+        // by-reference line keeps the general wording.
+        let mut link = link_with(2, 1, vec![link_fact(1, 3, 1, EXPRESSION)]);
+        link["occurrences"] = json!(1);
+        let text = reference_ticket(json!([link]));
+        let expected = "ticket `atlas-ga` (1 occurrence): 1 fact listed with this link in \
+                        `bundle/groups.json` names another caller or callee and is left out\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+        assert!(
+            text.contains("in an expression, or as the selection program of a variable"),
+            "{text}"
+        );
+
+        // Counts no sum can hold do not stop the import.
+        let mut facts = vec![
+            link_fact(1, 2, 1, EXPRESSION),
+            link_fact(2, 2, 1, EXPRESSION),
+        ];
+        facts[0]["occurrences"] = json!(u64::MAX);
+        facts[1]["occurrences"] = json!(u64::MAX);
+        let text = reference_ticket(json!([link_with(2, 1, facts)]));
+        assert!(
+            text.contains(&format!(
+                "these facts add up to {} occurrences, not 2\n",
+                u64::MAX
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn malformed_kinds_and_facts_of_a_reference_link_never_refuse_a_groups_file() {
+        type Edit = fn(&mut Value);
+        let cases: [(Edit, &str); 12] = [
+            // Without a list of facts the kinds alone say how.
+            (|link| link["facts"] = json!("x"), ": in an expression"),
+            (
+                |link| link["facts"] = json!({"fact": "f-1"}),
+                ": in an expression",
+            ),
+            (|link| link["facts"] = json!(7), ": in an expression"),
+            (
+                |link| link["reference_kinds"] = json!("expression_literal"),
+                FULL,
+            ),
+            (|link| link["reference_kinds"] = json!([7, null, {}]), FULL),
+            // An entry that is not a record is left out.
+            (
+                |link| link["facts"] = json!([7, "x", null, link["facts"][0]]),
+                FULL,
+            ),
+            (
+                |link| link["facts"][0]["occurrences"] = json!(-1),
+                ": in an expression (fact `f-0000000000000001`); `bundle/groups.json` is \
+                 inconsistent here: these facts add up to 0 occurrences, not 1",
+            ),
+            (
+                |link| link["facts"][0]["occurrences"] = json!("1"),
+                ": in an expression (fact `f-0000000000000001`); `bundle/groups.json` is \
+                 inconsistent here: these facts add up to 0 occurrences, not 1",
+            ),
+            (
+                |link| link["facts"][0]["fact"] = json!(["f-1"]),
+                ": in an expression (1 fact in `bundle/groups.json`)",
+            ),
+            (
+                |link| link["facts"][0]["reference_kind"] = json!(7),
+                ": in a way the bundle does not classify (fact `f-0000000000000001`)",
+            ),
+            (|link| link["facts"][0]["program"] = json!(null), FULL),
+            (
+                |link| link["facts"][0]["object"] = json!("app:program:1"),
+                FULL,
+            ),
+        ];
+        const FULL: &str = ": in an expression (fact `f-0000000000000001`)";
+        for (index, (edit, detail)) in cases.into_iter().enumerate() {
+            let mut link = link_with(2, 1, vec![link_fact(1, 2, 1, EXPRESSION)]);
+            edit(&mut link);
+            let text = reference_ticket(json!([link.clone()]));
+            let expected = format!("ticket `atlas-ga` (1 occurrence){detail}\n");
+            assert!(text.contains(&expected), "{index}: {expected}\n{text}");
+
+            // An earlier schema shows no reference link, whatever it holds.
+            let repo = tempfile::tempdir().unwrap();
+            let mut groups = chain();
+            groups[1].loose_ends = json!({ "reference_links": [link] });
+            let dir = write_bundle(repo.path(), "bundle", &groups);
+            import(repo.path(), &dir).unwrap();
+            let text = read_ticket(repo.path(), "atlas-gb");
+            assert!(text.contains("groups.json`: none.\n"), "{index}: {text}");
+        }
     }
 
     #[test]
