@@ -40,9 +40,12 @@ use std::sync::Arc;
 /// orchestrator wanted clarification it cannot get headlessly (`NotReady`).
 pub const EXIT_UNDERSPECIFIED: i32 = 3;
 
-/// Exit code when the mission COMPLETE'd but `--push` failed. Distinct from
-/// mission failure (1) and underspecified (3) so CI can tell delivery apart
-/// from the run itself. Stdout still reports `pushed=false`.
+/// Exit code when `--push` failed: either the remote failed preflight
+/// before the mission was created, or the mission COMPLETE'd but the
+/// post-run push failed. Distinct from mission failure (1) and
+/// underspecified (3) so CI can tell delivery apart from the run itself.
+/// On a preflight refusal nothing is printed to stdout; on a post-run
+/// failure stdout still reports `pushed=false`.
 pub const EXIT_PUSH_FAILED: i32 = 4;
 
 /// Restores the caller's branch whenever enqueue-only planning exits —
@@ -168,7 +171,9 @@ fn read_mission_file(path: &Path) -> Result<Ticket> {
 ///
 /// Immediately after config loads and before any mission directory is
 /// created, [`scrutiny_gate`] enforces the unattended scrutiny floor: see its
-/// doc comment for the rationale.
+/// doc comment for the rationale. When `--push <REMOTE>` is given, the
+/// remote is also preflighted (see [`cmd_exec_with_backend`]) before the
+/// mission is created, so a bad `--push` target is refused before any spend.
 pub async fn cmd_exec(repo: PathBuf, file: PathBuf, options: ExecOptions) -> Result<i32> {
     let ticket = read_mission_file(&file)?;
     let cfg = load_config(&repo, options.dangerously_allow_all)?;
@@ -196,6 +201,19 @@ async fn cmd_exec_with_backend(
     file: PathBuf,
     options: ExecOptions,
 ) -> Result<i32> {
+    // Preflight `--push` before anything else: a bad remote (unconfigured,
+    // armed local config, a `::` remote-helper URL, or simply unreachable)
+    // must be refused before `MissionEngine::create` spends anything, not
+    // discovered only after the mission has already run. This is read-only
+    // (ls-remote) and proves reachability, not write access — the real push
+    // still runs, and can still fail, after the mission completes.
+    if let Some(remote) = &options.push {
+        if let Err(e) = GitRepo::open(&repo).and_then(|git| git.preflight_push_remote(remote)) {
+            eprintln!("kranz exec: refusing --push {remote} before starting the mission: {e}");
+            return Ok(EXIT_PUSH_FAILED);
+        }
+    }
+
     // Declared before the engine so Rust drops the engine first on every
     // early return/unwind, then restores the checkout after its Git handles
     // are out of the way.
@@ -551,6 +569,171 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no pinned base"), "{err}");
+    }
+
+    /// Seeds a one-commit git repo on `main`, the minimal fixture every
+    /// `exec_push_preflight_*` test starts from.
+    fn seed_push_preflight_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-q", "-m", "seed"]] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        (tmp, repo)
+    }
+
+    fn push_preflight_options(remote: &str) -> ExecOptions {
+        ExecOptions {
+            max_cycles: Some(1),
+            enqueue: false,
+            enqueue_source: None,
+            push: Some(remote.to_string()),
+            dangerously_allow_all: false,
+            allow_unvalidated: false,
+        }
+    }
+
+    /// Asserts the shared `exec_push_preflight_*` refusal shape: exit 4, no
+    /// mission directory created (so no agent was ever spawned — the
+    /// `MockBackend` here has zero scripts and would error on first use),
+    /// and the checkout is still on `main`.
+    async fn assert_push_preflight_refused(repo: &Path, remote: &str) {
+        let backend: Arc<dyn AgentBackend> = Arc::new(
+            kranz_engine::backend_mock::MockBackend::with_scripts(vec![]),
+        );
+        let ticket = parse_mission_markdown(
+            "push-preflight",
+            "---\npriority: 1\n---\n## Goal\nship the demo\n\n## Acceptance hints\nit works\n",
+        )
+        .unwrap();
+        let cfg = MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            ..Default::default()
+        };
+
+        let code = cmd_exec_with_backend(
+            repo.to_path_buf(),
+            cfg,
+            backend,
+            ticket,
+            PathBuf::from("push-preflight.md"),
+            push_preflight_options(remote),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, EXIT_PUSH_FAILED);
+        let missions_dir = repo.join(".kranz").join("missions");
+        assert!(
+            !missions_dir.exists() || std::fs::read_dir(&missions_dir).unwrap().next().is_none(),
+            "a refused --push preflight must not create a mission"
+        );
+        assert_eq!(
+            GitRepo::open(repo).unwrap().current_branch().unwrap(),
+            "main",
+            "a refused --push preflight must not touch the checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_push_preflight_refuses_unconfigured_remote() {
+        let (_tmp, repo) = seed_push_preflight_repo();
+        assert_push_preflight_refused(&repo, "origin").await;
+    }
+
+    #[tokio::test]
+    async fn exec_push_preflight_refuses_remote_helper_url() {
+        let (_tmp, repo) = seed_push_preflight_repo();
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", "ext::sh -c true"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert_push_preflight_refused(&repo, "origin").await;
+    }
+
+    #[tokio::test]
+    async fn exec_push_preflight_refuses_armed_local_config() {
+        let (_tmp, repo) = seed_push_preflight_repo();
+        assert!(std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "/nonexistent/kranz-preflight.git"
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "credential.helper", "store"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert_push_preflight_refused(&repo, "origin").await;
+    }
+
+    #[tokio::test]
+    async fn exec_push_preflight_refuses_unreachable_remote() {
+        let (_tmp, repo) = seed_push_preflight_repo();
+        assert!(std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "/nonexistent/kranz-preflight.git"
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert_push_preflight_refused(&repo, "origin").await;
+    }
+
+    #[test]
+    fn exec_push_preflight_accepts_reachable_remote() {
+        let (_tmp, repo) = seed_push_preflight_repo();
+        let bare_tmp = tempfile::tempdir().unwrap();
+        let bare = bare_tmp.path().join("remote.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", bare.to_str().unwrap()])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        GitRepo::open(&repo)
+            .unwrap()
+            .preflight_push_remote("origin")
+            .unwrap();
     }
 
     #[test]

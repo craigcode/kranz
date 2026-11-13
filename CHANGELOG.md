@@ -16,6 +16,11 @@ Notable user-visible changes are documented here. This project follows
   `patterns_allowed` entries by glob. An Actions update must add its new
   commit to the allowlist in the same PR, and the operator must re-apply the
   file to the repository's selected-actions setting after it changes.
+- Changed: `kranz exec -f mission.md --push <remote>` now preflights the
+  remote (configured, no armed local config, no `::` remote-helper URL, and a
+  read-only `git ls-remote` reachability probe) before `MissionEngine::create`,
+  so an unusable `--push` target is refused (exit 4, no mission created)
+  before any spend rather than only after the mission runs.
 - Wired `SgianTerminalProvider` automatically into `MissionEngine` and `runner`
   (`AcpBackend::for_mission_worker`) for `checkout`-isolated uncontained ACP
   workers when both an external `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key`

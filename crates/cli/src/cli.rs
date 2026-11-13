@@ -409,6 +409,9 @@ pub enum Command {
         /// After a COMPLETE run, push the mission's `kranz/*` branch to this
         /// git remote (the cloud-mission handoff: a human reviews the branch
         /// and opens the PR). Refuses to push anything but a kranz/* ref.
+        /// The remote is checked (configured, reachable, no armed local
+        /// config, no `::` helper URL) before the mission starts, so an
+        /// unusable remote is refused before any spend.
         #[arg(long, value_name = "REMOTE")]
         push: Option<String>,
 

@@ -102,6 +102,12 @@ What the primitive guarantees:
   waive one; an allowlist edit inside the mission's own range does not.
 - On failure git's stderr is surfaced verbatim, so a bad deploy key or a
   rejected non-fast-forward lands in the mission log with git's own words.
+- `kranz exec --push <remote>` checks the remote (name shape, configured, no
+  armed repository-local config, no `::` remote-helper URL, and a read-only
+  `git ls-remote` reachability probe) **before `MissionEngine::create`** —
+  before the mission exists at all, not after a wasted run. A refused
+  preflight exits 4 and creates no mission. This only proves the remote is
+  reachable; write permission is still proven only by the push itself.
 
 End-to-end review flow:
 
