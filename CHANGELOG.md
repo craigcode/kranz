@@ -10,13 +10,16 @@ Notable user-visible changes are documented here. This project follows
   bundle. The "reference only" loose end then says how the program is named
   (in an expression, as the selection program of a variable no control is
   bound to, or both) and carries the ids of the `references_program` facts
-  behind it, at most 10 for a link with the rest counted. A kind the importer
+  behind it, at most 10 for a link with the rest counted. A link that has
+  kinds but lists no fact gives the ways without ids. A kind the importer
   does not know, or `unclassified`, is said to be that and never presented as
-  a known kind. When every link of a group says how, the by-reference line
-  points to the pairs instead of listing the ways. A link whose facts do not
-  add up to its occurrences, or name another caller or callee, is imported
-  and the bullet says so. Schema 3 bundles without the two fields, and
-  schema 1 and 2 bundles, give the same tickets as before. See
+  a known kind. A fact id or kind that is not a plain token is counted and
+  not shown. When every link of a group says something on how, the
+  by-reference line points to the pairs instead of listing the ways; when
+  only some do, it says so. A link that gives its occurrences and whose facts
+  do not add up to them, or whose facts name another caller or callee, is
+  imported and the bullet says so. Schema 3 bundles without the two fields,
+  and schema 1 and 2 bundles, give the same tickets as before. See
   `docs/tickets.md`.
 - Fixed: loose ends in tickets that `kranz ticket import-atlas` writes from a
   schema 3 bundle. Reference links are read from `groups.json`, counted and

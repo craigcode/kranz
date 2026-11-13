@@ -195,7 +195,8 @@ What a ticket holds:
     mentioned program is still worth having first. The mention is a program
     literal in an expression or the selection program of such a variable, so
     the text sends the worker to the group's `references_program` facts to
-    see how the program is named.
+    see how the program is named, unless the pairs say how themselves (see
+    below).
   - The group's reference links (`reference_links` in `groups.json`), external
     invocations and uninterpreted operations, among the loose ends, counted
     in the loose-ends line and within the same limit of 10. A reference link
@@ -212,24 +213,51 @@ What a ticket holds:
     occurrences, one part for each way the program is named, each with the
     ids of its facts in facts-file order: "(3 occurrences): in an expression
     (facts `<fact id>`, `<fact id>`); as the selection program of a variable
-    no control is bound to (fact `<fact id>`)". The ids are those of the
-    `references_program` facts in the group's facts file. A link names at
-    most 10 facts; the rest are counted, as in "and 2 more in `groups.json`".
-    The kind `unclassified`, or a fact with no kind, reads "in a way the
-    bundle does not classify". Any other kind reads "as a reference of a kind
-    this importer does not know", with the kind next to each fact id; it is
-    never presented as one of the known kinds. When every reference link of
-    the group says how its program is named, the by-reference line stops
-    listing the ways a program can be named and sends the worker to the pairs,
-    which can differ from one to the next.
+    no control is bound to (fact `<fact id>`)". The parts follow the order in
+    which the ways first appear in the facts. The ids are those of the
+    `references_program` facts in the group's facts file.
+    - The kind `unclassified`, or a fact with no kind, reads "in a way the
+      bundle does not classify". Any other kind reads "as a reference of a
+      kind this importer does not know", with the kind next to each fact id
+      as in "`<fact id>` of kind `<kind>`"; it is never presented as one of
+      the known kinds. A known kind is matched after the whitespace around it
+      is dropped, and in that spelling only.
+    - A link names at most 10 facts; the rest are counted, as in "and 2 more
+      in `groups.json`". The 10 are counted across the whole link, so a later
+      part can read "(2 facts in `groups.json`)" with no id.
+    - A fact id or a kind is shown only when it is a plain token: letters,
+      digits and `-`, `_`, `.`, `/`, `:`, `%`, no longer than the bound for an
+      id or a name. Anything else is counted like a fact past the 10 and not
+      shown, because escaped text in the middle of the bullet could still
+      read as the importer's own words. A fact with no id is counted the same
+      way. The fact ids Magic Atlas writes are plain tokens.
+    - The ways are taken from the facts. `reference_kinds` is read only when
+      the link lists no fact; the bullet then gives the ways without fact
+      ids, naming an unknown kind as in "(kind `<kind>`)". The two fields are
+      not checked against each other.
+    - When every reference link of the group says something on how, the
+      by-reference line stops listing the ways a program can be named and
+      reads "Each pair below says what the bundle records about how"; the
+      pairs can differ from one to the next, and a pair may say only that the
+      bundle does not classify the reference. When some links do and others
+      do not, the line says so and sends the worker to the facts file for the
+      others. When none does, the line is the one an earlier bundle gets.
   - What a reference link contradicts itself on. The two fields are read as
-    leniently as the rest of a loose end: a value of another shape reads as
-    absent, an entry that is not a record is left out, and the import never
-    fails on them. A fact whose `program` is not the link's caller, or whose
-    target is not its callee, is left out and the bullet says how many were.
-    When the occurrences of the facts do not add up to the link's
-    `occurrences`, the bullet says "`groups.json` is inconsistent here" with
-    both numbers. The link's own count is still the one shown.
+    leniently as the rest of a loose end, and the import never fails on
+    them: a value of another shape reads as absent, an entry of
+    `reference_kinds` that is not a string is left out, and an entry of
+    `facts` that is not a record is left out and the bullet says how many
+    were.
+    - A fact that names another `program` than the link's caller, or another
+      target than its callee, is left out and the bullet says how many were.
+      A fact that names neither is kept.
+    - When the link gives its `occurrences` and the facts kept do not add up
+      to it, the bullet says "`groups.json` is inconsistent here" with both
+      numbers. Leaving a fact out usually brings this about as well. When a
+      kept fact has no positive whole number as its `occurrences`, the bullet
+      says how many facts give no usable count and gives no sum.
+    - The link's own count is the one shown. A link with no count, or 0,
+      shows none and is not checked.
   - A loose end that is a fact carries its fact id, as in
     "external invocation in `<program id>` (fact `<fact id>`): COM
     `<stored text>`". Two invocations with the same text stay two bullets,
