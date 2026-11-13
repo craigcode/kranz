@@ -21,6 +21,32 @@ Notable user-visible changes are documented here. This project follows
   read-only `git ls-remote` reachability probe) before `MissionEngine::create`,
   so an unusable `--push` target is refused (exit 4, no mission created)
   before any spend rather than only after the mission runs.
+- Changed: `kranz ticket import-atlas` reads Magic Atlas bundles of schema 3
+  as well as 1 and 2. A schema 3 ticket says which of its `blocked-by` tickets
+  the group reaches by reference only (a program an expression or an unbound
+  variable names: a mention, not a call), lists the group's external
+  invocations and uninterpreted operations with its other loose ends, and
+  warns when the bundle was cut from an export that does not record such
+  links, so its dependencies may be incomplete. Tickets imported from schema 1
+  and 2 bundles are unchanged. See `docs/tickets.md`.
+- Changed: a session that the model declines to carry out is recorded as a
+  failed run, with a message in the event log that names the refusal and its
+  category when the agent reports one. It was recorded before as a partial run
+  with no report, which gave no reason for the missing report. This applies to
+  backends whose result reports a stop reason, which today is Claude Code.
+- Changed the orchestrator role prompt: it names the decisions that warrant
+  blocking (a change to the contract, scope or cost, or something only the
+  operator has) and the decisions inside an approved plan that need no
+  go-ahead, and it tells the orchestrator to plan from the repository as it is
+  and say so when a recorded lesson no longer matches it. The orchestrator
+  prompt hash recorded on new sessions changes.
+- Changed the worker role prompt: the turn limit is stated as the point where
+  the engine ends the session; ordinary obstacles are to be worked through
+  while the stops the prompt names are reported; the worker keeps the files its
+  feature touches in good shape without changing behaviour the spec does not
+  mention; and subagents are for work that splits into independent parts, not
+  for reviewing the worker's own diff. The worker prompt hash recorded on new
+  sessions changes.
 - Wired `SgianTerminalProvider` automatically into `MissionEngine` and `runner`
   (`AcpBackend::for_mission_worker`) for `checkout`-isolated uncontained ACP
   workers when both an external `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key`

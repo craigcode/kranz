@@ -751,6 +751,20 @@ pub(crate) fn isolated_global_home_test(name: &str) -> bool {
     true
 }
 
+/// Stop git's repository discovery at the temp root for a test that needs a
+/// tempdir to be NO repository. The temp root is not always outside one: as
+/// a contract command this suite runs with `TMPDIR` under the mission's
+/// `runs/contract-home`, inside the operator's checkout, and discovery from
+/// a bare tempdir would walk up into that repository.
+#[cfg(test)]
+pub(crate) fn git_ceiling_at_temp_root() -> EnvTestGuard {
+    let root = std::fs::canonicalize(std::env::temp_dir()).expect("temp root resolves");
+    EnvTestGuard::engage(&[(
+        "GIT_CEILING_DIRECTORIES",
+        root.to_str().expect("utf-8 temp root"),
+    )])
+}
+
 /// RAII guard: set each `(name, value)` pair on engage, restore the prior
 /// state (set/unset) on drop, all while holding [`ENV_TEST_LOCK`].
 #[cfg(test)]
@@ -1064,17 +1078,18 @@ mod tests {
     /// Ticket contract-toolchain-home-os-account: with `HOME` UNSET in the
     /// engine's own env (the env_clear'd / sandboxed gate shape), the
     /// toolchain derivation must fall to the OS account record, not silently
-    /// degrade to None. On a normal host the account record equals `$HOME`.
+    /// degrade to None. The account record is compared with itself, never
+    /// with the ambient `$HOME`: the two agree on a normal host, but this
+    /// suite also runs as a contract command, where `$HOME` is the gate's
+    /// scratch home.
     #[cfg(unix)]
     #[test]
     fn toolchain_home_os_account_resolves_when_home_is_unset() {
-        let real_home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
         let _guard = EnvTestGuard::engage_unsetting(&[], &["HOME", "CARGO_HOME", "RUSTUP_HOME"]);
 
         // The account record is the source now — HOME is gone, yet the
         // resolved operator home is still the operator's real home.
-        let account_home = os_account_home().expect("this host has a passwd entry");
-        assert_eq!(account_home, real_home, "account record == $HOME here");
+        let real_home = os_account_home().expect("this host has a passwd entry");
         assert_eq!(operator_home().as_deref(), Some(real_home.as_path()));
 
         // And the derivation still resolves the operator's real toolchain

@@ -20,6 +20,7 @@ Reported by the 2026-11-10 code review as low-severity items and not yet address
 - Fix each item on its own evidence; an item that cannot be reproduced is closed with a note, not patched speculatively.
 - Contract files change additively only.
 - Each fix carries a test that fails without it.
+- Operator decision, 2026-11-13: a delivery that was accepted once stays refused as a replay for at least 24 hours after first receipt, measured on the server's clock and bounded by the existing cache capacity. The 300 second timestamp window remains a freshness check only and does not set how long a replay is remembered. Document that a restart or a full cache can shorten the window.
 
 ## Acceptance hints
 

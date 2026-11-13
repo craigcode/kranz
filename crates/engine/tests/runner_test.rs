@@ -704,6 +704,122 @@ async fn run_session_without_parseable_report_is_partial() {
     assert_eq!(outcome.result, RunResult::Partial);
 }
 
+/// A terminal result whose `stop_reason` reports a model refusal: a clean
+/// exit with `is_error` false and no report text, as a declined request ends.
+fn refused_result(category: Option<&str>) -> AgentEvent {
+    let AgentEvent::Result {
+        text,
+        is_error,
+        usage,
+        cost_usd,
+        num_turns,
+        mut raw,
+    } = mock_result_text("")
+    else {
+        unreachable!("mock_result_text always returns a Result event");
+    };
+    raw["stop_reason"] = json!("refusal");
+    if let Some(category) = category {
+        raw["stop_details"] = json!({ "type": "refusal", "category": category });
+    }
+    AgentEvent::Result {
+        text,
+        is_error,
+        usage,
+        cost_usd,
+        num_turns,
+        raw,
+    }
+}
+
+#[tokio::test]
+async fn run_session_model_refusal_fails_and_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![mock_init("mock-session"), refused_result(Some("cyber"))],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("build it".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-r"), None)
+        .await
+        .unwrap();
+
+    // The process exited cleanly with no error flag and no report, which
+    // would otherwise read as an ordinary reportless `Partial`.
+    assert_eq!(outcome.exit, SessionExit::Completed);
+    assert!(outcome.report.is_none());
+    assert_eq!(outcome.result, RunResult::Fail);
+    drop(log);
+
+    let events = read_log(&p);
+    let refusal_at = events
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.kind,
+                EventKind::WorkerMessage { run_id, tag, content }
+                    if run_id == "run-r"
+                        && tag == "error"
+                        && content.contains("stop reason: refusal")
+                        && content.contains("category: cyber")
+            )
+        })
+        .expect("the refusal must be recorded as an error message");
+    let completed_at = events
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.kind,
+                EventKind::WorkerCompleted { run_id, result, .. }
+                    if run_id == "run-r" && *result == RunResult::Fail
+            )
+        })
+        .expect("worker.completed must carry the failed result");
+    assert!(
+        refusal_at < completed_at,
+        "the reason must be in the log before the completion it explains"
+    );
+}
+
+#[tokio::test]
+async fn run_session_refusal_recovered_by_a_later_turn_is_not_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let report = worker_report_json();
+    let script = MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            refused_result(None),
+            mock_result_text(&report.to_string()),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("build it".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-s"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.exit, SessionExit::Completed);
+    assert_eq!(outcome.result, RunResult::Pass);
+    drop(log);
+
+    let events = read_log(&p);
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::WorkerMessage { content, .. } if content.contains("stop reason: refusal")
+        )),
+        "a refusal the session recovered from must not be reported as its outcome"
+    );
+}
+
 #[tokio::test]
 async fn run_session_report_downgrades_provisional_pass() {
     let dir = tempfile::tempdir().unwrap();

@@ -676,10 +676,7 @@ fn note_referenced(note: &KnowledgeNote, haystack_lower: &str) -> bool {
         }
     }
     let title_l = note.title.to_ascii_lowercase();
-    if title_l.len() >= 8 && contains_word(haystack_lower, &title_l) {
-        return true;
-    }
-    false
+    title_l.len() >= 8 && contains_word(haystack_lower, &title_l)
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {
@@ -1213,6 +1210,7 @@ mod tests {
     #[test]
     fn knowledge_refresh_reports_git_open_failure() {
         let tmp = tempfile::tempdir().unwrap();
+        let _ceiling = crate::agent_env::git_ceiling_at_temp_root();
         fs::write(tmp.path().join("AGENTS.md"), "rules\n").unwrap();
         vault(tmp.path());
         write_note(

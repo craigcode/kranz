@@ -4,6 +4,8 @@
 # Runs the #[ignore]d soak_parallel_corruption test in release mode for
 # N iterations (default 20), cycling CLEAN / CRASH+RESUME / CONFLICT parallel
 # missions and asserting the full event-log invariant set after every one.
+# The same run includes soak_merge_during_run: N iterations that merge a
+# delivered mission while another runs in its own worktree (the lock split).
 #
 # Usage: scripts/soak.sh [iterations]
 set -uo pipefail

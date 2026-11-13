@@ -22,6 +22,8 @@ Reported by the 2026-11-10 code review as low-severity items and not yet address
 - Fix each item on its own evidence; an item that cannot be reproduced is closed with a note, not patched speculatively.
 - Contract files change additively only.
 - Each fix carries a test that fails without it.
+- Operator decision, 2026-11-13: the validation contract includes the additive-only check on the contract files (`events.rs`, `types.rs`, `backend.rs`, `error.rs`): no line removed or modified against the mission base.
+- Operator decision, 2026-11-13: declare write paths as the specific files or module directories each fix touches. Do not declare whole-crate globs such as `crates/engine/src/**`.
 
 ## Acceptance hints
 

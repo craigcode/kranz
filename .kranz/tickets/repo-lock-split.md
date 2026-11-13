@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Shipped in #171 and #174: separate merge lock (.kranz/queue/.repo.merge.lock) and soak_merge_during_run concurrent worktree-mission + merge soak test.
 title: Split the repo busy lock into a run lock and a merge lock
 priority: 2
 schedule: once
@@ -27,4 +29,4 @@ Today `RepoBusyGuard` in `crates/engine/src/queue.rs` is taken by the queue clai
 - A merge of a delivered mission succeeds while another mission is running in the same repository, and the running mission is unaffected.
 - Two merges in the same repository still serialize.
 - A second mission still cannot start while one is running.
-- A soak test exercises concurrent ref and object writes from a running mission worktree and a merge scratch worktree without corruption.
+- A soak test exercises concurrent ref and object writes from a running mission worktree and a merge scratch worktree without corruption. Delivered as `soak_merge_during_run` in `crates/engine/tests/soak_test.rs`, run by `scripts/soak.sh`.
