@@ -5,6 +5,19 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: loose ends in tickets that `kranz ticket import-atlas` writes from a
+  schema 3 bundle. Reference links are read from `groups.json`, counted and
+  listed with caller, callee, the callee's ticket and the occurrences; a
+  group whose only loose ends are reference links no longer says "none". The
+  by-reference line fits a selection program as well as an expression and
+  points to the group's `references_program` facts. Each loose end that is a
+  fact carries its fact id, the kind of an external invocation reads as
+  words ("OS command", not `os\_command`), and stored text such as a path is
+  shown in a code span instead of backslash-escaped, with a note after the
+  span when the text was cut at 80 characters or held a tab or line break.
+  Reference links are listed ahead of the other loose ends. Entries with no
+  fact id that read the same become one bullet with a count. Tickets
+  imported from schema 1 and 2 bundles are unchanged. See `docs/tickets.md`.
 - Changed: release builds no longer restore a Rust or npm cache
   (`.github/workflows/release.yml`), so every release artifact is built only
   from the tagged source; `scripts/check-release-workflow.py` guards this in
