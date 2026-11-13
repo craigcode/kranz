@@ -13,8 +13,10 @@ Notable user-visible changes are documented here. This project follows
   points to the group's `references_program` facts. Each loose end that is a
   fact carries its fact id, the kind of an external invocation reads as
   words ("OS command", not `os\_command`), and stored text such as a path is
-  shown in a code span as stored instead of backslash-escaped. Entries with
-  no fact id that read the same become one bullet with a count. Tickets
+  shown in a code span instead of backslash-escaped, with a note after the
+  span when the text was cut at 80 characters or held a tab or line break.
+  Reference links are listed ahead of the other loose ends. Entries with no
+  fact id that read the same become one bullet with a count. Tickets
   imported from schema 1 and 2 bundles are unchanged. See `docs/tickets.md`.
 - Changed: `kranz ticket import-atlas` reads Magic Atlas bundles of schema 3
   as well as 1 and 2. A schema 3 ticket says which of its `blocked-by` tickets

@@ -200,8 +200,11 @@ What a ticket holds:
     invocations and uninterpreted operations, among the loose ends, counted
     in the loose-ends line and within the same limit of 10. A reference link
     reads "`<caller id>` <name> names `<callee id>` <name> of ticket
-    `<slug>`" with its number of occurrences, so the pairs behind the
-    by-reference line are in the ticket.
+    `<slug>`" with its number of occurrences. Reference links are listed
+    ahead of the other loose ends, so the pairs behind the by-reference line
+    are in the ticket unless a group has more than 10 of them; the
+    by-reference line then says that only the first 10 are listed and that
+    `groups.json` holds them all.
   - A loose end that is a fact carries its fact id, as in
     "external invocation in `<program id>` (fact `<fact id>`): COM
     `<stored text>`". Two invocations with the same text stay two bullets,
@@ -212,9 +215,14 @@ What a ticket holds:
     web service. A kind the importer does not know is shown with spaces for
     underscores.
   - Text the application stored (the target of an external invocation, the
-    expression of a dynamic call target) in a code span, exactly as stored:
-    a Windows path keeps its single backslashes. The span is fenced with one
-    backtick more than the longest run inside the text.
+    expression of a dynamic call target) in a code span, without backslash
+    escaping: a Windows path keeps its single backslashes, and spaces are
+    kept as stored. The span holds at most the first 80 characters; a longer
+    text is followed, outside the span, by an ellipsis and a note that gives
+    its full length and names `groups.json` as the place of the rest. A tab,
+    line break or invisible character is shown as one space, and the bullet
+    says so. The span is fenced with one backtick more than the longest run
+    inside the text.
   - A `Links:` line when the bundle's `link_details` is anything but
     `available`. Such a bundle was cut from an export that does not record
     links from expressions, properties and external invocations, and only
@@ -255,8 +263,9 @@ What a ticket holds:
 Text taken from the bundle is treated as untrusted. Names, ids and paths are
 kept on one line, cut to a fixed length and Markdown-escaped, so a crafted
 program name cannot add a frontmatter key, a section heading or an instruction
-block. Stored text in a schema 3 loose end is kept on one line and cut the
-same way, then put in a code span that no backtick inside it can close.
+block. Stored text in a schema 3 loose end is kept on one line and cut to a
+fixed length too, then put in a code span that no backtick inside it can
+close.
 Characters that render as nothing (zero-width and bidirectional controls,
 fillers, variation selectors, tag characters) are replaced by a space, so a
 name cannot carry text the reviewer does not see.

@@ -301,6 +301,7 @@ struct LooseEnds {
     outside_output_calls: Vec<LooseCall>,
     external_invocations: Vec<LooseCall>,
     uninterpreted_operations: Vec<LooseCall>,
+    #[serde(deserialize_with = "lenient_list")]
     reference_links: Vec<ReferenceLink>,
     cross_application_calls: Vec<CrossApplicationCall>,
     data_sources: Vec<DataSource>,
@@ -311,6 +312,7 @@ struct LooseEnds {
 struct LooseCall {
     /// The id of the fact in the group's facts file; empty when the bundle
     /// gives none.
+    #[serde(deserialize_with = "lenient")]
     fact: String,
     program: String,
     object: LooseObject,
@@ -323,7 +325,36 @@ struct LooseCall {
 struct ReferenceLink {
     caller: String,
     callee: String,
+    #[serde(deserialize_with = "lenient")]
     occurrences: u64,
+}
+
+/// A field only schema 3 tickets show. A value of another shape reads as the
+/// default, so a groups file an earlier importer accepted is still accepted.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// As `lenient`, for a list: anything but a list reads as empty, and an
+/// entry of another shape is left out.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let entries = match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Array(entries) => entries,
+        _ => Vec::new(),
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
 }
 
 #[derive(Default, Deserialize)]
@@ -1412,20 +1443,62 @@ fn render_context(
             count(n, "group")
         ),
     });
+    // Reference links, which only schema 3 records, are the first loose ends
+    // listed: the by-reference line above them sends the worker to them.
+    let mut reference_lines = Vec::new();
+    if detailed {
+        let named = |id: &str| match programs.get(id) {
+            Some(program) => format!(
+                "{} {}",
+                code(id, MAX_ID_CHARS),
+                plain(&program.name, MAX_NAME_CHARS)
+            ),
+            None => code(id, MAX_ID_CHARS),
+        };
+        for link in &loose_ends.reference_links {
+            // The group id comes from the checked manifest, so it is inert.
+            let owner = match programs.get(link.callee.as_str()) {
+                Some(callee) if callee.group == group.id => " of this group".to_string(),
+                Some(callee) => format!(" of ticket `{prefix}-{}`", callee.group),
+                None => String::new(),
+            };
+            let times = match link.occurrences {
+                0 => String::new(),
+                n => format!(" ({})", count(n as usize, "occurrence")),
+            };
+            reference_lines.push(format!(
+                "- reference only: {} names {}{owner}{times}\n",
+                named(&link.caller),
+                named(&link.callee)
+            ));
+        }
+    }
     if !by_reference.is_empty() {
         // The slugs passed the slug rule, so they are inert in a code span.
         let slugs: Vec<String> = by_reference
             .iter()
             .map(|id| format!("`{prefix}-{id}`"))
             .collect();
+        // Reference links lead the loose ends, so the ticket names every
+        // pair unless there are more of them than the limit.
+        let pairs = match reference_lines.iter().collect::<HashSet<_>>().len() {
+            0 => format!("`{path}/{GROUPS}` lists the pairs under `reference_links`."),
+            n if n <= MAX_LISTED_LOOSE_ENDS => format!(
+                "The loose ends below name the pairs, which `{path}/{GROUPS}` lists under \
+                 `reference_links`."
+            ),
+            _ => format!(
+                "The loose ends below name the first {MAX_LISTED_LOOSE_ENDS} pairs; \
+                 `{path}/{GROUPS}` lists them all under `reference_links`."
+            ),
+        };
         out.push_str(&format!(
             "- By reference only ({} of them): {}. A program of this group names a program \
              of that ticket in an expression, or as the selection program of a variable no \
              control is bound to, and the bundle records no call between them. That is a \
              mention, not a call: the ticket still waits for it, but read the \
              `references_program` facts in {} to see how the program is named before \
-             treating it as one this group runs. The loose ends below name the pairs, which \
-             `{path}/{GROUPS}` lists under `reference_links`.\n",
+             treating it as one this group runs. {pairs}\n",
             by_reference.len(),
             slugs.join(", "),
             in_bundle(&group.facts)
@@ -1476,14 +1549,15 @@ fn render_context(
             program
         }
     };
-    let mut lines = Vec::new();
+    let full = format!("`{path}/{GROUPS}`");
+    let mut lines = reference_lines;
     for call in &loose_ends.dynamic_calls {
         let expression = call.object.expression.as_deref().unwrap_or("");
         lines.push(format!(
             "- dynamic call target in {}: {}\n",
             origin(call),
             if detailed {
-                stored(expression, MAX_NAME_CHARS)
+                stored(expression, MAX_NAME_CHARS, &full)
             } else {
                 plain(expression, MAX_NAME_CHARS)
             }
@@ -1513,44 +1587,19 @@ fn render_context(
             code(&call.callee, MAX_ID_CHARS)
         ));
     }
-    // Three kinds that only schema 3 records. An earlier bundle is rendered
+    // Two more kinds that only schema 3 records. An earlier bundle is rendered
     // without them whatever its groups file holds.
     let mut link_counts = String::new();
     if detailed {
-        let named = |id: &str| match programs.get(id) {
-            Some(program) => format!(
-                "{} {}",
-                code(id, MAX_ID_CHARS),
-                plain(&program.name, MAX_NAME_CHARS)
-            ),
-            None => code(id, MAX_ID_CHARS),
-        };
-        for link in &loose_ends.reference_links {
-            // The group id comes from the checked manifest, so it is inert.
-            let owner = match programs.get(link.callee.as_str()) {
-                Some(callee) if callee.group == group.id => " of this group".to_string(),
-                Some(callee) => format!(" of ticket `{prefix}-{}`", callee.group),
-                None => String::new(),
-            };
-            let times = match link.occurrences {
-                0 => String::new(),
-                n => format!(" ({})", count(n as usize, "occurrence")),
-            };
-            lines.push(format!(
-                "- reference only: {} names {}{owner}{times}\n",
-                named(&link.caller),
-                named(&link.callee)
-            ));
-        }
         for call in &loose_ends.external_invocations {
             // An invocation of a type the bundle does not interpret has no
             // text, only the stored type code.
             let text = call.object.text.as_deref().unwrap_or("");
             let detail = match call.object.code.as_deref() {
                 Some(code) if blank(text) && !blank(code) => {
-                    format!("stored type {}", stored(code, MAX_NAME_CHARS))
+                    format!("stored type {}", stored(code, MAX_NAME_CHARS, &full))
                 }
-                _ => stored(text, MAX_NAME_CHARS),
+                _ => stored(text, MAX_NAME_CHARS, &full),
             };
             lines.push(format!(
                 "- external invocation in {}: {} {detail}\n",
@@ -1803,14 +1852,28 @@ fn plain(text: &str, max_chars: usize) -> String {
 /// Text the application stored (a command line, a path, an expression) as a
 /// code span, so it reads as stored: backslash-escaping it would double every
 /// backslash of a Windows path for a reader who takes the ticket literally.
-/// The text is one line and capped. The span is fenced by one backtick more
-/// than the longest run of backticks inside it, and padded with a space when
-/// the text begins or ends with one, so no text can close its own span.
-fn stored(text: &str, max_chars: usize) -> String {
+/// Spaces are kept as they are. What the span does not hold as stored is
+/// said after it, outside the span: a cut at `max_chars` characters, with
+/// `full` named as the place of the whole text, and any other whitespace,
+/// control or invisible character, each shown as one space. The span is
+/// fenced by one backtick more than the longest run of backticks inside it,
+/// and padded with a space when the text begins or ends with one, so no text
+/// can close its own span.
+fn stored(text: &str, max_chars: usize, full: &str) -> String {
     if blank(text) {
         return "(blank)".to_string();
     }
-    let line = one_line(text, max_chars);
+    let total = text.chars().count();
+    let mut line = String::new();
+    let mut replaced = false;
+    for c in text.chars().take(max_chars) {
+        if c != ' ' && (c.is_whitespace() || c.is_control() || invisible(c)) {
+            replaced = true;
+            line.push(' ');
+        } else {
+            line.push(c);
+        }
+    }
     let mut longest = 0;
     let mut run = 0;
     for c in line.chars() {
@@ -1823,7 +1886,16 @@ fn stored(text: &str, max_chars: usize) -> String {
     } else {
         ""
     };
-    format!("{fence}{pad}{line}{pad}{fence}")
+    let mut out = format!("{fence}{pad}{line}{pad}{fence}");
+    if total > max_chars {
+        out.push_str(&format!(
+            "… (the first {max_chars} of {total} characters; {full} holds the rest)"
+        ));
+    }
+    if replaced {
+        out.push_str(" (a tab, line break or invisible character is shown as a space)");
+    }
+    out
 }
 
 /// Whether `one_line` would find nothing to show in the text.
@@ -2604,7 +2676,7 @@ mod tests {
             "in an expression, or as the selection program of a variable no control is bound to",
             "read the `references_program` facts in `bundles/app/facts/gc.jsonl` to see how \
              the program is named",
-            "`bundles/app/groups.json` lists under `reference_links`",
+            "runs. `bundles/app/groups.json` lists the pairs under `reference_links`.\n",
         ] {
             assert!(
                 ticket.context.contains(expected),
@@ -2794,7 +2866,8 @@ mod tests {
              operations the bundle does not interpret 2.",
             "- external invocation in `app:program:1`: OS command `` run `it` ``\n",
             "- external invocation in `app:program:1`: (blank) (blank)\n",
-            "- external invocation in `app:program:1`: uninterpreted stored type `9 ## Goal`\n",
+            "- external invocation in `app:program:1`: uninterpreted stored type `9 ## Goal` (a \
+             tab, line break or invisible character is shown as a space)\n",
             "- operation the bundle does not interpret in `app:program:1`: Strange \\#\\# Goal\n",
             "- operation the bundle does not interpret in `app:program:1`: (blank)\n",
         ] {
@@ -2999,6 +3072,157 @@ mod tests {
             text.contains("- 2 more in `bundle/groups.json`\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn schema_3_stored_text_says_what_the_code_span_does_not_hold() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = chain();
+        let long = format!("D:\\tools\\run.exe {}", "x".repeat(100));
+        let invocation = |fact: &str, text: &str| {
+            json!({
+                "fact": fact, "program": "app:program:1",
+                "object": {"kind": "os_command", "text": text},
+            })
+        };
+        groups[0].loose_ends = json!({
+            "dynamic_calls": [{
+                "fact": "f-0000000000000001", "program": "app:program:1",
+                "object": {"expression": "'P1'  &   A"},
+            }],
+            "external_invocations": [
+                invocation("f-0000000000000002", "  \"D:\\my  files\\run.exe\"  "),
+                invocation("f-0000000000000003", "a\tb\nc\u{200b}d"),
+                invocation("f-0000000000000004", &long),
+            ],
+        });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(repo.path(), &dir).unwrap();
+
+        let text = read_ticket(repo.path(), "atlas-ga");
+        let cut: String = long.chars().take(80).collect();
+        for expected in [
+            // Spaces are kept as stored, inside the text and at its ends.
+            "(fact `f-0000000000000001`): `'P1'  &   A`\n".to_string(),
+            "(fact `f-0000000000000002`): OS command `  \"D:\\my  files\\run.exe\"  `\n"
+                .to_string(),
+            "(fact `f-0000000000000003`): OS command `a b c d` (a tab, line break or \
+             invisible character is shown as a space)\n"
+                .to_string(),
+            // The cut is said outside the span, with where the rest is.
+            format!(
+                "(fact `f-0000000000000004`): OS command `{cut}`… (the first 80 of 117 \
+                 characters; `bundle/groups.json` holds the rest)\n"
+            ),
+        ] {
+            assert!(text.contains(&expected), "{expected}\n{text}");
+        }
+        Ticket::parse("atlas-ga", &text).unwrap();
+    }
+
+    #[test]
+    fn reference_links_lead_the_loose_ends_the_by_reference_line_points_to() {
+        let dynamic: Vec<Value> = (0..12)
+            .map(|n| {
+                json!({
+                    "fact": format!("f-{n:016x}"), "program": "app:program:2",
+                    "object": {"expression": format!("A_{n}")},
+                })
+            })
+            .collect();
+        let link = |callee: usize| {
+            json!({
+                "caller": "app:program:2", "callee": format!("app:program:{callee}"),
+                "callee_group": "ga", "occurrences": 1,
+            })
+        };
+        let ticket_with = |links: Vec<Value>| {
+            let repo = tempfile::tempdir().unwrap();
+            let mut groups = vec![
+                group("ga", 0, &["Program A"], &[]),
+                group("gb", 1, &["Program B"], &["ga"]),
+            ];
+            groups[1].loose_ends = json!({"dynamic_calls": dynamic, "reference_links": links});
+            let dir = write_bundle(repo.path(), "bundle", &groups);
+            to_schema_3(&dir, Some("available"), &[("gb", &["ga"])]);
+            import(repo.path(), &dir).unwrap();
+            read_ticket(repo.path(), "atlas-gb")
+        };
+        let below = "The loose ends below name the pairs, which `bundle/groups.json` lists \
+                     under `reference_links`.\n";
+        let first = "The loose ends below name the first 10 pairs; `bundle/groups.json` lists \
+                     them all under `reference_links`.\n";
+        let file_only = "runs. `bundle/groups.json` lists the pairs under `reference_links`.\n";
+
+        // One link among twelve dynamic targets is listed, ahead of them.
+        let text = ticket_with(vec![link(1)]);
+        assert!(text.contains(below), "{text}");
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}\n{text}"))
+        };
+        assert!(
+            at("- reference only: `app:program:2` Program B names `app:program:1` Program A")
+                < at("- dynamic call target in"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("- dynamic call target in").count(),
+            9,
+            "{text}"
+        );
+        assert!(
+            text.contains("- 3 more in `bundle/groups.json`\n"),
+            "{text}"
+        );
+
+        // More links than the limit: the line says only the first are below.
+        let text = ticket_with((1..=11).map(link).collect());
+        assert!(text.contains(first) && !text.contains(below), "{text}");
+        assert_eq!(text.matches("- reference only: ").count(), 10, "{text}");
+
+        // No link recorded: the line points to the file alone.
+        let text = ticket_with(Vec::new());
+        assert!(text.contains(file_only), "{text}");
+        assert!(!text.contains("loose ends below"), "{text}");
+    }
+
+    #[test]
+    fn fields_only_schema_3_shows_never_refuse_a_groups_file() {
+        type Edit = fn(&mut Value);
+        let cases: [Edit; 5] = [
+            |ends| ends["dynamic_calls"][0]["fact"] = json!(null),
+            |ends| ends["dynamic_calls"][0]["fact"] = json!(7),
+            |ends| ends["reference_links"] = json!(null),
+            |ends| ends["reference_links"] = json!([{"caller": 1}, "x"]),
+            |ends| ends["reference_links"][0]["occurrences"] = json!(-1),
+        ];
+        for schema_3 in [false, true] {
+            for edit in cases {
+                let repo = tempfile::tempdir().unwrap();
+                let mut groups = chain();
+                groups[0].loose_ends = json!({
+                    "dynamic_calls": [{
+                        "fact": "f-0000000000000001", "program": "app:program:1",
+                        "object": {"expression": "A"},
+                    }],
+                    "reference_links": [{
+                        "caller": "app:program:1", "callee": "app:program:1",
+                        "occurrences": null,
+                    }],
+                });
+                edit(&mut groups[0].loose_ends);
+                let dir = write_bundle(repo.path(), "bundle", &groups);
+                if schema_3 {
+                    to_schema_3(&dir, Some("available"), &[]);
+                }
+                import(repo.path(), &dir).unwrap();
+                let text = read_ticket(repo.path(), "atlas-ga");
+                assert!(text.contains("- dynamic call target in"), "{text}");
+                assert!(!text.contains("occurrence"), "{text}");
+            }
+        }
     }
 
     #[test]
