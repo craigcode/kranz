@@ -659,6 +659,12 @@ mod tests {
     async fn exec_push_preflight_refuses_unconfigured_remote() {
         let (_tmp, repo) = seed_push_preflight_repo();
         assert_push_preflight_refused(&repo, "origin").await;
+        let err = GitRepo::open(&repo)
+            .unwrap()
+            .preflight_push_remote("origin")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unconfigured remote"), "{err}");
     }
 
     #[tokio::test]
@@ -671,18 +677,26 @@ mod tests {
             .unwrap()
             .success());
         assert_push_preflight_refused(&repo, "origin").await;
+        let err = GitRepo::open(&repo)
+            .unwrap()
+            .preflight_push_remote("origin")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("remote helper URLs containing '::'"), "{err}");
     }
 
     #[tokio::test]
     async fn exec_push_preflight_refuses_armed_local_config() {
         let (_tmp, repo) = seed_push_preflight_repo();
+        let bare_tmp = tempfile::tempdir().unwrap();
+        let bare = bare_tmp.path().join("remote.git");
         assert!(std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "/nonexistent/kranz-preflight.git"
-            ])
+            .args(["init", "-q", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", bare.to_str().unwrap()])
             .current_dir(&repo)
             .status()
             .unwrap()
@@ -694,6 +708,12 @@ mod tests {
             .unwrap()
             .success());
         assert_push_preflight_refused(&repo, "origin").await;
+        let err = GitRepo::open(&repo)
+            .unwrap()
+            .preflight_push_remote("origin")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credential.helper"), "{err}");
     }
 
     #[tokio::test]
@@ -711,6 +731,12 @@ mod tests {
             .unwrap()
             .success());
         assert_push_preflight_refused(&repo, "origin").await;
+        let err = GitRepo::open(&repo)
+            .unwrap()
+            .preflight_push_remote("origin")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ls-remote"), "{err}");
     }
 
     #[test]
