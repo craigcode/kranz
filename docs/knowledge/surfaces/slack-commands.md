@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-11
+last_verified: 2026-11-14
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a grant card's Approve and Deny buttons carry the sequence number and kind of the request the card was posted for. A click for a replaced request, or on a card posted before this change, is refused as superseded and queues nothing. Action ids, identity capture and the allowlist are unchanged.
 
 Rechecked 2026-11-11 (UTC) against the write-path notices: every plan and revision card now carries an authority section, which for a plan with no `touchSet` says the plan does not limit which files the mission may change. Buttons and routing are unchanged.
 
