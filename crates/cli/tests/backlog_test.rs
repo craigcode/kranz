@@ -10,9 +10,9 @@
 
 use clap::Parser;
 use kranz_cli::backlog::{
-    self, cmd_queue_remove, draft_decision, next_work_action, render_queue, render_ticket_list,
-    render_ticket_show, ticket_state_for_mission, ticket_template, work_skip_for_failed_blocker,
-    DraftDecision, TicketRow, WorkAction,
+    self, cmd_queue_remove, draft_decision, next_work_action, parked_for_review_hint, render_queue,
+    render_ticket_list, render_ticket_show, ticket_state_for_mission, ticket_template,
+    work_skip_for_failed_blocker, DraftDecision, TicketRow, WorkAction,
 };
 use kranz_cli::cli::{Cli, Command, TicketCommand};
 use kranz_engine::orchestrator::PlanRequest;
@@ -1226,4 +1226,52 @@ fn ticket_state_frontmatter_list_renders_lifecycle_labels() {
     let out = backlog::cmd_ticket_list(repo);
     assert!(out.contains("SUPERSEDED"), "out:\n{out}");
     assert!(out.contains("WONTFIX"), "out:\n{out}");
+}
+
+// ---------------------------------------------------------------------------
+// parked_for_review_hint
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parked_draft_reshape_hint_mentions_the_working_route() {
+    let ticket_path = Path::new("/repo/.kranz/tickets/my-fix.md");
+    let hint = parked_for_review_hint(ticket_path, "my-fix", "m-abc123", "mission/m-abc123");
+
+    assert!(
+        hint.contains("`kranz ticket approve my-fix`"),
+        "hint:\n{hint}"
+    );
+    assert!(hint.contains("`kranz abandon m-abc123`"), "hint:\n{hint}");
+    assert!(hint.contains("`kranz draft my-fix`"), "hint:\n{hint}");
+    assert!(
+        hint.contains(&ticket_path.display().to_string()),
+        "hint:\n{hint}"
+    );
+    assert!(!hint.contains("kranz plan"), "hint:\n{hint}");
+}
+
+#[test]
+fn parked_draft_reshape_hint_commands_are_documented() {
+    let hint = parked_for_review_hint(Path::new("TICKET_PATH"), "<slug>", "<id>", "<branch>");
+
+    let docs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/tickets.md"
+    ))
+    .unwrap();
+
+    let mut spans = Vec::new();
+    let mut rest = hint.as_str();
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        let end = after.find('`').expect("unterminated backtick span");
+        spans.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    assert!(!spans.is_empty(), "hint:\n{hint}");
+
+    for span in spans {
+        let literal = format!("`{span}`");
+        assert!(docs.contains(&literal), "docs/tickets.md missing {literal}");
+    }
 }
