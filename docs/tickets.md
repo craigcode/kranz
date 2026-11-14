@@ -225,7 +225,7 @@ What a ticket holds:
     - A link names at most 10 facts; the rest are counted, as in "and 2 more
       in `groups.json`". The 10 are counted across the whole link, so a later
       part can read "(2 facts in `groups.json`)" with no id.
-    - A fact id or a kind is shown only when it is a plain token: letters,
+    - A fact id or a kind is shown only when it is a plain token of letters,
       digits and `-`, `_`, `.`, `/`, `:`, `%`, no longer than the bound for an
       id or a name. Anything else is counted like a fact past the 10 and not
       shown, because escaped text in the middle of the bullet could still
