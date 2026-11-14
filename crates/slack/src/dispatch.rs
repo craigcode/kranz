@@ -917,6 +917,8 @@ pub(crate) async fn dispatch_action(
         }
         Action::ApproveGrant {
             mission_id,
+            request_seq,
+            grant_kind,
             command,
             user_id,
             response_url,
@@ -930,6 +932,8 @@ pub(crate) async fn dispatch_action(
                 response_url.as_deref(),
                 ControlCommand::ApproveGrant {
                     command: command.clone(),
+                    grant_kind: Some(*grant_kind),
+                    request_seq: Some(*request_seq),
                 },
                 "grant approval queued",
             )
@@ -937,6 +941,8 @@ pub(crate) async fn dispatch_action(
         }
         Action::DenyGrant {
             mission_id,
+            request_seq,
+            grant_kind,
             command,
             user_id,
             response_url,
@@ -951,8 +957,24 @@ pub(crate) async fn dispatch_action(
                 ControlCommand::DenyGrant {
                     command: command.clone(),
                     reason: "denied from Slack".to_string(),
+                    grant_kind: Some(*grant_kind),
+                    request_seq: Some(*request_seq),
                 },
                 "grant denial queued",
+            )
+            .await;
+        }
+        Action::StaleGrantButton {
+            mission_id,
+            response_url,
+        } => {
+            reply_ephemeral(
+                cfg,
+                client,
+                response_url.as_deref(),
+                &error_blocks(&format!(
+                    "That grant card for `{mission_id}` is out of date — use the newest card or the dashboard."
+                )),
             )
             .await;
         }

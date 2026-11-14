@@ -1293,7 +1293,7 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
     assert_eq!(drained.len(), 1);
     assert!(matches!(
         &drained[0].1,
-        kranz_engine::types::ControlCommand::ApproveGrant { command: c } if c == command
+        kranz_engine::types::ControlCommand::ApproveGrant { command: c, .. } if c == command
     ));
 
     // Clear the (non-destructively drained) inbox, then deny.
@@ -1312,8 +1312,181 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
     let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
     assert!(matches!(
         &drained[0].1,
-        kranz_engine::types::ControlCommand::DenyGrant { command: c, reason } if c == command && reason == "not this run"
+        kranz_engine::types::ControlCommand::DenyGrant { command: c, reason, .. } if c == command && reason == "not this run"
     ));
+}
+
+/// A grant decision that echoes a `requestSeq` different from the pending
+/// request's is refused as superseded (same command text, stale seq), and
+/// nothing is enqueued — a stale dashboard tab can't approve/deny a LATER
+/// request that happens to share the same command.
+#[tokio::test]
+async fn grant_routes_reject_superseded_grant_request_seq_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
+
+    let (_status, state) = get_json(&app, "/api/missions/m-grant/state").await;
+    let pending_seq = state["pendingGrantRequest"]["requestSeq"]
+        .as_u64()
+        .expect("seeded grant has a request seq");
+    let stale_seq = pending_seq + 1;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": command, "requestSeq": stale_seq }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("superseded"));
+    assert!(
+        kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant"))
+            .unwrap()
+            .is_empty()
+    );
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/deny",
+        Some(TOKEN),
+        json!({ "command": command, "requestSeq": stale_seq }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("superseded"));
+    assert!(
+        kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A grant decision that echoes a `kind` different from the pending
+/// request's is refused as superseded, even when the command text and
+/// requestSeq both match.
+#[tokio::test]
+async fn grant_routes_reject_superseded_grant_kind_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": command, "kind": "touch-path" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("superseded"));
+    assert!(
+        kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Matching `kind` and `requestSeq` queues the decision and forwards both
+/// fields into the enqueued control so the engine re-checks them at drain
+/// time too.
+#[tokio::test]
+async fn grant_routes_accept_matching_superseded_grant_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
+
+    let (_status, state) = get_json(&app, "/api/missions/m-grant/state").await;
+    let pending_seq = state["pendingGrantRequest"]["requestSeq"]
+        .as_u64()
+        .expect("seeded grant has a request seq");
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": command, "kind": "command", "requestSeq": pending_seq }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(
+        &drained[0].1,
+        kranz_engine::types::ControlCommand::ApproveGrant {
+            command: c,
+            grant_kind: Some(kranz_engine::types::GrantKind::Command),
+            request_seq: Some(seq),
+        } if c == command && *seq == pending_seq
+    ));
+
+    for (path, _) in kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap() {
+        std::fs::remove_file(path).unwrap();
+    }
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/deny",
+        Some(TOKEN),
+        json!({ "command": command, "kind": "command", "requestSeq": pending_seq }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(
+        &drained[0].1,
+        kranz_engine::types::ControlCommand::DenyGrant {
+            command: c,
+            grant_kind: Some(kranz_engine::types::GrantKind::Command),
+            request_seq: Some(seq),
+            ..
+        } if c == command && *seq == pending_seq
+    ));
+}
+
+/// A legacy body naming only `command` (no `kind`/`requestSeq`) keeps
+/// today's behaviour: it still queues, so the CLI and the Even G2 client
+/// keep working.
+#[tokio::test]
+async fn grant_routes_legacy_body_without_superseded_grant_fields_still_queues() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
+
+    let (status, body) = post_json(
+        &app,
+        "/api/missions/m-grant/grant/approve",
+        Some(TOKEN),
+        json!({ "command": command }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// The mission state projection exposes the pending grant's `requestSeq` on
+/// the wire so the dashboard and Slack can echo it back on decision.
+#[tokio::test]
+async fn grant_routes_state_exposes_superseded_grant_request_seq() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let command = "gc audit --deep";
+    seed_pending_grant_log(&root, "m-grant", command);
+    let app = kranz_server::router_with_token(root.clone(), None, authority(TOKEN));
+
+    let (status, state) = get_json(&app, "/api/missions/m-grant/state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(state["pendingGrantRequest"]["requestSeq"]
+        .as_u64()
+        .is_some());
 }
 
 // ---------------------------------------------------------------------------

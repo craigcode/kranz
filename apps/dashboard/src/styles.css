@@ -1225,6 +1225,13 @@ button {
   gap: 6px;
 }
 
+.permission-status {
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+  margin: 0;
+}
+
 .revision-diff {
   /* This box holds text an approval acts on (a command, an invocation, a
      plan diff). It wraps and grows to its full height so no part of it sits

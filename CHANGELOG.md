@@ -5,6 +5,44 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: the dashboard's one-call permission card stays mounted in place
+  after its deadline passes (or after the engine closes it as expired),
+  instead of unmounting and shifting the remaining panels and buttons
+  underneath the cursor. The card's Allow/Deny buttons disable and a
+  reserved status line reads "Expired — no answer was sent" with a Dismiss
+  button to remove it. A card the operator already answered, or one closed
+  for a reason other than its deadline passing, no longer gets mislabeled
+  as expired.
+- Fixed: the dashboard's Trajectory Board now pauses background polling and
+  shows a "Polling paused — token required" status after an authentication
+  failure, instead of parking a fresh token-prompt waiter on every poll
+  tick; a "Resume polling" button re-tries once with the normal token gate
+  and restarts the timers.
+- Fixed: switching missions in the dashboard (back/forward, deep link, or URL
+  edit) now clears the revision-request textarea, the per-question free-text
+  drafts, the orchestrator composer's text and interrupt flag, and the
+  standards waiver reason/expiry form, so a draft typed for one mission can
+  no longer be submitted to a different one.
+- Fixed: the dashboard's grant request panel now sends the `kind` and
+  `requestSeq` of the exact pending request it rendered when approving or
+  denying, so a stale or superseded decision is refused by the server
+  instead of silently acting on a different request.
+- Fixed: a Slack grant card's Approve and Deny buttons carry the sequence
+  number and kind of the request the card was posted for. A click on a card
+  for a request that has since been replaced is refused as superseded and
+  queues nothing, even when the newer request has the same command text. A
+  card posted before this change is refused the same way; use the newest
+  card or the dashboard.
+- Fixed: `POST /api/missions/:id/grant/approve` and `/grant/deny` accept
+  optional `kind`/`requestSeq` fields and refuse the decision as superseded
+  (409) when they no longer match the pending grant request, binding a
+  dashboard/Slack decision to the exact request the operator saw rather than
+  to any pending request sharing the same command text. Bodies without these
+  fields keep today's behaviour.
+- Added: `PendingGrantRequest.requestSeq` records the sequence number of the
+  `grant.requested` event that parked the pending capability grant, so a
+  later decision can be bound to the exact request the operator saw instead
+  of matching on target text alone.
 - Changed: Sentry signal intake derives its replay key only from the signed
   request body, so a delivery re-sent with a new `Request-ID`,
   `X-Sentry-Delivery` or timestamp header is refused as a replay. An accepted

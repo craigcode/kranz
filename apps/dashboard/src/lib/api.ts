@@ -13,6 +13,7 @@ import type {
   ControlCommand,
   DrainState,
   EscalationMetrics,
+  GrantKind,
   MissionEvent,
   MissionHookStatus,
   MissionState,
@@ -210,12 +211,12 @@ export const api = {
     return getJson('/api/repos');
   },
 
-  missions(): Promise<MissionSummary[]> {
-    return getJson('/api/missions');
+  missions(opts?: GetJsonOptions): Promise<MissionSummary[]> {
+    return getJson('/api/missions', opts);
   },
 
-  missionState(id: string): Promise<MissionState> {
-    return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
+  missionState(id: string, opts?: GetJsonOptions): Promise<MissionState> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/state`, opts);
   },
 
   standards(id: string): Promise<MissionStandardsView> {
@@ -336,16 +337,32 @@ export const api = {
     );
   },
 
-  async approveGrant(id: string, command: string): Promise<void> {
+  async approveGrant(
+    id: string,
+    command: string,
+    binding?: { kind?: GrantKind; requestSeq?: number },
+  ): Promise<void> {
+    const body: { command: string; kind?: GrantKind; requestSeq?: number } = { command };
+    if (binding?.kind !== undefined) body.kind = binding.kind;
+    if (binding?.requestSeq !== undefined) body.requestSeq = binding.requestSeq;
     await postJson<{ queued: boolean }>(
       `/api/missions/${encodeURIComponent(id)}/grant/approve`,
-      { command },
+      body,
     );
   },
 
-  async denyGrant(id: string, command: string, reason?: string): Promise<void> {
-    const body: { command: string; reason?: string } = { command };
+  async denyGrant(
+    id: string,
+    command: string,
+    reason?: string,
+    binding?: { kind?: GrantKind; requestSeq?: number },
+  ): Promise<void> {
+    const body: { command: string; reason?: string; kind?: GrantKind; requestSeq?: number } = {
+      command,
+    };
     if (reason !== undefined) body.reason = reason;
+    if (binding?.kind !== undefined) body.kind = binding.kind;
+    if (binding?.requestSeq !== undefined) body.requestSeq = binding.requestSeq;
     await postJson<{ queued: boolean }>(
       `/api/missions/${encodeURIComponent(id)}/grant/deny`,
       body,
@@ -413,8 +430,8 @@ export const api = {
 
   // --- tickets (Pipeline Backlog lens) ---------------------------------------
 
-  tickets(): Promise<TicketSummary[]> {
-    return getJson('/api/tickets');
+  tickets(opts?: GetJsonOptions): Promise<TicketSummary[]> {
+    return getJson('/api/tickets', opts);
   },
 
   ticket(slug: string): Promise<Ticket> {

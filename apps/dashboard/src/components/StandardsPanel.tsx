@@ -34,6 +34,8 @@ export function StandardsPanel() {
     setSelected(null);
     setError(null);
     setRecorded(null);
+    setReason('');
+    setExpires(defaultExpiry());
     void refresh().catch(() => setView({}));
   }, [refresh]);
 

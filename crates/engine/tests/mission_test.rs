@@ -5114,6 +5114,8 @@ async fn validator_denial_grant_approved_extends_grants_and_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5196,6 +5198,8 @@ async fn validator_denial_grant_denied_blocks_the_milestone() {
         &ControlCommand::DenyGrant {
             command: denied_cmd.to_string(),
             reason: "not authorized this run".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5358,6 +5362,8 @@ async fn grant_request_cap_blocks_instead_of_looping() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5430,6 +5436,8 @@ async fn grant_offered_from_the_claude_retry_when_primary_had_no_command() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5519,6 +5527,8 @@ async fn out_of_contract_write_parks_a_touch_grant_and_approve_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "out-of-bounds.txt".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5620,6 +5630,8 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
         &ControlCommand::DenyGrant {
             command: "out-of-bounds.txt".to_string(),
             reason: "keep it out of contract".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5803,6 +5815,8 @@ async fn worker_deny_grant_lifts_the_rule_and_respawn_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "Bash(git push*)".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5977,6 +5991,8 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "Bash(git push*)".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -6066,6 +6082,8 @@ async fn egress_denial_grant_approved_extends_egress_grants_and_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: target.clone(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -6175,6 +6193,8 @@ async fn egress_denial_grant_denied_blocks_the_milestone() {
         &ControlCommand::DenyGrant {
             command: target.clone(),
             reason: "not authorized this run".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -6210,6 +6230,308 @@ async fn egress_denial_grant_denied_blocks_the_milestone() {
         state.mission.egress_grants
     );
     assert!(state.pending_grant_request.is_none());
+}
+
+/// Polls the mission log for an `orchestrator.decision` whose summary
+/// contains `needle`, used to observe a refused grant decision without
+/// stopping the still-running engine.
+async fn wait_for_decision_containing(paths: &MissionPaths, needle: &str) {
+    for _ in 0..400 {
+        let events = read_log(paths);
+        if events.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::OrchestratorDecision { summary, .. } if summary.contains(needle))
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for an orchestrator.decision containing {needle:?}");
+}
+
+/// A stale `ApproveGrant` naming the FIRST of two successive requests for the
+/// same target text is refused once a SECOND request for that same text is
+/// parked: the pending request is left untouched, no extra `grant.approved`
+/// is emitted, and `command_grants` is not widened by the stale decision.
+/// Approving with the second request's own seq (and matching kind) then
+/// succeeds normally.
+#[tokio::test]
+async fn superseded_grant_request_seq_is_refused_current_seq_succeeds() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    // Round 1 parks (denied), approve → round 2 re-validates and denies the
+    // SAME command text again (second park) → approve with the right seq →
+    // round 3 is clean → complete.
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_denied(denied_cmd),
+        validator_denied(denied_cmd),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let first = snap.pending_grant_request.expect("first parked request");
+    let first_seq = first.request_seq.expect("seq recorded on park");
+    assert_eq!(first.kind, GrantKind::Command);
+
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+            grant_kind: Some(GrantKind::Command),
+            request_seq: Some(first_seq),
+        },
+    )
+    .unwrap();
+
+    // Wait for the SECOND park (a new request_seq) before firing the stale
+    // decision — it must name the first request while the second is live.
+    for _ in 0..400 {
+        if let Ok(snap) = reducer::read_snapshot(&paths.state_file()) {
+            if let Some(pending) = &snap.pending_grant_request {
+                if pending.request_seq != Some(first_seq) {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let second = snap
+        .pending_grant_request
+        .clone()
+        .expect("second parked request");
+    let second_seq = second.request_seq.expect("seq recorded on second park");
+    assert_ne!(second_seq, first_seq, "the second park must get a new seq");
+    assert_eq!(second.command, denied_cmd, "same target text as round 1");
+
+    // The stale approve (naming the FIRST request's seq) must be refused.
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+            grant_kind: Some(GrantKind::Command),
+            request_seq: Some(first_seq),
+        },
+    )
+    .unwrap();
+    wait_for_decision_containing(&paths, "superseded").await;
+
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    assert_eq!(
+        snap.pending_grant_request
+            .as_ref()
+            .and_then(|p| p.request_seq),
+        Some(second_seq),
+        "the stale approve must leave the (second) pending request untouched"
+    );
+    let events_so_far = read_log(&paths);
+    assert_eq!(
+        events_so_far
+            .iter()
+            .filter(|e| e.kind.type_name() == "grant.approved")
+            .count(),
+        1,
+        "the stale approve must not emit an extra grant.approved"
+    );
+
+    // Approving with the SECOND request's own seq succeeds.
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+            grant_kind: Some(GrantKind::Command),
+            request_seq: Some(second_seq),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind.type_name() == "grant.requested")
+            .count(),
+        2,
+        "two successive requests for the same text must both be recorded"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind.type_name() == "grant.approved")
+            .count(),
+        2,
+        "only the two genuine decisions approve, the stale one does not"
+    );
+    let state = reducer::fold(&events).unwrap();
+    assert_eq!(
+        state.mission.command_grants,
+        vec![denied_cmd.to_string()],
+        "command_grants must not be widened by the stale decision"
+    );
+}
+
+/// An approve or deny whose `grant_kind` no longer matches the parked
+/// request's kind is refused as superseded, leaving the pending request in
+/// place; a decision with the matching kind then succeeds.
+#[tokio::test]
+async fn superseded_grant_kind_mismatch_on_approve_and_deny_is_refused() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_denied(denied_cmd),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap.pending_grant_request.expect("parked request");
+    assert_eq!(pending.kind, GrantKind::Command);
+    let seq = pending.request_seq.expect("seq recorded on park");
+
+    // Wrong grant_kind on approve: refused, pending stays parked.
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+            grant_kind: Some(GrantKind::TouchPath),
+            request_seq: Some(seq),
+        },
+    )
+    .unwrap();
+    wait_for_decision_containing(&paths, "superseded").await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    assert!(
+        snap.pending_grant_request.is_some(),
+        "a kind-mismatched approve must leave the pending request in place"
+    );
+    assert!(!snap
+        .mission
+        .command_grants
+        .contains(&denied_cmd.to_string()));
+
+    // Wrong grant_kind on deny: also refused.
+    control::enqueue(
+        &paths,
+        &ControlCommand::DenyGrant {
+            command: denied_cmd.to_string(),
+            reason: "nope".to_string(),
+            grant_kind: Some(GrantKind::TouchPath),
+            request_seq: Some(seq),
+        },
+    )
+    .unwrap();
+    for _ in 0..400 {
+        let events = read_log(&paths);
+        if events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::OrchestratorDecision { summary, .. } if summary.contains("superseded")))
+            .count()
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    assert!(
+        snap.pending_grant_request.is_some(),
+        "a kind-mismatched deny must leave the pending request in place"
+    );
+    assert!(
+        events_to_types_count(&paths, "grant.denied") == 0,
+        "no grant.denied must be emitted by the mismatched deny"
+    );
+
+    // Approving with the matching kind succeeds and completes the mission.
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: denied_cmd.to_string(),
+            grant_kind: Some(GrantKind::Command),
+            request_seq: Some(seq),
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind.type_name() == "grant.approved")
+            .count(),
+        1,
+        "exactly one genuine approval must land"
+    );
+}
+
+fn events_to_types_count(paths: &MissionPaths, type_name: &str) -> usize {
+    read_log(paths)
+        .iter()
+        .filter(|e| e.kind.type_name() == type_name)
+        .count()
 }
 
 // ---------------------------------------------------------------------------

@@ -91,10 +91,17 @@ export function OrchestratorView() {
 function Composer() {
   const connection = useKranzStore((s) => s.connection);
   const sendControl = useKranzStore((s) => s.sendControl);
+  const missionId = useKranzStore((s) => s.missionId);
   const [text, setText] = useState('');
   const [interrupt, setInterrupt] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const disabled = connection === 'lost';
+
+  useEffect(() => {
+    setText('');
+    setInterrupt(false);
+    setSendError(null);
+  }, [missionId]);
 
   const send = async () => {
     const trimmed = text.trim();

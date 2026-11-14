@@ -11,7 +11,7 @@
 // `question.answered` and the reducer routes it into the mission's
 // user-message consult.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { pendingQuestions } from '../lib/pendingAsks';
 import { visible } from '../lib/presentation';
@@ -20,9 +20,14 @@ import type { PendingQuestion } from '../lib/types';
 
 export function QuestionRequestPanel({ onActed }: { onActed?: () => void } = {}) {
   const state = useKranzStore((s) => s.state);
+  const missionId = useKranzStore((s) => s.missionId);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [freeText, setFreeText] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setFreeText({});
+  }, [missionId]);
 
   const mission = state?.mission ?? null;
   const questions = pendingQuestions(state);

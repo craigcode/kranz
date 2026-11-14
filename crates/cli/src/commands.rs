@@ -1605,6 +1605,8 @@ pub fn cmd_approve_grant(repo: &Path, mission_id: &str, command: &str) -> Result
         &paths,
         &ControlCommand::ApproveGrant {
             command: command.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )?)
 }
@@ -1622,6 +1624,8 @@ pub fn cmd_deny_grant(
         &ControlCommand::DenyGrant {
             command: command.to_string(),
             reason: reason.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )?)
 }

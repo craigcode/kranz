@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-13
+last_verified: 2026-11-14
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a pending grant request carries `requestSeq`, and Slack grant buttons carry the request's sequence number and kind. No term changed.
 
 Rechecked 2026-11-13 (UTC) against the signal intake config change: `signals.sentry.apiBaseUrl`, `signals.sentry.tokenEnv` and `signals.sentry.allowedHosts` joined the operator-only keys, and `signals.sentry.secret` stays settable per repository. No term changed.
 

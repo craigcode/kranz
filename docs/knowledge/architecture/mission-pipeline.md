@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-13
+last_verified: 2026-11-14
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a pending grant request records the sequence number of its `grant.requested` event, and a grant decision that names a sequence number or kind is refused as superseded when either no longer matches the pending request. A decision that names neither still matches on target text. The pipeline described here is otherwise unchanged.
 
 Rechecked 2026-11-13 (UTC) against the push preflight: `kranz exec --push <remote>` now checks the remote (configured, no armed local config, no `::` remote-helper URL, reachable by a read-only `git ls-remote`) before `MissionEngine::create`, and refuses with exit 4 and no mission created. The preflight and `push_mission_branch` share the same remote checks. The pipeline, the merge steps and the single push path are unchanged.
 

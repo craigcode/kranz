@@ -5,7 +5,8 @@
 // frames append to a capped ring buffer used by the log/conversation views.
 
 import { create } from 'zustand';
-import { api, httpOrigin, isNotHosted, isStalePlan } from './api';
+import { api, httpOrigin, isNotHosted, isStalePlan, isTokenRequired } from './api';
+import type { GetJsonOptions } from './api';
 import { repoIdFromHash } from './routes';
 import { MissionSocket } from './ws';
 import type {
@@ -114,9 +115,9 @@ interface KranzStore {
   startRunError: string | null;
 
   selectRepo: (repoId: string | null) => void;
-  loadMissions: () => Promise<void>;
+  loadMissions: (opts?: GetJsonOptions) => Promise<void>;
   /** Load the backlog list for the dashboard panel (`GET /api/tickets`). */
-  loadTickets: () => Promise<void>;
+  loadTickets: (opts?: GetJsonOptions) => Promise<void>;
   /** POST draft for a ticket, then connect to the returned mission's live
    *  feed via the existing `connectMission` action. Reloads tickets and
    *  missions so PipelineView stages stay current. */
@@ -348,7 +349,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       });
     },
 
-    loadMissions: async () => {
+    loadMissions: async (opts?: GetJsonOptions) => {
       const generation = repoGeneration;
       const request = ++missionsRequest;
       const connection = missionGeneration;
@@ -358,7 +359,7 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
       // mission connected mid-flight may legitimately postdate the list.
       const connectedAtStart = get().missionId;
       try {
-        const missions = await api.missions();
+        const missions = await api.missions(opts);
         if (repoGeneration !== generation || missionsRequest !== request) return;
         set({ missions });
         // The connected mission vanishing from a fresh list means it was
@@ -374,20 +375,24 @@ export const useKranzStore = create<KranzStore>()((set, get) => {
         }
       } catch (err) {
         if (repoGeneration !== generation || missionsRequest !== request) return;
+        // A background poll opted out of the token gate: let the caller
+        // (BoardLens) react to the auth failure instead of swallowing it.
+        if (opts?.tokenGate === false && isTokenRequired(err)) throw err;
         set({ missionsError: err instanceof Error ? err.message : String(err) });
       }
     },
 
-    loadTickets: async () => {
+    loadTickets: async (opts?: GetJsonOptions) => {
       const generation = repoGeneration;
       const request = ++ticketsRequest;
       set({ ticketsError: null });
       try {
-        const tickets = await api.tickets();
+        const tickets = await api.tickets(opts);
         if (repoGeneration !== generation || ticketsRequest !== request) return;
         set({ tickets });
       } catch (err) {
         if (repoGeneration !== generation || ticketsRequest !== request) return;
+        if (opts?.tokenGate === false && isTokenRequired(err)) throw err;
         set({ ticketsError: err instanceof Error ? err.message : String(err) });
       }
     },

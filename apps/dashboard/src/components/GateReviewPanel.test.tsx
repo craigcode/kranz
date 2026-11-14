@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { GateReviewPanel } from './GateReviewPanel';
 import { RevisionPanel } from './RevisionPanel';
 import { api } from '../lib/api';
@@ -139,6 +139,49 @@ describe('gate review obligations', () => {
       expect(reject().disabled).toBe(false);
     } finally {
       failing.mockRestore();
+    }
+  });
+
+  it('clears the revision instructions draft when switching missions and never sends mission A\'s text to B (DD2)', async () => {
+    const draftState = (id: string) =>
+      ({
+        mission: {
+          id,
+          goal: 'goal',
+          validationContract: [],
+          milestones: [],
+          status: 'running',
+          createdAt: '2026-01-01T00:00:00Z',
+          baseBranch: 'main',
+          missionBranch: `kranz/mission-${id}`,
+        },
+      }) as unknown as MissionState;
+
+    useKranzStore.setState({ missionId: 'm-a', state: draftState('m-a') });
+    const { rerender } = render(<RevisionPanel />);
+
+    fireEvent.change(screen.getByRole('textbox'), {
+      target: { value: 'instructions drafted for mission A' },
+    });
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe(
+      'instructions drafted for mission A',
+    );
+
+    useKranzStore.setState({ missionId: 'm-b', state: draftState('m-b') });
+    rerender(<RevisionPanel />);
+
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('');
+    expect(
+      (screen.getByRole('button', { name: 'Request revision' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    const requestSpy = vi.spyOn(api, 'requestRevision').mockResolvedValue(undefined as never);
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Request revision' }));
+      expect(requestSpy).not.toHaveBeenCalled();
+    } finally {
+      requestSpy.mockRestore();
     }
   });
 });

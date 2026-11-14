@@ -882,10 +882,14 @@ mod tests {
             ControlCommand::RejectRevision { revision: 1 },
             ControlCommand::ApproveGrant {
                 command: "fixture".into(),
+                grant_kind: None,
+                request_seq: None,
             },
             ControlCommand::DenyGrant {
                 command: "fixture".into(),
                 reason: "declined".into(),
+                grant_kind: None,
+                request_seq: None,
             },
         ];
         for command in controls {
