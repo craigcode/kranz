@@ -80,7 +80,12 @@ export function PermissionRequestPanel({ onActed }: { onActed?: () => void } = {
   }, [missionId]);
 
   const live = pendingPermissions(state, now);
-  const liveIds = new Set(live.map((r) => r.request.proposal.id));
+
+  const isExpired = (record: LivePermission): boolean => {
+    if (record.resolution) return false;
+    if (record.closed) return record.closed === 'deadline expired';
+    return Date.parse(record.request.proposal.deadline) <= now;
+  };
 
   useEffect(() => {
     setRetainedIds((prev) => {
@@ -99,10 +104,13 @@ export function PermissionRequestPanel({ onActed }: { onActed?: () => void } = {
     return next;
   });
 
+  const liveIds = new Set(live.map((r) => r.request.proposal.id));
+
   return <>{retainedIds
     .filter((id) => !dismissed.has(id))
     .map((id) => permissions?.[id])
     .filter((record): record is LivePermission => record != null)
+    .filter((record) => liveIds.has(record.request.proposal.id) || isExpired(record))
     .map((record) => {
       const id = record.request.proposal.id;
       return <PermissionCard key={id} record={record} expired={!liveIds.has(id)}

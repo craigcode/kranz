@@ -1226,7 +1226,10 @@ button {
 }
 
 .permission-status {
+  display: flex;
+  align-items: center;
   min-height: 20px;
+  margin: 0;
 }
 
 .revision-diff {

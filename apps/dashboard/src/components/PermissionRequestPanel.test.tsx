@@ -157,4 +157,30 @@ describe('PermissionRequestPanel', () => {
     fireEvent.click(allow);
     expect(api.answerPermission).not.toHaveBeenCalled();
   });
+
+  it('DD4 does not mark an answered card as Expired once its resolution arrives before its deadline', async () => {
+    const record = pending('permission-1', 60_000);
+    useKranzStore.setState({ state: { permissions: { 'permission-1': record } } as unknown as MissionState });
+    vi.mocked(useNow).mockReturnValue(Date.now());
+
+    const { rerender, container } = render(<PermissionRequestPanel />);
+    fireEvent.click(screen.getByRole('button', { name: 'Allow once' }));
+    await waitFor(() => expect(api.answerPermission).toHaveBeenCalledTimes(1));
+    await screen.findByText(/Answer queued/);
+
+    useKranzStore.setState({
+      state: {
+        permissions: {
+          'permission-1': {
+            ...record,
+            resolution: { requestId: 'permission-1', bindingDigest: 'exact-binding', allow: true, actor: { kind: 'operator' }, reason: 'allowed' },
+          },
+        },
+      } as unknown as MissionState,
+    });
+    rerender(<PermissionRequestPanel />);
+
+    expect(container.textContent).not.toContain('Expired');
+    expect(container.querySelector('section.panel-grant')).toBeNull();
+  });
 });

@@ -10,7 +10,9 @@ Notable user-visible changes are documented here. This project follows
   instead of unmounting and shifting the remaining panels and buttons
   underneath the cursor. The card's Allow/Deny buttons disable and a
   reserved status line reads "Expired — no answer was sent" with a Dismiss
-  button to remove it.
+  button to remove it. A card the operator already answered, or one closed
+  for a reason other than its deadline passing, no longer gets mislabeled
+  as expired.
 - Fixed: the dashboard's Trajectory Board now pauses background polling and
   shows a "Polling paused — token required" status after an authentication
   failure, instead of parking a fresh token-prompt waiter on every poll
