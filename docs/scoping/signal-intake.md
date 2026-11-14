@@ -101,9 +101,18 @@ deterministic; no model reads signal content before a human has consented.
 4. **Unverified or replayed payloads are dropped** after a one-line decision
    log that carries neither secret nor body. They are never written to the
    ledger: the sender is unauthenticated, and an append-only record must not
-   grow at the request of whoever can reach the port. Authenticity and replay bounds
-   (timestamp header within a 5-minute skew window plus a bounded replay cache
-   of `(source, delivery_id_or_sig_hash, timestamp)`) are checked first.
+   grow at the request of whoever can reach the port. Authenticity is checked
+   first (timestamp header within a 5-minute skew window, a freshness check
+   only), then replay: the replay key is derived only from values the
+   source's signature covers: for Sentry, the SHA-256 of the signed raw body,
+   never the unsigned `Request-ID` / `X-Sentry-Delivery` / timestamp headers.
+   An accepted delivery is remembered as a replay for at least 24 hours from
+   first receipt, measured on the server clock, bounded by the existing
+   4,096-entry in-memory cache (operator decision 2026-11-13). The 300-second
+   skew window does not set how long a replay is remembered. Because the
+   cache is in-memory and FIFO-bounded, a process restart or filling the
+   cache past capacity (evicting the oldest entry) can shorten the effective
+   window.
 5. **Every intake decision is durable and replayable** in the signal ledger
    (D-A): received, triaged, proposed, consented, linked, written back.
 6. **Write-back is idempotent and egress-pinned.** A crash and resume never
@@ -158,8 +167,11 @@ Alternative: a repo-level `EventKind` stream. Rejected for now: it needs
 An in-process Rust trait in engine core (`SignalSource`: verify, normalise,
 write back), beside the webhook code, not under the gate-evaluation
 subprocess contract. Verification needs the configured secret, enforces the
-timestamp skew window and bounded `(source, delivery_id_or_sig_hash, timestamp)`
-replay cache, and must run before any untrusted byte goes anywhere else, which
+timestamp skew window (freshness only) and a bounded replay cache keyed only
+on values the source's signature covers (never an unsigned delivery-id
+header), remembering an accepted delivery for at least 24 hours on the server
+clock, bounded by the 4,096-entry cache capacity (operator decision
+2026-11-13), and must run before any untrusted byte goes anywhere else, which
 rules out handing raw requests to a pack subprocess. Vendor adapters are
 domain-free (a vendor's public webhook format), so they pass the clean-room
 test. The GitHub trigger is ported onto the trait as its first implementation,

@@ -127,6 +127,18 @@ impl Default for SignalsConfig {
 impl SignalsConfig {
     /// Load the merged `signals` configuration block from `~/.kranz/config.json`
     /// and `<repo>/.kranz/config.json`.
+    ///
+    /// `signals.sentry.apiBaseUrl`, `tokenEnv` and `allowedHosts` are
+    /// operator-only: they control where triage write-back is sent and which
+    /// environment variable supplies its bearer token, so a repository must
+    /// not be able to redirect or steal credentials for them by setting the
+    /// `signals` key in its own `.kranz/config.json`. `secret` (the inbound
+    /// HMAC key) stays project-settable, the same precedent as
+    /// `hooks.secret`. The project layer's raw JSON is inspected before any
+    /// typed parse so the refusal can't be swallowed by a failed parse, and
+    /// `sentry` is merged field-by-field rather than wholesale so a project
+    /// layer that sets only `secret` can't wipe the operator's endpoint
+    /// config.
     pub fn load(repo_root: &Path) -> Result<Self> {
         let mut merged = SignalsConfig::default();
         if let Some(global_path) = crate::paths::global_config() {
@@ -140,30 +152,65 @@ impl SignalsConfig {
                 }
             }
         }
+
         let repo_cfg_path = repo_root.join(".kranz").join("config.json");
-        if let Ok(text) = std::fs::read_to_string(&repo_cfg_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(sig_val) = val.get("signals") {
-                    if let Ok(repo_cfg) = serde_json::from_value::<SignalsConfig>(sig_val.clone()) {
-                        for (k, v) in repo_cfg.project_map {
-                            merged.project_map.insert(k, v);
-                        }
-                        if sig_val.get("dedupeWindowSecs").is_some() {
-                            merged.dedupe_window_secs = repo_cfg.dedupe_window_secs;
-                        }
-                        for (k, v) in repo_cfg.source_dedupe_windows {
-                            merged.source_dedupe_windows.insert(k, v);
-                        }
-                        if !repo_cfg.rules.is_empty() {
-                            merged.rules = repo_cfg.rules;
-                        }
-                        if repo_cfg.sentry.is_some() {
-                            merged.sentry = repo_cfg.sentry;
-                        }
-                    }
+        let Ok(text) = std::fs::read_to_string(&repo_cfg_path) else {
+            return Ok(merged);
+        };
+        let val: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            crate::error::EngineError::Config(format!(
+                "invalid JSON in config file {}: {e}",
+                repo_cfg_path.display()
+            ))
+        })?;
+        let Some(sig_val) = val.get("signals") else {
+            return Ok(merged);
+        };
+
+        if let Some(sentry_val) = sig_val.get("sentry") {
+            let Some(sentry_obj) = sentry_val.as_object() else {
+                return Err(crate::error::EngineError::Config(format!(
+                    "{}: \"signals.sentry\" must be a JSON object",
+                    repo_cfg_path.display()
+                )));
+            };
+            for operator_only_key in ["apiBaseUrl", "tokenEnv", "allowedHosts"] {
+                if sentry_obj.contains_key(operator_only_key) {
+                    return Err(crate::error::EngineError::Config(format!(
+                        "{}: the project config layer may not set \"signals.sentry.{operator_only_key}\" \
+                         — it controls where triage write-back is sent and which \
+                         credentials it uses. Operator-only keys are settable from \
+                         the global layer (~/.kranz/config.json) only.",
+                        repo_cfg_path.display()
+                    )));
                 }
             }
+
+            // Field-by-field: a project layer that sets only `secret` must
+            // not wipe the operator's apiBaseUrl/tokenEnv/allowedHosts.
+            if let Some(secret_val) = sentry_obj.get("secret") {
+                let mut sentry = merged.sentry.clone().unwrap_or_default();
+                let value = secret_val.as_str().map(str::to_string);
+                sentry.secret = value;
+                merged.sentry = Some(sentry);
+            }
         }
+
+        if let Ok(repo_cfg) = serde_json::from_value::<SignalsConfig>(sig_val.clone()) {
+            for (k, v) in repo_cfg.project_map {
+                merged.project_map.insert(k, v);
+            }
+            if sig_val.get("dedupeWindowSecs").is_some() {
+                merged.dedupe_window_secs = repo_cfg.dedupe_window_secs;
+            }
+            for (k, v) in repo_cfg.source_dedupe_windows {
+                merged.source_dedupe_windows.insert(k, v);
+            }
+            if !repo_cfg.rules.is_empty() {
+                merged.rules = repo_cfg.rules;
+            }
+        }
+
         Ok(merged)
     }
 
