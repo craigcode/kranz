@@ -35,15 +35,16 @@ export function GrantRequestPanel({ onActed }: { onActed?: () => void } = {}) {
           ? 'A sandboxed run was refused egress to a destination outside the mission’s egress allowlist. Approving extends the allowlist for this mission:'
           : 'A validator is blocked on a command outside its allow-set:';
 
-  const decide = async (kind: 'approve' | 'deny') => {
-    if (kind === 'approve' && ambiguous) return;
-    setBusy(kind);
+  const decide = async (decision: 'approve' | 'deny') => {
+    if (decision === 'approve' && ambiguous) return;
+    setBusy(decision);
     setError(null);
+    const { kind, command, requestSeq } = pending;
     try {
-      if (kind === 'approve') {
-        await api.approveGrant(mission.id, pending.command);
+      if (decision === 'approve') {
+        await api.approveGrant(mission.id, command, { kind, requestSeq });
       } else {
-        await api.denyGrant(mission.id, pending.command);
+        await api.denyGrant(mission.id, command, undefined, { kind, requestSeq });
       }
       onActed?.();
     } catch (err) {

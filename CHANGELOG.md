@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: the dashboard's grant request panel now sends the `kind` and
+  `requestSeq` of the exact pending request it rendered when approving or
+  denying, so a stale or superseded decision is refused by the server
+  instead of silently acting on a different request.
 - Fixed: `POST /api/missions/:id/grant/approve` and `/grant/deny` accept
   optional `kind`/`requestSeq` fields and refuse the decision as superseded
   (409) when they no longer match the pending grant request, binding a
