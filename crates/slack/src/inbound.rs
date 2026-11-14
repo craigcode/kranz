@@ -1876,6 +1876,42 @@ mod tests {
         );
     }
 
+    /// A card built by [`crate::format::build_grant_ready`] round-trips back
+    /// through [`parse_grant_button_value`] even when the command itself
+    /// contains `:` — the binding to the exact parked request (seq + kind)
+    /// that defeats a superseded card depends on this surviving intact.
+    #[test]
+    fn grant_button_value_round_trips_a_colon_bearing_command_for_superseded_grant_binding() {
+        let g = crate::format::GrantReady {
+            mission_id: "m-9".into(),
+            milestone_id: "ms-1".into(),
+            kind: kranz_engine::types::GrantKind::Command,
+            command: "psql host:5432 --cmd 'select 1'".into(),
+            request_seq: 42,
+        };
+        let cards = crate::format::build_grant_ready(&g, None);
+        let text = serde_json::to_string(&cards).unwrap();
+        assert!(
+            text.contains("m-9:42:command:psql host:5432 --cmd 'select 1'"),
+            "card carries the expected button value: {text}"
+        );
+        let value = "m-9:42:command:psql host:5432 --cmd 'select 1'";
+        match parse_grant_button_value(value).expect("parses") {
+            GrantButtonValue::Current {
+                mission_id,
+                request_seq,
+                kind,
+                command,
+            } => {
+                assert_eq!(mission_id, "m-9");
+                assert_eq!(request_seq, 42);
+                assert_eq!(kind, kranz_engine::types::GrantKind::Command);
+                assert_eq!(command, "psql host:5432 --cmd 'select 1'");
+            }
+            GrantButtonValue::Legacy { .. } => panic!("should parse as Current"),
+        }
+    }
+
     /// A legacy `<mission-id>:<command>` grant button value (posted before a
     /// decision could bind to a specific request/kind) routes to
     /// [`Action::StaleGrantButton`] rather than being guessed at as a

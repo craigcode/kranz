@@ -5312,4 +5312,202 @@ mod tests {
             "ticket show should show Landed for a Done ticket with no linked mission: {show_text}"
         );
     }
+
+    /// A mission with a single pending grant request parked at `request_seq`
+    /// for `kind`/`command` on milestone `ms-1`.
+    /// `request_seq` must be `>= 4` — events 1..3 seed mission creation, plan
+    /// approval, and milestone start, so the grant.requested event (which
+    /// must be contiguous) lands at seq 4 at the earliest.
+    fn seed_mission_with_pending_grant(
+        repo_root: &Path,
+        mission_id: &str,
+        request_seq: u64,
+        kind: kranz_engine::types::GrantKind,
+        command: &str,
+    ) {
+        use kranz_engine::events::{Event, EventKind};
+        use kranz_engine::types::{
+            Assertion, AssertionCheck, MissionConfig, Plan, PlanFeature, PlanMilestone,
+        };
+        let paths = MissionPaths::new(repo_root, mission_id);
+        std::fs::create_dir_all(paths.mission_dir()).unwrap();
+        let plan = Plan {
+            goal: "build the thing, planned".into(),
+            validation_contract: vec![Assertion {
+                id: "a-1".into(),
+                statement: "cargo test passes".into(),
+                check: AssertionCheck::Command,
+                command: Some("cargo test".into()),
+                negative_control: None,
+                pty_script: None,
+            }],
+            milestones: vec![PlanMilestone {
+                title: "milestone one".into(),
+                features: vec![PlanFeature {
+                    title: "alpha".into(),
+                    spec: "spec for alpha".into(),
+                    validation_criteria: vec!["alpha works".into()],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+            reviewer_independence: None,
+        };
+        let events = vec![
+            Event {
+                seq: 1,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::MissionCreated {
+                    goal: "build the thing".into(),
+                    base_branch: "main".into(),
+                    mission_branch: format!("kranz/mission-{mission_id}"),
+                    config: MissionConfig::default(),
+                },
+            },
+            Event {
+                seq: 2,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::PlanApproved {
+                    plan,
+                    base_sha: None,
+                },
+            },
+            Event {
+                seq: 3,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::MilestoneStarted {
+                    milestone_id: "ms-1".into(),
+                    start_sha: "sha-1".into(),
+                },
+            },
+            Event {
+                seq: request_seq,
+                ts: chrono::Utc::now(),
+                mission_id: mission_id.to_string(),
+                kind: EventKind::GrantRequested {
+                    milestone_id: "ms-1".into(),
+                    kind,
+                    command: command.to_string(),
+                },
+            },
+        ];
+        let body: String = events
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        std::fs::write(paths.events_file(), body).unwrap();
+    }
+
+    /// A click naming a different `request_seq` than the parked request —
+    /// even with the SAME command text — is refused as superseded and
+    /// nothing lands in the mission's control directory.
+    #[test]
+    fn enqueue_grant_control_with_mismatched_seq_refuses_as_superseded_grant() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission_with_pending_grant(
+            tmp.path(),
+            "m-1",
+            4,
+            kranz_engine::types::GrantKind::Command,
+            "gc audit --deep",
+        );
+        let err = enqueue_grant_control(
+            tmp.path(),
+            "m-1",
+            ControlCommand::ApproveGrant {
+                command: "gc audit --deep".to_string(),
+                grant_kind: Some(kranz_engine::types::GrantKind::Command),
+                request_seq: Some(3),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("superseded"),
+            "error should name the request as superseded: {err}"
+        );
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        assert!(
+            kranz_engine::control::drain(&paths).unwrap().is_empty(),
+            "a superseded-seq click must enqueue nothing"
+        );
+    }
+
+    /// A click naming a different `grant_kind` than the parked request is
+    /// refused as superseded, even with a matching command and seq.
+    #[test]
+    fn enqueue_grant_control_with_mismatched_kind_refuses_as_superseded_grant() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission_with_pending_grant(
+            tmp.path(),
+            "m-1",
+            4,
+            kranz_engine::types::GrantKind::Command,
+            "docs/report.md",
+        );
+        let err = enqueue_grant_control(
+            tmp.path(),
+            "m-1",
+            ControlCommand::ApproveGrant {
+                command: "docs/report.md".to_string(),
+                grant_kind: Some(kranz_engine::types::GrantKind::TouchPath),
+                request_seq: Some(4),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("superseded"),
+            "error should name the request as superseded: {err}"
+        );
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        assert!(
+            kranz_engine::control::drain(&paths).unwrap().is_empty(),
+            "a mismatched-kind click must enqueue nothing"
+        );
+    }
+
+    /// A click whose seq, kind and command all match the parked request
+    /// enqueues the control with `request_seq`/`grant_kind` set, so the
+    /// engine's own cross-check binds to the same request.
+    #[test]
+    fn enqueue_grant_control_matching_request_enqueues_with_seq_and_kind_not_superseded_grant() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission_with_pending_grant(
+            tmp.path(),
+            "m-1",
+            4,
+            kranz_engine::types::GrantKind::Command,
+            "gc audit --deep",
+        );
+        let applied_to = enqueue_grant_control(
+            tmp.path(),
+            "m-1",
+            ControlCommand::ApproveGrant {
+                command: "gc audit --deep".to_string(),
+                grant_kind: Some(kranz_engine::types::GrantKind::Command),
+                request_seq: Some(4),
+            },
+        )
+        .unwrap();
+        assert_eq!(applied_to, "m-1");
+        let paths = MissionPaths::new(tmp.path(), "m-1");
+        let drained = kranz_engine::control::drain(&paths).unwrap();
+        assert_eq!(drained.len(), 1);
+        match &drained[0].1 {
+            ControlCommand::ApproveGrant {
+                command,
+                grant_kind,
+                request_seq,
+            } => {
+                assert_eq!(command, "gc audit --deep");
+                assert_eq!(*grant_kind, Some(kranz_engine::types::GrantKind::Command));
+                assert_eq!(*request_seq, Some(4));
+            }
+            other => panic!("unexpected control command: {other:?}"),
+        }
+    }
 }
