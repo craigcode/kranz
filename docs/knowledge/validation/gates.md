@@ -61,6 +61,8 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-13 (UTC) against the `docs/tickets.md` change for `kranz ticket import-atlas`: only the section on tickets imported from a Magic Atlas bundle changed (reference links, fact ids, kinds in words and stored text in schema 3 loose ends). No gate changed.
+
 Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. Gate commands, contracts and containment rules are unchanged.
 
 Rechecked 2026-11-12 (UTC) against the Sgian mission-runner terminal wiring: `runner` binds each uncontained worker session's `run_id` across `run_session_to`, and Sgian `terminal/create` enforces worker and authority deny patterns before live operator consent. Gate commands, contracts and containment rules are unchanged.

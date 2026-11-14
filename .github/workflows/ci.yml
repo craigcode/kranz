@@ -44,6 +44,10 @@ jobs:
         run: |
           python3 scripts/check-actions-allowlist.py --self-test
           python3 scripts/check-actions-allowlist.py
+      - name: Verify release workflow restores no cache
+        run: |
+          python3 scripts/check-release-workflow.py --self-test
+          python3 scripts/check-release-workflow.py
       - name: Install pinned Gitleaks
         env:
           GITLEAKS_VERSION: 8.29.1

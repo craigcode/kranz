@@ -40,8 +40,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
       # Match the Linux CI host: the workspace suite exercises real enforced
       # gates and nested builds. An unprepared release runner must not turn
       # these checks into skips or run those gates without containment.
@@ -71,10 +69,6 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            apps/dashboard/package-lock.json
-            apps/even-g2/package-lock.json
 
       - name: Verify tag, versions, changelog, and current main
         env:
@@ -215,6 +209,8 @@ jobs:
       - run: npm run lint
         working-directory: apps/even-g2
 
+  # No step in this job restores a cache (Rust or npm): every artifact must be
+  # built only from the tagged source, never from prior-run output.
   build:
     name: build ${{ matrix.asset }}
     needs: verify
@@ -263,8 +259,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # `aws-lc-sys` cannot assemble its ARM64 crypto with MSVC alone: cl.exe
       # will not build the .S sources and the link dies on a missing
