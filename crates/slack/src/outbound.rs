@@ -171,6 +171,7 @@ pub fn classify(event: &Event, state: &MissionState, repo_root: &Path) -> Option
             milestone_id: milestone_id.clone(),
             kind: *kind,
             command: command.clone(),
+            request_seq: event.seq,
         })),
 
         // An opened question is the second kind of the shared "your move"
