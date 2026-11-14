@@ -53,3 +53,4 @@ Approved plans, newest last.
 - 2026-07-21 · [m-d1e3c3](m-d1e3c3/plan.md) — Add a flight-surgeon outcomes fold (autonomy ratio, grant-latency distribution, escalation ledger) computed per-request … [truncated] · [report](m-d1e3c3/report.md)
 - 2026-07-07 · [m-66aff8](m-66aff8/plan.md) — Fix worktree-mode gated merges: relocate the untracked operator preview copies so they no longer collide with the canoni… [truncated] · [report](m-66aff8/report.md)
 - 2026-11-12 · [m-daa3aa](m-daa3aa/plan.md) — Close three confirmed over-trust gaps in release and delivery tooling: release builds restore no cache, the Actions allo… [truncated]
+- 2026-11-14 · [m-373b57](m-373b57/plan.md) — Bind every grant decision sent from the dashboard and from Slack to the exact request the operator saw (its grant kind a… [truncated]
