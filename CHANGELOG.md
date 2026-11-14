@@ -21,6 +21,19 @@ Notable user-visible changes are documented here. This project follows
   imported and the bullet says so. Schema 3 bundles without the two fields,
   and schema 1 and 2 bundles, give the same tickets as before. See
   `docs/tickets.md`.
+- Changed: Sentry signal intake derives its replay key only from the signed
+  request body, so a delivery re-sent with a new `Request-ID`,
+  `X-Sentry-Delivery` or timestamp header is refused as a replay. An accepted
+  delivery is remembered for at least 24 hours on the server clock, bounded by
+  the 4,096-entry in-memory cache; the 300 second timestamp window is a
+  freshness check only. A restart or a full cache can shorten the window. See
+  `docs/scoping/signal-intake.md`.
+- Changed: `signals.sentry.apiBaseUrl`, `signals.sentry.tokenEnv` and
+  `signals.sentry.allowedHosts` are settable from the global config layer
+  only. A project `.kranz/config.json` that sets one is refused with an error
+  naming the key, and the Sentry webhook for that repository refuses
+  deliveries until it is removed. `signals.sentry.secret` stays settable per
+  repository and merges with the global fields.
 - Fixed: loose ends in tickets that `kranz ticket import-atlas` writes from a
   schema 3 bundle. Reference links are read from `groups.json`, counted and
   listed with caller, callee, the callee's ticket and the occurrences; a

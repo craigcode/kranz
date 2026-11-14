@@ -754,6 +754,54 @@ async fn sentry_hook_without_a_secret_refuses_and_writes_nothing() {
     assert!(MissionPaths::list_missions(&root).is_empty());
 }
 
+/// `signal-intake` config-layer trust (mission `m-c5cd5f`, feature `f-2-2`):
+/// `signals.sentry.apiBaseUrl` controls where triage write-back is sent, so
+/// it is operator-only (global layer). A project config that sets it must be
+/// refused before any signal state is created, not merged in.
+#[tokio::test]
+async fn signals_sentry_layer_project_api_base_url_refuses_webhook() {
+    if !setup() {
+        return;
+    }
+    let (dir, root) = init_repo();
+    let kranz = root.join(".kranz");
+    std::fs::create_dir_all(&kranz).unwrap();
+    std::fs::write(
+        kranz.join("config.json"),
+        json!({
+            "signals": {
+                "projectMap": { "hello": "hello" },
+                "sentry": {
+                    "secret": SECRET,
+                    "apiBaseUrl": "http://evil.example"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = hook_app(&root, 1);
+
+    let mut body = sentry_payload();
+    body["kranzTestDelivery"] = json!("signals_sentry_layer_project_api_base_url_refuses_webhook");
+
+    let resp = app
+        .clone()
+        .oneshot(sentry_post(Some(SECRET), "issue", &body))
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "expected a non-2xx response, got {}",
+        resp.status()
+    );
+    assert!(
+        !root.join(".kranz/signals").exists(),
+        "a refused config layer must not create any signal state"
+    );
+    drop(dir);
+}
+
 fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
     let (dir, root) = init_repo();
     if let Some(secret) = secret {
@@ -772,8 +820,7 @@ fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
                         "outcome": "proposed"
                     }],
                     "sentry": {
-                        "secret": secret,
-                        "allowedHosts": ["sentry.io"]
+                        "secret": secret
                     }
                 }
             })
@@ -784,9 +831,16 @@ fn init_sentry_repo(secret: Option<&str>) -> (TempDir, PathBuf) {
     (dir, root)
 }
 
+/// Builds a Sentry webhook payload with a unique per-call marker field (ignored
+/// by the adapter) so each POSTed body is distinct. The Sentry replay cache keys
+/// on the signed raw body, so byte-identical bodies from separate calls would
+/// otherwise collide as replays against the server's process-wide replay cache.
 fn sentry_payload() -> Value {
+    static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call_id = CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     json!({
         "action": "created",
+        "kranzTestDelivery": call_id,
         "data": {
             "issue": {
                 "id": "998877",
@@ -809,6 +863,18 @@ fn sentry_payload() -> Value {
 }
 
 fn sentry_post(sign_with: Option<&str>, resource: &str, body: &Value) -> Request<Body> {
+    sentry_post_with_request_id(sign_with, resource, body, None)
+}
+
+/// Like [`sentry_post`] but lets the caller set the unsigned `Request-ID`
+/// header, to exercise replay protection across different delivery ids for
+/// the same signed body.
+fn sentry_post_with_request_id(
+    sign_with: Option<&str>,
+    resource: &str,
+    body: &Value,
+    request_id: Option<&str>,
+) -> Request<Body> {
     let text = body.to_string();
     let ts = chrono::Utc::now().timestamp().to_string();
     let mut builder = Request::builder()
@@ -817,12 +883,75 @@ fn sentry_post(sign_with: Option<&str>, resource: &str, body: &Value) -> Request
         .header("content-type", "application/json")
         .header("sentry-hook-resource", resource)
         .header("sentry-hook-timestamp", &ts);
+    if let Some(request_id) = request_id {
+        builder = builder.header("request-id", request_id);
+    }
     if let Some(secret) = sign_with {
         let sig =
             kranz_engine::signals::sentry::SentrySignalSource::sign_body(secret, text.as_bytes());
         builder = builder.header("sentry-hook-signature", sig);
     }
     builder.body(Body::from(text)).unwrap()
+}
+
+fn ledger_line_count(root: &Path) -> usize {
+    let ledger_path = root.join(".kranz/signals/ledger.jsonl");
+    match std::fs::read_to_string(&ledger_path) {
+        Ok(contents) => contents.lines().filter(|l| !l.trim().is_empty()).count(),
+        Err(_) => 0,
+    }
+}
+
+/// `signal-intake` replay regression (operator decision 2026-11-13): the
+/// Sentry replay key is the SHA-256 of the signed raw body, never the
+/// unsigned `Request-ID` header, so a byte-identical replay with a new
+/// request id and a fresh timestamp must still be rejected as a conflict.
+/// Against the pre-mission code (which kept the delivery id in the replay
+/// key) this same replay would have been accepted as a new delivery.
+#[tokio::test]
+async fn sentry_http_replay_with_new_request_id_and_fresh_timestamp_is_conflict() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_sentry_repo(Some(SECRET));
+    let app = hook_app(&root, 1);
+
+    let mut body = sentry_payload();
+    body["kranzTestDelivery"] = json!("sentry_http_replay_unique_body");
+
+    let first = app
+        .clone()
+        .oneshot(sentry_post_with_request_id(
+            Some(SECRET),
+            "issue",
+            &body,
+            Some("r1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let ledger_count_after_first = ledger_line_count(&root);
+    assert!(
+        ledger_count_after_first > 0,
+        "expected the accepted delivery to be recorded in the ledger"
+    );
+
+    let replay = app
+        .clone()
+        .oneshot(sentry_post_with_request_id(
+            Some(SECRET),
+            "issue",
+            &body,
+            Some("r2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        ledger_line_count(&root),
+        ledger_count_after_first,
+        "a rejected replay must not grow the ledger"
+    );
 }
 
 #[tokio::test]

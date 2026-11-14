@@ -17,6 +17,10 @@ pub const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
 /// Maximum entries retained in the in-memory bounded replay cache.
 pub const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 4_096;
 
+/// Minimum duration (server clock) an accepted delivery is remembered as a
+/// replay, bounded above by cache capacity (24 hours).
+pub const DEFAULT_REPLAY_RETENTION_SECS: i64 = 86_400;
+
 /// Reason an incoming webhook request was dropped before buffering/triage.
 /// Contains neither secret material nor payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,11 +63,22 @@ pub struct VerifiedDelivery {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Bounded replay cache of `(source, delivery_id_or_sig_hash, timestamp)`.
+/// Bounded replay cache of `(source, delivery_key, insertion_time)`.
+///
+/// The `delivery_key` for a given source must be derived only from values the
+/// source's signature covers. The skew check (`skew_secs`) is a freshness
+/// check on the delivery's own timestamp header and does NOT control how long
+/// a replay is remembered; that is governed by `retention_secs`, measured on
+/// the server clock (the `now` passed to [`ReplayCache::check_and_insert`]).
+/// An accepted entry is refused as a replay until `retention_secs` have
+/// elapsed on the server clock, bounded by `capacity`: because the cache is
+/// in-memory and FIFO-bounded, a process restart or filling the cache past
+/// capacity (evicting the oldest entry) can shorten the effective window.
 #[derive(Debug, Clone)]
 pub struct ReplayCache {
     capacity: usize,
     skew_secs: i64,
+    retention_secs: i64,
     entries: VecDeque<(String, String, i64)>,
 }
 
@@ -74,16 +89,27 @@ impl Default for ReplayCache {
 }
 
 impl ReplayCache {
+    /// Construct a cache with the 24-hour default replay retention
+    /// ([`DEFAULT_REPLAY_RETENTION_SECS`]).
     pub fn new(capacity: usize, skew_secs: i64) -> Self {
+        Self::with_retention(capacity, skew_secs, DEFAULT_REPLAY_RETENTION_SECS)
+    }
+
+    /// Construct a cache with an explicit replay retention window, clamped to
+    /// at least `skew_secs`.
+    pub fn with_retention(capacity: usize, skew_secs: i64, retention_secs: i64) -> Self {
+        let skew_secs = skew_secs.max(1);
         Self {
             capacity: capacity.max(16),
-            skew_secs: skew_secs.max(1),
+            skew_secs,
+            retention_secs: retention_secs.max(skew_secs),
             entries: VecDeque::new(),
         }
     }
 
-    /// Check whether `(source, delivery_key)` is within the skew window and not
-    /// already seen; if fresh, insert it and return `Ok(())`.
+    /// Check whether `delivery_key`'s timestamp is within the skew window and
+    /// the key has not been seen within the retention window; if fresh,
+    /// insert it (recorded at the server-clock `now`) and return `Ok(())`.
     pub fn check_and_insert(
         &mut self,
         source: &str,
@@ -97,9 +123,10 @@ impl ReplayCache {
             return Err(DropReason::TimestampSkew);
         }
 
-        // Evict expired entries outside the skew window.
-        let cutoff = now_ts - self.skew_secs;
-        self.entries.retain(|(_, _, ts)| *ts >= cutoff);
+        // Evict entries whose insertion time is older than the retention window.
+        let cutoff = now_ts - self.retention_secs;
+        self.entries
+            .retain(|(_, _, inserted_at)| *inserted_at >= cutoff);
 
         if self
             .entries
@@ -113,7 +140,7 @@ impl ReplayCache {
             self.entries.pop_front();
         }
         self.entries
-            .push_back((source.to_string(), delivery_key.to_string(), msg_ts));
+            .push_back((source.to_string(), delivery_key.to_string(), now_ts));
         Ok(())
     }
 }

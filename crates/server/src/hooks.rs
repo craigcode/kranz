@@ -223,7 +223,9 @@ fn decision_trigger(trigger: &Trigger, outcome: &str, detail: &str) {
 /// (`docs/scoping/signal-intake.md`, `signal-intake-7-first-source`).
 ///
 /// Authenticates via `Sentry-Hook-Signature` (HMAC-SHA256) +
-/// `Sentry-Hook-Timestamp` (5-minute skew window) + bounded replay cache.
+/// `Sentry-Hook-Timestamp` (5-minute skew window, a freshness check only) +
+/// a bounded replay cache keyed on the SHA-256 of the signed raw body, which
+/// remembers an accepted delivery for at least 24 hours on the server clock.
 /// Never drafts, queues, or executes a mission automatically; produces at most
 /// an undrafted proposal ticket with `signal-proposal: unconsented`.
 pub(crate) async fn sentry_hook(
