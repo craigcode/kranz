@@ -11,7 +11,6 @@
 //! build. The historical assertion is preserved as a committed fixture so
 //! this test never depends on gitignored runtime mission state.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 fn a9_command_from_plan_json() -> String {
@@ -53,9 +52,57 @@ fn plan_md_a9_command_matches_plan_json() {
     );
 }
 
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=a9 fixture",
+            "-c",
+            "user.email=a9@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn commit_file(dir: &std::path::Path, rel: &str) {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().expect("fixture path has a parent")).unwrap();
+    std::fs::write(&path, "changed\n").unwrap();
+    git(dir, &["add", "--", rel]);
+    git(dir, &["commit", "-q", "-m", rel]);
+}
+
+fn run_a9(dir: &std::path::Path, command: &str, base_sha: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .env("KRANZ_BASE_SHA", base_sha)
+        .status()
+        .expect("spawn a9 command via sh -c")
+        .success()
+}
+
 /// Runs the exact a9 command string (the same way a downstream gate would:
-/// `sh -c "<command>"`) against the pinned mission base commit and asserts it
-/// exits successfully, proving finding a9 no longer reproduces.
+/// `sh -c "<command>"`) in a fixture repository whose diff against its base
+/// has the shape of m-3cda6a's: in-scope engine work plus the two
+/// compiler-forced files. The command must exit 0 there, and must fail once a
+/// file outside the declared scope changes.
+///
+/// The fixture carries its own base. This test once took `KRANZ_BASE_SHA` from
+/// the ambient environment and ran the command in the live checkout, so under
+/// a contract gate it judged whichever mission was running against
+/// m-3cda6a's scope and failed for any mission that touched another crate.
 #[test]
 fn a9_command_runs_successfully_verbatim() {
     if Command::new("git").arg("--version").output().is_err() {
@@ -65,28 +112,25 @@ fn a9_command_runs_successfully_verbatim() {
         );
         return;
     }
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
+    let repo = tempfile::tempdir().expect("tempdir");
+    let dir = repo.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    commit_file(dir, "README.md");
+    let base_sha = git(dir, &["rev-parse", "HEAD"]);
 
-    let base_sha = match std::env::var("KRANZ_BASE_SHA") {
-        Ok(sha) => sha,
-        Err(_) => {
-            eprintln!("skipping: KRANZ_BASE_SHA not set");
-            return;
-        }
-    };
+    commit_file(dir, "crates/engine/src/events.rs");
+    commit_file(dir, "crates/cli/src/tail.rs");
+    commit_file(dir, "crates/slack/src/outbound.rs");
 
     let command = a9_command_from_plan_json();
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(&repo_root)
-        .env("KRANZ_BASE_SHA", &base_sha)
-        .status()
-        .expect("spawn a9 command via sh -c");
     assert!(
-        status.success(),
+        run_a9(dir, &command, &base_sha),
         "a9 command must exit 0 when run verbatim: {command}"
+    );
+
+    commit_file(dir, "crates/server/src/rest.rs");
+    assert!(
+        !run_a9(dir, &command, &base_sha),
+        "a9 command must fail when a file outside the declared scope changes: {command}"
     );
 }
