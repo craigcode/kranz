@@ -564,12 +564,10 @@ fn route_interactive(payload: &Value) -> Action {
                                 user_id,
                                 response_url,
                             },
-                            GrantButtonValue::Legacy { mission_id } => {
-                                Action::StaleGrantButton {
-                                    mission_id,
-                                    response_url,
-                                }
-                            }
+                            GrantButtonValue::Legacy { mission_id } => Action::StaleGrantButton {
+                                mission_id,
+                                response_url,
+                            },
                         }
                     }
                     ButtonKind::DenyGrant => {
@@ -590,12 +588,10 @@ fn route_interactive(payload: &Value) -> Action {
                                 user_id,
                                 response_url,
                             },
-                            GrantButtonValue::Legacy { mission_id } => {
-                                Action::StaleGrantButton {
-                                    mission_id,
-                                    response_url,
-                                }
-                            }
+                            GrantButtonValue::Legacy { mission_id } => Action::StaleGrantButton {
+                                mission_id,
+                                response_url,
+                            },
                         }
                     }
                     ButtonKind::AnswerQuestion => {

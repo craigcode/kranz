@@ -5355,7 +5355,7 @@ mod tests {
             standards_manifest: None,
             reviewer_independence: None,
         };
-        let events = vec![
+        let events = [
             Event {
                 seq: 1,
                 ts: chrono::Utc::now(),

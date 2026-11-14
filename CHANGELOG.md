@@ -27,6 +27,12 @@ Notable user-visible changes are documented here. This project follows
   `requestSeq` of the exact pending request it rendered when approving or
   denying, so a stale or superseded decision is refused by the server
   instead of silently acting on a different request.
+- Fixed: a Slack grant card's Approve and Deny buttons carry the sequence
+  number and kind of the request the card was posted for. A click on a card
+  for a request that has since been replaced is refused as superseded and
+  queues nothing, even when the newer request has the same command text. A
+  card posted before this change is refused the same way; use the newest
+  card or the dashboard.
 - Fixed: `POST /api/missions/:id/grant/approve` and `/grant/deny` accept
   optional `kind`/`requestSeq` fields and refuse the decision as superseded
   (409) when they no longer match the pending grant request, binding a
