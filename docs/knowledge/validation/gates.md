@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-13
+last_verified: 2026-11-14
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-14 (UTC) against a second `docs/tickets.md` change for `kranz ticket import-atlas`: only the section on tickets imported from a Magic Atlas bundle changed (what the reference-only loose end shows when a reference link carries its facts and kinds). No gate, acceptance requirement or consent behavior changed.
 
 Rechecked 2026-11-13 (UTC) against the `docs/tickets.md` change for `kranz ticket import-atlas`: only the section on tickets imported from a Magic Atlas bundle changed (reference links, fact ids, kinds in words and stored text in schema 3 loose ends). No gate changed.
 
