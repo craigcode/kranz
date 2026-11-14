@@ -1050,6 +1050,10 @@ pub struct PendingGrantRequest {
     /// destination (`Egress`). Named `command` for wire back-compat with the
     /// original command-only grant events.
     pub command: String,
+    /// The `seq` of the `grant.requested` event that parked this request.
+    /// `None` for snapshots folded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_seq: Option<u64>,
 }
 
 /// An open structured human question (ticket

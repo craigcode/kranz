@@ -5,6 +5,10 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: `PendingGrantRequest.requestSeq` records the sequence number of the
+  `grant.requested` event that parked the pending capability grant, so a
+  later decision can be bound to the exact request the operator saw instead
+  of matching on target text alone.
 - Fixed: loose ends in tickets that `kranz ticket import-atlas` writes from a
   schema 3 bundle. Reference links are read from `groups.json`, counted and
   listed with caller, callee, the callee's ticket and the occurrences; a
