@@ -104,7 +104,7 @@ deterministic; no model reads signal content before a human has consented.
    grow at the request of whoever can reach the port. Authenticity is checked
    first (timestamp header within a 5-minute skew window, a freshness check
    only), then replay: the replay key is derived only from values the
-   source's signature covers — for Sentry, the SHA-256 of the signed raw body,
+   source's signature covers: for Sentry, the SHA-256 of the signed raw body,
    never the unsigned `Request-ID` / `X-Sentry-Delivery` / timestamp headers.
    An accepted delivery is remembered as a replay for at least 24 hours from
    first receipt, measured on the server clock, bounded by the existing
