@@ -61,6 +61,9 @@ verified_against:
   - docs/tickets.md
 ---
 
+Rechecked 2026-11-14 (UTC) against the `docs/tickets.md` change adding a
+section on reshaping a parked draft (abandon + redraft). No gate changed.
+
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: grant decisions from REST, the dashboard and Slack may name the pending request's sequence number and kind and are refused as superseded on a mismatch; an expired one-call permission card stays in place in the dashboard. Gate behaviour and the denial signal are unchanged.
 
 Rechecked 2026-11-13 (UTC) against the `docs/tickets.md` change for `kranz ticket import-atlas`: only the section on tickets imported from a Magic Atlas bundle changed (reference links, fact ids, kinds in words and stored text in schema 3 loose ends). No gate changed.
