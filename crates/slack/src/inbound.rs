@@ -304,10 +304,14 @@ pub enum Action {
         user_id: Option<String>,
         response_url: Option<String>,
     },
-    /// Approve a parked capability grant from a button. The command must match
-    /// the parked request (checked at enqueue).
+    /// Approve a parked capability grant from a button. The seq, kind and
+    /// command must all match the parked request (checked at enqueue) — a
+    /// stale card is refused as superseded rather than applying to whatever
+    /// request happens to be pending now.
     ApproveGrant {
         mission_id: String,
+        request_seq: u64,
+        grant_kind: kranz_engine::types::GrantKind,
         command: String,
         user_id: Option<String>,
         response_url: Option<String>,
@@ -315,8 +319,19 @@ pub enum Action {
     /// Deny a parked capability grant from a button (block the milestone).
     DenyGrant {
         mission_id: String,
+        request_seq: u64,
+        grant_kind: kranz_engine::types::GrantKind,
         command: String,
         user_id: Option<String>,
+        response_url: Option<String>,
+    },
+    /// A grant button whose value is the pre-seq/kind legacy shape
+    /// (`<mission-id>:<command>`, no `:<seq>:<kind>:` in the middle). Posted
+    /// before a decision could bind to a specific request; refused as
+    /// out-of-date rather than guessed at (no command/kind to check it
+    /// against).
+    StaleGrantButton {
+        mission_id: String,
         response_url: Option<String>,
     },
     ResolvePermission {
@@ -532,25 +547,55 @@ fn route_interactive(payload: &Value) -> Action {
                         }
                     }
                     ButtonKind::ApproveGrant => {
-                        let Some((mission_id, command)) = parse_grant_button_value(&value) else {
+                        let Some(parsed) = parse_grant_button_value(&value) else {
                             return Action::Ignore;
                         };
-                        Action::ApproveGrant {
-                            mission_id,
-                            command,
-                            user_id,
-                            response_url,
+                        match parsed {
+                            GrantButtonValue::Current {
+                                mission_id,
+                                request_seq,
+                                kind,
+                                command,
+                            } => Action::ApproveGrant {
+                                mission_id,
+                                request_seq,
+                                grant_kind: kind,
+                                command,
+                                user_id,
+                                response_url,
+                            },
+                            GrantButtonValue::Legacy { mission_id } => {
+                                Action::StaleGrantButton {
+                                    mission_id,
+                                    response_url,
+                                }
+                            }
                         }
                     }
                     ButtonKind::DenyGrant => {
-                        let Some((mission_id, command)) = parse_grant_button_value(&value) else {
+                        let Some(parsed) = parse_grant_button_value(&value) else {
                             return Action::Ignore;
                         };
-                        Action::DenyGrant {
-                            mission_id,
-                            command,
-                            user_id,
-                            response_url,
+                        match parsed {
+                            GrantButtonValue::Current {
+                                mission_id,
+                                request_seq,
+                                kind,
+                                command,
+                            } => Action::DenyGrant {
+                                mission_id,
+                                request_seq,
+                                grant_kind: kind,
+                                command,
+                                user_id,
+                                response_url,
+                            },
+                            GrantButtonValue::Legacy { mission_id } => {
+                                Action::StaleGrantButton {
+                                    mission_id,
+                                    response_url,
+                                }
+                            }
                         }
                     }
                     ButtonKind::AnswerQuestion => {
@@ -640,17 +685,61 @@ fn parse_revision_button_value(value: &str) -> Option<(String, u32)> {
     Some((mission_id.to_string(), revision))
 }
 
-/// Split a grant button value `<mission-id>:<command>`. Mission ids never
-/// contain `:`, so the FIRST colon splits cleanly and the command keeps any
-/// remaining colons. The command is NOT trimmed — it must match the parked
-/// request byte-for-byte for the enqueue's cross-check to accept it.
-fn parse_grant_button_value(value: &str) -> Option<(String, String)> {
-    let (mission_id, command) = value.split_once(':')?;
-    let mission_id = mission_id.trim();
-    if mission_id.is_empty() || command.is_empty() {
+/// A grant button's parsed value — either the current
+/// `<mission-id>:<request-seq>:<kind>:<command>` shape, or the pre-seq/kind
+/// legacy `<mission-id>:<command>` shape from a card posted before a
+/// decision could bind to a specific request.
+pub(crate) enum GrantButtonValue {
+    Current {
+        mission_id: String,
+        request_seq: u64,
+        kind: kranz_engine::types::GrantKind,
+        command: String,
+    },
+    Legacy {
+        mission_id: String,
+    },
+}
+
+/// Split a grant button value. Mission ids never contain `:`, the seq is
+/// decimal and the kind is its kebab-case wire name, so none of the first
+/// three fields contain `:` — splitting on the first three colons leaves the
+/// command, which may contain more, intact. A value with no numeric seq
+/// (plus a recognized kind) in the second/third position is the pre-seq
+/// legacy `<mission-id>:<command>` shape and is returned as [`Legacy`] so
+/// the caller can refuse it as out-of-date rather than guess at a seq/kind
+/// to check it against. The command is NOT trimmed — it must match the
+/// parked request byte-for-byte for the enqueue's cross-check to accept it.
+///
+/// [`Legacy`]: GrantButtonValue::Legacy
+fn parse_grant_button_value(value: &str) -> Option<GrantButtonValue> {
+    let mut parts = value.splitn(4, ':');
+    let mission_id = parts.next()?.trim();
+    if mission_id.is_empty() {
         return None;
     }
-    Some((mission_id.to_string(), command.to_string()))
+    let rest: Vec<&str> = parts.collect();
+    if rest.len() == 3 {
+        if let (Ok(request_seq), Some(kind)) = (
+            rest[0].trim().parse::<u64>(),
+            crate::format::grant_kind_from_wire(rest[1].trim()),
+        ) {
+            if !rest[2].is_empty() {
+                return Some(GrantButtonValue::Current {
+                    mission_id: mission_id.to_string(),
+                    request_seq,
+                    kind,
+                    command: rest[2].to_string(),
+                });
+            }
+        }
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(GrantButtonValue::Legacy {
+        mission_id: mission_id.to_string(),
+    })
 }
 
 /// Split a question button value `<mission-id>:<question-id>:<option-index>`.
@@ -1745,7 +1834,7 @@ mod tests {
                 "user": { "id": "Ugrant" },
                 "response_url": "https://hooks.slack/g",
                 "actions": [
-                    { "action_id": APPROVE_GRANT_ACTION_ID, "value": "m-42:gc audit --deep", "type": "button" }
+                    { "action_id": APPROVE_GRANT_ACTION_ID, "value": "m-42:7:command:gc audit --deep", "type": "button" }
                 ]
             }
         });
@@ -1753,14 +1842,16 @@ mod tests {
             route(&approve, &lookup_none()).action,
             Action::ApproveGrant {
                 mission_id: "m-42".into(),
+                request_seq: 7,
+                grant_kind: kranz_engine::types::GrantKind::Command,
                 command: "gc audit --deep".into(),
                 user_id: Some("Ugrant".into()),
                 response_url: Some("https://hooks.slack/g".into()),
             }
         );
 
-        // A command containing colons is preserved: only the FIRST colon splits
-        // the mission id from the command.
+        // A command containing colons is preserved: only the first THREE
+        // colons split mission id / seq / kind from the command.
         let deny = json!({
             "type": "interactive",
             "payload": {
@@ -1768,7 +1859,7 @@ mod tests {
                 "user": { "id": "Ugrant" },
                 "response_url": "https://hooks.slack/g",
                 "actions": [
-                    { "action_id": DENY_GRANT_ACTION_ID, "value": "m-42:psql host:5432", "type": "button" }
+                    { "action_id": DENY_GRANT_ACTION_ID, "value": "m-42:3:command:psql host:5432", "type": "button" }
                 ]
             }
         });
@@ -1776,8 +1867,36 @@ mod tests {
             route(&deny, &lookup_none()).action,
             Action::DenyGrant {
                 mission_id: "m-42".into(),
+                request_seq: 3,
+                grant_kind: kranz_engine::types::GrantKind::Command,
                 command: "psql host:5432".into(),
                 user_id: Some("Ugrant".into()),
+                response_url: Some("https://hooks.slack/g".into()),
+            }
+        );
+    }
+
+    /// A legacy `<mission-id>:<command>` grant button value (posted before a
+    /// decision could bind to a specific request/kind) routes to
+    /// [`Action::StaleGrantButton`] rather than being guessed at as a
+    /// decision.
+    #[test]
+    fn block_actions_legacy_grant_button_value_routes_to_superseded_grant_stale_notice() {
+        let approve = json!({
+            "type": "interactive",
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "Ugrant" },
+                "response_url": "https://hooks.slack/g",
+                "actions": [
+                    { "action_id": APPROVE_GRANT_ACTION_ID, "value": "m-42:gc audit --deep", "type": "button" }
+                ]
+            }
+        });
+        assert_eq!(
+            route(&approve, &lookup_none()).action,
+            Action::StaleGrantButton {
+                mission_id: "m-42".into(),
                 response_url: Some("https://hooks.slack/g".into()),
             }
         );

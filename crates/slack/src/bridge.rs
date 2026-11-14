@@ -1237,6 +1237,7 @@ pub(crate) fn apply_action(repo_root: &Path, action: &Action) -> Result<()> {
         | Action::ResolvePermission { .. }
         | Action::ApproveGrant { .. }
         | Action::DenyGrant { .. }
+        | Action::StaleGrantButton { .. }
         | Action::AnswerQuestion { .. }
         | Action::Work { .. }
         | Action::WorkRun { .. }
@@ -2441,17 +2442,35 @@ fn enqueue_grant_control(
     let mission_id = resolve_active_config_target(repo_root, Some(mission_id))?;
     let paths = MissionPaths::new(repo_root, &mission_id);
     let state = read_mission_state(&paths)?;
-    let command = match &cmd {
-        ControlCommand::ApproveGrant { command, .. } => command,
-        ControlCommand::DenyGrant { command, .. } => command,
+    let (command, grant_kind, request_seq) = match &cmd {
+        ControlCommand::ApproveGrant {
+            command,
+            grant_kind,
+            request_seq,
+        } => (command, grant_kind, request_seq),
+        ControlCommand::DenyGrant {
+            command,
+            grant_kind,
+            request_seq,
+            ..
+        } => (command, grant_kind, request_seq),
         _ => anyhow::bail!("not a grant control command"),
     };
-    match state.pending_grant_request {
-        Some(pending) if pending.command == *command => {}
-        Some(pending) => anyhow::bail!(
+    match &state.pending_grant_request {
+        Some(pending) if pending.command != *command => anyhow::bail!(
             "mission `{mission_id}` is awaiting a grant for `{}`, not `{command}`",
             pending.command
         ),
+        Some(pending)
+            if (*grant_kind).is_some_and(|k| k != pending.kind)
+                || (*request_seq).is_some_and(|seq| Some(seq) != pending.request_seq) =>
+        {
+            anyhow::bail!(
+                "mission `{mission_id}`'s pending grant for `{}` has been superseded by a newer request — use the newest card or the dashboard",
+                pending.command
+            )
+        }
+        Some(_) => {}
         None => anyhow::bail!("mission `{mission_id}` has no pending grant request"),
     }
     kranz_engine::control::enqueue(&paths, &cmd).context("enqueue grant control")?;
