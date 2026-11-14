@@ -20,7 +20,8 @@ use kranz_engine::preflight::PREFLIGHT_CLEAR_SUMMARY;
 use kranz_engine::reducer;
 use kranz_engine::report_render::render_plan_markdown;
 use kranz_engine::types::{
-    ControlCommand, MissionState, MissionStatus, RoleConfig, SandboxEnforce, WorkerIsolation,
+    ControlCommand, GrantKind, MissionState, MissionStatus, RoleConfig, SandboxEnforce,
+    WorkerIsolation,
 };
 use kranz_engine::{config, control};
 use serde::{Deserialize, Serialize};
@@ -1181,6 +1182,10 @@ pub(crate) async fn post_permission_answer(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GrantApproveBody {
     command: String,
+    #[serde(default)]
+    kind: Option<GrantKind>,
+    #[serde(default)]
+    request_seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1189,6 +1194,10 @@ pub(crate) struct GrantDenyBody {
     command: String,
     #[serde(default = "default_grant_deny_reason")]
     reason: String,
+    #[serde(default)]
+    kind: Option<GrantKind>,
+    #[serde(default)]
+    request_seq: Option<u64>,
 }
 
 fn default_grant_deny_reason() -> String {
@@ -1201,13 +1210,13 @@ pub(crate) async fn post_grant_approve(
     UrlPath(id): UrlPath<String>,
     Json(body): Json<GrantApproveBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let paths = require_pending_grant(&server, &id, &body.command)?;
+    let paths = require_pending_grant(&server, &id, &body.command, body.kind, body.request_seq)?;
     control::enqueue(
         &paths,
         &ControlCommand::ApproveGrant {
             command: body.command,
-            grant_kind: None,
-            request_seq: None,
+            grant_kind: body.kind,
+            request_seq: body.request_seq,
         },
     )?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
@@ -1219,14 +1228,14 @@ pub(crate) async fn post_grant_deny(
     UrlPath(id): UrlPath<String>,
     Json(body): Json<GrantDenyBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let paths = require_pending_grant(&server, &id, &body.command)?;
+    let paths = require_pending_grant(&server, &id, &body.command, body.kind, body.request_seq)?;
     control::enqueue(
         &paths,
         &ControlCommand::DenyGrant {
             command: body.command,
             reason: body.reason,
-            grant_kind: None,
-            request_seq: None,
+            grant_kind: body.kind,
+            request_seq: body.request_seq,
         },
     )?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
@@ -1346,16 +1355,41 @@ fn require_pending_revision(
 
 /// Confirm a grant request for exactly `command` is parked, so the enqueued
 /// approve/deny can't target a different (or absent) request than the operator
-/// saw. Same active-mission preconditions as the revision gate.
+/// saw. Same active-mission preconditions as the revision gate. When the
+/// caller provides `kind`/`request_seq` (the dashboard/Slack echo what the
+/// operator was shown), both must match the parked request or the decision is
+/// refused as superseded — a stale approval can't silently apply to a later
+/// request that happens to share the same command text. Omitted fields keep
+/// the legacy command-only behaviour for older clients (CLI, Even G2).
 fn require_pending_grant(
     server: &ServerState,
     id: &str,
     command: &str,
+    kind: Option<GrantKind>,
+    request_seq: Option<u64>,
 ) -> Result<MissionPaths, ApiError> {
     let paths = require_revisable_mission(server, id)?;
     let state = fold_log(&paths).map_err(ApiError::internal)?;
     match state.pending_grant_request {
-        Some(pending) if pending.command == command => Ok(paths),
+        Some(pending) if pending.command == command => {
+            if let Some(seen_kind) = kind {
+                if seen_kind != pending.kind {
+                    return Err(ApiError::conflict(format!(
+                        "pending grant is superseded: pending request (seq {:?}) is kind {:?}, not {seen_kind:?}",
+                        pending.request_seq, pending.kind
+                    )));
+                }
+            }
+            if let Some(seen_seq) = request_seq {
+                if Some(seen_seq) != pending.request_seq {
+                    return Err(ApiError::conflict(format!(
+                        "pending grant is superseded: pending request seq is {:?} (kind {:?}), not {seen_seq}",
+                        pending.request_seq, pending.kind
+                    )));
+                }
+            }
+            Ok(paths)
+        }
         Some(pending) => Err(ApiError::conflict(format!(
             "mission '{id}' is awaiting a grant for `{}`, not `{command}`",
             pending.command

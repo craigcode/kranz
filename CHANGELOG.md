@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: `POST /api/missions/:id/grant/approve` and `/grant/deny` accept
+  optional `kind`/`requestSeq` fields and refuse the decision as superseded
+  (409) when they no longer match the pending grant request, binding a
+  dashboard/Slack decision to the exact request the operator saw rather than
+  to any pending request sharing the same command text. Bodies without these
+  fields keep today's behaviour.
 - Added: `PendingGrantRequest.requestSeq` records the sequence number of the
   `grant.requested` event that parked the pending capability grant, so a
   later decision can be bound to the exact request the operator saw instead
