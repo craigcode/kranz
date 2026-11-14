@@ -53,3 +53,4 @@ Approved plans, newest last.
 - 2026-07-21 · [m-d1e3c3](m-d1e3c3/plan.md) — Add a flight-surgeon outcomes fold (autonomy ratio, grant-latency distribution, escalation ledger) computed per-request … [truncated] · [report](m-d1e3c3/report.md)
 - 2026-07-07 · [m-66aff8](m-66aff8/plan.md) — Fix worktree-mode gated merges: relocate the untracked operator preview copies so they no longer collide with the canoni… [truncated] · [report](m-66aff8/report.md)
 - 2026-11-12 · [m-daa3aa](m-daa3aa/plan.md) — Close three confirmed over-trust gaps in release and delivery tooling: release builds restore no cache, the Actions allo… [truncated]
+- 2026-11-13 · [m-c5cd5f](m-c5cd5f/plan.md) — Confirm and close two reported gaps in the Sentry signal intake path: Sentry replay protection must rely only on values … [truncated]

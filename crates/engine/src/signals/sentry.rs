@@ -10,7 +10,9 @@
 //! - Timestamp header: `Sentry-Hook-Timestamp` (Unix epoch seconds or RFC 3339),
 //!   checked against the 5-minute (`300s`) skew window.
 //! - Resource header: `Sentry-Hook-Resource` (`issue`, `event_alert`, `metric_alert`).
-//! - Replay protection: `(source, request_id_or_sig_hash, timestamp)` in [`ReplayCache`].
+//! - Replay protection: the [`ReplayCache`] key is the SHA-256 hex of the raw
+//!   body (the only value `Sentry-Hook-Signature` covers), never the unsigned
+//!   `Request-ID` / `X-Sentry-Delivery` / timestamp headers.
 //! - Domain-free: no project names or repository names in core.
 
 use crate::error::{EngineError, Result};
@@ -135,12 +137,17 @@ impl SignalSource for SentrySignalSource {
             return Err(DropReason::InvalidSignature);
         }
 
+        // The replay key MUST be derived only from values `Sentry-Hook-Signature`
+        // covers (the raw body); Request-ID/X-Sentry-Delivery/timestamp headers
+        // and the signature header string are unsigned and attacker-controlled.
+        let body_hash = crate::standards_waiver::sha256_hex(body);
+
         let delivery_id = header_value(headers, "request-id")
             .or_else(|| header_value(headers, "x-sentry-delivery"))
             .map(str::to_string)
-            .unwrap_or_else(|| crate::standards_waiver::sha256_hex(sig.as_bytes()));
+            .unwrap_or_else(|| body_hash.clone());
 
-        replay_cache.check_and_insert(self.source_id(), &delivery_id, timestamp, now)?;
+        replay_cache.check_and_insert(self.source_id(), &body_hash, timestamp, now)?;
 
         Ok(VerifiedDelivery {
             source: self.source_id().to_string(),

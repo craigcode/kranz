@@ -338,12 +338,26 @@ fn slice_3_4_5_7_8_end_to_end_sentry_signal_triage_proposal_consent_and_metrics(
     );
 
     // Second distinct delivery of the same issue within the dedupe window updates Occurrences
-    // on the existing proposal ticket instead of creating a second ticket.
+    // on the existing proposal ticket instead of creating a second ticket. The body must differ
+    // (replay protection now keys on the signed raw body), so add a field the adapter ignores
+    // while keeping the same issue id/shortId so triage still dedupes it.
+    let mut payload2 = payload.clone();
+    payload2["kranzTestDelivery"] = serde_json::json!(2);
+    let body2 = serde_json::to_vec(&payload2).unwrap();
+    let sig2 = SentrySignalSource::sign_body(dummy_key, &body2);
     let mut headers2 = headers.clone();
     headers2.insert("request-id".to_string(), "req-sentry-2".to_string());
-    let repeat_res =
-        ingest_verified_signal(repo_root, &sentry, &headers2, &body, &cfg, now, &mut replay)
-            .unwrap();
+    headers2.insert("sentry-hook-signature".to_string(), sig2);
+    let repeat_res = ingest_verified_signal(
+        repo_root,
+        &sentry,
+        &headers2,
+        &body2,
+        &cfg,
+        now,
+        &mut replay,
+    )
+    .unwrap();
     match repeat_res {
         IngestResult::Proposed(prop) => {
             assert!(!prop.created);

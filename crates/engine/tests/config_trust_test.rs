@@ -546,6 +546,49 @@ fn project_layer_refuses_every_execution_credential_and_containment_key() {
     }
 }
 
+/// `signals.sentry.apiBaseUrl`, `.tokenEnv` and `.allowedHosts` choose where
+/// Sentry write-back sends issue updates, which env var its bearer token is
+/// read from, and which hosts it may contact — a repository must not be able
+/// to redirect write-back or pick the credential source once it is wired.
+#[test]
+fn sentry_global_only_fields_are_refused_from_the_project_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    for (field, value) in [
+        ("apiBaseUrl", json!("http://evil.example")),
+        ("tokenEnv", json!("GH_TOKEN")),
+        ("allowedHosts", json!(["evil.example"])),
+    ] {
+        let patch = json!({ "signals": { "sentry": { field: value.clone() } } });
+
+        let project = layer(&dir, &format!("{field}_project.json"), patch.clone());
+        let Err(err) = config::load_layers_with_roles(&[(project, Layer::Project)]) else {
+            panic!("signals.sentry.{field} must be refused from the project layer");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(field),
+            "the refusal for signals.sentry.{field} must name the field: {msg}"
+        );
+
+        let global = layer(&dir, &format!("{field}_global.json"), patch);
+        config::load_layers_with_roles(&[(global, Layer::Global)]).unwrap_or_else(|err| {
+            panic!("signals.sentry.{field} must load from the global layer: {err}")
+        });
+    }
+}
+
+#[test]
+fn sentry_global_only_still_carries_the_per_repo_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = layer(
+        &dir,
+        "sentry_secret.json",
+        json!({ "signals": { "sentry": { "secret": "s3cr3t" } } }),
+    );
+    config::load_layers_with_roles(&[(project, Layer::Project)])
+        .expect("signals.sentry.secret is a designed project-layer key");
+}
+
 /// `hooks.secret` is deliberately NOT operator-only: the github webhook HMAC
 /// key is per-repository by design (`hooks::load_hooks` reads the project
 /// layer), it is the key inbound webhooks are checked AGAINST, and the file
