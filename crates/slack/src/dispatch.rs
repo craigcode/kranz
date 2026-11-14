@@ -930,6 +930,8 @@ pub(crate) async fn dispatch_action(
                 response_url.as_deref(),
                 ControlCommand::ApproveGrant {
                     command: command.clone(),
+                    grant_kind: None,
+                    request_seq: None,
                 },
                 "grant approval queued",
             )
@@ -951,6 +953,8 @@ pub(crate) async fn dispatch_action(
                 ControlCommand::DenyGrant {
                     command: command.clone(),
                     reason: "denied from Slack".to_string(),
+                    grant_kind: None,
+                    request_seq: None,
                 },
                 "grant denial queued",
             )

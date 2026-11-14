@@ -5114,6 +5114,8 @@ async fn validator_denial_grant_approved_extends_grants_and_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5196,6 +5198,8 @@ async fn validator_denial_grant_denied_blocks_the_milestone() {
         &ControlCommand::DenyGrant {
             command: denied_cmd.to_string(),
             reason: "not authorized this run".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5358,6 +5362,8 @@ async fn grant_request_cap_blocks_instead_of_looping() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5430,6 +5436,8 @@ async fn grant_offered_from_the_claude_retry_when_primary_had_no_command() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: denied_cmd.to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5519,6 +5527,8 @@ async fn out_of_contract_write_parks_a_touch_grant_and_approve_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "out-of-bounds.txt".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5620,6 +5630,8 @@ async fn out_of_contract_write_touch_grant_denied_flows_to_waive() {
         &ControlCommand::DenyGrant {
             command: "out-of-bounds.txt".to_string(),
             reason: "keep it out of contract".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5803,6 +5815,8 @@ async fn worker_deny_grant_lifts_the_rule_and_respawn_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "Bash(git push*)".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -5977,6 +5991,8 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: "Bash(git push*)".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -6066,6 +6082,8 @@ async fn egress_denial_grant_approved_extends_egress_grants_and_completes() {
         &paths,
         &ControlCommand::ApproveGrant {
             command: target.clone(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();
@@ -6175,6 +6193,8 @@ async fn egress_denial_grant_denied_blocks_the_milestone() {
         &ControlCommand::DenyGrant {
             command: target.clone(),
             reason: "not authorized this run".to_string(),
+            grant_kind: None,
+            request_seq: None,
         },
     )
     .unwrap();

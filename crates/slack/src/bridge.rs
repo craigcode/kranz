@@ -2442,7 +2442,7 @@ fn enqueue_grant_control(
     let paths = MissionPaths::new(repo_root, &mission_id);
     let state = read_mission_state(&paths)?;
     let command = match &cmd {
-        ControlCommand::ApproveGrant { command } => command,
+        ControlCommand::ApproveGrant { command, .. } => command,
         ControlCommand::DenyGrant { command, .. } => command,
         _ => anyhow::bail!("not a grant control command"),
     };

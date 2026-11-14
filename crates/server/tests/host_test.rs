@@ -1293,7 +1293,7 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
     assert_eq!(drained.len(), 1);
     assert!(matches!(
         &drained[0].1,
-        kranz_engine::types::ControlCommand::ApproveGrant { command: c } if c == command
+        kranz_engine::types::ControlCommand::ApproveGrant { command: c, .. } if c == command
     ));
 
     // Clear the (non-destructively drained) inbox, then deny.
@@ -1312,7 +1312,7 @@ async fn grant_routes_enqueue_approve_and_deny_decisions() {
     let drained = kranz_engine::control::drain(&MissionPaths::new(&root, "m-grant")).unwrap();
     assert!(matches!(
         &drained[0].1,
-        kranz_engine::types::ControlCommand::DenyGrant { command: c, reason } if c == command && reason == "not this run"
+        kranz_engine::types::ControlCommand::DenyGrant { command: c, reason, .. } if c == command && reason == "not this run"
     ));
 }
 

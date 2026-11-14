@@ -1206,6 +1206,8 @@ pub(crate) async fn post_grant_approve(
         &paths,
         &ControlCommand::ApproveGrant {
             command: body.command,
+            grant_kind: None,
+            request_seq: None,
         },
     )?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
@@ -1223,6 +1225,8 @@ pub(crate) async fn post_grant_deny(
         &ControlCommand::DenyGrant {
             command: body.command,
             reason: body.reason,
+            grant_kind: None,
+            request_seq: None,
         },
     )?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))

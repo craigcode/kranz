@@ -607,6 +607,8 @@ mod tests {
         enqueue(&paths, &ControlCommand::Pause).unwrap();
         let cmd = ControlCommand::ApproveGrant {
             command: "cargo publish".to_string(),
+            grant_kind: None,
+            request_seq: None,
         };
         let forged = sign(
             b"not the repository authority key",
@@ -643,6 +645,8 @@ mod tests {
             &paths,
             &ControlCommand::ApproveGrant {
                 command: "cargo publish".to_string(),
+                grant_kind: None,
+                request_seq: None,
             },
         )
         .unwrap();
@@ -650,7 +654,7 @@ mod tests {
         let drained = drain(&paths).unwrap();
         assert_eq!(drained.len(), 1);
         assert!(
-            matches!(&drained[0].1, ControlCommand::ApproveGrant { command } if command == "cargo publish"),
+            matches!(&drained[0].1, ControlCommand::ApproveGrant { command, .. } if command == "cargo publish"),
             "{:?}",
             drained[0].1
         );
@@ -699,6 +703,8 @@ mod tests {
         let target = MissionPaths::new(tmp.path(), "m-b");
         let cmd = ControlCommand::ApproveGrant {
             command: "cargo publish".to_string(),
+            grant_kind: None,
+            request_seq: None,
         };
         let file = enqueue(&source, &cmd).unwrap();
         let body = std::fs::read_to_string(&file).unwrap();
@@ -929,6 +935,8 @@ mod replay_tests {
         let paths = MissionPaths::new(tmp.path(), "m-1");
         let cmd = ControlCommand::ApproveGrant {
             command: "cargo publish".to_string(),
+            grant_kind: None,
+            request_seq: None,
         };
         let path = enqueue(&paths, &cmd).unwrap();
         let captured = std::fs::read(&path).unwrap();

@@ -1952,7 +1952,12 @@ impl MissionEngine {
     /// allow-set. The `command` echoed back by the operator must match the
     /// parked request — a stale approval for a different command is refused,
     /// not silently applied to whatever is parked now.
-    fn approve_pending_grant(&mut self, command: &str) -> Result<()> {
+    fn approve_pending_grant(
+        &mut self,
+        command: &str,
+        grant_kind: Option<GrantKind>,
+        request_seq: Option<u64>,
+    ) -> Result<()> {
         let pending = self.state.pending_grant_request.clone().ok_or_else(|| {
             EngineError::InvalidState("no pending grant request to approve".to_string())
         })?;
@@ -1961,6 +1966,22 @@ impl MissionEngine {
                 "pending grant is {:?}, not {command:?}",
                 pending.command
             )));
+        }
+        if let Some(seen_kind) = grant_kind {
+            if seen_kind != pending.kind {
+                return Err(EngineError::InvalidState(format!(
+                    "pending grant is superseded: pending request (seq {:?}) is kind {:?}, not {seen_kind:?}",
+                    pending.request_seq, pending.kind
+                )));
+            }
+        }
+        if let Some(seen_seq) = request_seq {
+            if Some(seen_seq) != pending.request_seq {
+                return Err(EngineError::InvalidState(format!(
+                    "pending grant is superseded: pending request seq is {:?} (kind {:?}), not {seen_seq}",
+                    pending.request_seq, pending.kind
+                )));
+            }
         }
         self.emit(EventKind::GrantApproved {
             kind: pending.kind,
@@ -2016,7 +2037,13 @@ impl MissionEngine {
     /// automatic). If the milestone is gone, the revision already moved past it,
     /// so clearing the grant (`grant.denied`, which folds unconditionally) is
     /// enough — the run loop re-evaluates the revised plan.
-    fn deny_pending_grant(&mut self, command: &str, reason: &str) -> Result<()> {
+    fn deny_pending_grant(
+        &mut self,
+        command: &str,
+        reason: &str,
+        grant_kind: Option<GrantKind>,
+        request_seq: Option<u64>,
+    ) -> Result<()> {
         let pending = self.state.pending_grant_request.clone().ok_or_else(|| {
             EngineError::InvalidState("no pending grant request to deny".to_string())
         })?;
@@ -2025,6 +2052,22 @@ impl MissionEngine {
                 "pending grant is {:?}, not {command:?}",
                 pending.command
             )));
+        }
+        if let Some(seen_kind) = grant_kind {
+            if seen_kind != pending.kind {
+                return Err(EngineError::InvalidState(format!(
+                    "pending grant is superseded: pending request (seq {:?}) is kind {:?}, not {seen_kind:?}",
+                    pending.request_seq, pending.kind
+                )));
+            }
+        }
+        if let Some(seen_seq) = request_seq {
+            if Some(seen_seq) != pending.request_seq {
+                return Err(EngineError::InvalidState(format!(
+                    "pending grant is superseded: pending request seq is {:?} (kind {:?}), not {seen_seq}",
+                    pending.request_seq, pending.kind
+                )));
+            }
         }
         self.emit(EventKind::GrantDenied {
             kind: pending.kind,
@@ -2970,6 +3013,8 @@ impl MissionEngine {
                     self.deny_pending_grant(
                         &pending.command,
                         "grant request timed out with no operator decision (deny-default)",
+                        None,
+                        None,
                     )?;
                     continue;
                 }
@@ -3126,8 +3171,12 @@ impl MissionEngine {
                         })?;
                     }
                 }
-                ControlCommand::ApproveGrant { command } => {
-                    if let Err(e) = self.approve_pending_grant(&command) {
+                ControlCommand::ApproveGrant {
+                    command,
+                    grant_kind,
+                    request_seq,
+                } => {
+                    if let Err(e) = self.approve_pending_grant(&command, grant_kind, request_seq) {
                         tracing::warn!(error = %e, command, "grant approval ignored");
                         self.emit(EventKind::OrchestratorDecision {
                             summary: format!("grant approval for `{command}` ignored: {e}"),
@@ -3135,8 +3184,15 @@ impl MissionEngine {
                         })?;
                     }
                 }
-                ControlCommand::DenyGrant { command, reason } => {
-                    if let Err(e) = self.deny_pending_grant(&command, &reason) {
+                ControlCommand::DenyGrant {
+                    command,
+                    reason,
+                    grant_kind,
+                    request_seq,
+                } => {
+                    if let Err(e) =
+                        self.deny_pending_grant(&command, &reason, grant_kind, request_seq)
+                    {
                         tracing::warn!(error = %e, command, "grant denial ignored");
                         self.emit(EventKind::OrchestratorDecision {
                             summary: format!("grant denial for `{command}` ignored: {e}"),
