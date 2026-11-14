@@ -662,6 +662,71 @@ mod tests {
     }
 
     #[test]
+    fn superseded_grant_fields_are_additive_and_legacy_control_still_applies_by_target() {
+        // None fields must be omitted from the wire so legacy control files
+        // (signed under the old shape) stay byte-identical.
+        let approve = ControlCommand::ApproveGrant {
+            command: "cargo publish".to_string(),
+            grant_kind: None,
+            request_seq: None,
+        };
+        let value = serde_json::to_value(&approve).unwrap();
+        assert!(value.get("grant-kind").is_none());
+        assert!(value.get("request-seq").is_none());
+
+        let deny = ControlCommand::DenyGrant {
+            command: "cargo publish".to_string(),
+            reason: "no".to_string(),
+            grant_kind: None,
+            request_seq: None,
+        };
+        let value = serde_json::to_value(&deny).unwrap();
+        assert!(value.get("grant-kind").is_none());
+        assert!(value.get("request-seq").is_none());
+
+        // A legacy ApproveGrant JSON (no grant-kind/request-seq keys at all)
+        // must still deserialize, with both new fields None.
+        let legacy = serde_json::json!({
+            "kind": "approve-grant",
+            "command": "cargo publish",
+        });
+        let parsed: ControlCommand = serde_json::from_value(legacy).unwrap();
+        match parsed {
+            ControlCommand::ApproveGrant {
+                command,
+                grant_kind,
+                request_seq,
+            } => {
+                assert_eq!(command, "cargo publish");
+                assert_eq!(grant_kind, None);
+                assert_eq!(request_seq, None);
+            }
+            other => panic!("expected ApproveGrant, got {other:?}"),
+        }
+
+        // End to end: a legacy signed control file with neither field still
+        // drains and applies by target text alone.
+        let tmp = TempDir::new().unwrap();
+        let paths = MissionPaths::new(tmp.path(), "m-legacy-grant");
+        enqueue(
+            &paths,
+            &ControlCommand::ApproveGrant {
+                command: "cargo publish".to_string(),
+                grant_kind: None,
+                request_seq: None,
+            },
+        )
+        .unwrap();
+        let drained = drain(&paths).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            &drained[0].1,
+            ControlCommand::ApproveGrant { command, grant_kind: None, request_seq: None }
+                if command == "cargo publish"
+        ));
+    }
+
+    #[test]
     fn signed_fractional_config_values_keep_their_bits() {
         let tmp = TempDir::new().unwrap();
         let paths = MissionPaths::new(tmp.path(), "m-fractional");
