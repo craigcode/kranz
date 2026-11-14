@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: switching missions in the dashboard (back/forward, deep link, or URL
+  edit) now clears the revision-request textarea, the per-question free-text
+  drafts, the orchestrator composer's text and interrupt flag, and the
+  standards waiver reason/expiry form, so a draft typed for one mission can
+  no longer be submitted to a different one.
 - Fixed: the dashboard's grant request panel now sends the `kind` and
   `requestSeq` of the exact pending request it rendered when approving or
   denying, so a stale or superseded decision is refused by the server

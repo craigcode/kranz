@@ -18,17 +18,17 @@ import { api, ApiError } from '../lib/api';
 
 const INITIAL_STORE_STATE = useKranzStore.getState();
 
-function missionState(pending?: PendingQuestion[]): MissionState {
+function missionState(pending?: PendingQuestion[], missionId = 'm-1'): MissionState {
   return {
     mission: {
-      id: 'm-1',
+      id: missionId,
       goal: 'test question UI',
       validationContract: [],
       milestones: [],
       status: 'running',
       createdAt: '2026-07-13T00:00:00Z',
       baseBranch: 'main',
-      missionBranch: 'kranz/mission-m-1',
+      missionBranch: `kranz/mission-${missionId}`,
     },
     runs: {},
     totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -150,5 +150,27 @@ describe('QuestionRequestPanel', () => {
     } finally {
       errSpy.mockRestore();
     }
+  });
+
+  it('clears the q-1 free-text draft when switching missions and never sends it under the new mission (DD2)', async () => {
+    useKranzStore.setState({ missionId: 'm-1', state: missionState([OPEN_QUESTION], 'm-1') });
+    const { rerender } = render(<QuestionRequestPanel />);
+
+    fireEvent.change(screen.getByPlaceholderText('Free-text answer...'), {
+      target: { value: 'draft written under mission A' },
+    });
+    expect((screen.getByPlaceholderText('Free-text answer...') as HTMLInputElement).value).toBe(
+      'draft written under mission A',
+    );
+
+    useKranzStore.setState({ missionId: 'm-2', state: missionState([OPEN_QUESTION], 'm-2') });
+    rerender(<QuestionRequestPanel />);
+
+    const input = screen.getByPlaceholderText('Free-text answer...') as HTMLInputElement;
+    expect(input.value).toBe('');
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(api.answerQuestion).not.toHaveBeenCalled();
   });
 });
