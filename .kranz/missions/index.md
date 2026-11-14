@@ -55,3 +55,4 @@ Approved plans, newest last.
 - 2026-11-12 · [m-daa3aa](m-daa3aa/plan.md) — Close three confirmed over-trust gaps in release and delivery tooling: release builds restore no cache, the Actions allo… [truncated]
 - 2026-11-13 · [m-c5cd5f](m-c5cd5f/plan.md) — Confirm and close two reported gaps in the Sentry signal intake path: Sentry replay protection must rely only on values … [truncated]
 - 2026-11-14 · [m-373b57](m-373b57/plan.md) — Bind every grant decision sent from the dashboard and from Slack to the exact request the operator saw (its grant kind a… [truncated]
+- 2026-11-14 · [m-7886d9](m-7886d9/plan.md) — Make the hint printed for a parked draft name a route that accepts it: add answers to the ticket, then `kranz abandon <i… [truncated]
