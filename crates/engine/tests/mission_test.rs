@@ -6238,9 +6238,10 @@ async fn egress_denial_grant_denied_blocks_the_milestone() {
 async fn wait_for_decision_containing(paths: &MissionPaths, needle: &str) {
     for _ in 0..400 {
         let events = read_log(paths);
-        if events.iter().any(|e| matches!(&e.kind,
-            EventKind::OrchestratorDecision { summary, .. } if summary.contains(needle)))
-        {
+        if events.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::OrchestratorDecision { summary, .. } if summary.contains(needle))
+        }) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -6458,7 +6459,10 @@ async fn superseded_grant_kind_mismatch_on_approve_and_deny_is_refused() {
         snap.pending_grant_request.is_some(),
         "a kind-mismatched approve must leave the pending request in place"
     );
-    assert!(!snap.mission.command_grants.contains(&denied_cmd.to_string()));
+    assert!(!snap
+        .mission
+        .command_grants
+        .contains(&denied_cmd.to_string()));
 
     // Wrong grant_kind on deny: also refused.
     control::enqueue(
