@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 const SECRET: &str = "dummy-replay-test-secret";
 
 fn sentry_source() -> SentrySignalSource {
+    let key = Some(SECRET.to_string());
     SentrySignalSource::new(SentryConfig {
-        secret: Some(SECRET.to_string()),
+        secret: key,
         allowed_hosts: vec!["sentry.io".to_string()],
         api_base_url: None,
         token_env: None,
