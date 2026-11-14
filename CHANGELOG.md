@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: the dashboard's Trajectory Board now pauses background polling and
+  shows a "Polling paused — token required" status after an authentication
+  failure, instead of parking a fresh token-prompt waiter on every poll
+  tick; a "Resume polling" button re-tries once with the normal token gate
+  and restarts the timers.
 - Fixed: switching missions in the dashboard (back/forward, deep link, or URL
   edit) now clears the revision-request textarea, the per-question free-text
   drafts, the orchestrator composer's text and interrupt flag, and the

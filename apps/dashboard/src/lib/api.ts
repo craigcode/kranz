@@ -211,12 +211,12 @@ export const api = {
     return getJson('/api/repos');
   },
 
-  missions(): Promise<MissionSummary[]> {
-    return getJson('/api/missions');
+  missions(opts?: GetJsonOptions): Promise<MissionSummary[]> {
+    return getJson('/api/missions', opts);
   },
 
-  missionState(id: string): Promise<MissionState> {
-    return getJson(`/api/missions/${encodeURIComponent(id)}/state`);
+  missionState(id: string, opts?: GetJsonOptions): Promise<MissionState> {
+    return getJson(`/api/missions/${encodeURIComponent(id)}/state`, opts);
   },
 
   standards(id: string): Promise<MissionStandardsView> {
@@ -430,8 +430,8 @@ export const api = {
 
   // --- tickets (Pipeline Backlog lens) ---------------------------------------
 
-  tickets(): Promise<TicketSummary[]> {
-    return getJson('/api/tickets');
+  tickets(opts?: GetJsonOptions): Promise<TicketSummary[]> {
+    return getJson('/api/tickets', opts);
   },
 
   ticket(slug: string): Promise<Ticket> {

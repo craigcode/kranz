@@ -3,7 +3,8 @@
 // of the main dashboard chunk.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from '../lib/api';
+import { api, isTokenRequired } from '../lib/api';
+import type { GetJsonOptions } from '../lib/api';
 import { DEMO_STEP_MS, demoSnapshotAt } from '../lib/board/demo';
 import { buildFleetModel, type BoardAsk, type FleetModel } from '../lib/board/fleet';
 import { buildRows } from '../lib/pipelineRows';
@@ -79,6 +80,8 @@ export function BoardLens({ demo = false }: BoardLensProps) {
   const [demoStep, setDemoStep] = useState<number>(0);
   const [selectedCraftKey, setSelectedCraftKey] = useState<string | null>(null);
   const [selectedAskId, setSelectedAskId] = useState<string | null>(null);
+  const [pollingPaused, setPollingPaused] = useState(false);
+  const pollingPausedRef = useRef(false);
 
   const scopeKey = `${repoId ?? ''}:${demo}`;
   const genRef = useRef<number>(0);
@@ -115,6 +118,8 @@ export function BoardLens({ demo = false }: BoardLensProps) {
     setSelectedAskId(null);
     setDemoStep(0);
     setNowMs(Date.now());
+    pollingPausedRef.current = false;
+    setPollingPaused(false);
   }, [repoId, demo]);
 
   // Discard state for any mission that is no longer in the `running` stage
@@ -158,9 +163,17 @@ export function BoardLens({ demo = false }: BoardLensProps) {
     setNowMs(Date.now());
   }, [demo, connectedMissionId, connectedState]);
 
+  // A background poll failing authentication must stop polling entirely
+  // rather than keep parking fresh waiters on the token gate (one per tick).
+  const pauseForTokenRequired = useCallback(() => {
+    pollingPausedRef.current = true;
+    setPollingPaused(true);
+  }, []);
+
   const fetchRunningStates = useCallback(
-    (force: boolean) => {
+    (force: boolean, opts?: GetJsonOptions) => {
       if (demo) return;
+      if (pollingPausedRef.current) return;
       if (typeof document !== 'undefined' && document.hidden) return;
       const gen = genRef.current;
       const now = Date.now();
@@ -168,8 +181,7 @@ export function BoardLens({ demo = false }: BoardLensProps) {
         const last = lastStateFetchRef.current.get(id) ?? -Infinity;
         if (!force && now - last < STATE_POLL_MS) continue;
         lastStateFetchRef.current.set(id, now);
-        api
-          .missionState(id)
+        (opts !== undefined ? api.missionState(id, opts) : api.missionState(id))
           .then((st) => {
             if (genRef.current !== gen || !runningIdsRef.current.has(id)) return;
             setMissionStates((prev) => {
@@ -183,29 +195,40 @@ export function BoardLens({ demo = false }: BoardLensProps) {
           })
           .catch((err: unknown) => {
             if (genRef.current !== gen) return;
+            if (opts?.tokenGate === false && isTokenRequired(err)) {
+              pauseForTokenRequired();
+              return;
+            }
             setStatePollError(err instanceof Error ? err.message : String(err));
           });
       }
     },
-    [demo],
+    [demo, pauseForTokenRequired],
   );
 
   const refreshLists = useCallback(
-    (force: boolean) => {
+    (force: boolean, opts?: GetJsonOptions) => {
       if (demo) return;
+      if (pollingPausedRef.current) return;
       if (typeof document !== 'undefined' && document.hidden) return;
       const now = Date.now();
       if (!force && now - lastListFetchRef.current < LIST_POLL_MS) return;
       const gen = genRef.current;
       lastListFetchRef.current = now;
       setNowMs(now);
-      void Promise.all([loadTickets(), loadMissions()]).finally(() => {
-        if (genRef.current === gen) {
-          setNowMs(Date.now());
-        }
-      });
+      void Promise.all([loadTickets(opts), loadMissions(opts)])
+        .catch((err: unknown) => {
+          if (opts?.tokenGate === false && isTokenRequired(err)) {
+            pauseForTokenRequired();
+          }
+        })
+        .finally(() => {
+          if (genRef.current === gen) {
+            setNowMs(Date.now());
+          }
+        });
     },
-    [demo, loadTickets, loadMissions],
+    [demo, loadTickets, loadMissions, pauseForTokenRequired],
   );
 
   // Immediate refresh after an in-place act completes (slice 6)
@@ -240,21 +263,27 @@ export function BoardLens({ demo = false }: BoardLensProps) {
       return () => window.clearInterval(id);
     }
 
-    refreshLists(false);
-    fetchRunningStates(false);
+    // A paused board must issue no further requests until the operator
+    // explicitly resumes — skip starting intervals/listener altogether.
+    if (pollingPaused) return;
+
+    const backgroundOpts: GetJsonOptions = { tokenGate: false };
+
+    refreshLists(false, backgroundOpts);
+    fetchRunningStates(false, backgroundOpts);
 
     const listTimer = window.setInterval(() => {
-      refreshLists(false);
+      refreshLists(false, backgroundOpts);
     }, LIST_POLL_MS);
 
     const stateTimer = window.setInterval(() => {
-      fetchRunningStates(false);
+      fetchRunningStates(false, backgroundOpts);
     }, STATE_POLL_MS);
 
     const onVisibilityChange = () => {
       if (typeof document !== 'undefined' && !document.hidden) {
-        refreshLists(true);
-        fetchRunningStates(true);
+        refreshLists(true, backgroundOpts);
+        fetchRunningStates(true, backgroundOpts);
       }
     };
 
@@ -269,7 +298,17 @@ export function BoardLens({ demo = false }: BoardLensProps) {
         document.removeEventListener('visibilitychange', onVisibilityChange);
       }
     };
-  }, [demo, repoId, refreshLists, fetchRunningStates]);
+  }, [demo, repoId, pollingPaused, refreshLists, fetchRunningStates]);
+
+  const resumePolling = useCallback(() => {
+    pollingPausedRef.current = false;
+    setPollingPaused(false);
+    setStatePollError(null);
+    // User-initiated: keep the default token gate so a missing/rejected
+    // token re-opens the TokenPrompt instead of failing silently.
+    refreshLists(true);
+    fetchRunningStates(true);
+  }, [refreshLists, fetchRunningStates]);
 
   // Build the FleetModel purely; commit prevModelRef inside useEffect so StrictMode never wipes transitions
   const currentHash = typeof window !== 'undefined' ? window.location.hash : undefined;
@@ -436,6 +475,15 @@ export function BoardLens({ demo = false }: BoardLensProps) {
           )}
         </dl>
       </header>
+
+      {pollingPaused && (
+        <div className="dim trajectory-board-polling-paused" role="status">
+          Polling paused — token required.{' '}
+          <button type="button" className="btn-small" onClick={resumePolling}>
+            Resume polling
+          </button>
+        </div>
+      )}
 
       {statePollError !== null && (
         <div className="dim trajectory-board-quiet-error" role="status">
