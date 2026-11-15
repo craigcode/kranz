@@ -1267,6 +1267,39 @@ impl GitRepo {
         }
     }
 
+    /// Unwaived secret findings among the ADDED lines of `diff_full(from,
+    /// to)`.
+    ///
+    /// The allowlist is read from `allowlist_sha` via [`Self::show_file`], a
+    /// commit chosen SEPARATELY from `from`: a mission's own edits to its
+    /// allowlist inside the scanned range must waive nothing, so callers that
+    /// need that guarantee (e.g. [`Self::secret_scan_range_refusal`]) pin
+    /// `allowlist_sha` to a commit outside the range — typically the base
+    /// the range is measured from, before the mission could have touched it.
+    /// `None` means an empty allowlist (waives nothing), as does a missing
+    /// allowlist file at `allowlist_sha`. A git error reading the diff or the
+    /// allowlist commit is always an `Err`, never an empty `Ok(vec![])`: a
+    /// scan that cannot read its inputs must not report a silent pass.
+    pub fn secret_scan_range(
+        &self,
+        allowlist_sha: Option<&str>,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<scrub::SecretFinding>> {
+        let diff = self.diff_full(from, to)?;
+        let allowed = match allowlist_sha {
+            Some(sha) => self
+                .show_file(sha, scrub::SECRET_ALLOWLIST_PATH)?
+                .map(|bytes| scrub::read_allowlist_text(&String::from_utf8_lossy(&bytes)))
+                .unwrap_or_default(),
+            None => Default::default(),
+        };
+        Ok(scrub::filter_allowed(
+            scrub::scan_unified_diff(&diff),
+            &allowed,
+        ))
+    }
+
     /// The refusal message when the added lines of `base_sha..tip` carry a
     /// secret finding, or `None` when the range is clean.
     ///
@@ -1278,12 +1311,7 @@ impl GitRepo {
     /// mission added to its own allowlist waives nothing. A diff that cannot
     /// be read is an error, never a pass.
     pub fn secret_scan_range_refusal(&self, base_sha: &str, tip: &str) -> Result<Option<String>> {
-        let diff = self.diff_full(base_sha, tip)?;
-        let allowed = self
-            .show_file(base_sha, scrub::SECRET_ALLOWLIST_PATH)?
-            .map(|bytes| scrub::read_allowlist_text(&String::from_utf8_lossy(&bytes)))
-            .unwrap_or_default();
-        let findings = scrub::filter_allowed(scrub::scan_unified_diff(&diff), &allowed);
+        let findings = self.secret_scan_range(Some(base_sha), base_sha, tip)?;
         Ok((!findings.is_empty()).then(|| {
             format!(
                 "secret scan found {} finding(s) in {base_sha}..{tip}; add a fingerprint to {} on \

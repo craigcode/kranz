@@ -1630,6 +1630,98 @@ fn range_scan_refuses_a_secret_and_ignores_a_self_added_waiver() {
     );
 }
 
+#[test]
+fn secret_scan_range_reads_allowlist_from_a_separate_commit() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, base) = seeded_repo();
+
+    let canary = "token = sk-ant-api03-NewSecret_123456\n";
+    let fingerprint = kranz_engine::scrub::scan_text(canary)
+        .into_iter()
+        .next()
+        .expect("canary line must produce a finding")
+        .fingerprint;
+
+    // Commit A: an allowlist waiving the canary's fingerprint, with no
+    // canary anywhere in the repo yet.
+    std::fs::create_dir_all(dir.path().join(".kranz")).unwrap();
+    write(&dir, ".kranz/secret-allowlist", &format!("{fingerprint}\n"));
+    raw_git(dir.path(), &["add", "-f", ".kranz/secret-allowlist"]);
+    raw_git(dir.path(), &["commit", "-q", "-m", "add allowlist"]);
+    let commit_a = raw_git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // Commit B: the canary itself, later, so the allowlist edit in A is
+    // OUTSIDE the range B..tip that will be scanned.
+    write(&dir, "notes.txt", canary);
+    raw_git(dir.path(), &["add", "notes.txt"]);
+    raw_git(dir.path(), &["commit", "-q", "-m", "worker commit"]);
+    let commit_b = raw_git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let tip = commit_b.clone();
+
+    // Allowlist from commit A (outside the range) waives the finding.
+    assert_eq!(
+        repo.secret_scan_range(Some(&commit_a), &commit_b, &tip)
+            .unwrap(),
+        Vec::new(),
+        "a fingerprint waived at the named allowlist commit must be filtered out"
+    );
+
+    // No allowlist commit given: nothing is waived.
+    let findings = repo.secret_scan_range(None, &base, &tip).unwrap();
+    assert_eq!(findings.len(), 1, "None must waive nothing");
+    assert_eq!(findings[0].rule_id, "anthropic-api-key");
+    assert!(
+        findings[0].location.contains("notes.txt:"),
+        "location must be path:line, got {:?}",
+        findings[0].location
+    );
+    let (path, line) = findings[0]
+        .location
+        .rsplit_once(':')
+        .expect("location must have a path:line form");
+    assert_eq!(path, "notes.txt");
+    assert!(line.parse::<usize>().is_ok(), "line must be numeric");
+
+    // Allowlist pinned at the pre-allowlist base: still nothing waived.
+    assert_eq!(
+        repo.secret_scan_range(Some(&base), &base, &tip)
+            .unwrap()
+            .len(),
+        1,
+        "the allowlist commit must be read, not assumed from the range start"
+    );
+
+    // An allowlist added only INSIDE the scanned range (base..tip includes
+    // commit A, which adds the waiver) must not waive anything when the
+    // allowlist commit itself is pinned outside the range (at base).
+    assert_eq!(
+        repo.secret_scan_range(Some(&base), &base, &tip)
+            .unwrap()
+            .len(),
+        1,
+        "an allowlist edit inside the range must not count unless it is the named allowlist commit"
+    );
+}
+
+#[test]
+fn secret_scan_range_errors_on_unreadable_range() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, base) = seeded_repo();
+    let bogus = "0000000000000000000000000000000000000000";
+    let err = repo
+        .secret_scan_range(Some(&base), bogus, &base)
+        .expect_err("a nonexistent sha must error, never pass as empty");
+    assert!(matches!(err, EngineError::Git(_)));
+}
+
 /// Audit M15: keys that change WHERE a push goes or WHAT it carries are
 /// refused like the program-naming ones. `pushurl` redirects the push away
 /// from the URL the handle vetted; the others widen one branch into tags,
