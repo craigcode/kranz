@@ -4565,6 +4565,32 @@ impl MissionEngine {
                             continue;
                         }
                     };
+                    // Feature-range secret scan (dispatch-pool path, record
+                    // only): same scan as the parallel-worktree path, over
+                    // this candidate's own pre_run_sha..HEAD against the
+                    // allowlist pinned at plan approval. The pool still parks
+                    // for human judgement regardless — this only annotates
+                    // the candidate line so the finding is visible before
+                    // that judgement, never an engine decision to drop it.
+                    let base_sha = self.state.mission.base_sha.clone();
+                    match wt_repo.secret_scan_range(base_sha.as_deref(), pre_run_sha, "HEAD") {
+                        Err(error) => {
+                            note.push_str(&format!(
+                                "; feature-range secret scan could not read the range ({error})"
+                            ));
+                        }
+                        Ok(findings) if !findings.is_empty() => {
+                            let rendered = scrub::format_findings(&findings)
+                                .lines()
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            note.push_str(&format!(
+                                "; feature-range secret scan: {} unwaived finding(s): {rendered}",
+                                findings.len()
+                            ));
+                        }
+                        Ok(_) => {}
+                    }
                     lines.push(format!(
                         "- candidate {idx}/{}: `{}` / `{}` → branch `{}` — run {:?}, {} commit(s){}",
                         n - 1,
@@ -5305,6 +5331,14 @@ impl MissionEngine {
                     })?;
                     continue;
                 }
+                WorktreeDisposition::Refused(reason) => {
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id,
+                        reason: reason.clone(),
+                        commits: Vec::new(), // worktree branch never merged
+                    })?;
+                    continue;
+                }
             }
             let pre_merge_sha = self.active_repo().head_sha()?;
             match self.active_repo().merge_no_ff(&ws.branch)? {
@@ -5537,6 +5571,48 @@ impl MissionEngine {
             Err(error) => return self.record_uninspectable_worktree(ws, &error),
         };
         let diff_stat = wt_repo.diff_stat(start_sha, "HEAD").unwrap_or_default();
+
+        // Feature-range secret scan (parallel path): the worker's own
+        // commits in this worktree are never covered by the checkpoint scan
+        // above (which only scans the engine's dirty-tree checkpoint
+        // commit), so scan the worktree's own start_sha..HEAD against the
+        // allowlist pinned at plan approval — the worktree shares the main
+        // repo's object database, so `base_sha` resolves here too. A
+        // refusal fails the feature with NO merge and NO judgement turn
+        // (unlike the sequential path, the parallel subset never respawns).
+        let base_sha = self.state.mission.base_sha.clone();
+        match wt_repo.secret_scan_range(base_sha.as_deref(), start_sha, "HEAD") {
+            Err(error) => {
+                self.emit_decision(
+                    &format!(
+                        "feature-range secret scan for {}: could not read the diff",
+                        ws.feature_id
+                    ),
+                    Some(format!("{error}")),
+                )?;
+                return Ok(WorktreeDisposition::Refused(format!(
+                    "feature-range secret scan could not read the feature's diff: {error}"
+                )));
+            }
+            Ok(findings) if !findings.is_empty() => {
+                let rendered = scrub::format_findings(&findings);
+                self.emit_decision(
+                    &format!(
+                        "feature-range secret scan for {}: {} unwaived finding(s)",
+                        ws.feature_id,
+                        findings.len()
+                    ),
+                    Some(rendered.clone()),
+                )?;
+                return Ok(WorktreeDisposition::Refused(format!(
+                    "feature-range secret scan: {} unwaived finding(s) against the allowlist \
+                     pinned at approval:\n{rendered}",
+                    findings.len()
+                )));
+            }
+            Ok(_) => {}
+        }
+
         // Worker self-escalation (KRZ-331): same record-only emission as the
         // sequential path, before the judgement turn consumes the report.
         self.emit_worker_escalation(&ws.feature_id, outcome)?;
@@ -7809,6 +7885,11 @@ enum WorktreeDisposition {
     /// fails AND its index lands in the batch's `preserve` set, so the
     /// cleanup guard keeps the worktree dir and branch for human inspection.
     InspectionFailed,
+    /// The feature-range secret scan (over the worktree's own
+    /// `start_sha..HEAD`) found an unwaived finding, or the range could not
+    /// be read: the feature fails with this reason and no judgement turn
+    /// runs. The branch is never merged.
+    Refused(String),
 }
 
 /// Result of one buffered parallel worker session (roadmap M3): the event
@@ -15023,6 +15104,107 @@ pub(crate) mod tests {
             )),
             "the milestone must park for judgement: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// A dispatch-pool candidate that commits an unwaived secret in its own
+    /// worktree gets a feature-range secret scan note on its candidate
+    /// line — naming the fingerprint and path:line, never the canary — and
+    /// the pool still parks for human judgement exactly as it would without
+    /// the note: this is record-only, not an engine decision to drop the
+    /// candidate.
+    #[tokio::test]
+    async fn pool_candidate_line_notes_feature_range_findings() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        // Same canary shape as the scrub-at-write tests' anchor.
+        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        let leak_contents = format!("ANTHROPIC_API_KEY={SECRET}\n");
+        let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(
+                "claude candidate",
+            ))
+            .writes_file("leak.txt", leak_contents.clone())
+            .commits_all("worker commit"),
+        ]));
+        let codex_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            dispatch_pool_pass_script("codex candidate", "codex.txt", "codex was here"),
+        ]));
+        let backend: Arc<dyn AgentBackend> = claude_mock.clone();
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", dispatch_pool_cfg()).unwrap();
+        engine.seed_worker_auth_verdict_for_test(AuthVerdict::Authenticated);
+        engine.seed_kind_backend_for_test(BackendKind::Codex, codex_mock.clone());
+        engine
+            .state
+            .mission
+            .milestones
+            .push(dispatch_pool_milestone(&engine));
+
+        engine.run_feature(0, 0).await.unwrap();
+
+        let fingerprint = scrub::scan_text(&leak_contents)
+            .into_iter()
+            .find(|f| f.rule_id == "anthropic-api-key")
+            .expect("the canary must trip the anthropic-api-key rule")
+            .fingerprint;
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        let decision = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision { summary, detail }
+                    if summary.starts_with("dispatch pool:") =>
+                {
+                    Some(detail.clone().unwrap_or_default())
+                }
+                _ => None,
+            })
+            .expect("a dispatch pool decision must be recorded");
+        let candidate_0_line = decision
+            .lines()
+            .find(|l| l.contains("candidate 0/"))
+            .unwrap_or_else(|| panic!("candidate 0 line present in decision detail: {decision}"));
+        assert!(
+            candidate_0_line.contains("feature-range secret scan"),
+            "candidate 0 line notes the feature-range scan: {candidate_0_line}"
+        );
+        assert!(
+            candidate_0_line.contains(&fingerprint),
+            "candidate 0 line names the fingerprint: {candidate_0_line}"
+        );
+        assert!(
+            candidate_0_line.contains("leak.txt:1"),
+            "candidate 0 line names path:line: {candidate_0_line}"
+        );
+        assert!(
+            !candidate_0_line.contains(SECRET),
+            "candidate 0 line must never quote the canary: {candidate_0_line}"
+        );
+        assert!(
+            !decision.contains(SECRET),
+            "the decision detail must never quote the canary: {decision}"
+        );
+
+        // Record-only: the pool still parks for human judgement exactly as
+        // before, and the candidate still joins `inspected` (no completion
+        // or failure from either candidate).
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::FeatureCompleted { feature_id, .. } | EventKind::FeatureFailed { feature_id, .. }
+                if feature_id == "f-1-1"
+            )),
+            "no code path completes or fails the unit from a candidate"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::MilestoneBlocked { milestone_id, reason, .. }
+                if milestone_id == "ms-1" && reason.contains("candidate for judgement")
+            )),
+            "the milestone must still park for judgement"
         );
     }
 

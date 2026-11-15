@@ -10861,6 +10861,92 @@ async fn feature_range_scan_refuses_worker_committed_canary() {
     );
 }
 
+/// Parallel path: each worker commits the canary itself (not a dirty-tree
+/// leftover) in its own worktree. `append_and_judge_worktree` must run the
+/// feature-range scan over the worktree's own `start_sha..HEAD` and refuse
+/// BEFORE any judgement turn — worker-to-feature pairing is
+/// scheduler-dependent, so both workers leak and both features must fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_worktree_scan_refuses_worker_committed_canary() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![parallel_plan(&["f-1-1", "f-1-2"])]),
+        worker_commits_canary(),
+        worker_commits_canary(),
+    ]));
+
+    let cfg = MissionConfig {
+        max_parallel_workers: 2,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a parallel-worktree scan refusal must not error the run loop");
+    assert_eq!(status, MissionStatus::Failed);
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.features[0].status, FeatureStatus::Failed);
+    assert_eq!(ms.features[1].status, FeatureStatus::Failed);
+
+    let paths = engine.paths().clone();
+    let mission_branch = engine.state().mission.mission_branch.clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let fingerprint = leaked_secret_fingerprint();
+    for feature_id in ["f-1-1", "f-1-2"] {
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::FeatureFailed {
+                    feature_id: fid,
+                    reason,
+                    ..
+                } if fid == feature_id => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("feature.failed for {feature_id} is on the log"));
+        assert!(
+            reason.contains(&fingerprint),
+            "reason for {feature_id} names the fingerprint: {reason}"
+        );
+        assert!(
+            reason.contains("anthropic-api-key"),
+            "reason for {feature_id} names the rule: {reason}"
+        );
+        assert!(
+            reason.contains("leak.txt:1"),
+            "reason for {feature_id} names the path:line: {reason}"
+        );
+    }
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { .. })),
+        "no feature.completed for a refused worktree"
+    );
+
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(
+        !raw_log.contains(LEAKED_SECRET),
+        "the raw secret must never land in events.jsonl"
+    );
+
+    let files = raw_git(&root, &["ls-tree", "-r", "--name-only", &mission_branch]);
+    assert!(
+        !files.lines().any(|f| f == "leak.txt"),
+        "leak.txt must never land on the mission branch: {files}"
+    );
+}
+
 /// A worker commit that carries no secret sails through the feature-range
 /// scan and the feature completes after a normal judgement turn.
 #[tokio::test(flavor = "multi_thread")]
