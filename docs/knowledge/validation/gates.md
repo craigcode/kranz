@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-14
+last_verified: 2026-11-15
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -60,6 +60,8 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
 ---
+
+Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: grant decisions from REST, the dashboard and Slack may name the pending request's sequence number and kind and are refused as superseded on a mismatch; an expired one-call permission card stays in place in the dashboard. Gate behaviour and the denial signal are unchanged.
 
