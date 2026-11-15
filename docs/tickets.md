@@ -437,6 +437,29 @@ What each step really does:
   automatic: claims are atomic file renames, and dead dispatchers' claims
   are recovered on the next run.
 
+### Reshaping a parked draft
+
+A parked draft (REVIEW) already has an **approved** mission, so neither
+existing reshaping command fits: `kranz plan --mission <id>` accepts only
+missions in Planning status, and `kranz revise` only revises the remaining
+work of a Running or Blocked mission. A parked draft is none of these. The
+route that works:
+
+1. Add your answers under `## Scoping answers` in the ticket file.
+2. `kranz abandon <id>`: the mission is abandoned and the linked ticket is
+   reconciled to FAILED.
+3. `kranz draft <slug>`: a fresh mission, seeded with the updated ticket,
+   parks a new plan for review.
+4. `kranz ticket approve <slug>` picks up the new mission.
+
+A draft started through `kranz serve` (dashboard, Slack, or REST) stays
+attached to that `serve` process and holds the mission lock until approval,
+so `kranz abandon` run from a separate terminal is refused while `serve`
+holds the lock.
+
+Whether in-place reshaping (editing a parked plan without abandoning the
+mission) should exist is an **open operator decision**, not yet built.
+
 ## Dependencies (`blocked-by`)
 
 A ticket can name other tickets it depends on:

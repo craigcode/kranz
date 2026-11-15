@@ -486,6 +486,26 @@ fn config_for_ticket(
     cfg
 }
 
+/// Builds the message printed for a parked draft (`DraftOutcome::ParkedForReview`).
+///
+/// The mission is already APPROVED, so the reshape commands that require
+/// Planning status (see docs/tickets.md) cannot touch it. The route that
+/// works: add answers to the ticket, `kranz abandon <id>` (reconciles the
+/// ticket to FAILED), then `kranz draft <slug>` again (a fresh mission).
+pub fn parked_for_review_hint(
+    ticket_path: &Path,
+    slug: &str,
+    mission_id: &str,
+    mission_branch: &str,
+) -> String {
+    format!(
+        "plan committed on {mission_branch} for review; mission {mission_id} parked. Review it, \
+         then run `kranz ticket approve {slug}` to queue it. To reshape it instead, add your \
+         answers to {}, then run `kranz abandon {mission_id}` and `kranz draft {slug}`.",
+        ticket_path.display()
+    )
+}
+
 /// `kranz draft <slug> [--yes] [--from-mission m-xxxx]`: non-interactive plan
 /// drafting.
 ///
@@ -619,10 +639,10 @@ pub async fn cmd_draft(
             mission_id,
             mission_branch: _,
         } => {
+            let ticket_path = Ticket::tickets_dir(&repo).join(format!("{slug}.md"));
             println!(
-                "plan committed on {mission_branch} for review; mission {mission_id} parked. \
-                 Review it, then run `kranz ticket approve {slug}` to queue it \
-                 (or `kranz plan --mission {mission_id}` to reshape)."
+                "{}",
+                parked_for_review_hint(&ticket_path, slug, &mission_id, &mission_branch)
             );
         }
     }

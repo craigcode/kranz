@@ -743,3 +743,77 @@ async fn redraft_after_wrong_plan_is_accepted() {
     );
     assert_eq!(Ticket::read_state(&root, "wp6"), TicketState::Review);
 }
+
+// ---------------------------------------------------------------------------
+// Reshaping a parked draft (roadmap f-1-1): abandon the approved mission,
+// then re-draft the same ticket into a fresh parked mission.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn parked_draft_reshape_abandon_then_redraft_parks_a_new_mission() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let ticket = write_ticket(&root, "rsh1", TICKET_BODY);
+
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let first_mission_id = engine.mission_id().to_string();
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        drive.outcome,
+        DraftOutcome::ParkedForReview { .. }
+    ));
+    assert_eq!(Ticket::read_state(&root, "rsh1"), TicketState::Review);
+    drop(engine);
+    // `approve_plan` checked out the mission branch to commit plan.md; a
+    // fresh `MissionEngine::create` below refuses to branch off it.
+    kranz_engine::git_ops::GitRepo::open(&root)
+        .unwrap()
+        .checkout("main")
+        .unwrap();
+
+    kranz_engine::mission_catalog::abandon_mission(
+        &root,
+        &first_mission_id,
+        "reshape via abandon+redraft",
+        kranz_engine::event_log::LockForce::No,
+    )
+    .unwrap();
+    assert_eq!(Ticket::read_state(&root, "rsh1"), TicketState::Failed);
+
+    // Re-draft the same ticket: a fresh engine/mission, parked again.
+    let ticket = Ticket::load(&Ticket::tickets_dir(&root).join("rsh1.md")).unwrap();
+    let goal = ticket.mission_goal();
+    let backend: Arc<dyn AgentBackend> =
+        Arc::new(MockBackend::with_scripts(vec![orch_script(vec![
+            "seeded, thinking...".to_string(),
+            plan_json(&goal),
+        ])]));
+    let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+    let second_mission_id = engine.mission_id().to_string();
+    assert_ne!(second_mission_id, first_mission_id);
+    let drive = drive_draft(&mut engine, &root, &ticket, false)
+        .await
+        .unwrap();
+
+    match &drive.outcome {
+        DraftOutcome::ParkedForReview {
+            mission_id: out_id, ..
+        } => assert_eq!(out_id, &second_mission_id),
+        other => panic!("expected ParkedForReview, got {other:?}"),
+    }
+    assert_eq!(Ticket::read_state(&root, "rsh1"), TicketState::Review);
+    assert_eq!(
+        Ticket::mission_for(&root, "rsh1").as_deref(),
+        Some(second_mission_id.as_str())
+    );
+}

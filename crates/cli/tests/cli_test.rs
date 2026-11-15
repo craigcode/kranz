@@ -2658,3 +2658,194 @@ fn live_permission_cli_requires_an_inspected_binding_and_never_falls_back_to_mes
             .is_empty()
     );
 }
+
+// ---------------------------------------------------------------------------
+// parked_draft_reshape: abandon a real parked draft through the `kranz`
+// binary (roadmap f-1-1 — the documented reshape route).
+// ---------------------------------------------------------------------------
+
+mod parked_draft_reshape {
+    use kranz_engine::backend::AgentBackend;
+    use kranz_engine::backend_mock::{mock_init, mock_result_text, mock_text, MockScript};
+    use kranz_engine::draft::{drive_draft, DraftOutcome};
+    use kranz_engine::orchestrator::MissionEngine;
+    use kranz_engine::paths::MissionPaths;
+    use kranz_engine::ticket::{Ticket, TicketState};
+    use kranz_engine::types::{MissionConfig, MissionStatus, WorkerIsolation};
+    use kranz_engine::MockBackend;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Arc, Once};
+    use tempfile::TempDir;
+
+    static ENV_ISOLATION: Once = Once::new();
+
+    fn isolate_git_env() {
+        ENV_ISOLATION.call_once(|| {
+            let missing = std::env::temp_dir().join(format!(
+                "kranz-parked-draft-reshape-cli-test-no-config-{}",
+                std::process::id()
+            ));
+            std::env::set_var("GIT_CONFIG_GLOBAL", &missing);
+            std::env::set_var("GIT_CONFIG_SYSTEM", &missing);
+            if let Ok(ceiling) = std::fs::canonicalize(std::env::temp_dir()) {
+                std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+            }
+        });
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn setup() -> bool {
+        isolate_git_env();
+        if git_available() {
+            true
+        } else {
+            kranz_engine::test_capability::skip(
+                kranz_engine::test_capability::capability::GIT,
+                "git is not on PATH",
+            );
+            false
+        }
+    }
+
+    fn raw_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo() -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git init");
+        if !init.status.success() {
+            raw_git(dir.path(), &["init"]);
+            raw_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        }
+        raw_git(dir.path(), &["config", "user.name", "test"]);
+        raw_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        raw_git(dir.path(), &["add", "-A"]);
+        raw_git(dir.path(), &["commit", "-m", "seed"]);
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
+        (dir, root)
+    }
+
+    fn test_cfg() -> MissionConfig {
+        MissionConfig {
+            skip_scrutiny: true,
+            skip_functional: true,
+            worker_isolation: WorkerIsolation::Checkout,
+            ..MissionConfig::default()
+        }
+    }
+
+    fn orch_script(replies: Vec<String>) -> MockScript {
+        MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")])
+            .responding(
+                replies
+                    .iter()
+                    .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+                    .collect(),
+            )
+    }
+
+    fn plan_json(goal: &str) -> String {
+        json!({
+            "goal": goal,
+            "validationContract": [],
+            "milestones": [{
+                "title": "M1",
+                "features": [{
+                    "title": "F1",
+                    "spec": "do it",
+                    "validationCriteria": ["works"]
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    const TICKET_BODY: &str = "\
+---
+title: Rate limit
+priority: 2
+---
+
+## Goal
+Add rate limiting.
+";
+
+    fn write_ticket(repo: &Path, slug: &str, body: &str) -> Ticket {
+        let dir = Ticket::tickets_dir(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{slug}.md"));
+        std::fs::write(&path, body).unwrap();
+        Ticket::load(&path).unwrap()
+    }
+
+    #[test]
+    fn abandon_on_a_real_parked_draft_fails_the_mission_and_the_ticket() {
+        if !setup() {
+            return;
+        }
+        let (_dir, root) = init_repo();
+        let ticket = write_ticket(&root, "rl", TICKET_BODY);
+
+        let goal = ticket.mission_goal();
+        let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::with_scripts(vec![
+            orch_script(vec!["seeded, thinking...".to_string(), plan_json(&goal)]),
+        ]));
+        let mut engine = MissionEngine::create(backend, root.clone(), &goal, test_cfg()).unwrap();
+        let mission_id = engine.mission_id().to_string();
+
+        let drive = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(drive_draft(&mut engine, &root, &ticket, false))
+            .unwrap();
+        assert!(matches!(
+            drive.outcome,
+            DraftOutcome::ParkedForReview { .. }
+        ));
+        assert_eq!(Ticket::read_state(&root, "rl"), TicketState::Review);
+        drop(engine);
+        // `approve_plan` checked out the mission branch; put the repo back on
+        // main before invoking the binary (mirrors cmd_draft's own restore).
+        raw_git(&root, &["checkout", "main"]);
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kranz"))
+            .args(["--repo", root.to_str().unwrap(), "abandon", &mission_id])
+            .output()
+            .expect("spawn kranz abandon");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let paths = MissionPaths::new(&root, &mission_id);
+        let events = kranz_engine::event_log::EventLog::read_events(&paths.events_file()).unwrap();
+        let state = kranz_engine::reducer::fold(&events).unwrap();
+        assert_eq!(state.mission.status, MissionStatus::Abandoned);
+        assert_eq!(Ticket::read_state(&root, "rl"), TicketState::Failed);
+    }
+}
