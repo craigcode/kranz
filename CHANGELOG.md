@@ -6,8 +6,8 @@ Notable user-visible changes are documented here. This project follows
 ## Unreleased
 
 - Fixed: the hint printed for a parked draft now names the route that
-  actually works — add answers to the ticket, `kranz abandon <id>`, then
-  `kranz draft <slug>` — instead of `kranz plan --mission`, which refuses an
+  works (add answers to the ticket, `kranz abandon <id>`, then
+  `kranz draft <slug>`) instead of `kranz plan --mission`, which refuses an
   already-approved mission.
 - Fixed: the dashboard's one-call permission card stays mounted in place
   after its deadline passes (or after the engine closes it as expired),

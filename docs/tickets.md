@@ -389,13 +389,13 @@ What each step really does:
 A parked draft (REVIEW) already has an **approved** mission, so neither
 existing reshaping command fits: `kranz plan --mission <id>` accepts only
 missions in Planning status, and `kranz revise` only revises the remaining
-work of a Running or Blocked mission — a parked draft is none of these. The
+work of a Running or Blocked mission. A parked draft is none of these. The
 route that works:
 
 1. Add your answers under `## Scoping answers` in the ticket file.
-2. `kranz abandon <id>` — the mission is abandoned and the linked ticket is
+2. `kranz abandon <id>`: the mission is abandoned and the linked ticket is
    reconciled to FAILED.
-3. `kranz draft <slug>` — a fresh mission, seeded with the updated ticket,
+3. `kranz draft <slug>`: a fresh mission, seeded with the updated ticket,
    parks a new plan for review.
 4. `kranz ticket approve <slug>` picks up the new mission.
 
