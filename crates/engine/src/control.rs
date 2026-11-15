@@ -835,12 +835,19 @@ mod tests {
         .unwrap();
         let traversal_id = "../../../outside-target";
         // Fixture liveness: the traversal id really folds to an active
-        // mission, so a reverted `is_safe_id` guard would ACCEPT it.
-        assert!(
-            mission_status(&repo_root, traversal_id)
-                .is_some_and(|status| !crate::mission_catalog::is_terminal_status(status)),
-            "fixture: traversal target must fold as an active mission"
-        );
+        // mission, so a reverted `is_safe_id` guard would ACCEPT it. The
+        // check cannot hold when the scratch dir is itself inside a mission
+        // directory (the contract gate's TMPDIR): the no-follow open then
+        // anchors on that outer mission and refuses the `..` components
+        // before the log is read.
+        let nested_in_mission = tmp.path().components().any(|c| c.as_os_str() == ".kranz");
+        if !nested_in_mission {
+            assert!(
+                mission_status(&repo_root, traversal_id)
+                    .is_some_and(|status| !crate::mission_catalog::is_terminal_status(status)),
+                "fixture: traversal target must fold as an active mission"
+            );
+        }
 
         for id in [traversal_id, "a/b", r"a\b", "C:escape"] {
             let error = resolve_active_mission(&repo_root, Some(id))
