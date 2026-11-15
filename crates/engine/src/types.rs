@@ -1050,6 +1050,10 @@ pub struct PendingGrantRequest {
     /// destination (`Egress`). Named `command` for wire back-compat with the
     /// original command-only grant events.
     pub command: String,
+    /// The `seq` of the `grant.requested` event that parked this request.
+    /// `None` for snapshots folded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_seq: Option<u64>,
 }
 
 /// An open structured human question (ticket
@@ -1946,11 +1950,31 @@ pub enum ControlCommand {
     /// to a different pending request than the operator saw.
     ApproveGrant {
         command: String,
+        /// The pending request's kind as the operator saw it; if present and
+        /// it no longer matches the parked request's kind, the approval is
+        /// refused as superseded instead of silently applying to the wrong
+        /// kind of grant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_kind: Option<GrantKind>,
+        /// The `seq` of the `grant.requested` event the operator saw; if
+        /// present and it no longer matches the parked request's seq, the
+        /// approval is refused as superseded instead of applying to a later
+        /// request that happens to share the same target text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_seq: Option<u64>,
     },
     /// Deny the parked grant request for `command` (fail the feature closed).
     DenyGrant {
         command: String,
         reason: String,
+        /// The pending request's kind as the operator saw it; see
+        /// `ApproveGrant::grant_kind`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_kind: Option<GrantKind>,
+        /// The `seq` of the `grant.requested` event the operator saw; see
+        /// `ApproveGrant::request_seq`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_seq: Option<u64>,
     },
     /// Answer an open structured question (ticket
     /// `structured-human-question-events`) — the pending-decision

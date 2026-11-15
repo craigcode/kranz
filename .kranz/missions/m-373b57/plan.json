@@ -1,0 +1,228 @@
+{
+  "goal": "Bind every grant decision sent from the dashboard and from Slack to the exact request the operator saw (its grant kind and request sequence number, not just its target text), clear panel drafts when the operator switches missions, stop board polling with a visible paused state after an authentication failure, and keep an expired permission card in place so the remaining controls do not move.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "The full Rust workspace test suite passes and runs a nonzero number of tests.",
+      "check": "command",
+      "command": "out=$(cargo test --workspace 2>&1) && printf '%s' \"$out\" | grep -qE 'test result: ok\\. [1-9]'"
+    },
+    {
+      "id": "a2",
+      "statement": "Clippy passes across the workspace, all targets, with warnings denied.",
+      "check": "command",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings"
+    },
+    {
+      "id": "a3",
+      "statement": "The workspace is rustfmt-clean.",
+      "check": "command",
+      "command": "cargo fmt --all --check"
+    },
+    {
+      "id": "a4",
+      "statement": "The engine refuses a grant approve or deny whose request sequence number or grant kind differs from the pending grant request, including a superseded request with the same target text: the pending request stays untouched and no allow-list is widened. A legacy control carrying neither field still applies by target, and its serialized form is unchanged.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine superseded_grant 2>&1) && printf '%s' \"$out\" | grep -qE 'test result: ok\\. [1-9]'"
+    },
+    {
+      "id": "a5",
+      "statement": "POST /api/missions/:id/grant/approve and /grant/deny return 409 and enqueue nothing when the body's requestSeq or kind differs from the pending grant request. A matching body returns 202 and enqueues a control that carries the request sequence number and grant kind.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-server superseded_grant 2>&1) && printf '%s' \"$out\" | grep -qE 'test result: ok\\. [1-9]'"
+    },
+    {
+      "id": "a6",
+      "statement": "Slack grant buttons encode mission, request sequence number, grant kind and target. A click for a superseded request, or for a legacy mission:command button value, is refused with a notice and enqueues no control. A click for the current request enqueues a control carrying its sequence number and kind.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-slack superseded_grant 2>&1) && printf '%s' \"$out\" | grep -qE 'test result: ok\\. [1-9]'"
+    },
+    {
+      "id": "a7",
+      "statement": "On approve and deny, the dashboard grant panel sends the target together with the kind and request sequence number of the request it displayed. A 409 refusal is shown as an error, not a success.",
+      "check": "command",
+      "command": "npm --prefix apps/dashboard ci >/dev/null 2>&1; out=$(NO_COLOR=1 npm --prefix apps/dashboard test -- -t 'DD1' 2>&1) && printf '%s' \"$out\" | grep -qE 'Tests +[1-9][0-9]* passed'"
+    },
+    {
+      "id": "a8",
+      "statement": "Switching from one mission to another clears the free-text drafts in the revision panel, the question-answer panel, the orchestrator composer (text and interrupt flag) and the standards waiver form, so none of them can be submitted to the new mission.",
+      "check": "command",
+      "command": "npm --prefix apps/dashboard ci >/dev/null 2>&1; out=$(NO_COLOR=1 npm --prefix apps/dashboard test -- -t 'DD2' 2>&1) && printf '%s' \"$out\" | grep -qE 'Tests +([4-9]|[1-9][0-9]+) passed'"
+    },
+    {
+      "id": "a9",
+      "statement": "After a board poll gets a 401, the board stops issuing poll requests and parks nothing on the token gate; it shows a visible 'Polling paused — token required' state with a control that resumes polling.",
+      "check": "command",
+      "command": "npm --prefix apps/dashboard ci >/dev/null 2>&1; out=$(NO_COLOR=1 npm --prefix apps/dashboard test -- -t 'DD3' 2>&1) && printf '%s' \"$out\" | grep -qE 'Tests +([2-9]|[1-9][0-9]+) passed'"
+    },
+    {
+      "id": "a10",
+      "statement": "When a permission request shown as pending passes its deadline, its card keeps the same DOM node and position, its Allow and Deny buttons are disabled, and an always-present status line reads Expired. Every other control keeps its DOM node and order, and clicking the expired buttons sends nothing.",
+      "check": "command",
+      "command": "npm --prefix apps/dashboard ci >/dev/null 2>&1; out=$(NO_COLOR=1 npm --prefix apps/dashboard test -- -t 'DD4' 2>&1) && printf '%s' \"$out\" | grep -qE 'Tests +[1-9][0-9]* passed'"
+    },
+    {
+      "id": "a11",
+      "statement": "The dashboard test suite passes, it type-checks and builds, the embedded bundle in crates/cli/assets/dashboard/dist matches the build, and lint passes.",
+      "check": "command",
+      "command": "npm --prefix apps/dashboard ci >/dev/null 2>&1 && npm --prefix apps/dashboard test && npm --prefix apps/dashboard run build && npm --prefix apps/dashboard run check-embedded && npm --prefix apps/dashboard run lint"
+    },
+    {
+      "id": "a12",
+      "statement": "The contract files change additively only: against the mission base, events.rs, types.rs, backend.rs and error.rs have no removed or modified line.",
+      "check": "command",
+      "command": "git diff --numstat $KRANZ_BASE_SHA HEAD -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | awk '$2 != 0 {bad=1} END {exit bad}'"
+    },
+    {
+      "id": "a13",
+      "statement": "An expired permission card does not change height when it expires: the expiry text sits in a status line that is always rendered with reserved space, not in an inserted element, and no element of the card is added or removed at the moment of expiry, so nothing below or beside it moves.",
+      "check": "agent-judgement"
+    },
+    {
+      "id": "a14",
+      "statement": "Every behavioural change in the mission diff traces to one of the four confirmed reports (grant decision binding, drafts surviving a mission switch, board polls parking on the token gate, the permission-expiry shift). Nothing is patched speculatively, and existing tests are changed only where the old assertion encoded the defect or a compile-forced signature change requires it.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "Pending decisions are bound to what was shown, and their panels stay stable",
+      "features": [
+        {
+          "title": "Engine records the grant request's sequence number",
+          "spec": "CONTEXT. Kranz parks at most one capability-grant request per mission in `MissionState.pending_grant_request: Option<PendingGrantRequest>` (crates/engine/src/types.rs ~924; struct ~1037-1053, fields milestone_id, kind: GrantKind, command; serde camelCase). It is set by the reducer when folding `EventKind::GrantRequested` (crates/engine/src/reducer.rs ~170-186). The request's only unique identity is the event envelope's `Event.seq: u64`, which `apply(state, event)` has in hand. CONFIRMED DEFECT: decisions match by target text only, so a decision for one request can land on a later request with the same text. This feature only RECORDS the sequence number; later features check it.\n\nDO:\n1. crates/engine/src/types.rs is ADDITIVE ONLY (operator rule, gated by a contract check `git diff --numstat $KRANZ_BASE_SHA HEAD -- crates/engine/src/{events,types,backend,error}.rs` must show 0 deletions). Do not modify or remove ANY existing line, including doc comments, derives, attributes and trailing commas: only insert new lines. In `PendingGrantRequest`, insert after the `command` field: a doc comment saying it is the seq of the grant.requested event that parked this request (None for snapshots folded before this field existed), then `#[serde(default, skip_serializing_if = \"Option::is_none\")]` and `pub request_seq: Option<u64>,`. Wire name is requestSeq via the struct's camelCase.\n2. crates/engine/src/reducer.rs ~181: in the `PendingGrantRequest { .. }` literal, set `request_seq: Some(event.seq)`. Check how the event variable is named in that match arm's scope. This is the only struct-literal site in the workspace (grep `PendingGrantRequest {` to confirm).\n3. Do not change ControlCommand, orchestrator.rs, server, Slack or dashboard code in this feature.\n4. TESTS in crates/engine/tests/reducer_test.rs (follow its existing grant tests). The new test name must contain `superseded_grant` (the contract filter; no existing test contains it): fold a log with plan approval then grant.requested and assert `pending_grant_request.request_seq == Some(<that event's seq>)`; then a second grant.requested after a grant.denied records the newer seq. Also assert a serialized state with request_seq None has no requestSeq key and a JSON PendingGrantRequest without requestSeq deserializes to None.\n5. Add one line under `## Unreleased` in CHANGELOG.md.\n\nGATES before reporting, run bare with no pipes: `cargo fmt --all`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --numstat $KRANZ_BASE_SHA HEAD -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs` must show 0 in every deletions column. Name any new Rust binding `authority`, never `token` (the secret scan refuses `let token = ...`). Commit your own work on the mission branch before reporting.",
+          "validationCriteria": [
+            "PendingGrantRequest gains request_seq: Option<u64> (wire requestSeq) inserted as new lines only; types.rs shows zero deleted lines against the base",
+            "Folding grant.requested sets request_seq to that event's seq, and a later re-request records the newer seq (reducer test whose name contains superseded_grant)",
+            "request_seq None is omitted from serialized JSON and a legacy JSON request without requestSeq deserializes to None (test whose name contains superseded_grant)",
+            "cargo test --workspace, cargo clippy --workspace --all-targets -- -D warnings and cargo fmt --all --check pass"
+          ]
+        },
+        {
+          "title": "Engine refuses grant decisions for a superseded request or a different kind",
+          "spec": "CONTEXT. A previous feature added `PendingGrantRequest.request_seq: Option<u64>` (crates/engine/src/types.rs ~1044), set by the reducer to the seq of the grant.requested event. Operators decide through `ControlCommand::ApproveGrant { command }` and `ControlCommand::DenyGrant { command, reason }` (types.rs ~1944-1954). The orchestrator drain loop (crates/engine/src/orchestrator.rs ~3129-3146) calls `approve_pending_grant(&command)` (~1955) and `deny_pending_grant(&command, &reason)` (~2019); both compare the target text only and copy `pending.kind` into the emitted event. CONFIRMED DEFECT: a stale decision naming text X lands on a later request for X (re-park, another milestone, or another kind).\n\nDO:\n1. types.rs is ADDITIVE ONLY (contract-gated: zero deleted or modified lines in events.rs/types.rs/backend.rs/error.rs). Insert, in BOTH ApproveGrant and DenyGrant, new lines only: `#[serde(default, skip_serializing_if = \"Option::is_none\")] grant_kind: Option<GrantKind>,` and `#[serde(default, skip_serializing_if = \"Option::is_none\")] request_seq: Option<u64>,` each with a short doc comment. Do NOT name a field `kind`: ControlCommand is `#[serde(tag = \"kind\", rename_all = \"kebab-case\")]` and a `kind` field collides with the tag. skip_serializing_if keeps legacy control files byte-identical (crates/engine/src/control.rs signs the serialized command).\n2. orchestrator.rs: give approve_pending_grant and deny_pending_grant extra params `grant_kind: Option<GrantKind>, request_seq: Option<u64>`. If either is Some and differs from the pending request's kind / request_seq, return `Err(EngineError::InvalidState(..))` whose message contains 'superseded' and names the pending seq and kind, leaving the pending request untouched (the drain loop's existing 'ignored' OrchestratorDecision records it). Both None keeps today's text-only match (the CLI stays command-only). Update the drain loop arms.\n3. Make the WHOLE workspace compile; struct-variant construction needs every field. Sites (grep `ApproveGrant`/`DenyGrant` across crates to confirm): crates/engine/src/control.rs tests (~594-930); crates/engine/src/orchestrator/live_permissions.rs (~883-889); crates/engine/tests/mission_test.rs (~5115-6175, 10 sites); crates/server/src/rest.rs (~1207, ~1223: pass None for now); crates/server/tests/host_test.rs (~1296, ~1315: add `..` to patterns); crates/cli/src/commands.rs (~1606, ~1622: None); crates/slack/src/dispatch.rs (~931, ~951: None for now); crates/slack/src/bridge.rs (~2445-2446: add `..`). Change no behaviour at those consumer sites.\n4. TESTS; every new test name must contain `superseded_grant`. (a) End-to-end in mission_test.rs reusing `wait_for_pending_grant` and the fixtures of `unanswered_grant_request_times_out_to_denied` / `grant_request_cap_blocks_instead_of_looping`: two successive grant requests with the SAME target text; an ApproveGrant carrying the first request's request_seq while the second is pending is refused (pending unchanged, no grant.approved emitted, command_grants not widened); then an approve with the second request's seq and matching grant_kind succeeds. (b) Approve and deny with a mismatched grant_kind are refused. (c) Serde: legacy `{\"kind\":\"approve-grant\",\"command\":\"x\"}` deserializes with None fields; a command with None fields serializes with no grant_kind/request_seq key; a legacy approve with neither field still approves by target.\n5. Add one line under `## Unreleased` in CHANGELOG.md.\n\nGATES, run bare with no pipes: `cargo fmt --all`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and the numstat check above showing 0 deletions. Name new bindings `authority`, never `token`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "ControlCommand::ApproveGrant and DenyGrant gain optional grant_kind and request_seq fields inserted as new lines only, both skipped when None; a legacy JSON control round-trips with no new keys (test name contains superseded_grant)",
+            "An approve carrying a superseded request's seq for the same target text is refused at drain time: pending request unchanged, no grant.approved emitted, no allow-list widened; the current request's seq succeeds (end-to-end test name contains superseded_grant)",
+            "An approve or deny whose grant_kind differs from the pending kind is refused (test name contains superseded_grant)",
+            "A legacy approve with neither field still applies by target",
+            "types.rs and the other contract files show zero deleted lines against the base",
+            "cargo test --workspace, clippy -D warnings and fmt --check pass"
+          ]
+        },
+        {
+          "title": "REST grant routes refuse a decision for a superseded request",
+          "spec": "CONTEXT. The dashboard posts grant decisions to `POST /api/missions/:id/grant/approve` and `/grant/deny` (crates/server/src/rest.rs ~1180-1229). Bodies: `GrantApproveBody { command }`, `GrantDenyBody { command, reason (default 'denied by operator') }`, serde camelCase. `require_pending_grant` (~1343-1363) folds the log and returns 409 (`ApiError::conflict`) only when the text differs or nothing is pending; then the handler enqueues ControlCommand::ApproveGrant/DenyGrant and returns 202 `{queued:true}`. Earlier features in this mission added (crates/engine/src/types.rs): `PendingGrantRequest.request_seq: Option<u64>` (wire requestSeq) and optional `grant_kind: Option<GrantKind>` / `request_seq: Option<u64>` on ControlCommand::ApproveGrant/DenyGrant, re-checked by the engine at drain time. rest.rs currently passes None. Read those definitions first.\n\nDO:\n1. Add optional `kind: Option<GrantKind>` and `request_seq: Option<u64>` (wire kind / requestSeq, `#[serde(default)]`) to both body structs; `kind` is safe here because these structs are not tagged.\n2. Extend require_pending_grant to take these Options. When provided, kind must equal the pending kind and requestSeq must equal the pending request_seq; on mismatch return 409 with a message containing 'superseded' naming what is pending (seq and kind) and enqueue nothing. Keep the command-text check. Omitted fields keep today's behaviour (the CLI and the experimental Even G2 client keep working).\n3. Forward the provided values into the enqueued ControlCommand's grant_kind and request_seq.\n4. Do NOT edit crates/engine/src/types.rs or any other engine contract file.\n5. TESTS in crates/server/tests/host_test.rs (reuse `seed_pending_grant_log` ~1239; see `grant_routes_enqueue_approve_and_deny_decisions` ~1264). Every new test name must contain `superseded_grant`. (a) Pending requestSeq is N; approve and deny with the same command but requestSeq != N each return 409 and the control directory gains no file. (b) A kind mismatch returns 409. (c) Matching requestSeq and kind returns 202 and the enqueued control carries request_seq Some(N) and the grant_kind. (d) A legacy body with only command still returns 202. (e) GET /api/missions/:id/state exposes pendingGrantRequest.requestSeq.\n6. Add one line under `## Unreleased` in CHANGELOG.md.\n\nGATES, run bare: `cargo fmt --all`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "A grant approve or deny whose requestSeq differs from the pending request (same command text) returns 409 and enqueues nothing (test name contains superseded_grant)",
+            "A grant approve or deny whose kind differs from the pending kind returns 409 (test name contains superseded_grant)",
+            "A matching requestSeq and kind returns 202 and the enqueued control carries request_seq and grant_kind (test name contains superseded_grant)",
+            "A legacy body with only command still returns 202",
+            "The mission state JSON exposes pendingGrantRequest.requestSeq",
+            "cargo test --workspace, clippy -D warnings and fmt --check pass"
+          ]
+        },
+        {
+          "title": "Slack grant buttons carry the request's sequence number and kind",
+          "spec": "CONTEXT. Slack grant cards are built by `build_grant_ready` (crates/slack/src/format.rs ~897). Both buttons (action ids `kranz_approve_grant` / `kranz_deny_grant`, format.rs ~44/48) carry `value = format!(\"{}:{}\", mission_id, command)` (~898), capped at MAX_BUTTON_VALUE. `GrantReady { mission_id, milestone_id, kind, command }` (format.rs ~221) has no seq; it is built in crates/slack/src/outbound.rs ~165-169 inside the GrantRequested arm of classify (where `event.seq` is in hand), plus test literals at outbound.rs ~450 and outbound_engine.rs ~786; production call outbound_engine.rs ~586. Clicks are parsed by `parse_grant_button_value` (crates/slack/src/inbound.rs ~647, split on first ':') into `Action::ApproveGrant/DenyGrant { mission_id, command, user_id, response_url }` (inbound.rs ~309/316, routed ~534-555), dispatched in crates/slack/src/dispatch.rs ~918-958 to `grant_control` then `enqueue_grant_control` (crates/slack/src/bridge.rs ~2399-2460), which compares only `pending.command == command`. Refusals are already sent ephemerally via reply_ephemeral ('Couldn't queue grant command: {e}', bridge.rs ~2423-2431). Old cards stay clickable. Earlier features added `PendingGrantRequest.request_seq: Option<u64>` and optional `grant_kind`/`request_seq` on ControlCommand::ApproveGrant/DenyGrant (crates/engine/src/types.rs). Do NOT edit any engine file.\n\nDO:\n1. Add `request_seq: u64` to GrantReady, filled from `event.seq` where the card is built.\n2. Encode the button value as `{mission_id}:{request_seq}:{kind}:{command}` (kind = GrantKind's kebab-case wire name). Mission ids, the decimal seq and kebab kinds contain no ':', so split on the first three ':'; the command may contain ':'. Apply the existing MAX_BUTTON_VALUE and visibility rules to the full new value.\n3. parse_grant_button_value returns mission, seq, kind and command. A legacy `mission:command` value (no numeric seq plus known kind) must NOT become a decision: reply ephemerally that the card is out of date (use the newest card or the dashboard) and enqueue nothing.\n4. Add `request_seq: u64` and `grant_kind: GrantKind` to Action::ApproveGrant and DenyGrant. Repo lesson: grep and update EVERY construction and match site before reporting — inbound.rs (routing ~534-555, tests ~1740-1790), dispatch.rs (exhaustive match in dispatch_action ~37, arms ~918/938), bridge.rs (exhaustive apply_action ~1205, arms ~1238-1239), and crates/slack/tests/*.rs.\n5. enqueue_grant_control compares seq and kind as well as command with the pending request; on mismatch bail with a message containing 'superseded' that names the pending request (shown to the clicker, nothing enqueued). On match enqueue with `grant_kind: Some(..)` and `request_seq: Some(..)`.\n6. TESTS; every new test name must contain `superseded_grant`: (a) format/parse round trip with a command containing ':'; (b) a button for seq N while seq M is pending with the SAME text is refused and the mission's control directory gains no file; (c) a kind mismatch is refused; (d) a legacy `mission:command` value is refused and enqueues nothing; (e) a matching click enqueues a control carrying request_seq and grant_kind. Update existing tests (`grant_ready_names_the_command_with_approve_deny_buttons`, `block_actions_grant_buttons_route_to_grant_actions`, `grant_requested_classifies_grant_ready`, other grant_card/grant_ready tests) only as the new format requires.\n7. Add one line under `## Unreleased` in CHANGELOG.md.\n\nGATES, run bare: `cargo test -p kranz-slack` (must COMPILE and pass in full), `cargo fmt --all`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "Grant card buttons encode mission, request seq, kind and command, and parsing round-trips a command containing ':' (test name contains superseded_grant)",
+            "A click for a superseded request (same command text, different seq) is refused with a notice and enqueues no control (test name contains superseded_grant)",
+            "A click whose kind differs from the pending kind is refused (test name contains superseded_grant)",
+            "A legacy mission:command button value is refused and enqueues nothing (test name contains superseded_grant)",
+            "A matching click enqueues ApproveGrant or DenyGrant carrying request_seq and grant_kind (test name contains superseded_grant)",
+            "cargo test -p kranz-slack compiles and passes in full; workspace test, clippy and fmt gates pass"
+          ]
+        },
+        {
+          "title": "Dashboard grant panel sends the displayed request's kind and sequence number",
+          "spec": "CONTEXT. The React/Vite dashboard (apps/dashboard) renders the parked grant in src/components/GrantRequestPanel.tsx (mounted in App.tsx's right column and BoardLens's act column), reading `pendingGrant(state)` from src/lib/pendingAsks.ts. Approve/deny call `api.approveGrant(mission.id, pending.command)` / `api.denyGrant(mission.id, pending.command)` (src/lib/api.ts ~339-353), posting `{ command }` / `{ command, reason? }`. The TS type `PendingGrantRequest` (src/lib/types.ts ~368) is `{ milestoneId, kind?, command }`. Earlier features made the server serialize `pendingGrantRequest.requestSeq` and made `POST /api/missions/:id/grant/approve|deny` accept optional `kind` and `requestSeq`, returning 409 with a 'superseded' message on mismatch.\n\nDO:\n1. Add `requestSeq?: number` to PendingGrantRequest in types.ts.\n2. Give api.approveGrant and api.denyGrant an optional binding argument `{ kind?: GrantKind; requestSeq?: number }`; include `kind` and `requestSeq` in the POST body when defined. Keep existing positional parameters so other callers compile.\n3. GrantRequestPanel passes the `kind` and `requestSeq` of the exact pending request it rendered (capture them at click time; postJson may park on the token gate and retry, so it must send what was shown, not re-read the store). A rejection (e.g. ApiError 409) must show in the existing role='alert' error block, never as success.\n4. Tests in src/components/GrantRequestPanel.test.tsx (vitest + @testing-library/react + jsdom; api mocked via vi.mock('../lib/api'); store seeded with useKranzStore.setState; follow the file's cleanup pattern). Every new test name must contain the tag `DD1` (the contract's -t filter; no existing test contains it): (a) approve sends command, kind and requestSeq of the shown request; (b) deny does the same; (c) a 409 rejection renders the error and no success state. Update existing assertions such as approveGrant('m-1','gc audit --deep') only as the new argument requires.\n5. Add one line under `## Unreleased` in CHANGELOG.md.\n6. Rebuild and commit the embedded bundle: `npm --prefix apps/dashboard ci`, then `npm --prefix apps/dashboard run build`, then `npm --prefix apps/dashboard run sync-embedded` (copies dist into crates/cli/assets/dashboard/dist); commit that directory's changes.\n\nGATES, run bare: `npm --prefix apps/dashboard test`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run check-embedded`, `npm --prefix apps/dashboard run lint`. Do not modify apps/even-g2. Commit your own work before reporting.",
+          "validationCriteria": [
+            "Approving from GrantRequestPanel posts command, kind and requestSeq of the displayed request (test name contains DD1)",
+            "Denying from GrantRequestPanel posts command, kind and requestSeq of the displayed request (test name contains DD1)",
+            "A 409 refusal is rendered in the role='alert' error block and not as success (test name contains DD1)",
+            "Dashboard test, build, check-embedded and lint pass, and the embedded bundle is committed"
+          ]
+        },
+        {
+          "title": "Switching missions clears panel drafts",
+          "spec": "CONTEXT (confirmed). In the dashboard (apps/dashboard), a direct mission-to-mission hash change (back/forward, deep link, URL edit) keeps App's mission layout mounted: App.tsx ~74-77 calls the store's `connectMission(id)` (src/lib/store.ts ~468-485), which sets missionId to B and `state: null`, then loads B. The right-column panels (App.tsx ~138-151) have no key and the centre stays `<OrchestratorView/>`, so component state survives. Drafts that carry over and can be submitted to B:\n1. src/components/RevisionPanel.tsx: `instructions` (line 11); its effect at 22-42 resets only diff and error; submit calls api.requestRevision(mission.id, ..).\n2. src/components/QuestionRequestPanel.tsx: `freeText: Record<string,string>` keyed by questionId (line 25). Question ids are q-<n> per mission, so A's q-1 draft appears pre-filled under B's q-1; submit calls api.answerQuestion(mission.id, ..).\n3. src/components/OrchestratorView.tsx `Composer`: `text` and `interrupt` (~94-95); sendControl resolves the mission at send time.\n4. src/components/StandardsPanel.tsx: its reset effect (~32-38) clears selected, error and recorded but not `reason` (line 20) or `expires` (line 21).\nNOT affected, do not change: PlanningView's composer (unmounts when state goes null); BoardLens's act column (already keyed by mission id, BoardLens.tsx ~526/551).\n\nDO: reset each of these drafts whenever the store's selected mission (and repo) changes, inside each component so the fix holds wherever it is mounted. Follow src/components/ModelPanel.tsx's existing pattern (a useEffect on [missionId] resetting local editing state) or key an inner form component by mission id. Reset StandardsPanel's `expires` to its default. Do not key the whole App layout and do not change store semantics.\n\nTESTS (vitest + @testing-library/react + jsdom; mock api with vi.mock('../lib/api'); seed with useKranzStore.setState). Copy the switch idiom from StatusStrip.test.tsx ~167 ('disarms confirm abandon when switching missions (KRZ-H7)'): render, setState missionId B with state null, then B's state, rerender. QuestionRequestPanel.test.tsx's missionState() helper hardcodes 'm-1' — vary the id for the second mission. RevisionPanel is exercised in GateReviewPanel.test.tsx ~74-121. Write at least FOUR tests, one per component; every new test name must contain the tag `DD2` (no existing test contains it). Each seeds mission A so the input renders, types a draft, switches to B, asserts the input is empty, and where possible asserts submitting never sends A's text to B. The question test uses questionId 'q-1' in both missions. Each test must fail on the current code.\n\nAdd one line under `## Unreleased` in CHANGELOG.md. Rebuild and commit the embedded bundle: `npm --prefix apps/dashboard ci`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run sync-embedded`, then commit crates/cli/assets/dashboard/dist.\n\nGATES, run bare: `npm --prefix apps/dashboard test`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run check-embedded`, `npm --prefix apps/dashboard run lint`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "RevisionPanel's draft instructions are empty after switching from mission A to mission B, and submitting cannot send A's text to B (test name contains DD2)",
+            "QuestionRequestPanel's free-text draft for q-1 in mission A does not appear under mission B's q-1 (test name contains DD2)",
+            "OrchestratorView's composer text and interrupt flag reset on a mission switch (test name contains DD2)",
+            "StandardsPanel's waiver reason and expiry reset on a mission switch (test name contains DD2)",
+            "Dashboard test, build, check-embedded and lint pass, and the embedded bundle is committed"
+          ]
+        },
+        {
+          "title": "Board polling stops with a visible paused state after an authentication failure",
+          "spec": "CONTEXT (confirmed). src/components/BoardLens.tsx in the dashboard (apps/dashboard) polls on two window.setInterval timers (~246-252): lists every LIST_POLL_MS = 10s via `refreshLists` (~193-209) → store `loadTickets()`/`loadMissions()` (src/lib/store.ts ~351-393) → api.tickets()/api.missions(); and per-running-mission state every STATE_POLL_MS = 5s via `fetchRunningStates` (~161-191) → `api.missionState(id)`. It also refreshes on visibilitychange (~254-263). None pass options, so on a 401 (off-loopback or read-auth serve, token missing or rejected) `getJson` (src/lib/api.ts ~142-164) calls `awaitToken()` (src/lib/token.ts ~143) and parks a new waiter. Poll timestamps are stamped at request start, so every tick parks another waiter and re-opens the TokenPrompt; pasting a token releases a burst. The intended opt-out exists: `getJson(path, { tokenGate: false })` rejects a 401 immediately, `isTokenRequired(err)` (api.ts ~95) detects it, and RunQueueButton.tsx ~23-31 / SignalsPanel.tsx use it.\n\nCONSTRAINT: the existing test BoardLens.test.tsx ~982 requires Board files to reference only `api.missionState` among api methods, so route the opt-out through `api.missionState(id, opts)` and store-level options, not new direct api calls from BoardLens.\n\nDO:\n1. Add an optional `opts?: GetJsonOptions` parameter to api.missions, api.tickets and api.missionState, forwarded to getJson (as api.queue does).\n2. Let the store's loadMissions and loadTickets accept an optional opts and pass it through; when called with tokenGate:false and the error is token-required, surface it to the caller (rethrow or return a flag). Behaviour for existing callers (PipelineView, TicketDetail, etc.) is unchanged.\n3. BoardLens's background polls (both interval paths and the visibilitychange refresh) use tokenGate:false. On the first token-required failure BoardLens enters a paused state: clear both intervals, ignore visibility refreshes, issue no further poll requests. Render an element with role='status' whose text contains 'Polling paused — token required', plus a button 'Resume polling'. Clicking it clears the pause, polls once immediately with the default gate (user-initiated; may open the TokenPrompt), and restarts the intervals.\n4. Demo mode is untouched. Do not change HookStatusPanel polling (out of scope).\n\nTESTS in src/components/BoardLens.test.tsx or a new sibling file; at least TWO, every new test name containing the tag `DD3` (no existing test contains it). Follow the existing polling tests (~308, ~376: vi.useFakeTimers, vi.spyOn(globalThis,'fetch'), advanceTimersByTimeAsync inside act). (a) fetch answers 401: mount the non-demo board, advance 60s, assert no fetches after the first failing round, `tokenGateListenerCount()` (or tokenGateSnapshot) from src/lib/token.ts shows nothing parked, and the paused status text is visible. (b) make fetch succeed, click 'Resume polling', assert new requests are issued and the paused status disappears. Existing BoardLens polling tests, src/lib/api.test.ts and src/lib/api.readauth.test.ts must still pass.\n\nDo not introduce variables named `token`; use `authority`. Add one line under `## Unreleased` in CHANGELOG.md. Rebuild and commit the embedded bundle: `npm --prefix apps/dashboard ci`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run sync-embedded`, then commit crates/cli/assets/dashboard/dist.\n\nGATES, run bare: `npm --prefix apps/dashboard test`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run check-embedded`, `npm --prefix apps/dashboard run lint`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "After a 401 on a board poll, advancing timers by 60s issues no further poll requests and parks no waiter on the token gate (test name contains DD3)",
+            "A role='status' element showing 'Polling paused — token required' is visible while paused (test name contains DD3)",
+            "Clicking 'Resume polling' issues new requests and clears the paused state (test name contains DD3)",
+            "Existing BoardLens polling tests, api tests and api.readauth tests still pass",
+            "Dashboard test, build, check-embedded and lint pass, and the embedded bundle is committed"
+          ]
+        },
+        {
+          "title": "An expired permission card holds its place",
+          "spec": "CONTEXT (confirmed). src/components/PermissionRequestPanel.tsx in the dashboard (apps/dashboard) re-renders every second via `useNow()` (src/lib/useNow.ts) and maps over `pendingPermissions(state, now)` (src/lib/pendingAsks.ts ~44-53), which drops records whose `proposal.deadline` has passed (the engine also later marks them closed with reason 'deadline expired'). So when a request expires its whole `<section className='panel panel-grant'>` card unmounts and every panel and button below it moves up under the cursor; with two permission cards, the second card's 'Allow once' can land where the first one's was. The panel is mounted in src/App.tsx's right column (~142) and BoardLens's act column (~551-562). Compare src/components/GateReviewPanel.tsx, which keeps an expired attempt in place with a status message.\n\nDO:\n1. A card this panel has rendered as pending stays mounted in the same position after its deadline passes, including when the record later arrives closed because it expired. Its Allow and Deny buttons become disabled and clicking them sends nothing.\n2. The card has a status line that is ALWAYS rendered, in both states, as the same element (e.g. `<p role='status' className='permission-status'>`): a non-breaking space while pending, text containing 'Expired' (e.g. 'Expired — no answer was sent') afterwards. Nothing is inserted into or removed from the card at the moment of expiry. Give the line a reserved min-height in src/styles.css. Any existing conditional status lines inside the card that could appear at expiry must not change the card's height at that moment.\n3. An expired card leaves only when the operator dismisses it via a 'Dismiss' button placed inside the reserved status line (not where Allow/Deny sit), or when the selected mission changes.\n4. A request already expired, resolved or closed when first rendered is still not shown, so the existing test `it.each(['expired','resolved','closed'])('hides a %s request')` keeps passing. Do NOT change `pendingPermissions` semantics (BoardLens ask counts and src/lib/pendingAsks.test.ts rely on them); keep retained-card logic local to the panel or in a new selector.\n\nTESTS in src/components/PermissionRequestPanel.test.tsx (vitest + @testing-library/react + jsdom; api mocked; drive time with fake timers or by mocking useNow). Every new test name must contain the tag `DD4` (no existing test contains it). Render two pending cards; capture the first card's section, its status element and buttons, and the second card's buttons. Advance past the first card's deadline only, then assert: the same DOM nodes are still connected and in the same order; the status element is the same node and reads Expired; the first card's buttons are disabled and clicking Allow does not call api.answerPermission; the second card's buttons are the same nodes and still enabled. The test must fail on the current code.\n\nAdd one line under `## Unreleased` in CHANGELOG.md. Rebuild and commit the embedded bundle: `npm --prefix apps/dashboard ci`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run sync-embedded`, then commit crates/cli/assets/dashboard/dist.\n\nGATES, run bare: `npm --prefix apps/dashboard test`, `npm --prefix apps/dashboard run build`, `npm --prefix apps/dashboard run check-embedded`, `npm --prefix apps/dashboard run lint`. Commit your own work before reporting.",
+          "validationCriteria": [
+            "A permission card shown as pending keeps its DOM node and position after its deadline, with Allow and Deny disabled and the always-present status line reading Expired (test name contains DD4)",
+            "Clicking an expired card's Allow sends no answer (test name contains DD4)",
+            "A sibling permission card's buttons keep their DOM nodes, order and enabled state when another card expires (test name contains DD4)",
+            "A request already expired, resolved or closed at first render is still hidden (existing test passes)",
+            "Dashboard test, build, check-embedded and lint pass, and the embedded bundle is committed"
+          ]
+        }
+      ]
+    }
+  ],
+  "consideredAlternatives": {
+    "chosen": "One milestone with eight independent features in dependency order: two small engine features (record the request seq; bind and check ControlCommand), then the REST, Slack and dashboard consumers, then the three dashboard-only stability fixes. This redrafts the approved m-fcde79 plan on a base that carries #191, splitting its oversize engine feature (flagged by the context-fit check at 5446 chars / 27 files) in two. The repo runs the whole contract at every milestone gate, so one milestone avoids waiver rounds. kind/requestSeq are optional on REST and in the engine so the CLI and Even G2 keep working, while the dashboard and Slack always bind and legacy Slack card values are refused. Engine contract fields are inserted as new lines only, and ControlCommand fields are named grant_kind/request_seq to avoid its serde tag 'kind'.",
+    "rejected": [
+      {
+        "approach": "Two milestones: grant binding first, then dashboard stability.",
+        "tradeOff": "Every milestone gate runs the whole contract, so the first gate would fail the DD2-DD4 assertions and need a waiver round with no extra integration signal."
+      },
+      {
+        "approach": "Make kind and requestSeq required on the REST grant routes and in the engine.",
+        "tradeOff": "Strictest binding, but it breaks the CLI and the Even G2 client unless both change in this mission, widening scope beyond the reported dashboard and Slack surfaces."
+      },
+      {
+        "approach": "Clear drafts by keying the whole App layout on the mission id.",
+        "tradeOff": "Remounts every panel including ones with in-flight async work; per-component resets follow ModelPanel's existing pattern and are testable per panel."
+      },
+      {
+        "approach": "Fix the expiry shift with a CSS min-height slot only.",
+        "tradeOff": "jsdom cannot verify layout, and it still removes the buttons, so the next card's controls slide under the cursor."
+      }
+    ]
+  },
+  "touchSet": [
+    "crates/engine/src/types.rs",
+    "crates/engine/src/reducer.rs",
+    "crates/engine/src/orchestrator.rs",
+    "crates/engine/src/orchestrator/live_permissions.rs",
+    "crates/engine/src/control.rs",
+    "crates/engine/tests/mission_test.rs",
+    "crates/engine/tests/reducer_test.rs",
+    "crates/server/src/rest.rs",
+    "crates/server/tests/host_test.rs",
+    "crates/cli/src/commands.rs",
+    "crates/slack/src/format.rs",
+    "crates/slack/src/inbound.rs",
+    "crates/slack/src/dispatch.rs",
+    "crates/slack/src/bridge.rs",
+    "crates/slack/src/outbound.rs",
+    "crates/slack/src/outbound_engine.rs",
+    "crates/slack/tests/**",
+    "apps/dashboard/src/components/**",
+    "apps/dashboard/src/lib/**",
+    "apps/dashboard/src/styles.css",
+    "crates/cli/assets/dashboard/dist/**",
+    "CHANGELOG.md"
+  ]
+}

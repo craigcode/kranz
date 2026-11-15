@@ -788,6 +788,7 @@ mod tests {
                 milestone_id: "ms-1".into(),
                 kind: kranz_engine::types::GrantKind::Command,
                 command: "x".repeat(5000),
+                request_seq: 9,
             }),
             Some("http://127.0.0.1:4560"),
         );

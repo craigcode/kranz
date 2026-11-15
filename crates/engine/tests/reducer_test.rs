@@ -2609,6 +2609,88 @@ fn grant_requested_sets_pending_and_approved_extends_grants() {
 }
 
 #[test]
+fn grant_requested_records_seq_and_superseded_grant_request_updates_it() {
+    let mut state = state_at_active_milestone();
+    let first_seq = state.last_seq + 1;
+    apply(
+        &mut state,
+        &ev(
+            first_seq,
+            EventKind::GrantRequested {
+                kind: GrantKind::Command,
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .expect("grant.requested accepted");
+    assert_eq!(
+        state.pending_grant_request.as_ref().unwrap().request_seq,
+        Some(first_seq),
+        "pending request records the seq of the grant.requested event that parked it"
+    );
+
+    apply(
+        &mut state,
+        &ev(
+            first_seq + 1,
+            EventKind::GrantDenied {
+                kind: GrantKind::Command,
+                command: "gc lint --strict".to_string(),
+                reason: "operator denied".to_string(),
+            },
+        ),
+    )
+    .expect("grant.denied accepted");
+    assert!(state.pending_grant_request.is_none());
+
+    let second_seq = first_seq + 2;
+    apply(
+        &mut state,
+        &ev(
+            second_seq,
+            EventKind::GrantRequested {
+                kind: GrantKind::Command,
+                milestone_id: "ms-1".to_string(),
+                command: "gc lint --strict".to_string(),
+            },
+        ),
+    )
+    .expect("re-request accepted");
+    assert_eq!(
+        state.pending_grant_request.as_ref().unwrap().request_seq,
+        Some(second_seq),
+        "a superseded grant request records the newer seq, not the original"
+    );
+}
+
+#[test]
+fn superseded_grant_request_omits_request_seq_when_none_and_deserializes_legacy_json() {
+    let with_seq = PendingGrantRequest {
+        milestone_id: "ms-1".to_string(),
+        kind: GrantKind::Command,
+        command: "gc lint".to_string(),
+        request_seq: None,
+    };
+    let value = serde_json::to_value(&with_seq).unwrap();
+    assert!(
+        value.get("requestSeq").is_none(),
+        "request_seq: None must be omitted from the wire, got {value}"
+    );
+
+    let legacy_json = json!({
+        "milestoneId": "ms-1",
+        "kind": "command",
+        "command": "gc lint",
+    });
+    let parsed: PendingGrantRequest = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(
+        parsed.request_seq, None,
+        "legacy JSON without requestSeq deserializes to None"
+    );
+}
+
+#[test]
 fn grant_denied_clears_pending_without_widening_grants() {
     let mut state = state_at_active_milestone();
     let next = state.last_seq + 1;

@@ -8,6 +8,7 @@ import { useKranzStore } from '../lib/store';
 
 export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
   const state = useKranzStore((s) => s.state);
+  const storeMissionId = useKranzStore((s) => s.missionId);
   const [instructions, setInstructions] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [decisionBusy, setDecisionBusy] = useState<'approve' | 'reject' | null>(null);
@@ -18,6 +19,10 @@ export function RevisionPanel({ onActed }: { onActed?: () => void } = {}) {
   const pending = selectPendingRevision(state);
   const missionId = mission?.id ?? null;
   const pendingRevisionNum = pending?.revision ?? null;
+
+  useEffect(() => {
+    setInstructions('');
+  }, [storeMissionId]);
 
   useEffect(() => {
     if (missionId === null || pendingRevisionNum === null) {

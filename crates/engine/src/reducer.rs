@@ -182,6 +182,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 milestone_id: milestone_id.clone(),
                 kind: *kind,
                 command: command.clone(),
+                request_seq: Some(event.seq),
             });
         }
 

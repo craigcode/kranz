@@ -5,6 +5,7 @@ import { BoardLens } from './BoardLens';
 import { api } from '../lib/api';
 import { buildFleetModel } from '../lib/board/fleet';
 import { useKranzStore } from '../lib/store';
+import { cancelTokenPrompt, clearToken, provideToken, tokenGateListenerCount } from '../lib/token';
 import type {
   GateEvaluation,
   LivePermission,
@@ -404,6 +405,87 @@ describe('BoardLens — slice 3 list, counts, escaping, and polling', () => {
       const method = (init?.method ?? 'GET').toUpperCase();
       expect(method).toBe('GET');
     }
+  });
+
+  it('DD3: a 401 on a background poll pauses polling, shows a status, and parks no token waiter', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+    cancelTokenPrompt();
+    clearToken();
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ error: 'token required' }), {
+        status: 401,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    useKranzStore.setState({ tickets: [], missions: [] });
+
+    render(<BoardLens />);
+
+    // First round of polling fails with 401 and pauses the board.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    const callsAfterFirstRound = fetchSpy.mock.calls.length;
+    expect(callsAfterFirstRound).toBeGreaterThan(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    // No further poll requests, and no waiter parked on the token gate.
+    expect(fetchSpy.mock.calls.length).toBe(callsAfterFirstRound);
+    expect(tokenGateListenerCount()).toBe(0);
+    expect(screen.getByText(/Polling paused — token required/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Resume polling' })).toBeTruthy();
+  });
+
+  it('DD3: clicking Resume polling issues new requests and clears the paused state', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW_MS);
+    cancelTokenPrompt();
+    clearToken();
+
+    let authorized = false;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      if (!authorized) {
+        return new Response(JSON.stringify({ error: 'token required' }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    useKranzStore.setState({ tickets: [], missions: [] });
+
+    render(<BoardLens />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    expect(screen.getByText(/Polling paused — token required/)).toBeTruthy();
+    const callsWhilePaused = fetchSpy.mock.calls.length;
+
+    // Resuming is user-initiated: it succeeds once the gate/credentials are fixed.
+    authorized = true;
+    provideToken('fresh-token');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume polling' }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(callsWhilePaused);
+    expect(screen.queryByText(/Polling paused — token required/)).toBeNull();
   });
 });
 

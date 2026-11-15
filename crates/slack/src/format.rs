@@ -39,12 +39,18 @@ pub const APPROVE_REVISION_ACTION_ID: &str = "kranz_approve_revision";
 pub const REJECT_REVISION_ACTION_ID: &str = "kranz_reject_revision";
 
 /// `action_id` of the "Approve grant" button on a grant-request card. The
-/// button value is `<mission-id>:<command>` (mission ids never contain `:`, so
-/// the first colon splits cleanly and the command may contain more).
+/// button value is `<mission-id>:<request-seq>:<kind>:<command>` (mission
+/// ids never contain `:`, the seq is decimal and the kind is its kebab-case
+/// wire name, so none of the three contain `:`; splitting on the first three
+/// colons leaves the command, which may contain more, intact). Binding the
+/// decision to the seq and kind — not just the command text — means a stale
+/// card can't apply to a later request that happens to share the same
+/// target.
 pub const APPROVE_GRANT_ACTION_ID: &str = "kranz_approve_grant";
 
 /// `action_id` of the "Deny" button on a grant-request card. The button value
-/// is `<mission-id>:<command>`.
+/// is `<mission-id>:<request-seq>:<kind>:<command>`, same as
+/// [`APPROVE_GRANT_ACTION_ID`].
 pub const DENY_GRANT_ACTION_ID: &str = "kranz_deny_grant";
 
 /// `action_id` of an option button on a question card (ticket
@@ -225,6 +231,34 @@ pub struct GrantReady {
     /// The granted target: a command string, a path glob, a deny rule, or a
     /// `host:port` egress destination, per `kind`.
     pub command: String,
+    /// The `seq` of the `grant.requested` event that parked this request —
+    /// carried on the card's buttons so a decision binds to the exact
+    /// request shown, not any later one sharing the same `command` text.
+    pub request_seq: u64,
+}
+
+/// Kebab-case wire name of a [`kranz_engine::types::GrantKind`], used on the
+/// grant card's button value. Mirrors the type's own `serde(rename_all =
+/// "kebab-case")`.
+pub(crate) fn grant_kind_wire(kind: kranz_engine::types::GrantKind) -> &'static str {
+    match kind {
+        kranz_engine::types::GrantKind::Command => "command",
+        kranz_engine::types::GrantKind::TouchPath => "touch-path",
+        kranz_engine::types::GrantKind::WorkerDeny => "worker-deny",
+        kranz_engine::types::GrantKind::Egress => "egress",
+    }
+}
+
+/// Inverse of [`grant_kind_wire`], for parsing a clicked button's value back
+/// into a [`kranz_engine::types::GrantKind`].
+pub(crate) fn grant_kind_from_wire(s: &str) -> Option<kranz_engine::types::GrantKind> {
+    match s {
+        "command" => Some(kranz_engine::types::GrantKind::Command),
+        "touch-path" => Some(kranz_engine::types::GrantKind::TouchPath),
+        "worker-deny" => Some(kranz_engine::types::GrantKind::WorkerDeny),
+        "egress" => Some(kranz_engine::types::GrantKind::Egress),
+        _ => None,
+    }
 }
 
 /// An open structured human question (ticket
@@ -890,12 +924,21 @@ pub fn build_permission_ready(
 }
 
 /// Parked-grant announcement: names the exact target a run was denied and
-/// offers approve/deny buttons carrying `<mission-id>:<command>`. Approving
-/// extends the list the grant's kind selects (`command_grants`, `touch_set`,
+/// offers approve/deny buttons carrying
+/// `<mission-id>:<request-seq>:<kind>:<command>`. Approving extends the list
+/// the grant's kind selects (`command_grants`, `touch_set`,
 /// `deny_exceptions`, or `egress_grants`) and re-runs; denying applies the
-/// kind's refusal semantics.
+/// kind's refusal semantics. Binding the button to the request's seq and
+/// kind (not just the command text) means a click on a stale card is refused
+/// as superseded rather than silently applying to a later request.
 pub fn build_grant_ready(g: &GrantReady, dashboard_url: Option<&str>) -> Vec<Value> {
-    let value = format!("{}:{}", g.mission_id, g.command);
+    let value = format!(
+        "{}:{}:{}:{}",
+        g.mission_id,
+        g.request_seq,
+        grant_kind_wire(g.kind),
+        g.command
+    );
     let (blurb, field_label) = match g.kind {
         kranz_engine::types::GrantKind::Command => (
             "A validator is blocked on a command outside its allow-set.",
@@ -2308,6 +2351,7 @@ mod tests {
                 milestone_id: "ms-1".into(),
                 kind: kranz_engine::types::GrantKind::Command,
                 command: "gc audit --deep".into(),
+                request_seq: 7,
             },
             None,
         );
@@ -2330,11 +2374,12 @@ mod tests {
             "approve button: {ids:?}"
         );
         assert!(ids.contains(&DENY_GRANT_ACTION_ID), "deny button: {ids:?}");
-        // The button value carries `<mission-id>:<command>` so the inbound
-        // router can round-trip it back to the exact parked request.
+        // The button value carries `<mission-id>:<request-seq>:<kind>:<command>`
+        // so the inbound router can round-trip it back to the exact parked
+        // request.
         let values: Vec<&str> = buttons.iter().filter_map(|b| b["value"].as_str()).collect();
         assert!(
-            values.contains(&"m-42:gc audit --deep"),
+            values.contains(&"m-42:7:command:gc audit --deep"),
             "button value round-trips: {values:?}"
         );
     }
@@ -2346,6 +2391,7 @@ mod tests {
                 milestone_id: "ms-1".into(),
                 kind: kranz_engine::types::GrantKind::Command,
                 command,
+                request_seq: 7,
             },
             None,
         );
@@ -2396,6 +2442,7 @@ mod tests {
                 milestone_id: "ms-2".into(),
                 kind: kranz_engine::types::GrantKind::TouchPath,
                 command: "docs/report.md".into(),
+                request_seq: 3,
             },
             None,
         );
@@ -2423,6 +2470,7 @@ mod tests {
                 milestone_id: "ms-1".into(),
                 kind: kranz_engine::types::GrantKind::Egress,
                 command: "registry.npmjs.org:443".into(),
+                request_seq: 5,
             },
             None,
         );

@@ -89,7 +89,10 @@ describe('GrantRequestPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Approve grant' }));
 
     await waitFor(() =>
-      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'gc audit --deep'),
+      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'gc audit --deep', {
+        kind: undefined,
+        requestSeq: undefined,
+      }),
     );
     expect(api.denyGrant).not.toHaveBeenCalled();
   });
@@ -102,8 +105,77 @@ describe('GrantRequestPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
 
-    await waitFor(() => expect(api.denyGrant).toHaveBeenCalledWith('m-1', 'gc audit --deep'));
+    await waitFor(() =>
+      expect(api.denyGrant).toHaveBeenCalledWith('m-1', 'gc audit --deep', undefined, {
+        kind: undefined,
+        requestSeq: undefined,
+      }),
+    );
     expect(api.approveGrant).not.toHaveBeenCalled();
+  });
+
+  it('approves with the kind and requestSeq of the shown request (DD1)', async () => {
+    useKranzStore.setState({
+      state: missionState({
+        milestoneId: 'ms-1',
+        kind: 'touch-path',
+        command: 'gc audit --deep',
+        requestSeq: 42,
+      }),
+    });
+    render(<GrantRequestPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve grant' }));
+
+    await waitFor(() =>
+      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'gc audit --deep', {
+        kind: 'touch-path',
+        requestSeq: 42,
+      }),
+    );
+  });
+
+  it('denies with the kind and requestSeq of the shown request (DD1)', async () => {
+    useKranzStore.setState({
+      state: missionState({
+        milestoneId: 'ms-1',
+        kind: 'egress',
+        command: 'registry.npmjs.org:443',
+        requestSeq: 7,
+      }),
+    });
+    render(<GrantRequestPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+
+    await waitFor(() =>
+      expect(api.denyGrant).toHaveBeenCalledWith('m-1', 'registry.npmjs.org:443', undefined, {
+        kind: 'egress',
+        requestSeq: 7,
+      }),
+    );
+  });
+
+  it('renders a 409 superseded rejection as an error, not success (DD1)', async () => {
+    vi.mocked(api.approveGrant).mockRejectedValueOnce(
+      new ApiError(409, 'request superseded'),
+    );
+    useKranzStore.setState({
+      state: missionState({
+        milestoneId: 'ms-1',
+        kind: 'command',
+        command: 'gc audit --deep',
+        requestSeq: 5,
+      }),
+    });
+    const onActed = vi.fn();
+    render(<GrantRequestPanel onActed={onActed} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve grant' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('request superseded');
+    expect(onActed).not.toHaveBeenCalled();
   });
 
   it('renders an egress grant distinctly and approves the host:port target', async () => {
@@ -122,7 +194,10 @@ describe('GrantRequestPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve grant' }));
     await waitFor(() =>
-      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'registry.npmjs.org:443'),
+      expect(api.approveGrant).toHaveBeenCalledWith('m-1', 'registry.npmjs.org:443', {
+        kind: 'egress',
+        requestSeq: undefined,
+      }),
     );
   });
 
@@ -164,6 +239,11 @@ describe('GrantRequestPanel', () => {
     expect(api.approveGrant).not.toHaveBeenCalled();
 
     fireEvent.click(denyBtn);
-    await waitFor(() => expect(api.denyGrant).toHaveBeenCalledWith('m-1', trojanCommand));
+    await waitFor(() =>
+      expect(api.denyGrant).toHaveBeenCalledWith('m-1', trojanCommand, undefined, {
+        kind: undefined,
+        requestSeq: undefined,
+      }),
+    );
   });
 });

@@ -371,6 +371,8 @@ export interface PendingGrantRequest {
   kind?: GrantKind;
   /** The granted target: a command string, a path glob, a deny rule, or a host:port egress destination. */
   command: string;
+  /** The request's sequence number, used to bind decisions to the exact request shown. */
+  requestSeq?: number;
 }
 
 /**

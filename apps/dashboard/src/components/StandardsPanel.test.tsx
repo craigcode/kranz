@@ -120,4 +120,33 @@ describe('StandardsPanel', () => {
     await vi.waitFor(() => expect(api.standards).toHaveBeenCalledWith('m-1'));
     expect(container.textContent).toBe('');
   });
+
+  it('clears the waiver reason and expiry draft when switching missions (DD2)', async () => {
+    const { rerender } = render(<StandardsPanel />);
+    await screen.findByText('failed: 1');
+
+    fireEvent.click(screen.getByRole('button', { name: /Review exact waiver/ }));
+    fireEvent.change(screen.getByLabelText('Reason'), {
+      target: { value: 'waiver reason for mission A' },
+    });
+    fireEvent.change(screen.getByLabelText('Expires'), {
+      target: { value: '2026-01-01T00:00' },
+    });
+    expect((screen.getByLabelText('Reason') as HTMLTextAreaElement).value).toBe(
+      'waiver reason for mission A',
+    );
+
+    useKranzStore.setState({ missionId: 'm-2' });
+    vi.mocked(api.standards).mockResolvedValue(view());
+    rerender(<StandardsPanel />);
+    await vi.waitFor(() => expect(api.standards).toHaveBeenCalledWith('m-2'));
+    await screen.findByText('failed: 1');
+
+    expect(screen.queryByLabelText('Reason')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Review exact waiver/ }));
+    const reasonInput = screen.getByLabelText('Reason') as HTMLTextAreaElement;
+    const expiresInput = screen.getByLabelText('Expires') as HTMLInputElement;
+    expect(reasonInput.value).toBe('');
+    expect(expiresInput.value).not.toBe('2026-01-01T00:00');
+  });
 });
