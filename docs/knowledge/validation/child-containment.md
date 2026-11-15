@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-13
+last_verified: 2026-11-15
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -15,6 +15,8 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-15 (UTC) against a test-only change in `command_exec.rs`: one gate test waits longer for its stub runtime to record its launch on a loaded host. No product code changed, and the containment rules here are unchanged.
 
 Rechecked 2026-11-13 (UTC) against a test-only change in `agent_env.rs`, `command_exec.rs`, `comparison_metrics.rs`, `knowledge.rs` and `sandbox.rs`: five engine tests no longer depend on where the contract scratch directory lives. No product code changed. The unix socket reach test now prints `SKIP-UNDER-WRAP` when it has no short writable temp root for a socket path. Containment rules are unchanged.
 
