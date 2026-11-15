@@ -10857,7 +10857,7 @@ async fn feature_range_scan_passes_clean_worker_commit() {
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_commits_clean(),
-        orch_script(vec![judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), no_lesson()]),
     ]));
 
     let cfg = MissionConfig {
@@ -10900,7 +10900,7 @@ async fn feature_range_scan_honours_base_allowlist() {
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_commits_canary(),
-        orch_script(vec![judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), no_lesson()]),
     ]));
 
     let cfg = MissionConfig {
@@ -10983,7 +10983,7 @@ async fn feature_range_scan_respawn_after_rewording_completes() {
         worker_commits_canary(),
         orch_script(vec![]),
         worker_commits_clean(),
-        orch_script(vec![judgement("complete", "")]),
+        orch_script(vec![judgement("complete", ""), no_lesson()]),
     ]));
 
     let cfg = MissionConfig {
