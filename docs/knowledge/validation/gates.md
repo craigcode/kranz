@@ -521,7 +521,9 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
     feature and its branch is never merged — no respawn in this path.
   - **Dispatch pool:** findings are noted on the candidate's line, record-only;
     the pool still parks for human judgement regardless.
-  - An unreadable range always fails the feature, never a silent pass.
+  - An unreadable range is never a silent pass: on the sequential and
+    parallel paths it fails the feature; for a dispatch-pool candidate it is
+    noted on the candidate's line (record-only).
 - **Merge pre-gate:** step 2 above.
 - **`kranz scan`** ([commands.rs](../../../crates/cli/src/commands.rs) `cmd_scan`):
   `kranz scan --range main..HEAD` (or `--staged`, or default `HEAD`); prints
